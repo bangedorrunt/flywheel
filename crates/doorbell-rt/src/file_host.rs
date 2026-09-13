@@ -1442,7 +1442,7 @@ mod tests {
 
     #[test]
     fn daemon_gen_gate() {
-        let dir = tmp_state("gen");
+        let dir = tmp_state("gen-gate");
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
         cfg.herdr_bin = "true".into();

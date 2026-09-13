@@ -1292,6 +1292,7 @@ mod tests {
             filter: Filter::default(),
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
+            project: Some("proj".into()),
         };
         let sub = store
             .subscribe(Actor::operator(), sub, "w")

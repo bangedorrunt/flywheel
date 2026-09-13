@@ -118,15 +118,24 @@ DOORBELL_TORON_BIN=true DOORBELL_HERDR_BIN=true \
   "$ROOT/target/debug/doorbell" serve --state-dir "$SMOKE_D/dd" --port 18999 \
   --flywheel-state-dir "$SMOKE_D/fw" --host smokeproj/smokews >"$SMOKE_D/serve.log" 2>&1 &
 SMOKE_WATCHER=$!
+smoke_cleanup() {
+  # bd-2o1v: killing the watcher orphans serve (reparented, keeps the
+  # port AND the lease and poisons the next run). Always kill the port
+  # holder too — 18999 is this smoke's own port.
+  kill -9 "$SMOKE_WATCHER" 2>/dev/null
+  local holder
+  holder=$(lsof -tiTCP:18999 2>/dev/null)
+  [ -n "$holder" ] && kill -9 $holder 2>/dev/null
+}
 smoke_ok=0
 for _ in $(seq 1 30); do
   if curl -sm 2 http://127.0.0.1:18999/health 2>/dev/null | grep -q '"mode":"hosted"'; then smoke_ok=1; break; fi
   sleep 0.5
 done
-[ "$smoke_ok" -eq 1 ] || { kill -9 "$SMOKE_WATCHER" 2>/dev/null; fail "serve smoke never reached hosted mode"; }
+[ "$smoke_ok" -eq 1 ] || { smoke_cleanup; fail "serve smoke never reached hosted mode"; }
 sleep 3
 grep -q '"stage":"sweep"' "$SMOKE_D/fw/journals/doorbell-journal-smokews.jsonl" 2>/dev/null \
-  || { kill -9 "$SMOKE_WATCHER" 2>/dev/null; fail "hosted loop journaled no sweeps"; }
+  || { smoke_cleanup; fail "hosted loop journaled no sweeps"; }
 pass "serve smoke hosted + sweeping"
 # TERM fires at 12s; graceful exit releases the per-ws lease. A KILL
 # fallback (137) leaves the lease held and fails the next check loudly.
@@ -135,6 +144,7 @@ wait "$SMOKE_WATCHER"
 [ -e "$SMOKE_D/fw/doorbell/owner-smokews.json" ] && fail "graceful stop left the lease held"
 pass "serve SIGTERM graceful (leases released)"
 rm -rf "$SMOKE_D"
+smoke_cleanup
 echo "== ADR-0012 Phase 4 analytics (bd-asr2.19) =="
 ART="$ROOT/docs/learnings/doorbell/wake-analytics-2026-09-10.md"
 [ -f "$ART" ] || fail "wake analytics artifact missing"

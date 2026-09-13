@@ -27,6 +27,10 @@ pub struct Decision {
     /// ADR-0011 D1: topology is a briefing axis, never collapsed into the
     /// workflow primitive. Join is decided by the briefing world, not here.
     pub topology: &'static str,
+    /// bd-2o1v P0-5 (a): profile affinity of the routed row — filled by the
+    /// caller from the workflow's steps (never re-declared on the row).
+    /// `decide` itself stays role-blind; `cmd_decide` names it.
+    pub role: Option<String>,
 }
 
 fn has(t: &str, needles: &[&str]) -> bool {
@@ -714,6 +718,46 @@ pub fn check_workflow_routes(table: &[RouteEntry], known: &[String]) -> Result<(
     Ok(())
 }
 
+/// bd-2o1v P0-5 (a): profile affinity READ from a workflow's steps — the
+/// first dispatch_job whose spec names a lowercase role (`@coder` or
+/// `coder`). Pins and pass-through aliases (CamelCase, hyphen forms) are
+/// not profiles and return None; unknown roles surface at the loud gate,
+/// never here. Stays pure: steps arrive as data.
+pub fn workflow_role_from_steps(steps: &[toron_workflow::schema::Step]) -> Option<String> {
+    use toron_workflow::schema::Action;
+    steps.iter().find_map(|step| {
+        let toron_workflow::schema::Step { action, .. } = step;
+        let Action::DispatchJob { spec, .. } = action else {
+            return None;
+        };
+        let name = spec.profile.as_deref()?.trim_start_matches('@');
+        (!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .then(|| name.to_string())
+    })
+}
+
+/// Spec 9 sibling to [`check_workflow_routes`]: every role a routed row
+/// dispatches to must exist in the profile catalog. `rows` pairs
+/// primitive → derived role (None when the workflow dispatches to no
+/// profile); `known` is the merged profile catalog's names. Loud, naming
+/// the orphaned route.
+pub fn check_profile_routes(
+    rows: &[(&str, Option<String>)],
+    known: &[String],
+) -> Result<(), String> {
+    for (primitive, role) in rows {
+        if let Some(r) = role
+            && !known.iter().any(|k| k == r)
+        {
+            return Err(format!(
+                "catalog: route {primitive:?} dispatches to role @{r} but no such profile \
+                 exists (flywheel profile list)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Compile the one routing table. Loud on overlap, on an ambiguous trigger, and
 /// on a dangling claim — callers fail closed.
 pub fn compile_routing_table() -> Result<(), String> {
@@ -727,6 +771,7 @@ fn none_decision(target: &str, why: String) -> Decision {
         reason: format!("no catalog route for {target:?} — {why}"),
         argv: Vec::new(),
         topology: "none",
+        role: None,
     }
 }
 
@@ -819,6 +864,7 @@ fn build_decision(entry: &RouteEntry, target: &str, snap: &Snapshot) -> Decision
         reason,
         argv,
         topology: entry.topology,
+        role: None,
     }
 }
 
@@ -2019,6 +2065,41 @@ mod decide_router_tests {
         assert_eq!(d.primitive, "pause", "fronted verb is the intent: {d:?}");
         let d = decide("goal: ship the onboarding flow", &snap());
         assert_eq!(d.primitive, "goal", "fronted topic is the intent: {d:?}");
+    }
+
+    // bd-2o1v P0-5 (a): role affinity is READ from workflow steps, never
+    // re-declared on the row — every WorkflowRun row's first dispatch_job
+    // role must exist in the profile catalog, and roles that are pins
+    // (CamelCase) never become affinity.
+    #[test]
+    fn decide_router_profile_affinity() {
+        use crate::profile::ProfileCatalog;
+        let known: Vec<String> = ProfileCatalog::load()
+            .expect("profile catalog loads")
+            .names();
+        let merged = crate::workflow_catalog::all_workflows_merged(None)
+            .expect("merged workflow catalog loads");
+        let rows: Vec<(&str, Option<String>)> = ROUTING_TABLE
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.argv,
+                    RouteArgv::WorkflowRun { .. } | RouteArgv::WorkflowRunNoMode
+                )
+            })
+            .map(|e| {
+                let role = merged
+                    .get(e.primitive)
+                    .and_then(|(w, _)| workflow_role_from_steps(&w.steps));
+                (e.primitive, role)
+            })
+            .collect();
+        check_profile_routes(&rows, &known)
+            .expect("every routed row's dispatch role must be a profile");
+        assert!(
+            rows.iter().any(|(_, r)| r.is_some()),
+            "the fold is real: at least one row derives a role from its steps"
+        );
     }
 
     // Exact same-position contention across primitives is explicit none.

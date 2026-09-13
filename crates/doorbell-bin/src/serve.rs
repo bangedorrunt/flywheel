@@ -84,7 +84,71 @@ async fn host_workspace(
 struct AppState {
     started: std::time::Instant,
     fw_state: std::path::PathBuf,
-    hosted: Vec<String>,
+    /// bd-2o1v: hosting is dynamic (auto-host on subscribe), so the list
+    /// is shared mutably; handlers snapshot it under the lock.
+    hosted: Shared<Vec<String>>,
+}
+
+/// bd-2o1v: shared mutable state handle (parking_lot — no poisoning).
+type Shared<T> = std::sync::Arc<parking_lot::Mutex<T>>;
+
+/// Reap threshold for orphaned spawn-scoped subscriptions (bd-2o1v): a
+/// crashed fleet's rows die after a week of journal silence. `kill`
+/// normally drops its own rows; this is the belt.
+const REAP_AFTER_SECS: u64 = 7 * 24 * 3600;
+
+/// (project, workspace) pairs named by subscriptions but not yet hosted.
+/// Legacy rows without a project are never guessed into a host.
+fn unhosted_subscribed(
+    subs: &[doorbell_rt::subscribe::Subscription],
+    hosted: &[String],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for sub in subs {
+        let Some(project) = &sub.project else { continue };
+        for ws in sub.scope.workspaces() {
+            let key = format!("{project}/{ws}");
+            if !hosted.contains(&key) && !out.contains(&(project.clone(), ws.clone())) {
+                out.push((project.clone(), ws));
+            }
+        }
+    }
+    out
+}
+
+/// Spawn-scoped rows whose workspace journal has been silent past
+/// [`REAP_AFTER_SECS`]. No journal yet (fresh spawn) or a live journal
+/// keeps the row; operator/cli rows always stay.
+fn reap_candidates(
+    subs: &[doorbell_rt::subscribe::Subscription],
+    journal_age_secs: impl Fn(&str) -> Option<u64>,
+) -> Vec<String> {
+    subs.iter()
+        .filter(|s| s.id.starts_with("spawn-"))
+        .filter_map(|s| {
+            let ws = s.scope.workspaces().into_iter().next()?;
+            match journal_age_secs(&ws) {
+                Some(age) if age > REAP_AFTER_SECS => Some(s.id.clone()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Mtime age of a workspace's journal file, in seconds (None = no journal).
+fn journal_age_secs(fw_state: &std::path::Path, ws: &str) -> Option<u64> {
+    let md = std::fs::metadata(
+        fw_state
+            .join("journals")
+            .join(format!("doorbell-journal-{ws}.jsonl")),
+    )
+    .ok()?;
+    let modified = md.modified().ok()?;
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(doorbell_rt::lease::unix_now().saturating_sub(secs))
 }
 
 pub async fn run(cfg: &Config) -> Result<()> {
@@ -132,12 +196,13 @@ pub async fn run(cfg: &Config) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("bind 127.0.0.1:{}", cfg.port)),
     };
     // Claim one writer lease per hosted workspace before serving.
-    let mut owned: Vec<(String, doorbell_rt::lease::OwnerLease)> = Vec::new();
+    let owned: Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     for (_, workspace) in &cfg.hosts {
         match lease::acquire_lease(&cfg.flywheel_state, workspace, lease::unix_now()) {
-            Ok(l) => owned.push((workspace.clone(), l)),
+            Ok(l) => owned.lock().push((workspace.clone(), l)),
             Err(e) => {
-                for (ws, l) in &owned {
+                for (ws, l) in owned.lock().iter() {
                     lease::release_lease(&cfg.flywheel_state, ws, l);
                 }
                 anyhow::bail!("doorbell serve: lease claim failed after bind: {e:?}");
@@ -171,33 +236,35 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
     let started = std::time::Instant::now();
     let log_path = cfg.log_file();
-    let hosted: Vec<String> = cfg.hosts.iter().map(|(p, w)| format!("{p}/{w}")).collect();
+    // bd-2o1v: `hosted` starts EMPTY — `spawn_host_loop` is the sole writer,
+    // so the list names only loops that actually exist (a pre-populated
+    // list made the idempotency guard skip every boot host: health showed
+    // hosted strings with no Brain behind them, zero sweeps, clean exit).
+    let hosted: Shared<Vec<String>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     eprintln!(
         "doorbell serve: up on 127.0.0.1:{} + {} (hosting {})",
         cfg.port,
         sock_path.display(),
-        if hosted.is_empty() {
+        if cfg.hosts.is_empty() {
             "nothing (standby)".to_string()
         } else {
-            hosted.join(", ")
+            cfg.hosts
+                .iter()
+                .map(|(p, w)| format!("{p}/{w}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     );
     // Host loops: one Brain per configured workspace. Shutdown = drop
     // every sender (tickers + loop handle), so each brain drains its
     // sinks, journals undelivered intents, and returns its report.
-    let mut loops = Vec::new();
-    let mut loop_txs = Vec::new();
+    let loops: Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let loop_txs: Shared<Vec<tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     for (project, workspace) in &cfg.hosts {
-        let (tx, rx) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
-        loop_txs.push(tx.clone());
-        let (fw, p, w) = (
-            cfg.flywheel_state.clone(),
-            project.clone(),
-            workspace.clone(),
-        );
-        loops.push(tokio::spawn(async move {
-            host_workspace(fw, p, w, tx, rx).await
-        }));
+        spawn_host_loop(cfg, &hosted, &loops, &loop_txs, project, workspace);
     }
     let rotate_tick = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -229,26 +296,48 @@ pub async fn run(cfg: &Config) -> Result<()> {
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
-    // D9 layer 1 upkeep: heartbeat every 30s per held lease.
+    // D9 layer 1 upkeep: heartbeat every 30s per held lease. Dynamic hosts
+    // (bd-2o1v auto-host) add leases to the same shared set, so they are
+    // heartbeated identically to boot-time hosts.
     let hb_state = cfg.flywheel_state.clone();
-    let hb_owned: Vec<String> = owned.iter().map(|(ws, _)| ws.clone()).collect();
+    let hb_owned = owned.clone();
     let heartbeat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             tick.tick().await;
             let now = doorbell_rt::lease::unix_now();
-            for ws in &hb_owned {
+            for (ws, _) in hb_owned.lock().iter() {
                 if let Some(mut cur) = doorbell_rt::lease::read_lease(&hb_state, ws) {
                     doorbell_rt::lease::refresh_lease(&hb_state, ws, &mut cur, now);
                 }
             }
         }
     });
-    let finish = |owned: &[(String, doorbell_rt::lease::OwnerLease)]| {
+    // bd-2o1v reconcile: subscriptions are the hosting truth. Every 60s the
+    // daemon hosts every subscribed (project, workspace) it can name
+    // (lease-fenced — never steal a live writer) and reaps spawn-scoped
+    // rows whose workspace went silent for a week.
+    let reconcile = std::sync::Arc::new(tokio::spawn({
+        let cfg = cfg.clone();
+        let hosted = hosted.clone();
+        let loops = loops.clone();
+        let loop_txs = loop_txs.clone();
+        let owned = owned.clone();
+        async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                reconcile_once(&cfg, &hosted, &loops, &loop_txs, &owned);
+            }
+        }
+    }));
+    let finish = || {
         heartbeat.abort();
+        reconcile.abort();
         rotate_tick.abort();
         crate::lifecycle::release_pid_file(&cfg.pid_file(), std::process::id());
-        for (ws, l) in owned {
+        for (ws, l) in owned.lock().iter() {
             doorbell_rt::lease::release_lease(&cfg.flywheel_state, ws, l);
         }
     };
@@ -269,24 +358,105 @@ pub async fn run(cfg: &Config) -> Result<()> {
         tokio::signal::ctrl_c().await.ok();
     };
     tokio::select! {
-        r = serve_tcp => { finish(&owned); r }
-        r = serve_uds => { finish(&owned); r }
+        r = serve_tcp => { finish(); r }
+        r = serve_uds => { finish(); r }
         _ = shutdown => {
             // Shutdown travels as a message (ticker + forwarder senders
             // stay open until their tasks end with the brain).
             eprintln!("doorbell serve: shutdown signal received, draining loops");
-            for tx in &loop_txs {
+            let txs = std::mem::take(&mut *loop_txs.lock());
+            for tx in &txs {
                 let _ = tx.send(doorbell_rt::BrainMsg::Shutdown).await;
             }
             eprintln!("doorbell serve: shutdown sent, joining loops");
-            drop(loop_txs);
-            for h in loops {
+            drop(txs);
+            let handles = std::mem::take(&mut *loops.lock());
+            for h in handles {
                 let _ = h.await;
             }
             eprintln!("doorbell serve: loops joined, releasing leases");
-            finish(&owned);
+            finish();
             eprintln!("doorbell serve: shutting down");
             Ok(())
+        }
+    }
+}
+
+/// Spawn one hosted loop (bd-2o1v: shared by boot-time `--host` config and
+/// dynamic auto-host) and record it on the shared tables.
+fn spawn_host_loop(
+    cfg: &Config,
+    hosted: &Shared<Vec<String>>,
+    loops: &Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>>,
+    loop_txs: &Shared<Vec<tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>>>,
+    project: &str,
+    workspace: &str,
+) {
+    // Idempotent: two callers (boot config + reconcile auto-host) may race
+    // the same pair — a second Brain on one workspace double-rings. Check
+    // before pushing anything, so an early return leaves no orphan tx.
+    let key = format!("{project}/{workspace}");
+    if hosted.lock().contains(&key) {
+        return;
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
+    loop_txs.lock().push(tx.clone());
+    let (fw, p, w) = (
+        cfg.flywheel_state.clone(),
+        project.to_string(),
+        workspace.to_string(),
+    );
+    loops.lock().push(tokio::spawn(async move {
+        host_workspace(fw, p, w, tx, rx).await
+    }));
+    hosted.lock().push(key);
+}
+/// auto-host of every nameable subscribed (project, workspace).
+fn reconcile_once(
+    cfg: &Config,
+    hosted: &Shared<Vec<String>>,
+    loops: &Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>>,
+    loop_txs: &Shared<Vec<tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>>>,
+    owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
+) {
+    use doorbell_rt::lease;
+    use doorbell_rt::subscribe::{Actor, SubscriptionStore};
+    let mut store = SubscriptionStore::open(&cfg.flywheel_state);
+    let subs = store.list();
+    for id in reap_candidates(&subs, |ws| journal_age_secs(&cfg.flywheel_state, ws)) {
+        match store.unsubscribe(Actor::operator(), &id) {
+            Ok(dropped) => {
+                eprintln!(
+                    "doorbell serve: reaped stale subscription {} (journal silent > {}s)",
+                    dropped.id, REAP_AFTER_SECS
+                );
+            }
+            Err(e) => eprintln!("doorbell serve: reap {id} failed: {e:?}"),
+        }
+    }
+    let now = lease::unix_now();
+    // Bind the work list BEFORE looping: the `hosted` guard must not be
+    // held across the loop body — `spawn_host_loop` locks it again and
+    // parking_lot mutexes are not reentrant (self-deadlock wedged the
+    // whole runtime: every handler parked in lock_slow behind /health).
+    let unhosted = unhosted_subscribed(&store.list(), &hosted.lock().clone());
+    for (project, workspace) in unhosted {
+        if let Some(cur) = lease::read_lease(&cfg.flywheel_state, &workspace)
+            && !lease::lease_stale(&cur, now)
+        {
+            continue; // a live writer (embedded loop) owns it — never steal
+        }
+        match lease::acquire_lease(&cfg.flywheel_state, &workspace, now) {
+            Ok(l) => {
+                owned.lock().push((workspace.clone(), l));
+                eprintln!(
+                    "doorbell serve: auto-hosting {project}/{workspace} (subscribed)"
+                );
+                spawn_host_loop(cfg, hosted, loops, loop_txs, &project, &workspace);
+            }
+            Err(e) => eprintln!(
+                "doorbell serve: auto-host {project}/{workspace} lease failed: {e:?}"
+            ),
         }
     }
 }
@@ -508,13 +678,15 @@ fn known_journal_workspaces(fw_state: &std::path::Path) -> Vec<String> {
 }
 
 fn health_body(app: &AppState) -> String {
+    // bd-2o1v: hosting is dynamic — snapshot under the lock once.
+    let hosted = app.hosted.lock().clone();
     // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut degraded = Vec::new();
     if store.any_torn_tail() {
         degraded.push("journal_torn_tail".to_string());
     }
-    let mode = if app.hosted.is_empty() {
+    let mode = if hosted.is_empty() {
         "standby"
     } else {
         "hosted"
@@ -529,8 +701,8 @@ fn health_body(app: &AppState) -> String {
     if wake_blind {
         degraded.push("standby_with_known_workspaces".to_string());
     }
-    let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &app.hosted);
-    let watch_age = hosted_watch_age(&app.fw_state, &app.hosted);
+    let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &hosted);
+    let watch_age = hosted_watch_age(&app.fw_state, &hosted);
     let mailbox_root = doorbell_rt::toron_data_root(None);
     let presence_age =
         doorbell_rt::watchbeat::file_age_secs(&doorbell_rt::presence_path(&mailbox_root));
@@ -540,19 +712,19 @@ fn health_body(app: &AppState) -> String {
         "journal_v": doorbell_rt::api::PING.journal_v,
         "uptime_s": app.started.elapsed().as_secs(),
         "mode": mode,
-        "hosted": app.hosted,
+        "hosted": hosted,
         // last_event_age_s is MEASURED from the watch heartbeat (None =
         // this workspace has never seen a bus event: wrong bus or dead
         // child), not the literal `null` it used to be.
         "watch": {
-            "state": if app.hosted.is_empty() { "standby" } else { "hosted" },
+            "state": if hosted.is_empty() { "standby" } else { "hosted" },
             "last_event_age_s": watch_age,
         },
         "sweep": {"last_age_s": sweep_age},
         // Measured, not hardcoded: the literal `0` here read as "no wake
         // subscriptions" even on a fully hosted daemon mid-ring, and sent
         // operators hunting the wrong fault.
-        "subscribers": hosted_subscribers(&app.fw_state, &app.hosted),
+        "subscribers": hosted_subscribers(&app.fw_state, &hosted),
         // The mailbox this daemon actually watches. A daemon on a different
         // toron root than the pins' bus is deaf; presence_age_s (None = no
         // projection ever written at the canonical root-level path) makes
@@ -645,6 +817,7 @@ fn events_body(state_dir: &std::path::Path, since: Option<u64>) -> String {
 /// Host-level counters (D8 stats shape; journal-derived truth across the
 /// flywheel state dir; per-loop runtime counters stay in RunReports).
 fn stats_body(app: &AppState) -> String {
+    let hosted = app.hosted.lock().clone();
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut journal_rows = 0u64;
     let mut workspaces = 0u64;
@@ -667,8 +840,8 @@ fn stats_body(app: &AppState) -> String {
         "core_v": doorbell_rt::api::PING.core_v,
         "journal_v": doorbell_rt::api::PING.journal_v,
         "uptime_s": app.started.elapsed().as_secs(),
-        "mode": if app.hosted.is_empty() { "standby" } else { "hosted" },
-        "hosted": app.hosted,
+        "mode": if hosted.is_empty() { "standby" } else { "hosted" },
+        "hosted": hosted,
         "workspaces": workspaces,
         "journal_rows": journal_rows,
         "torn_tail": store.any_torn_tail(),
@@ -685,6 +858,7 @@ fn stats_body(app: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::known_journal_workspaces;
+    use super::{reap_candidates, unhosted_subscribed, REAP_AFTER_SECS};
 
     /// bd-enov (F17): the wake-blind detector reads exactly the workspaces the
     /// plane has served — a journal file per workspace, ignoring strays and
@@ -717,5 +891,68 @@ mod tests {
             "only live journal names count"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-2o1v: subscriptions are the hosting truth — named (project, ws)
+    /// pairs not yet hosted come back; legacy project-less rows and
+    /// already-hosted keys never do.
+    #[test]
+    fn unhosted_subscribed_names_only_nameable() {
+        use doorbell_rt::subscribe::*;
+        let named = Subscription {
+            id: "spawn-w-p".into(),
+            identity: Identity::Pin("p".into()),
+            scope: Scope::One("w".into()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+            project: Some("proj".into()),
+        };
+        let legacy = Subscription {
+            project: None,
+            ..named.clone()
+        };
+        assert_eq!(
+            unhosted_subscribed(&[named.clone(), legacy], &[]),
+            vec![("proj".to_string(), "w".to_string())],
+            "legacy rows without a project are never guessed into a host"
+        );
+        assert!(
+            unhosted_subscribed(&[named], &["proj/w".to_string()]).is_empty(),
+            "already-hosted keys stay hosted, never double-spawned"
+        );
+    }
+
+    /// bd-2o1v: the reaper drops spawn-scoped rows after a week of journal
+    /// silence; fresh journals, journal-less workspaces, and operator rows
+    /// stay. Missing journal = fresh spawn pre-first-tick, never a corpse.
+    #[test]
+    fn reap_candidates_only_quiet_spawn_rows() {
+        use doorbell_rt::subscribe::*;
+        let spawn = |id: &str, ws: &str| Subscription {
+            id: id.into(),
+            identity: Identity::Pin("p".into()),
+            scope: Scope::One(ws.into()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+            project: Some("proj".into()),
+        };
+        let cli = spawn("cli-w-p", "w");
+        let rows = vec![
+            spawn("spawn-old-p", "old"),
+            spawn("spawn-fresh-p", "fresh"),
+            spawn("spawn-never-p", "never"),
+            cli,
+        ];
+        let aged = |ws: &str| match ws {
+            "old" => Some(REAP_AFTER_SECS + 1),
+            "fresh" => Some(10),
+            _ => None,
+        };
+        assert_eq!(
+            reap_candidates(&rows, aged),
+            vec!["spawn-old-p".to_string()]
+        );
     }
 }

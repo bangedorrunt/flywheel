@@ -41,6 +41,9 @@ pub struct Proposal {
     pub remove: Vec<String>,
     pub why: String,
     pub argv: Vec<String>,
+    /// bd-2o1v P0-5 (a): profile affinity of the proposed row, READ from
+    /// the workflow's steps by the caller (never re-declared here).
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +185,7 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
             remove,
             why,
             argv,
+            role: None,
         },
         alternatives: vec![
             Alternative {

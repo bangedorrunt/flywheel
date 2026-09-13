@@ -1841,6 +1841,10 @@ enum DoorbellCmd {
         /// (repeatable; operator-only)
         #[arg(long)]
         extra: Vec<String>,
+        /// project context so the daemon can auto-host this scope
+        /// (bd-2o1v); omitted = legacy row, never auto-hosted
+        #[arg(long)]
+        project: Option<String>,
     },
     /// list subscription store rows.
     Subscriptions {},
@@ -4771,7 +4775,8 @@ fn main() {
                 pin,
                 sink,
                 extra,
-            } => cmd_doorbell_subscribe(&cfg, workspace, pin, sink, extra),
+                project,
+            } => cmd_doorbell_subscribe(&cfg, workspace, pin, sink, extra, project.as_deref()),
             DoorbellCmd::Subscriptions {} => cmd_doorbell_subscriptions(&cfg),
             DoorbellCmd::Unsubscribe { id } => cmd_doorbell_unsubscribe(&cfg, id),
         },
@@ -7694,6 +7699,71 @@ mod adr0013_spawn_effect_tests {
     }
 }
 
+/// bd-2o1v stack-reset contracts: the crew-confirm gate and the profile
+/// projections (real `builtin` flag + the `fallback` taxonomy surfaced).
+#[cfg(test)]
+mod bd2o1v_reset_tests {
+    fn body_of(src: &'static str, start_needle: &str, end_needle: &str) -> &'static str {
+        let start = src.find(start_needle).expect("start needle");
+        let end = src
+            .find(end_needle)
+            .unwrap_or(src.len())
+            .max(start + start_needle.len());
+        &src[start..end]
+    }
+
+    /// Crew plans are proposals: `briefing --commit` may not auto-dispatch a
+    /// spawn-class topology without the operator's word — TTY asks inline,
+    /// non-TTY refuses naming --yes. Zero-pane topologies (open/join/none)
+    /// never gate.
+    #[test]
+    fn briefing_commit_gates_spawn_class_crews() {
+        let src = include_str!("main.rs");
+        let body = body_of(src, "\nfn cmd_briefing(", "\nfn warn_uncommitted_decision_docs(");
+        let gate = body.find("spawns_crew").expect("gate predicate");
+        let refusal = body.find("crew-confirm gate").expect("non-TTY refusal");
+        let tty_ask = body.find("spawn this crew?").expect("TTY inline ask");
+        let exec = body
+            .find("briefing --commit {}")
+            .expect("argv exec must exist after the gate");
+        assert!(gate < exec && refusal < exec && tty_ask < exec);
+        assert!(
+            body.contains(r#""open" | "join" | "none""#),
+            "zero-pane topologies bypass the gate"
+        );
+    }
+
+    /// D4 taxonomy surfaces: `profile show` must project `fallback` (it
+    /// dropped it while `model_fallback` showed), and `profile list` must
+    /// report the real builtin flag from the catalog source, not the
+    /// vacuous skills/behavior-emptiness heuristic.
+    #[test]
+    fn profile_projections_surface_fallback_and_real_builtin() {
+        let src = include_str!("main.rs");
+        // rfind: the real match arms sit BELOW this test module, so the
+        // LAST occurrence is always the live code, never our quoted needles.
+        let show = {
+            let start = src
+                .rfind("ProfileCmd::Show { name, json } => {")
+                .expect("real Show arm");
+            let end = src.rfind("ProfileCmd::Create {").expect("real Create arm");
+            &src[start..end]
+        };
+        assert!(show.matches(r#""fallback": p.fallback"#).count() >= 2);
+        let list = {
+            let start = src.rfind("ProfileCmd::List =>").expect("real List arm");
+            let end = src
+                .rfind("ProfileCmd::Show { name, json } => {")
+                .expect("real Show arm bounds List");
+            &src[start..end]
+        };
+        assert!(
+            list.contains(r#""builtin": is_builtin_profile(&name)"#),
+            "list must derive builtin from the catalog source of truth"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tripwire {
     /// Locate a column-0 `fn name(` definition in `src`.
@@ -9546,6 +9616,7 @@ projects available: {}",
     // the daemon serves these rows when it hosts wake. Best-effort.
     doorbell::register_workspace_subscriptions(
         &config::state_dir(),
+        project,
         &label,
         &registry
             .iter()
@@ -10614,13 +10685,13 @@ fn cmd_doorbell_inject(
 
 /// Subscribe an identity (D8, bd-woha): thin CLI over the subscription
 /// store. The store itself enforces operator-only cross-workspace scopes
-/// and non-herdr sinks — refusals print loudly, never silent.
 fn cmd_doorbell_subscribe(
     _cfg: &Config,
     workspace: &str,
     pin: &str,
     sink: &str,
     extra: &[String],
+    project: Option<&str>,
 ) -> Result<()> {
     use doorbell_rt::subscribe::{
         Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
@@ -10660,6 +10731,7 @@ fn cmd_doorbell_subscribe(
         },
         sink: kind,
         budget: Budget::default_530(),
+        project: project.map(|s| s.to_string()),
     };
     let mut store = SubscriptionStore::open(&config::state_dir());
     match store.subscribe(actor, sub, workspace) {
@@ -14028,6 +14100,15 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
     Ok(())
 }
 
+/// bd-2o1v P0-5 (a): profile affinity of a routed primitive, READ from the
+/// workflow's own steps (never re-declared). None when the workflow
+/// dispatches to no profile (headless/diagnosis) or is unresolvable.
+fn routed_role(primitive: &str) -> Option<String> {
+    let merged = workflow_catalog::all_workflows_merged(None).ok()?;
+    let (wf, _) = merged.get(primitive)?;
+    decide::workflow_role_from_steps(&wf.steps)
+}
+
 /// Classify only. Never dispatches.
 fn cmd_decide(
     cfg: &Config,
@@ -14066,27 +14147,54 @@ fn cmd_decide(
     // must name a workflow the merged catalog actually resolves. A row pointing
     // at a renamed or removed workflow is a dangling claim — fail here, where
     // the fix is named, not later as an unrunnable argv.
-    let known: Vec<String> = workflow_catalog::all_workflows_merged(None)?
-        .into_keys()
-        .collect();
+    let merged = workflow_catalog::all_workflows_merged(None)?;
+    let known: Vec<String> = merged.keys().cloned().collect();
     if let Err(e) = decide::check_workflow_routes(decide::ROUTING_TABLE, &known) {
         bail!("{e}");
     }
-    let d = decide::decide(target, &snap);
+    // bd-2o1v P0-5 (a): role affinity is READ from each routed workflow's
+    // steps — a row dispatching to an unknown profile fails here, where
+    // the row and the catalog are both named.
+    let affinity: Vec<(&str, Option<String>)> = decide::ROUTING_TABLE
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.argv,
+                decide::RouteArgv::WorkflowRun { .. } | decide::RouteArgv::WorkflowRunNoMode
+            )
+        })
+        .map(|e| {
+            let role = merged
+                .get(e.primitive)
+                .and_then(|(w, _)| decide::workflow_role_from_steps(&w.steps));
+            (e.primitive, role)
+        })
+        .collect();
+    let known_profiles: Vec<String> = profile::ProfileCatalog::load()?.names();
+    if let Err(e) = decide::check_profile_routes(&affinity, &known_profiles) {
+        bail!("{e}");
+    }
+    let mut d = decide::decide(target, &snap);
+    d.role = affinity
+        .iter()
+        .find(|(p, _)| *p == d.primitive)
+        .and_then(|(_, r)| r.clone());
     if json {
         print_json(&serde_json::json!({
             "primitive": d.primitive,
             "reason": d.reason,
             "argv": d.argv,
             "topology": d.topology,
+            "role": d.role,
         }));
     } else {
         println!(
-            "{}\n{}\n{}\ntopology {}",
+            "{}\n{}\n{}\ntopology {}\nrole {}",
             d.primitive,
             d.reason,
             d.argv.join(" "),
-            d.topology
+            d.topology,
+            d.role.as_deref().unwrap_or("-"),
         );
     }
     Ok(())
@@ -14308,6 +14416,10 @@ fn cmd_briefing(
             b.proposal.argv.push(n.to_string());
         }
     }
+    // bd-2o1v P0-5 (a): name the proposed row's profile affinity (read from
+    // the workflow's steps, never re-declared) so the crew-confirm gate
+    // above and the captain see the same dispatch relation.
+    b.proposal.role = routed_role(&b.proposal.workflow);
     if json {
         print_json(&serde_json::to_value(&b)?);
     } else {
@@ -14318,6 +14430,7 @@ fn cmd_briefing(
         );
         println!("why {}", b.proposal.why);
         println!("argv {}", b.proposal.argv.join(" "));
+        println!("role {}", b.proposal.role.as_deref().unwrap_or("-"));
         println!(
             "questions topology={} crew={}",
             b.questions[0].default, b.questions[1].default
@@ -14330,6 +14443,42 @@ fn cmd_briefing(
     warn_uncommitted_decision_docs(cfg, project);
     if commit || yes {
         let argv = b.proposal.argv.clone();
+        // Crew-confirm gate (bd-2o1v, captain contract 2026-09-13): a crew
+        // plan is a PROPOSAL. Spawn-class topologies may not auto-commit
+        // without the operator's word — TTY asks inline; non-TTY callers
+        // (agents) present the proposal in chat and rerun with --yes / a
+        // remixed --crew. Cron/loop never route through briefing.
+        let spawns_crew =
+            !matches!(b.proposal.topology.as_str(), "open" | "join" | "none" | "");
+        if commit && !yes && spawns_crew {
+            let plan = format!(
+                "crew plan (proposal): topology={} workflow={} crew-default={} argv=`{}`",
+                b.proposal.topology,
+                b.proposal.workflow,
+                b.questions
+                    .iter()
+                    .find(|q| q.id == "crew")
+                    .map(|q| q.default.clone())
+                    .unwrap_or_default(),
+                argv.join(" ")
+            );
+            if std::io::stdin().is_terminal() {
+                eprintln!("\n{plan}");
+                eprint!("spawn this crew? [y/N] (remix: rerun with --crew N / profile flags) ");
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if !line.trim().eq_ignore_ascii_case("y") {
+                    bail!("briefing aborted — crew plan not confirmed");
+                }
+            } else {
+                bail!(
+                    "briefing --commit: topology '{}' spawns a crew — crew-confirm gate \
+                     (bd-2o1v). {plan}. Present this proposal to the operator and rerun \
+                     with --yes (or --crew N after remix)",
+                    b.proposal.topology
+                );
+            }
+        }
         eprintln!("flywheel: briefing --commit {}", argv.join(" "));
         if argv.len() < 2 {
             bail!("briefing commit: empty argv");
@@ -17380,6 +17529,27 @@ fn cmd_kill(
     c.workspace_close(&ws_id, false)?;
     if let Err(e) = doorbell::stop(&config::state_dir(), &ws_label) {
         eprintln!("flywheel: doorbell stop failed: {e:#}");
+    }
+    // bd-2o1v lifecycle symmetry: a full close drops THIS spawn's wake
+    // subscription rows — panes are gone, so their herdr-sink rows are
+    // stale weight (20-row graveyards were the finding). Operator/cli
+    // rows outlive swarms; the next spawn re-records its rows idempotently.
+    // Continue/Adopt keeps crews alive and never reaches here.
+    {
+        use doorbell_rt::subscribe::{Actor, SubscriptionStore};
+        let prefix = format!("spawn-{ws_label}-");
+        let mut store = SubscriptionStore::open(&config::state_dir());
+        for row in store.list() {
+            if row.id.starts_with(&prefix) {
+                match store.unsubscribe(Actor::operator(), &row.id) {
+                    Ok(dropped) => println!("unsubscribed: {}", dropped.id),
+                    Err(e) => eprintln!(
+                        "flywheel: cannot drop wake subscription {}: {e:?}",
+                        row.id
+                    ),
+                }
+            }
+        }
     }
     // Persist policy effect on registry + alias (Stop / reap_crews)
     let remaining =
@@ -25604,7 +25774,9 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     "role": p.role,
                     "backend": cat.backend(&name),
                     "default_workflow": p.default_workflow,
-                    "builtin": p.skills.is_empty() && p.behavior.is_empty(),
+                    "builtin": is_builtin_profile(&name),
+                    "fallback": p.fallback,
+                    "model_fallback": p.model_fallback,
                 }));
             }
             print_json(&json!({ "profiles": rows }));
@@ -25630,6 +25802,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                     "name": name,
                     "harness": p.harness,
                     "model": p.model,
+                    "fallback": p.fallback,
                     "model_fallback": p.model_fallback,
                     "resolved": resolved,
                     "effort": p.effort,
@@ -25648,7 +25821,8 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             print_json(&json!({
                 "name": name,
                 "harness": p.harness,
-                "model": p.model,
+                "fallback": p.fallback,
+                "model_fallback": p.model_fallback,
                 "effort": p.effort,
                 "smol": p.smol,
                 "slow": p.slow,
