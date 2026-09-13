@@ -433,7 +433,8 @@ pub fn render_autostart(
         }
         include_str!("../units/com.doorbell.serve.plist")
             .replace("DOORBELL_BIN", exe)
-            .replace("DOORBELL_STATE_DIR", state_dir)
+            .replace("DOORBELL_STATE_DIR_VALUE", state_dir)
+            .replace("DOORBELL_STATE_DIR_KEY", "DOORBELL_STATE_DIR")
             .replace("DOORBELL_SERVE_ARGS", &args.join("\n        "))
     }
     #[cfg(not(target_os = "macos"))]
@@ -452,7 +453,8 @@ pub fn render_autostart(
         }
         include_str!("../units/doorbell.service")
             .replace("DOORBELL_BIN", exe)
-            .replace("DOORBELL_STATE_DIR", state_dir)
+            .replace("DOORBELL_STATE_DIR_VALUE", state_dir)
+            .replace("DOORBELL_STATE_DIR_KEY", "DOORBELL_STATE_DIR")
             .replace("DOORBELL_SERVE_ARGS", &args.join(" "))
     }
 }
@@ -577,9 +579,20 @@ mod tests {
         assert!(body.contains("/var/fw"), "flywheel state dir rendered");
         assert!(body.contains("proj/ws"), "--host pair rendered");
         assert!(!body.contains("DOORBELL_BIN"), "no placeholder survives");
+        // bd-y6gw: the env key resolves to the literal `DOORBELL_STATE_DIR`
+        // (a real env name), so absence is asserted on the _KEY/_VALUE
+        // placeholder tokens, not the resolved name.
         assert!(
-            !body.contains("DOORBELL_STATE_DIR"),
-            "no placeholder survives"
+            !body.contains("DOORBELL_STATE_DIR_VALUE"),
+            "value placeholder resolved"
+        );
+        assert!(
+            !body.contains("DOORBELL_STATE_DIR_KEY"),
+            "key placeholder resolved"
+        );
+        assert!(
+            body.contains("DOORBELL_STATE_DIR"),
+            "env key resolves to the literal DOORBELL_STATE_DIR name"
         );
         assert!(
             !body.contains("DOORBELL_SERVE_ARGS"),

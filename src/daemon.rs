@@ -566,7 +566,7 @@ pub fn ensure_doorbell_spawn() -> DoorbellEnsure {
     let Some(bin) = which_doorbell() else {
         return DoorbellEnsure::Degraded {
             hint: format!(
-                "doorbell binary not found on PATH or beside {:?}; install it (`cargo install --path crates/doorbell-bin`)",
+                "doorbell binary not found on PATH or beside {:?}; install it (`cargo install --path crates/doorbell-cli`)",
                 std::env::current_exe().ok()
             ),
         };

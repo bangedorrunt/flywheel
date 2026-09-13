@@ -109,7 +109,7 @@ $CARGO test --bin flywheel parity_tests 2>&1 | tail -n 2
 # under `timeout -s TERM -k` (foreground-spawned children keep a normal
 # disposition): TERM at 12s must exit 0 with leases released; the -k
 # fallback exits 137 with the lease held and fails the gate loudly.
-$CARGO build -p doorbell-bin 2>&1 | tail -n 1
+$CARGO build -p doorbell-cli 2>&1 | tail -n 1
 SMOKE_D="$(mktemp -d "${TMPDIR:-/tmp}/doorbell-smoke.XXXXXX")"
 mkdir -p "$SMOKE_D/fw/agents" "$SMOKE_D/dd"
 echo '[{"pane_id":"pane-a","name":"herdr-a","mail_identity":"PinA"}]' > "$SMOKE_D/fw/agents/smokeproj.json"

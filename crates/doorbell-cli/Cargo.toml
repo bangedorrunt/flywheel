@@ -1,5 +1,5 @@
 [package]
-name = "doorbell-bin"
+name = "doorbell-cli"
 version = "0.1.0"
 edition = "2024"
 description = "Doorbell daemon binary (ADR-0012 Phase 1) — lifecycle, UDS+TCP bind, /health"

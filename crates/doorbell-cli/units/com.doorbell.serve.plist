@@ -25,13 +25,13 @@
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>StandardOutPath</key>
-    <string>DOORBELL_STATE_DIR/doorbell.log</string>
+    <string>DOORBELL_STATE_DIR_VALUE/doorbell.log</string>
     <key>StandardErrorPath</key>
-    <string>DOORBELL_STATE_DIR/doorbell.log</string>
+    <string>DOORBELL_STATE_DIR_VALUE/doorbell.log</string>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>DOORBELL_STATE_DIR</key>
-        <string>DOORBELL_STATE_DIR</string>
+        <key>DOORBELL_STATE_DIR_KEY</key>
+        <string>DOORBELL_STATE_DIR_VALUE</string>
     </dict>
 </dict>
 </plist>

@@ -967,7 +967,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "doorbell-bin"
+name = "doorbell-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",

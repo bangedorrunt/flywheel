@@ -6,7 +6,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=DOORBELL_BIN serve DOORBELL_SERVE_ARGS
-Environment=DOORBELL_STATE_DIR=DOORBELL_STATE_DIR
+Environment=DOORBELL_STATE_DIR_KEY=DOORBELL_STATE_DIR_VALUE
 # Restart=on-failure with SuccessfulExit=false semantics: a clean exit
 # (e.g. port conflict, which exits 0) must STAY dead — no respawn war
 # (bd-serve-double-spawn lesson).
