@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doorbell Plane D — as-is vs after</title>
+<style>
+:root{
+  --void:#08080e; --panel:#0e0e1a; --line:#23233a; --fg:#c8d0e8;
+  --dim:#7a83a3; --cyan:#0db9d7; --lav:#bb9af7; --mint:#73daca;
+  --amber:#e0af68; --red:#f7768e; --ice:#89ddff; --sel:#1a1a3e;
+}
+*{box-sizing:border-box}
+body{background:var(--void);color:var(--fg);font:15px/1.55 -apple-system,"Segoe UI",Roboto,sans-serif;margin:0;padding:32px 20px;max-width:1080px;margin-inline:auto}
+h1{font-size:26px;margin:0 0 4px}h1 .d{color:var(--cyan)}
+.sub{color:var(--dim);margin:0 0 28px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;margin:0 0 22px}
+h2{font-size:18px;margin:0 0 2px}h2 .n{color:var(--lav)}
+.q{color:var(--dim);font-style:italic;margin:0 0 14px}
+svg{width:100%;height:auto;display:block;background:var(--void);border:1px solid var(--line);border-radius:8px}
+p.cap{color:var(--dim);font-size:13.5px;margin:12px 0 0}
+p.cap b{color:var(--fg)}code{color:var(--ice);font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--dim);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.04em}
+tr td:first-child{color:var(--cyan);font-weight:700;white-space:nowrap}
+.pass{color:var(--mint)}.gap{color:var(--amber)}.dead{color:var(--red)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--dim);font-size:13px;margin:0 0 14px}
+.sw{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:baseline}
+footer{color:var(--dim);font-size:13px}
+@media(max-width:640px){body{padding:18px 12px}section{padding:15px}table{font-size:12.5px}}
+</style>
+</head>
+<body>
+<h1>Doorbell <span class="d">Plane D</span> — as-is vs after</h1>
+<p class="sub">ADR-0012 visual companion · flywheel × toron × beads · every claim traces to <code>docs/decisions/0012-doorbell-plane-independent-runtime.md</code></p>
+
+<section>
+<h2><span class="n">D1 ·</span> As-is dataflow (doorbell inside flywheel)</h2>
+<p class="q">Where does a wake travel today, and what dies with the swarm?</p>
+<svg viewBox="0 0 900 430" role="img" aria-label="As-is dataflow">
+<title>As-is: dispatcher embedded in flywheel, dies with kill</title>
+<defs><marker id="a1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#7a83a3" stroke-width="1.5"/></marker></defs>
+<rect id="swarm" x="230" y="20" width="440" height="330" rx="10" fill="none" stroke="#f7768e" stroke-dasharray="7 5" stroke-width="1.5"><title>Swarm boundary: everything inside dies with flywheel kill</title></rect>
+<text x="245" y="42" fill="#f7768e" font-size="12">swarm boundary — dies with kill</text>
+<rect id="tick" x="260" y="60" width="180" height="64" rx="8" fill="#1a1a3e" stroke="#bb9af7"><title>workspace::tick pure reducer src/workspace.rs:1290</title></rect>
+<text x="350" y="86" fill="#c8d0e8" font-size="13" text-anchor="middle">workspace::tick</text><text x="350" y="104" fill="#7a83a3" font-size="11" text-anchor="middle">pure reducer</text>
+<rect id="disp" x="460" y="60" width="180" height="64" rx="8" fill="#1a1a3e" stroke="#0db9d7"><title>cmd_internal_doorbell effect loop src/main.rs:9615</title></rect>
+<text x="550" y="86" fill="#c8d0e8" font-size="13" text-anchor="middle">dispatcher</text><text x="550" y="104" fill="#7a83a3" font-size="11" text-anchor="middle">effects process</text>
+<rect id="loop" x="260" y="140" width="180" height="56" rx="8" fill="#0e0e1a" stroke="#23233a"><title>loop-mode --work bead dispatch</title></rect>
+<text x="350" y="163" fill="#c8d0e8" font-size="13" text-anchor="middle">loop --work</text><text x="350" y="180" fill="#7a83a3" font-size="11" text-anchor="middle">br ready poll</text>
+<rect id="jr" x="460" y="140" width="180" height="56" rx="8" fill="#0e0e1a" stroke="#23233a"><title>doorbell journal state_dir/journals/doorbell-journal-{ws}.jsonl</title></rect>
+<text x="550" y="163" fill="#c8d0e8" font-size="13" text-anchor="middle">journal</text><text x="550" y="180" fill="#7a83a3" font-size="11" text-anchor="middle">why-fold replays</text>
+<rect id="toron" x="40" y="250" width="180" height="64" rx="8" fill="#0e0e1a" stroke="#73daca"><title>toron bus, mailbox, receipts :18080</title></rect>
+<text x="130" y="275" fill="#c8d0e8" font-size="13" text-anchor="middle">toron bus</text><text x="130" y="293" fill="#7a83a3" font-size="11" text-anchor="middle">9/14/20001/43001…</text>
+<rect id="br" x="260" y="250" width="180" height="64" rx="8" fill="#0e0e1a" stroke="#73daca"><title>br ledger: ready, gates, holds</title></rect>
+<text x="350" y="275" fill="#c8d0e8" font-size="13" text-anchor="middle">br ledger</text><text x="350" y="293" fill="#7a83a3" font-size="11" text-anchor="middle">ready/gate/hold</text>
+<rect id="herdr" x="460" y="250" width="180" height="64" rx="8" fill="#0e0e1a" stroke="#e0af68"><title>herdr panes: prompt in, status out</title></rect>
+<text x="550" y="275" fill="#c8d0e8" font-size="13" text-anchor="middle">herdr panes</text><text x="550" y="293" fill="#7a83a3" font-size="11" text-anchor="middle">pi · omp · oc…</text>
+<rect id="human" x="700" y="250" width="160" height="64" rx="8" fill="none" stroke="#7a83a3" stroke-dasharray="4 4"><title>Human: no wake address without a live swarm</title></rect>
+<text x="780" y="275" fill="#7a83a3" font-size="13" text-anchor="middle">human / cron</text><text x="780" y="293" fill="#f7768e" font-size="11" text-anchor="middle">no address ✕</text>
+<line x1="130" y1="250" x2="350" y2="172" stroke="#7a83a3" stroke-width="1.5" marker-end="url(#a1)"><title>watch NDJSON pipe + inbox sweep</title></line>
+<line x1="550" y1="196" x2="550" y2="250" stroke="#0db9d7" stroke-width="2" marker-end="url(#a1)"><title>agent.prompt one [doorbell] line</title></line>
+<line x1="440" y1="168" x2="350" y2="168" stroke="#7a83a3" stroke-width="1.5" marker-end="url(#a1)"><title>claim-watch, flood guard, wave-gate share the tick</title></line>
+<text x="120" y="380" fill="#7a83a3" font-size="12">watch pipe + CLI inbox sweep (fragile seam C6) · prompt-only sink (C3) · spawn-registry identity (C2)</text>
+</svg>
+<p class="cap"><b>Read it as:</b> the red dashed boundary is the whole problem. Wake, dispatch, and journal share one process and one lifecycle, the only sink is <code>herdr agent.prompt</code>, and anything flywheel didn't spawn (humans, cron, services) has no address.</p>
+</section>
+
+<section>
+<h2><span class="n">D2 ·</span> After dataflow (plane D)</h2>
+<p class="q">What changes when the reducer stays and everything around it moves?</p>
+<svg viewBox="0 0 900 440" role="img" aria-label="To-be dataflow">
+<title>To-be: plane D center, subscribers around, toron/herdr/beads below</title>
+<defs><marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#0db9d7" stroke-width="1.5"/></marker></defs>
+<rect id="core" x="330" y="150" width="240" height="120" rx="10" fill="#1a1a3e" stroke="#0db9d7" stroke-width="2"><title>doorbell-daemon :18980 — doorbell-core pure reducer inside, journal + roster + /events SSE</title></rect>
+<text x="450" y="180" fill="#c8d0e8" font-size="15" text-anchor="middle">plane D :18980</text><text x="450" y="200" fill="#7a83a3" font-size="11.5" text-anchor="middle">core (pure) · daemon (effects)</text><text x="450" y="218" fill="#7a83a3" font-size="11.5" text-anchor="middle">journal · roster · /events SSE</text><text x="450" y="236" fill="#7a83a3" font-size="11.5" text-anchor="middle">why · digest · budget</text>
+<rect id="s-fw" x="60" y="40" width="150" height="56" rx="8" fill="#0e0e1a" stroke="#bb9af7"><title>flywheel: first subscriber, proxy CLI</title></rect>
+<text x="135" y="63" fill="#c8d0e8" font-size="13" text-anchor="middle">flywheel</text><text x="135" y="80" fill="#7a83a3" font-size="11" text-anchor="middle">subscriber 1</text>
+<rect id="s-cron" x="375" y="40" width="150" height="56" rx="8" fill="#0e0e1a" stroke="#bb9af7"><title>cron ticks subscribe</title></rect>
+<text x="450" y="63" fill="#c8d0e8" font-size="13" text-anchor="middle">cron</text><text x="450" y="80" fill="#7a83a3" font-size="11" text-anchor="middle">ticks</text>
+<rect id="s-human" x="690" y="40" width="150" height="56" rx="8" fill="#0e0e1a" stroke="#73daca"><title>human digest + morning briefing</title></rect>
+<text x="765" y="63" fill="#c8d0e8" font-size="13" text-anchor="middle">human</text><text x="765" y="80" fill="#7a83a3" font-size="11" text-anchor="middle">digest</text>
+<rect id="s-ci" x="60" y="160" width="150" height="56" rx="8" fill="#0e0e1a" stroke="#bb9af7"><title>CI and services via webhook sink</title></rect>
+<text x="135" y="183" fill="#c8d0e8" font-size="13" text-anchor="middle">CI / services</text><text x="135" y="200" fill="#7a83a3" font-size="11" text-anchor="middle">webhook</text>
+<rect id="s-br" x="690" y="160" width="150" height="56" rx="8" fill="#0e0e1a" stroke="#bb9af7"><title>br holds + wave-gate as wake rules</title></rect>
+<text x="765" y="183" fill="#c8d0e8" font-size="13" text-anchor="middle">br holds</text><text x="765" y="200" fill="#7a83a3" font-size="11" text-anchor="middle">SLA rules</text>
+<rect id="d-toron" x="180" y="330" width="150" height="56" rx="8" fill="#0e0e1a" stroke="#73daca"><title>toron consumed, never hosting D</title></rect>
+<text x="255" y="353" fill="#c8d0e8" font-size="13" text-anchor="middle">toron :18080</text><text x="255" y="370" fill="#7a83a3" font-size="11" text-anchor="middle">bus · mail · receipts</text>
+<rect id="d-herdr" x="375" y="330" width="150" height="56" rx="8" fill="#0e0e1a" stroke="#e0af68"><title>herdr: one sink among many</title></rect>
+<text x="450" y="353" fill="#c8d0e8" font-size="13" text-anchor="middle">herdr</text><text x="450" y="370" fill="#7a83a3" font-size="11" text-anchor="middle">prompt sink</text>
+<rect id="d-beads" x="570" y="330" width="150" height="56" rx="8" fill="#0e0e1a" stroke="#73daca"><title>br stays the ledger, D subscribes to its events</title></rect>
+<text x="645" y="353" fill="#c8d0e8" font-size="13" text-anchor="middle">br</text><text x="645" y="370" fill="#7a83a3" font-size="11" text-anchor="middle">ledger (stays)</text>
+<line x1="135" y1="96" x2="330" y2="160" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a2)"><title>subscribe: wake+digest+why</title></line>
+<line x1="450" y1="96" x2="450" y2="150" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a2)"/>
+<line x1="765" y1="96" x2="570" y2="160" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a2)"/>
+<line x1="210" y1="188" x2="330" y2="200" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a2)"/>
+<line x1="690" y1="188" x2="570" y2="200" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a2)"/>
+<line x1="380" y1="270" x2="300" y2="330" stroke="#7a83a3" stroke-width="1.5" marker-end="url(#a2)"><title>D consumes toron; never lives in it</title></line>
+<line x1="450" y1="270" x2="450" y2="330" stroke="#7a83a3" stroke-width="1.5"/>
+<line x1="520" y1="270" x2="600" y2="330" stroke="#7a83a3" stroke-width="1.5"/>
+<text x="450" y="420" fill="#7a83a3" font-size="12">one wire: UDS+NDJSON same-host · HTTP/SSE remote · CLI stays human-only</text>
+</svg>
+<p class="cap"><b>Read it as:</b> D is the hub, not another spoke. Flywheel becomes subscriber one with a proxy CLI. Toron, herdr, and br drop below the line as consumed infrastructure. New sinks are effect-layer adapters; the reducer never changes.</p>
+</section>
+
+<section>
+<h2><span class="n">D3 ·</span> Arrival handshake (discovery without introduction)</h2>
+<p class="q">How do two harnesses learn each other when nobody mentions anyone?</p>
+<svg viewBox="0 0 900 330" role="img" aria-label="Arrival handshake sequence">
+<title>Arrival triple: presence plus role bind plus channel join, roster rides digest</title>
+<defs><marker id="a3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#0db9d7" stroke-width="1.5"/></marker></defs>
+<text x="110" y="24" fill="#c8d0e8" font-size="13" text-anchor="middle">new pane Q</text>
+<text x="360" y="24" fill="#c8d0e8" font-size="13" text-anchor="middle">plane D</text>
+<text x="580" y="24" fill="#c8d0e8" font-size="13" text-anchor="middle">toron</text>
+<text x="780" y="24" fill="#c8d0e8" font-size="13" text-anchor="middle">member P</text>
+<line x1="110" y1="32" x2="110" y2="310" stroke="#23233a"/><line x1="360" y1="32" x2="360" y2="310" stroke="#23233a"/><line x1="580" y1="32" x2="580" y2="310" stroke="#23233a"/><line x1="780" y1="32" x2="780" y2="310" stroke="#23233a"/>
+<line x1="110" y1="60" x2="360" y2="60" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a3)"><title>1 arrive: spawn writes mail_identity, pane boots peer-aware</title></line>
+<text x="235" y="52" fill="#7a83a3" font-size="11.5" text-anchor="middle">1 · arrive</text>
+<line x1="360" y1="110" x2="580" y2="110" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a3)"><title>2 arrival triple: presence working, role pin reviewer=Q (30013), channel join</title></line>
+<text x="470" y="102" fill="#7a83a3" font-size="11.5" text-anchor="middle">2 · triple: presence + role + join</text>
+<line x1="580" y1="160" x2="780" y2="160" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a3)"><title>3 join event 39002 rings existing members</title></line>
+<text x="680" y="152" fill="#7a83a3" font-size="11.5" text-anchor="middle">3 · 39002 ring</text>
+<line x1="360" y1="215" x2="780" y2="215" stroke="#73daca" stroke-width="1.5" marker-end="url(#a3)"><title>4 next digest carries roster header with Q</title></line>
+<text x="570" y="207" fill="#7a83a3" font-size="11.5" text-anchor="middle">4 · digest + roster(Q: omp/reviewer/working)</text>
+<line x1="780" y1="265" x2="580" y2="265" stroke="#bb9af7" stroke-width="1.5" marker-end="url(#a3)"><title>5 P contacts role:reviewer, never learning the pin from a human</title></line>
+<text x="680" y="257" fill="#7a83a3" font-size="11.5" text-anchor="middle">5 · P → role:reviewer</text>
+</svg>
+<p class="cap"><b>Read it as:</b> arrival <b>is</b> the handshake. No bind means no arrival (unbound panes are invisible by construction). The operator transcript contains zero pin mentions in E2.</p>
+</section>
+
+<section>
+<h2><span class="n">D4 ·</span> Wake delivery ladder (one wake, every outcome)</h2>
+<p class="q">What happens to a single addressed wake from ring to silence?</p>
+<svg viewBox="0 0 900 300" role="img" aria-label="Wake delivery ladder">
+<title>Classify, budget-gate, inject or queue, heard or re-ring 90s x3 then audit</title>
+<defs><marker id="a4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#0db9d7" stroke-width="1.5"/></marker></defs>
+<rect id="w-ring" x="20" y="110" width="130" height="60" rx="8" fill="#1a1a3e" stroke="#0db9d7"><title>classify: 5 classes, presence and chatter never ring</title></rect>
+<text x="85" y="135" fill="#c8d0e8" font-size="12.5" text-anchor="middle">ring: 5 classes</text><text x="85" y="152" fill="#7a83a3" font-size="11" text-anchor="middle">chatter ✕</text>
+<rect id="w-budget" x="180" y="110" width="130" height="60" rx="8" fill="#1a1a3e" stroke="#e0af68"><title>budget gate 5/30/3: 4th prompt in window drops to digest</title></rect>
+<text x="245" y="135" fill="#c8d0e8" font-size="12.5" text-anchor="middle">budget 5/30/3</text><text x="245" y="152" fill="#7a83a3" font-size="11" text-anchor="middle">4th drops</text>
+<rect id="w-state" x="340" y="110" width="130" height="60" rx="8" fill="#1a1a3e" stroke="#bb9af7"><title>idle/done/blocked injects; working queues LWW; urgent skips</title></rect>
+<text x="405" y="135" fill="#c8d0e8" font-size="12.5" text-anchor="middle">idle? queue?</text><text x="405" y="152" fill="#7a83a3" font-size="11" text-anchor="middle">urgent skips</text>
+<rect id="w-prompt" x="500" y="110" width="130" height="60" rx="8" fill="#1a1a3e" stroke="#0db9d7"><title>one [doorbell] line with Pull hint, never the body</title></rect>
+<text x="565" y="135" fill="#c8d0e8" font-size="12.5" text-anchor="middle">1 × [doorbell]</text><text x="565" y="152" fill="#7a83a3" font-size="11" text-anchor="middle">Pull hint</text>
+<rect id="w-heard" x="660" y="60" width="110" height="52" rx="8" fill="#0e0e1a" stroke="#73daca"><title>heard within 120s: presence working or one kind-9 line</title></rect>
+<text x="715" y="82" fill="#73daca" font-size="12.5" text-anchor="middle">heard ≤120s</text><text x="715" y="99" fill="#7a83a3" font-size="11" text-anchor="middle">done ✓</text>
+<rect id="w-re" x="660" y="170" width="110" height="52" rx="8" fill="#0e0e1a" stroke="#e0af68"><title>re-ring 90s grace, max 3, then audit digest, never a 4th prompt</title></rect>
+<text x="715" y="192" fill="#e0af68" font-size="12.5" text-anchor="middle">90s × 3</text><text x="715" y="209" fill="#7a83a3" font-size="11" text-anchor="middle">then audit</text>
+<line x1="150" y1="140" x2="180" y2="140" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a4)"/>
+<line x1="310" y1="140" x2="340" y2="140" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a4)"/>
+<line x1="470" y1="140" x2="500" y2="140" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a4)"/>
+<line x1="630" y1="130" x2="660" y2="95" stroke="#0db9d7" stroke-width="1.5" marker-end="url(#a4)"/>
+<line x1="630" y1="150" x2="660" y2="190" stroke="#e0af68" stroke-width="1.5" marker-end="url(#a4)"/>
+<text x="450" y="260" fill="#7a83a3" font-size="12">every edge journaled → why replays msg / state-delta / Cmd (E8)</text>
+</svg>
+<p class="cap"><b>Read it as:</b> five gates, each with a number. The ladder is identical as-is and after; what changes is who can stand at each end of it.</p>
+</section>
+
+<section>
+<h2><span class="n">E ·</span> Live e2e scenario catalog</h2>
+<p class="q">Which scenarios prove the migration, and which are impossible without it?</p>
+<div class="legend"><span><span class="sw" style="background:var(--mint)"></span>runs on both</span><span><span class="sw" style="background:var(--amber)"></span>after-only (impossible as-is)</span></div>
+<table>
+<tr><th>ID</th><th>Scenario</th><th>As-is</th><th>After (plane D)</th><th>Pass signal</th></tr>
+<tr><td>E1</td><td>Arrival handshake, one harness</td><td class="pass">mail_identity + inject + dispatcher start</td><td class="pass">plus arrival triple; roster shows P in one sweep</td><td class="pass">roster row; why replays triple</td></tr>
+<tr><td>E2</td><td>Discovery without introduction</td><td class="dead">Q silent to P unless addressed</td><td class="pass">P's digest carries Q; P uses role:reviewer</td><td class="pass">zero pin mentions in transcript</td></tr>
+<tr><td>E3</td><td>Idle wake delivery</td><td class="pass">one [doorbell] line, heard ≤120s</td><td class="pass">identical</td><td class="pass">one prompt; journal effect row</td></tr>
+<tr><td>E4</td><td>Working pane queues + drains</td><td class="pass">zero prompts; LWW; one inject on idle</td><td class="pass">identical</td><td class="pass">no prompt while working; exactly one on drain</td></tr>
+<tr><td>E5</td><td>Urgent skips queue</td><td class="pass">immediate inject + digest record</td><td class="pass">identical</td><td class="pass">latency &lt; one sweep interval</td></tr>
+<tr><td>E6</td><td>Budget exhaustion (4 rapid posts)</td><td class="pass">3 prompts; 4th to digest</td><td class="pass">identical</td><td class="pass">exactly 3 prompts in window</td></tr>
+<tr><td>E7</td><td>Deaf pin</td><td class="pass">90s × 3, then audit digest</td><td class="pass">identical</td><td class="pass">3 attempts; audit row; no 4th prompt</td></tr>
+<tr><td>E8</td><td>why-fold replay</td><td class="pass">msg/delta/Cmd triple, equality asserted</td><td class="pass">identical, cross-subscriber</td><td class="pass">exit 0, triple complete</td></tr>
+<tr><td class="gap">E9</td><td>Cross-project unblock</td><td class="dead">silence until human/poll notices</td><td class="pass">waiter re-ringed on foreign close</td><td class="pass">one wake within one sweep; no swarm needed</td></tr>
+<tr><td class="gap">E10</td><td>Hold expiry, no swarm</td><td class="dead">nothing fires</td><td class="pass">expiry wake + digest entry</td><td class="pass">fires with zero flywheel process</td></tr>
+<tr><td class="gap">E11</td><td>Kill swarm, wake survives</td><td class="dead">doorbell dies with kill</td><td class="pass">daemon green, digests flow</td><td class="pass">E3 re-run succeeds post-kill</td></tr>
+<tr><td class="gap">E12</td><td>Crash-resume at-least-once</td><td class="dead">N/A (dies with parent)</td><td class="pass">pending wakes re-fire within budget</td><td class="pass">no loss; no budget breach</td></tr>
+</table>
+<p class="cap"><b>Read it as:</b> E3–E8 prove nothing broke (parity gate for Phase 1). E9–E12 prove the migration was worth doing. Full procedures live in ADR-0012 §11.</p>
+</section>
+
+<footer>Source of truth: <code>docs/decisions/0012-doorbell-plane-independent-runtime.md</code> · diagram files traced: <code>src/workspace.rs:1290</code> <code>src/doorbell.rs:41,75,225,1245</code> <code>src/main.rs:9615,10392</code> · status: Proposed 2026-09-09</footer>
+</body>
+</html>

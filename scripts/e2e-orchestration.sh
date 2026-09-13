@@ -9,6 +9,12 @@
 # Requirements: flywheel (current build), herdr server up, br on PATH,
 # Resonate server up (com.flywheel.resonate), toron daemon up.
 #
+# Every spawn passes --yes: this is a HEADLESS gate, so it must never enter
+# the pre-spawn model reconfirm (bd-ll3k), which is TTY-only — run from a
+# terminal it blocks on the prompt, and with output redirected it dies
+# `flywheel: IO error: not a terminal`, leaving no swarm and every scenario
+# failing for an unrelated reason.
+#
 # Usage: scripts/e2e-orchestration.sh [--only <n>]
 # Exit 0 = all green; 1 = any FAIL.
 set -u
@@ -83,9 +89,9 @@ wait_until() {
 scenario_1_loop_orphans() { # bd-bvwf.1
   say "--- scenario 1: LOOP-ORPHANS (spawn 3x --retire-orphans -> ONE workspace)"
   scratch s1 || { fail "S1 setup"; return; }
-  "$FW" spawn "$PROJ" --oc 1 --no-verify --no-focus >/dev/null 2>&1 || { fail "S1 spawn1"; return; }
-  "$FW" spawn "$PROJ" --oc 1 --label osc-s2 --retire-orphans --no-verify --no-focus >/dev/null 2>&1 || { fail "S1 spawn2"; return; }
-  "$FW" spawn "$PROJ" --oc 1 --label osc-s3 --retire-orphans --no-verify --no-focus >/dev/null 2>&1 || { fail "S1 spawn3"; return; }
+  "$FW" spawn "$PROJ" --oc 1 --yes --no-verify --no-focus >/dev/null 2>&1 || { fail "S1 spawn1"; return; }
+  "$FW" spawn "$PROJ" --oc 1 --label osc-s2 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1 || { fail "S1 spawn2"; return; }
+  "$FW" spawn "$PROJ" --oc 1 --label osc-s3 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1 || { fail "S1 spawn3"; return; }
   local n
   # the surviving workspace may carry the LAST spawn's label (osc-s3); count
   # every workspace whose label is one of this project's spawns (the gate:
@@ -105,7 +111,7 @@ scenario_2_loop_fresh_detection() { # bd-bvwf.2
   say "--- scenario 2: LOOP-FRESH-DETECTION (fresh spawn -> ready bead dispatches <=90s)"
   scratch s2 || { fail "S2 setup"; return; }
   bead "fresh-detection" "Create done-fresh.txt containing ok, then br sync + commit." "test -f done-fresh.txt"
-  "$FW" spawn "$PROJ" --oc 1 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
+  "$FW" spawn "$PROJ" --oc 1 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1
   # spawn-verify: wait for the agent to be DETECTED (herdr classifies the
   # fresh pane) before the loop's first poll — the loop must then dispatch
   # the ready bead on the active cadence (bd-bvwf.2: no first-poll stall)
@@ -137,7 +143,7 @@ scenario_3_loop_chain() { # bd-bvwf.3
   (cd "$SCRATCH" && br update "$A" --verify 'test -f done-a.txt' >/dev/null 2>&1)
   (cd "$SCRATCH" && br update "$B" --verify 'test -f done-b.txt' >/dev/null 2>&1)
   (cd "$SCRATCH" && br dep add "$B" "$A" >/dev/null 2>&1)
-  "$FW" spawn "$PROJ" --oc 2 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
+  "$FW" spawn "$PROJ" --oc 2 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1
   # spawn-verify (same as S2): the chain loop must not strand A on the
   # first poll before the fresh agents are detected (bd-bvwf.2/3)
   if ! wait_until "agents detected" 45 bash -c "herdr agent list 2>/dev/null | grep -c '$(basename "$PROJ")' | grep -qE '[1-9]'"; then
@@ -162,7 +168,7 @@ print(sum(1 for i in arr if i.get(\"status\")==\"closed\"))' | grep -q '^2$'"; t
 scenario_4_loop_singleton() { # bd-bvwf.4
   say "--- scenario 4: LOOP-SINGLETON (second loop refuses)"
   scratch s4 || { fail "S4 setup"; return; }
-  "$FW" spawn "$PROJ" --oc 1 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
+  "$FW" spawn "$PROJ" --oc 1 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1
   nohup "$FW" loop run "$PROJ" --work --interval-active 15 >"$SCRATCH/loop4a.log" 2>&1 &
   local LPID=$!
   sleep 3
@@ -180,7 +186,7 @@ scenario_5_loop_unknown() { # bd-bvwf.5
   say "--- scenario 5: LOOP-UNKNOWN (working agent polling unknown 1-2 polls NOT respawned)"
   scratch s5 || { fail "S5 setup"; return; }
   bead "unknown-gate" "Create done-unknown.txt with ok, close." "test -f done-unknown.txt"
-  "$FW" spawn "$PROJ" --oc 1 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
+  "$FW" spawn "$PROJ" --oc 1 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1
   nohup "$FW" loop run "$PROJ" --work --interval-active 10 --force >"$SCRATCH/loop5.log" 2>&1 &
   local LPID=$!
   sleep 30
@@ -203,7 +209,7 @@ scenario_6_crew_execution() { # bd-efk1
   for i in 1 2 3; do
     scratch s6 || { ok=0; break; }
     bead "crew-exec-$i" "Create done-ce$i.txt with ok, close." "test -f done-ce$i.txt"
-    "$FW" spawn "$PROJ" --oc 1 --retire-orphans --no-verify --no-focus >/dev/null 2>&1
+    "$FW" spawn "$PROJ" --oc 1 --retire-orphans --yes --no-verify --no-focus >/dev/null 2>&1
     if ! wait_until "agent detected" 45 bash -c "herdr agent list 2>/dev/null | grep -q '$(basename "$PROJ")'"; then
       fail "S6 round $i: agent not detected"; ok=0; "$FW" kill "$PROJ" --force >/dev/null 2>&1; continue
     fi
@@ -329,7 +335,7 @@ scenario_13_profile_spawn() { # never --oc when --profile
   say "--- scenario 13: SPAWN --profile coder (not --oc)"
   scratch s13 || { fail "S13 setup"; return; }
   # launch_pending may make spawn exit 1 (swarm not ready). Pane must still exist.
-  "$FW" spawn "$PROJ" --profile coder --settle-secs 0 --no-verify --no-focus --retire-orphans >/dev/null 2>&1 || true
+  "$FW" spawn "$PROJ" --profile coder --settle-secs 0 --yes --no-verify --no-focus --retire-orphans >/dev/null 2>&1 || true
   local st
   st=$("$FW" status 2>/dev/null)
   if echo "$st" | grep -q coder && ! echo "$st" | grep -qE '"name": "flywheel-.*-oc"'; then

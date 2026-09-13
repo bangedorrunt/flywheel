@@ -66,19 +66,25 @@ fwenv() {
     FLYWHEEL_MAIL_NAME=e2e-planner "$@"
 }
 
-# create a P3 bead with a VERIFY fence; returns (base dir, bead id, sha)
+# create a DISPATCHABLE P3 bead; returns (base dir, bead id, sha, created_by)
+#
+# VERIFY goes in br's own `--verify` column, NOT a `## VERIFY` fence in the
+# description. br 0.4.x has a real --verify flag, the column is what
+# `__loop-run-verify` reads, and the fence populates nothing: the loop
+# classified every bead `non-runnable` with `"verify": ""`, skipped the
+# receipt, and the stage that hoped to author a valid VERIFY could only ever
+# assert against an empty one.
 bead() {
   local base="$1" tag="$2" verify="$3" with_commit="${4:-0}"
   local id
   id=$(cd "$base/proj" && br create --title "$tag" --slug "$tag" -p 3 \
-    -d "work
-
-## VERIFY
-\`\`\`
-$verify
-\`\`\`" --json 2>/dev/null | jq -r .id)
+    -d "work" --verify "$verify" --json 2>/dev/null | jq -r .id)
   local created_by
-  created_by=$(cd "$base/proj" && br show "$id" --json 2>/dev/null | jq -r '.[0].created_by')
+  # br 0.4.x `br show --json` is a FLAT object (no list wrapper): `.[0]` is
+  # null, so the old accessor silently yielded an empty name and stage 1's
+  # "exactly one mail" assertion compared against nobody.
+  created_by=$(cd "$base/proj" && br show "$id" --json 2>/dev/null \
+    | jq -r '(if type=="array" then .[0] else . end).created_by // empty')
   fwenv "$base" "$FW" mail register "$base/proj" --name e2e-planner >/dev/null 2>&1
   fwenv "$base" "$FW" mail register "$base/proj" --name "$created_by" >/dev/null 2>&1
   local sha=""
@@ -97,14 +103,35 @@ mail_count() {
 }
 
 status() {
-  ( cd "$1" && br show "$2" --json 2>/dev/null | jq -r '.[0].status' )
+  # flat object, same as above — `.[0].status` returned empty, which made
+  # "status back to open" / "stays closed" fail against nothing.
+  ( cd "$1" && br show "$2" --json 2>/dev/null \
+    | jq -r '(if type=="array" then .[0] else . end).status // empty' )
+}
+
+# br 0.4.x refuses a commit-less close (ADR-0001 §5.3: --commit-sha is required
+# and its message must cite the bead id, which bead()'s commit does). A bare
+# `br close --reason` now fails validation and leaves the bead OPEN, so a
+# "stays closed" or "reopen" assertion would silently test the wrong state.
+# Assert the close landed instead of trusting it did.
+close_legal() { # close_legal <base> <id> <sha> <reason>
+  ( cd "$1/proj" && br close "$2" --commit-sha "$3" --reason "$4" >/dev/null 2>&1 )
+  local st; st=$(status "$1/proj" "$2")
+  [ "$st" = "closed" ] || fail "close($2) did not land — status is '$st', not closed"
 }
 
 # ---- stage 1: RED no-commit -------------------------------------------------
 say "stage 1/5: red-nocommit — no gate row + no commit -> reopen + one mail"
 B=$(scratch red-nocommit)
 IFS='|' read -r BASE ID SHA BY < <(bead "$B" red-nocommit 'test -f README.md' 0)
-( cd "$BASE/proj" && br close "$ID" --reason "worker says done" >/dev/null 2>&1 )
+# The "worker closed with no evidence" shape can only be produced by an
+# operator bypass now — a commit-less close is rejected. Without the bypass the
+# close failed validation, the bead never left `open`, and stage 1's reopen
+# assertions passed against a bead that was never closed.
+( cd "$BASE/proj" && BR_OPERATOR=1 br close "$ID" --bypass-policy \
+  --bypass-reason "e2e stage 1: simulate a worker close with no evidence" >/dev/null 2>&1 )
+[ "$(status "$BASE/proj" "$ID")" = "closed" ] && pass "closed with no evidence (operator bypass)" \
+  || fail "stage 1 close did not land — status $(status "$BASE/proj" "$ID")"
 S=$(fwenv "$BASE" "$FW" __close-check "$BASE/proj" "$ID" 2>/dev/null | jq -r .status)
 [ "$S" = "no-commit" ] && pass "close-check -> no-commit" || fail "close-check: got $S"
 R=$(fwenv "$BASE" "$FW" __reopen-bead "$BASE/proj" "$ID" "" 2>/dev/null)
@@ -118,7 +145,7 @@ rm -rf "$BASE" 2>/dev/null || true
 say "stage 2/5: green-legal — commit + gate row (after close) -> stays closed"
 B=$(scratch green-legal)
 IFS='|' read -r BASE ID SHA BY < <(bead "$B" green-legal 'test -f README.md' 1)
-( cd "$BASE/proj" && br close "$ID" --reason "worker done" >/dev/null 2>&1 )
+close_legal "$BASE" "$ID" "$SHA" "worker done"
 fwenv "$BASE" "$FW" __loop-run-verify "$BASE/proj" "$ID" --sha "$SHA" >/dev/null 2>&1
 ( cd "$BASE/proj" && br gate report "$ID" --gate command-verified \
   --provider flywheel-toron-loop1 --status pass \
@@ -133,7 +160,7 @@ rm -rf "$BASE" 2>/dev/null || true
 say "stage 3/5: loop-verify-pos — cheap band executes, verified close stays closed"
 B=$(scratch loop-verify-pos)
 IFS='|' read -r BASE ID SHA BY < <(bead "$B" loop-verify-pos 'test -f README.md' 1)
-( cd "$BASE/proj" && br close "$ID" --reason "worker done" >/dev/null 2>&1 )
+close_legal "$BASE" "$ID" "$SHA" "worker done"
 L=$(fwenv "$BASE" "$FW" __loop-run-verify "$BASE/proj" "$ID" --sha "$SHA" --timeout-secs 30 2>/dev/null)
 [ "$(echo "$L" | jq -r .band)" = "loop-runnable" ] && pass "classified loop-runnable" || fail "band: $L"
 [ "$(echo "$L" | jq -r .exit)" = "0" ] && pass "verify exit 0" || fail "exit: $L"
@@ -148,7 +175,7 @@ rm -rf "$BASE" 2>/dev/null || true
 say "stage 4/5: loop-verify-neg — failing VERIFY -> marker -> reopen"
 B=$(scratch loop-verify-neg)
 IFS='|' read -r BASE ID SHA BY < <(bead "$B" loop-verify-neg 'test -f NO_SUCH_FILE_9cf0' 1)
-( cd "$BASE/proj" && br close "$ID" --reason "worker done" >/dev/null 2>&1 )
+close_legal "$BASE" "$ID" "$SHA" "worker done"
 L=$(fwenv "$BASE" "$FW" __loop-run-verify "$BASE/proj" "$ID" --sha "$SHA" 2>/dev/null)
 [ "$(echo "$L" | jq -r .exit)" = "1" ] && pass "verify exit non-zero" || fail "exit: $L"
 [ -f "$BASE/proj/.flywheel/loop-run-verify-failed/$ID-$SHA" ] && pass "failed-head marker written" || fail "marker missing"
