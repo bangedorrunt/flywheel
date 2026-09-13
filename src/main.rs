@@ -1844,6 +1844,13 @@ enum DoorbellCmd {
         /// sink: herdr (default), webhook, dm (endpoint binds at the adapter)
         #[arg(long, default_value = "herdr")]
         sink: String,
+        /// where this row's wake lands (bd-8ulu): the webhook endpoint URL,
+        /// e.g. `http://127.0.0.1:18999/wake`. Per-row, so two subscribers
+        /// can target two endpoints. The host must be on the daemon's
+        /// `DOORBELL_WEBHOOK_ALLOWLIST` or the daemon never registers it
+        /// (the wake then stays digest-visible).
+        #[arg(long)]
+        url: Option<String>,
         /// extra workspaces for an explicit cross-workspace scope
         /// (repeatable; operator-only)
         #[arg(long)]
@@ -4782,9 +4789,18 @@ fn main() {
                 workspace,
                 pin,
                 sink,
+                url,
                 extra,
                 project,
-            } => cmd_doorbell_subscribe(&cfg, workspace, pin, sink, extra, project.as_deref()),
+            } => cmd_doorbell_subscribe(
+                &cfg,
+                workspace,
+                pin,
+                sink,
+                url.as_deref(),
+                extra,
+                project.as_deref(),
+            ),
             DoorbellCmd::Subscriptions {} => cmd_doorbell_subscriptions(&cfg),
             DoorbellCmd::Unsubscribe { id } => cmd_doorbell_unsubscribe(&cfg, id),
         },
@@ -10797,6 +10813,7 @@ fn cmd_doorbell_subscribe(
     workspace: &str,
     pin: &str,
     sink: &str,
+    url: Option<&str>,
     extra: &[String],
     project: Option<&str>,
 ) -> Result<()> {
@@ -10828,6 +10845,13 @@ fn cmd_doorbell_subscribe(
     } else {
         Actor::local_process()
     };
+    // bd-8ulu: the endpoint is the row's destination, so a webhook row
+    // without one is stored as-is (the daemon then registers nothing and the
+    // wake stays digest-visible) — never silently pointed at a default host.
+    let endpoint = url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string);
     let sub = Subscription {
         id: format!("cli-{workspace}-{pin}"),
         identity: Identity::Pin(pin.to_string()),
@@ -10839,6 +10863,7 @@ fn cmd_doorbell_subscribe(
         sink: kind,
         budget: Budget::default_530(),
         project: project.map(|s| s.to_string()),
+        endpoint,
     };
     let mut store = SubscriptionStore::open(&config::state_dir());
     match store.subscribe(actor, sub, workspace) {

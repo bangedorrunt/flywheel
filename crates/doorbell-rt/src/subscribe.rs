@@ -84,6 +84,24 @@ pub enum SinkKind {
     Dm,
 }
 
+impl SinkKind {
+    /// The name this kind's adapter is registered under in a
+    /// [`crate::sinks::SinkManager`].
+    ///
+    /// One mapping (bd-8ulu): the subscription row's `sink` is what routes a
+    /// wake, and the manager keys adapters by name — if those two spellings
+    /// ever diverged, a subscribed wake would be sent to a sink nobody
+    /// registered and the send would report success anyway.
+    #[must_use]
+    pub fn sink_name(self) -> &'static str {
+        match self {
+            Self::Herdr => "herdr",
+            Self::Webhook => "webhook",
+            Self::Dm => "dm",
+        }
+    }
+}
+
 /// Per-subscription budget override (5/30/3 when absent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Budget {
@@ -119,6 +137,32 @@ pub struct Subscription {
     /// NAME — legacy rows without a project are never guessed into a host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Where THIS row's wake lands (bd-8ulu), for sinks that are an
+    /// endpoint rather than a pane: the webhook URL. Per-row, not
+    /// per-daemon — identity x scope x sink x endpoint is the whole point
+    /// of the row, and two subscribers routinely target two endpoints.
+    /// Absent for `herdr` (the pane registry is the destination) and for a
+    /// legacy row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+impl Subscription {
+    /// The adapter name a wake through this row must be sent to.
+    ///
+    /// bd-8ulu: an endpoint-carrying row gets an adapter OF ITS OWN, named
+    /// by its endpoint, so two webhook subscribers can point at two
+    /// destinations. Everything else (herdr, dm, a webhook row that never
+    /// named a URL) keeps the bare [`SinkKind::sink_name`].
+    #[must_use]
+    pub fn route_name(&self) -> String {
+        match (&self.sink, &self.endpoint) {
+            (SinkKind::Webhook, Some(url)) if !url.trim().is_empty() => {
+                format!("webhook:{}", url.trim())
+            }
+            (kind, _) => kind.sink_name().to_string(),
+        }
+    }
 }
 
 /// The actor attempting a verb.
@@ -249,6 +293,26 @@ impl SubscriptionStore {
 
 #[cfg(test)]
 mod tests {
+    /// bd-8ulu: the name a subscription's `sink` routes to IS the name the
+    /// manager registers, in one place. A divergence would send a subscribed
+    /// wake to a sink nobody registered (and the send reports success anyway).
+    #[test]
+    fn sink_names_are_distinct_and_non_empty() {
+        let names: Vec<&str> = [SinkKind::Herdr, SinkKind::Webhook, SinkKind::Dm]
+            .into_iter()
+            .map(SinkKind::sink_name)
+            .collect();
+        assert_eq!(names, vec!["herdr", "webhook", "dm"]);
+        for n in &names {
+            assert!(!n.is_empty());
+            assert_eq!(*n, n.to_ascii_lowercase());
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "sink names must be distinct");
+    }
+
     use super::*;
 
     fn sub() -> Subscription {
@@ -260,7 +324,37 @@ mod tests {
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
             project: None,
+            endpoint: None,
         }
+    }
+
+    /// bd-8ulu: the route a row names. Only an endpoint-carrying webhook row
+    /// gets an adapter of its own; everything else keeps the bare sink name
+    /// (so no pre-existing routing changes spelling).
+    #[test]
+    fn route_name_is_per_endpoint_only_for_webhook() {
+        let herdr = sub();
+        assert_eq!(herdr.route_name(), "herdr");
+        let mut dm = sub();
+        dm.sink = SinkKind::Dm;
+        dm.endpoint = Some("https://ignored.example/x".into());
+        assert_eq!(dm.route_name(), "dm", "only webhook binds an endpoint");
+        let mut bare = sub();
+        bare.sink = SinkKind::Webhook;
+        assert_eq!(bare.route_name(), "webhook", "no URL = the default name");
+        bare.endpoint = Some("   ".into());
+        assert_eq!(bare.route_name(), "webhook", "blank URL is no URL");
+        let mut hook = sub();
+        hook.sink = SinkKind::Webhook;
+        hook.endpoint = Some(" http://127.0.0.1:18999/wake ".into());
+        assert_eq!(hook.route_name(), "webhook:http://127.0.0.1:18999/wake");
+        let mut other = hook.clone();
+        other.endpoint = Some("http://127.0.0.1:19000/wake".into());
+        assert_ne!(
+            hook.route_name(),
+            other.route_name(),
+            "two subscribers must be able to target two endpoints"
+        );
     }
 
     #[test]

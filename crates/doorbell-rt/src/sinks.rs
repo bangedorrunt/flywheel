@@ -88,6 +88,15 @@ impl SinkManager {
         }
     }
 
+    /// Is an adapter registered under this name?
+    ///
+    /// bd-8ulu: a wake routed to a name nobody registered would be absorbed
+    /// by nobody, so the brain must not count it as a route.
+    #[must_use]
+    pub fn has(&self, name: &str) -> bool {
+        self.sinks.contains_key(name)
+    }
+
     /// Register a sink adapter; spawns its supervised worker. The sink
     /// cannot be restarted after an endpoint failure (see
     /// [`Self::add_sink_with_factory`] for supervised registration).
@@ -474,6 +483,14 @@ impl PromptSink for CliPromptSink {
     }
 }
 
+/// Operator-approved egress hosts, comma/space separated. Absent = empty
+/// allowlist = no webhook endpoint ever registers (fail-closed).
+///
+/// The daemon is launched by launchd/systemd, so an operator surface has to
+/// be an env var it can carry in the unit — same shape as
+/// `DOORBELL_TORON_BIN`/`DOORBELL_HERDR_BIN`.
+pub const EGRESS_ALLOWLIST_ENV: &str = "DOORBELL_WEBHOOK_ALLOWLIST";
+
 /// Operator-approved egress hosts (D6 threat table: attention metadata
 /// must not exfiltrate). Exact host or `.suffix` match, lowercase.
 #[derive(Debug, Clone, Default)]
@@ -482,6 +499,19 @@ pub struct EgressAllowlist {
 }
 
 impl EgressAllowlist {
+    /// Read the operator's allowlist from the environment (bd-8ulu).
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::new(
+            std::env::var(EGRESS_ALLOWLIST_ENV)
+                .unwrap_or_default()
+                .split([',', ' ', ';', '\n'])
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string),
+        )
+    }
+
     pub fn new(hosts: impl IntoIterator<Item = String>) -> Self {
         Self {
             hosts: hosts
@@ -514,9 +544,40 @@ fn url_host(url: &str) -> String {
 /// Hand-rolled POST (one route, no dependency); blocking per-sink worker
 /// isolates slow endpoints from the brain (E15).
 pub struct WebhookSink {
-    url: String,
+    /// Parsed once at construction — the send path never re-parses the URL.
+    host: String,
+    port: u16,
+    path: String,
     full_line: bool,
     timeout: std::time::Duration,
+}
+
+/// `(host, port, path)` from an explicit-scheme URL.
+///
+/// Phase 2 speaks plain http (TLS terminates at the operator's edge, see
+/// [`WebhookSink::post`]), so the port must come from the URL: an `https://`
+/// endpoint still dials the port written here rather than being silently
+/// rewritten to 443 and 80. Returns `None` for a host-less or port-less
+/// malformed URL so [`WebhookSink::new`] can fail closed instead of dialling
+/// something the operator did not write (bd-8ulu: the old send path hardcoded
+/// port 80 and path `/`, so no real endpoint could be reached at all).
+fn url_host_port_path(url: &str) -> Option<(String, u16, String)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
+    let authority = authority.split(['?', '#']).next().unwrap_or("");
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()?),
+        None => (authority, 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_lowercase(), port, path))
 }
 
 impl WebhookSink {
@@ -530,8 +591,13 @@ impl WebhookSink {
         if !allowlist.allows(&url) {
             anyhow::bail!("webhook host not allowlisted: {url}");
         }
+        let Some((host, port, path)) = url_host_port_path(&url) else {
+            anyhow::bail!("webhook url needs a scheme and a host: {url}");
+        };
         Ok(Self {
-            url,
+            host,
+            port,
+            path,
             full_line,
             timeout: std::time::Duration::from_secs(10),
         })
@@ -558,11 +624,14 @@ impl WebhookSink {
 
     fn post(&self, body: &str) -> anyhow::Result<()> {
         use std::io::{Read, Write};
-        let host = url_host(&self.url);
+        let host = self.host.as_str();
+        let authority = if self.port == 80 {
+            host.to_string()
+        } else {
+            format!("{host}:{}", self.port)
+        };
         let mut stream = std::net::TcpStream::connect_timeout(
-            &format!("{host}:80")
-                .parse()
-                .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            &authority.parse().map_err(|e| anyhow::anyhow!("{e:?}"))?,
             self.timeout,
         )?;
         // Only plain-http loopback/allowlisted hosts in Phase 2 (TLS via
@@ -571,7 +640,8 @@ impl WebhookSink {
         stream.set_read_timeout(Some(self.timeout))?;
         write!(
             stream,
-            "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST {} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.path,
             body.len()
         )?;
         let mut resp = [0u8; 12];
@@ -770,6 +840,64 @@ mod tests {
             undelivered.iter().any(|u| u.line == "held"),
             "held intent returns for journaling, got {undelivered:?}"
         );
+    }
+
+    /// bd-8ulu: the send path must honour the URL's port and path. It used to
+    /// hardcode `Host: {host}` against port 80 and `POST / HTTP/1.1`, so no
+    /// real endpoint (which is almost never root-path on 80) could be reached
+    /// and the operator's URL was silently only a host.
+    #[test]
+    fn webhook_url_parses_port_and_path() {
+        assert_eq!(
+            url_host_port_path("http://127.0.0.1:18999/wake"),
+            Some(("127.0.0.1".to_string(), 18999, "/wake".to_string()))
+        );
+        assert_eq!(
+            url_host_port_path("http://hooks.internal"),
+            Some(("hooks.internal".to_string(), 80, "/".to_string()))
+        );
+        assert_eq!(
+            url_host_port_path("https://ops.example:8443/a/b"),
+            Some(("ops.example".to_string(), 8443, "/a/b".to_string())),
+            "an https URL keeps the written port (TLS terminates at the edge)"
+        );
+        // Malformed is refused rather than guessed at.
+        assert_eq!(url_host_port_path("hooks.internal:18999/wake"), None);
+        assert_eq!(url_host_port_path("http://"), None);
+        assert_eq!(url_host_port_path("http://h:notaport/"), None);
+    }
+
+    #[test]
+    fn webhook_sink_refuses_malformed_and_unallowlisted_urls() {
+        let allow = EgressAllowlist::new(["127.0.0.1".to_string()]);
+        assert!(WebhookSink::new("http://127.0.0.1:18999/wake", &allow, false).is_ok());
+        assert!(
+            WebhookSink::new("http://elsewhere.example:9/w", &allow, false).is_err(),
+            "an unallowlisted host is refused at construction"
+        );
+        assert!(
+            WebhookSink::new("127.0.0.1:18999/wake", &allow, false).is_err(),
+            "a schemeless URL is malformed, not a host:port"
+        );
+    }
+
+    /// `has` gates the brain's route test, so it must answer for exactly the
+    /// names `add_sink*` registered.
+    #[test]
+    fn manager_reports_registered_sinks() {
+        let (deg_tx, _deg_rx) = mpsc::channel(16);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut mgr = SinkManager::new(deg_tx);
+            assert!(!mgr.has("webhook"), "nothing registered yet");
+            let (sink, _sent) = MockSink::new();
+            mgr.add_sink("webhook", Box::new(sink));
+            assert!(mgr.has("webhook"));
+            assert!(!mgr.has("dm"));
+        });
     }
 
     #[test]

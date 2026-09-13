@@ -73,8 +73,44 @@ the pin. That blindness predates this change and covers the daemon's whole
 inbox path, not just pane-less pins; it is filed separately.
 
 To get an actual **prompt** for such a pin you need a real pane to route to
-(bind a subscription to a spawned pin) — or the non-herdr sinks (webhook/DM)
-that Phase 2 specifies. Until then, digest is the delivery.
+(bind a subscription to a spawned pin) — or a webhook subscription (below),
+which gives a pane-less pin a real destination. Otherwise digest is the
+delivery.
+
+## Waking a human with zero swarm (webhook sink)
+
+The herdr sink needs a pane, and a human operator pin normally has none. Point
+the subscription at an HTTP endpoint instead — the endpoint *is* the human:
+
+```bash
+export DOORBELL_WEBHOOK_ALLOWLIST=127.0.0.1   # the daemon's egress allowlist (D6)
+flywheel doorbell subscribe --workspace w1 --pin OperatorPin \
+  --sink webhook --url http://127.0.0.1:18999/wake --project myproj
+doorbell restart        # the adapter registers at host start
+```
+
+What each part buys:
+
+- **The endpoint is per-row** (identity × scope × sink × endpoint), so two
+  subscribers can target two endpoints; the workspace's `main_sink` stays the
+  fallback for every pin no row names.
+- **The URL's port and path are used verbatim** — `http://host:18999/wake`
+  dials 18999 and `POST /wake` (Phase 2 speaks plain HTTP; TLS terminates at
+  your edge, so an `https://` URL still dials the port you wrote).
+- **The host must be on the allowlist.** Without it the daemon registers
+  nothing and says so at start:
+  `webhook subscription <id> (<pin>) host not on DOORBELL_WEBHOOK_ALLOWLIST:
+  refused (D6 egress), its wakes stay digest-visible`. That is the
+  fail-closed direction: a wake with no destination is never reported
+  delivered.
+- **Digest is a batching route** — the default is 10 lines or 300s, so expect a
+  single wake to arrive as one `POST` within five minutes, not instantly. A
+  pane-less pin's wake is digest-bound by design (there is no pane to prompt).
+
+Verify the live chain end to end with `bash scripts/e2e-doorbell-webhook.sh`:
+it stands up a receiver, hosts a workspace whose only pin is subscribed but
+pane-less, and asserts the `POST` arrives on the URL's own port and path with
+the pin named — then that an off-allowlist endpoint receives nothing.
 
 So when `why` says nothing about a pin, ask in this order: is the daemon
 hosting (`/health`), can it exec its CLIs (`/health.binaries`), is the pin
@@ -187,6 +223,7 @@ serve/migrate/ping).
 | Direct ring | `flywheel doorbell inject <project> <pin> "<line>"` (ratcheted, budgeted, digest-visible) |
 | Subscriptions | `flywheel doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair; omitted = never auto-hosted) |
 | Cross-workspace | `flywheel doorbell subscribe --workspace wA --pin P --extra wB` (scope printed, never implicit) |
+| Human wake (no pane) | `flywheel doorbell subscribe --sink webhook --url http://host:port/path` + `DOORBELL_WEBHOOK_ALLOWLIST=host` on the daemon (see above) |
 | Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded` |
 
 Cross-project wake is a captain hold: `br hold --kind captain --corr external:<proj>:<bead> <your-bead>` rings once when the foreign bead closes; you still resolve the hold.

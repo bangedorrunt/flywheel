@@ -49,6 +49,37 @@ async fn host_workspace(
         Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
         move || Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
     );
+    // bd-8ulu: a durable human wake with zero swarm needs somewhere to land.
+    // The pane registry is not an option for a human pin, so register the
+    // webhook adapters this workspace's rows justify — one per distinct
+    // endpoint, allowlist-gated. A row that cannot be honoured registers
+    // nothing and is named LOUDLY here: silence would look like a delivered
+    // wake while the digest quietly absorbs it.
+    let allowlist = doorbell_rt::sinks::EgressAllowlist::from_env();
+    let (hook_regs, refused) = webhook_registrations(
+        &doorbell_rt::subscribe::SubscriptionStore::open(&fw_state).list(),
+        &workspace,
+        &allowlist,
+    );
+    for line in &refused {
+        eprintln!("doorbell serve: {project}/{workspace} — {line}");
+    }
+    for reg in hook_regs {
+        match doorbell_rt::sinks::WebhookSink::new(reg.url.clone(), &allowlist, false) {
+            Ok(hook) => {
+                sinks.add_sink(reg.route.clone(), Box::new(hook));
+                eprintln!(
+                    "doorbell serve: hosted loop {project}/{workspace} — registered {} (endpoint {})",
+                    reg.route, reg.url
+                );
+            }
+            Err(e) => eprintln!(
+                "doorbell serve: {project}/{workspace} — {} NOT registered: {e}; its wakes \
+                 stay digest-visible",
+                reg.route
+            ),
+        }
+    }
     let store = FileStore::new(fw_state);
     // Watch child (CLI; the in-process bus needs toron-core, which the
     // lean daemon never links). Backoff + retry gate live in the host.
@@ -184,6 +215,71 @@ fn subscribed_keys(subs: &[doorbell_rt::subscribe::Subscription]) -> Vec<String>
         }
     }
     out
+}
+
+/// One webhook adapter a hosted workspace must register (bd-8ulu).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebhookReg {
+    /// Adapter name the wake routes to (`webhook:<url>`).
+    route: String,
+    url: String,
+}
+
+/// bd-8ulu: which webhook adapters this workspace's subscription rows
+/// justify. Pure over `(rows, allowlist)` so the decision is testable
+/// without a runtime, a socket, or a daemon.
+///
+/// Returns `(registrations, refusals)`. `refusals` are operator-facing lines,
+/// not errors: a row that cannot be honoured registers NOTHING and its wake
+/// stays digest-visible — the fail-closed direction (bd-bk9t's rule: never
+/// manufacture a `Delivered` receipt for a wake nobody received).
+fn webhook_registrations(
+    subs: &[doorbell_rt::subscribe::Subscription],
+    workspace: &str,
+    allowlist: &doorbell_rt::sinks::EgressAllowlist,
+) -> (Vec<WebhookReg>, Vec<String>) {
+    use doorbell_rt::subscribe::{Identity, SinkKind};
+    let mut regs: Vec<WebhookReg> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    for sub in subs {
+        if sub.sink != SinkKind::Webhook || !sub.scope.workspaces().iter().any(|w| w == workspace) {
+            continue;
+        }
+        let who = match &sub.identity {
+            Identity::Pin(p) => p.clone(),
+            other => other.tag(),
+        };
+        let Some(url) = sub
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        else {
+            refused.push(format!(
+                "webhook subscription {} ({who}) names no --url: nothing registered, \
+                 its wakes stay digest-visible",
+                sub.id
+            ));
+            continue;
+        };
+        if !allowlist.allows(url) {
+            refused.push(format!(
+                "webhook subscription {} ({who}) host not on {}: refused (D6 egress), \
+                 its wakes stay digest-visible",
+                sub.id,
+                doorbell_rt::sinks::EGRESS_ALLOWLIST_ENV
+            ));
+            continue;
+        }
+        let route = sub.route_name();
+        if !regs.iter().any(|r| r.route == route) {
+            regs.push(WebhookReg {
+                route,
+                url: url.to_string(),
+            });
+        }
+    }
+    (regs, refused)
 }
 
 /// (project, workspace) pairs named by subscriptions but not yet hosted.
@@ -1231,6 +1327,7 @@ mod tests {
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
             project: Some("proj".into()),
+            endpoint: None,
         };
         let live = super::subscribed_keys(&[named]);
         assert_eq!(live, vec!["proj/w".to_string()]);
@@ -1290,6 +1387,7 @@ mod tests {
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
             project: Some("proj".into()),
+            endpoint: None,
         };
         let legacy = Subscription {
             project: None,
@@ -1351,6 +1449,7 @@ mod tests {
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
             project: Some("proj".into()),
+            endpoint: None,
         };
         let cli = spawn("cli-w-p", "w");
         let rows = vec![
@@ -1368,6 +1467,100 @@ mod tests {
             reap_candidates(&rows, aged),
             vec!["spawn-old-p".to_string()]
         );
+    }
+
+    /// bd-8ulu: the daemon registers exactly the webhook adapters the
+    /// workspace's rows justify, and NOTHING for a row it cannot honour.
+    /// Registering a sink nobody's row names, or skipping a sink a row DOES
+    /// name, are both the same class of bug: a wake that reports delivered
+    /// and lands nowhere.
+    #[test]
+    fn reconcile_webhook_registrations_follow_the_rows_and_fail_closed() {
+        use doorbell_rt::sinks::EgressAllowlist;
+        use doorbell_rt::subscribe::*;
+        let allow = EgressAllowlist::new(["127.0.0.1".to_string()]);
+        let row = |id: &str, sink: SinkKind, url: Option<&str>, ws: &str| Subscription {
+            id: id.into(),
+            identity: Identity::Pin(format!("Pin-{id}")),
+            scope: Scope::One(ws.into()),
+            filter: Filter::default(),
+            sink,
+            budget: Budget::default_530(),
+            project: Some("proj".into()),
+            endpoint: url.map(str::to_string),
+        };
+        let named = row(
+            "a",
+            SinkKind::Webhook,
+            Some("http://127.0.0.1:18999/wake"),
+            "w",
+        );
+        let (regs, refused) = super::webhook_registrations(&[named.clone()], "w", &allow);
+        assert_eq!(
+            regs,
+            vec![super::WebhookReg {
+                route: "webhook:http://127.0.0.1:18999/wake".into(),
+                url: "http://127.0.0.1:18999/wake".into(),
+            }],
+            "a named, allowlisted endpoint registers under its row's route"
+        );
+        assert!(refused.is_empty(), "{refused:?}");
+
+        // Two rows, same endpoint -> ONE adapter (a second would be a
+        // duplicate worker for the same socket).
+        let (regs, _) = super::webhook_registrations(&[named.clone(), named.clone()], "w", &allow);
+        assert_eq!(regs.len(), 1, "distinct endpoints, not distinct rows");
+
+        // Two rows, two endpoints -> TWO adapters (that is the point of
+        // per-subscription routing).
+        let other = row(
+            "b",
+            SinkKind::Webhook,
+            Some("http://127.0.0.1:19000/wake"),
+            "w",
+        );
+        let (regs, _) = super::webhook_registrations(&[named.clone(), other], "w", &allow);
+        assert_eq!(regs.len(), 2, "per-subscription endpoints stay separate");
+
+        // A webhook row with no URL: refuse LOUDLY, register nothing.
+        let bare = row("c", SinkKind::Webhook, None, "w");
+        let (regs, refused) = super::webhook_registrations(&[bare], "w", &allow);
+        assert!(regs.is_empty(), "no URL means no adapter: {regs:?}");
+        assert_eq!(refused.len(), 1, "and it must be named: {refused:?}");
+        assert!(refused[0].contains("--url"), "{refused:?}");
+
+        // An off-allowlist endpoint: refused (D6 egress), nothing registered.
+        let evil = row(
+            "d",
+            SinkKind::Webhook,
+            Some("http://evil.example/wake"),
+            "w",
+        );
+        let (regs, refused) = super::webhook_registrations(&[evil], "w", &allow);
+        assert!(regs.is_empty(), "egress is allowlisted or absent: {regs:?}");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].contains(doorbell_rt::sinks::EGRESS_ALLOWLIST_ENV),
+            "the refusal names the operator knob: {refused:?}"
+        );
+
+        // Another workspace's rows are not this host's business, and a
+        // herdr row never becomes a webhook adapter.
+        let elsewhere = row(
+            "e",
+            SinkKind::Webhook,
+            Some("http://127.0.0.1:19100/wake"),
+            "other",
+        );
+        let herdr = row(
+            "f",
+            SinkKind::Herdr,
+            Some("http://127.0.0.1:19200/wake"),
+            "w",
+        );
+        let (regs, refused) = super::webhook_registrations(&[elsewhere, herdr], "w", &allow);
+        assert!(regs.is_empty(), "scope + sink kind both gate: {regs:?}");
+        assert!(refused.is_empty(), "neither is an error: {refused:?}");
     }
 
     /// The 2026-09-13 outage was invisible in the one place an operator

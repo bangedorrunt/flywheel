@@ -497,6 +497,7 @@ pub fn register_workspace_subscriptions(
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
             project: Some(project.to_string()),
+            endpoint: None,
         };
         if let Err(e) = store.subscribe(Actor::local_process(), sub, workspace) {
             eprintln!("flywheel: cannot record wake subscription for {pin}: {e:?}");
@@ -523,6 +524,7 @@ pub fn register_arrival_subscription(state_dir: &Path, project: &str, workspace:
         sink: SinkKind::Herdr,
         budget: Budget::default_530(),
         project: Some(project.to_string()),
+        endpoint: None,
     };
     if let Err(e) = store.subscribe(Actor::local_process(), sub, workspace) {
         eprintln!("flywheel: cannot record arrival wake subscription for {pin}: {e:?}");
@@ -3241,6 +3243,7 @@ mod tests {
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
             project: Some("proj".into()),
+            endpoint: None,
         };
         store
             .subscribe(Actor::local_process(), sub, ws)
