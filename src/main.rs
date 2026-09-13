@@ -10355,6 +10355,15 @@ fn cmd_doorbell_why(
                         doorbell_tick::DoorbellAction::Audit { kind, pin, detail } => {
                             workspace::Cmd::Audit { kind, pin, detail }
                         }
+                        // bd-bk9t: same data mapping as Cmd::from_doorbell —
+                        // the embedded digest is the audit surface.
+                        doorbell_tick::DoorbellAction::Digest { pin, line, why } => {
+                            workspace::Cmd::Audit {
+                                kind: "digest_bound".into(),
+                                pin,
+                                detail: format!("{why}: {line}"),
+                            }
+                        }
                     })
                     .collect()
             } else {
@@ -10815,7 +10824,7 @@ fn cmd_doorbell_digest(
             }
         }
     }
-    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     for (ws, entry) in &entries {
         if !doorbell::journal_version_accepted(entry) {
             continue;
@@ -10867,7 +10876,11 @@ fn cmd_doorbell_digest(
                     })
                     .unwrap_or_default()
             });
-        rows.push((ws.clone(), ts, stage, who));
+        // bd-bk9t: a digest-bound wake (a pane-less subscribed pin) has no
+        // prompt route, so its `Digest` action row IS the delivery. Without
+        // the line here the batch could only be read by grepping the journal.
+        let detail = digest_action_lines(entry).join(" | ");
+        rows.push((ws.clone(), ts, stage, who, detail));
     }
     let roster = digest_roster_lines(cfg, project, doorbell_now_unix());
     if format == "json" {
@@ -10877,8 +10890,8 @@ fn cmd_doorbell_digest(
                 "identity": identity,
                 "since": since,
                 "unanswered": unanswered.iter().collect::<Vec<_>>(),
-                "rows": rows.iter().map(|(ws, ts, stage, who)| {
-                    serde_json::json!({"workspace": ws, "ts": ts, "stage": stage, "who": who})
+                "rows": rows.iter().map(|(ws, ts, stage, who, detail)| {
+                    serde_json::json!({"workspace": ws, "ts": ts, "stage": stage, "who": who, "detail": detail})
                 }).collect::<Vec<_>>(),
                 "roster": roster,
             })
@@ -10898,14 +10911,68 @@ fn cmd_doorbell_digest(
     if rows.is_empty() {
         println!("doorbell digest: nothing queued");
     }
-    for (ws, ts, stage, who) in rows {
-        println!("{ts} {ws}/{stage} {who}");
+    for (ws, ts, stage, who, detail) in rows {
+        if detail.is_empty() {
+            println!("{ts} {ws}/{stage} {who}");
+        } else {
+            println!("{ts} {ws}/{stage} {who} — {detail}");
+        }
     }
     for line in roster {
         println!("{line}");
     }
     Ok(())
 }
+/// bd-bk9t: the wake lines of a journal row's `Digest` actions, in order.
+/// `route_or_queue` emits one per unroutable-pin wake, so a row can carry
+/// several; the caller joins them. Non-`Digest` actions are ignored.
+fn digest_action_lines(entry: &serde_json::Value) -> Vec<String> {
+    entry
+        .get("actions")
+        .and_then(|a| a.as_array())
+        .map(|actions| {
+            actions
+                .iter()
+                .filter_map(|a| {
+                    a.get("Digest")
+                        .and_then(|d| d.get("line"))
+                        .and_then(|l| l.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod bk9t_digest_line_tests {
+    use super::digest_action_lines;
+
+    #[test]
+    fn reads_only_digest_lines_in_order() {
+        let entry = serde_json::json!({
+            "actions": [
+                {"Audit": {"kind": "queued", "pin": "OtherPin", "detail": "x"}},
+                {"Digest": {"pin": "OperatorPin", "line": "[doorbell] plane-P urgent", "why": "no_route"}},
+                {"FetchInbox": 0},
+                {"Digest": {"pin": "OperatorPin", "line": "[doorbell] channel", "why": "no_route"}},
+            ]
+        });
+        assert_eq!(
+            digest_action_lines(&entry),
+            vec!["[doorbell] plane-P urgent", "[doorbell] channel"],
+            "a digest-bound wake must be readable from the row, in order"
+        );
+    }
+
+    #[test]
+    fn rows_without_a_digest_action_are_empty() {
+        let entry = serde_json::json!({"actions": ["FetchInbox"]});
+        assert!(digest_action_lines(&entry).is_empty());
+        assert!(digest_action_lines(&serde_json::json!({})).is_empty());
+    }
+}
+
 fn why_entry_mentions_pin(pin: &str, msg: &workspace::Msg, cmds: &[workspace::Cmd]) -> bool {
     let cmd_hit = cmds.iter().any(|c| match c {
         workspace::Cmd::Prompt { pin: p, .. } => p == pin,

@@ -972,6 +972,15 @@ impl Cmd {
             crate::doorbell_tick::DoorbellAction::Audit { kind, pin, detail } => {
                 Self::Audit { kind, pin, detail }
             }
+            // bd-bk9t: a pane-less pin's wake has no prompt route. In this
+            // path the digest IS the audit surface — `classify_cmd` reads
+            // every Audit as CaptainRelevant and queues it for the batch —
+            // so the wake lands in the digest with the reason on the row.
+            crate::doorbell_tick::DoorbellAction::Digest { pin, line, why } => Self::Audit {
+                kind: "digest_bound".into(),
+                pin,
+                detail: format!("{why}: {line}"),
+            },
         }
     }
 
