@@ -18088,7 +18088,9 @@ fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
             // SHA rule first: no commit carries the bead id -> illegal
             // regardless of verdicts.
             let sha = verdict::derive_head_sha(&cwd, bead_id)?;
-            let mut bead = verdict::bead_from_br_show(&cwd, bead_id)?;
+            // Crediting a close is not dispatching: a triage bead has no
+            // VERIFY and its legal proof is a record review (bd-tfxv).
+            let mut bead = verdict::bead_from_br_show_for_close(&cwd, bead_id)?;
             bead.blast = match blast.as_str() {
                 "high" => verdict::Blast::High,
                 _ => verdict::Blast::Normal,

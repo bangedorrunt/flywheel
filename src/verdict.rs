@@ -537,6 +537,27 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
 /// caller supplies them (the loop derives blast from reservation overlap + AC
 /// shape at ready-parse).
 pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> {
+    load_bead(cwd, bead_id, /* require_verify */ true)
+}
+
+/// Close-crediting loader: identical to [`bead_from_br_show`] except that a
+/// bead with NO VERIFY is admissible.
+///
+/// Why this exists: `require_verify` is a DISPATCH precondition (nothing to
+/// run -> do not hand the bead to a worker), not a close precondition. A
+/// triage/dupe bead has no VERIFY by definition, and its legal proof is a
+/// record review (`triage-verified`) rather than a command. Applying the
+/// dispatch precondition while crediting a close made br's own refusal list
+/// uncreditable for exactly the bead class it names (bd-tfxv).
+///
+/// The empty VERIFY is safe here because `verify_is_loop_runnable("")` is
+/// false, so the bead lands in the non-runnable band where the legal-close
+/// table admits only record/independent proofs — never `CommandVerified`.
+pub fn bead_from_br_show_for_close(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> {
+    load_bead(cwd, bead_id, /* require_verify */ false)
+}
+
+fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<BeadUnit> {
     #[derive(Deserialize)]
     struct BrShow {
         id: String,
@@ -556,9 +577,14 @@ pub fn bead_from_br_show(cwd: &Path, bead_id: &str) -> anyhow::Result<BeadUnit> 
         v
     };
     let row: BrShow = serde_json::from_value(row_val)?;
-    let verify = row.verify.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-        anyhow::anyhow!("bead {bead_id}: missing/empty typed verify field — refuse to dispatch")
-    })?;
+    let verify = row.verify.filter(|s| !s.trim().is_empty());
+    let verify = match (verify, require_verify) {
+        (Some(v), _) => v,
+        (None, false) => String::new(),
+        (None, true) => {
+            anyhow::bail!("bead {bead_id}: missing/empty typed verify field — refuse to dispatch")
+        }
+    };
     Ok(BeadUnit {
         id: row.id,
         title: row.title,
@@ -1187,6 +1213,13 @@ mod tests {
     /// commit whose message carries the bead id (SHA rule). Returns
     /// `(dir, bead_id)`.
     fn scratch_workspace(tag: &str) -> (PathBuf, String) {
+        scratch_workspace_with_verify(tag, Some("cargo test -p flywheel verdict::"))
+    }
+
+    /// [`scratch_workspace`] with control over the bead's typed VERIFY —
+    /// `None` models a triage/dupe bead, whose legal close is a record review
+    /// and not a command (bd-tfxv).
+    fn scratch_workspace_with_verify(tag: &str, verify: Option<&str>) -> (PathBuf, String) {
         let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1211,20 +1244,22 @@ mod tests {
             "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n",
         )
         .unwrap();
+        let mut args: Vec<&str> = vec![
+            "create",
+            "--title",
+            "gate roundtrip",
+            "--slug",
+            "gate-rt-1",
+            "-p",
+            "3",
+            "-d",
+            "work",
+        ];
+        if let Some(v) = verify {
+            args.extend(["--verify", v]);
+        }
         let created = StdCommand::new("br")
-            .args([
-                "create",
-                "--title",
-                "gate roundtrip",
-                "--slug",
-                "gate-rt-1",
-                "-p",
-                "3",
-                "-d",
-                "work",
-                "--verify",
-                "cargo test -p flywheel verdict::",
-            ])
+            .args(&args)
             .current_dir(&dir)
             .output()
             .expect("br create");
@@ -1415,6 +1450,51 @@ mod tests {
                 "br gate {gate:?} has no flywheel VerdictKind"
             );
         }
+    }
+
+    /// The other half of bd-tfxv: a bead with NO VERIFY is a triage/dupe bead.
+    /// Its legal proof is a record review, not a command — so the CLOSE path
+    /// must be able to load it, while the DISPATCH path keeps demanding a
+    /// VERIFY. Before this, `flywheel ledger check` refused on
+    /// `missing/empty typed verify field — refuse to dispatch` and the
+    /// `triage-verified` row (the gate br itself names for this shape) could
+    /// never be credited.
+    #[test]
+    fn triage_bead_without_verify_credits_a_triage_verified_row() {
+        let (dir, bead_id) = scratch_workspace_with_verify("triage-close", None);
+        // Dispatch still refuses: no VERIFY, nothing to run, do not dispatch.
+        let err = bead_from_br_show(&dir, &bead_id).unwrap_err();
+        assert!(err.to_string().contains("refuse to dispatch"), "{err}");
+        // Close crediting loads it, and the empty VERIFY lands in the
+        // non-runnable band (nothing could have been run).
+        let bead = bead_from_br_show_for_close(&dir, &bead_id).unwrap();
+        assert_eq!(bead.priority, 3);
+        assert!(bead.verify.is_empty());
+        assert!(!verify_is_loop_runnable(&bead.verify));
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
+        let v = |kind| Verdict {
+            kind,
+            bead_id: bead_id.clone(),
+            sha: sha.clone(),
+            at: Utc::now(),
+            actor: AgentName::new("reviewer:QuietHeron"),
+            receipt_path: PathBuf::new(),
+            verify_cmd: String::new(),
+        };
+        for gate in ["triage-verified", "worker-receipt", "unit-test-verified"] {
+            let kind = VerdictKind::from_gate_name(gate).unwrap();
+            assert!(
+                legal_close(&v(kind), &bead, AcShape::Checkable),
+                "gate {gate:?} should credit a triage bead"
+            );
+        }
+        // Nothing could have been run, so a loop-run proof is a false verdict.
+        assert!(!legal_close(
+            &v(VerdictKind::CommandVerified),
+            &bead,
+            AcShape::Checkable
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ...and the parsed row must actually CLOSE the bead, not merely parse:
