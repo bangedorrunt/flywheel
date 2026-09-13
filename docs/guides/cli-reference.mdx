@@ -9,8 +9,8 @@ Conventions: `<p>` is the project slug. The full clap surface is `flywheel --hel
 |---|---|
 | `init` | Scaffold a project: dir + `.beads` + `.flywheel/stages.toml`, standing orders, `docs/learnings/` |
 | `arrive` | Session entry: helm drain, join-loud, doorbell, FCFS captain |
-| `briefing` | Observe + propose one topology; `--commit` runs the argv |
-| `decide` | The classifier leaf: one captain primitive per target, `--json` |
+| `briefing` | Observe + propose one topology; `--commit` runs the argv (`--yes` required non-TTY on spawn-class topologies — crew-confirm gate); names `role` |
+| `decide` | The classifier leaf: one captain primitive per target, `--json` (names `role`, read from the workflow's steps) |
 | `helm <p>` | Session-start drain: open decisions, unread status, divergence |
 | `preflight` | herdr socket, resonate, operator key, toron mail, standing orders |
 | `deps` | Environment + toolchain health; `--ensure` starts a down loopback resonate |
@@ -42,7 +42,7 @@ Conventions: `<p>` is the project slug. The full clap surface is `flywheel --hel
 | `artifacts` | Typed per-run records: `<run_id> [--json]`, `stitch <run_id>` |
 | `snapshot`, `checkpoint`, `resume`, `changes`, `timeline`, `audit`, `analytics`, `history` | Fleet state forensics |
 | `runs` | Runs dashboard: state, owner, per-run cost |
-| `profile`, `squad`, `model`, `slot`, `catalog`, `backend` | Identity and routing: profiles, squads (recipes/template aliases), model registry, routing slots, TUI catalog hub, backend selection |
+| `profile`, `squad`, `model`, `slot`, `catalog`, `backend` | Identity and routing: profiles, squads (recipes/template aliases), model registry, routing slots, TUI catalog hub, backend selection (`profile show` projects `fallback`/`model_fallback`; `subscribe --project` names the auto-host pair) |
 | `worktree` | git worktree swarms (never on loop-owned beads) |
 | `guards`, `policy`, `safety` | Active policy guards, destructive-command policy, posture |
 | `daemon`, `serve` | Daemon lifecycle over the REST + SSE surface |
@@ -51,7 +51,7 @@ Conventions: `<p>` is the project slug. The full clap surface is `flywheel --hel
 | `work` | bv/br pass-through work-graph surfaces |
 | `upgrade`, `tutorial` | Reinstall from source; interactive walkthrough |
 
-Rebuild after source changes: `mbx +nightly-aarch64-apple-darwin install --path . --force` (binary `~/.cargo/bin/flywheel`; re-sign only on stale-signature SIGKILL: `codesign --force --sign - ~/.cargo/bin/flywheel`).
+Rebuild after source changes: `mbx +nightly-aarch64-apple-darwin install --path . --force` plus `install --path crates/doorbell-cli --force` for the daemon (binary `~/.cargo/bin/{flywheel,doorbell}`; re-sign only on stale-signature SIGKILL: `codesign --force --sign -` both; reload the unit after `install`: `bootout` + `bootstrap`).
 
 ## Output contract
 

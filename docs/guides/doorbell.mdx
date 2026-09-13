@@ -26,6 +26,19 @@ sequenceDiagram
 - Journals (v2, rotated, seq-stamped) and subscriptions persist, so pending wakes survive crashes at-least-once.
 - `flywheel doorbell why <project> <pin> --seq <n> --corr <id>` folds the tick from default and explains a named wake.
 
+## Hosting (how a subscription becomes a wake)
+
+Subscriptions alone wake nothing — a hosted loop does. The daemon hosts a
+Brain loop per `(project, workspace)` from two sources: boot `--host p/w`
+pairs (baked into the launchd/systemd unit, so reboots keep them) and
+auto-host: every 60s the daemon hosts every subscribed pair it can name
+(lease-fenced — it never steals a live writer) and reaps spawn-scoped rows
+silent for 7 days. `standby` with zero subscriptions is the only quiet
+state; `standby_with_known_workspaces` is degraded and names the arming
+verb. `flywheel kill` drops its spawn's rows (lifecycle symmetry);
+operator rows outlive swarms. After `doorbell install`, reload the unit
+definition (`bootout` + `bootstrap`) or the reboot runs the old hosts.
+
 ## Commands
 
 | Need | Command |
@@ -34,9 +47,9 @@ sequenceDiagram
 | Why | `doorbell why <project> <pin> --seq <n> --corr <id>` |
 | History | `doorbell events`, `doorbell digest` |
 | Direct ring | `doorbell inject <project> <pin> "<line>"` (ratcheted, budgeted, digest-visible) |
-| Subscriptions | `doorbell subscribe\|subscriptions\|unsubscribe` |
+| Subscriptions | `doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair; omitted = never auto-hosted) |
 | Cross-workspace | `doorbell subscribe --workspace wA --pin P --extra wB` (scope printed, never implicit) |
-| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent) |
+| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `degraded` |
 
 Cross-project wake is a captain hold: `br hold --kind captain --corr external:<proj>:<bead> <your-bead>` rings once when the foreign bead closes; you still resolve the hold.
 
