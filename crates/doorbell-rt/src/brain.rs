@@ -64,6 +64,11 @@ pub struct Brain<H: Host> {
     /// Consecutive unanswered expiries per pin (S3 deaf digest names
     /// subscriber + attempts; corr binds in bd-asr2.11 with receipts).
     deaf_attempts: BTreeMap<String, u32>,
+    /// High-water of traced watch-dedup suppressions (bd-bpj1 F3): redelivered
+    /// lines repeat identically (observed 82x per line), so only a suppression
+    /// newer than every traced one earns a journal row — O(1) sampling that
+    /// keeps the journal bounded while staying answerable.
+    dedup_high_us: Option<i64>,
 }
 
 impl<H: Host> Brain<H> {
@@ -139,6 +144,7 @@ impl<H: Host> Brain<H> {
             sweep_last: None,
             next_seq,
             deaf_attempts: BTreeMap::new(),
+            dedup_high_us: None,
         }
     }
 
@@ -289,6 +295,29 @@ impl<H: Host> Brain<H> {
         if let Some(created_at) = doorbell_core::watch_created_at(&line) {
             let us = (created_at as i64) * 1_000_000;
             if self.wake.plane_s_cursor_us.is_some_and(|c| us <= c) {
+                // bd-bpj1 (F3): the drop leaves a trace — a silent dedup is
+                // indistinguishable from a lost event on later inspection.
+                // Bounded two ways: presence heartbeats (kind 20001, never
+                // ring) stay silent, and only a suppression newer than every
+                // traced one earns a row (redeliveries repeat identically).
+                *self
+                    .stats
+                    .rings_by_class
+                    .entry("watch_dedup".into())
+                    .or_default() += 1;
+                let ring_candidate = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("kind").and_then(|k| k.as_u64()))
+                    .is_none_or(|k| k != 20001);
+                if ring_candidate && self.dedup_high_us.is_none_or(|h| us > h) {
+                    self.dedup_high_us = Some(us);
+                    self.journal(
+                        &serde_json::json!({"rt_kind": "Watch"}),
+                        &[],
+                        serde_json::json!({"stage": "dedup", "cursor_us": us}),
+                        &[],
+                    );
+                }
                 return;
             }
             self.wake.plane_s_cursor_us =
@@ -444,7 +473,7 @@ impl<H: Host> Brain<H> {
         // stays the follow-up; this cuts the steady-state sweep to tick
         // plus presence when no inbox work is due.
         let fetched = if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
-            self.fetch_all_inbox()
+            self.fetch_all_inbox(now)
         } else {
             Vec::new()
         };
@@ -493,8 +522,10 @@ impl<H: Host> Brain<H> {
     // floor, never the sweep's wall-clock now (strict-newer-than-now is
     // empty forever and the cursor would never initialize — permanent
     // plane-P deafness for fresh spawns and post-state-loss restarts).
-    fn fetch_all_inbox(&self) -> Vec<(String, Vec<serde_json::Value>)> {
-        let floor = doorbell_core::redelivery_floor_rfc3339(self.host.now_unix());
+    // bd-bpj1 (F4): the floor derives from the sweep's `now`, never a fresh
+    // wall-clock read — the fetch window reproduces from the journaled Msg.
+    fn fetch_all_inbox(&self, now_unix: u64) -> Vec<(String, Vec<serde_json::Value>)> {
+        let floor = doorbell_core::redelivery_floor_rfc3339(now_unix);
         let mut fetched = Vec::new();
         for pin in self.host.pins() {
             let pin_since = self
@@ -529,7 +560,7 @@ impl<H: Host> Brain<H> {
         // Live AckSla arm also sweeps the inbox when tick asks for it.
         // F4: route fetched rows via on_inbox_fetched (was fire-and-drop).
         if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
-            for (pin, rows) in self.fetch_all_inbox() {
+            for (pin, rows) in self.fetch_all_inbox(now) {
                 self.on_inbox_fetched(pin, rows).await;
             }
         }
@@ -817,6 +848,30 @@ mod tests {
         // Intent was still journaled decided-before-delivery.
         let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
         assert!(journal.contains("\"stage\":\"decided\""), "{journal}");
+    }
+
+    #[tokio::test]
+    async fn watch_dedup_leaves_a_journal_trace() {
+        // bd-bpj1 (F3): a cursor-suppressed duplicate must read as
+        // suppressed on later inspection, never as lost — but identical
+        // redeliveries trace once (bounded sampling, O(1) state).
+        let (mut brain, _rx, _tx) = test_brain("dedup", vec![vec![], vec![], vec![]]);
+        brain
+            .dispatch(BrainMsg::Watch("{\"kind\":9,\"created_at\":100}".into()))
+            .await;
+        for ts in [90, 95, 95] {
+            brain
+                .dispatch(BrainMsg::Watch(
+                    format!("{{\"kind\":9,\"created_at\":{ts}}}").into(),
+                ))
+                .await;
+        }
+        let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        assert_eq!(
+            journal.matches("\"stage\":\"dedup\"").count(),
+            2,
+            "first 90 and 95 trace; the repeated 95 stays silent: {journal}"
+        );
     }
 
     #[tokio::test]
