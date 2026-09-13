@@ -10891,7 +10891,8 @@ mod timeout_presence_tests {
     fn presence_rows_keep_fresh_states_latest_wins() {
         let now = 1_000_000u64;
         let body = format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({"name": "ZebraPin", "state": "idle", "ts": now - 10}),
             serde_json::json!({"name": "BlueRidge", "state": "idle", "ts": now - 100}),
             serde_json::json!({"name": "BlueRidge", "state": "working", "ts": now - 5}),
             serde_json::json!({"name": "LilacChapel", "state": "working", "ts": now - 500}),
@@ -10899,8 +10900,11 @@ mod timeout_presence_tests {
         let rows = super::timeout_presence_rows(&body, now);
         assert_eq!(
             rows,
-            vec![("BlueRidge".to_string(), "working".to_string())],
-            "latest fresh row wins; stale rows drop: {rows:?}"
+            vec![
+                ("BlueRidge".to_string(), "working".to_string()),
+                ("ZebraPin".to_string(), "idle".to_string()),
+            ],
+            "latest fresh row wins; stale rows drop; pin order is deterministic (bd-bpj1 F2): {rows:?}"
         );
     }
 
@@ -10928,8 +10932,11 @@ mod timeout_presence_tests {
 /// row's `state` field (the Kind 20001 projection); rows without one default to
 /// `unknown`, which never prompts.
 fn timeout_presence_rows(body: &str, now: u64) -> Vec<(String, String)> {
-    let mut latest: std::collections::HashMap<String, (u64, String)> =
-        std::collections::HashMap::new();
+    // bd-bpj1 (F2): BTreeMap, never HashMap — row order feeds tick order
+    // feeds journal order, and identical runs must journal identically
+    // (the daemon side already uses BTreeMap).
+    let mut latest: std::collections::BTreeMap<String, (u64, String)> =
+        std::collections::BTreeMap::new();
     for line in body.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;

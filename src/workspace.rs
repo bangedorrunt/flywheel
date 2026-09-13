@@ -1792,6 +1792,10 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         }
         Msg::Receipt { corr, receipt } => {
             next.assignment.insert(corr.clone(), receipt.clone());
+            // bd-bpj1 (F1): the wait-list removal is owned here, not by the
+            // effect-layer drain — the full receipt transition (insert +
+            // unpark + upsert) reproduces from this one Msg on replay.
+            next.pending_wait.remove(corr);
             cmds.push(Cmd::SqliteUpsert {
                 corr: corr.clone(),
                 receipt: receipt.clone(),
@@ -2230,6 +2234,23 @@ mod tests {
             }
             other => panic!("expected SqliteUpsert got {:?}", other),
         }
+    }
+
+    #[test]
+    fn ws_model_receipt_unparks_the_wait() {
+        // bd-bpj1 (F1): the receipt transition owns the wait-list removal —
+        // the effect-layer drain must have nothing left to do.
+        let mut m = empty_model();
+        m.pending_wait.insert("c".into(), 999);
+        let (next, _) = tick(
+            &m,
+            &Msg::Receipt {
+                corr: "c".into(),
+                receipt: Receipt::default(),
+            },
+        );
+        assert!(!next.pending_wait.contains_key("c"));
+        assert!(next.assignment.contains_key("c"));
     }
 
     #[test]

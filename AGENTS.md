@@ -31,6 +31,7 @@ Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --
 - **Compound spine (ADR-0009):** `ce-*` stages, `compound` phase, per-project `docs/learnings/`; `p-code` aliases are retired (`ce-execute`, not `p6`).
 - **Preflight:** `steer`/`loop-mode run`/`workflow run --execute` auto-run prerequisite checks; `--skip-preflight` bypasses; standalone `flywheel preflight --mode {steer|loop|workflow|cron}`.
 - Wave/swarm/doorbell/crew-control semantics live in the flywheel skill; the Tick Law (`workspace::tick` owns the live path, slice reducers private) holds on every path touching `src/workspace.rs`.
+- **Tick Law is Elm law (bd-bpj1):** reducers (`workspace::tick`, `doorbell-core::tick`, `durable::tick`) are pure `(Model, Msg) -> (Model, Vec<Cmd>)` — no I/O, clock, rand, or `&mut` inside; `now` enters only as a Msg payload; maps iterated for output are `BTreeMap`, never `HashMap`; the effect layer never mutates the model, I/O results re-enter as Msgs; every drop is journaled (queue transitions, watch dedups). New reducer paths carry a same-log-same-effects test; `doorbell why` stays mismatch-free on current journals. Review rejects reducer bypasses, wall-clock reads, and silent drops.
 
 ## Public API
 - Keep the public API surface as small as possible. Use the narrowest visibility that satisfies the current requirement.
