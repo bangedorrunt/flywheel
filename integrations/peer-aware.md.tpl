@@ -24,7 +24,15 @@ BOOT: join lane channels first (`toron channel join <channel> --project <project
 
 On `[doorbell]`: 1. show you heard within 120s or you are unanswered: presence `working` or one kind-9 line. 2. Pull: `toron channel read` / `toron job list` / `toron mail inbox --since last` (since_ts high-water, never unread). 3. Act on URGENT and doorbell-named items (reply/ack plane P as required), escalate the rest via kind 9 or captain mail. 4. Acknowledge each ack-required message acted on. A duplicate ring is the same delivery, never second work.
 
-Verify-after-send: after any load-bearing post, one read-back (`--wait-ack 5`); delivery is claimed only after it is observed.
+ACK-DUTY (the delivery contract): the toron message IS the delivery, the `[doorbell]` line is only the wake. On a ring: `fetch_inbox` (or `toron mail inbox --since last`), process in rumor order, act, then `acknowledge_message` / `mark_message_read`. The ack is the handling fact -- an unacked corr re-rings on the ladder (one ring per grace window, then Dead->respawn / Unknown->digest).
+
+ID DISCIPLINE: the TASK-ID is routing metadata only, never the work order and never a `br show` argument. The work order is the BEAD id (bd-###) named in a BEAD line of your dispatch; with no BEAD line bound, do not act, ask the captain.
+
+ASK-USER AUTHORITY (worker never self-answer): a finding that asks the user a question is never answered by the worker that raised it. Reconstruct accepted intent from the brief (GOAL / SCOPE / ACCEPTANCE). RESTORATION -- an unambiguous restoration of accepted behavior, including hard but in-scope corrections -- may be auto-decided: Publish the corr (journaled) and proceed. EXPANSION (new guarantee, threat model, architecture, destructive, security): STOP, Publish the corr, park on WaitCorr, and escalate with five elements: (1) original criterion, (2) proposed expansion, (3) smallest compliant alternative, (4) accept-vs-decline consequences, (5) recommendation. Expansions stay human; the open call parks in OPEN DECISIONS until an answer/--verdict clears it. Worker-side auto-close of an ask-user finding is a LoudMiss, never a close.
+
+Verify-after-send: after any load-bearing post, one read-back (`--wait-ack 5`); delivery is claimed only after it is observed. One read-back, never a poll loop.
+
+WAKE VERBS (kind-9 is a wake log, not current state): post sparse verbs only -- `blocked: <what> [key=...]` / `paused: <which-human> <why>` / `needs-decision [key=...] <question>` / `resolved [key=...] <outcome>`. Never percent-done or activity prose ("working on X", "update:"). Current state = presence verdict + `br show`; the room carries wakes, not status.
 
 RED-SURFACE PING: if your work leaves the tree non-compiling, post one project-mail line (`<pin>: <path> red at <error> -- fixing by <time>`) within one poll cycle; re-ping while it stays red.
 
