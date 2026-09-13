@@ -13230,6 +13230,58 @@ mod tests {
         assert!(snapshot_due(false, true, 1));
     }
 
+    /// bd-lob1: the loop observes the open -> closed transition itself and
+    /// releases that bead's reservations.
+    ///
+    /// Why pin it: `docs/configuration.md` §6 listed this as "open automation
+    /// (follow-up beads, not this session)" long after it shipped, because
+    /// nothing in the code said so. The doctrine now says the loop does it, so
+    /// this test is what keeps that claim true — a refactor that drops the
+    /// release fails here instead of silently reinstating the doc's gap.
+    #[test]
+    fn close_path_releases_the_beads_reservations() {
+        let loop_path = include_str!("durable.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("non-test source");
+        // Slice the CLOSED-bead arm: from its match arm to the next top-level
+        // fn, so the assertion cannot be satisfied by the leaf definition or
+        // the executor registration seen earlier in the file.
+        let arm = loop_path
+            .split("ClaimWatchAction::ReleaseReservations { bead_id } => {")
+            .nth(1)
+            .expect("the closed-bead arm exists")
+            .split("\nfn ")
+            .next()
+            .expect("arm body");
+        assert!(
+            arm.contains("release_bead_locks"),
+            "the open->closed arm must release the bead's reservations (bd-lob1)"
+        );
+        // The leaf is the operator-signed door, and main.rs implements it via
+        // release_by_reason — not a per-holder release that would miss peers.
+        assert!(
+            loop_path.contains("\"__release-bead-locks\""),
+            "the leaf must call the __release-bead-locks door"
+        );
+        let main_src = include_str!("main.rs");
+        let handler = main_src
+            .split("fn cmd_internal_release_bead_locks")
+            .nth(1)
+            .expect("handler exists")
+            .split("\nfn ")
+            .next()
+            .expect("handler body");
+        assert!(
+            handler.contains("release_by_reason"),
+            "the door must release BY REASON (every holder), not one holder"
+        );
+        assert!(
+            handler.contains("orchestrator_mail_name"),
+            "release-by-reason is operator-signed; the loop must act in that context"
+        );
+    }
+
     /// Grep acceptance: the loop path (durable.rs + the __poll_events
     /// collector) contains no direct herdr_shim event construction — the
     /// event stream comes via the backend trait. The scan covers the
