@@ -340,6 +340,53 @@ fn herdr_agent_statuses(herdr_bin: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Pane ids from one `herdr pane list` (bd-adms). Pane EXISTENCE is a
+/// different question from injectability (bd-ba8t's `agent_status`): a pane
+/// can exist with no agent in it. An empty set means herdr did not answer
+/// (unknown binary, non-zero exit), and callers must treat that as "cannot
+/// tell" rather than "no panes exist".
+fn herdr_pane_ids(herdr_bin: &str) -> std::collections::BTreeSet<String> {
+    let out = run_cli(herdr_bin, &["pane", "list"], CLI_TIMEOUT_SECS);
+    let Some(out) = out else {
+        return std::collections::BTreeSet::new();
+    };
+    if !out.status.success() {
+        return std::collections::BTreeSet::new();
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let empty = Vec::new();
+    v.get("result")
+        .and_then(|r| r.get("panes"))
+        .and_then(|p| p.as_array())
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|p| {
+            p.get("pane_id")
+                .and_then(|i| i.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// `(pin, pane_id, herdr name)` — one spawn-registry row.
+type RegistryRow = (String, String, String);
+
+/// One stale-pin pass (bd-adms): `live` rows keep the sweep; `vanished` pins
+/// have no pane right now (they keep the digest route a pane-less pin gets,
+/// bd-bk9t); `reaped` is the subset past the grace window, which also leaves
+/// the sweep set.
+struct StaleReap {
+    live: Vec<RegistryRow>,
+    vanished: Vec<String>,
+    reaped: Vec<String>,
+}
+
+/// bd-adms: how long a registry pin's pane must be missing before the sweep
+/// stops fetching it. Long enough to cover a spawn race (the pane is created
+/// before the registry row is written, but herdr may brief us mid-flight),
+/// short enough that a dead fleet stops costing fetches.
+const STALE_PANE_GRACE_SECS: u64 = 120;
+
 /// Can the ring's LAST hop land here at all? (bd-ba8t)
 ///
 /// `should_inject` accepts only `idle|done|blocked`, and statuses arrive from
@@ -423,7 +470,18 @@ pub struct FileHost {
     targets: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
     /// npub cache for the index (whois on pin-set change + 60s TTL).
     npubs: BTreeMap<String, String>,
+    /// The pins actually swept. Excludes registry pins reaped as stale
+    /// (bd-adms); `index_pins_raw` keeps the unfiltered view so the index
+    /// change guard does not thrash.
     index_pins: Vec<String>,
+    /// Registry ∪ subscription pins, before stale reaping (bd-adms).
+    index_pins_raw: Vec<String>,
+    /// pin -> first second we saw its registry pane missing from
+    /// `herdr pane list` (bd-adms). RAM-only on purpose: a restart re-arms
+    /// the grace window instead of reaping on stale evidence.
+    stale_panes: BTreeMap<String, u64>,
+    /// Pins already audited as reaped, so the audit fires once per episode.
+    reaped_pins: Vec<String>,
     /// The subset of `index_pins` with no spawn-registry row, so no pane and
     /// no herdr target (bd-bk9t). Mirrored onto
     /// `reducer.model.unroutable`; kept here too so the index change guard
@@ -472,6 +530,9 @@ impl FileHost {
             targets: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             npubs: BTreeMap::new(),
             index_pins: Vec::new(),
+            index_pins_raw: Vec::new(),
+            stale_panes: BTreeMap::new(),
+            reaped_pins: Vec::new(),
             unroutable_pins: Vec::new(),
             index_refreshed_at: 0,
             retry: crate::policy::WatchRetry::default(),
@@ -556,6 +617,68 @@ impl FileHost {
             .collect()
     }
 
+    /// bd-adms: the spawn registry is not garbage-collected, so a fleet that
+    /// died leaves its pins behind forever. Live, three pins sat on `w11:*`
+    /// panes herdr had long GC'd: the sweep fetched three dead inboxes on
+    /// every tick, and when those fetches failed they wrote the
+    /// `inbox_error` stream that hid a real outage (gs-044). Subscriptions
+    /// gained a 7d reaper (bd-2o1v); this is the same belt for registry
+    /// rows — a pin whose pane is absent from `herdr pane list` past the
+    /// grace window drops out of the sweep set with ONE audit row naming it.
+    ///
+    /// Guards: an EMPTY pane list means herdr did not answer, so nothing is
+    /// reaped on a transient failure, and a pin whose pane reappears is
+    /// un-reaped. `/health.injection` still counts reaped pins (it reads the
+    /// raw registry), so the fault stays visible after it stops costing a
+    /// fetch per tick.
+    fn reap_stale_registry_pins(&mut self, rows: &[RegistryRow], now: u64) -> StaleReap {
+        let known = herdr_pane_ids(&self.cfg.herdr_bin);
+        if known.is_empty() {
+            return StaleReap {
+                live: rows.to_vec(),
+                vanished: Vec::new(),
+                reaped: Vec::new(),
+            };
+        }
+        let mut vanished: Vec<String> = Vec::new();
+        let mut reaped: Vec<String> = Vec::new();
+        for (pin, pane, _) in rows {
+            if !pane.is_empty() && known.contains(pane) {
+                self.stale_panes.remove(pin);
+                self.reaped_pins.retain(|p| p != pin);
+                continue;
+            }
+            vanished.push(pin.clone());
+            let since = *self.stale_panes.entry(pin.clone()).or_insert(now);
+            if now.saturating_sub(since) < STALE_PANE_GRACE_SECS {
+                continue;
+            }
+            reaped.push(pin.clone());
+            if !self.reaped_pins.contains(pin) {
+                self.audit_file(
+                    "registry_pin_stale",
+                    serde_json::json!({
+                        "pin": pin,
+                        "pane": pane,
+                        "workspace": self.cfg.workspace,
+                        "grace_s": STALE_PANE_GRACE_SECS,
+                        "why": "pane absent from `herdr pane list`; dropped from the sweep",
+                    }),
+                );
+                self.reaped_pins.push(pin.clone());
+            }
+        }
+        StaleReap {
+            live: rows
+                .iter()
+                .filter(|(pin, _, _)| !reaped.contains(pin))
+                .cloned()
+                .collect(),
+            vanished,
+            reaped,
+        }
+    }
+
     /// Refresh the reducer index when the pin set changes or the TTL
     /// lapses (mirrors the embedded 60s rule; whois failures keep None).
     fn refresh_index(&mut self) {
@@ -576,20 +699,40 @@ impl FileHost {
             }
         }
         let now = Self::now_unix();
-        if pins == self.index_pins
+        // Compared against the RAW view: reaped pins stay in `pins` here, so
+        // the guard does not thrash once a stale fleet is filtered out
+        // (bd-adms).
+        if pins == self.index_pins_raw
             && unroutable == self.unroutable_pins
             && now.saturating_sub(self.index_refreshed_at) < INDEX_TTL_SECS
         {
             return;
         }
-        self.panes = rows
+        // bd-adms: drop registry pins whose pane herdr no longer has, and
+        // treat a vanished pane like a subscription-only pin — no pane, no
+        // route, so its wake digests instead of parking in a queue nothing
+        // can drain.
+        let reap = self.reap_stale_registry_pins(&rows, now);
+        for pin in reap.vanished {
+            if !unroutable.contains(&pin) {
+                unroutable.push(pin);
+            }
+        }
+        let swept: Vec<String> = pins
+            .iter()
+            .filter(|p| !reap.reaped.contains(p))
+            .cloned()
+            .collect();
+        self.panes = reap
+            .live
             .iter()
             .map(|(pin, pane, _)| (pane.clone(), pin.clone()))
             .collect();
         if let Ok(mut targets) = self.targets.lock() {
             targets.clear();
             targets.extend(
-                rows.iter()
+                reap.live
+                    .iter()
                     .map(|(pin, _, name)| (pin.clone(), name.clone())),
             );
         }
@@ -613,7 +756,8 @@ impl FileHost {
         }
         self.reducer.model.unroutable = unroutable.iter().cloned().collect();
         self.unroutable_pins = unroutable;
-        self.index_pins = pins;
+        self.index_pins = swept;
+        self.index_pins_raw = pins;
         self.index_refreshed_at = now;
     }
 
@@ -1229,6 +1373,73 @@ mod tests {
             {"pane_id": "pane-a", "name": "herdr-a", "mail_identity": "PinA"},
             {"pane_id": "pane-b", "name": "herdr-b", "mail_identity": "PinB"}
         ])
+    }
+
+    /// bd-adms: the registry is not garbage-collected. Live, three pins sat
+    /// on `w11:*` panes herdr had long GC'd, so every tick fetched dead
+    /// inboxes (and their failed fetches wrote the `inbox_error` stream that
+    /// hid a real outage). A pin whose pane is gone must leave the sweep set
+    /// after the grace window, ONCE and visibly — and a pin whose pane is
+    /// present must never be touched.
+    #[test]
+    fn stale_registry_pins_leave_the_sweep_after_the_grace_window() {
+        let dir = tmp_state("reap");
+        std::fs::write(
+            dir.join("agents").join("proj.json"),
+            serde_json::to_string(&serde_json::json!([
+                {"pane_id": "w9:p1", "name": "herdr-a", "mail_identity": "LivePin"},
+                {"pane_id": "w11:p1", "name": "herdr-dead", "mail_identity": "DeadPin"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        // `herdr pane list` knows only w9:p1; `agent list` keeps w9:p1 idle so
+        // the live pin stays injectable.
+        let script = dir.join("herdr");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"pane\" ]; then echo '{\"result\":{\"panes\":[{\"pane_id\":\"w9:p1\"}]}}'; \
+             else echo '{\"result\":{\"agents\":[{\"pane_id\":\"w9:p1\",\"agent_status\":\"idle\"}]}}'; fi\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
+        cfg.toron_bin = "true".into();
+        cfg.herdr_bin = script.to_string_lossy().into_owned();
+        cfg.registry_file = Some(dir.join("agents").join("proj.json"));
+        let mut host = FileHost::new(cfg);
+        host.refresh_index();
+        assert_eq!(
+            host.pins(),
+            vec!["LivePin".to_string(), "DeadPin".to_string()],
+            "inside the grace window nothing is reaped"
+        );
+        // Push the grace window past STALE_PANE_GRACE_SECS and refresh again.
+        let birth = FileHost::now_unix();
+        host.stale_panes
+            .insert("DeadPin".to_string(), birth - STALE_PANE_GRACE_SECS - 1);
+        host.index_refreshed_at = birth - INDEX_TTL_SECS - 1;
+        host.refresh_index();
+        assert_eq!(
+            host.pins(),
+            vec!["LivePin".to_string()],
+            "the pin on a vanished pane leaves the sweep"
+        );
+        assert!(
+            host.reducer.model.unroutable.contains("DeadPin"),
+            "a vanished pane has no route, so its wake digests"
+        );
+        let audit = std::fs::read_to_string(dir.join("doorbell").join("w.audit.jsonl")).unwrap();
+        assert_eq!(
+            audit.matches("registry_pin_stale").count(),
+            1,
+            "one audit row, not one per tick: {audit}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-ba8t: `herdr agent list` returning no agents is the live condition
