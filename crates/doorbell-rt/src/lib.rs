@@ -19,11 +19,14 @@ pub mod sensors;
 pub mod sinks;
 pub mod store;
 pub mod subscribe;
+pub mod watchbeat;
 pub use api::{AskError, Ping, Stats, ask};
 pub use brain::{Brain, BrainConfig, RunReport};
+pub use doorbell_core::registry_key;
 pub use doorbell_core::{PinBudget, take_allowed, take_allowed_like};
 pub use file_host::{
-    FileHost, FileHostConfig, WATCH_KINDS, ensure_daemon_gen, registry_key, resolve_registry_file,
+    FileHost, FileHostConfig, WATCH_KINDS, ensure_daemon_gen, presence_path, resolve_registry_file,
+    toron_data_root,
 };
 pub use hear::HearTracker;
 pub use host::{CoreReducer, Effect, Host, MockHost};

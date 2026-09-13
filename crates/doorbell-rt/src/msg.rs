@@ -13,7 +13,7 @@ pub enum BrainMsg {
     /// Watch child died; supervisor must restart, never exit (GS-007).
     Died,
     /// 1s sweep beat (`since` RFC3339, `now` unix secs).
-    Sweep { since: String, now: u64 },
+    Sweep { now: u64 },
     /// Role bind drained from the pending queue (live, not snapshot).
     RoleBound { role: String, pin: String },
     /// Captain-bound fact drained live.

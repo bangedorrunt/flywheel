@@ -251,14 +251,9 @@ pub fn loops_dir() -> PathBuf {
 /// (mktemp-style scratch projects) would collapse every per-project sidecar
 /// onto `<abs-path>.json` (PathBuf::join discards the base) — they get a
 /// slug: base name + short hash of the full path (unique per project).
+/// Single owner lives in doorbell-core (bd-z5ou); this keeps the name.
 pub fn state_key(project: &str) -> String {
-    if project.contains('/') {
-        let base = project.rsplit('/').next().unwrap_or(project);
-        let h = fnv1a64(project);
-        format!("{base}-{:08x}", (h & 0xffff_ffff) as u32)
-    } else {
-        project.to_string()
-    }
+    doorbell_core::registry_key(project)
 }
 
 fn sidecar_file(project: &str) -> PathBuf {
@@ -1472,13 +1467,9 @@ pub fn find_last_sent<'a>(
 /// FNV-1a 64: a trivial, byte-stable hash. Chosen over
 /// `DefaultHasher` (not guaranteed stable across Rust releases — replay
 /// determinism requires identical bytes across process restarts).
+/// Single owner lives in doorbell-core (bd-z5ou); this keeps the name.
 pub fn fnv1a64(text: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in text.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    doorbell_core::fnv1a64(text)
 }
 
 /// Append one event to the project's JSONL log (creates dir/file on first use).

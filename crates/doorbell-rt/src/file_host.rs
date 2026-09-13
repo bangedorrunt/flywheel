@@ -13,8 +13,7 @@
 //! `doorbell-core` verbatim (via [`CoreReducer`]); the presence prompt
 //! filter mirrors `workspace::filter_prompts` (Idle keeps, Busy+urgent
 //! breaks through, else `prompt_filtered` Audit — same kind/pin/detail
-//! text); `FetchInbox` effects normalize to empty pin/since like the
-//! embedded advisory mapping. The former G1 gap (`scan_ack_sla` returned
+//! text); `FetchInbox` is a payload-free signal like the embedded mapping. The former G1 gap (`scan_ack_sla` returned
 //! empty for lack of a toron CLI verb) is closed: the daemon shells
 //! `toron ack-sla --project` and relays the expired ids (bd-0zcr.2).
 
@@ -32,22 +31,8 @@ pub const PRESENCE_FRESH_SECS: u64 = 30;
 /// Index rebuild cadence — mirrors the embedded 60s TTL + pin-set change.
 pub const INDEX_TTL_SECS: u64 = 60;
 
-/// Presence verdict subset the tick path stores (mirrors
-/// `workspace::Presence::from_str`: wire words only, never Dead).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pres {
-    Idle,
-    Busy,
-    Unknown,
-}
-
-fn pres_from_word(s: &str) -> Pres {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "working" | "busy" | "blocked" => Pres::Busy,
-        "idle" | "done" => Pres::Idle,
-        _ => Pres::Unknown,
-    }
-}
+/// Registry key + resolution live in core (bd-z5ou single owner).
+use doorbell_core::{PresenceVerdict, registry_key};
 
 /// Minimal generation record — same JSON shape as flywheel's
 /// `WatcherGen` (`started_unix`, `binary_mtime_unix`, `binary_len`,
@@ -239,33 +224,11 @@ pub fn presence_path(toron_data_root: &Path) -> PathBuf {
     toron_data_root.join("presence.jsonl")
 }
 
-/// fnv1a64 — mirrors flywheel `state::fnv1a64` for registry keys.
-fn fnv1a64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-/// Registry key — mirrors `state::state_key`: slash paths hash to
-/// `{base}-{8hex}`, bare slugs pass through.
-pub fn registry_key(project: &str) -> String {
-    if project.contains('/') {
-        let base = project.rsplit('/').next().unwrap_or(project);
-        let h = fnv1a64(project);
-        format!("{base}-{:08x}", (h & 0xffff_ffff) as u32)
-    } else {
-        project.to_string()
-    }
-}
-
 /// Resolve the registry file: explicit override, `{slug}.json`, or the
-/// single `{slug}-*.json` hashed candidate (sorted-first + ambiguous
-/// flag when several match). Slug matching uses `registry_key`, which
-/// mirrors flywheel `state::state_key`: absolute-path projects hash to
-/// `{base}-{8hex}` (e.g. `proj-0ec6cde6`). Matching the RAW project string
+/// freshest `{slug}-*.json` hashed candidate (mtime-desc, ambiguous flag
+/// when several match). Slug matching uses the core `registry_key`
+/// (single owner with flywheel `state::state_key`, bd-z5ou): absolute-path
+/// projects hash to `{base}-{8hex}` (e.g. `proj-0ec6cde6`). Matching the RAW project string
 /// instead meant an absolute-path project could never resolve its own
 /// registry — the daemon saw zero pins, resolved no p-tag npubs, and every
 /// wake classified to zero targets (the silent-deaf root cause).
@@ -325,7 +288,7 @@ pub struct FileHost {
     reducer: CoreReducer,
     /// Sticky presence verdicts — ONLY `Presence` msgs write here
     /// (mirrors the workspace tick arm: direct insert, no fallback).
-    presence: BTreeMap<String, Pres>,
+    presence: BTreeMap<String, PresenceVerdict>,
     /// Last-known herdr statuses by pin (poll-joined via registry).
     herdr: BTreeMap<String, String>,
     /// Role binds (role -> pin), drained from the pending files at sweep
@@ -699,18 +662,16 @@ impl FileHost {
             .into_iter()
             .flat_map(|e| match e {
                 Effect::Prompt { pin, line } => match self.presence.get(&pin) {
-                    Some(Pres::Idle) => vec![Effect::Prompt { pin, line }],
-                    Some(Pres::Busy) if doorbell_core::is_urgent_line(&line) => {
+                    Some(PresenceVerdict::Idle) => vec![Effect::Prompt { pin, line }],
+                    Some(PresenceVerdict::Busy) if doorbell_core::is_urgent_line(&line) => {
                         vec![Effect::Prompt { pin, line }]
                     }
                     _ => vec![Effect::Audit {
                         kind: "prompt_filtered".into(),
-                        detail: serde_json::json!({
-                            "pin": pin,
-                            "detail": format!(
-                                "non-injectable presence held wake for digest: {line}"
-                            ),
-                        }),
+                        pin,
+                        detail: serde_json::json!(format!(
+                            "non-injectable presence held wake for digest: {line}"
+                        )),
                     }],
                 },
                 other => vec![other],
@@ -723,21 +684,20 @@ impl FileHost {
             .into_iter()
             .map(|a| match a {
                 doorbell_core::DoorbellAction::Prompt { pin, line } => Effect::Prompt { pin, line },
-                // Empty pin/since: the brain fetches every known pin with
-                // per-pin cursors (mirrors the embedded advisory mapping).
-                doorbell_core::DoorbellAction::FetchInbox { .. } => Effect::FetchInbox {
-                    pin: String::new(),
-                    since: String::new(),
-                },
+                // Signal only: the brain fetches every known pin with
+                // per-pin cursors (mirrors the embedded mapping).
+                doorbell_core::DoorbellAction::FetchInbox => Effect::FetchInbox,
                 doorbell_core::DoorbellAction::CheckAckSla => Effect::CheckAckSla,
                 doorbell_core::DoorbellAction::RestartWatch => Effect::RestartWatch,
                 doorbell_core::DoorbellAction::FactMiss { why } => Effect::Audit {
                     kind: "fact_miss".into(),
+                    pin: String::new(),
                     detail: serde_json::json!({ "why": why }),
                 },
                 doorbell_core::DoorbellAction::Audit { kind, pin, detail } => Effect::Audit {
                     kind,
-                    detail: serde_json::json!({ "pin": pin, "detail": detail }),
+                    pin,
+                    detail: serde_json::json!(detail),
                 },
             })
             .collect()
@@ -750,7 +710,11 @@ impl Host for FileHost {
         // (never silent; never more than one per error).
         let mut pre = Vec::new();
         if let Some((kind, detail)) = self.pending_audit.take() {
-            pre.push(Effect::Audit { kind, detail });
+            pre.push(Effect::Audit {
+                kind,
+                pin: String::new(),
+                detail,
+            });
         }
         let core_effects = match msg {
             BrainMsg::Watch(line) => {
@@ -781,10 +745,7 @@ impl Host for FileHost {
                 self.reducer.model = next;
                 self.normalize(actions)
             }
-            BrainMsg::Sweep { .. } => vec![Effect::FetchInbox {
-                pin: String::new(),
-                since: String::new(),
-            }],
+            BrainMsg::Sweep { .. } => vec![Effect::FetchInbox],
             BrainMsg::RoleBound { role, pin } => {
                 // Mirrors the workspace arm: binds assignment routing only,
                 // never the doorbell index — zero classification effect on
@@ -801,20 +762,17 @@ impl Host for FileHost {
                 );
                 self.reducer.model = next;
                 // bd-ztek: promote a captain fact to a Prompt exactly like
-                // the embedded workspace arm (captain, else wheelhouse, and
-                // only over an Idle presence verdict). Without this every
-                // daemon-side fact — including `inject` — degraded to
-                // fact_miss even with a bound captain.
-                if let Some(pin) = self
-                    .roles
-                    .get("captain")
-                    .or_else(|| self.roles.get("wheelhouse"))
-                    .cloned()
-                    && self.presence.get(&pin) == Some(&Pres::Idle)
+                // the embedded workspace arm — precedence + line shape come
+                // from the shared core helpers (bd-z5ou), only the Idle
+                // read is host-side. Without this every daemon-side fact —
+                // including `inject` — degraded to fact_miss even with a
+                // bound captain.
+                if let Some(pin) = doorbell_core::fact_captain_pin(&self.roles)
+                    && self.presence.get(&pin) == Some(&PresenceVerdict::Idle)
                 {
                     self.apply_presence_filter(vec![Effect::Prompt {
                         pin,
-                        line: format!("[doorbell] {summary}"),
+                        line: doorbell_core::fact_prompt_line(summary),
                     }])
                 } else {
                     self.normalize(actions)
@@ -830,7 +788,8 @@ impl Host for FileHost {
             }
             BrainMsg::Presence { pin, state } => {
                 // Direct insert (mirrors the workspace tick arm).
-                self.presence.insert(pin.clone(), pres_from_word(state));
+                self.presence
+                    .insert(pin.clone(), doorbell_core::parse_presence_word(state));
                 Vec::new()
             }
             BrainMsg::InboxFetched { pin, rows } => {
@@ -1316,20 +1275,11 @@ mod tests {
         let (mut host, _dir) = host_with_registry("t4", entries());
         let fx = host.tick(&BrainMsg::AckSlaTick { now: 1_000 });
         assert!(fx.iter().any(|e| matches!(e, Effect::CheckAckSla)));
-        // Empty pin/since: the brain fetches per-pin cursors (embedded advisory shape).
-        assert!(fx.iter().any(|e| matches!(
-            e,
-            Effect::FetchInbox { pin, since } if pin.is_empty() && since.is_empty()
-        )));
-        let fx = host.tick(&BrainMsg::Sweep {
-            since: "x".into(),
-            now: 1,
-        });
+        // Signal only: the brain fetches per-pin cursors (embedded shape).
+        assert!(fx.iter().any(|e| matches!(e, Effect::FetchInbox)));
+        let fx = host.tick(&BrainMsg::Sweep { now: 1 });
         assert_eq!(fx.len(), 1);
-        assert!(matches!(
-            &fx[0],
-            Effect::FetchInbox { pin, since } if pin.is_empty() && since.is_empty()
-        ));
+        assert!(matches!(&fx[0], Effect::FetchInbox));
     }
 
     #[test]

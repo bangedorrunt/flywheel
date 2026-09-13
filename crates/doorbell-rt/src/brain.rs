@@ -189,7 +189,7 @@ impl<H: Host> Brain<H> {
             BrainMsg::Watch(line) => self.on_watch(line).await,
             BrainMsg::HerdrStatus { pin, status } => self.on_status(pin, status).await,
             BrainMsg::Died => self.on_died().await,
-            BrainMsg::Sweep { since, now } => self.on_sweep(since, now).await,
+            BrainMsg::Sweep { now } => self.on_sweep(now).await,
             BrainMsg::RoleBound { role, pin } => self.on_rolebound(role, pin).await,
             BrainMsg::Fact { summary } => self.on_fact(summary).await,
             BrainMsg::AckSlaTick { now } => self.on_ack_sla(now).await,
@@ -419,7 +419,7 @@ impl<H: Host> Brain<H> {
         );
         self.deliver(effects, "fact").await;
     }
-    async fn on_sweep(&mut self, since: String, now: u64) {
+    async fn on_sweep(&mut self, now: u64) {
         // Live drains first (loop-top order): role binds, then facts.
         for (role, pin) in self.host.drain_role_bounds() {
             self.on_rolebound(role, pin).await;
@@ -438,18 +438,12 @@ impl<H: Host> Brain<H> {
             self.hear.note_heard_pin(&pin);
         }
         self.sweep_last = Some(now);
-        let effects = self.host.tick(&BrainMsg::Sweep {
-            since: since.clone(),
-            now,
-        });
+        let effects = self.host.tick(&BrainMsg::Sweep { now });
         // F6: fetch only when tick asks (need_fetch arm) — was unconditional
         // per-pin I/O every 1s sweep. Full pipe (fetch off-loop as Msgs)
         // stays the follow-up; this cuts the steady-state sweep to tick
         // plus presence when no inbox work is due.
-        let fetched = if effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchInbox { .. }))
-        {
+        let fetched = if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
             self.fetch_all_inbox()
         } else {
             Vec::new()
@@ -534,10 +528,7 @@ impl<H: Host> Brain<H> {
         }
         // Live AckSla arm also sweeps the inbox when tick asks for it.
         // F4: route fetched rows via on_inbox_fetched (was fire-and-drop).
-        if effects
-            .iter()
-            .any(|e| matches!(e, Effect::FetchInbox { .. }))
-        {
+        if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
             for (pin, rows) in self.fetch_all_inbox() {
                 self.on_inbox_fetched(pin, rows).await;
             }
@@ -690,13 +681,13 @@ impl<H: Host> Brain<H> {
                     Effect::Prompt { pin, line } => {
                         serde_json::json!({"Prompt": {"pin": pin, "line": line}})
                     }
-                    Effect::FetchInbox { pin, since } => {
-                        serde_json::json!({"FetchInbox": {"pin": pin, "since": since}})
+                    Effect::FetchInbox => {
+                        serde_json::json!("FetchInbox")
                     }
                     Effect::CheckAckSla => serde_json::json!("CheckAckSla"),
                     Effect::RestartWatch => serde_json::json!("RestartWatch"),
-                    Effect::Audit { kind, detail } => {
-                        serde_json::json!({"Audit": {"kind": kind, "detail": detail}})
+                    Effect::Audit { kind, pin, detail } => {
+                        serde_json::json!({"Audit": {"kind": kind, "pin": pin, "detail": detail}})
                     }
                 })
                 .collect::<Vec<_>>()
@@ -952,10 +943,7 @@ mod tests {
             brain.sinks.add_sink("herdr", Box::new(sink));
             for msg in [
                 BrainMsg::Watch("{\"kind\":9}".into()),
-                BrainMsg::Sweep {
-                    since: "2026-09-10T00:00:00Z".into(),
-                    now: 1_000_100,
-                },
+                BrainMsg::Sweep { now: 1_000_100 },
                 BrainMsg::HerdrStatus {
                     pin: "p".into(),
                     status: "idle".into(),
@@ -1070,7 +1058,6 @@ mod tests {
         brain.host.now = 1_000_000 + 86_400; // +1 day mid-run
         brain
             .dispatch(BrainMsg::Sweep {
-                since: "2026-09-10T00:00:00Z".into(),
                 now: 1_000_000 + 86_400,
             })
             .await;
@@ -1101,16 +1088,7 @@ mod tests {
         let now = 1_700_000_000u64;
         let floor = doorbell_core::redelivery_floor_rfc3339(now);
         let row_us = now as i64 * 1_000_000; // recent mail, inside the floor
-        let (mut brain, _rx, _tx) = test_brain(
-            "floor",
-            vec![
-                vec![Effect::FetchInbox {
-                    pin: String::new(),
-                    since: String::new(),
-                }],
-                vec![],
-            ],
-        );
+        let (mut brain, _rx, _tx) = test_brain("floor", vec![vec![Effect::FetchInbox], vec![]]);
         brain.host.now = now;
         brain.host.pin_list = vec!["p".into()];
         brain.host.inbox.insert(
@@ -1122,12 +1100,7 @@ mod tests {
             })],
         );
         assert!(brain.wake.since_by_pin.get("p").is_none());
-        brain
-            .dispatch(BrainMsg::Sweep {
-                since: "2026-09-10T00:00:00Z".into(),
-                now,
-            })
-            .await;
+        brain.dispatch(BrainMsg::Sweep { now }).await;
         let hw = brain
             .wake
             .since_by_pin
@@ -1169,7 +1142,6 @@ mod tests {
                 },
                 2 => BrainMsg::Died,
                 3 => BrainMsg::Sweep {
-                    since: "2026-09-10T00:00:00Z".into(),
                     now: 1_000_000 + next_rand(rng) % 100_000,
                 },
                 4 => BrainMsg::RoleBound {
@@ -1217,7 +1189,6 @@ mod tests {
         brain.hear.note_inject("svc", None, 1_000_000);
         brain
             .dispatch(BrainMsg::Sweep {
-                since: "2026-09-10T00:00:00Z".into(),
                 now: 1_000_000 + 120,
             })
             .await;

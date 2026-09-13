@@ -198,6 +198,70 @@ pub fn redelivery_floor_rfc3339(now_unix: u64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
 }
 
+/// One presence-word verdict (bd-z5ou): the single owner of the
+/// 20001/jsonl state-word map. Both hosts read through this — the
+/// workspace `Presence` adds the evidence source, the daemon host reads
+/// the verdict directly. blocked reads as Busy (occupied, digest not
+/// prompt); done reads as Idle; anything unparseable is Unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceVerdict {
+    Idle,
+    Busy,
+    Dead,
+    Unknown,
+}
+
+pub fn parse_presence_word(s: &str) -> PresenceVerdict {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "idle" | "done" => PresenceVerdict::Idle,
+        "working" | "busy" | "blocked" => PresenceVerdict::Busy,
+        "dead" | "endpoint-dead" | "endpoint" => PresenceVerdict::Dead,
+        _ => PresenceVerdict::Unknown,
+    }
+}
+
+/// fnv1a64 (bd-z5ou): single owner of the registry-key hash. Formerly
+/// duplicated byte-identically in flywheel `state` and doorbell-rt
+/// `file_host` behind "mirrors" comments — the second copy is how key
+/// skew goes silent.
+pub fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Registry key (bd-z5ou): bare slugs pass through, slash paths hash to
+/// `{base}-{8hex}`. Single owner; both the flywheel registry and the
+/// daemon resolver read through this.
+pub fn registry_key(project: &str) -> String {
+    if project.contains('/') {
+        let base = project.rsplit('/').next().unwrap_or(project);
+        let h = fnv1a64(project);
+        format!("{base}-{:08x}", (h & 0xffff_ffff) as u32)
+    } else {
+        project.to_string()
+    }
+}
+
+/// Captain-fact promotion, split in two so both hosts share the rule
+/// (bd-z5ou): `fact_captain_pin` owns the role precedence (captain, else
+/// wheelhouse); `fact_prompt_line` owns the line shape. The Idle check
+/// stays host-side (workspace reads its Presence map, the daemon its
+/// sticky verdicts) — only the precedence + format unify.
+pub fn fact_captain_pin(roles: &BTreeMap<String, String>) -> Option<String> {
+    roles
+        .get("captain")
+        .or_else(|| roles.get("wheelhouse"))
+        .cloned()
+}
+
+pub fn fact_prompt_line(summary: &str) -> String {
+    format!("[doorbell] {summary}")
+}
+
 pub fn watch_pubkey(line: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     v.get("pubkey")
@@ -526,9 +590,9 @@ pub enum DoorbellAction {
         pin: String,
         line: String,
     },
-    FetchInbox {
-        since: String,
-    },
+    /// Fetch signal only (bd-z5ou): per-pin cursors live in the brain, so
+    /// this carries no payload — rows re-enter as InboxRows/InboxFetched.
+    FetchInbox,
     /// Effect: run `check_ack_sla_expired` for the project (toron mailbox).
     /// Overdue wakes re-enter as WatchNdjson Msgs via plane S.
     CheckAckSla,
@@ -729,14 +793,12 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 why: format!("fact without captain alias: {}", summary),
             });
         }
-        DoorbellMsg::AckSlaTick { now } => {
+        DoorbellMsg::AckSlaTick { .. } => {
             // The scan is check_ack_sla_expired (toron), not an inbox fetch.
             // Overdue wakes arrive back as kind-9 ack-sla-expired WatchNdjson.
             actions.push(DoorbellAction::CheckAckSla);
             // leftover #13: FetchInbox is now a real Cmd whose rows re-enter as InboxRows
-            actions.push(DoorbellAction::FetchInbox {
-                since: format!("{now}"),
-            });
+            actions.push(DoorbellAction::FetchInbox);
         }
         DoorbellMsg::WatchDied => {
             // Never exit the dispatcher: restart is the only path (heal_tick is backup).
@@ -790,7 +852,7 @@ impl DoorbellAction {
     pub fn to_label(&self) -> String {
         match self {
             Self::Prompt { pin, .. } => format!("prompt {pin}"),
-            Self::FetchInbox { since } => format!("fetch-inbox {since}"),
+            Self::FetchInbox => "fetch-inbox".into(),
             Self::CheckAckSla => "check-ack-sla".into(),
             Self::RestartWatch => "restart-watch".into(),
             Self::FactMiss { why } => format!("fact-miss {why}"),
@@ -808,6 +870,36 @@ mod tests {
         m.index.insert_pin(pin.to_string(), None);
         m.statuses.insert(pin.to_string(), "idle".into());
         m
+    }
+
+    #[test]
+    fn presence_word_map_is_single_sourced() {
+        // bd-z5ou: both hosts read through this — blocked is Busy, done
+        // is Idle, dead words are Dead, garbage is Unknown (never idle).
+        for w in ["idle", "done", " IDLE "] {
+            assert_eq!(parse_presence_word(w), PresenceVerdict::Idle);
+        }
+        for w in ["working", "busy", "blocked"] {
+            assert_eq!(parse_presence_word(w), PresenceVerdict::Busy);
+        }
+        for w in ["dead", "endpoint-dead", "endpoint"] {
+            assert_eq!(parse_presence_word(w), PresenceVerdict::Dead);
+        }
+        for w in ["", "mystery", "null"] {
+            assert_eq!(parse_presence_word(w), PresenceVerdict::Unknown);
+        }
+    }
+
+    #[test]
+    fn fact_promotion_prefers_captain_over_wheelhouse() {
+        // bd-z5ou: precedence + line shape shared by both hosts.
+        let mut roles = BTreeMap::new();
+        assert_eq!(fact_captain_pin(&roles), None);
+        roles.insert("wheelhouse".into(), "PinW".into());
+        assert_eq!(fact_captain_pin(&roles).as_deref(), Some("PinW"));
+        roles.insert("captain".into(), "PinC".into());
+        assert_eq!(fact_captain_pin(&roles).as_deref(), Some("PinC"));
+        assert_eq!(fact_prompt_line("deploy"), "[doorbell] deploy");
     }
 
     #[test]
