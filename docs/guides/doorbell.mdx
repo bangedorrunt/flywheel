@@ -39,14 +39,25 @@ verb. `flywheel kill` drops its spawn's rows (lifecycle symmetry);
 operator rows outlive swarms. After `doorbell install`, reload the unit
 definition (`bootout` + `bootstrap`) or the reboot runs the old hosts.
 
-**A subscription is not yet enough on its own.** The hosted loop's sweep,
-watch index, and pin→pane routing are all built from the **spawn registry**
-for that project, so only registry pins are fetched, addressed, and routed.
-An identity that is subscribed but has never been spawned there — the
-operator pin is the live case — has delivered mail in its inbox and still
-rings nobody. Trust `/health` plus the journal, not the subscription list,
-when asking whether a wake will land. (Tracked as a Phase-2 gap in
-ADR-0012 §8.)
+**A subscription buys you the sweep and an address — not a route.** The
+hosted loop unions subscribed identities into the pin set it sweeps and
+addresses, so a subscribed pin that was never spawned in the project (the
+operator pin is the live case) has its inbox fetched and its mail
+classified and journaled like anyone else's.
+
+What a subscription row cannot create is a **pane**: rows carry identity,
+scope, filter, sink, and budget — no target. Routing is registry-driven, and
+deliberately so: inventing a target for a pane-less pin would fabricate a
+delivery the sink cannot perform. Instead the pin's status stays `unknown`,
+so `should_inject` refuses, and the wake lands as a visible
+`Audit queued` row against that pin — read it with
+`flywheel doorbell why <project> <pin>`. Prompt delivery for such a pin
+needs a real pane to route to (or a non-herdr sink, still Phase 2).
+
+So when `why` says nothing about a pin, ask in this order: is the daemon
+hosting (`/health`), can it exec its CLIs (`/health.binaries`), is the pin
+in the sweep set (`since_by_pin` in `doorbell-wake-<ws>.json`), and is it
+subscribed? The journal is the only surface that answers all four.
 
 ## What the daemon execs (CLI resolution)
 
