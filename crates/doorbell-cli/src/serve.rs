@@ -465,6 +465,28 @@ fn spawn_host_loop(
     if hosted.lock().contains(&key) {
         return;
     }
+    // bd-ba8t: say out loud whether this workspace's wakes have anywhere to
+    // land. Silence here is exactly how a hosted-but-deaf plane looks healthy.
+    // Two `herdr agent list` shells per host is acceptable at boot; /health
+    // recomputes it live for readers.
+    let inj = doorbell_rt::file_host::injection_picture(
+        &cfg.flywheel_state,
+        project,
+        None,
+        &resolved_bins().herdr,
+    );
+    eprintln!(
+        "doorbell serve: hosting {key} — {} pin(s), {} pane(s) in herdr, {} injectable now",
+        inj.pins, inj.panes_seen, inj.injectable
+    );
+    if inj.pins > 0 && inj.panes_seen == 0 {
+        eprintln!(
+            "doorbell serve: WARNING hosting {key} — {} pin(s) but herdr knows none of their \
+             panes: NO wake can be injected here (inbox wakes queue/digest instead). Start agents \
+             (`herdr agent start`) or fix the stale registry",
+            inj.pins
+        );
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
     loop_txs.lock().push(tx.clone());
     let (fw, p, w) = (
@@ -659,6 +681,48 @@ fn hosted_workspace(hw: &str) -> Option<&str> {
         .filter(|ws| !ws.is_empty())
 }
 
+/// bd-ba8t: the prompt hop's precondition, as counts. A registry pin whose
+/// pane `herdr agent list` does not know can never be injected into, no
+/// matter how well its wake classifies. Summed per hosted PROJECT (the
+/// registry file is project-scoped), not per workspace, so two workspaces of
+/// one project are not double-counted.
+fn hosted_injection(
+    fw_state: &std::path::Path,
+    hosted: &[String],
+    herdr_bin: &str,
+) -> doorbell_rt::file_host::InjectionPicture {
+    use doorbell_rt::file_host::{InjectionPicture, injection_picture};
+    let mut total = InjectionPicture::default();
+    let mut projects: Vec<&str> = Vec::new();
+    for h in hosted {
+        let Some((project, _)) = h.split_once('/') else {
+            continue;
+        };
+        if projects.contains(&project) {
+            continue;
+        }
+        projects.push(project);
+        let pic = injection_picture(fw_state, project, None, herdr_bin);
+        total.pins += pic.pins;
+        total.panes_seen += pic.panes_seen;
+        total.injectable += pic.injectable;
+        total.panes_missing += pic.panes_missing;
+    }
+    total
+}
+
+/// bd-ba8t: when does the ring's LAST hop become structurally impossible?
+/// Only when the daemon hosts something AND the registry names pins AND
+/// herdr knows the panes of NONE of them. A fleet caught mid-work (every
+/// pane `working`) is healthy: the durable queue holds the wake and drains
+/// on the next `idle` transition.
+fn prompt_hop_degraded(
+    hosted_pairs: usize,
+    pic: &doorbell_rt::file_host::InjectionPicture,
+) -> bool {
+    hosted_pairs > 0 && pic.pins > 0 && pic.panes_seen == 0
+}
+
 /// Wake subscriptions registered for the daemon's hosted workspaces
 /// (flywheel `spawn` writes one per pin as `Scope::One(workspace)`). A
 /// standby daemon hosts nothing, so 0 is the honest answer there — but it
@@ -807,6 +871,14 @@ fn health_body(app: &AppState) -> String {
     if restarts > WATCH_RESTARTS_ALLOWED_PER_WS * ws_names.len() {
         degraded.push("watch_restart_loop".to_string());
     }
+    // bd-ba8t: the prompt hop needs an INJECTABLE pane, and that precondition
+    // used to be invisible — a hosted daemon with zero herdr agents read
+    // `degraded: []` while no wake could ever land (gs-044's hard part).
+    let inj = hosted_injection(&app.fw_state, &hosted, &bins.herdr);
+    let no_prompt_hop = prompt_hop_degraded(hosted.len(), &inj);
+    if no_prompt_hop {
+        degraded.push("no_injectable_panes".to_string());
+    }
     let mailbox_root = doorbell_rt::toron_data_root(None);
     let presence_age =
         doorbell_rt::watchbeat::file_age_secs(&doorbell_rt::presence_path(&mailbox_root));
@@ -847,6 +919,16 @@ fn health_body(app: &AppState) -> String {
         "mailbox": {
             "toron_data_dir": mailbox_root.display().to_string(),
             "presence_age_s": presence_age,
+        },
+        // bd-ba8t: can a wake land here at all? `prompt_hop` is a word, not a
+        // number to interpret: `no_pane_in_herdr` means every registry pin's
+        // pane is unknown to herdr, so wakes queue/digest and never inject.
+        "injection": {
+            "pins": inj.pins,
+            "panes_seen": inj.panes_seen,
+            "injectable": inj.injectable,
+            "panes_missing": inj.panes_missing,
+            "prompt_hop": if no_prompt_hop { "no_pane_in_herdr" } else { "ok" },
         },
         "degraded": degraded,
         "known_workspaces": known_workspaces.len(),
@@ -1041,6 +1123,37 @@ mod tests {
     /// bd-2o1v: the reaper drops spawn-scoped rows after a week of journal
     /// silence; fresh journals, journal-less workspaces, and operator rows
     /// stay. Missing journal = fresh spawn pre-first-tick, never a corpse.
+    /// bd-ba8t: `herdr agent list` = [] while the registry names pins is the
+    /// live condition that made the ring unable to land and `/health` look
+    /// clean. It must degrade; a busy fleet (panes seen, none free) must not.
+    #[test]
+    fn prompt_hop_degrades_only_when_herdr_knows_no_pane() {
+        use super::prompt_hop_degraded;
+        use doorbell_rt::file_host::InjectionPicture;
+        let pic = |pins, seen, injectable, missing| InjectionPicture {
+            pins,
+            panes_seen: seen,
+            injectable,
+            panes_missing: missing,
+        };
+        assert!(
+            prompt_hop_degraded(1, &pic(3, 0, 0, 3)),
+            "three pins, herdr knows none of their panes"
+        );
+        assert!(
+            !prompt_hop_degraded(1, &pic(3, 3, 0, 0)),
+            "all panes busy is healthy: the queue drains on the next idle"
+        );
+        assert!(
+            !prompt_hop_degraded(0, &pic(0, 0, 0, 0)),
+            "standby hosts nothing"
+        );
+        assert!(
+            !prompt_hop_degraded(1, &pic(0, 0, 0, 0)),
+            "hosted with an empty registry is not a prompt-hop fault"
+        );
+    }
+
     #[test]
     fn reap_candidates_only_quiet_spawn_rows() {
         use doorbell_rt::subscribe::*;
