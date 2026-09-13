@@ -271,6 +271,125 @@ pub fn resolve_registry_file(
     (hits.into_iter().next(), ambiguous)
 }
 
+/// (pin, pane_id, herdr name) rows from a registry file, plus the chosen
+/// file's name when several hashed candidates matched (the caller audits
+/// that ambiguity). Read-only and `&self`-free so the /health probe can ask
+/// the same question the sweep asks (bd-ba8t).
+fn read_registry_rows(
+    flywheel_state: &Path,
+    project: &str,
+    override_path: Option<&Path>,
+) -> (Vec<(String, String, String)>, Option<String>) {
+    let (file, ambiguous) = resolve_registry_file(flywheel_state, project, override_path);
+    let chosen = if ambiguous {
+        file.as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    let Some(path) = file else {
+        return (Vec::new(), chosen);
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return (Vec::new(), chosen);
+    };
+    let rows = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| {
+            let pin = e.get("mail_identity")?.as_str()?.to_string();
+            if pin.is_empty() {
+                return None;
+            }
+            let pane = e.get("pane_id")?.as_str().unwrap_or("").to_string();
+            let name = e.get("name")?.as_str().unwrap_or("").to_string();
+            Some((pin, pane, name))
+        })
+        .collect();
+    (rows, chosen)
+}
+
+/// pane_id -> `agent_status` from one `herdr agent list`. Empty map = herdr
+/// reports no agents at all, which is a fact the /health probe must
+/// distinguish from "every pane is busy" (bd-ba8t).
+fn herdr_agent_statuses(herdr_bin: &str) -> BTreeMap<String, String> {
+    let out = run_cli(herdr_bin, &["agent", "list"], CLI_TIMEOUT_SECS);
+    let Some(out) = out else {
+        return BTreeMap::new();
+    };
+    if !out.status.success() {
+        return BTreeMap::new();
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let empty = Vec::new();
+    let agents = v
+        .get("result")
+        .and_then(|r| r.get("agents"))
+        .and_then(|a| a.as_array())
+        .unwrap_or(&empty);
+    agents
+        .iter()
+        .filter_map(|a| {
+            let pane = a.get("pane_id").and_then(|p| p.as_str())?;
+            let status = a.get("agent_status").and_then(|s| s.as_str())?;
+            Some((pane.to_string(), status.to_string()))
+        })
+        .collect()
+}
+
+/// Can the ring's LAST hop land here at all? (bd-ba8t)
+///
+/// `should_inject` accepts only `idle|done|blocked`, and statuses arrive from
+/// `herdr agent list` mapped through the spawn registry. With zero herdr
+/// agents — the live condition that made gs-044 hard to see — every wake
+/// classifies correctly and then has nowhere to go, while `/health` reads
+/// `hosted, degraded: []`. Counting the picture here turns that into a fact.
+///
+/// `panes_seen` deliberately counts panes in ANY status: a fleet where every
+/// pane is momentarily `working` is healthy (a durable queue holds the wake),
+/// while `panes_seen == 0` with pins > 0 means the prompt hop is structurally
+/// impossible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InjectionPicture {
+    /// registry pins (non-empty `mail_identity`)
+    pub pins: usize,
+    /// pins whose pane appears in `herdr agent list`, any status
+    pub panes_seen: usize,
+    /// pins whose status is injectable right now (`idle|done|blocked`)
+    pub injectable: usize,
+    /// pins whose pane is absent from `herdr agent list` (or empty)
+    pub panes_missing: usize,
+}
+
+/// The same registry + herdr view the sweep reads, reduced to the counts
+/// `/health` needs. Pure read: no journal, no store, no locks.
+pub fn injection_picture(
+    flywheel_state: &Path,
+    project: &str,
+    override_path: Option<&Path>,
+    herdr_bin: &str,
+) -> InjectionPicture {
+    let (rows, _) = read_registry_rows(flywheel_state, project, override_path);
+    let statuses = herdr_agent_statuses(herdr_bin);
+    let mut picture = InjectionPicture::default();
+    for (_, pane, _) in &rows {
+        picture.pins += 1;
+        match statuses.get(pane) {
+            Some(status) => {
+                picture.panes_seen += 1;
+                if doorbell_core::should_inject(status) {
+                    picture.injectable += 1;
+                }
+            }
+            None => picture.panes_missing += 1,
+        }
+    }
+    picture
+}
+
 /// A `toron watch` child that is killed + reaped when dropped. Wrapping is
 /// the point: a bare `std::process::Child` drop leaves the process running,
 /// which is how `Died`-driven restarts littered long-lived watchers.
@@ -389,43 +508,20 @@ impl FileHost {
     /// (pin, pane_id, herdr name) rows from the registry file. Ambiguity
     /// queues a pending audit (drained as one Audit effect on next tick).
     fn registry_rows(&mut self) -> Vec<(String, String, String)> {
-        let (file, ambiguous) = resolve_registry_file(
+        let (rows, ambiguous_file) = read_registry_rows(
             &self.cfg.flywheel_state,
             &self.cfg.project,
             self.cfg.registry_file.as_deref(),
         );
-        if ambiguous {
+        if let Some(chosen) = ambiguous_file {
             // bd-ztek: name the chosen file — first-sorted used to sweep a
             // stale fleet's pins with no trace of which file won.
-            let chosen = file
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
             self.pending_audit = Some((
                 "registry_ambiguous".into(),
                 serde_json::json!({ "project": self.cfg.project, "registry_file": chosen }),
             ));
         }
-        let Some(path) = file else { return Vec::new() };
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return Vec::new();
-        };
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|e| {
-                let pin = e.get("mail_identity")?.as_str()?.to_string();
-                if pin.is_empty() {
-                    return None;
-                }
-                let pane = e.get("pane_id")?.as_str().unwrap_or("").to_string();
-                let name = e.get("name")?.as_str().unwrap_or("").to_string();
-                Some((pin, pane, name))
-            })
-            .collect()
+        rows
     }
 
     /// Pins named by this workspace's wake subscriptions (bd-cak3).
@@ -580,31 +676,7 @@ impl FileHost {
 
     /// herdr statuses joined to pins: `{pane_id: status}` -> `{pin: status}`.
     fn poll_herdr(&self) -> BTreeMap<String, String> {
-        let out = run_cli(&self.cfg.herdr_bin, &["agent", "list"], CLI_TIMEOUT_SECS);
-        let Some(out) = out else {
-            return BTreeMap::new();
-        };
-        if !out.status.success() {
-            return BTreeMap::new();
-        }
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-        let empty = Vec::new();
-        let agents = v
-            .get("result")
-            .and_then(|r| r.get("agents"))
-            .and_then(|a| a.as_array())
-            .unwrap_or(&empty);
-        let mut by_pane: BTreeMap<String, String> = BTreeMap::new();
-        for a in agents {
-            let (Some(pane), Some(status)) = (
-                a.get("pane_id").and_then(|p| p.as_str()),
-                a.get("agent_status").and_then(|s| s.as_str()),
-            ) else {
-                continue;
-            };
-            by_pane.insert(pane.to_string(), status.to_string());
-        }
-        by_pane
+        herdr_agent_statuses(&self.cfg.herdr_bin)
             .into_iter()
             .filter_map(|(pane, status)| self.panes.get(&pane).map(|pin| (pin.clone(), status)))
             .collect()
@@ -1157,6 +1229,71 @@ mod tests {
             {"pane_id": "pane-a", "name": "herdr-a", "mail_identity": "PinA"},
             {"pane_id": "pane-b", "name": "herdr-b", "mail_identity": "PinB"}
         ])
+    }
+
+    /// bd-ba8t: `herdr agent list` returning no agents is the live condition
+    /// that made the ring's last hop impossible and invisible at once. The
+    /// picture must say `panes_seen: 0` rather than "all busy".
+    #[test]
+    fn injection_picture_sees_zero_panes_when_herdr_has_no_agents() {
+        let dir = tmp_state("inj-none");
+        std::fs::write(
+            dir.join("agents").join("proj.json"),
+            serde_json::to_string(&entries()).unwrap(),
+        )
+        .unwrap();
+        let script = dir.join("herdr-empty");
+        std::fs::write(&script, "#!/bin/sh\necho '{\"result\":{\"agents\":[]}}'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        let pic = injection_picture(
+            &dir,
+            "proj",
+            Some(&dir.join("agents").join("proj.json")),
+            &script.to_string_lossy(),
+        );
+        assert_eq!(pic.pins, 2, "two registry pins");
+        assert_eq!(pic.panes_seen, 0, "herdr saw no agents");
+        assert_eq!(pic.injectable, 0);
+        assert_eq!(pic.panes_missing, 2, "both panes unaccounted for");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The healthy shape the signal must NOT fire on: herdr knows the panes
+    /// (some busy, some idle), so the ring can land.
+    #[test]
+    fn injection_picture_counts_busy_and_idle_panes() {
+        let dir = tmp_state("inj-mixed");
+        std::fs::write(
+            dir.join("agents").join("proj.json"),
+            serde_json::to_string(&entries()).unwrap(),
+        )
+        .unwrap();
+        let script = dir.join("herdr-mixed");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"},{\"pane_id\":\"pane-b\",\"agent_status\":\"idle\"}]}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        let pic = injection_picture(
+            &dir,
+            "proj",
+            Some(&dir.join("agents").join("proj.json")),
+            &script.to_string_lossy(),
+        );
+        assert_eq!(
+            (pic.pins, pic.panes_seen, pic.injectable, pic.panes_missing),
+            (2, 2, 1, 0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
