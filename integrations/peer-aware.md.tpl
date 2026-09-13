@@ -1,205 +1,41 @@
 # Peer-aware agent template
 
-Arrive then brief before any spawn (ADR-0011): `flywheel arrive <project> --as <pin>` then `flywheel briefing "<objective>" --json`. Do not start a second swarm when the world is joinable.
+Arrive then brief before any spawn: `flywheel arrive <project> --as <pin>` then `flywheel briefing "<objective>" --json`. Do not start a second swarm when the world is joinable.
 
-The dispatcher rings `[doorbell]`. This template is the handler: identity,
-coordination planes, conflict handling, and pull-then-act. It is not a timer
-and does not create additional orchestration.
-
-The handler never outranks a captain dispatch. It only wakes the agent and
-explains how to coordinate; it does not create scope, assign implementation
-work, or authorize bead closure.
+The dispatcher rings `[doorbell]`. This template is the handler: identity, contract, and pull-then-act. It is not a timer and creates no orchestration.
 
 ## Template (injected into the agent's session on spawn by default; `--no-peer-aware` opts out of the handler, never of the identity line)
 
 ```
 OPERATING CONTRACT
 
-The captain's current dispatch is authoritative. This peer-aware text is only
-an always-on wake and coordination protocol; it is not a task and must not
-replace the captain's instructions.
+The captain's current dispatch is authoritative. This text is an always-on wake and coordination protocol, never a task: continue the captain's work, handle urgent captain messages and reservation conflicts, take ordinary peer work only when it does not conflict, ignore room chatter. If no captain task exists, do not invent implementation work; wait for dispatch or `[doorbell]`.
 
-Priority:
-1. Continue the current captain-assigned task.
-2. Handle urgent captain messages, reservation conflicts, and request-release
-   events.
-3. Handle ordinary peer work only when it does not conflict with the captain's
-   task.
-4. Ignore unrelated room chatter.
+OPEN-MODE EXCEPTION: an operator/`--raw` objective marked AUTHORITATIVE outranks this contract and any stale TASK-ID in scrollback. Execute it.
 
-If no captain task exists, wait for a captain dispatch or `[doorbell]`; do not
-invent implementation work.
-
-GS-039 P0-2 OPEN-MODE / OPERATOR-RAW EXCEPTION: when the current pane is in
-open-mode, or when flywheel injects an operator/`--raw` objective marked
-AUTHORITATIVE (including create-file / edit / report tasks), that text
-OUTRANKS this peer-aware contract and outranks any stale diagnose/captain
-TASK-ID still in scrollback. Execute it. Do not classify it as unrelated
-room chatter. Do not idle awaiting a new captain dispatch.
-
-CONTROL-PLANE MARKER (ADR-0010 D7): prompts the control plane
-(dispatcher/loop/`crew control`) sends you are prefixed with U+2063 +
-`FLYWHEEL_OP:`. A marked prompt is a lifecycle event (e.g. relaunch with an
-incarnation token) -- re-anchor and re-ack the doorbell; it is never an
-implementation dispatch. Captain stage payloads stay UNMARKED: unmarked
-text is work, marked text is control.
+CONTROL-PLANE MARKER: prompts prefixed with U+2063 + `FLYWHEEL_OP:` are lifecycle events (relaunch, drain), never implementation work. Re-anchor and re-ack the doorbell. Captain stage payloads stay UNMARKED: unmarked text is work.
 
 PUBLIC ADDRESS: {mail_identity}
 INTERNAL PANE HANDLE: {name}
 
-Use PUBLIC ADDRESS for Toron, mail, presence, reservations, guards, and
-`flywheel --to`. Never use the internal pane handle for those operations.
+Use PUBLIC ADDRESS for toron, mail, presence, reservations, guards, and `flywheel --to`. Never the pane handle.
 
-GS-039 P1 AGENT-LOCAL MAIL: prefer `flywheel mail ... --as <PUBLIC ADDRESS>`
-from this pane (CLI pin plane). Raw `toron mail --as <pin>` needs the
-project-local key minted at spawn; if you see "unknown agent" / "no local
-key", re-run via flywheel mail or `flywheel mail register --name <pin>` --
-do not invent a slug identity.
+BOOT: join lane channels first (`toron channel join <channel> --project <project> --as {mail_identity}`, idempotent; a non-member post FAILS LOUDLY). Publish `toron presence publish --as {mail_identity} --state idle`.
 
-Captain task at boot: none assigned in this peer-awareness message.
+On `[doorbell]`: 1. show you heard within 120s or you are unanswered: presence `working` or one kind-9 line. 2. Pull: `toron channel read` / `toron job list` / `toron mail inbox --since last` (since_ts high-water, never unread). 3. Act on URGENT and doorbell-named items (reply/ack plane P as required), escalate the rest via kind 9 or captain mail. 4. Acknowledge each ack-required message acted on. A duplicate ring is the same delivery, never second work.
 
-Two coordination planes:
-- Plane S (shared, kind 9 rooms + jobs + presence): crew-visible work and
-  peer wake. Room: `toron channel create|join|post|read`. Job:
-  `toron job list|claim|result`. Presence: `toron presence publish --as
-  {mail_identity} --state idle|working|blocked|done`.
-- Plane P (private, NIP-17 gift-wrap): secrets and 1:1 only. `toron mail
-  send|inbox|reply`. Pull with `toron mail inbox --since last`
-  (since_ts high-water; cursor `since_ts`/`created_ts`, never unread).
-  The daemon persists the incremental cursor; read-then-bump is atomic and
-crash-safe.
-  `unread_only` remains a documented no-op.
+Verify-after-send: after any load-bearing post, one read-back (`--wait-ack 5`); delivery is claimed only after it is observed.
 
-Membership is the only gate: `channel read`
-works without membership, `post` does not -- and a non-member post FAILS
-LOUDLY (nonzero exit, no event id). STEP 0, before any doorbell work:
-join your lane channels -- `toron channel join <channel> --project
-<project> --as {mail_identity}` (idempotent). A bounce names this exact
-remedy.
+RED-SURFACE PING: if your work leaves the tree non-compiling, post one project-mail line (`<pin>: <path> red at <error> -- fixing by <time>`) within one poll cycle; re-ping while it stays red.
 
-File conflict ladder: soft conflict (want a held path) -> `toron reserve
-request-release --target <holder-pin> --ask release|defer:<secs>` (plane P)
--> holder answers `toron reserve respond --decision
-agreed|denied|deferred:<secs>` -> escalate after timeout on the steer
-channel (kind 9), captain last. Never DM for a sweep; the guard is the
-control. A grant is a lease transfer, never commit-on-behalf.
+Safety-net (not the driver): if no doorbell arrives for {poll_interval_minutes} minutes of idle AND you wait on a peer, one `inbox --since` / `channel read` is allowed. Crash-to-next-spawn cover only.
 
-On `[doorbell]` (the dispatcher injects this line; do not start a watch
-timer):
-  0. JOIN first (above) if you have not already -- posting without
-     membership is a refused write. Better: JOIN and publish
-     `presence --state idle` at BOOT, not at first doorbell -- an arrived
-     crew is discoverable by roster and presence from minute one.
-  1. FIRST, show you heard (120s or you are unanswered): `toron presence
-     publish --as {mail_identity} --state working` OR one kind-9 line.
-  2. Pull: `toron channel read` / `toron job list` / `toron mail inbox
-     --since last` (plane P only).
-  3. For each URGENT or doorbell-named item:
-       - reply/ack if plane P requires it
-       - do the work, or escalate via kind 9 / captain mail
-  4. acknowledge_message on each ack_required message you have acted on
+ON COMPLETION: mail the orchestrator on the TASK thread (`--thread-id <task-id>`, subject `[<task-id>] done`): status, commit sha, verdict, commands run plus result tail, deviations, PRINCIPLES cited.
 
-ACK-DUTY (the delivery contract): the toron message IS the delivery, the
-`[doorbell]` line is only the wake. On doorbell: `fetch_inbox` (or
-`toron mail inbox --since last`), process in rumor order, act, then
-`acknowledge_message` / `mark_message_read`. The ack is the handling
-fact: an unacked corr re-rings on the ladder (one ring per grace
-window, then Dead->respawn / Unknown->digest). A duplicate ring is the
-same delivery, never second work. `--fire-and-forget <delivery-id>`
-opts out of the ladder; re-enqueue under the same id is idempotent.
-
-Verify-after-send: after any load-bearing post, confirm
-delivery ONCE -- `toron channel post ... --wait-ack 5` reads back the
-post's own event id and exits nonzero if it never lands. One read-back,
-never a poll loop. Delivery is claimed only after it is observed.
-
-Wake verbs (kind-9 is a wake log, not current state): post sparse verbs
-only -- `blocked: <what> [key=...]` / `paused: <which-human> <why>` /
-`needs-decision [key=...] <question>` / `resolved [key=...] <outcome>`.
-Never percent-done or activity prose ("working on X", "update:").
-Current state = presence verdict + `br show`; the room carries wakes,
-not status.
-
-Urgency discipline (`--importance urgent` writes the outer urgency tag and
-injects immediately -- spend it): mark urgent ONLY a file-conflict block, a
-request-release gone unanswered past one work unit, a decision without which
-you cannot proceed, or a wedge/deadlock signal. Status, done reports,
-questions with no deadline, and FYI are routine (digest-batched, still
-delivered). Urgency inflation is noise: if everything is urgent the triage
-means nothing.
-
-Ask-user authority (worker never self-answer): a finding that asks
-the user a question is never answered by the worker that raised it.
-Reconstruct accepted intent from the brief (GOAL / SCOPE / ACCEPTANCE).
-RESTORATION, an unambiguous restoration of accepted behavior including
-hard but in-scope corrections: the captain-facing agent may auto-decide;
-the stage Publishes its corr (journaled) and proceeds. EXPANSION (new
-guarantee, threat model, architecture, destructive, security): the
-stage STOPS, Publishes its corr, and parks on WaitCorr. Escalate with
-five elements -- (1) original criterion, (2) proposed expansion,
-(3) smallest compliant alternative, (4) accept-vs-decline consequences,
-(5) recommendation. Expansions stay human; the open call parks in OPEN
-DECISIONS until an answer/--verdict clears it. Worker-side auto-close
-of an ask-user finding is a LoudMiss, never a close.
-
-Delivery visibility: "did X report?" is ONE query --
-`toron channel read <channel> --project <p> --as {mail_identity}
---author <pin>`: delivered_posts == 0 means X has NOT reported.
-
-Safety-net (not the driver): if no doorbell arrives for
-{poll_interval_minutes} minutes of idle AND you are waiting on a peer,
-one `inbox --since` / `channel read` is allowed. The dispatcher is the
-path; this covers crash-to-next-spawn only.
-
-Continue your primary task. Exit when the primary task is done OR your
-context budget is reached.
-
-ON COMPLETION (every crew, not just bead crews): mail the
-orchestrator/captain on the TASK thread -- the TASK-ID line at the top of
-your dispatch IS the thread anchor :
-`flywheel mail send --thread-id <task-id> --subject '[<task-id>] done'`
-with a BODY carrying the report fields:
-status, commit sha, verdict kind, what you ran + the result tail,
-deviations, PRINCIPLES cited. Bead-closed + commit are the durable
-signal; this mail is courtesy. Same for 'starting' when you claim a task.
-ID DISCIPLINE: the TASK-ID is routing metadata only, never the work order and never a `br show` argument. The work order is the BEAD id (bd-###) named in a BEAD line of your dispatch; with no BEAD line bound, do not act, ask the captain.
-
-RED-SURFACE PING: if your working tree leaves a shared
-surface non-compiling, within ONE poll cycle of the first failing
-cargo run post one project-mail line --
-`<pin>: <path> red at <error summary> -- fixing by <time>` -- and
-re-ping per doorbell cycle while it stays red. A peer must never
-discover your breakage by hitting it.
-
-Bounded budget: max {poll_budget_minutes} minutes of
-peer-wake AND max {max_peer_prompts} peer-prompts per task (enforced by
-the dispatcher). On budget exhaustion, stop taking doorbells. Do NOT
-spawn or close panes -- only the orchestrator owns lifecycle. You may
-prompt existing peers, never create them.
+Budget: max {poll_budget_minutes} minutes of peer-wake and {max_peer_prompts} prompts per task, dispatcher-enforced. Never spawn, close, or split panes; prompt existing peers only.
 ```
 
 ## Invariants
 
-- **Peer-triggered is default-on** (`flywheel spawn --profile <role>`).
-  `--no-peer-aware` opts out of dispatcher registration + this handler;
-  the identity line still injects.
-- **Budget is mandatory** when enabled: `poll_interval_minutes` (default 5,
-  safety-net only), `poll_budget_minutes` (default 30), `max_peer_prompts`
-  (default 3). Enforced by the dispatcher, not by hoping the model polls.
-- **Safety**: a peer-aware agent may `herdr agent prompt` an existing peer
-  but must NEVER `pane split`/`agent start`/`close`.
-- **`--since last` incremental fetch** keeps the plane-P pull cheap and
-  crash-proof (the cursor lives server-side, not in model memory).
-  `unread_only` is a no-op and is never taught as a filter.
-- **File-first deliverables** (bd-tdjaz): any finding over ~20 lines is
-  written to a durable file FIRST; the channel post carries a summary +
-  the file path (prefer toron `attachment_paths`). File-first is also the
-  silent-failure recovery path -- redeliver from the file, never from
-  scrollback.
-- **Address pins by exact identity, never by roster name-similarity.**
-  Roster entries can be stale session artifacts; an unknown pin gets a
-  `whois` + recency check before it is addressed. The `captain` alias, when
-  bound, is the only title-based address.
-- **Plane S is the room, plane P is the whisper.**
-- **`[doorbell]` is the wake.** A 5-minute self-watch loop is not the
-  driver.
+- **Peer-triggered is default-on** (`flywheel spawn --profile <role>`). `--no-peer-aware` opts out of dispatcher registration + this handler, never of the identity line.
+- **`[doorbell]` is the wake.** A self-watch loop is not the driver.
