@@ -48,11 +48,33 @@ classified and journaled like anyone else's.
 What a subscription row cannot create is a **pane**: rows carry identity,
 scope, filter, sink, and budget — no target. Routing is registry-driven, and
 deliberately so: inventing a target for a pane-less pin would fabricate a
-delivery the sink cannot perform. Instead the pin's status stays `unknown`,
-so `should_inject` refuses, and the wake lands as a visible
-`Audit queued` row against that pin — read it with
-`flywheel doorbell why <project> <pin>`. Prompt delivery for such a pin
-needs a real pane to route to (or a non-herdr sink, still Phase 2).
+delivery the sink cannot perform.
+
+So the index marks such a pin **unroutable**, and its wakes are
+**digest-bound**: they never enter the per-pin prompt queue (that queue only
+drains on a `working → injectable` status transition, which a pin with no
+pane can never produce — a queued wake there would be a RAM-only entry that
+dies with the daemon and never reaches you). Instead the wake lands in the
+digest batch, and the journal row says why:
+
+```json
+{"actions":[{"Digest":{"pin":"QuietHeron","why":"no_route"}}]}
+```
+
+Read it with `flywheel doorbell digest <project> --identity <pin>` — the verb
+prints the wake line for a `Digest` row, which is the only place it is
+rendered (the wake is otherwise readable only by grepping the journal).
+
+`flywheel doorbell why <project> <pin>` does **not** yet replay these rows:
+`why` rebuilds each entry by folding the embedded `workspace::tick`, and the
+daemon journals its inbox wakes as `InboxFetched`, which has no `workspace::Msg`
+counterpart — so the fold skips the row and `why` reports that nothing mentions
+the pin. That blindness predates this change and covers the daemon's whole
+inbox path, not just pane-less pins; it is filed separately.
+
+To get an actual **prompt** for such a pin you need a real pane to route to
+(bind a subscription to a spawned pin) — or the non-herdr sinks (webhook/DM)
+that Phase 2 specifies. Until then, digest is the delivery.
 
 So when `why` says nothing about a pin, ask in this order: is the daemon
 hosting (`/health`), can it exec its CLIs (`/health.binaries`), is the pin
