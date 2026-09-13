@@ -7,6 +7,7 @@
 //! prompt intents, degradation arrives as data. No tokio actor framework;
 //! plain tasks + `mpsc`/`oneshot` (kameo concepts, Appendix A).
 pub mod api;
+pub mod binpath;
 pub mod brain;
 pub mod file_host;
 pub mod hear;
@@ -19,6 +20,7 @@ pub mod sensors;
 pub mod sinks;
 pub mod store;
 pub mod subscribe;
+pub mod tailprobe;
 pub mod watchbeat;
 pub use api::{AskError, Ping, Stats, ask};
 pub use brain::{Brain, BrainConfig, RunReport};

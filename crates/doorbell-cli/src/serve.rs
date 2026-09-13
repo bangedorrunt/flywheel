@@ -28,16 +28,16 @@ async fn host_workspace(
 ) -> doorbell_rt::RunReport {
     use doorbell_rt::{Brain, BrainConfig, FileHost, FileHostConfig, Host, SinkManager};
     use doorbell_rt::{CliPromptSink, FileStore};
-    let toron_bin = std::env::var("DOORBELL_TORON_BIN").unwrap_or_else(|_| "toron".into());
-    let herdr_bin = std::env::var("DOORBELL_HERDR_BIN").unwrap_or_else(|_| "herdr".into());
+    let bins = resolved_bins();
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
-    fcfg.toron_bin = toron_bin;
-    fcfg.herdr_bin = herdr_bin.clone();
+    fcfg.toron_bin = bins.toron.clone();
+    fcfg.herdr_bin = bins.herdr.clone();
     let mut host = FileHost::new(fcfg).with_tx(tx.clone());
     // Daemon-keyed generation: first run captures the doorbell binary
     // identity so a mid-run upgrade retires the loop instead of waking
     // stale (same rule as the embedded WatcherGen gate, daemon-keyed).
     doorbell_rt::ensure_daemon_gen(&fw_state, &workspace);
+    let herdr_bin = bins.herdr.clone();
     let mut sinks = SinkManager::new(tx.clone());
     // Supervised registration (audit P1): a failed herdr CLI park gets a
     // fresh adapter under the Transient policy instead of dying until
@@ -92,6 +92,54 @@ struct AppState {
 /// bd-2o1v: shared mutable state handle (parking_lot — no poisoning).
 type Shared<T> = std::sync::Arc<parking_lot::Mutex<T>>;
 
+/// The external CLIs this daemon execs. Resolved through the shared search
+/// order (`doorbell_rt::binpath`) — under launchd/systemd `PATH` is
+/// `/usr/bin:/bin:/usr/sbin:/sbin`, which holds neither `toron` nor
+/// `herdr`, so a bare name silently breaks the watch child and every
+/// prompt while the daemon still advertises `mode: hosted`.
+/// `*_resolved=false` keeps the bare name as a last resort (the spawn then
+/// fails visibly) and is reported as `degraded` in `/health`.
+#[derive(Clone)]
+struct Bins {
+    toron: String,
+    herdr: String,
+    toron_resolved: bool,
+    herdr_resolved: bool,
+}
+
+fn resolved_bins() -> Bins {
+    use doorbell_rt::binpath::{HERDR_BIN_ENV, TORON_BIN_ENV, resolve_cli_or_name};
+    let (toron, toron_resolved) = resolve_cli_or_name("toron", TORON_BIN_ENV);
+    let (herdr, herdr_resolved) = resolve_cli_or_name("herdr", HERDR_BIN_ENV);
+    Bins {
+        toron: toron.to_string_lossy().into_owned(),
+        herdr: herdr.to_string_lossy().into_owned(),
+        toron_resolved,
+        herdr_resolved,
+    }
+}
+
+/// A degradation probe is about NOW, not history: a fetch error older than
+/// this is stale evidence, not a live fault.
+const PROBE_FRESH_SECS: u64 = 120;
+/// Watch-thrash measurement window. A healthy quiet watcher idle-exits at
+/// 90s and is respawned after the retry gate (~109s cadence measured live),
+/// so individual restarts are routine and two workspaces phase them
+/// independently — only the *frequency* separates thrash (live: every 16s)
+/// from health. Allowance is ~2x the healthy cadence.
+const WATCH_WINDOW_SECS: u64 = 300;
+const WATCH_RESTARTS_ALLOWED_PER_WS: usize = 6;
+
+fn workspace_audit_path(fw_state: &std::path::Path, ws: &str) -> std::path::PathBuf {
+    fw_state.join("doorbell").join(format!("{ws}.audit.jsonl"))
+}
+
+fn workspace_journal_path(fw_state: &std::path::Path, ws: &str) -> std::path::PathBuf {
+    fw_state
+        .join("journals")
+        .join(format!("doorbell-journal-{ws}.jsonl"))
+}
+
 /// Reap threshold for orphaned spawn-scoped subscriptions (bd-2o1v): a
 /// crashed fleet's rows die after a week of journal silence. `kill`
 /// normally drops its own rows; this is the belt.
@@ -105,7 +153,9 @@ fn unhosted_subscribed(
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for sub in subs {
-        let Some(project) = &sub.project else { continue };
+        let Some(project) = &sub.project else {
+            continue;
+        };
         for ws in sub.scope.workspaces() {
             let key = format!("{project}/{ws}");
             if !hosted.contains(&key) && !out.contains(&(project.clone(), ws.clone())) {
@@ -236,12 +286,28 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
     let started = std::time::Instant::now();
     let log_path = cfg.log_file();
+    // Precondition, named loudly: the daemon execs `toron` (bus watch +
+    // inbox fetch) and `herdr` (prompt sink). Under launchd/systemd neither
+    // is on PATH; resolving them here to a real absolute path is what keeps
+    // the ring alive, and the miss is stated once instead of being inferred
+    // from a wake that never arrives.
+    let bins = resolved_bins();
+    eprintln!(
+        "doorbell serve: cli toron={} (resolved={}) herdr={} (resolved={})",
+        bins.toron, bins.toron_resolved, bins.herdr, bins.herdr_resolved
+    );
+    if !bins.toron_resolved || !bins.herdr_resolved {
+        eprintln!(
+            "doorbell serve: WARNING no `toron`/`herdr` on PATH, beside this binary, or in \
+             ~/.cargo/bin, ~/.local/bin, ~/.local/share/mise/shims — wakes will NOT be \
+             delivered; set DOORBELL_TORON_BIN / DOORBELL_HERDR_BIN or install the binaries"
+        );
+    }
     // bd-2o1v: `hosted` starts EMPTY — `spawn_host_loop` is the sole writer,
     // so the list names only loops that actually exist (a pre-populated
     // list made the idempotency guard skip every boot host: health showed
     // hosted strings with no Brain behind them, zero sweeps, clean exit).
-    let hosted: Shared<Vec<String>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let hosted: Shared<Vec<String>> = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     eprintln!(
         "doorbell serve: up on 127.0.0.1:{} + {} (hosting {})",
         cfg.port,
@@ -449,14 +515,12 @@ fn reconcile_once(
         match lease::acquire_lease(&cfg.flywheel_state, &workspace, now) {
             Ok(l) => {
                 owned.lock().push((workspace.clone(), l));
-                eprintln!(
-                    "doorbell serve: auto-hosting {project}/{workspace} (subscribed)"
-                );
+                eprintln!("doorbell serve: auto-hosting {project}/{workspace} (subscribed)");
                 spawn_host_loop(cfg, hosted, loops, loop_txs, &project, &workspace);
             }
-            Err(e) => eprintln!(
-                "doorbell serve: auto-host {project}/{workspace} lease failed: {e:?}"
-            ),
+            Err(e) => {
+                eprintln!("doorbell serve: auto-host {project}/{workspace} lease failed: {e:?}")
+            }
         }
     }
 }
@@ -703,6 +767,46 @@ fn health_body(app: &AppState) -> String {
     }
     let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &hosted);
     let watch_age = hosted_watch_age(&app.fw_state, &hosted);
+    // D2/P3: the daemon's own edges degrade loudly. Two facts that were
+    // live-invisible: every inbox fetch failing (`inbox_error` audits) and a
+    // watch child that dies far faster than its idle-exit cadence
+    // (`RestartWatch` rows). Both are read back from the ground-truth
+    // surfaces rather than tracked in RAM, so they survive a restart.
+    let bins = resolved_bins();
+    if !bins.toron_resolved || !bins.herdr_resolved {
+        degraded.push("cli_unresolved".to_string());
+    }
+    let now = doorbell_rt::lease::unix_now();
+    let ws_names: Vec<String> = hosted
+        .iter()
+        .filter_map(|h| hosted_workspace(h).map(str::to_string))
+        .collect();
+    let audits: Vec<std::path::PathBuf> = ws_names
+        .iter()
+        .map(|w| workspace_audit_path(&app.fw_state, w))
+        .collect();
+    if doorbell_rt::tailprobe::newest_match_age_secs_across(
+        audits.iter().map(std::path::PathBuf::as_path),
+        "\"kind\":\"inbox_error\"",
+        now,
+    )
+    .is_some_and(|age| age <= PROBE_FRESH_SECS)
+    {
+        degraded.push("inbox_fetch_failing".to_string());
+    }
+    let journals: Vec<std::path::PathBuf> = ws_names
+        .iter()
+        .map(|w| workspace_journal_path(&app.fw_state, w))
+        .collect();
+    let restarts = doorbell_rt::tailprobe::count_matches_within_across(
+        journals.iter().map(std::path::PathBuf::as_path),
+        "RestartWatch",
+        now,
+        WATCH_WINDOW_SECS,
+    );
+    if restarts > WATCH_RESTARTS_ALLOWED_PER_WS * ws_names.len() {
+        degraded.push("watch_restart_loop".to_string());
+    }
     let mailbox_root = doorbell_rt::toron_data_root(None);
     let presence_age =
         doorbell_rt::watchbeat::file_age_secs(&doorbell_rt::presence_path(&mailbox_root));
@@ -713,6 +817,17 @@ fn health_body(app: &AppState) -> String {
         "uptime_s": app.started.elapsed().as_secs(),
         "mode": mode,
         "hosted": hosted,
+        // The CLIs actually exec'd. An operator reading `/health` after a
+        // silent ring can see the resolved paths instead of guessing which
+        // `toron`/`herdr` a launchd daemon found.
+        "binaries": {
+            "toron": bins.toron,
+            "herdr": bins.herdr,
+            "resolved": {
+                "toron": bins.toron_resolved,
+                "herdr": bins.herdr_resolved,
+            },
+        },
         // last_event_age_s is MEASURED from the watch heartbeat (None =
         // this workspace has never seen a bus event: wrong bus or dead
         // child), not the literal `null` it used to be.
@@ -858,7 +973,7 @@ fn stats_body(app: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::known_journal_workspaces;
-    use super::{reap_candidates, unhosted_subscribed, REAP_AFTER_SECS};
+    use super::{REAP_AFTER_SECS, reap_candidates, unhosted_subscribed};
 
     /// bd-enov (F17): the wake-blind detector reads exactly the workspaces the
     /// plane has served — a journal file per workspace, ignoring strays and
@@ -954,5 +1069,63 @@ mod tests {
             reap_candidates(&rows, aged),
             vec!["spawn-old-p".to_string()]
         );
+    }
+
+    /// The 2026-09-13 outage was invisible in the one place an operator
+    /// looks: every inbox fetch failed (`inbox_error` per pin per second)
+    /// and the watch child thrashed (a `RestartWatch` every 16s), yet
+    /// `/health` reported `degraded: []`. Both facts are now read back from
+    /// the ground-truth surfaces and named.
+    #[test]
+    fn health_names_fetch_failure_and_watch_thrash() {
+        use super::{AppState, health_body};
+        let dir = std::env::temp_dir().join(format!("db-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
+        std::fs::create_dir_all(dir.join("journals")).expect("mkdir journal");
+        let ts = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 5, 0)
+            .expect("now in range")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        std::fs::write(
+            dir.join("doorbell/flywheel-flywheel.audit.jsonl"),
+            format!(
+                "{{\"ts\":\"{ts}\",\"kind\":\"inbox_error\",\"workspace\":\"flywheel-flywheel\"}}\n"
+            ),
+        )
+        .expect("write audit");
+        // Thrash = a restart every 16s (the live failure), not one routine
+        // idle-exit restart: the probe must count, not sample recency.
+        let mut journal = String::new();
+        for off in (0..=288).step_by(16) {
+            let stamp =
+                chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - off, 0)
+                    .expect("in range")
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            journal.push_str(&format!(
+                "{{\"ts\":\"{stamp}\",\"v\":2,\"actions\":[\"RestartWatch\"]}}\n"
+            ));
+        }
+        std::fs::write(
+            dir.join("journals/doorbell-journal-flywheel-flywheel.jsonl"),
+            journal,
+        )
+        .expect("write journal");
+        let app = AppState {
+            started: std::time::Instant::now(),
+            fw_state: dir.clone(),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![
+                "flywheel/flywheel-flywheel".to_string(),
+            ])),
+        };
+        let body = health_body(&app);
+        assert!(
+            body.contains("inbox_fetch_failing"),
+            "a failing inbox fetch must be named in degraded: {body}"
+        );
+        assert!(
+            body.contains("watch_restart_loop"),
+            "watch thrash must be named in degraded: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
