@@ -1773,7 +1773,14 @@ enum DoorbellCmd {
     /// Folds tick from Default over the doorbell journal (same trust
     /// surface as `why`); urgent wakes never batch. Wedge alarm when the
     /// queue cannot drain.
-    Afk { project: String },
+    Afk {
+        project: String,
+        /// newest entries to show (bd-z5ut: the folded queue is unbounded by
+        /// construction — an older remainder is summarized, never silently
+        /// dropped)
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
     /// generalized digest (bd-asr2.11, D8): per-identity wake digest over
     /// any window — earliest first, unanswered escalated on top. `afk`
     /// stays as the captain-default alias. Roster-free (no arrival triple).
@@ -4741,7 +4748,7 @@ fn main() {
             DoorbellCmd::Start { project } => cmd_doorbell_start(&cfg, project),
             DoorbellCmd::Stop { project, workspace } => cmd_doorbell_stop(&cfg, project, workspace),
             DoorbellCmd::ReInject { project } => cmd_doorbell_re_inject(&cfg, project),
-            DoorbellCmd::Afk { project } => cmd_doorbell_afk(&cfg, project),
+            DoorbellCmd::Afk { project, limit } => cmd_doorbell_afk(&cfg, project, *limit),
             DoorbellCmd::Digest {
                 project,
                 identity,
@@ -10233,20 +10240,8 @@ fn cmd_doorbell_why(
     subscriber: Option<&str>,
 ) -> Result<()> {
     let _ = cfg;
-    // bd-a8ld: fold only the workspaces this project owns. The journal dir
-    // accumulates unrelated ones — synthetic `manual` / `facts-lapsed-*` rows
-    // written by fact helpers, other projects' hosts — and folding them
-    // reported a mismatch per row and buried the ring the caller asked about.
-    // `all` opts back into the global scan.
-    let scoped: Option<Vec<String>> = (project != "all").then(|| {
-        let mut w = vec![project.to_string()];
-        w.extend(
-            doorbell::journal_workspaces_list(&config::state_dir())
-                .into_iter()
-                .filter(|x| x.starts_with(&format!("{project}-"))),
-        );
-        w
-    });
+    // bd-a8ld: fold only the workspaces this project owns (see the helper).
+    let scoped = doorbell_scoped_workspaces(project);
     // fold tick from Default — replay is the trust surface, not grep
     // WorkspaceModel is the single owner; journal entries may be DoorbellMsg (old) or workspace::Msg (new)
     let entries = doorbell::journal_read_all(&config::state_dir());
@@ -10570,9 +10565,14 @@ fn cmd_doorbell_why(
 /// so their presence here is record, not backlog. Wedge alarm when the
 /// queue cannot drain (overdue predicate); empty queue is clean, not an
 /// error — AFK with nothing queued means nothing needs the captain.
-fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
+fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
     let _ = cfg;
-    let _ = project;
+    // bd-z5ut: fold only this project's workspaces. The journal dir holds
+    // synthetic fact workspaces (`manual`, `facts-close-*`, `facts-lapsed-*`)
+    // whose folds have no clock Msg, so their drain never fires and their
+    // entire history accumulated into the queue — that is what printed as 362
+    // items of another workspace's noise with the caller's fresh wake absent.
+    let scoped = doorbell_scoped_workspaces(project);
     let entries = doorbell::journal_read_all(&config::state_dir());
     if entries.is_empty() {
         println!("doorbell afk: no journal entries — nothing queued");
@@ -10580,12 +10580,29 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
     }
     let mut models: std::collections::BTreeMap<String, workspace::WorkspaceModel> =
         std::collections::BTreeMap::new();
+    // bd-z5ut: rt-journaled digest-bound wakes, collected off the rows because
+    // the embedded fold cannot produce them (no InboxFetched arm — bd-c9jw).
+    let mut bound: Vec<(String, String, String, String)> = Vec::new();
     for (ws, entry) in &entries {
+        if scoped
+            .as_ref()
+            .is_some_and(|allowed| !allowed.iter().any(|w| w == ws))
+        {
+            continue;
+        }
         if !doorbell::journal_version_accepted(entry) {
             eprintln!(
                 "doorbell afk: refusing entry with unknown journal v (workspace {ws}) — no fold-past"
             );
             continue;
+        }
+        let ts = entry
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .unwrap_or("?")
+            .to_string();
+        for (pin, line, why) in digest_action_entries(entry) {
+            bound.push((ts.clone(), ws.clone(), pin, format!("[{why}] {line}")));
         }
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
         if let Some(msg) = snapshot::replay_msg(&msg_val) {
@@ -10615,11 +10632,35 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str) -> Result<()> {
             *counters.entry(k).or_insert(0) += m.wake_counters.get(k).copied().unwrap_or(0);
         }
     }
+    // bd-z5ut: bound the surface. Newest first, and say what was withheld —
+    // a silently truncated digest is the same failure as an unbounded one.
+    queue.sort_by_key(|e| e.at_unix);
+    let withheld = queue.len().saturating_sub(limit);
+    if withheld > 0 {
+        queue.drain(..withheld);
+    }
     let now = doorbell_now_unix();
     if queue.is_empty() {
         println!("doorbell afk: queue empty — nothing needs the captain");
     } else {
         print!("{}", workspace::render_digest_with_holds(&queue, &[], now));
+    }
+    if withheld > 0 {
+        println!(
+            "… {withheld} older entr{} withheld — raise --limit to see them",
+            if withheld == 1 { "y" } else { "ies" }
+        );
+    }
+    bound.sort_by(|a, b| a.0.cmp(&b.0));
+    if !bound.is_empty() {
+        println!("digest-bound wakes ({}):", bound.len());
+        let hidden = bound.len().saturating_sub(limit);
+        for (ts, ws, pin, line) in bound.iter().skip(hidden) {
+            println!("- {ts} {ws} {pin} {line}");
+        }
+        if hidden > 0 {
+            println!("… {hidden} older withheld — raise --limit to see them");
+        }
     }
     let counters: Vec<String> = ["benign", "routine", "captain", "urgent"]
         .iter()
@@ -10910,7 +10951,11 @@ fn cmd_doorbell_digest(
         // bd-bk9t: a digest-bound wake (a pane-less subscribed pin) has no
         // prompt route, so its `Digest` action row IS the delivery. Without
         // the line here the batch could only be read by grepping the journal.
-        let detail = digest_action_lines(entry).join(" | ");
+        let detail = digest_action_entries(entry)
+            .into_iter()
+            .map(|(_, line, _)| line)
+            .collect::<Vec<_>>()
+            .join(" | ");
         rows.push((ws.clone(), ts, stage, who, detail));
     }
     let roster = digest_roster_lines(cfg, project, doorbell_now_unix());
@@ -10954,6 +10999,27 @@ fn cmd_doorbell_digest(
     }
     Ok(())
 }
+/// bd-a8ld/bd-z5ut: the journal workspaces this project owns — `<project>`
+/// itself plus every `<project>-<workspace>` the journal dir holds. `None`
+/// means "no scoping" (`all`), which the global scan needs.
+///
+/// The journal dir accumulates workspaces that are not the caller's business:
+/// synthetic `manual` / `facts-lapsed-*` / `facts-close-*` rows written by the
+/// fact helpers, and other projects' hosts. Folding them made `why` report a
+/// mismatch per row and made `afk` print an unbounded digest of another
+/// workspace's noise — in both cases burying the answer that was asked for.
+fn doorbell_scoped_workspaces(project: &str) -> Option<Vec<String>> {
+    (project != "all").then(|| {
+        let mut w = vec![project.to_string()];
+        w.extend(
+            doorbell::journal_workspaces_list(&config::state_dir())
+                .into_iter()
+                .filter(|x| x.starts_with(&format!("{project}-"))),
+        );
+        w
+    })
+}
+
 /// bd-a8ld: rewrite unit doorbell actions written in their pre-bd-z5ou
 /// object form (`{"FetchInbox":{"since":…}}`) to the current unit string.
 /// Only the three unit variants are touched: `Prompt`/`Audit`/`FactMiss`/
@@ -10973,10 +11039,15 @@ pub(crate) fn normalize_action_shapes(actions: &mut serde_json::Value) {
     }
 }
 
-/// bd-bk9t: the wake lines of a journal row's `Digest` actions, in order.
-/// `route_or_queue` emits one per unroutable-pin wake, so a row can carry
-/// several; the caller joins them. Non-`Digest` actions are ignored.
-fn digest_action_lines(entry: &serde_json::Value) -> Vec<String> {
+/// bd-bk9t: the `(pin, line, why)` of a journal row's `Digest` actions, in
+/// order. `route_or_queue` emits one per unroutable-pin wake, so a row can
+/// carry several. Non-`Digest` actions are ignored.
+///
+/// bd-z5ut: `afk` reads these too. A digest-bound wake is never produced by
+/// the embedded fold (`workspace::tick` has no `InboxFetched` arm, which is
+/// bd-c9jw), so without reading the rows the captain's batch surface missed
+/// exactly the wake that had just arrived.
+fn digest_action_entries(entry: &serde_json::Value) -> Vec<(String, String, String)> {
     entry
         .get("actions")
         .and_then(|a| a.as_array())
@@ -10984,10 +11055,15 @@ fn digest_action_lines(entry: &serde_json::Value) -> Vec<String> {
             actions
                 .iter()
                 .filter_map(|a| {
-                    a.get("Digest")
-                        .and_then(|d| d.get("line"))
-                        .and_then(|l| l.as_str())
-                        .map(str::to_string)
+                    let d = a.get("Digest")?;
+                    Some((
+                        d.get("pin")?.as_str()?.to_string(),
+                        d.get("line")?.as_str()?.to_string(),
+                        d.get("why")
+                            .and_then(|w| w.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ))
                 })
                 .collect()
         })
@@ -10996,10 +11072,10 @@ fn digest_action_lines(entry: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod bk9t_digest_line_tests {
-    use super::digest_action_lines;
+    use super::digest_action_entries;
 
     #[test]
-    fn reads_only_digest_lines_in_order() {
+    fn reads_only_digest_entries_in_order() {
         let entry = serde_json::json!({
             "actions": [
                 {"Audit": {"kind": "queued", "pin": "OtherPin", "detail": "x"}},
@@ -11009,8 +11085,19 @@ mod bk9t_digest_line_tests {
             ]
         });
         assert_eq!(
-            digest_action_lines(&entry),
-            vec!["[doorbell] plane-P urgent", "[doorbell] channel"],
+            digest_action_entries(&entry),
+            vec![
+                (
+                    "OperatorPin".to_string(),
+                    "[doorbell] plane-P urgent".to_string(),
+                    "no_route".to_string()
+                ),
+                (
+                    "OperatorPin".to_string(),
+                    "[doorbell] channel".to_string(),
+                    "no_route".to_string()
+                ),
+            ],
             "a digest-bound wake must be readable from the row, in order"
         );
     }
@@ -11018,8 +11105,8 @@ mod bk9t_digest_line_tests {
     #[test]
     fn rows_without_a_digest_action_are_empty() {
         let entry = serde_json::json!({"actions": ["FetchInbox"]});
-        assert!(digest_action_lines(&entry).is_empty());
-        assert!(digest_action_lines(&serde_json::json!({})).is_empty());
+        assert!(digest_action_entries(&entry).is_empty());
+        assert!(digest_action_entries(&serde_json::json!({})).is_empty());
     }
 }
 
