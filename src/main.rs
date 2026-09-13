@@ -7764,6 +7764,27 @@ mod bd2o1v_reset_tests {
     }
 }
 
+    /// bd-kj2z: the door means woken — `cmd_arrive` records the arriving
+    /// pin's subscription (idempotent, project-named) instead of relying
+    /// on `doorbell start`, which arms nothing on an empty registry.
+    #[test]
+    fn arrive_records_pin_subscription() {
+        let src = include_str!("main.rs");
+        let start = src
+            .rfind("\nfn cmd_arrive(")
+            .expect("real cmd_arrive (rfind skips quoted copies)");
+        let end = src[start..]
+            .find("\n/// (holder pin, whois.stale)")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let hook = body
+            .find("register_arrival_subscription")
+            .expect("arrive records the pin subscription");
+        let gate = body.find("if let Some(pin) = as_agent").expect("pin-gated");
+        assert!(gate < hook, "subscription follows the pin gate");
+    }
+
 #[cfg(test)]
 mod tripwire {
     /// Locate a column-0 `fn name(` definition in `src`.
@@ -14678,7 +14699,6 @@ fn cmd_arrive(
             }
         }
     }
-    // F10 (bd-enov): a KEPT captain slot with nothing live behind it. Roster
     // staleness is a generous 7 days, so a prior session's pin (pane gone,
     // no heartbeat, dispatcher down) still reads fresh and `mail --to
     // captain` reaches nobody. OFFER the rebind verb; never auto-rebind —
@@ -14699,7 +14719,20 @@ fn cmd_arrive(
         Ok(()) => {}
         Err(e) => eprintln!("flywheel: doorbell start: {e:#}"),
     }
-    // bd-enov (F3): the session door must name uncommitted decision docs
+    // bd-kj2z: the door means woken — record the arriving pin's own wake
+    // subscription so zero-fleet sessions need no babysitting. Idempotent
+    // per (workspace, pin); the daemon auto-hosts the pair within 60s and
+    // reaps week-silent pins. Never fatal to the session door. Scope is
+    // the stable project label, not the possibly-stale spawn meta, so rows
+    // converge instead of scattering one per dead workspace.
+    if let Some(pin) = as_agent {
+        doorbell::register_arrival_subscription(
+            &config::state_dir(),
+            project,
+            &swarm_label(project),
+            pin,
+        );
+    }
     // before a crew is dispatched off stale git history.
     warn_uncommitted_decision_docs(cfg, project);
     if let Some(obj) = objective {
@@ -14707,8 +14740,6 @@ fn cmd_arrive(
     }
     Ok(())
 }
-
-/// (holder pin, whois.stale). Missing/failed whois → (None, true).
 fn lookup_captain_holder(project: &str) -> (Option<String>, bool) {
     let out = std::process::Command::new("toron")
         .args(["mail", "whois", project, "captain", "--json"])

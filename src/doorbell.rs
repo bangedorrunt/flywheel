@@ -504,6 +504,49 @@ pub fn register_workspace_subscriptions(
     }
 }
 
+/// Arrival registration (bd-kj2z): `arrive` records one operator row for
+/// the arriving pin so zero-fleet sessions get woken with no babysitting —
+/// the daemon auto-hosts the named pair within 60s. Idempotent per
+/// (workspace, pin) — re-arriving refreshes the same row. Best-effort and
+/// never fatal to the session door. Stale pins age out via the daemon
+/// reaper; `kill` never touches cli rows (no panes to tie them to).
+pub fn register_arrival_subscription(state_dir: &Path, project: &str, workspace: &str, pin: &str) {
+    use doorbell_rt::subscribe::{
+        Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
+    };
+    let mut store = SubscriptionStore::open(state_dir);
+    let sub = Subscription {
+        id: format!("cli-{workspace}-{pin}"),
+        identity: Identity::Pin(pin.to_string()),
+        scope: Scope::One(workspace.to_string()),
+        filter: Filter::default(),
+        sink: SinkKind::Herdr,
+        budget: Budget::default_530(),
+        project: Some(project.to_string()),
+    };
+    if let Err(e) = store.subscribe(Actor::local_process(), sub, workspace) {
+        eprintln!("flywheel: cannot record arrival wake subscription for {pin}: {e:?}");
+    }
+}
+
+    /// bd-kj2z: arrival rows are idempotent per (workspace, pin) and carry
+    /// the project for auto-host; re-arriving refreshes the same row,
+    /// never a second one.
+    #[test]
+    fn arrival_subscription_is_idempotent_and_names_project() {
+        use doorbell_rt::subscribe::*;
+        let dir = std::env::temp_dir().join(format!("dbll-arrive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        register_arrival_subscription(&dir, "proj", "wA", "P");
+        register_arrival_subscription(&dir, "proj", "wA", "P");
+        let store = SubscriptionStore::open(&dir);
+        let rows = store.list();
+        assert_eq!(rows.len(), 1, "re-arrive refreshes, never duplicates");
+        assert_eq!(rows[0].id, "cli-wA-P");
+        assert_eq!(rows[0].project.as_deref(), Some("proj"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 /// Cron doorbell sink (bd-asr2.16, D7, flag-gated): on tick completion,
 /// journal a Fact row and queue a pending wake. Digest-visible with zero
 /// swarm (the embedded Brain ticks drains on sweep); the emit/deliver
