@@ -123,6 +123,34 @@ plane's own files rather than tracked in RAM, so it survives a restart:
 | `watch_restart_loop` | more than ~2× the healthy watcher restart rate in 300s. A **quiet** watcher restarts by design (90s idle-exit + retry gate ≈ every 109s); a handful in five minutes is healthy, dozens is a loop |
 | `journal_torn_tail` | the journal has a torn tail; folds stop at the gap |
 | `standby_with_known_workspaces` | the daemon is hosting nothing while workspaces that expect rings exist — re-arm it |
+| `no_injectable_panes` | the exact opposite of a bug: hosting, registry pins exist, and `herdr agent list` knows the panes of **none** of them. Wakes classify, queue, and digest, and no prompt can land — start agents (`herdr agent start`) or fix the stale registry |
+
+### The prompt hop's precondition (`/health.injection`)
+
+A wake reaching a pane needs an *injectable* pane: `should_inject` accepts
+only `idle|done|blocked`, and statuses come from `herdr agent list` mapped
+through the spawn registry. When herdr knows no agent, no wake can ever be
+injected — a property of the environment, not a doorbell bug — and it used
+to be invisible: `mode: hosted, degraded: []` while nothing landed. `/health`
+now counts it:
+
+```json
+"injection": { "pins": 3, "panes_seen": 0, "injectable": 0,
+               "panes_missing": 3, "prompt_hop": "no_pane_in_herdr" }
+```
+
+`panes_seen` counts panes in **any** status on purpose: a fleet caught
+mid-work (every pane `working`) is healthy — the durable queue holds the
+wake and drains on the next `idle` — so only `panes_seen == 0` with
+`pins > 0` degrades. `doorbell serve` also says it out loud when it starts
+hosting:
+
+```
+doorbell serve: hosting flywheel/flywheel-flywheel — 3 pin(s), 0 pane(s) in herdr, 0 injectable now
+doorbell serve: WARNING hosting flywheel/flywheel-flywheel — 3 pin(s) but herdr knows none of their
+  panes: NO wake can be injected here (inbox wakes queue/digest instead). Start agents (`herdr agent start`)
+  or fix the stale registry
+```
 
 ## Commands
 
@@ -139,7 +167,7 @@ serve/migrate/ping).
 | Direct ring | `flywheel doorbell inject <project> <pin> "<line>"` (ratcheted, budgeted, digest-visible) |
 | Subscriptions | `flywheel doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair; omitted = never auto-hosted) |
 | Cross-workspace | `flywheel doorbell subscribe --workspace wA --pin P --extra wB` (scope printed, never implicit) |
-| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `degraded` |
+| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded` |
 
 Cross-project wake is a captain hold: `br hold --kind captain --corr external:<proj>:<bead> <your-bead>` rings once when the foreign bead closes; you still resolve the hold.
 
