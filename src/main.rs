@@ -10233,7 +10233,20 @@ fn cmd_doorbell_why(
     subscriber: Option<&str>,
 ) -> Result<()> {
     let _ = cfg;
-    let _ = project;
+    // bd-a8ld: fold only the workspaces this project owns. The journal dir
+    // accumulates unrelated ones — synthetic `manual` / `facts-lapsed-*` rows
+    // written by fact helpers, other projects' hosts — and folding them
+    // reported a mismatch per row and buried the ring the caller asked about.
+    // `all` opts back into the global scan.
+    let scoped: Option<Vec<String>> = (project != "all").then(|| {
+        let mut w = vec![project.to_string()];
+        w.extend(
+            doorbell::journal_workspaces_list(&config::state_dir())
+                .into_iter()
+                .filter(|x| x.starts_with(&format!("{project}-"))),
+        );
+        w
+    });
     // fold tick from Default — replay is the trust surface, not grep
     // WorkspaceModel is the single owner; journal entries may be DoorbellMsg (old) or workspace::Msg (new)
     let entries = doorbell::journal_read_all(&config::state_dir());
@@ -10284,6 +10297,12 @@ fn cmd_doorbell_why(
     let mut shown = 0usize;
     let mut matched = 0usize;
     for (workspace, entry) in &entries {
+        if scoped
+            .as_ref()
+            .is_some_and(|allowed| !allowed.iter().any(|w| w == workspace))
+        {
+            continue;
+        }
         if !doorbell::journal_version_accepted(entry) {
             eprintln!(
                 "doorbell why: refusing entry with unknown journal v (workspace {workspace}) — no fold-past"
@@ -10299,10 +10318,16 @@ fn cmd_doorbell_why(
             }
         }
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
-        let actions_val = entry
+        let mut actions_val = entry
             .get("actions")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        // bd-a8ld: pre-bd-z5ou journals encode the unit `FetchInbox` action as
+        // `{"FetchInbox":{"since":…}}`. The output renderer already tolerates
+        // both shapes; this projection did not — the parse failed as a whole,
+        // `expected` fell back to `[]`, and every legacy row printed a
+        // mismatch against a recomputed action. Normalise before parsing.
+        normalize_action_shapes(&mut actions_val);
         let replay_msg: Option<workspace::Msg> = if let Ok(m) =
             serde_json::from_value::<workspace::Msg>(msg_val.clone())
         {
@@ -10331,44 +10356,33 @@ fn cmd_doorbell_why(
         } else {
             None
         };
-        if let Some(msg) = replay_msg {
-            // Expected may be workspace::Cmd or legacy DoorbellAction
-            let expected: Vec<workspace::Cmd> = if let Ok(v) =
-                serde_json::from_value::<Vec<workspace::Cmd>>(actions_val.clone())
-            {
+        // Expected may be workspace::Cmd or legacy DoorbellAction. The mapping
+        // is `workspace::Cmd::from_doorbell` — ONE definition, so a new action
+        // variant cannot drift between this replay and the live path (it did
+        // for bd-bk9t's Digest, which this block had to be taught by hand).
+        let expected: Vec<workspace::Cmd> =
+            if let Ok(v) = serde_json::from_value::<Vec<workspace::Cmd>>(actions_val.clone()) {
                 v
             } else if let Ok(legacy) =
                 serde_json::from_value::<Vec<doorbell_tick::DoorbellAction>>(actions_val.clone())
             {
                 legacy
                     .into_iter()
-                    .map(|a| match a {
-                        doorbell_tick::DoorbellAction::Prompt { pin, line } => {
-                            workspace::Cmd::Prompt { pin, line }
-                        }
-                        doorbell_tick::DoorbellAction::FetchInbox => workspace::Cmd::FetchInbox,
-                        doorbell_tick::DoorbellAction::CheckAckSla => workspace::Cmd::CheckAckSla,
-                        doorbell_tick::DoorbellAction::RestartWatch => workspace::Cmd::RestartWatch,
-                        doorbell_tick::DoorbellAction::FactMiss { why } => {
-                            workspace::Cmd::FactMiss { why }
-                        }
-                        doorbell_tick::DoorbellAction::Audit { kind, pin, detail } => {
-                            workspace::Cmd::Audit { kind, pin, detail }
-                        }
-                        // bd-bk9t: same data mapping as Cmd::from_doorbell —
-                        // the embedded digest is the audit surface.
-                        doorbell_tick::DoorbellAction::Digest { pin, line, why } => {
-                            workspace::Cmd::Audit {
-                                kind: "digest_bound".into(),
-                                pin,
-                                detail: format!("{why}: {line}"),
-                            }
-                        }
-                    })
+                    .map(workspace::Cmd::from_doorbell)
                     .collect()
             } else {
                 Vec::new()
             };
+        // bd-c9jw/bd-a8ld: the daemon journals rt-only messages (InboxFetched,
+        // Sweep, Presence, Delivered, ...) that the embedded reducer has no arm
+        // for. `why` rebuilds its model from Default + journal, and the daemon's
+        // index state (registry pins, the unroutable set) is not in the journal
+        // — so recomputing such a row compares against a baseline the writer
+        // never used, prints a mismatch for every one of them, and buries the
+        // ring the caller asked about. Replay those rows from their journaled
+        // actions and LABEL them; never fold them as if re-derived.
+        let folded = replay_msg.is_some();
+        let actual: Vec<workspace::Cmd> = if let Some(msg) = replay_msg.clone() {
             let (next, actual) = {
                 // bd-z54w honesty contract: restore the journaled pin set into
                 // the fold index so classification reproduces deterministically.
@@ -10398,91 +10412,104 @@ fn cmd_doorbell_why(
                 );
             }
             models.insert(workspace.clone(), next);
-            replay_seq += 1;
-            // 55nx.9: the journal line carries the budget-gate outcome
-            // (effect); dropped-pin Prompts replayed below are the EFFECTIVE
-            // injects, never the pre-gate cmds.
-            let dropped = why_dropped_pins(entry);
-            let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
-            let corr_match = match corr {
-                Some(c) => {
-                    models
-                        .get(workspace)
-                        .map(|m| m.assignment.contains_key(c))
-                        .unwrap_or(false)
-                        || actual.iter().any(|cmd| match cmd {
-                            workspace::Cmd::WaitCorr { corr } => corr == c,
-                            workspace::Cmd::SqliteUpsert { corr, .. } => corr == c,
-                            _ => false,
-                        })
-                }
-                None => true,
-            };
-            let pin_match = if corr.is_some() || seq.is_some() {
-                true
-            } else {
-                let effective: Vec<workspace::Cmd> = actual
-                    .iter()
-                    .filter(|c| match c {
-                        workspace::Cmd::Prompt { pin: p, .. } => !dropped.contains(p),
-                        _ => true,
+            actual
+        } else {
+            expected.clone()
+        };
+        replay_seq += 1;
+        // 55nx.9: the journal line carries the budget-gate outcome
+        // (effect); dropped-pin Prompts replayed below are the EFFECTIVE
+        // injects, never the pre-gate cmds.
+        let dropped = why_dropped_pins(entry);
+        let seq_match = seq.map(|s| s == replay_seq - 1).unwrap_or(true);
+        let corr_match = match corr {
+            Some(c) => {
+                models
+                    .get(workspace)
+                    .map(|m| m.assignment.contains_key(c))
+                    .unwrap_or(false)
+                    || actual.iter().any(|cmd| match cmd {
+                        workspace::Cmd::WaitCorr { corr } => corr == c,
+                        workspace::Cmd::SqliteUpsert { corr, .. } => corr == c,
+                        _ => false,
                     })
-                    .cloned()
-                    .collect();
-                why_entry_mentions_pin(pin, &msg, &effective)
-            };
-            if !corr_match || !seq_match || !pin_match {
-                continue;
             }
-            // Also support direct corr/seq fields in msg if present (extra_tags)
-            matched += 1;
-            shown += 1;
-            if shown > limit {
-                continue;
-            }
-            let ts = entry.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
-            let msg = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
-            let actions = entry
-                .get("actions")
-                .and_then(|a| a.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| {
-                            // 55nx.9: a journaled Prompt the budget dropped
-                            // was never injected — skip it in the replay.
-                            if let Some(p) = v
-                                .get("Prompt")
-                                .and_then(|p| p.get("pin"))
-                                .and_then(|p| p.as_str())
-                                && dropped.iter().any(|d| d == p)
-                            {
-                                return None;
-                            }
-                            Some(if v.get("Prompt").is_some() {
-                                "prompt"
-                            } else if v.get("CheckAckSla").is_some() {
-                                "check-ack-sla"
-                            } else if v.get("RestartWatch").is_some() {
-                                "restart-watch"
-                            } else if v.get("FactMiss").is_some() {
-                                "fact-miss"
-                            } else if v.get("Audit").is_some() {
-                                "audit"
-                            } else if v.get("FetchInbox").is_some()
-                                || v.as_str() == Some("FetchInbox")
-                            {
-                                // Unit since bd-z5ou (was {"FetchInbox":{"since"}});
-                                // old journals keep the object shape.
-                                "fetch-inbox"
-                            } else {
-                                "unknown"
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",")
+            None => true,
+        };
+        let pin_match = if corr.is_some() || seq.is_some() {
+            true
+        } else {
+            let effective: Vec<workspace::Cmd> = actual
+                .iter()
+                .filter(|c| match c {
+                    workspace::Cmd::Prompt { pin: p, .. } => !dropped.contains(p),
+                    _ => true,
                 })
-                .unwrap_or_default();
-            let kind = match msg.get("WatchNdjson") {
+                .cloned()
+                .collect();
+            why_entry_mentions_pin(pin, replay_msg.as_ref(), &effective)
+        };
+        if !corr_match || !seq_match || !pin_match {
+            continue;
+        }
+        // Also support direct corr/seq fields in msg if present (extra_tags)
+        matched += 1;
+        shown += 1;
+        if shown > limit {
+            continue;
+        }
+        let ts = entry.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
+        let msg = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+        let actions = entry
+            .get("actions")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        // 55nx.9: a journaled Prompt the budget dropped
+                        // was never injected — skip it in the replay.
+                        if let Some(p) = v
+                            .get("Prompt")
+                            .and_then(|p| p.get("pin"))
+                            .and_then(|p| p.as_str())
+                            && dropped.iter().any(|d| d == p)
+                        {
+                            return None;
+                        }
+                        Some(if v.get("Prompt").is_some() {
+                            "prompt"
+                        } else if v.get("CheckAckSla").is_some() {
+                            "check-ack-sla"
+                        } else if v.get("RestartWatch").is_some() {
+                            "restart-watch"
+                        } else if v.get("FactMiss").is_some() {
+                            "fact-miss"
+                        } else if v.get("Audit").is_some() {
+                            "audit"
+                        } else if v.get("Digest").is_some() {
+                            // bd-bk9t: a digest-bound wake is a first-class
+                            // action, never "unknown".
+                            "digest"
+                        } else if v.get("FetchInbox").is_some() || v.as_str() == Some("FetchInbox")
+                        {
+                            // Unit since bd-z5ou (was {"FetchInbox":{"since"}});
+                            // old journals keep the object shape.
+                            "fetch-inbox"
+                        } else {
+                            "unknown"
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        // bd-c9jw: daemon rows carry the rt message shape (`rt_kind`),
+        // embedded rows the workspace::Msg shape. Name both, instead of
+        // labelling every daemon row "other".
+        let kind = if let Some(rt) = msg.get("rt_kind").and_then(|k| k.as_str()) {
+            rt
+        } else {
+            match msg.get("WatchNdjson") {
                 Some(_) => "watch",
                 None => match msg.get("HerdrStatus") {
                     Some(_) => "status",
@@ -10494,28 +10521,32 @@ fn cmd_doorbell_why(
                         },
                     },
                 },
-            };
-            let status = msg
-                .get("HerdrStatus")
-                .and_then(|h| h.get("status"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
-            // fold tick replay already verified above; this print is the user-visible replay
-            println!(
-                "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}",
-                replay_seq - 1,
-                if status.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ->{status}")
-                },
-                if dropped.is_empty() {
-                    String::new()
-                } else {
-                    format!(" dropped=[{}]", dropped.join(","))
-                },
-            );
-        }
+            }
+        };
+        let status = msg
+            .get("HerdrStatus")
+            .and_then(|h| h.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        // fold tick replay already verified above; this print is the user-visible replay
+        println!(
+            "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}{}",
+            replay_seq - 1,
+            if status.is_empty() {
+                String::new()
+            } else {
+                format!(" ->{status}")
+            },
+            if dropped.is_empty() {
+                String::new()
+            } else {
+                format!(" dropped=[{}]", dropped.join(","))
+            },
+            // bd-c9jw: say which rows were re-derived by the fold and
+            // which were read from the journal — the trust surface must
+            // not blur the two.
+            if folded { "" } else { " [journaled]" },
+        );
     }
     if matched == 0 {
         if let Some(c) = corr {
@@ -10923,6 +10954,25 @@ fn cmd_doorbell_digest(
     }
     Ok(())
 }
+/// bd-a8ld: rewrite unit doorbell actions written in their pre-bd-z5ou
+/// object form (`{"FetchInbox":{"since":…}}`) to the current unit string.
+/// Only the three unit variants are touched: `Prompt`/`Audit`/`FactMiss`/
+/// `Digest` are struct variants in BOTH encodings and must stay objects.
+pub(crate) fn normalize_action_shapes(actions: &mut serde_json::Value) {
+    let Some(arr) = actions.as_array_mut() else {
+        return;
+    };
+    for a in arr.iter_mut() {
+        for unit in ["FetchInbox", "CheckAckSla", "RestartWatch"] {
+            let payloaded = a.get(unit).is_some_and(|v| !v.is_boolean() && !v.is_null());
+            if payloaded {
+                *a = serde_json::Value::String(unit.to_string());
+                break;
+            }
+        }
+    }
+}
+
 /// bd-bk9t: the wake lines of a journal row's `Digest` actions, in order.
 /// `route_or_queue` emits one per unroutable-pin wake, so a row can carry
 /// several; the caller joins them. Non-`Digest` actions are ignored.
@@ -10973,7 +11023,50 @@ mod bk9t_digest_line_tests {
     }
 }
 
-fn why_entry_mentions_pin(pin: &str, msg: &workspace::Msg, cmds: &[workspace::Cmd]) -> bool {
+#[cfg(test)]
+mod action_shape_tests {
+    use super::normalize_action_shapes;
+
+    #[test]
+    fn legacy_object_shaped_unit_actions_become_unit_strings() {
+        // bd-a8ld: pre-bd-z5ou journals wrote {"FetchInbox":{"since":…}}.
+        // The projection must read them, or every such row compares as [].
+        let mut v = serde_json::json!([
+            {"FetchInbox": {"since": "2026-09-10T00:57:23Z"}},
+            "CheckAckSla",
+            {"Prompt": {"pin": "P", "line": "x"}},
+            {"Digest": {"pin": "P", "line": "l", "why": "no_route"}},
+        ]);
+        normalize_action_shapes(&mut v);
+        assert_eq!(v[0], serde_json::json!("FetchInbox"));
+        assert_eq!(v[1], serde_json::json!("CheckAckSla"));
+        // Struct variants carry real payloads in BOTH encodings — never touch.
+        assert_eq!(
+            v[2],
+            serde_json::json!({"Prompt": {"pin": "P", "line": "x"}})
+        );
+        assert_eq!(
+            v[3],
+            serde_json::json!({"Digest": {"pin": "P", "line": "l", "why": "no_route"}})
+        );
+    }
+
+    #[test]
+    fn non_array_actions_are_left_alone() {
+        let mut v = serde_json::json!({"FetchInbox": {"since": "x"}});
+        normalize_action_shapes(&mut v);
+        assert!(
+            v.get("FetchInbox").is_some(),
+            "a non-array actions field must not be rewritten"
+        );
+    }
+}
+
+fn why_entry_mentions_pin(
+    pin: &str,
+    msg: Option<&workspace::Msg>,
+    cmds: &[workspace::Cmd],
+) -> bool {
     let cmd_hit = cmds.iter().any(|c| match c {
         workspace::Cmd::Prompt { pin: p, .. } => p == pin,
         workspace::Cmd::Audit { pin: p, .. } => p == pin,
@@ -10982,6 +11075,10 @@ fn why_entry_mentions_pin(pin: &str, msg: &workspace::Msg, cmds: &[workspace::Cm
     if cmd_hit {
         return true;
     }
+    // bd-c9jw: a daemon row has no workspace::Msg counterpart, so there is
+    // nothing left to match on beyond the journaled actions above. Say no
+    // rather than pretend.
+    let Some(msg) = msg else { return false };
     match msg {
         workspace::Msg::InboxItems { pin: p, .. }
         | workspace::Msg::InboxRows { pin: p, .. }
