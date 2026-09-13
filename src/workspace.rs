@@ -960,7 +960,10 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    fn from_doorbell(a: crate::doorbell_tick::DoorbellAction) -> Self {
+    /// bd-c9jw: `pub(crate)` so the `why` journal replay uses this ONE
+    /// mapping instead of re-stating it — the duplicate drifted the moment
+    /// a new action variant landed (bd-bk9t's `Digest`).
+    pub(crate) fn from_doorbell(a: crate::doorbell_tick::DoorbellAction) -> Self {
         match a {
             crate::doorbell_tick::DoorbellAction::Prompt { pin, line } => {
                 Self::Prompt { pin, line }
