@@ -39,17 +39,74 @@ verb. `flywheel kill` drops its spawn's rows (lifecycle symmetry);
 operator rows outlive swarms. After `doorbell install`, reload the unit
 definition (`bootout` + `bootstrap`) or the reboot runs the old hosts.
 
+**A subscription is not yet enough on its own.** The hosted loop's sweep,
+watch index, and pin→pane routing are all built from the **spawn registry**
+for that project, so only registry pins are fetched, addressed, and routed.
+An identity that is subscribed but has never been spawned there — the
+operator pin is the live case — has delivered mail in its inbox and still
+rings nobody. Trust `/health` plus the journal, not the subscription list,
+when asking whether a wake will land. (Tracked as a Phase-2 gap in
+ADR-0012 §8.)
+
+## What the daemon execs (CLI resolution)
+
+The daemon shells out to `toron` (bus watch + inbox fetch) and `herdr`
+(prompt sink). It is normally started by launchd/systemd, whose `PATH` is
+`/usr/bin:/bin:/usr/sbin:/sbin` — neither tool is there, and a bare-name
+spawn fails as an ordinary child death: the watcher respawns on the retry
+gate forever and every inbox fetch audits `toron spawn/timeout failed`,
+while `/health` still says `mode: hosted`.
+
+So the daemon resolves both to an absolute path at startup, first hit wins:
+
+1. `PATH`
+2. `~/.cargo/bin`
+3. `~/.local/bin`
+4. beside its own binary (dev checkouts, co-install)
+5. `~/.local/share/mise/shims` **last**
+
+Shims go last on purpose: a mise shim is a dispatcher that must infer a
+tool version from env and cwd, so under launchd it dies with
+`mise ERROR No version is set for shim: toron` — a resolved-looking path
+that cannot run. Set `DOORBELL_TORON_BIN` / `DOORBELL_HERDR_BIN` to pin an
+explicit binary; an override is used verbatim. `doorbell serve` logs the
+resolved pair on startup and `/health.binaries` reports it:
+
+```json
+"binaries": { "toron": "/Users/me/.cargo/bin/toron",
+              "herdr": "/Users/me/.local/bin/herdr",
+              "resolved": { "toron": true, "herdr": true } }
+```
+
+### Reading `/health.degraded`
+
+The list is the answer to "why didn't I get woken?", read back from the
+plane's own files rather than tracked in RAM, so it survives a restart:
+
+| Value | Means |
+|---|---|
+| `cli_unresolved` | `toron`/`herdr` not found anywhere above — wakes will not be delivered |
+| `inbox_fetch_failing` | an `inbox_error` audit row inside the last 120s: the sweep is failing |
+| `watch_restart_loop` | more than ~2× the healthy watcher restart rate in 300s. A **quiet** watcher restarts by design (90s idle-exit + retry gate ≈ every 109s); a handful in five minutes is healthy, dozens is a loop |
+| `journal_torn_tail` | the journal has a torn tail; folds stop at the gap |
+| `standby_with_known_workspaces` | the daemon is hosting nothing while workspaces that expect rings exist — re-arm it |
+
 ## Commands
+
+Verbs live in two places: `flywheel doorbell …` (the operator surface —
+status/start/stop/re-inject/afk/digest/why/inject/subscribe) and the
+`doorbell` binary itself (the daemon: start/stop/restart/status/install/
+serve/migrate/ping).
 
 | Need | Command |
 |---|---|
 | Lifecycle | `flywheel doorbell status\|start\|stop\|re-inject\|afk` |
-| Why | `doorbell why <project> <pin> --seq <n> --corr <id>` |
-| History | `doorbell events`, `doorbell digest` |
-| Direct ring | `doorbell inject <project> <pin> "<line>"` (ratcheted, budgeted, digest-visible) |
-| Subscriptions | `doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair; omitted = never auto-hosted) |
-| Cross-workspace | `doorbell subscribe --workspace wA --pin P --extra wB` (scope printed, never implicit) |
-| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `degraded` |
+| Why | `flywheel doorbell why <project> <pin> --seq <n> --corr <id>` |
+| History | `flywheel doorbell digest` |
+| Direct ring | `flywheel doorbell inject <project> <pin> "<line>"` (ratcheted, budgeted, digest-visible) |
+| Subscriptions | `flywheel doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair; omitted = never auto-hosted) |
+| Cross-workspace | `flywheel doorbell subscribe --workspace wA --pin P --extra wB` (scope printed, never implicit) |
+| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `degraded` |
 
 Cross-project wake is a captain hold: `br hold --kind captain --corr external:<proj>:<bead> <your-bead>` rings once when the foreign bead closes; you still resolve the hold.
 
