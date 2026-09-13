@@ -9,6 +9,10 @@ k
 mbx +nightly-aarch64-apple-darwin install --path . --force
 mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force # plane D CLI (bd-s4fc: proxy resolves it co-located or on PATH)
 # macOS (only if a stale-signature SIGKILL appears): codesign --force --sign - ~/.cargo/bin/flywheel
+# Same for the daemon after `cargo install` — a CODESIGNING SIGKILL shows up as the
+# planned `doorbell serve` vanishing mid-tick with an empty log and a
+# ~/Library/Logs/DiagnosticReports/doorbell-*.ips saying "Code Signature Invalid":
+# codesign --force --sign - ~/.cargo/bin/doorbell && launchctl kickstart -k gui/$(id -u)/com.doorbell.serve
 ```
 
 Rust runs through mbx (cargo cache): prefix every cargo invocation with `mbx +nightly-aarch64-apple-darwin` (bare `cargo` misparses under the mbx shim).
