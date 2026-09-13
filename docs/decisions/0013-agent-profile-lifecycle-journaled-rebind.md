@@ -291,13 +291,15 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 | **P2-11** | Versioned portable profile codec | **STILL** | **STILL** |
 | **P2-12** | Capability plugins without OTP | **STILL** | **STILL** |
 | **P2-13** | Fleet CoS control surface | **STILL** | **STILL** |
-| **P2-14** | Clean `dead_code` / profile CLI | **STILL** | **STILL** |
+| **P2-14** | Clean `dead_code` / profile CLI | **FOLDED** — the blanket `#![allow(dead_code)]` is gone; `check --all-targets` reports zero dead-code warnings | was **STILL** |
 
 **No invent-green:** FOLDED = tip proves contract; CHANGED = partial; STILL = gap remains; PARTIAL = rebind only (not full spawn-as-effect).
 
 > **Rev 3 (2026-09-12):** P1-7/P1-8 re-scored on the Wave C digest landing — `model_pin` (the resolved route, never the `@slot` alias) and `skills_digest` (bounded, order-sensitive) ride the spawn ledger row, written from the same `profile_launch_plan` call that builds the argv, all gated in `verify-0013.sh`. The rescore *baseline* column above stays the PR#8-tip audit; the catalog-compiler remainder (P0-5) and the portable codec (P2-11) remain open.
 
 > **Rev 5 (2026-09-13):** P0-5 folded as option (a) of `bd-wave-c-profiles-routing-source-zymc` (captain, stack-reset grilling `bd-2o1v`): affinity derived from steps + loud profile-exists gate (`decide_router_profile_affinity` test, `verify-0013.sh`). The residual Rev-4 worry (folding trades one duplication for a real ambiguity) is answered structurally: profiles are never re-typed into routing rows, so no second truth exists. Still open: portable codec (P2-11), `dead_code` cleanup (P2-14).
+
+> **Rev 6 (2026-09-14):** P2-14 folded (`bd-5es8`): the module-wide `#![allow(dead_code)]` in `src/profile.rs` is deleted. It was scaffolding from when the catalog was test-exercised only; the CLI is now the sole `profiles.toml` mutation path (`cmd_profile` owns every write, `profile.rs`'s only `fs::write` is a test fixture) and consumes the catalog, so the allow hid nothing but real regressions. `cargo check --all-targets` is clean of dead-code warnings with it gone. Still open: portable codec (P2-11).
 
 ---
 
@@ -377,6 +379,7 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 - [x] **Rejects:** no AgentServer, no mailbox-as-journal, no dual tpl, no invent Settled — still explicit in this file.
 - [x] **P0-5 (FOLDED, Rev 5):** the routing table is the single source for trigger / matcher / argv / topology, it loads loud against the merged catalog, trigger derivation is proven equal to the deleted hand list, and route rows now carry profile affinity READ from each workflow's first `dispatch_job` role (`decide::workflow_role_from_steps` + `check_profile_routes` + `decide::decide_router_tests::decide_router_profile_affinity`). Profiles are never re-typed into routing rows, so no second truth exists. **Owed:** the portable codec (P2-11) / `dead_code` cleanup (P2-14) stay their own items.
 - [x] **Beads:** re-cut against this ADR + ADR-0032 (stack-reset grilling `bd-2o1v`, 2026-09-13): no bead claims mailbox receipts give profile exactly-once; P0-5 remainder closed by `bd-wave-c-profiles-routing-source-zymc` (option a); follow-ups filed `bd-8ulu` (human digest sink), `bd-8ana` (portable codec P2-11), `bd-d60u` (clock-jump), `bd-5es8` (`dead_code` P2-14).
+- [x] **P2-14 (FOLDED, Rev 6):** the `src/profile.rs` blanket `#![allow(dead_code)]` is deleted (`bd-5es8`). Precondition verified rather than assumed: `cmd_profile` is the only writer of `profiles.toml` (the sole `fs::write` in `profile.rs` is a test), and `cargo check --all-targets` reports no dead-code warnings once the allow is gone — so the attribute was masking real regressions.
 - [x] **HOLD discipline:** the HOLD was on *this* ADR PR only — captain word given 2026-09-12; spawn-as-effect (D9) landed on the flywheel journal; toron `workflow_effects` wiring and the P1-10 robot-mode hard-fail stay sequenced under ADR-0032.
 
 **Non-goals for acceptance of this ADR alone:** full Fleet CoS surface (P2-13), portable codec (P2-11), or ADR-0032 Wave 3 completion — those remain sequenced under their own records.
@@ -395,6 +398,7 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 | PR#8 | `9677e9b…` merged as `772abd8…` (2026-09-12 19:55 AEST) |
 | Wave B effect journal | `src/agent_ref.rs` (`AgentEffect`, `AgentEffectGuard`) + `adr0013_spawn_effect_tests` in `src/main.rs` |
 | Wave C ledger digests | `state::SpawnEntry::{model_pin, skills_digest}` + `profile::skills_digest` (P1-7/P1-8) — bead `bd-adr0013-wave-c-digests-ko5y`, work `f11b964` + `20e7cfe` |
+| P2-14 `dead_code` cleanup | `src/profile.rs` (allow deleted) — bead `bd-5es8`, work `74b4f23`; `cargo check --all-targets` clean |
 | Catalog unification (P0-5 partial) | `src/decide.rs`: `UNROUTED_PRIMITIVES`, `check_catalog`, `check_workflow_routes`; wired at `cmd_decide` (`src/main.rs`) |
 | ADR compliance gate | `docs/decisions/_scripts/verify-0013.sh` |
 | This ship | GS-044 report `GS-044.md` / `GS-044-profile-adr.md` |
@@ -410,3 +414,4 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 | 3 | 2026-09-12 | Wave C digests landed: `SpawnEntry.model_pin` (resolved route, never the `@slot` alias) + `SpawnEntry.skills_digest` (bounded, order-sensitive), both taken from the single `profile_launch_plan` call that builds the argv; P1-7/P1-8 re-scored FOLDED; `verify-0013.sh` covers them. Still open: one compiled catalog table, portable codec. |
 | 4 | 2026-09-12 | P0-5 narrowed but **not** folded: `decide_trigger_for` is now DERIVED from the one routing table (the duplicate 32-arm match deleted; all 32 phrases were measured equal to `matchers[0]` first, so output is unchanged), `UNROUTED_PRIMITIVES` is the single "not routed" declaration, and the table loads loud against the merged workflow catalog. Profile tier, portable codec, `dead_code` cleanup remain open. D1-adjacent: every file under `integrations/` is now ASCII-only (the launch guard rejects non-ASCII launch text), so the SoT is 10804 B with the chrome at 1458 B. |
 | 5 | 2026-09-13 | P0-5 **folded** as option (a) of `bd-wave-c-profiles-routing-source-zymc` (captain, stack-reset grilling `bd-2o1v`): affinity derived from steps + loud profile-exists gate; `decide --json` + `briefing` name the role. Still open: portable codec (P2-11), `dead_code` cleanup (P2-14). |
+| 6 | 2026-09-14 | P2-14 **folded** (`bd-5es8`): the blanket `#![allow(dead_code)]` in `src/profile.rs` is deleted now the CLI is the sole `profiles.toml` mutation path; `check --all-targets` is clean without it. Not claimed: P2-11 (portable codec) stays open. |
