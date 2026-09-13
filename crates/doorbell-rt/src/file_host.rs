@@ -136,10 +136,21 @@ pub fn ensure_daemon_gen(flywheel_state: &Path, workspace: &str) {
     let path = flywheel_state
         .join("doorbell")
         .join(format!("{workspace}.daemon.gen"));
-    if path.is_file() {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("doorbell"));
+    // Refresh when the RUNNING binary no longer matches the record, not
+    // only when the file is missing. The gen gate exists to retire a
+    // watcher whose binary changed UNDER it mid-run; a daemon started
+    // AFTER a binary upgrade must re-arm against its own (new) exe —
+    // keeping the stale record made `inject_allowed` permanently false,
+    // so every budget-granted prompt was silently eaten (grants journaled,
+    // zero panes touched).
+    if path.is_file()
+        && let Ok(raw) = std::fs::read(&path)
+        && let Ok(record) = serde_json::from_slice::<GenRecord>(&raw)
+        && !gen_stale(&record, &exe)
+    {
         return;
     }
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("doorbell"));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -196,6 +207,38 @@ impl FileHostConfig {
     }
 }
 
+/// Resolve the toron mailbox data ROOT the way flywheel's `mailbox_roots`
+/// does: explicit override > `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` >
+/// `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Free fn so `/health`
+/// can report the root the daemon actually watches — a daemon on a
+/// different mailbox than the pins is deaf, and this is the field that
+/// makes that visible.
+pub fn toron_data_root(explicit: Option<&Path>) -> PathBuf {
+    if let Some(d) = explicit {
+        return d.to_path_buf();
+    }
+    for var in ["TORON_DATA_DIR", "TORON_MCP_DATA_DIR"] {
+        if let Ok(d) = std::env::var(var)
+            && !d.trim().is_empty()
+        {
+            return PathBuf::from(d.trim());
+        }
+    }
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("toron")
+}
+
+/// Canonical presence projection under a toron data ROOT: `<root>/presence.jsonl`.
+/// Toron lifts the mailbox data dir (`<root>/projects`) back to the root via
+/// `mailbox_root` (bd-m5ym), so rows land HERE — never at
+/// `<root>/projects/presence.jsonl`, which nothing writes.
+pub fn presence_path(toron_data_root: &Path) -> PathBuf {
+    toron_data_root.join("presence.jsonl")
+}
+
 /// fnv1a64 — mirrors flywheel `state::fnv1a64` for registry keys.
 fn fnv1a64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -220,7 +263,12 @@ pub fn registry_key(project: &str) -> String {
 
 /// Resolve the registry file: explicit override, `{slug}.json`, or the
 /// single `{slug}-*.json` hashed candidate (sorted-first + ambiguous
-/// flag when several match).
+/// flag when several match). Slug matching uses `registry_key`, which
+/// mirrors flywheel `state::state_key`: absolute-path projects hash to
+/// `{base}-{8hex}` (e.g. `proj-0ec6cde6`). Matching the RAW project string
+/// instead meant an absolute-path project could never resolve its own
+/// registry — the daemon saw zero pins, resolved no p-tag npubs, and every
+/// wake classified to zero targets (the silent-deaf root cause).
 pub fn resolve_registry_file(
     flywheel_state: &Path,
     project: &str,
@@ -229,8 +277,9 @@ pub fn resolve_registry_file(
     if let Some(p) = override_path {
         return (Some(p.to_path_buf()), false);
     }
+    let slug = registry_key(project);
     let agents = flywheel_state.join("agents");
-    let plain = agents.join(format!("{project}.json"));
+    let plain = agents.join(format!("{slug}.json"));
     if plain.is_file() {
         return (Some(plain), false);
     }
@@ -242,12 +291,33 @@ pub fn resolve_registry_file(
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&format!("{project}-")) && n.ends_with(".json"))
+                .is_some_and(|n| n.starts_with(&format!("{slug}-")) && n.ends_with(".json"))
         })
         .collect();
     hits.sort();
+    // bd-ztek: several hashed files routinely exist for one project slug
+    // (absolute vs relative spellings hash differently, each holding a
+    // different spawn's pins). First-sorted silently swept a stale fleet's
+    // pins. Prefer the most recently modified file — the live spawn writes
+    // its registry at spawn — with name order only breaking mtime ties.
+    hits.sort_by(|a, b| {
+        let mtime = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        mtime(b).cmp(&mtime(a)).then_with(|| a.cmp(b))
+    });
     let ambiguous = hits.len() > 1;
     (hits.into_iter().next(), ambiguous)
+}
+
+/// A `toron watch` child that is killed + reaped when dropped. Wrapping is
+/// the point: a bare `std::process::Child` drop leaves the process running,
+/// which is how `Died`-driven restarts littered long-lived watchers.
+struct WatchChild(std::process::Child);
+
+impl Drop for WatchChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 pub struct FileHost {
@@ -258,6 +328,11 @@ pub struct FileHost {
     presence: BTreeMap<String, Pres>,
     /// Last-known herdr statuses by pin (poll-joined via registry).
     herdr: BTreeMap<String, String>,
+    /// Role binds (role -> pin), drained from the pending files at sweep
+    /// top exactly like the embedded workspace model. The Fact arm reads
+    /// `captain`/`wheelhouse` here (bd-ztek: without it every daemon-side
+    /// fact, including inject, degraded to fact_miss).
+    roles: BTreeMap<String, String>,
     /// pane_id -> pin for the herdr list join.
     panes: BTreeMap<String, String>,
     /// pin -> herdr agent name for prompt delivery. Shared with the
@@ -275,6 +350,19 @@ pub struct FileHost {
     /// through this channel (forwarder topology over a poll transport).
     tx: Option<tokio::sync::mpsc::Sender<BrainMsg>>,
     pending_audit: Option<(String, serde_json::Value)>,
+    /// The single live `toron watch` child (shared with the respawn task so
+    /// a replacement reaps its predecessor). [`WatchChild`] kills on drop.
+    watch_child: std::sync::Arc<std::sync::Mutex<Option<WatchChild>>>,
+}
+
+impl Drop for FileHost {
+    /// Never outlive a live watcher: dropping the host (shutdown, or a
+    /// retired generation) reaps the child instead of orphaning it.
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.watch_child.lock() {
+            let _ = g.take();
+        }
+    }
 }
 
 impl FileHost {
@@ -292,6 +380,7 @@ impl FileHost {
             reducer: CoreReducer::default(),
             presence: BTreeMap::new(),
             herdr: BTreeMap::new(),
+            roles: BTreeMap::new(),
             panes: BTreeMap::new(),
             targets: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             npubs: BTreeMap::new(),
@@ -302,6 +391,7 @@ impl FileHost {
             generation,
             tx: None,
             pending_audit: None,
+            watch_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -324,24 +414,7 @@ impl FileHost {
     }
 
     fn toron_data_dir(&self) -> PathBuf {
-        if let Some(d) = &self.cfg.toron_data_dir {
-            return d.clone();
-        }
-        if let Ok(d) = std::env::var("TORON_DATA_DIR")
-            && !d.trim().is_empty()
-        {
-            return PathBuf::from(d.trim());
-        }
-        if let Ok(d) = std::env::var("TORON_MCP_DATA_DIR")
-            && !d.trim().is_empty()
-        {
-            return PathBuf::from(d.trim());
-        }
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("toron")
+        toron_data_root(self.cfg.toron_data_dir.as_deref())
     }
 
     /// (pin, pane_id, herdr name) rows from the registry file. Ambiguity
@@ -353,9 +426,16 @@ impl FileHost {
             self.cfg.registry_file.as_deref(),
         );
         if ambiguous {
+            // bd-ztek: name the chosen file — first-sorted used to sweep a
+            // stale fleet's pins with no trace of which file won.
+            let chosen = file
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             self.pending_audit = Some((
                 "registry_ambiguous".into(),
-                serde_json::json!({ "project": self.cfg.project }),
+                serde_json::json!({ "project": self.cfg.project, "registry_file": chosen }),
             ));
         }
         let Some(path) = file else { return Vec::new() };
@@ -440,7 +520,7 @@ impl FileHost {
     /// Presence rows: latest state word per pin from presence.jsonl,
     /// <30s fresh (mirrors `timeout_presence_rows`, registry-pinned).
     fn presence_rows(&self, pins: &[String], now: u64) -> Vec<(String, String)> {
-        let path = self.toron_data_dir().join("presence.jsonl");
+        let path = presence_path(&self.toron_data_dir());
         let Ok(body) = std::fs::read_to_string(&path) else {
             return Vec::new();
         };
@@ -705,10 +785,11 @@ impl Host for FileHost {
                 pin: String::new(),
                 since: String::new(),
             }],
-            BrainMsg::RoleBound { .. } => {
+            BrainMsg::RoleBound { role, pin } => {
                 // Mirrors the workspace arm: binds assignment routing only,
                 // never the doorbell index — zero classification effect on
-                // either host.
+                // either host. The bind itself is state the Fact arm reads.
+                self.roles.insert(role.clone(), pin.clone());
                 Vec::new()
             }
             BrainMsg::Fact { summary } => {
@@ -719,7 +800,25 @@ impl Host for FileHost {
                     },
                 );
                 self.reducer.model = next;
-                self.normalize(actions)
+                // bd-ztek: promote a captain fact to a Prompt exactly like
+                // the embedded workspace arm (captain, else wheelhouse, and
+                // only over an Idle presence verdict). Without this every
+                // daemon-side fact — including `inject` — degraded to
+                // fact_miss even with a bound captain.
+                if let Some(pin) = self
+                    .roles
+                    .get("captain")
+                    .or_else(|| self.roles.get("wheelhouse"))
+                    .cloned()
+                    && self.presence.get(&pin) == Some(&Pres::Idle)
+                {
+                    self.apply_presence_filter(vec![Effect::Prompt {
+                        pin,
+                        line: format!("[doorbell] {summary}"),
+                    }])
+                } else {
+                    self.normalize(actions)
+                }
             }
             BrainMsg::AckSlaTick { now } => {
                 let (next, actions) = doorbell_core::tick(
@@ -855,12 +954,39 @@ impl Host for FileHost {
         let tx = self.tx.clone();
         let project = self.cfg.project.clone();
         let toron = self.cfg.toron_bin.clone();
+        let fw_state = self.cfg.flywheel_state.clone();
+        let workspace = self.cfg.workspace.clone();
+        // One live watcher per host, never a litter. The slot's `Drop`
+        // kills+reaps the previous child before the replacement spawns:
+        // dropping a bare `Child` does NOT terminate it, so every Died
+        // burst used to leak another long-lived `toron watch` holding a bus
+        // subscription (observed live as PPID-1 orphans after restarts).
+        let slot = self.watch_child.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
             let Some(tx) = tx else { return };
+            if let Ok(mut g) = slot.lock() {
+                let _ = g.take();
+            }
             let kinds = WATCH_KINDS;
+            // --idle-exit bounds silence: a half-open bus subscription
+            // delivers nothing AND never errors (observed live as a zombie
+            // child whose heartbeat went 14 minutes stale while the process
+            // sat alive). Exit 4 = idle exit; the reader thread's EOF on the
+            // next line feeds Died, and this spawn site's backoff respawns.
+            // The plane-S cursor (gap 1) dedupes the respawn's replay.
+            const WATCH_IDLE_EXIT_SECS: u64 = 90;
             let mut child = match std::process::Command::new(&toron)
-                .args(["watch", "--live", "--project", &project, "--kinds", kinds])
+                .args([
+                    "watch",
+                    "--live",
+                    "--project",
+                    &project,
+                    "--kinds",
+                    kinds,
+                    "--idle-exit",
+                    &WATCH_IDLE_EXIT_SECS.to_string(),
+                ])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -878,11 +1004,24 @@ impl Host for FileHost {
                     return;
                 }
             };
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(WatchChild(child));
+            }
             std::thread::spawn(move || {
                 use std::io::BufRead;
+                // Heartbeat, throttled to 1s: `/health` reads this mtime so
+                // a watcher on the wrong bus (or a dead child) is visible
+                // instead of indistinguishable from a quiet workspace.
+                let mut stamped: Option<std::time::Instant> = None;
                 for line in std::io::BufReader::new(stdout).lines() {
                     match line {
                         Ok(l) => {
+                            if stamped
+                                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+                            {
+                                crate::watchbeat::touch(&fw_state, &workspace);
+                                stamped = Some(std::time::Instant::now());
+                            }
                             if tx.blocking_send(BrainMsg::Watch(l)).is_err() {
                                 break;
                             }
@@ -932,7 +1071,15 @@ impl Host for FileHost {
         let rows = self.presence_rows(&self.index_pins, now);
         if let Some(tx) = &self.tx {
             for (pin, status) in &changed {
-                let _ = tx.blocking_send(BrainMsg::HerdrStatus {
+                // `try_send`, never `blocking_send`: the daemon-hosted Brain
+                // drives the Host from inside its own tokio runtime, where
+                // `blocking_send` panics ("Cannot block the current thread
+                // from within a runtime") — on the first status change the
+                // sweep task died and the hosted workspace went ring-deaf
+                // while /health kept reporting `mode=hosted`. A full channel
+                // drops the update, which is what the ignored result already
+                // meant.
+                let _ = tx.try_send(BrainMsg::HerdrStatus {
                     pin: pin.clone(),
                     status: status.clone(),
                 });
@@ -1004,12 +1151,53 @@ mod tests {
 
     #[test]
     fn resolve_flags_ambiguous_hashed() {
+        use std::time::{Duration, SystemTime};
         let dir = tmp_state("amb");
-        std::fs::write(dir.join("agents").join("proj-11111111.json"), "[]").unwrap();
-        std::fs::write(dir.join("agents").join("proj-22222222.json"), "[]").unwrap();
+        let old = dir.join("agents").join("proj-11111111.json");
+        let new = dir.join("agents").join("proj-22222222.json");
+        std::fs::write(&old, "[]").unwrap();
+        std::fs::write(&new, "[]").unwrap();
+        // bd-ztek: freshest-mtime wins (the live spawn writes at spawn),
+        // not first-sorted — pin the mtimes explicitly, never rely on
+        // write order (coarse filesystems tie).
+        let t0 = SystemTime::now();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(t0 - Duration::from_secs(60))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&new)
+            .unwrap()
+            .set_modified(t0)
+            .unwrap();
         let (path, ambiguous) = resolve_registry_file(&dir, "proj", None);
         assert!(ambiguous);
-        assert_eq!(path.unwrap().file_name().unwrap(), "proj-11111111.json");
+        assert_eq!(path.unwrap().file_name().unwrap(), "proj-22222222.json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_absolute_path_project_finds_hashed_registry() {
+        // The daemon-hosting shape (bd-*: parse_host rsplit): flywheel spawn
+        // writes `proj-{8hex}.json` (state::state_key hash of the absolute
+        // path); the daemon passes the same absolute string as `project`.
+        // Matching the RAW string (slashes never appear in a filename) made
+        // every absolute-path project's registry invisible — zero pins, no
+        // npub resolution, every wake classified to zero targets.
+        let dir = tmp_state("abs");
+        let abs = "/tmp/scratch/proj";
+        let expected = registry_key(abs); // "proj-{8hex}"
+        std::fs::write(dir.join("agents").join(format!("{expected}.json")), "[]").unwrap();
+        let (path, ambiguous) = resolve_registry_file(&dir, abs, None);
+        assert!(!ambiguous, "single hash candidate is unambiguous");
+        assert_eq!(
+            path.unwrap().file_name().unwrap().to_string_lossy(),
+            format!("{expected}.json"),
+            "absolute-path project must resolve its hashed registry"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1062,6 +1250,38 @@ mod tests {
                 .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "prompt_filtered")),
             "busy presence holds routine wake: {fx:?}"
         );
+    }
+
+    #[test]
+    fn ensure_daemon_gen_refreshes_stale_record() {
+        // Regression: the gen file is write-once-if-missing, so a daemon
+        // started after a binary upgrade kept the OLD record. gen_stale()
+        // then refused every inject forever — budget-granted prompts were
+        // journaled and silently dropped (zero panes touched). A restart
+        // against a NEW binary must re-arm to the new identity.
+        let dir = tmp_state("gen");
+        std::fs::create_dir_all(dir.join("doorbell")).unwrap();
+        let path = dir.join("doorbell").join("w.daemon.gen");
+        let stale = serde_json::json!({
+            "started_unix": 1,
+            "binary_mtime_unix": 1,
+            "binary_len": 1,
+            "binary_hash": "deadbeefdeadbeefdeadbeefdeadbeef",
+        });
+        std::fs::write(&path, stale.to_string()).unwrap();
+        ensure_daemon_gen(&dir, "w");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_ne!(
+            raw["binary_hash"], "deadbeefdeadbeefdeadbeefdeadbeef",
+            "stale daemon gen must refresh to the running binary identity"
+        );
+        // A matching record is kept (idempotent, preserves started_unix).
+        ensure_daemon_gen(&dir, "w");
+        let again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw, again, "matching gen is idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1124,6 +1344,51 @@ mod tests {
     }
 
     #[test]
+    fn fact_promotes_to_captain_over_idle_presence() {
+        // bd-ztek: daemon-side facts (including inject) must ring a bound
+        // idle captain exactly like the embedded workspace arm — no more
+        // unconditional fact_miss.
+        let (mut host, _dir) = host_with_registry("t-fact", entries());
+        host.refresh_index();
+        host.tick(&BrainMsg::RoleBound {
+            role: "captain".into(),
+            pin: "PinA".into(),
+        });
+        host.tick(&BrainMsg::Presence {
+            pin: "PinA".into(),
+            state: "idle".into(),
+        });
+        let fx = host.tick(&BrainMsg::Fact {
+            summary: "deploy".into(),
+        });
+        assert_eq!(fx.len(), 1, "captain fact over idle must prompt: {fx:?}");
+        match &fx[0] {
+            Effect::Prompt { pin, line } => {
+                assert_eq!(pin, "PinA");
+                assert!(line.contains("[doorbell]"));
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fact_without_captain_stays_fact_miss() {
+        // No bind (or non-idle presence): the loud miss survives.
+        let (mut host, _dir) = host_with_registry("t-fact-miss", entries());
+        host.refresh_index();
+        let fx = host.tick(&BrainMsg::Fact {
+            summary: "deploy".into(),
+        });
+        assert!(
+            fx.iter().any(|e| matches!(
+                e,
+                Effect::Audit { kind, .. } if kind == "fact_miss"
+            )),
+            "unbound fact must miss loud: {fx:?}"
+        );
+    }
+
+    #[test]
     fn drains_read_and_remove_pending_files() {
         let (mut host, dir) = host_with_registry("t6", entries());
         std::fs::create_dir_all(dir.join("roles")).unwrap();
@@ -1175,6 +1440,53 @@ mod tests {
         assert_eq!(host.pin_npub("PinA").as_deref(), Some("NPUB1"));
         let rows = host.fetch_inbox("PinA", "2026-01-01T00:00:00Z");
         assert_eq!(rows.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The daemon-hosted Brain runs the `Host` on ITS OWN tokio runtime, so
+    /// the sweep path must never use `Sender::blocking_send`: it panics
+    /// ("Cannot block the current thread from within a runtime"), the sweep
+    /// task dies on the first herdr status change, and the hosted workspace
+    /// goes ring-deaf while `/health` still says `mode=hosted` (only the
+    /// climbing `sweep.last_age_s` and a frozen journal show it).
+    #[test]
+    fn sweep_forwards_status_changes_without_blocking_a_runtime() {
+        let dir = tmp_state("sweep-runtime");
+        let script = dir.join("herdr");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        std::fs::write(
+            dir.join("agents").join("proj.json"),
+            serde_json::to_string(&entries()).unwrap(),
+        )
+        .unwrap();
+        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
+        cfg.toron_bin = "true".into();
+        cfg.herdr_bin = script.to_string_lossy().into_owned();
+        cfg.registry_file = Some(dir.join("agents").join("proj.json"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut host = FileHost::new(cfg).with_tx(tx);
+        host.refresh_index();
+        // Same context the daemon's Brain calls it in.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = host.sweep_maintenance();
+        });
+        assert!(
+            rx.try_recv().is_ok(),
+            "the herdr status change must reach the brain channel"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

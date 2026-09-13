@@ -765,7 +765,23 @@ fn route_or_queue(
             line,
         });
     } else {
-        next.queues.entry(pin.to_string()).or_default().push(line);
+        // bd-ztek: a queued ring leaves one journal-visible Audit on the
+        // empty→non-empty transition per pin. Without it the queue was
+        // silent (no action row), so `why` showed nothing for dead-pane
+        // pins and the wake looked lost. Bounded: further enqueues while
+        // non-empty stay quiet; the drain still emits the Prompts.
+        let fresh = next.queues.get(pin).is_none_or(std::vec::Vec::is_empty);
+        next.queues
+            .entry(pin.to_string())
+            .or_default()
+            .push(line.clone());
+        if fresh {
+            actions.push(DoorbellAction::Audit {
+                kind: "queued".into(),
+                pin: pin.to_string(),
+                detail: line,
+            });
+        }
     }
 }
 
@@ -846,7 +862,12 @@ mod tests {
         model.statuses.insert("BlueRidge".into(), "working".into());
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
         let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
-        assert!(actions.is_empty(), "working pin must not prompt");
+        assert_eq!(actions.len(), 1, "queue transition leaves one audit");
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "queued"),
+            "queued ring must be journal-visible: {:?}",
+            actions[0]
+        );
         assert_eq!(next.queues.get("BlueRidge").map(Vec::len), Some(1));
         let (next2, actions2) = tick(
             &next,
@@ -863,6 +884,21 @@ mod tests {
                 .get("BlueRidge")
                 .is_none_or(std::vec::Vec::is_empty)
         );
+    }
+
+    #[test]
+    fn queue_audit_fires_once_per_nonempty_stretch() {
+        // bd-ztek: bounded noise — the second enqueue while queued stays
+        // quiet; a new stretch after a drain audits again.
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let msg = DoorbellMsg::WatchNdjson { line: line.into() };
+        let (next, first) = tick(&model, &msg);
+        assert_eq!(first.len(), 1);
+        let (next2, second) = tick(&next, &msg);
+        assert!(second.is_empty(), "no audit storm while queued");
+        assert_eq!(next2.queues.get("BlueRidge").map(Vec::len), Some(2));
     }
 
     #[test]
