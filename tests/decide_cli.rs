@@ -2,8 +2,13 @@
 //!
 //! `flywheel decide <target> [--ready-beads N] [--profiled-panes N]
 //! [--launch-pending N] [--contention] [--project P] [--json]` classifies a captain
-//! target into ONE primitive and prints `{primitive, reason, argv, topology}`.
+//! target into ONE primitive and prints
+//! `{primitive, reason, argv, topology, role}`.
 //! Never dispatches. Exit 0. Absent snapshot facts stay zero/false.
+//!
+//! bd-2o1v added `role` (the routed workflow's default profile, `-`/null when
+//! the row dispatches to none); these tests were left pinning the pre-`role`
+//! shape and were red on HEAD.
 //!
 //! The classifier itself is unit-tested in `src/decide.rs` (bd-5inr);
 //! these tests pin the CLI contract: clap parse, JSON shape, plain lines,
@@ -178,7 +183,7 @@ fn decide_contention_flag_is_coalition() {
 }
 
 #[test]
-fn decide_plain_mode_prints_three_lines() {
+fn decide_plain_mode_prints_contract_lines() {
     let h = hermetic();
     let out = run(&h, &["decide", "analyze the durable loop"]);
     assert!(out.status.success());
@@ -186,13 +191,16 @@ fn decide_plain_mode_prints_three_lines() {
     let lines: Vec<&str> = s.lines().collect();
     assert_eq!(
         lines.len(),
-        4,
-        "primitive / reason / argv / topology lines: {s}"
+        5,
+        "primitive / reason / argv / topology / role lines: {s}"
     );
     assert_eq!(lines[0], "captain-audit");
     assert!(lines[1].contains("read-only"));
     assert!(lines[2].starts_with("flywheel workflow run captain-audit"));
     assert_eq!(lines[3], "topology open");
+    // bd-2o1v: the routed workflow names its default profile; a row that
+    // dispatches to no role prints the explicit `-`, never a blank line.
+    assert_eq!(lines[4], "role -", "role line must be explicit: {s}");
 }
 
 #[test]
@@ -230,5 +238,34 @@ fn decide_json_never_dispatches() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, vec!["argv", "primitive", "reason", "topology"]);
+    // bd-2o1v added the `role` metadata field. The key set is pinned exactly
+    // so any future addition is a deliberate edit here, not a silent drift.
+    assert_eq!(
+        keys,
+        vec!["argv", "primitive", "reason", "role", "topology"]
+    );
+    // The intent of this gate: no field may name an effect. `argv` is the
+    // only actionable output; everything else is inert metadata.
+    for forbidden in [
+        "dispatch",
+        "dispatch_job",
+        "cmd",
+        "args",
+        "exec",
+        "spawn",
+        "run",
+    ] {
+        assert!(
+            !v.as_object().expect("object").contains_key(forbidden),
+            "decide --json grew a side-effect field `{forbidden}`: {v}"
+        );
+    }
+    assert!(v["argv"].is_array(), "argv is the only actionable output");
+    for inert in ["primitive", "reason", "role", "topology"] {
+        let field = &v[inert];
+        assert!(
+            field.is_string() || field.is_null(),
+            "{inert} must stay inert metadata, got {field}"
+        );
+    }
 }
