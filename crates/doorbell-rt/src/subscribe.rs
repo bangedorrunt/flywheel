@@ -319,13 +319,15 @@ mod tests {
         // Legacy JSON (pre-project rows on disk) still loads as None.
         let sub_path = dir.join("doorbell").join("subscriptions.json");
         let raw = std::fs::read_to_string(&sub_path).expect("persisted");
-        let mut legacy: serde_json::Value =
-            serde_json::from_str(&raw).expect("persisted json");
+        let mut legacy: serde_json::Value = serde_json::from_str(&raw).expect("persisted json");
         for row in legacy.as_object_mut().expect("map").values_mut() {
             row.as_object_mut().map(|m| m.remove("project"));
         }
-        std::fs::write(&sub_path, serde_json::to_string_pretty(&legacy).expect("legacy"))
-            .expect("rewrite legacy");
+        std::fs::write(
+            &sub_path,
+            serde_json::to_string_pretty(&legacy).expect("legacy"),
+        )
+        .expect("rewrite legacy");
         let reopened = SubscriptionStore::open(&dir);
         assert_eq!(
             reopened.list()[0].project,

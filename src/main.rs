@@ -7719,7 +7719,11 @@ mod bd2o1v_reset_tests {
     #[test]
     fn briefing_commit_gates_spawn_class_crews() {
         let src = include_str!("main.rs");
-        let body = body_of(src, "\nfn cmd_briefing(", "\nfn warn_uncommitted_decision_docs(");
+        let body = body_of(
+            src,
+            "\nfn cmd_briefing(",
+            "\nfn warn_uncommitted_decision_docs(",
+        );
         let gate = body.find("spawns_crew").expect("gate predicate");
         let refusal = body.find("crew-confirm gate").expect("non-TTY refusal");
         let tty_ask = body.find("spawn this crew?").expect("TTY inline ask");
@@ -7764,26 +7768,26 @@ mod bd2o1v_reset_tests {
     }
 }
 
-    /// bd-kj2z: the door means woken — `cmd_arrive` records the arriving
-    /// pin's subscription (idempotent, project-named) instead of relying
-    /// on `doorbell start`, which arms nothing on an empty registry.
-    #[test]
-    fn arrive_records_pin_subscription() {
-        let src = include_str!("main.rs");
-        let start = src
-            .rfind("\nfn cmd_arrive(")
-            .expect("real cmd_arrive (rfind skips quoted copies)");
-        let end = src[start..]
-            .find("\n/// (holder pin, whois.stale)")
-            .map(|i| start + i)
-            .unwrap_or(src.len());
-        let body = &src[start..end];
-        let hook = body
-            .find("register_arrival_subscription")
-            .expect("arrive records the pin subscription");
-        let gate = body.find("if let Some(pin) = as_agent").expect("pin-gated");
-        assert!(gate < hook, "subscription follows the pin gate");
-    }
+/// bd-kj2z: the door means woken — `cmd_arrive` records the arriving
+/// pin's subscription (idempotent, project-named) instead of relying
+/// on `doorbell start`, which arms nothing on an empty registry.
+#[test]
+fn arrive_records_pin_subscription() {
+    let src = include_str!("main.rs");
+    let start = src
+        .rfind("\nfn cmd_arrive(")
+        .expect("real cmd_arrive (rfind skips quoted copies)");
+    let end = src[start..]
+        .find("\n/// (holder pin, whois.stale)")
+        .map(|i| start + i)
+        .unwrap_or(src.len());
+    let body = &src[start..end];
+    let hook = body
+        .find("register_arrival_subscription")
+        .expect("arrive records the pin subscription");
+    let gate = body.find("if let Some(pin) = as_agent").expect("pin-gated");
+    assert!(gate < hook, "subscription follows the pin gate");
+}
 
 #[cfg(test)]
 mod tripwire {
@@ -14469,8 +14473,7 @@ fn cmd_briefing(
         // without the operator's word — TTY asks inline; non-TTY callers
         // (agents) present the proposal in chat and rerun with --yes / a
         // remixed --crew. Cron/loop never route through briefing.
-        let spawns_crew =
-            !matches!(b.proposal.topology.as_str(), "open" | "join" | "none" | "");
+        let spawns_crew = !matches!(b.proposal.topology.as_str(), "open" | "join" | "none" | "");
         if commit && !yes && spawns_crew {
             let plan = format!(
                 "crew plan (proposal): topology={} workflow={} crew-default={} argv=`{}`",
@@ -17574,10 +17577,9 @@ fn cmd_kill(
             if row.id.starts_with(&prefix) {
                 match store.unsubscribe(Actor::operator(), &row.id) {
                     Ok(dropped) => println!("unsubscribed: {}", dropped.id),
-                    Err(e) => eprintln!(
-                        "flywheel: cannot drop wake subscription {}: {e:?}",
-                        row.id
-                    ),
+                    Err(e) => {
+                        eprintln!("flywheel: cannot drop wake subscription {}: {e:?}", row.id)
+                    }
                 }
             }
         }

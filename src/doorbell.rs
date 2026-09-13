@@ -529,23 +529,23 @@ pub fn register_arrival_subscription(state_dir: &Path, project: &str, workspace:
     }
 }
 
-    /// bd-kj2z: arrival rows are idempotent per (workspace, pin) and carry
-    /// the project for auto-host; re-arriving refreshes the same row,
-    /// never a second one.
-    #[test]
-    fn arrival_subscription_is_idempotent_and_names_project() {
-        use doorbell_rt::subscribe::*;
-        let dir = std::env::temp_dir().join(format!("dbll-arrive-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        register_arrival_subscription(&dir, "proj", "wA", "P");
-        register_arrival_subscription(&dir, "proj", "wA", "P");
-        let store = SubscriptionStore::open(&dir);
-        let rows = store.list();
-        assert_eq!(rows.len(), 1, "re-arrive refreshes, never duplicates");
-        assert_eq!(rows[0].id, "cli-wA-P");
-        assert_eq!(rows[0].project.as_deref(), Some("proj"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+/// bd-kj2z: arrival rows are idempotent per (workspace, pin) and carry
+/// the project for auto-host; re-arriving refreshes the same row,
+/// never a second one.
+#[test]
+fn arrival_subscription_is_idempotent_and_names_project() {
+    use doorbell_rt::subscribe::*;
+    let dir = std::env::temp_dir().join(format!("dbll-arrive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    register_arrival_subscription(&dir, "proj", "wA", "P");
+    register_arrival_subscription(&dir, "proj", "wA", "P");
+    let store = SubscriptionStore::open(&dir);
+    let rows = store.list();
+    assert_eq!(rows.len(), 1, "re-arrive refreshes, never duplicates");
+    assert_eq!(rows[0].id, "cli-wA-P");
+    assert_eq!(rows[0].project.as_deref(), Some("proj"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 /// Cron doorbell sink (bd-asr2.16, D7, flag-gated): on tick completion,
 /// journal a Fact row and queue a pending wake. Digest-visible with zero
