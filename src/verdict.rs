@@ -92,6 +92,12 @@ pub enum VerdictKind {
     ReviewerSigned,
     /// Worker self-report; legal only where the loop cannot run VERIFY.
     WorkerReceipt,
+    /// A named human attester (recorded as the gate `provider`) ordered the
+    /// close at P0/P1, where no command can verify.
+    OperatorDirected,
+    /// Record-level evidence reviewed, no command applies (dupe/stale
+    /// triage); legal in the P2+ non-runnable band, alongside `WorkerReceipt`.
+    TriageVerified,
     /// Loop state, not a pass.
     VerifierBlocked,
     /// Loop state, not a pass.
@@ -99,20 +105,27 @@ pub enum VerdictKind {
 }
 
 impl VerdictKind {
-    /// Every kind; the exhaustive-match surface for `legal_close`.
-    pub const ALL: [Self; 7] = [
+    /// Every kind; the exhaustive-match surface for `legal_close`. The order
+    /// matches br's `verify::VerdictKind::ALL` so a drift in either table is
+    /// visible side by side (bd-tfxv: one gate-name authority).
+    pub const ALL: [Self; 9] = [
         Self::CommandVerified,
         Self::UnitTestVerified,
         Self::LiveVerified,
         Self::ReviewerSigned,
         Self::WorkerReceipt,
+        Self::OperatorDirected,
+        Self::TriageVerified,
         Self::VerifierBlocked,
         Self::VerifierFailed,
     ];
 
     /// br gate name (kebab-cased `VerdictKind`, ADR-0019 Spec 1). Only PASS
     /// verdicts become gate rows; Blocked/Failed are loop state, but the names
-    /// exist so the mapping is total.
+    /// exist so the mapping is total. Every name br's transition policy
+    /// enumerates (`beads::close_policy::ADR0019_VERDICT_GATE_NAMES`) is
+    /// present — a name br offers that we cannot parse is a close the ledger
+    /// can never credit (bd-tfxv).
     pub fn gate_name(self) -> &'static str {
         match self {
             Self::CommandVerified => "command-verified",
@@ -120,6 +133,8 @@ impl VerdictKind {
             Self::LiveVerified => "live-verified",
             Self::ReviewerSigned => "reviewer-signed",
             Self::WorkerReceipt => "worker-receipt",
+            Self::OperatorDirected => "operator-directed",
+            Self::TriageVerified => "triage-verified",
             Self::VerifierBlocked => "verifier-blocked",
             Self::VerifierFailed => "verifier-failed",
         }
@@ -134,6 +149,8 @@ impl VerdictKind {
             "live-verified" => Self::LiveVerified,
             "reviewer-signed" => Self::ReviewerSigned,
             "worker-receipt" => Self::WorkerReceipt,
+            "operator-directed" => Self::OperatorDirected,
+            "triage-verified" => Self::TriageVerified,
             "verifier-blocked" => Self::VerifierBlocked,
             "verifier-failed" => Self::VerifierFailed,
             _ => return None,
@@ -278,13 +295,15 @@ fn estimated_cheap(exec: &str, args: &[String]) -> bool {
     }
 }
 
-/// Legal-close table (ADR-0019 Spec 1, amended 2026-08-15):
+/// Legal-close table (ADR-0019 Spec 1, amended 2026-08-15; kinds aligned
+/// with br's `verify::legal_close` by bd-tfxv):
 ///
 /// | Condition | Legal kinds |
 /// |---|---|
 /// | priority >= 2, blast Normal, VERIFY loop-runnable | `CommandVerified` (loop-run) ONLY |
-/// | priority >= 2, blast Normal, VERIFY not loop-runnable | `WorkerReceipt` (+ two-tick grace), or `UnitTestVerified` / `LiveVerified` |
-/// | priority <= 1 or blast High | `UnitTestVerified`, `LiveVerified` only |
+/// | priority >= 2, blast Normal, VERIFY not loop-runnable | `WorkerReceipt` (+ two-tick grace), `TriageVerified`, or `UnitTestVerified` / `LiveVerified` |
+/// | priority <= 1, blast Normal | `OperatorDirected` (provider names the human), or `UnitTestVerified` / `LiveVerified` |
+/// | blast High | `UnitTestVerified`, `LiveVerified` only |
 /// | AC is judgment | `ReviewerSigned` only (recording `unit-test-verified` for a judgment bead is a FALSE verdict) |
 /// | any | never `VerifierFailed`, never `VerifierBlocked`, never missing |
 ///
@@ -302,13 +321,19 @@ pub fn legal_close(verdict: &Verdict, bead: &BeadUnit, ac: AcShape) -> bool {
                 && bead.blast == Blast::Normal
                 && runnable
         }
-        // Row 2 — non-runnable band: WorkerReceipt (+ two-tick grace) or an
-        // independent unit/live verification.
-        VerdictKind::WorkerReceipt => {
+        // Row 2 — non-runnable band: WorkerReceipt (+ two-tick grace),
+        // TriageVerified (reviewed record evidence), or an independent
+        // unit/live verification.
+        VerdictKind::WorkerReceipt | VerdictKind::TriageVerified => {
             ac == AcShape::Checkable
                 && bead.priority >= 2
                 && bead.blast == Blast::Normal
                 && !runnable
+        }
+        // Row 2b — ordered close: a human attester (recorded as provider) is
+        // the independent verifier at P0/P1, where no command can verify.
+        VerdictKind::OperatorDirected => {
+            ac == AcShape::Checkable && bead.priority <= 1 && bead.blast == Blast::Normal
         }
         // Rows 2+3 — independent verification closes the non-runnable band
         // (P>=2, Normal, VERIFY not loop-runnable) as well as P0/P1 / High
@@ -922,8 +947,14 @@ mod tests {
             VerifierBlocked | VerifierFailed => false,
             // Row 1 — cheap band: CommandVerified (loop-run) ONLY.
             CommandVerified => ac == Checkable && priority >= 2 && blast == Normal && runnable,
-            // Row 2 — non-runnable band: WorkerReceipt or unit/live verified.
-            WorkerReceipt => ac == Checkable && priority >= 2 && blast == Normal && !runnable,
+            // Row 2 — non-runnable band: WorkerReceipt, TriageVerified, or
+            // unit/live verified.
+            WorkerReceipt | TriageVerified => {
+                ac == Checkable && priority >= 2 && blast == Normal && !runnable
+            }
+            // Row 2b — ordered close: a named human attester is the
+            // independent verifier at P0/P1 where no command can verify.
+            OperatorDirected => ac == Checkable && priority <= 1 && blast == Normal,
             // Row 3 — P0/P1 or High blast: independent verification only
             // (row 2's non-runnable band also admits unit/live — bd-legal-
             // close-row2-reconcile-2m34).
@@ -936,7 +967,7 @@ mod tests {
     }
 
     /// Acceptance: table test covers EVERY kind x priority(0..4) x blast x
-    /// AC-shape x loop-runnability cell (7 * 5 * 2 * 2 * 2 = 280 cells).
+    /// AC-shape x loop-runnability cell (9 * 5 * 2 * 2 * 2 = 360 cells).
     #[test]
     fn legal_close_matches_table_over_every_cell() {
         for kind in VerdictKind::ALL {
@@ -1358,6 +1389,97 @@ mod tests {
         }
         assert_eq!(VerdictKind::from_gate_name("not-a-gate"), None);
         assert_eq!(VerdictKind::from_gate_name(""), None);
+    }
+
+    // ---- bd-tfxv: one gate-name authority across br + flywheel ----
+
+    /// Every gate name br's own transition policy enumerates
+    /// (`beads::close_policy::ADR0019_VERDICT_GATE_NAMES`, literal copy) must
+    /// parse into a flywheel `VerdictKind`. Before bd-tfxv, `operator-directed`
+    /// and `triage-verified` did not — a worker following br's refusal message
+    /// (`br gate report --gate triage-verified`) landed a row that
+    /// `ledger_check` skipped forever, so the bead could never be credited.
+    #[test]
+    fn every_br_gate_name_parses_to_a_kind() {
+        for gate in [
+            "command-verified",
+            "unit-test-verified",
+            "live-verified",
+            "reviewer-signed",
+            "worker-receipt",
+            "operator-directed",
+            "triage-verified",
+        ] {
+            assert!(
+                VerdictKind::from_gate_name(gate).is_some(),
+                "br gate {gate:?} has no flywheel VerdictKind"
+            );
+        }
+    }
+
+    /// ...and the parsed row must actually CLOSE the bead, not merely parse:
+    /// this is `ledger_check`'s body (from_gate_name -> legal_close) for the
+    /// shape br told the operator was legal.
+    #[test]
+    fn ledger_check_credits_the_rows_br_names_for_a_p3_script_verify() {
+        // bd-tfxv's live shape: P3, Normal blast, checkable AC, VERIFY is a
+        // committed bash script (non-runnable: `sh`/`bash` demands an explicit
+        // `timeout` token). br named exactly these gates as legal.
+        let bead = bead(3, Blast::Normal, /* runnable */ false);
+        for gate in ["worker-receipt", "triage-verified", "unit-test-verified"] {
+            let kind = VerdictKind::from_gate_name(gate)
+                .unwrap_or_else(|| panic!("br gate {gate:?} unparseable"));
+            assert!(
+                legal_close(&verdict(kind), &bead, AcShape::Checkable),
+                "ledger_check would refuse br-legal gate {gate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn triage_verified_closes_the_non_runnable_band_only() {
+        // Row 2, alongside WorkerReceipt: p>=2 + Normal + VERIFY not runnable.
+        let non_runnable = bead(3, Blast::Normal, false);
+        let v = verdict(VerdictKind::TriageVerified);
+        assert!(legal_close(&v, &non_runnable, AcShape::Checkable));
+        // Illegal in the cheap band: a loop-run command existed, so a
+        // record-review is the wrong proof (ADR-0019 Spec 1 row 1).
+        let cheap = bead(3, Blast::Normal, true);
+        assert!(!legal_close(&v, &cheap, AcShape::Checkable));
+        // Judgment AC: ReviewerSigned only.
+        assert!(!legal_close(&v, &non_runnable, AcShape::Judgment));
+    }
+
+    #[test]
+    fn operator_directed_closes_p0_p1_normal_only() {
+        // Row 2b: a named human attester is the independent verifier where no
+        // command can satisfy the close (P0/P1, Normal blast, checkable AC).
+        let v = verdict(VerdictKind::OperatorDirected);
+        for priority in [0u8, 1] {
+            assert!(legal_close(
+                &v,
+                &bead(priority, Blast::Normal, false),
+                AcShape::Checkable
+            ));
+        }
+        // Not a P>=2 bead (the loop/verifier bands own those).
+        assert!(!legal_close(
+            &v,
+            &bead(3, Blast::Normal, false),
+            AcShape::Checkable
+        ));
+        // Not High blast (row 3: independent verification only).
+        assert!(!legal_close(
+            &v,
+            &bead(0, Blast::High, false),
+            AcShape::Checkable
+        ));
+        // Not judgment AC (row 4: ReviewerSigned only).
+        assert!(!legal_close(
+            &v,
+            &bead(0, Blast::Normal, false),
+            AcShape::Judgment
+        ));
     }
 
     #[test]
