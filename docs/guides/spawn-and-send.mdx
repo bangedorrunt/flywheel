@@ -41,6 +41,14 @@ Compiled slots: `cheap` (opencode/big-pickle), `standard` (pi + muse-spark), `pr
 
 An `@slot` alias resolves through the operator-wide default pair when one is set (`flywheel model set-default <harness> <model>`; `flywheel model defaults` shows the effective pair, `clear-default` restores per-slot behavior). Precedence is CLI > concrete id > defaults > slot.
 
+**Fallback chains are tier-down and journaled.** `fallback[]` names other
+*profiles* (billing/auth/provider hops, e.g. coder→`[scout]`);
+`model_fallback[]` names *model ids* (rate_limit rungs, e.g.
+`zai/glm-5.3-flash`). Every live hop rides the rebind journal
+(`Prepared→InFlight→Settled|Failed|Unknown`); timeout or mail-ack alone
+never hops. `decide --json` and `briefing` name each routed row's role,
+read from the workflow's own steps and gated against this catalog.
+
 **The ledger records the resolved route, never the alias.** A profiled spawn writes `model_pin` (the concrete registry key, e.g. `opencode-go/muse-spark-1.3-contributor`) and `skills_digest` (a bounded identity+count digest of the profile's attached skills; absent when none attach). Both come from one `profile_launch_plan` resolution, so the ledger row and the argv cannot name two different routes. This is *planned* provenance: a mid-spawn reroute hop is separate audit evidence, not a silent row rewrite.
 
 Bare `spawn --model <id> [--provider <p>]` is the lenient fallback for spawns without a named profile; `--provider` requires `--model`.

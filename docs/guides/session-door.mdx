@@ -11,6 +11,12 @@ flywheel briefing "<goal>" --project <project> --json
 # then run the proposal's argv (--commit / --yes accepts and executes)
 ```
 
+Crews are proposals, not dispatches: after briefing, present the crew plan
+(topology, roles, N, models) to the operator and accept a remix before
+spawning. Non-TTY `briefing --commit` on a spawn-class topology refuses
+without `--yes`; TTY asks inline. Cron/loop dispatch never routes through
+briefing and is unattended by design.
+
 ## What arrive does
 
 - Publishes presence (kind 20001) for the pin.

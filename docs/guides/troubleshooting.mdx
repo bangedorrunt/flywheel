@@ -21,6 +21,14 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 | doorbell `answered by foreign owner, not child <pid>` | Port 18980 conflict | Stop the foreign holder or relocate; arrival itself was unaffected |
 | preflight `resonate ... connection refused` | Durable engine down | `flywheel deps --ensure` starts it, or run open-vehicle work and say so in the trail |
 | Mail to `captain` fails | Alias cleared by parent death or never bound | `flywheel mail whois <p> captain` to check; `recover`/`adopt` rebinds; `toron contact captain --pin <pin>` sets it |
+| `mode: standby` + `standby_with_known_workspaces` | Daemon adopted without hosts; zero wakes delivered | Arm it: `flywheel doorbell start <project>` for registry workspaces, or subscribe with `--project` and let auto-host fire within 60s |
+| `doorbell start` adopts but hosts nothing | `--host` only rides a fresh serve spawn | `doorbell stop`, then start with `--host p/w`; or subscribe and wait one reconcile tick |
+| Unit respawns hostless after `install` | launchd kept the stale loaded definition | `launchctl bootout gui/$(id -u)/com.doorbell.serve`, then `bootstrap` the plist; verify `hosted` in `/health` |
+| Fresh binary SIGKILLed under launchd | Stale/missing ad-hoc signature | `codesign --force --sign - ~/.cargo/bin/doorbell ~/.cargo/bin/flywheel` |
+| `doorbell`/`flywheel` behave like an older build | mise shims shadow `~/.cargo/bin` | Symlink shims at the fresh binaries, or remove the orphan shims |
+| `/health` accepts but never responds | Wedged runtime (seen: lock held across a reconcile loop) | `sample <pid>` for `lock_slow` parks; restart; the class is fixed, report a recurrence with the sample |
+| 20+ `spawn-*` subscriptions, `subscribers: 0` | Dead spawns never unsubscribed (pre-fix graveyard) | `flywheel doorbell unsubscribe <id>` each; `kill` now drops its own rows, daemon reaps week-silent ones |
+| `briefing --commit` refuses: crew-confirm gate | Spawn-class topology without `--yes` (non-TTY) | Present the proposal to the operator, remix, rerun with `--yes` (or `--crew N`) |
 
 ## Escape costs
 
