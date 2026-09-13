@@ -5,7 +5,15 @@ ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 BIN="$ROOT/target/debug/doorbell"
 STATE="$(mktemp -d "${TMPDIR:-/tmp}/doorbell-verify.XXXXXX")"
 PORT="${DOORBELL_TEST_PORT:-18981}"
+# bd-8ulu: pin the FLYWHEEL state dir too. Journals — the ground truth
+# `/events`, `why` and `digest` replay — live there (never in the doorbell
+# state dir), so without this the seeded `$STATE/journals` was ignored and
+# the events assertions silently graded whatever happened to be in the
+# operator's real `~/.local/state/flywheel`: non-hermetic, and green or red
+# for reasons unrelated to this gate. (verify-0012.sh already passed
+# --flywheel-state-dir; this harness never did.)
 export DOORBELL_STATE_DIR="$STATE" DOORBELL_PORT="$PORT"
+export DOORBELL_FLYWHEEL_STATE_DIR="$STATE"
 FAIL=0
 pass(){ echo "PASS: $1"; }
 fail(){ echo "FAIL: $1"; FAIL=1; }
@@ -102,11 +110,21 @@ pass "events full replay streams retained rows"
 # Last-Event-ID resumes gap-free from 12 (only newer rows stream).
 TAIL="$(curl -sf -H "Last-Event-ID: 11" "http://127.0.0.1:$PORT/events" 2>/dev/null)"
 echo "$TAIL" | grep -Fq "id: 12" || fail "reconnect must resume at 12"
-echo "$TAIL" | grep -Fq "id: 10" && fail "reconnect must not replay 10" || pass "reconnect gap-free resume"
+if echo "$TAIL" | grep -Fq "id: 10"; then
+  fail "reconnect must not replay 10"
+else
+  pass "reconnect gap-free resume"
+fi
 # Cursor predating retention names the first replayable seq.
 OLD="$(curl -sf "http://127.0.0.1:$PORT/events?since=1" 2>/dev/null)"
-echo "$OLD" | grep -Fq "first replayable seq is 10" || fail "retention notice missing"
-pass "retention notice names first replayable seq"
+# The PASS must be conditional on the notice actually being there: printing
+# it unconditionally after the `fail` above reported a green line for a red
+# assertion, so the gate's own output lied about its verdict.
+if echo "$OLD" | grep -Fq "first replayable seq is 10"; then
+  pass "retention notice names first replayable seq"
+else
+  fail "retention notice missing"
+fi
 # Stats shape carries the D8 counter keys.
 STATS="$(curl -sf "http://127.0.0.1:$PORT/stats" 2>/dev/null)" \
   || { fail "/stats unreachable"; echo "RESULT: FAIL"; exit 1; }
