@@ -145,6 +145,14 @@ wait "$SMOKE_WATCHER"
 pass "serve SIGTERM graceful (leases released)"
 rm -rf "$SMOKE_D"
 smoke_cleanup
+echo "== ADR-0012 Phase 4 clock-jump (bd-d60u) =="
+# Mid-run NTP step, backwards and forwards: journal order stays the seq
+# counter's business, a backwards step buys no prompt, liveness refuses a
+# behind stamp, and the budget window re-stabilizes once the clock settles.
+$CARGO test -p doorbell-rt --lib clock_ 2>&1 | tail -n 2
+[ "${PIPESTATUS[0]}" -eq 0 ] || fail "clock-jump resilience red"
+pass "clock-jump: order intact, no grant on a backward step, deadlines re-stabilize"
+
 echo "== ADR-0012 Phase 4 analytics (bd-asr2.19) =="
 ART="$ROOT/docs/learnings/doorbell/wake-analytics-2026-09-10.md"
 [ -f "$ART" ] || fail "wake analytics artifact missing"

@@ -369,7 +369,7 @@ Phase 4 (per flag, on opt-in):
 - [x] `arrival_triple`: E2 semantics (P's digest carries Q's roster row; role-addressed first contact) with flag on; flag off = Phase-3 behavior byte-identical
 - [x] `beads_poller`: E17 — hold expiry wake at 03:00, zero swarm, `ps` proves daemon-only; poller is read-only (br sqlite mtime/hash unchanged)
 - [x] `emit`: tokened service identity rings via kind-9; revoked token refused; rate limit holds
-- [ ] **Clock-jump**: NTP step mid-run → journal order unchanged, deadlines re-stabilize within one digest interval
+- [x] **Clock-jump** (bd-d60u, 2026-09-13): NTP step mid-run → journal order unchanged, deadlines re-stabilize. Two rt tests, both run by `verify-0012.sh` Phase 4 under `clock_`. The forward case proves `seq` stays consecutive across a +1 day step. The hard direction is covered too: stepping the clock BACK one hour must not refill the 5/30/3 budget window (`PinBudget::allows` counts a future-dated grant as recent via `saturating_sub`, so the window fails closed rather than re-opening), and the liveness ratchet refuses a behind stamp (`note_wake`, bd-7qg6), so a backward step can neither buy prompts nor rewind `last_wake`. Stepping forward two hours rolls the window, the next wake goes out, and the stamp advances — the deadlines re-stabilize. Journal order is the `seq` counter's business and never the clock's, so no step can reorder it.
 - [x] **Torn tail**: truncate journal mid-line → `why` stops at gap loudly, `/health` degraded, no fold-past
 
 Standing (all phases): `mbx +nightly-aarch64-apple-darwin test` green; proptest determinism (same Msg log → same Cmds, randomized sequences) in CI from Phase 0.
