@@ -84,13 +84,32 @@ async fn host_workspace(
 struct AppState {
     started: std::time::Instant,
     fw_state: std::path::PathBuf,
-    /// bd-2o1v: hosting is dynamic (auto-host on subscribe), so the list
-    /// is shared mutably; handlers snapshot it under the lock.
-    hosted: Shared<Vec<String>>,
+    /// bd-2o1v: hosting is dynamic (auto-host on subscribe), so the table
+    /// is shared mutably; handlers snapshot the keys under the lock.
+    hosted: Hosts,
 }
 
 /// bd-2o1v: shared mutable state handle (parking_lot — no poisoning).
 type Shared<T> = std::sync::Arc<parking_lot::Mutex<T>>;
+
+/// One hosted loop's control handle: its `project/workspace` key and the
+/// sender that shuts its Brain down.
+///
+/// Keyed by construction (bd-mk60). The daemon used to keep three parallel
+/// `Vec`s (keys / handles / senders), which could not name WHICH loop to stop,
+/// so reconcile could add hosts but never retire one: unsubscribing a
+/// workspace left its Brain sweeping forever and holding a writer lease.
+struct HostedLoop {
+    key: String,
+    tx: tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>,
+}
+
+type Hosts = Shared<Vec<HostedLoop>>;
+
+/// The hosted keys, in insertion order — what `/health` reports as `hosted`.
+fn hosted_keys(hosts: &[HostedLoop]) -> Vec<String> {
+    hosts.iter().map(|h| h.key.clone()).collect()
+}
 
 /// The external CLIs this daemon execs. Resolved through the shared search
 /// order (`doorbell_rt::binpath`) — under launchd/systemd `PATH` is
@@ -145,25 +164,56 @@ fn workspace_journal_path(fw_state: &std::path::Path, ws: &str) -> std::path::Pa
 /// normally drops its own rows; this is the belt.
 const REAP_AFTER_SECS: u64 = 7 * 24 * 3600;
 
-/// (project, workspace) pairs named by subscriptions but not yet hosted.
-/// Legacy rows without a project are never guessed into a host.
-fn unhosted_subscribed(
-    subs: &[doorbell_rt::subscribe::Subscription],
-    hosted: &[String],
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// Every `project/workspace` key named by a subscription row. Legacy rows
+/// without a project name nothing (never guessed into a host).
+///
+/// The single key builder: auto-host ([`unhosted_subscribed`]) and retire
+/// ([`retire_keys`]) must agree on what a subscription references, or a loop
+/// could be spawned by one rule and retired by another.
+fn subscribed_keys(subs: &[doorbell_rt::subscribe::Subscription]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     for sub in subs {
         let Some(project) = &sub.project else {
             continue;
         };
         for ws in sub.scope.workspaces() {
             let key = format!("{project}/{ws}");
-            if !hosted.contains(&key) && !out.contains(&(project.clone(), ws.clone())) {
-                out.push((project.clone(), ws));
+            if !out.contains(&key) {
+                out.push(key);
             }
         }
     }
     out
+}
+
+/// (project, workspace) pairs named by subscriptions but not yet hosted.
+/// Legacy rows without a project are never guessed into a host.
+fn unhosted_subscribed(
+    subs: &[doorbell_rt::subscribe::Subscription],
+    hosted: &[String],
+) -> Vec<(String, String)> {
+    subscribed_keys(subs)
+        .into_iter()
+        .filter(|key| !hosted.contains(key))
+        .filter_map(|key| {
+            key.rsplit_once('/')
+                .map(|(p, w)| (p.to_string(), w.to_string()))
+        })
+        .collect()
+}
+
+/// Which hosted keys reconcile should retire (bd-mk60).
+///
+/// Retire only when BOTH hold: the loop is not boot-configured — `--host` is
+/// an explicit operator choice that outlives any subscription — and no
+/// subscription row references it any more. Boot config is compared as a key
+/// so a boot host is never retired while it is the only reason the plane runs.
+fn retire_keys(hosted: &[String], boot: &[String], live: &[String]) -> Vec<String> {
+    hosted
+        .iter()
+        .filter(|k| !boot.contains(k) && !live.contains(k))
+        .cloned()
+        .collect()
 }
 
 /// Spawn-scoped rows whose workspace journal has been silent past
@@ -307,7 +357,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // so the list names only loops that actually exist (a pre-populated
     // list made the idempotency guard skip every boot host: health showed
     // hosted strings with no Brain behind them, zero sweeps, clean exit).
-    let hosted: Shared<Vec<String>> = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let hosted: Hosts = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     eprintln!(
         "doorbell serve: up on 127.0.0.1:{} + {} (hosting {})",
         cfg.port,
@@ -327,10 +377,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // sinks, journals undelivered intents, and returns its report.
     let loops: Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>> =
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let loop_txs: Shared<Vec<tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     for (project, workspace) in &cfg.hosts {
-        spawn_host_loop(cfg, &hosted, &loops, &loop_txs, project, workspace);
+        spawn_host_loop(cfg, &hosted, &loops, project, workspace);
     }
     let rotate_tick = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -387,14 +435,13 @@ pub async fn run(cfg: &Config) -> Result<()> {
         let cfg = cfg.clone();
         let hosted = hosted.clone();
         let loops = loops.clone();
-        let loop_txs = loop_txs.clone();
         let owned = owned.clone();
         async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                reconcile_once(&cfg, &hosted, &loops, &loop_txs, &owned);
+                reconcile_once(&cfg, &hosted, &loops, &owned);
             }
         }
     }));
@@ -430,12 +477,12 @@ pub async fn run(cfg: &Config) -> Result<()> {
             // Shutdown travels as a message (ticker + forwarder senders
             // stay open until their tasks end with the brain).
             eprintln!("doorbell serve: shutdown signal received, draining loops");
-            let txs = std::mem::take(&mut *loop_txs.lock());
-            for tx in &txs {
-                let _ = tx.send(doorbell_rt::BrainMsg::Shutdown).await;
+            let retiring = std::mem::take(&mut *hosted.lock());
+            for h in &retiring {
+                let _ = h.tx.send(doorbell_rt::BrainMsg::Shutdown).await;
             }
             eprintln!("doorbell serve: shutdown sent, joining loops");
-            drop(txs);
+            drop(retiring);
             let handles = std::mem::take(&mut *loops.lock());
             for h in handles {
                 let _ = h.await;
@@ -452,9 +499,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
 /// dynamic auto-host) and record it on the shared tables.
 fn spawn_host_loop(
     cfg: &Config,
-    hosted: &Shared<Vec<String>>,
+    hosted: &Hosts,
     loops: &Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>>,
-    loop_txs: &Shared<Vec<tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>>>,
     project: &str,
     workspace: &str,
 ) {
@@ -462,7 +508,7 @@ fn spawn_host_loop(
     // the same pair — a second Brain on one workspace double-rings. Check
     // before pushing anything, so an early return leaves no orphan tx.
     let key = format!("{project}/{workspace}");
-    if hosted.lock().contains(&key) {
+    if hosted.lock().iter().any(|h| h.key == key) {
         return;
     }
     // bd-ba8t: say out loud whether this workspace's wakes have anywhere to
@@ -488,30 +534,33 @@ fn spawn_host_loop(
         );
     }
     let (tx, rx) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
-    loop_txs.lock().push(tx.clone());
     let (fw, p, w) = (
         cfg.flywheel_state.clone(),
         project.to_string(),
         workspace.to_string(),
     );
+    let loop_tx = tx.clone();
     loops.lock().push(tokio::spawn(async move {
-        host_workspace(fw, p, w, tx, rx).await
+        host_workspace(fw, p, w, loop_tx, rx).await
     }));
-    hosted.lock().push(key);
+    // The table keeps its OWN sender: the loop's clones live inside the task,
+    // so this handle is the only one reconcile can address. `try_send` on it
+    // is how a retiring loop is told to drain (bd-mk60).
+    hosted.lock().push(HostedLoop { key, tx });
 }
 /// auto-host of every nameable subscribed (project, workspace).
 fn reconcile_once(
     cfg: &Config,
-    hosted: &Shared<Vec<String>>,
+    hosted: &Hosts,
     loops: &Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>>,
-    loop_txs: &Shared<Vec<tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>>>,
     owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
 ) {
     use doorbell_rt::lease;
     use doorbell_rt::subscribe::{Actor, SubscriptionStore};
     let mut store = SubscriptionStore::open(&cfg.flywheel_state);
-    let subs = store.list();
-    for id in reap_candidates(&subs, |ws| journal_age_secs(&cfg.flywheel_state, ws)) {
+    for id in reap_candidates(&store.list(), |ws| {
+        journal_age_secs(&cfg.flywheel_state, ws)
+    }) {
         match store.unsubscribe(Actor::operator(), &id) {
             Ok(dropped) => {
                 eprintln!(
@@ -527,7 +576,13 @@ fn reconcile_once(
     // held across the loop body — `spawn_host_loop` locks it again and
     // parking_lot mutexes are not reentrant (self-deadlock wedged the
     // whole runtime: every handler parked in lock_slow behind /health).
-    let unhosted = unhosted_subscribed(&store.list(), &hosted.lock().clone());
+    let subs = store.list();
+    // Bind the key snapshot to a LOCAL: `&hosted_keys(&hosted.lock())` as a
+    // call argument keeps the guard alive until the end of the call
+    // statement, and `retire_unsubscribed` locks `hosted` again — parking_lot
+    // mutexes are not reentrant, so the inline form self-deadlocks the
+    // reconcile task forever (and every /health handler behind it).
+    let unhosted = unhosted_subscribed(&subs, &hosted_keys(&hosted.lock()));
     for (project, workspace) in unhosted {
         if let Some(cur) = lease::read_lease(&cfg.flywheel_state, &workspace)
             && !lease::lease_stale(&cur, now)
@@ -538,11 +593,76 @@ fn reconcile_once(
             Ok(l) => {
                 owned.lock().push((workspace.clone(), l));
                 eprintln!("doorbell serve: auto-hosting {project}/{workspace} (subscribed)");
-                spawn_host_loop(cfg, hosted, loops, loop_txs, &project, &workspace);
+                spawn_host_loop(cfg, hosted, loops, &project, &workspace);
             }
             Err(e) => {
                 eprintln!("doorbell serve: auto-host {project}/{workspace} lease failed: {e:?}")
             }
+        }
+    }
+    // bd-mk60: retire what this tick did not justify. Runs AFTER the auto-host
+    // pass so a pair that is still subscribed is already hosted — and that
+    // ordering is what makes the retire rule safe: an auto-hosted key is in
+    // `subscribed_keys(subs)`, so it can never be retired on the same tick.
+    let hosted_now = hosted_keys(&hosted.lock());
+    retire_unsubscribed(cfg, hosted, owned, &subs, &hosted_now);
+}
+
+/// bd-mk60: stop the loops whose subscriptions went away.
+///
+/// Reconcile could add hosts but never remove them: unsubscribing a
+/// workspace left its Brain sweeping forever and holding a writer lease.
+///
+/// Retirement is a `Shutdown` message, never a bare task abort — the brain
+/// drains its sinks, journals its undelivered intents and returns a report,
+/// which an abort would throw away. The writer lease is released here for the
+/// same reason `finish()` releases the others: a retired loop no longer
+/// writes, so holding it would block a peer's embedded loop.
+fn retire_unsubscribed(
+    cfg: &Config,
+    hosted: &Hosts,
+    owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
+    subs: &[doorbell_rt::subscribe::Subscription],
+    hosted_now: &[String],
+) {
+    let boot: Vec<String> = cfg.hosts.iter().map(|(p, w)| format!("{p}/{w}")).collect();
+    let retiring = retire_keys(hosted_now, &boot, &subscribed_keys(subs));
+    if retiring.is_empty() {
+        return;
+    }
+    let mut stopped: Vec<HostedLoop> = Vec::new();
+    {
+        let mut table = hosted.lock();
+        table.retain(|l| {
+            if retiring.contains(&l.key) {
+                stopped.push(HostedLoop {
+                    key: l.key.clone(),
+                    tx: l.tx.clone(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+    }
+    for l in &stopped {
+        eprintln!(
+            "doorbell serve: retiring {} (no subscription references it)",
+            l.key
+        );
+        // Not `try_send`: a full channel must not silently keep the loop
+        // alive. Spawn the send so reconcile never blocks on a busy brain.
+        let tx = l.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(doorbell_rt::BrainMsg::Shutdown).await;
+        });
+        let Some(ws) = hosted_workspace(&l.key).map(str::to_string) else {
+            continue;
+        };
+        let mut o = owned.lock();
+        if let Some(pos) = o.iter().position(|(w, _)| w == &ws) {
+            let (_, lease) = o.remove(pos);
+            doorbell_rt::lease::release_lease(&cfg.flywheel_state, &ws, &lease);
         }
     }
 }
@@ -807,7 +927,7 @@ fn known_journal_workspaces(fw_state: &std::path::Path) -> Vec<String> {
 
 fn health_body(app: &AppState) -> String {
     // bd-2o1v: hosting is dynamic — snapshot under the lock once.
-    let hosted = app.hosted.lock().clone();
+    let hosted = hosted_keys(&app.hosted.lock());
     // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut degraded = Vec::new();
@@ -1014,7 +1134,7 @@ fn events_body(state_dir: &std::path::Path, since: Option<u64>) -> String {
 /// Host-level counters (D8 stats shape; journal-derived truth across the
 /// flywheel state dir; per-loop runtime counters stay in RunReports).
 fn stats_body(app: &AppState) -> String {
-    let hosted = app.hosted.lock().clone();
+    let hosted = hosted_keys(&app.hosted.lock());
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut journal_rows = 0u64;
     let mut workspaces = 0u64;
@@ -1056,6 +1176,72 @@ fn stats_body(app: &AppState) -> String {
 mod tests {
     use super::known_journal_workspaces;
     use super::{REAP_AFTER_SECS, reap_candidates, unhosted_subscribed};
+
+    /// bd-mk60 test seam: a keyed host handle with a real (unused) channel.
+    /// `tokio::sync::mpsc::channel` needs no runtime, so this works from a
+    /// plain `#[test]`.
+    fn host_for_test(key: &str) -> super::HostedLoop {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        super::HostedLoop {
+            key: key.to_string(),
+            tx,
+        }
+    }
+
+    /// bd-mk60: reconcile retires a loop whose subscription went away, and
+    /// ONLY that one. A boot-configured host (`--host`) is an explicit
+    /// operator choice that outlives any subscription, and a still-subscribed
+    /// workspace keeps its loop.
+    #[test]
+    fn retire_keys_drops_only_unsubscribed_non_boot_hosts() {
+        let boot = vec!["proj/boot".to_string()];
+        let hosted = vec![
+            "proj/boot".to_string(),
+            "proj/live".to_string(),
+            "proj/gone".to_string(),
+        ];
+        let live = vec!["proj/live".to_string()];
+        assert_eq!(
+            super::retire_keys(&hosted, &boot, &live),
+            vec!["proj/gone".to_string()],
+            "only the unsubscribed, non-boot host retires"
+        );
+        // Nothing subscribed and nothing boot-configured: every loop retires.
+        assert_eq!(
+            super::retire_keys(&hosted, &[], &[]).len(),
+            3,
+            "an empty subscription set retires every non-boot host"
+        );
+        // A boot host is never retired on its own account.
+        assert!(super::retire_keys(&boot, &boot, &[]).is_empty());
+    }
+
+    /// The key a subscription names is built in ONE place, so the auto-host
+    /// rule and the retire rule cannot disagree about what is referenced:
+    /// what `subscribed_keys` names is exactly what `retire_keys` treats as
+    /// still-live.
+    #[test]
+    fn retire_key_reads_the_same_subscription_set_that_auto_hosts() {
+        use doorbell_rt::subscribe::*;
+        let named = Subscription {
+            id: "spawn-w-p".into(),
+            identity: Identity::Pin("p".into()),
+            scope: Scope::One("w".into()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+            project: Some("proj".into()),
+        };
+        let live = super::subscribed_keys(&[named]);
+        assert_eq!(live, vec!["proj/w".to_string()]);
+        let hosted = vec!["proj/w".to_string(), "proj/orphan".to_string()];
+        // Even with no boot config, the subscribed key survives and the
+        // orphan does not — the two rules read one set.
+        assert_eq!(
+            super::retire_keys(&hosted, &[], &live),
+            vec!["proj/orphan".to_string()]
+        );
+    }
 
     /// bd-enov (F17): the wake-blind detector reads exactly the workspaces the
     /// plane has served — a journal file per workspace, ignoring strays and
@@ -1226,9 +1412,9 @@ mod tests {
         let app = AppState {
             started: std::time::Instant::now(),
             fw_state: dir.clone(),
-            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![
-                "flywheel/flywheel-flywheel".to_string(),
-            ])),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![host_for_test(
+                "flywheel/flywheel-flywheel",
+            )])),
         };
         let body = health_body(&app);
         assert!(
