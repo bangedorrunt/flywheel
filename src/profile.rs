@@ -25,10 +25,6 @@
 //!
 //! governed-by: ADR-0005 (Spec 1, Spec 1b), ADR-0003 (G14), ADR-0026, ADR-0007
 
-// TODO(bd-p2-cli-wn8): drop this allow once `flywheel profile {list,show,...}`
-// consumes the catalog (the module is test-exercised until then).
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
