@@ -162,6 +162,21 @@ fn mailbox_data_dir(durable_root: &Path) -> PathBuf {
     durable_root.join(toron_core::config::PROJECTS_RELATIVE)
 }
 
+/// Canonical toron presence projection path — the file `toron watch`/`toron
+/// presence` appends kind-20001 rows to (bd-m5ym, toron `plane.rs`
+/// `presence_path`). Toron lifts the mailbox `data_dir` (`<root>/projects`)
+/// back to the durable root via `toron_core::config::mailbox_root`, so rows
+/// land at `<root>/presence.jsonl` — **never** `<root>/projects/presence.jsonl`.
+///
+/// Reading the projects-level path yields a dead file (nothing writes it),
+/// which starves the doorbell presence map: every registry pin reads
+/// Unknown-presence and the reducer's filter holds every wake for digest, so
+/// the ring silently never fires. Both the embedded host and the `why`
+/// replay fold read this one path.
+pub fn presence_path() -> PathBuf {
+    toron_core::config::mailbox_root(&mailbox_roots().0).join("presence.jsonl")
+}
+
 /// Mirror of toron's `env_non_empty` for the ambient os-string vars: empty
 /// counts as unset, so `resolve_data_root` never sees a blank root.
 fn env_non_empty_os(name: &str) -> Option<PathBuf> {
@@ -2389,6 +2404,33 @@ mod tests {
                 root: PathBuf::from("/tmp/flywheel-bd-enov"),
             }
             .index_path()
+        );
+        unsafe { std::env::remove_var("TORON_DATA_DIR") };
+    }
+
+    /// bd-*: the presence projection lives at the durable ROOT, not under
+    /// `projects/`. Toron lifts the mailbox data dir via `mailbox_root`
+    /// (bd-m5ym), so a pin's 20001 rows land at `<root>/presence.jsonl`.
+    /// Reading `<root>/projects/presence.jsonl` finds a file nothing writes:
+    /// every pin reads Unknown-presence, the filter holds every wake for
+    /// digest, and the ring never fires (the silent-deafness this guards).
+    #[test]
+    fn presence_path_is_toron_root_level() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::set_var("TORON_DATA_DIR", "/tmp/flywheel-presence-path") };
+        unsafe { std::env::remove_var("TORON_MCP_DATA_DIR") };
+        let (data_dir, _db) = mailbox_roots();
+        let expected = toron_core::config::mailbox_root(&data_dir).join("presence.jsonl");
+        assert_eq!(
+            presence_path(),
+            PathBuf::from("/tmp/flywheel-presence-path/presence.jsonl"),
+            "presence projection is a root-level file (toron parity)"
+        );
+        assert_eq!(presence_path(), expected, "mirrors toron's presence_path");
+        assert!(
+            presence_path().parent().and_then(|p| p.file_name())
+                != Some(std::ffi::OsStr::new("projects")),
+            "never the dead projects/presence.jsonl"
         );
         unsafe { std::env::remove_var("TORON_DATA_DIR") };
     }

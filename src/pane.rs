@@ -889,11 +889,10 @@ pub fn pane_dispatch(
                                     },
                                     0,
                                 );
-                                let _ = crate::agent_ref::commit_rebind_opt(
-                                    project,
-                                    intent,
-                                    |_| Ok(None::<()>),
-                                );
+                                let _ =
+                                    crate::agent_ref::commit_rebind_opt(project, intent, |_| {
+                                        Ok(None::<()>)
+                                    });
                                 out["reroute"] = json!("refused-empty-evidence");
                             }
                         }
@@ -1799,9 +1798,7 @@ mod tests {
             src.contains("refused-empty-evidence"),
             "pane 429 empty-evidence path must expose refused-empty-evidence"
         );
-        let dispatch = src
-            .find("bd-mukq: 429 reroute")
-            .expect("429 reroute block");
+        let dispatch = src.find("bd-mukq: 429 reroute").expect("429 reroute block");
         let arm = &src[dispatch..dispatch.saturating_add(12000)];
         assert!(
             !arm.contains("still hop (legacy"),
@@ -1812,9 +1809,7 @@ mod tests {
             "429 arm must refuse empty-evidence hop"
         );
         // The refuse arm journals Unknown via commit_rebind_opt → Ok(None)
-        let idx = src
-            .find("refused-empty-evidence")
-            .expect("refused marker");
+        let idx = src.find("refused-empty-evidence").expect("refused marker");
         let window = &src[idx.saturating_sub(900)..idx.saturating_add(200)];
         assert!(
             window.contains("commit_rebind_opt") && window.contains("Ok(None"),

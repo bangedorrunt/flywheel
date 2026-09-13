@@ -26,8 +26,15 @@ pub struct Config {
 }
 
 /// Parse one `--host project/workspace` value.
+/// Split `--host <project>/<workspace>` on the LAST `/`.
+///
+/// `rsplit_once` is load-bearing, not style: project keys are routinely
+/// ABSOLUTE paths (`/tmp/scratch/proj`), and splitting on the first `/`
+/// yields an empty project and bails — so every harness/scratch project
+/// was unhostable (`doorbell serve --host /abs/proj/ws` refused), which is
+/// exactly the workspaces that need a hosted ring most.
 pub fn parse_host(s: &str) -> anyhow::Result<(String, String)> {
-    match s.split_once('/') {
+    match s.rsplit_once('/') {
         Some((p, w)) if !p.is_empty() && !w.is_empty() => Ok((p.to_string(), w.to_string())),
         _ => anyhow::bail!("--host must be project/workspace, got {s:?}"),
     }
@@ -529,6 +536,36 @@ fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_host_accepts_absolute_project_paths() {
+        // The scratch/harness shape: absolute project, bare workspace name.
+        assert_eq!(
+            parse_host("/tmp/scratch/proj/flywheel-proj").unwrap(),
+            ("/tmp/scratch/proj".to_string(), "flywheel-proj".to_string()),
+            "absolute project paths must be hostable"
+        );
+        // Relative slug stays as before.
+        assert_eq!(
+            parse_host("dbell/flywheel-dbell").unwrap(),
+            ("dbell".to_string(), "flywheel-dbell".to_string())
+        );
+        // Root-anchored single segment is a legal project key.
+        assert_eq!(
+            parse_host("/proj/ws").unwrap(),
+            ("/proj".to_string(), "ws".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_host_refuses_shapes_it_cannot_address() {
+        for bad in ["", "onlyslug", "/ws", "proj/", "/"] {
+            assert!(
+                parse_host(bad).is_err(),
+                "{bad:?} must be refused (project AND workspace are required)"
+            );
+        }
+    }
 
     #[test]
     fn render_substitutes_live_paths() {

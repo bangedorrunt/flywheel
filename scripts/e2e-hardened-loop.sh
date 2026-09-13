@@ -87,7 +87,16 @@ except Exception:
     print("")
 PY
 }
-SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# `br ready --json` is a WRAPPER object in br 0.4.x
+# ({issues:[...],total,limit,offset,has_more}), so `len(json)` is the KEY count
+# (always 5) and never the bead count. Read `.issues`.
+ready_count() {
+  (cd "$SCRATCH" && br ready --json 2>/dev/null | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+d=d.get('issues',d) if isinstance(d,dict) else d
+print(len(d))" 2>/dev/null)
+}
 
 # ---- setup: scratch project OUTSIDE the repo ------------------------------
 # unique label per run — the swarm label is the base name, and a leftover
@@ -108,18 +117,69 @@ git commit -q --allow-empty -m init
 br init >/dev/null 2>&1 || { fail "br init"; exit 1; }
 "$FW" init "$PROJ" >/dev/null 2>&1 || { fail "flywheel init"; exit 1; }
 
+# mk_bead <title> <desc> <verify-cmd>
+#
+# `br ready` is DISPATCHABILITY-gated (fail-closed work-ledger): EVERY bead
+# needs a VERIFY command or it is returned to nobody. Without one the loop
+# looks broken when it is behaving correctly — `loop run --work` finds no
+# ready bead and exits `loop: complete` with the work untouched, and every
+# scenario below fails for a reason that has nothing to do with the hardening
+# it is meant to gate. `br create` has no --verify flag and a `## VERIFY`
+# fence in the description does not populate the column; it is set with
+# `br update`. Each bead writes a distinct file, so VERIFY is that file.
+mk_bead() { # mk_bead <title> <desc> <verify-cmd>
+  local id
+  [ -n "${3:-}" ] || { fail "mk_bead: missing verify-cmd for '$1' (would not be dispatchable)"; return 1; }
+  id=$(cd "$SCRATCH" && br create --title="$1" --description="$2" --type=task --priority=3 --json 2>/dev/null \
+    | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+  [ -n "$id" ] || { fail "mk_bead: create '$1' returned no id"; return 1; }
+  (cd "$SCRATCH" && br update "$id" --verify "$3" >/dev/null 2>&1)
+}
+
 # six trivial beads: each writes a distinct file
 for i in 1 2 3 4 5 6; do
-  (cd "$SCRATCH" && br create --title="gate-bead-$i" \
-    --description="Create the file done-$i.txt in this repo root containing the single word ok. Then run br sync --flush-only and commit." \
-    --type=task --priority=3 >/dev/null 2>&1)
+  mk_bead "gate-bead-$i" \
+    "Create the file done-$i.txt in this repo root containing the single word ok. Then run br sync --flush-only and commit." \
+    "test -f done-$i.txt"
 done
-N_BEADS=$(cd "$SCRATCH" && br ready --json 2>/dev/null | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+N_BEADS=$(ready_count)
 say "setup: $N_BEADS ready beads"
+[ "$N_BEADS" = "6" ] || fail "setup: expected 6 DISPATCHABLE beads, got $N_BEADS (every scenario below depends on them)"
+
+# spawn_swarm <count> — spawn and CONFIRM the swarm is visible.
+#
+# Scenarios 2-5 reuse this swarm, so a failed spawn used to sink the whole gate
+# as a downstream symptom with no cause named: `loop: complete` with zero
+# claims, or a preflight `worktree` FAIL ("no flywheel swarm for <project>").
+# The old call sent spawn output to /dev/null; keep it, and fail loudly here
+# instead of letting every later scenario blame the wrong thing.
+spawn_swarm() { # spawn_swarm <count> <tag>
+  # NOTE: `local n="$1" tag="$2" log="...$tag..."` expands every RHS before
+  # any assignment lands, so $tag would be unbound under set -u.
+  local n="$1" tag="$2"
+  local log="$SCRATCH/spawn-$tag.log"
+  local agents
+  # --yes: this is a HEADLESS gate, so never enter the pre-spawn model
+  # reconfirm (bd-ll3k, `flywheel spawn --yes`). The reconfirm is TTY-only:
+  # run from a terminal it blocks on a prompt, and with output redirected it
+  # dies `flywheel: IO error: not a terminal` — either way the spawn produced
+  # no swarm and every scenario below failed for an unrelated reason.
+  "$FW" spawn "$PROJ" --oc "$n" --yes >"$log" 2>&1
+  agents=$("$FW" status "$PROJ" --robot-status 2>/dev/null | python3 -c "
+import sys,json
+try: print(len(json.load(sys.stdin).get('agents',[])))
+except Exception: print(0)")
+  if [ "${agents:-0}" -lt 1 ]; then
+    fail "spawn --oc $n produced NO swarm (agents=$agents) — every scenario below reuses it; spawn log tail: $(tail -2 "$log" | tr '\n' ' ')"
+    return 1
+  fi
+  say "spawn: $n agent(s) live"
+  return 0
+}
 
 # ===========================================================================
 say "=== scenario 1: baseline drain (all beads close, loop completes) ==="
-"$FW" spawn "$PROJ" --oc 2 >/dev/null 2>&1
+spawn_swarm 2 s1
 nohup "$FW" loop run "$PROJ" --work --interval-active 15 ${LOOP_EXTRA:-} >"$SCRATCH/loop1.log" 2>&1 &
 LOOP_PID=$!
 # wait up to 10 min for the loop to complete
@@ -145,16 +205,16 @@ say "scenario 2: pre-run invocation=$INV_PRE"
 # ===========================================================================
 say "=== scenario 2: crash-resume + dedup (kill -9 mid-task, resume, no dup) ==="
 for i in 1 2 3 4; do
-  (cd "$SCRATCH" && br create --title="gate-resume-$i" \
-    --description="Create the file resume-$i.txt in this repo root containing ok. Then br sync --flush-only and commit." \
-    --type=task --priority=3 >/dev/null 2>&1)
+  mk_bead "gate-resume-$i" \
+    "Create the file resume-$i.txt in this repo root containing ok. Then br sync --flush-only and commit." \
+    "test -f resume-$i.txt"
 done
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 nohup "$FW" loop run "$PROJ" --work --interval-active 15 ${LOOP_EXTRA:-} >"$SCRATCH/loop2.log" 2>&1 &
 LOOP_PID=$!
 # let the first bead land + close, then kill -9 mid-flight
 for i in $(seq 1 40); do
-  OPEN=$(cd "$SCRATCH" && br ready --json 2>/dev/null | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+  OPEN=$(ready_count)
   [ "${OPEN:-4}" -lt 4 ] 2>/dev/null && break
   sleep 5
 done
@@ -187,9 +247,9 @@ pkill -f "flywheel loop run $PROJ" 2>/dev/null; sleep 1
 # ===========================================================================
 say "=== scenario 3: context respawn via state file (fresh -> respawn, stale -> none) ==="
 for i in 1 2; do
-  (cd "$SCRATCH" && br create --title="gate-ctx-$i" \
-    --description="Create ctx-$i.txt containing ok, br sync --flush-only, commit." \
-    --type=task --priority=3 >/dev/null 2>&1)
+  mk_bead "gate-ctx-$i" \
+    "Create ctx-$i.txt containing ok, br sync --flush-only, commit." \
+    "test -f ctx-$i.txt"
 done
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 nohup "$FW" loop run "$PROJ" --work --interval-active 15 ${LOOP_EXTRA:-} >"$SCRATCH/loop3.log" 2>&1 &
@@ -197,7 +257,7 @@ LOOP_PID=$!
 # wait for an idle agent, then hand-write a FRESH state file
 AGENT=""
 for i in $(seq 1 20); do
-  AGENT=$("$FW" status "$PROJ" 2>/dev/null | python3 -c "
+  AGENT=$("$FW" status "$PROJ" --robot-status 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
@@ -244,7 +304,7 @@ say "=== scenario 4: blocked fast-alert (--on-blocked mail within ~2x active int
 # herdr `blocked` = agent at an approval prompt. Try to drive one via a
 # prompt that needs approval; if the build cannot produce blocked, document.
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-AGENT=$("$FW" status "$PROJ" 2>/dev/null | python3 -c "
+AGENT=$("$FW" status "$PROJ" --robot-status 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
@@ -255,7 +315,7 @@ if [ -n "$AGENT" ]; then
   "$FW" __send "$PROJ" "$AGENT" "Ask for permission to run this command and WAIT for the user: rm -rf /nonexistent-permission-test" --confirm --timeout-ms 30000 >/dev/null 2>&1
   BLOCKED=""
   for i in $(seq 1 18); do
-    BLOCKED=$("$FW" status "$PROJ" 2>/dev/null | python3 -c "
+    BLOCKED=$("$FW" status "$PROJ" --robot-status 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
@@ -278,9 +338,9 @@ pkill -f "flywheel loop run $PROJ" 2>/dev/null; sleep 1
 # ===========================================================================
 say "=== scenario 5: frozen-agent escalation (SIGSTOP -> error -> respawn x3 -> hard-stop) ==="
 for i in 1 2 3 4; do
-  (cd "$SCRATCH" && br create --title="gate-freeze-$i" \
-    --description="Create freeze-$i.txt containing ok, br sync --flush-only, commit." \
-    --type=task --priority=3 >/dev/null 2>&1)
+  mk_bead "gate-freeze-$i" \
+    "Create freeze-$i.txt containing ok, br sync --flush-only, commit." \
+    "test -f freeze-$i.txt"
 done
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 nohup "$FW" loop run "$PROJ" --work --interval-active 15 ${LOOP_EXTRA:-} >"$SCRATCH/loop5.log" 2>&1 &
@@ -294,7 +354,7 @@ ROUNDS=0
 for round in 1 2 3 4; do
   # wait for the current agent to be idle/done
   for i in $(seq 1 20); do
-    ST=$("$FW" status "$PROJ" 2>/dev/null | python3 -c "
+    ST=$("$FW" status "$PROJ" --robot-status 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
@@ -378,7 +438,7 @@ say "=== scenario 6: unknown-agent repair (documented limitation on this build) 
 # respawn machinery are the same code paths proven in scenarios 3/5; the
 # unknown-specific branch is unit-tested (track_unknown/unknown_decision).
 SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-AGENT=$("$FW" status "$PROJ" 2>/dev/null | python3 -c "
+AGENT=$("$FW" status "$PROJ" --robot-status 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
@@ -388,9 +448,9 @@ except: pass")
 if [ -z "$AGENT" ]; then
   # the hard-stop consumed the swarm — respawn an agent to demonstrate the drop
   say "scenario 6: no live agent (post-hard-stop) — respawning one"
-  "$FW" __respawn "$PROJ" "flywheel-$LABEL-oc" opencode >/dev/null 2>&1
+  "$FW" __respawn "$PROJ" "flywheel-$LABEL-oc" opencode >"$SCRATCH/respawn6.log" 2>&1
   for i in $(seq 1 24); do
-    AGENT=$("$FW" status "$PROJ" 2>/dev/null | python3 -c "
+    AGENT=$("$FW" status "$PROJ" --robot-status 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)
@@ -405,7 +465,7 @@ if [ -n "$AGENT" ]; then
   PID=$(lsof -c opencode 2>/dev/null | grep "$PROJ" | awk '{print $2}' | sort -u | head -1)
   [ -n "${PID:-}" ] && kill -9 "$PID" 2>/dev/null
   sleep 3
-  COUNT=$("$FW" status "$PROJ" 2>/dev/null | python3 -c "
+  COUNT=$("$FW" status "$PROJ" --robot-status 2>/dev/null | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin); print(len(d.get('agents',[])))

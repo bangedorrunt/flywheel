@@ -875,7 +875,10 @@ pub fn ensure_running(
     {
         eprintln!("flywheel doorbell: {hint}");
     }
-    if matches!(resolve_host(state_dir, cfg_url), DoorbellHost::Proxy { .. }) {
+    if matches!(
+        resolve_host(state_dir, cfg_url, Some((project, workspace))),
+        DoorbellHost::Proxy { .. }
+    ) {
         eprintln!(
             "flywheel doorbell: daemon host alive — attached, local loop suppressed (deference)"
         );
@@ -912,53 +915,91 @@ pub enum DoorbellHost {
     Proxy { url: String },
 }
 
-pub fn resolve_host(state_dir: &Path, cfg_url: Option<String>) -> DoorbellHost {
+/// `target` is `Some((project, workspace))` whenever the caller has one.
+/// It is load-bearing, not decoration: deference SUPPRESSES the local loop,
+/// so deferring on "a daemon answered" alone left any workspace the daemon
+/// does not host with no writer and no rings — silently deaf. The probe is
+/// now qualified by (a) the daemon actually hosting this workspace and
+/// (b) this workspace's OWN lease, never a stranger's on another one.
+/// `None` asserts neither and is for generic lifecycle verbs (status/stop)
+/// that address the daemon itself rather than a workspace.
+pub fn resolve_host(
+    state_dir: &Path,
+    cfg_url: Option<String>,
+    target: Option<(&str, &str)>,
+) -> DoorbellHost {
     use doorbell_rt::lease::{deference_decision, live_leases};
     const DEFAULT_URL: &str = "http://127.0.0.1:18980";
-    // F3/bd-ene2 lease-aware deference (D9, per-ws scope). Daemon health
-    // decides defer; a live lease without a daemon means another writer
-    // runs — the per-workspace acquire in run_embedded refuses, never
-    // double-runs. This probe is workspace-blind (any live lease warns).
     let now = doorbell_rt::lease::unix_now();
-    let live = live_leases(state_dir, now);
-    let probe = live.into_iter().next().map(|(_, lease)| lease);
-    if let Some(url) = cfg_url {
-        let healthy = daemon_healthy(&url);
-        match deference_decision(probe.as_ref(), healthy, now) {
-            doorbell_rt::lease::Deference::DeferToDaemon => return DoorbellHost::Proxy { url },
+    // Per-workspace lease probe: leases are per workspace (bd-ene2), so a
+    // live lease on another workspace must never refuse THIS one.
+    let probe = target.and_then(|(_, ws)| {
+        live_leases(state_dir, now)
+            .into_iter()
+            .find(|(w, _)| w == ws)
+            .map(|(_, lease)| lease)
+    });
+    let resolve_at = |url: &str, configured: bool| -> DoorbellHost {
+        let health = daemon_health_json(url);
+        let hosts_target = match (&health, target) {
+            (Some(v), Some((p, w))) => daemon_hosts(v, p, w),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        // Up but not hosting us is a real, common state (standby daemon,
+        // or a daemon armed for other workspaces). Name it and run local.
+        if let (Some(v), Some((p, w))) = (&health, target)
+            && !daemon_hosts(v, p, w)
+        {
+            let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or("unknown");
+            eprintln!(
+                "flywheel doorbell: daemon {url} is alive (mode={mode}) but does not host {p}/{w} — not deferring; running the local loop (arm it: doorbell start --host {p}/{w})"
+            );
+        }
+        match deference_decision(probe.as_ref(), hosts_target, now) {
+            doorbell_rt::lease::Deference::DeferToDaemon => DoorbellHost::Proxy {
+                url: url.to_string(),
+            },
             doorbell_rt::lease::Deference::TakeLease => {
-                if !healthy {
+                if configured && health.is_none() {
                     eprintln!(
                         "flywheel doorbell: WARNING configured daemon {url} unreachable (remediation: doorbell start | doorbell install | flywheel daemon start) — embedded degraded mode"
                     );
                 }
-                return DoorbellHost::Embedded;
+                DoorbellHost::Embedded
             }
             doorbell_rt::lease::Deference::RefuseDoubleRun => {
                 eprintln!(
                     "flywheel doorbell: live lease held by another writer — refusing second loop (see doorbell/owner-*.json)"
                 );
-                return DoorbellHost::Embedded;
+                DoorbellHost::Embedded
             }
         }
+    };
+    if let Some(url) = cfg_url {
+        return resolve_at(&url, true);
     }
-    let healthy = daemon_healthy(DEFAULT_URL);
-    match deference_decision(probe.as_ref(), healthy, now) {
-        doorbell_rt::lease::Deference::DeferToDaemon => DoorbellHost::Proxy {
-            url: DEFAULT_URL.to_string(),
-        },
-        doorbell_rt::lease::Deference::TakeLease => DoorbellHost::Embedded,
-        doorbell_rt::lease::Deference::RefuseDoubleRun => {
-            eprintln!(
-                "flywheel doorbell: live lease held by another writer — refusing second loop (see doorbell/owner-*.json)"
-            );
-            DoorbellHost::Embedded
-        }
-    }
+    resolve_at(DEFAULT_URL, false)
+}
+
+/// Is the daemon at `url` hosting `project/workspace`? `hosted` is the
+/// `/health` list of `project/workspace` pairs the daemon writes for.
+fn daemon_hosts(v: &serde_json::Value, project: &str, workspace: &str) -> bool {
+    let target = format!("{project}/{workspace}");
+    v.get("hosted")
+        .and_then(|h| h.as_array())
+        .is_some_and(|a| a.iter().any(|e| e.as_str() == Some(target.as_str())))
 }
 
 /// 200ms loopback probe: `/health` answers with our protocol.
 pub fn daemon_healthy(url: &str) -> bool {
+    daemon_health_json(url).is_some()
+}
+
+/// The parsed `/health` body, or `None` when nothing doorbell-shaped
+/// answers. Parsed (not substring-matched) so callers can ask WHAT the
+/// daemon hosts — "answers" and "does our work" are different questions.
+fn daemon_health_json(url: &str) -> Option<serde_json::Value> {
     let health_url = format!("{url}/health");
     let addr = health_url
         .trim_start_matches("http://")
@@ -966,32 +1007,24 @@ pub fn daemon_healthy(url: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_string();
-    let Ok(sock) = addr
+    let sock = addr
         .parse::<std::net::SocketAddr>()
         .or_else(|_| format!("{addr}:80").parse::<std::net::SocketAddr>())
-    else {
-        return false;
-    };
-    let Ok(mut stream) =
-        std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(200))
-    else {
-        return false;
-    };
+        .ok()?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(200)).ok()?;
     use std::io::{Read, Write};
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    if write!(
+    write!(
         stream,
         "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     )
-    .is_err()
-    {
-        return false;
-    }
-    let mut body = String::new();
-    if stream.read_to_string(&mut body).is_err() {
-        return false;
-    }
-    body.contains("\"protocol\":\"doorbell.v1\"")
+    .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let payload = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(&raw);
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    (v.get("protocol").and_then(|p| p.as_str()) == Some("doorbell.v1")).then_some(v)
 }
 /// Fan-out: given classified rings and pane status, produce (pin, line)
 /// pairs that should be prompted now. Working pins are skipped (queued

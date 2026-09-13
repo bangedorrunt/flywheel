@@ -151,7 +151,6 @@ fn consume_token(s: &str) -> usize {
         .sum()
 }
 
-
 /// Immutable identity for a pane lifetime (ADR-0018 pin vs slug).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRef {
@@ -187,7 +186,13 @@ impl AgentRef {
         if self.pin.trim().is_empty() {
             return Err("AgentRef unbound after settle: empty pin".into());
         }
-        if require_npub && self.npub.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+        if require_npub
+            && self
+                .npub
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+        {
             return Err(format!(
                 "AgentRef unbound after settle: pin={} has no npub",
                 self.pin
@@ -668,8 +673,14 @@ mod tests {
             FailureKind::Billing,
             "402 insufficient balance"
         ));
-        assert_eq!(RebindIntent::hop_kind(FailureKind::Billing), Some("profile"));
-        assert_eq!(RebindIntent::hop_kind(FailureKind::RateLimit), Some("model"));
+        assert_eq!(
+            RebindIntent::hop_kind(FailureKind::Billing),
+            Some("profile")
+        );
+        assert_eq!(
+            RebindIntent::hop_kind(FailureKind::RateLimit),
+            Some("model")
+        );
         assert_eq!(RebindIntent::hop_kind(FailureKind::Timeout), None);
     }
 
@@ -706,7 +717,11 @@ mod tests {
         assert!(r.assert_bound_after_settle(false).is_err());
         let r2 = AgentRef::new("p", "Pin");
         assert!(r2.assert_bound_after_settle(true).is_err());
-        assert!(r2.with_npub("npub1abc").assert_bound_after_settle(true).is_ok());
+        assert!(
+            r2.with_npub("npub1abc")
+                .assert_bound_after_settle(true)
+                .is_ok()
+        );
     }
 
     #[test]

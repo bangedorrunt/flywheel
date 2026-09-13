@@ -1,6 +1,6 @@
 /target
 .DS_Store
-
+/.zvec-grep/
 # agent state files (context signals written by agents mid-session)
 .flywheel/
 
