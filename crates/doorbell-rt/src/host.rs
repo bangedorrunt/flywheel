@@ -27,6 +27,16 @@ pub enum Effect {
         pin: String,
         detail: serde_json::Value,
     },
+    /// bd-bk9t: a wake for a pin with no prompt route (subscribed, never
+    /// spawned, so no pane). Not a Prompt — the sink cannot deliver it — and
+    /// not an Audit, because the wake is real and must reach the human. The
+    /// brain folds it into the digest batch; `why` names the skip in the
+    /// journal row.
+    Digest {
+        pin: String,
+        line: String,
+        why: String,
+    },
 }
 
 /// Flywheel-shaped capabilities the brain orchestrates. All synchronous:
@@ -45,6 +55,16 @@ pub trait Host: Send {
     fn restart_watch(&mut self);
     /// Binary-generation gate (.5: `WatcherGen`; default allows).
     fn inject_allowed(&self, _pin: &str) -> bool {
+        true
+    }
+    /// Does `pin` have a prompt route — a pane/target the sink can reach?
+    /// bd-bk9t: a digest batch for a pin with no route has nowhere to be
+    /// shipped. The herdr sink MISSES an unknown pin and still returns
+    /// `Ok`, so flushing would stamp a `Delivered` receipt (and a hear
+    /// stamp) for a wake nobody received. The brain keeps those batches
+    /// journal-recorded only — read them with `flywheel doorbell digest`.
+    /// Default true: only a host with a routing table can answer.
+    fn has_route(&self, _pin: &str) -> bool {
         true
     }
     /// Pins this brain owns (.5: spawn registry + role binds).
@@ -87,6 +107,8 @@ pub struct MockHost {
     /// Last-known status per pin, recorded at tick time (mirrors the
     /// real hosts so `prev_status` ordering is testable at the brain).
     pub statuses: BTreeMap<String, String>,
+    /// Pins with no prompt route (`has_route` false) — bd-bk9t tests.
+    pub unroutable: std::collections::BTreeSet<String>,
 }
 
 impl MockHost {
@@ -100,6 +122,7 @@ impl MockHost {
             tick_log: Vec::new(),
             restarts: 0,
             statuses: Default::default(),
+            unroutable: Default::default(),
         }
     }
 
@@ -146,6 +169,10 @@ impl Host for MockHost {
 
     fn restart_watch(&mut self) {
         self.restarts += 1;
+    }
+
+    fn has_route(&self, pin: &str) -> bool {
+        !self.unroutable.contains(pin)
     }
 }
 
@@ -199,6 +226,7 @@ impl CoreReducer {
                     pin,
                     detail: serde_json::json!(detail),
                 },
+                DoorbellAction::Digest { pin, line, why } => Effect::Digest { pin, line, why },
             })
             .collect()
     }

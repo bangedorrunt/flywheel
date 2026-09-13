@@ -605,6 +605,16 @@ pub enum DoorbellAction {
         pin: String,
         detail: String,
     },
+    /// bd-bk9t: a wake for a pin the index knows cannot be routed to a pane
+    /// (a subscribed identity with no spawn row). The effect layer puts it
+    /// in the digest batch; `why` rides the journal row so the skip is never
+    /// silent. Distinct from `Audit` because the wake still reaches the
+    /// human — it is only the *prompt* route that does not exist.
+    Digest {
+        pin: String,
+        line: String,
+        why: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -620,6 +630,13 @@ pub struct DoorbellModel {
     /// the effect layer (take_allowed below) — threading it into tick
     /// would reshape decided rows and break the .6 parity gate.
     pub budgets: BTreeMap<String, PinBudget>,
+    /// Pins the index knows but cannot route to: subscribed identities with
+    /// no spawn row, so no pane and no herdr target (bd-bk9t). Their wakes
+    /// must NOT park in `queues` — that map only drains on a
+    /// `working -> injectable` [`is_drain_transition`], and a pane-less pin
+    /// never produces one, so the entry would sit in RAM forever and die
+    /// with the process. `route_or_queue` sends them to the digest instead.
+    pub unroutable: BTreeSet<String>,
 }
 
 /// Per-pin 5/30/3 budget (D1 item 2, D4.5 home).
@@ -826,6 +843,17 @@ fn route_or_queue(
             pin: pin.to_string(),
             line,
         });
+    } else if next.unroutable.contains(pin) {
+        // bd-bk9t: no pane means no drain is possible, ever. Queueing here
+        // would be a memory leak wearing a delivery intent — the RAM-only
+        // queue is lost on restart and no `HerdrStatus` will ever drain it.
+        // The wake is real and the human is the addressee, so it goes to
+        // the digest with a named reason instead.
+        actions.push(DoorbellAction::Digest {
+            pin: pin.to_string(),
+            line,
+            why: "no_route".into(),
+        });
     } else {
         // bd-ztek: a queued ring leaves one journal-visible Audit on the
         // empty→non-empty transition per pin. Without it the queue was
@@ -857,6 +885,7 @@ impl DoorbellAction {
             Self::RestartWatch => "restart-watch".into(),
             Self::FactMiss { why } => format!("fact-miss {why}"),
             Self::Audit { kind, pin, .. } => format!("audit {kind} {pin}"),
+            Self::Digest { pin, why, .. } => format!("digest {pin} ({why})"),
         }
     }
 }
@@ -991,6 +1020,67 @@ mod tests {
         let (next2, second) = tick(&next, &msg);
         assert!(second.is_empty(), "no audit storm while queued");
         assert_eq!(next2.queues.get("BlueRidge").map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn unroutable_pin_wake_goes_to_digest_not_queue() {
+        // bd-bk9t: a subscribed identity with no spawn row has no pane, so
+        // its status can never leave "unknown" and the per-pin queue can
+        // never drain. The wake must reach the digest instead of parking in
+        // RAM with a delivery intent it can never honour.
+        let mut model = model_with("QuietHeron");
+        model.statuses.remove("QuietHeron");
+        model.unroutable.insert("QuietHeron".into());
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","QuietHeron"],["h","ch-1"]],"content":"@QuietHeron hi"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert_eq!(actions.len(), 1, "one digest-bound wake");
+        match &actions[0] {
+            DoorbellAction::Digest { pin, line, why } => {
+                assert_eq!(pin, "QuietHeron");
+                assert!(line.contains("[doorbell]"), "the wake line itself: {line}");
+                assert_eq!(why, "no_route", "the skip must name its reason");
+            }
+            other => panic!("expected Digest, got {other:?}"),
+        }
+        assert!(
+            next.queues.is_empty(),
+            "a queueless pin must never accumulate RAM entries: {:?}",
+            next.queues
+        );
+    }
+
+    #[test]
+    fn unroutable_pin_still_prompts_when_injectable() {
+        // Defensive: routability is about the *pane*, injectability about
+        // the *status*. If a pane ever turns up for a previously pane-less
+        // pin and it is idle, the prompt gate still wins.
+        let mut model = model_with("QuietHeron");
+        model.unroutable.insert("QuietHeron".into());
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","QuietHeron"],["h","ch-1"]],"content":"@QuietHeron hi"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert!(
+            matches!(&actions[0], DoorbellAction::Prompt { .. }),
+            "idle stays injectable: {:?}",
+            actions[0]
+        );
+        assert!(next.queues.is_empty());
+    }
+
+    #[test]
+    fn routable_unknown_pin_still_queues_not_digests() {
+        // Regression: a spawned pin whose status has not arrived yet is a
+        // *transient* unknown — it will drain when herdr reports. Only the
+        // index-marked pane-less kind is digest-bound.
+        let mut model = model_with("BlueRidge");
+        model.statuses.remove("BlueRidge");
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["h","ch-1"]],"content":"@BlueRidge hi"}"#;
+        let (next, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: line.into() });
+        assert!(
+            matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "queued"),
+            "a routable unknown pin still queues: {:?}",
+            actions[0]
+        );
+        assert_eq!(next.queues.get("BlueRidge").map(Vec::len), Some(1));
     }
 
     #[test]

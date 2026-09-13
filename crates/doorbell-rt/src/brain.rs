@@ -326,6 +326,9 @@ impl<H: Host> Brain<H> {
         }
         *self.stats.rings_by_class.entry("watch".into()).or_default() += 1;
         let effects = self.host.tick(&BrainMsg::Watch(line.clone()));
+        // bd-bk9t: a digest-bound wake (pane-less subscriber pin) carries no
+        // Prompt, so it must be absorbed here or this arm drops it.
+        self.absorb_digests(&effects);
         let raw: Vec<(String, String)> = effects
             .iter()
             .filter_map(|e| match e {
@@ -377,6 +380,7 @@ impl<H: Host> Brain<H> {
             pin: pin.clone(),
             status: status.clone(),
         });
+        self.absorb_digests(&effects);
         let raw = self.prompts_of(&effects);
         let now = self.host.now_unix();
         let injects = self.gated(raw.clone(), now);
@@ -586,8 +590,13 @@ impl<H: Host> Brain<H> {
     /// Audit/FactMiss/LoudMiss/Digest effects are recorded by the Host layer
     /// (single ownership); the journal row above already carries them as data.
     async fn deliver(&mut self, effects: Vec<Effect>, _stage: &str) -> Vec<String> {
+        // bd-bk9t: digest-bound wakes are not prompts. Fold them in first so
+        // a prompt-less arm (the pane-less case by construction) still
+        // reaches the batch instead of returning early and losing the wake.
+        self.absorb_digests(&effects);
         let raw = self.prompts_of(&effects);
         if raw.is_empty() {
+            self.maybe_flush_digest().await;
             return Vec::new();
         }
         let now = self.host.now_unix();
@@ -650,6 +659,18 @@ impl<H: Host> Brain<H> {
         queued
     }
 
+    /// Fold every `Effect::Digest` into the batch (bd-bk9t). Every arm that
+    /// consumes effects calls this before its prompt path, so a wake with no
+    /// prompt route still lands in the human-visible digest. The flush is
+    /// left to the arm (`deliver_prompts` ends with one unconditionally).
+    fn absorb_digests(&mut self, effects: &[Effect]) {
+        for e in effects {
+            if let Effect::Digest { pin, line, .. } = e {
+                self.digest_push(pin.clone(), line.clone());
+            }
+        }
+    }
+
     fn digest_push(&mut self, pin: String, line: String) {
         if self.digest_since.is_none() {
             self.digest_since = Some(tokio::time::Instant::now());
@@ -687,6 +708,15 @@ impl<H: Host> Brain<H> {
         self.stats.digest_batches += 1;
         let sink = self.cfg.main_sink.clone();
         for (pin, lines) in by_pin {
+            // bd-bk9t: a pin with no route has nowhere for a batch to land.
+            // The sink MISSES an unknown pin and still reports success, so
+            // shipping it would manufacture a `Delivered` receipt and a
+            // hear stamp for a wake nobody received — the same delivery lie
+            // the queue used to tell. The `Digest` journal row (with `why`)
+            // is the durable record; `doorbell digest` reads it.
+            if !self.host.has_route(&pin) {
+                continue;
+            }
             let batch = format!("[digest] {} queued: {}", lines.len(), lines.join(" | "));
             match self.sinks.send(&sink, &pin, &batch).await {
                 SendOutcome::Queued => {}
@@ -720,6 +750,9 @@ impl<H: Host> Brain<H> {
                     Effect::Audit { kind, pin, detail } => {
                         serde_json::json!({"Audit": {"kind": kind, "pin": pin, "detail": detail}})
                     }
+                    Effect::Digest { pin, line, why } => serde_json::json!({
+                        "Digest": {"pin": pin, "line": line, "why": why}
+                    }),
                 })
                 .collect::<Vec<_>>()
         );
@@ -1271,6 +1304,88 @@ mod tests {
         assert!(
             body.contains("[deaf] subscriber=workspace:w attempts=1"),
             "deaf digest names subscriber+attempts: {body}"
+        );
+    }
+
+    /// bd-bk9t: a pane-less subscribed pin's wake has no prompt route, so the
+    /// `Watch` arm must fold it into the digest batch. Regression: that arm
+    /// collected prompts only, so a `Digest` effect was silently dropped —
+    /// the exact failure mode this bead exists to remove.
+    #[tokio::test]
+    async fn digest_bound_wake_from_watch_reaches_the_batch() {
+        let line = "[doorbell] plane-P urgent. Pull: toron mail inbox --since t";
+        let (mut brain, _rx, _tx) = test_brain(
+            "bk9t-watch",
+            vec![vec![Effect::Digest {
+                pin: "OperatorPin".into(),
+                line: line.into(),
+                why: "no_route".into(),
+            }]],
+        );
+        brain
+            .dispatch(BrainMsg::Watch("{\"kind\":9,\"created_at\":2}".into()))
+            .await;
+        // The journal row names the skip, so a later `why` read is not a
+        // mystery about where the wake went.
+        let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        assert!(
+            journal.contains("\"why\":\"no_route\""),
+            "the watch row must carry the digest reason: {journal}"
+        );
+        // And the wake itself is in the batch for the human.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        brain
+            .dispatch(BrainMsg::Ask {
+                kind: AskKind::Digest,
+                reply: tx,
+            })
+            .await;
+        match rx.await.expect("digest reply") {
+            AskReply::Digest(batch) => assert!(
+                batch.iter().any(|(p, l)| p == "OperatorPin" && l == line),
+                "the pane-less pin's wake must be in the digest: {batch:?}"
+            ),
+            other => panic!("expected Digest reply, got {other:?}"),
+        }
+        // A wake that reaches the digest is never a prompt intent.
+        assert_eq!(brain.stats.injects, 0, "no prompt route exists");
+    }
+
+    /// bd-bk9t: a digest batch for a pin with no route must NOT be shipped
+    /// to a sink. The herdr sink misses an unknown pin and returns `Ok`, so
+    /// shipping would stamp a `Delivered` receipt (and a hear stamp) for a
+    /// wake nobody received. The journal row is the durable record.
+    #[tokio::test]
+    async fn digest_batch_for_a_pane_less_pin_is_not_shipped_to_a_sink() {
+        let (mut brain, _rx, _tx) = test_brain(
+            "bk9t-skip",
+            vec![vec![Effect::Digest {
+                pin: "OperatorPin".into(),
+                line: "[doorbell] plane-P urgent".into(),
+                why: "no_route".into(),
+            }]],
+        );
+        brain.cfg.digest_threshold = 1; // force the flush during this arm
+        let (sink, sent) = MockSink::new();
+        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.host.unroutable.insert("OperatorPin".into());
+        assert!(!brain.host.has_route("OperatorPin"));
+        brain
+            .dispatch(BrainMsg::Watch("{\"kind\":9,\"created_at\":2}".into()))
+            .await;
+        assert!(
+            sent.lock().expect("sent log").is_empty(),
+            "a batch with no destination must not be shipped: {:?}",
+            sent.lock().expect("sent log")
+        );
+        assert_eq!(
+            brain.stats.injects, 0,
+            "nothing was delivered, so no inject intent may be counted"
+        );
+        let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        assert!(
+            journal.contains("\"why\":\"no_route\""),
+            "the wake stays journal-recorded: {journal}"
         );
     }
 

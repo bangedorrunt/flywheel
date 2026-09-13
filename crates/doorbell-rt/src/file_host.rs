@@ -305,6 +305,11 @@ pub struct FileHost {
     /// npub cache for the index (whois on pin-set change + 60s TTL).
     npubs: BTreeMap<String, String>,
     index_pins: Vec<String>,
+    /// The subset of `index_pins` with no spawn-registry row, so no pane and
+    /// no herdr target (bd-bk9t). Mirrored onto
+    /// `reducer.model.unroutable`; kept here too so the index change guard
+    /// notices a pin gaining/losing its route without the pin set changing.
+    unroutable_pins: Vec<String>,
     index_refreshed_at: u64,
     retry: crate::policy::WatchRetry,
     daemon_exe: PathBuf,
@@ -348,6 +353,7 @@ impl FileHost {
             targets: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             npubs: BTreeMap::new(),
             index_pins: Vec::new(),
+            unroutable_pins: Vec::new(),
             index_refreshed_at: 0,
             retry: crate::policy::WatchRetry::default(),
             daemon_exe,
@@ -459,16 +465,25 @@ impl FileHost {
     fn refresh_index(&mut self) {
         let rows = self.registry_rows();
         let mut pins: Vec<String> = rows.iter().map(|(p, _, _)| p.clone()).collect();
+        // bd-bk9t: a subscribed pin with no registry row has no pane and no
+        // target, so its status can never leave "unknown" and no queue drain
+        // can ever fire. Marked here so `route_or_queue` digests its wakes
+        // instead of parking them in a queue that only dies with the process.
+        let mut unroutable: Vec<String> = Vec::new();
         // bd-cak3: union subscribed identities. Registry order is preserved
         // so spawned pins keep their existing order; subscribed-only pins
         // append deduped, and the whois loop below resolves their npubs too.
         for pin in self.subscription_pins() {
             if !pins.contains(&pin) {
-                pins.push(pin);
+                pins.push(pin.clone());
+                unroutable.push(pin);
             }
         }
         let now = Self::now_unix();
-        if pins == self.index_pins && now.saturating_sub(self.index_refreshed_at) < INDEX_TTL_SECS {
+        if pins == self.index_pins
+            && unroutable == self.unroutable_pins
+            && now.saturating_sub(self.index_refreshed_at) < INDEX_TTL_SECS
+        {
             return;
         }
         self.panes = rows
@@ -500,6 +515,8 @@ impl FileHost {
                 .index
                 .insert_pin(pin.clone(), self.npubs.get(pin).cloned());
         }
+        self.reducer.model.unroutable = unroutable.iter().cloned().collect();
+        self.unroutable_pins = unroutable;
         self.index_pins = pins;
         self.index_refreshed_at = now;
     }
@@ -739,6 +756,9 @@ impl FileHost {
                     pin,
                     detail: serde_json::json!(detail),
                 },
+                doorbell_core::DoorbellAction::Digest { pin, line, why } => {
+                    Effect::Digest { pin, line, why }
+                }
             })
             .collect()
     }
@@ -1041,6 +1061,16 @@ impl Host for FileHost {
         }
     }
 
+    /// bd-bk9t: routability IS the routing table the prompt sink reads — a
+    /// subscribed pin with no registry row has no entry here, so a digest
+    /// batch for it has nowhere to be shipped (see `Host::has_route`).
+    fn has_route(&self, pin: &str) -> bool {
+        self.targets
+            .lock()
+            .map(|t| t.contains_key(pin))
+            .unwrap_or(false)
+    }
+
     fn pins(&self) -> Vec<String> {
         self.index_pins.clone()
     }
@@ -1248,8 +1278,7 @@ mod tests {
             "a subscribed pin must be addressable (classifier self-index)"
         );
         // ...but never a FABRICATED route: a pane-less identity must not be
-        // handed a prompt target the sink cannot deliver to. Status stays
-        // unknown, so `should_inject` refuses and the wake queues visibly.
+        // handed a prompt target the sink cannot deliver to.
         assert!(
             !host.panes.values().any(|p| p == "OperatorPin"),
             "no pane is invented for a subscribed pin"
@@ -1261,6 +1290,71 @@ mod tests {
                 .expect("targets lock")
                 .contains_key("OperatorPin"),
             "no herdr target is invented for a subscribed pin"
+        );
+        // bd-bk9t: and because there is no route, the index marks it
+        // unrouteable so its wakes are digest-bound instead of parked in a
+        // queue no status transition can ever drain.
+        assert!(
+            host.reducer.model.unroutable.contains("OperatorPin"),
+            "a pane-less subscribed pin must be marked unroutable: {:?}",
+            host.reducer.model.unroutable
+        );
+        // A spawned pin with a pane keeps its route.
+        assert!(
+            host.reducer.model.unroutable.is_empty() == false
+                && !host.reducer.model.unroutable.contains("PinA"),
+            "a registry pin with a pane stays routable: {:?}",
+            host.reducer.model.unroutable
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-bk9t: the wake for a pane-less subscribed pin must not enter the
+    /// per-pin queue. The queue only drains on `working -> injectable`, which
+    /// a pin with no pane can never produce — so a queued wake is a RAM-only
+    /// entry that dies with the daemon. It belongs in the digest batch.
+    #[test]
+    fn pane_less_pin_wake_is_digest_bound_not_queued() {
+        use crate::subscribe::{
+            Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
+        };
+        let (mut host, dir) = host_with_registry("bk9t", entries());
+        let mut store = SubscriptionStore::open(&dir);
+        store
+            .subscribe(
+                Actor::local_process(),
+                Subscription {
+                    id: "cli-proj-w-OperatorPin".into(),
+                    identity: Identity::Pin("OperatorPin".into()),
+                    scope: Scope::One("w".into()),
+                    filter: Filter::default(),
+                    sink: SinkKind::Herdr,
+                    budget: Budget::default_530(),
+                    project: Some("proj".into()),
+                },
+                "w",
+            )
+            .expect("local herdr subscribe");
+        host.refresh_index();
+        let fx = host.tick(&BrainMsg::Watch(watch_line(
+            "OperatorPin",
+            "@OperatorPin ping",
+        )));
+        assert!(
+            fx.iter().any(
+                |e| matches!(e, Effect::Digest { pin, why, .. } if pin == "OperatorPin" && why == "no_route")
+            ),
+            "a pane-less pin's wake is digest-bound with a named reason: {fx:?}"
+        );
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "queued")),
+            "no queued audit for a pin that can never drain: {fx:?}"
+        );
+        assert!(
+            host.reducer.model.queues.is_empty(),
+            "the RAM queue stays empty for digest-only pins: {:?}",
+            host.reducer.model.queues
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
