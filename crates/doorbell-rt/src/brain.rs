@@ -1221,6 +1221,99 @@ mod tests {
         assert!(brain.sweep_last.is_some(), "sweep re-stabilizes after jump");
     }
 
+    /// Clock-jump, the hard direction (bd-d60u, ADR-0012 §8 Phase 4): an NTP
+    /// step BACKWARDS mid-run must not buy extra prompts, rewind liveness, or
+    /// reorder the journal, and the deadline state must re-stabilize once the
+    /// clock settles forward again. The forward-only case above misses the
+    /// direction that can actually mis-grant a budget.
+    #[tokio::test]
+    async fn clock_step_backwards_buys_nothing_and_re_stabilizes() {
+        let t = 1_700_000_000u64;
+        let one = |line: &str| {
+            vec![Effect::Prompt {
+                pin: "p".into(),
+                line: line.into(),
+            }]
+        };
+        let burn_window: Vec<Effect> = (0..4)
+            .map(|i| Effect::Prompt {
+                pin: "p".into(),
+                line: format!("m{i}"),
+            })
+            .collect();
+        let (mut brain, _rx, _tx) = test_brain(
+            "clock-step",
+            vec![burn_window, vec![], vec![], vec![], one("forward")],
+        );
+        let (sink, _sent) = MockSink::new();
+        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.host.now = t;
+        // 3 grants fill the 5/30/3 window at T; the 4th drops.
+        brain
+            .dispatch(BrainMsg::Fact {
+                summary: "x".into(),
+            })
+            .await;
+        assert_eq!((brain.stats.injects, brain.stats.drops), (3, 1));
+        // A real status transition stamps liveness at T.
+        brain
+            .dispatch(BrainMsg::HerdrStatus {
+                pin: "p".into(),
+                status: "idle".into(),
+            })
+            .await;
+        assert_eq!(brain.wake.last_wake_unix, Some(t), "liveness stamped at T");
+
+        // NTP steps the clock BACK one hour: no prompt may be granted and no
+        // stamp may rewind.
+        brain.host.now = t - 3_600;
+        brain
+            .dispatch(BrainMsg::HerdrStatus {
+                pin: "p".into(),
+                status: "done".into(),
+            })
+            .await;
+        assert_eq!(
+            brain.stats.injects, 3,
+            "a backwards step must never refill the budget window"
+        );
+        assert_eq!(
+            brain.wake.last_wake_unix,
+            Some(t),
+            "the liveness ratchet refuses a behind stamp (bd-7qg6)"
+        );
+
+        // ...then FORWARD two hours: the window has rolled, so the deadline
+        // state re-stabilizes and the next wake goes out.
+        brain.host.now = t + 7_200;
+        brain
+            .dispatch(BrainMsg::HerdrStatus {
+                pin: "p".into(),
+                status: "idle".into(),
+            })
+            .await;
+        assert_eq!(brain.wake.last_wake_unix, Some(t + 7_200));
+        brain
+            .dispatch(BrainMsg::Fact {
+                summary: "x".into(),
+            })
+            .await;
+        assert_eq!(brain.stats.injects, 4, "budget window rolled forward");
+
+        // Journal order is the seq counter's business, never the clock's.
+        let raw = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        let seqs: Vec<u64> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get("seq").and_then(|s| s.as_u64()))
+            .collect();
+        assert!(seqs.len() >= 4, "every step journaled: {seqs:?}");
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0] + 1),
+            "seq stays consecutive and increasing across both steps: {seqs:?}"
+        );
+    }
+
     #[tokio::test]
     async fn cursorless_pin_sweeps_from_redelivery_floor() {
         // bd-5d0v: a pin with no since_by_pin entry (fresh spawn, state
