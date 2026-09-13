@@ -650,13 +650,39 @@ impl<H: Host> Brain<H> {
         allowed
     }
 
+    /// bd-8ulu: the sink a wake for `pin` goes to.
+    ///
+    /// The subscription row's `sink` is the operator's explicit choice
+    /// (identity x scope x sink), so it outranks the workspace-wide
+    /// `main_sink`; `main_sink` remains the fallback so every single-sink
+    /// deployment — and every host that does not implement [`Host::sink_for`]
+    /// — behaves exactly as before.
+    fn sink_for(&self, pin: &str) -> String {
+        self.host
+            .sink_for(pin)
+            .unwrap_or_else(|| self.cfg.main_sink.clone())
+    }
+
+    /// Does a wake for `pin` on `sink` have anywhere to land?
+    ///
+    /// bd-bk9t made "no prompt route" mean "keep it in the digest" because
+    /// the herdr sink MISSES an unknown pin and still reports `Ok`, so
+    /// flushing would stamp a `Delivered` receipt for a wake nobody received.
+    /// A registered non-pane sink is the opposite case: the webhook endpoint
+    /// IS the destination, so the pane-less pin finally has a route
+    /// (bd-8ulu). An unregistered name is not a route — the send would be
+    /// absorbed by nobody.
+    fn route_exists(&mut self, pin: &str, sink: &str) -> bool {
+        self.host.has_route(pin) || self.sinks.has(sink)
+    }
+
     async fn deliver_prompts(&mut self, injects: Vec<(String, String)>) -> Vec<String> {
         let mut queued = Vec::new();
-        let sink = self.cfg.main_sink.clone();
         for (pin, line) in injects {
             if !self.host.inject_allowed(&pin) {
                 continue;
             }
+            let sink = self.sink_for(&pin);
             match self.sinks.send(&sink, &pin, &line).await {
                 crate::sinks::SendOutcome::Queued => {
                     // F5: queued, not delivered — count the accepted intent
@@ -724,15 +750,17 @@ impl<H: Host> Brain<H> {
         }
         self.digest_since = None;
         self.stats.digest_batches += 1;
-        let sink = self.cfg.main_sink.clone();
         for (pin, lines) in by_pin {
+            let sink = self.sink_for(&pin);
             // bd-bk9t: a pin with no route has nowhere for a batch to land.
             // The sink MISSES an unknown pin and still reports success, so
             // shipping it would manufacture a `Delivered` receipt and a
             // hear stamp for a wake nobody received — the same delivery lie
             // the queue used to tell. The `Digest` journal row (with `why`)
             // is the durable record; `doorbell digest` reads it.
-            if !self.host.has_route(&pin) {
+            // bd-8ulu: a pin whose subscription names a REGISTERED non-pane
+            // sink does have a route — the endpoint is the human.
+            if !self.route_exists(&pin, &sink) {
                 continue;
             }
             let batch = format!("[digest] {} queued: {}", lines.len(), lines.join(" | "));
@@ -1556,6 +1584,7 @@ mod tests {
             sink: SinkKind::Herdr,
             budget: Budget::default_530(),
             project: Some("proj".into()),
+            endpoint: None,
         };
         let sub = store
             .subscribe(Actor::operator(), sub, "w")

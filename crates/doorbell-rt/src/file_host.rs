@@ -601,20 +601,45 @@ impl FileHost {
     /// `should_inject` refuses, and the wake queues/audits visibly instead
     /// of being silently invisible.
     fn subscription_pins(&self) -> Vec<String> {
+        self.workspace_subscriptions()
+            .into_iter()
+            .filter_map(|s| match &s.identity {
+                crate::subscribe::Identity::Pin(p) if !p.is_empty() => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every subscription row that names this workspace in its scope.
+    ///
+    /// Read live (not cached): rows are added and dropped while the daemon
+    /// runs, and a stale cache would route a wake to the sink its owner just
+    /// changed away from.
+    fn workspace_subscriptions(&self) -> Vec<crate::subscribe::Subscription> {
         crate::subscribe::SubscriptionStore::open(&self.cfg.flywheel_state)
             .list()
-            .iter()
+            .into_iter()
             .filter(|s| {
                 s.scope
                     .workspaces()
                     .iter()
                     .any(|w| w == &self.cfg.workspace)
             })
-            .filter_map(|s| match &s.identity {
-                crate::subscribe::Identity::Pin(p) if !p.is_empty() => Some(p.clone()),
-                _ => None,
-            })
             .collect()
+    }
+
+    /// bd-8ulu: which sink this pin's wake goes to, from its subscription
+    /// row. The FIRST row naming the pin wins (a pin with two rows is a
+    /// configuration smell the subscribe verb already refuses to create
+    /// silently); a row that never names a pin (channel/scope identities)
+    /// leaves the workspace default in place. The name is the row's
+    /// [`crate::subscribe::Subscription::route_name`], so an
+    /// endpoint-carrying webhook row routes to its own adapter.
+    fn sink_for(&self, pin: &str) -> Option<String> {
+        self.workspace_subscriptions()
+            .into_iter()
+            .find(|s| matches!(&s.identity, crate::subscribe::Identity::Pin(p) if p == pin))
+            .map(|s| s.route_name())
     }
 
     /// bd-adms: the spawn registry is not garbage-collected, so a fleet that
@@ -1287,6 +1312,12 @@ impl Host for FileHost {
             .unwrap_or(false)
     }
 
+    /// bd-8ulu: the subscription row's sink wins over the workspace default,
+    /// so a pane-less operator pin subscribed to the webhook sink lands there.
+    fn sink_for(&self, pin: &str) -> Option<String> {
+        FileHost::sink_for(self, pin)
+    }
+
     fn pins(&self) -> Vec<String> {
         self.index_pins.clone()
     }
@@ -1610,6 +1641,7 @@ mod tests {
                     sink: SinkKind::Herdr,
                     budget: Budget::default_530(),
                     project: Some("proj".into()),
+                    endpoint: None,
                 },
                 "w",
             )
@@ -1679,6 +1711,7 @@ mod tests {
                     sink: SinkKind::Herdr,
                     budget: Budget::default_530(),
                     project: Some("proj".into()),
+                    endpoint: None,
                 },
                 "w",
             )
@@ -1727,6 +1760,7 @@ mod tests {
                     sink: SinkKind::Herdr,
                     budget: Budget::default_530(),
                     project: Some("proj".into()),
+                    endpoint: None,
                 },
                 "other-ws",
             )

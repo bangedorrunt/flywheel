@@ -119,6 +119,7 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 | `FLYWHEEL_SOCKET/ROOT/TIMEOUT/BACKEND/MAIL/AGENTMAIL_URL/TOKEN/MAIL_NAME/CREW_MAX/VERIFY_STRICT/COMPOSE_MAX_SECONDS/DISPATCH_TTL_SECS/PANE_STALL_SECS/RECLAIM_*/MCP_TIMEOUT_SECS/NO_DOORBELL_ENSURE` | per-name overrides (TIMEOUT fail-loud) |
 | `DOORBELL_STATE_DIR` / `DOORBELL_FLYWHEEL_STATE_DIR` / `DOORBELL_PORT` | daemon dir/port resolution (unit exports the first) |
 | `DOORBELL_TORON_BIN` / `DOORBELL_HERDR_BIN` | watch/prompt child binaries (tests set `true`) |
+| `DOORBELL_WEBHOOK_ALLOWLIST` | egress hosts allowed for `--sink webhook` rows (comma/space separated, exact or `.suffix`; absent = the daemon registers no webhook adapter and those wakes stay digest-visible) |
 | `TORON_DATA_DIR` / `TORON_MCP_DATA_DIR` / `TORON_KEY_PASSPHRASE` | toron roots + operator key (never `TORON_OPERATOR_PASSPHRASE`) |
 | `RESONATE_URL` | durable-loop server (default `http://localhost:8001`) |
 | `HERDR_SOCKET_PATH` | multiplexer socket |
@@ -152,10 +153,13 @@ unmanaged holders, even with `--force`.
 
 ## 5. Hosting, plainly (the doorbell host feat)
 
-A subscription row is `identity × scope × filter × sink × budget`
+A subscription row is `identity × scope × filter × sink × budget × endpoint`
 (`state/doorbell/subscriptions.json`). Spawn writes one per pin
 (`spawn-<ws>-<pin>`); `doorbell subscribe` writes `cli-*` rows with an
-optional `--project`. Every 60s the daemon reconciles: for each
+optional `--project` and, for `--sink webhook`, the row's own `--url` —
+the daemon registers one adapter per distinct subscribed endpoint at host
+start, gated by `DOORBELL_WEBHOOK_ALLOWLIST`, so the endpoint *is* the
+human's route when they have no pane. Every 60s the daemon reconciles: for each
 subscribed `(project, workspace)` not yet hosted, it claims the lease
 (skips live writers — never steals) and spawns a Brain loop; spawn-scoped
 rows silent for 7 days are reaped. Standby with zero subscriptions is the

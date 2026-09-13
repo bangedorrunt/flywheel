@@ -67,6 +67,16 @@ pub trait Host: Send {
     fn has_route(&self, _pin: &str) -> bool {
         true
     }
+    /// The sink a wake for `pin` must go to, named as a registered adapter.
+    ///
+    /// bd-8ulu: the subscription row's `sink` is the operator's choice
+    /// (identity x scope x sink), so it outranks the workspace-wide default.
+    /// `None` means "no row names one" and the brain falls back to
+    /// [`crate::brain::BrainConfig::main_sink`] — the default keeps every
+    /// pre-existing single-sink deployment working unchanged.
+    fn sink_for(&self, _pin: &str) -> Option<String> {
+        None
+    }
     /// Pins this brain owns (.5: spawn registry + role binds).
     fn pins(&self) -> Vec<String> {
         Vec::new()
