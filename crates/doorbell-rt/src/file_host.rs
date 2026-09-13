@@ -422,11 +422,51 @@ impl FileHost {
             .collect()
     }
 
+    /// Pins named by this workspace's wake subscriptions (bd-cak3).
+    ///
+    /// The registry only knows SPAWNED crews, so a subscribed identity that
+    /// was never spawned here — the operator's own pin is the live case —
+    /// had mail delivered, a subscription row, and still no sweep, no
+    /// `SelfIndex` entry, and no route: its wake never materialised at all
+    /// (ADR-0012 §8 Phase 2). Unioning these in makes it swept and
+    /// addressable, which is the half a subscription is allowed to buy on
+    /// its own.
+    ///
+    /// Deliberately NOT unioned into `panes`/`targets`: a subscription row
+    /// carries no pane, so inventing one would fabricate a route the sink
+    /// cannot deliver to. With no pane the status stays `unknown`,
+    /// `should_inject` refuses, and the wake queues/audits visibly instead
+    /// of being silently invisible.
+    fn subscription_pins(&self) -> Vec<String> {
+        crate::subscribe::SubscriptionStore::open(&self.cfg.flywheel_state)
+            .list()
+            .iter()
+            .filter(|s| {
+                s.scope
+                    .workspaces()
+                    .iter()
+                    .any(|w| w == &self.cfg.workspace)
+            })
+            .filter_map(|s| match &s.identity {
+                crate::subscribe::Identity::Pin(p) if !p.is_empty() => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Refresh the reducer index when the pin set changes or the TTL
     /// lapses (mirrors the embedded 60s rule; whois failures keep None).
     fn refresh_index(&mut self) {
         let rows = self.registry_rows();
-        let pins: Vec<String> = rows.iter().map(|(p, _, _)| p.clone()).collect();
+        let mut pins: Vec<String> = rows.iter().map(|(p, _, _)| p.clone()).collect();
+        // bd-cak3: union subscribed identities. Registry order is preserved
+        // so spawned pins keep their existing order; subscribed-only pins
+        // append deduped, and the whois loop below resolves their npubs too.
+        for pin in self.subscription_pins() {
+            if !pins.contains(&pin) {
+                pins.push(pin);
+            }
+        }
         let now = Self::now_unix();
         if pins == self.index_pins && now.saturating_sub(self.index_refreshed_at) < INDEX_TTL_SECS {
             return;
@@ -1167,6 +1207,95 @@ mod tests {
         assert_eq!(host.pins(), vec!["PinA".to_string(), "PinB".to_string()]);
         assert!(host.pin_npub("PinA").is_none());
         assert_eq!(host.panes.get("pane-a").cloned(), Some("PinA".to_string()));
+    }
+
+    /// bd-cak3: the registry only knows SPAWNED crews. A subscribed identity
+    /// that was never spawned in this project (the operator's own pin is the
+    /// live case) had mail delivered, a subscription row, and no sweep, no
+    /// `SelfIndex` entry, and no way to be addressed — so its wake never
+    /// materialised at all. The index must union subscribed pins in.
+    #[test]
+    fn subscribed_pin_without_a_registry_row_enters_the_index() {
+        use crate::subscribe::{
+            Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
+        };
+        let (mut host, dir) = host_with_registry("cak3", entries());
+        let mut store = SubscriptionStore::open(&dir);
+        store
+            .subscribe(
+                Actor::local_process(),
+                Subscription {
+                    id: "cli-proj-w-OperatorPin".into(),
+                    identity: Identity::Pin("OperatorPin".into()),
+                    scope: Scope::One("w".into()),
+                    filter: Filter::default(),
+                    sink: SinkKind::Herdr,
+                    budget: Budget::default_530(),
+                    project: Some("proj".into()),
+                },
+                "w",
+            )
+            .expect("local herdr subscribe");
+        host.refresh_index();
+        assert!(
+            host.pins().contains(&"OperatorPin".to_string()),
+            "the sweep set must union subscribed pins: {:?}",
+            host.pins()
+        );
+        assert_eq!(
+            host.reducer.model.index.resolve("OperatorPin").as_deref(),
+            Some("OperatorPin"),
+            "a subscribed pin must be addressable (classifier self-index)"
+        );
+        // ...but never a FABRICATED route: a pane-less identity must not be
+        // handed a prompt target the sink cannot deliver to. Status stays
+        // unknown, so `should_inject` refuses and the wake queues visibly.
+        assert!(
+            !host.panes.values().any(|p| p == "OperatorPin"),
+            "no pane is invented for a subscribed pin"
+        );
+        assert!(
+            !host
+                .targets
+                .lock()
+                .expect("targets lock")
+                .contains_key("OperatorPin"),
+            "no herdr target is invented for a subscribed pin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scope is per-workspace: another workspace's subscription is not this
+    /// host's business and must not leak into its sweep set.
+    #[test]
+    fn subscribed_pin_of_another_workspace_stays_out() {
+        use crate::subscribe::{
+            Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
+        };
+        let (mut host, dir) = host_with_registry("cak3-scope", entries());
+        let mut store = SubscriptionStore::open(&dir);
+        store
+            .subscribe(
+                Actor::local_process(),
+                Subscription {
+                    id: "cli-proj-other-Elsewhere".into(),
+                    identity: Identity::Pin("Elsewhere".into()),
+                    scope: Scope::One("other-ws".into()),
+                    filter: Filter::default(),
+                    sink: SinkKind::Herdr,
+                    budget: Budget::default_530(),
+                    project: Some("proj".into()),
+                },
+                "other-ws",
+            )
+            .expect("local herdr subscribe");
+        host.refresh_index();
+        assert!(
+            !host.pins().contains(&"Elsewhere".to_string()),
+            "another workspace's subscription is not this host's business: {:?}",
+            host.pins()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn watch_line(pin: &str, content: &str) -> String {
