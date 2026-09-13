@@ -2027,7 +2027,8 @@ enum LedgerCmd {
     Receipt {
         bead_id: String,
         /// verdict kind (kebab): command-verified | unit-test-verified |
-        /// live-verified | reviewer-signed | worker-receipt
+        /// live-verified | reviewer-signed | worker-receipt |
+        /// operator-directed | triage-verified
         #[arg(long)]
         kind: String,
         /// commit SHA (default: derived via git log --grep=<bead-id>)
