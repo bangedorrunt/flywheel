@@ -177,7 +177,7 @@ fresh-binary SIGKILL (ad-hoc `codesign -s -`); malformed plist env
 
 | Artifact | Liveness signal | TTL / reaper | Manual command |
 |---|---|---|---|
-| toron reservations | holder activity | intent 5min / held 90d; close does NOT release | `toron reserve release --project … --as …`; operator `release-by-reason <bead>` |
+| toron reservations | holder activity | intent 5min / held 90d; the LOOP releases on a verified close (reason == bead id) | `toron reserve release --project … --as …`; operator `release-by-reason <bead>` |
 | doorbell subscriptions | pane/workspace alive | `kill` drops its spawn rows; daemon reaps week-silent spawn rows | `flywheel doorbell unsubscribe <id>` |
 | spawn registry pins | herdr pane exists | none automatic (heal warns) | `flywheel recover`; `toron role clear` |
 | doorbell journals | subscription present | rotation 5k lines / 5 MiB (never silent loss) | archive, never delete |
@@ -186,7 +186,15 @@ fresh-binary SIGKILL (ad-hoc `codesign -s -`); malformed plist env
 | legacy slug identities | — | none (bead `bd-4a0u`) | operator follow-up |
 | unit definitions | file mtime vs loaded | none — `bootout`+`bootstrap` after `install` | (above) |
 
-Open automation (follow-up beads, not this session): loop-observed
-`br close` → `release-by-reason` (needs a `LoopMsg` + executor arm);
-spawn-registry prune of pane-less entries; journal archiving for
-subscription-less workspaces.
+Landed automation: the durable loop observes the open→closed transition in
+its close-detect arm and runs the operator-signed `__release-bead-locks`
+leaf (`release_by_reason`, reason == bead id) — `durable.rs`
+`ClaimWatchAction::ReleaseReservations`, pinned by
+`close_path_releases_the_beads_reservations`. It is best-effort and
+idempotent (`released: 0` is a clean no-op), and `reclaim_bead` runs the same
+leaf when a pane exits. A close still does NOT release by itself: nothing
+frees a lease if no loop is watching that workspace, so a peer holding one
+drops it explicitly.
+
+Open automation (follow-up beads, not this session): spawn-registry prune of
+pane-less entries; journal archiving for subscription-less workspaces.
