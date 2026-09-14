@@ -3415,22 +3415,33 @@ enum ControlVerbCmd {
 /// a workflow would spawn.
 #[derive(Subcommand)]
 enum WorkflowCmd {
-    /// List catalog + built-in workflows (name, source, trigger, crew)
+    /// List catalog + built-in workflows (name, source, trigger, crew).
+    /// `--project` layers the project tier (built-ins < user < project),
+    /// matching the `run`/`compose` resolution order.
     List {
         /// accepted: list is always JSON (agent `--json` parity)
         #[arg(long)]
         json: bool,
+        /// project whose `.flywheel/workflows/` shadows the user catalog
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Show one workflow's definition
     Show {
         /// workflow name (built-in or catalog)
         name: String,
+        /// project whose `.flywheel/workflows/` shadows the user catalog
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Lint ALL built-in + catalog workflows (the fail-stop gate). Exit 0
     /// clean, 1 on any blocking issue, 2 on a parse failure.
     Lint {
         /// lint only this workflow (name), else all
         name: Option<String>,
+        /// project whose `.flywheel/workflows/` joins the lint set
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Run a workflow by name through the unified engine (lint gate first).
     /// Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`.
@@ -3606,6 +3617,9 @@ enum WorkflowCmd {
     Crew {
         /// workflow name (built-in or catalog)
         name: String,
+        /// project whose `.flywheel/workflows/` shadows the user catalog
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Remove a catalog workflow (deletes ~/.config/flywheel/workflows/<name>.yaml).
     /// Built-in workflows cannot be removed — override via a catalog file of the
@@ -4543,7 +4557,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
-            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; workflow run + compose layer the project tier, the read doors list/show/lint/crew are user-tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -29195,9 +29209,23 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))
     }
 
+    /// The layered catalog for a read door (`--project`): the same
+    /// resolution order `run`/`compose` use — built-ins < user < project
+    /// (`bd-workflow-catalog-read-doors-project-tier-jah1`). `None` keeps the
+    /// historical user-tier view.
+    fn read_door_workflows(
+        cfg: &Config,
+        project: &Option<String>,
+    ) -> Result<BTreeMap<String, (Workflow, &'static str)>> {
+        match project {
+            Some(p) => all_workflows_layered(Some(&project_dir(cfg, p))),
+            None => all_workflows(),
+        }
+    }
+
     match cmd {
-        WorkflowCmd::List { json: _ } => {
-            let all = all_workflows()?;
+        WorkflowCmd::List { json: _, project } => {
+            let all = read_door_workflows(cfg, project)?;
             if all.is_empty() {
                 println!("no workflows defined");
                 return Ok(());
@@ -29234,8 +29262,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             print_json(&json!({ "workflows": rows }));
             Ok(())
         }
-        WorkflowCmd::Show { name } => {
-            let all = all_workflows()?;
+        WorkflowCmd::Show { name, project } => {
+            let all = read_door_workflows(cfg, project)?;
             let (wf, source) = all
                 .get(name)
                 .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))?;
@@ -29284,8 +29312,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             }));
             Ok(())
         }
-        WorkflowCmd::Lint { name } => {
-            let all = all_workflows()?;
+        WorkflowCmd::Lint { name, project } => {
+            let all = read_door_workflows(cfg, project)?;
             if let Some(n) = name {
                 let (wf, _) = all
                     .get(n)
@@ -30320,8 +30348,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             print_json(&json!({ "workflow": name, "runs": rows }));
             Ok(())
         }
-        WorkflowCmd::Crew { name } => {
-            let all = all_workflows()?;
+        WorkflowCmd::Crew { name, project } => {
+            let all = read_door_workflows(cfg, project)?;
             let wf = resolve_workflow(name, &all)?;
             let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
             let packed = packed_from_flag(cfg, wf, &resolve, None, None)?;

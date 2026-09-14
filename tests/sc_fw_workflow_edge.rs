@@ -104,33 +104,79 @@ fn workflow_run_resolves_the_project_tier() {
     );
 }
 
-/// The remainder is deliberate, not accidental
-/// (`bd-workflow-catalog-read-doors-project-tier-jah1`): `workflow
-/// list`/`show`/`lint`/`crew` carry no
-/// project context, so they stay user-tier and do NOT list a project-tier
-/// workflow that `workflow run` can now execute. Flipping this test is the
-/// bead's job, together with those four verbs.
+/// The read doors land (`bd-workflow-catalog-read-doors-project-tier-jah1`):
+/// all four verbs that read the catalog accept `--project` and layer
+/// built-ins < user < project, matching `run`/`compose`. Without `--project`
+/// each stays user-tier — a project workflow is invisible there by design,
+/// because nothing names the project.
 #[test]
-fn workflow_list_stays_user_tier_until_the_read_doors_land() {
+fn workflow_read_doors_layer_the_project_tier() {
     let h = TieredProject::new();
-    let out = h.run_without_project(&["workflow", "list"]);
-    let listing = String::from_utf8_lossy(&out.stdout);
+
+    // list: names the project workflow under --project, not without it.
+    let bare = h.run_without_project(&["workflow", "list"]);
     assert!(
-        out.status.success(),
+        bare.status.success(),
         "workflow list failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&bare.stderr)
     );
     assert!(
-        !listing.contains("project-tier-demo"),
-        "workflow list is user-tier today; if it now lists the project tier, \
-         flip this test and close the read-doors bead: {listing}"
+        !String::from_utf8_lossy(&bare.stdout).contains("project-tier-demo"),
+        "without --project, list stays user-tier (no project named)"
     );
-    // The reason it cannot layer yet: the verb carries no project context.
-    let refused = h.run_without_project(&["workflow", "list", "--project", "whatever"]);
+    let listed = h.run(&["workflow", "list"]);
     assert!(
-        !refused.status.success(),
-        "workflow list takes no --project today; if it does now, it can layer \
-         the project tier and this test should be flipped"
+        listed.status.success(),
+        "workflow list --project failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("project-tier-demo"),
+        "workflow list --project must surface the project tier: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // show: resolves the project workflow under --project; bare fails loud.
+    let shown = h.run(&["workflow", "show", "project-tier-demo"]);
+    assert!(
+        shown.status.success(),
+        "workflow show --project must resolve the project tier: stderr={}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let bare_show = h.run_without_project(&["workflow", "show", "project-tier-demo"]);
+    assert!(
+        !bare_show.status.success(),
+        "bare show must fail loud on a project-tier workflow"
+    );
+
+    // lint: the project tier joins the lint set under --project (a project
+    // regression cannot ship unlinted); a broken project workflow fails it.
+    let broken = h.project.join(".flywheel/workflows/broken-tier.yaml");
+    std::fs::write(
+        &broken,
+        "name: broken-tier\nsteps:\n  - name: nope\n    action: not_an_action\n",
+    )
+    .expect("write broken workflow");
+    let linted = h.run(&["workflow", "lint"]);
+    assert!(
+        !linted.status.success(),
+        "workflow lint --project must lint the project tier and fail on a broken workflow: {}",
+        String::from_utf8_lossy(&linted.stdout)
+    );
+    std::fs::remove_file(&broken).expect("remove broken workflow");
+    let clean = h.run(&["workflow", "lint"]);
+    assert!(
+        clean.status.success(),
+        "workflow lint --project is clean once the broken file is gone: {}",
+        String::from_utf8_lossy(&clean.stdout)
+    );
+
+    // crew: previews the project workflow's crew under --project.
+    let crewed = h.run(&["workflow", "crew", "project-tier-demo"]);
+    assert!(
+        crewed.status.success(),
+        "workflow crew --project must resolve the project tier: stderr={}",
+        String::from_utf8_lossy(&crewed.stderr)
     );
 }
 
