@@ -796,6 +796,56 @@ pub fn compiled_in_squads() -> BTreeMap<String, Squad> {
     m
 }
 
+/// Portable profile envelope version (ADR-0013 P2-11). Bump when the
+/// envelope's meaning changes in a way an older reader cannot honor;
+/// readers refuse unknown versions loud instead of guessing.
+pub const PORTABLE_CODEC_VERSION: u64 = 1;
+
+/// Encode a named profile as the versioned portable envelope (ADR-0013
+/// P2-11): `{"codec": 1, "name": ..., "profile": {...}}`. JSON, not TOML,
+/// so the doc survives copy/paste between machines unharmed by tool-local
+/// TOML dialects.
+pub fn profile_to_portable(name: &str, profile: &Profile) -> serde_json::Value {
+    serde_json::json!({
+        "codec": PORTABLE_CODEC_VERSION,
+        "name": name,
+        "profile": profile,
+    })
+}
+
+/// Decode the versioned portable envelope. Unknown versions refuse loud
+/// naming the supported one; absent fields fall back to the same serde
+/// defaults the TOML loader uses, so a doc from an older codec still reads.
+pub fn profile_from_portable(value: &serde_json::Value) -> Result<(String, Profile)> {
+    let codec = value
+        .get("codec")
+        .and_then(serde_json::Value::as_u64)
+        .with_context(|| {
+            format!(
+                "portable profile doc carries no `codec` version (expected {PORTABLE_CODEC_VERSION})"
+            )
+        })?;
+    if codec != PORTABLE_CODEC_VERSION {
+        anyhow::bail!(
+            "portable profile doc is codec {codec}; this binary reads codec \
+             {PORTABLE_CODEC_VERSION} — upgrade flywheel or re-export"
+        );
+    }
+    let name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| "portable profile doc carries no `name`")?
+        .to_string();
+    let profile: Profile = serde_json::from_value(
+        value
+            .get("profile")
+            .cloned()
+            .with_context(|| "portable profile doc carries no `profile` object")?,
+    )
+    .context("portable profile doc `profile` object does not parse as a Profile")?;
+    Ok((name, profile))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,5 +1486,59 @@ model = "big-pickle"
         assert_eq!(s["plan"].counts.get("planner"), Some(&1));
         assert_eq!(s["review"].counts.get("oracle"), Some(&1));
         assert_eq!(s["recon"].counts.get("scout"), Some(&2));
+    }
+
+    #[test]
+    fn portable_codec_round_trips_a_profile() {
+        let p = Profile {
+            harness: "pi".into(),
+            model: "muse-spark".into(),
+            provider: "opencode-go".into(),
+            skills: vec!["br".into(), "toron".into()],
+            model_fallback: vec!["zai/glm-5.3-flash".into()],
+            ..Default::default()
+        };
+        let doc = profile_to_portable("coder", &p);
+        let (name, back) = profile_from_portable(&doc).unwrap();
+        assert_eq!(name, "coder");
+        assert_eq!(back, p, "round trip is lossless");
+    }
+
+    #[test]
+    fn portable_codec_defaults_absent_fields_like_toml() {
+        let doc = serde_json::json!({
+            "codec": PORTABLE_CODEC_VERSION,
+            "name": "minimal",
+            "profile": { "harness": "oc" },
+        });
+        let (name, back) = profile_from_portable(&doc).unwrap();
+        assert_eq!(name, "minimal");
+        assert_eq!(back.harness, "oc");
+        assert!(back.skills.is_empty(), "absent vec fields default empty");
+    }
+
+    #[test]
+    fn portable_codec_refuses_unknown_version_loud() {
+        let doc = serde_json::json!({ "codec": 99, "name": "x", "profile": {} });
+        let err = profile_from_portable(&doc).unwrap_err().to_string();
+        assert!(err.contains("codec 99"), "{err}");
+        assert!(
+            err.contains(&format!("codec {PORTABLE_CODEC_VERSION}")),
+            "names the supported version: {err}"
+        );
+    }
+
+    #[test]
+    fn portable_codec_refuses_missing_version_name_and_profile() {
+        for doc in [
+            serde_json::json!({ "name": "x", "profile": {} }),
+            serde_json::json!({ "codec": PORTABLE_CODEC_VERSION, "profile": {} }),
+            serde_json::json!({ "codec": PORTABLE_CODEC_VERSION, "name": "x" }),
+        ] {
+            assert!(
+                profile_from_portable(&doc).is_err(),
+                "malformed doc refuses: {doc}"
+            );
+        }
     }
 }

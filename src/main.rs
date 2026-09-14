@@ -2976,6 +2976,28 @@ enum ProfileCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Export a profile as the versioned portable doc (ADR-0013 P2-11) to
+    /// stdout, or a file with --out
+    Export {
+        /// profile name (built-in or local; exports the merged definition)
+        name: String,
+        /// write the doc to this path instead of stdout
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Import a portable profile doc: upsert into
+    /// ~/.config/flywheel/profiles.toml (an import of a built-in name lands
+    /// as a deliberate local override)
+    Import {
+        /// path to the portable doc, or - for stdin
+        path: String,
+        /// import under this name instead of the doc's own
+        #[arg(long)]
+        name: Option<String>,
+        /// print the resulting user-file entry without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Squad commands (ADR-0005 P6): a squad is a named group of profile counts —
@@ -26416,6 +26438,57 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let raw = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
             std::fs::write(&path, raw)?;
             println!("wrote {} [profiles.{name}]", path.display());
+        }
+        ProfileCmd::Export { name, out } => {
+            let cat = ProfileCatalog::load()?;
+            let profile = cat
+                .get(name)
+                .with_context(|| format!("no profile named {name:?} (flywheel profile list)"))?;
+            let doc = profile::profile_to_portable(name, profile);
+            let rendered = serde_json::to_string_pretty(&doc)?;
+            match out {
+                Some(out_path) => {
+                    std::fs::write(&out_path, rendered + "\n")?;
+                    println!("exported profile {name} -> {out_path}");
+                }
+                None => println!("{rendered}"),
+            }
+        }
+        ProfileCmd::Import {
+            path,
+            name,
+            dry_run,
+        } => {
+            let raw = if path == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&path)?
+            };
+            let doc: serde_json::Value = serde_json::from_str(raw.trim())?;
+            let (doc_name, imported) = profile::profile_from_portable(&doc)?;
+            let target = name.clone().unwrap_or(doc_name);
+            if *dry_run {
+                let mut one: BTreeMap<String, profile::Profile> = BTreeMap::new();
+                one.insert(target.clone(), imported);
+                print_json(&serde_json::to_value(&one)?);
+                return Ok(());
+            }
+            // bd-2dao: upsert into the RAW user file, so importing a built-in
+            // name lands as a deliberate local override — never a catalog
+            // rebuild that freezes today's built-ins into the file.
+            let file_path = config::config_dir().join("profiles.toml");
+            let mut on_disk: BTreeMap<String, profile::Profile> =
+                profile::ProfileCatalog::load_user_file(Some(&file_path));
+            on_disk.insert(target.clone(), imported);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let raw_toml = toml::to_string_pretty(&ProfilesFile { profiles: on_disk })?;
+            std::fs::write(&file_path, raw_toml)?;
+            println!("imported profile {target} -> {}", file_path.display());
         }
     }
     Ok(())
