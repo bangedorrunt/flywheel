@@ -6,7 +6,7 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 |------|---------|
 | profile | `flywheel profile {list,show,create,edit,run,remove}` — 6 built-ins (oracle/planner/reviewer/coder/scout/housekeeper) |
 | squad | `flywheel squad {list,show,spawn,remove}` (`recipes list` alias) |
-| workflow | `flywheel workflow {list,show,lint,run,new,history,crew,compose,remove}` |
+| workflow | `flywheel workflow {list,show,lint,run,new,history,crew,compose,remove}` — `run` + `compose` resolve built-ins < user < project tiers; the read doors (`list`/`show`/`lint`/`crew`) are user-tier (no `--project`) |
 | cron | `flywheel cron {lint,run,list,show,pause,resume,status,history,start,remove}` — distinct YAML type |
 | model | `flywheel model {list,show,add,remove}` |
 | runs | `flywheel runs {list,show,pending,digest}` |
@@ -76,6 +76,12 @@ from the stage catalog (`stage list`).
 
 - **pane**: pre-spawn crew, `__send --confirm`, bus-auditable. `dispatch_job` live. `action: spawn` drains `SpawnSink` into `agent_start`.
 - **headless**: `__run-headless` one-shot, logs `runs/<id>.jsonl`. Spawn must not fake 43001/43004.
+
+## Run ledger + effect journal (ADR-0032 Spec 5/6/9)
+
+`runs {list,show,pending,digest}` is the dashboard over the same state log `workflow history` and `cron history` read. ONE reader rule (`history_row_status`) decides a row's status at every door: a row that recorded none reads `unknown`, never a default `done`. Rows that **annotate** a run instead of recording one declare a `kind` — `phase-gate` (one ship-chain link), `loop-monitor` (the legacy loop monitor's start notice), `plan-warning` (the warn-first plan-artifact gate); they carry their real verdict, are skipped by `cron history`, and never count as run outcomes. Run rows carry terminal status + real project + failure artifact paths.
+
+Effect journal: flywheel embeds the engine, so flywheel owns the journal. Every engine built for a run that really dispatches (`workflow run --execute`, `compose --run`, `cron run --live`, the cron daemon) gets a host-owned `EffectRunner` (`src/effect_journal.rs`): an effectful `job`/`mailbox` leaf commits prepared intent, claims the attempt, invokes its provider **exactly once**, then settles — or records `failed`/`unknown` through the engine's one ambiguity rule. Rows land in toron's `workflow_effects` tables, keyed by the engine boundary's own derivation (a retry reuses one key; two runs never collide on a byte-identical payload). A sink no provider performs is **not** journaled — the leaf keeps the engine's `bypassed-sink-uncovered` marker with a loud reason. Dry arms (`run` without `--execute`, `cron run` without `--live`) stay unjournaled on purpose: they perform no external effect. Mailbox leaves journal only on the in-process plane (a remote `[mail.toron] url` cannot carry `corr`).
 ## Collaboration bootstrap (empty-fleet edge)
 
 Any mode whose agent holds a registered mail identity but has no live
