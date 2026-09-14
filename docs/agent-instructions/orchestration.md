@@ -6,7 +6,7 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 |------|---------|
 | profile | `flywheel profile {list,show,create,edit,run,remove}` — 6 built-ins (oracle/planner/reviewer/coder/scout/housekeeper) |
 | squad | `flywheel squad {list,show,spawn,remove}` (`recipes list` alias) |
-| workflow | `flywheel workflow {list,show,lint,run,new,history,crew,compose,remove}` — `run` + `compose` resolve built-ins < user < project tiers; the read doors (`list`/`show`/`lint`/`crew`) are user-tier (no `--project`) |
+| workflow | `flywheel workflow {list,show,lint,run,new,history,crew,compose,remove}` — every catalog verb takes `--project` and resolves built-ins < user < project tiers |
 | cron | `flywheel cron {lint,run,list,show,pause,resume,status,history,start,remove}` — distinct YAML type |
 | model | `flywheel model {list,show,add,remove}` |
 | runs | `flywheel runs {list,show,pending,digest}` |
