@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
+### Added — portable profile codec (ADR-0013 P2-11, bd-8ana)
+- `flywheel profile export <name> [--out <file>]` writes the versioned portable doc (`{"codec":1,"name",..."profile"}` JSON); `flywheel profile import <path|-> [--name] [--dry-run]` upserts it into the user `profiles.toml` (importing a built-in name lands as a deliberate local override). Unknown codec versions refuse loud naming the supported one; absent fields take the same defaults as the TOML loader.
 ### Fixed — run-ledger truth (ADR-0032 Spec 9 tail)
 - `runs list`, `--robot-snapshot`, and `cron history` no longer default a run row's status to `done`. A row with no recorded status now reads `unknown`, the same honest reader `workflow history` already used; measured on the live state dir this stops 354 of 2658 rows (13%) from being reported as `completed` with no evidence behind them.
 - `runs list` rows carry the failure artifacts the run wrote (`artifacts`, a stable `[]` when none), so a failed row is diagnosable without a second lookup.
