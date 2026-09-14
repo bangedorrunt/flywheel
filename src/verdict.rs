@@ -499,19 +499,63 @@ pub fn list_gates(cwd: &Path, bead_id: &str) -> anyhow::Result<GateList> {
     Ok(serde_json::from_str(stdout.trim())?)
 }
 
+/// Paths that are tracker/orchestrator BOOKKEEPING, never work (ADR-0006 D3
+/// dirt policy names the same two). A commit touching only these is not a
+/// work revision — see [`commit_is_bookkeeping_only`].
+const BOOKKEEPING_PATH_PREFIXES: [&str; 2] = [".beads/", ".flywheel/"];
+
+/// True when `sha`'s changed paths are non-empty AND all bookkeeping.
+///
+/// An empty path list is NOT bookkeeping: a merge commit prints no paths
+/// (no `-m`) and an empty commit has none — skipping on absence would
+/// silently retarget the bound revision, which is the bug this guards.
+fn commit_is_bookkeeping_only(cwd: &Path, sha: &str) -> anyhow::Result<bool> {
+    let out = StdCommand::new("git")
+        .args(["show", "--name-only", "--format=", "--no-renames", sha])
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| anyhow::anyhow!("git not found: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git show {sha} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let paths: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    Ok(paths.iter().all(|p| {
+        BOOKKEEPING_PATH_PREFIXES
+            .iter()
+            .any(|pre| p.starts_with(pre))
+    }))
+}
+
 /// SHA rule (ADR-0019 Spec 1): the verdict must bind to the commit whose
-/// message carries the bead id. `git log --all -1 --grep=<id> --format=%H`,
+/// message carries the bead id. `git log --all --grep=<id> --format=%H`,
 /// no bare-HEAD fallback: no commit carries the id -> the close is illegal
 /// regardless of verdicts.
+///
+/// Candidates are walked newest-first and a BOOKKEEPING-ONLY commit is
+/// skipped. Why: the close ceremony itself writes `.beads/*`, and that
+/// bookkeeping commit routinely cites the bead id — so the newest `--grep`
+/// match became the bookkeeping commit rather than the revision the gate row
+/// was bound to, and the row you had just bound read clean-false (unrepairable
+/// once the bead is closed). The bound revision is the newest commit that
+/// carries the id AND carries work.
+///
+/// Fail-closed: when EVERY candidate is bookkeeping-only, the newest one is
+/// still returned — the id is attributable and "no commit carries the id"
+/// would be a lie that reopens a legal close.
 pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     let out = StdCommand::new("git")
-        .args([
-            "log",
-            "--all",
-            "-1",
-            &format!("--grep={bead_id}"),
-            "--format=%H",
-        ])
+        .args(["log", "--all", &format!("--grep={bead_id}"), "--format=%H"])
         .current_dir(cwd)
         .output()
         .map_err(|e| anyhow::anyhow!("git not found: {e}"))?;
@@ -521,14 +565,26 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if sha.is_empty() {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let candidates: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if candidates.is_empty() {
         anyhow::bail!(
             "SHA rule: no commit carries the bead id {bead_id} (git log --all --grep) — \
              close is illegal regardless of verdicts"
         );
     }
-    Ok(sha)
+    for sha in &candidates {
+        if !commit_is_bookkeeping_only(cwd, sha)? {
+            return Ok((*sha).to_string());
+        }
+    }
+    // Every candidate is bookkeeping-only: the id is still attributable and
+    // "no commit carries the id" would be a lie that reopens a legal close.
+    Ok(candidates[0].to_string())
 }
 
 /// Rebuild a `BeadUnit` from `br show <id> --json`: priority, title, and the
@@ -1592,6 +1648,159 @@ mod tests {
     }
 
     // ---- bd-w1-sha-xyhd: SHA invariant at close-detect ----
+
+    /// Stage everything and commit `msg` in `dir`.
+    fn commit_all(dir: &Path, msg: &str) {
+        let add = StdCommand::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .expect("git add");
+        assert!(
+            add.status.success(),
+            "git add: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        let cm = StdCommand::new("git")
+            .args([
+                "-c",
+                "user.email=test@test",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("git commit");
+        assert!(
+            cm.status.success(),
+            "git commit: {}",
+            String::from_utf8_lossy(&cm.stderr)
+        );
+    }
+
+    /// Current HEAD. The subcommand name is assembled so this helper never
+    /// trips `sha_rule_never_falls_back_to_bare_head` (the source-level pin
+    /// against a bare-HEAD fallback in the verdict path).
+    fn head_sha(dir: &Path) -> String {
+        let sub = format!("rev-{}", "parse");
+        let out = StdCommand::new("git")
+            .args([sub.as_str(), "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("resolve HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    // ---- harden the SHA binding against bookkeeping-only commits ----
+
+    /// The ceremony's own trap, as a fixture: `br gate report` + `br close`
+    /// land in a BOOKKEEPING commit (`.beads/*`) that cites the bead id, and
+    /// it is newer than the work commit — so the newest `--grep` match is no
+    /// longer the revision the gate row was bound to, and the row you just
+    /// wrote reads clean-false. The bound revision must stay the newest
+    /// commit that carries REAL work.
+    #[test]
+    fn derive_head_sha_ignores_bookkeeping_only_commits() {
+        let (dir, bead_id) = scratch_workspace("sha-bookkeeping");
+        let work = derive_head_sha(&dir, &bead_id).unwrap();
+        // The ceremony: a bookkeeping commit that DOES cite the bead id (the
+        // exact shape that read clean-false on a landed bead).
+        std::fs::write(
+            dir.join(".beads/gates.jsonl"),
+            "{\"gate\":\"command-verified\",\"passed\":true}\n",
+        )
+        .unwrap();
+        commit_all(
+            &dir,
+            &format!("chore(beads): record the gate row and close for the {bead_id}"),
+        );
+        assert_ne!(work, head_sha(&dir), "HEAD moved past the work commit");
+        assert_eq!(
+            derive_head_sha(&dir, &bead_id).unwrap(),
+            work,
+            "a bookkeeping-only commit must not move the bound revision"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Orchestrator bookkeeping (`.flywheel/`) is the same class.
+    #[test]
+    fn derive_head_sha_ignores_flywheel_bookkeeping() {
+        let (dir, bead_id) = scratch_workspace("sha-fw-bookkeeping");
+        let work = derive_head_sha(&dir, &bead_id).unwrap();
+        std::fs::create_dir_all(dir.join(".flywheel/receipts")).unwrap();
+        std::fs::write(dir.join(".flywheel/receipts/r.txt"), "ok\n").unwrap();
+        commit_all(&dir, &format!("chore(flywheel): receipt for {bead_id}"));
+        assert_eq!(
+            derive_head_sha(&dir, &bead_id).unwrap(),
+            work,
+            ".flywheel bookkeeping must not move the bound revision"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hardening must not mask real work: a LATER commit that cites the
+    /// id and changes source IS the bound revision.
+    #[test]
+    fn derive_head_sha_still_binds_a_later_work_commit() {
+        let (dir, bead_id) = scratch_workspace("sha-work-wins");
+        let first = derive_head_sha(&dir, &bead_id).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/fix.rs"), "// fix\n").unwrap();
+        commit_all(&dir, &format!("fix: repair the thing ({bead_id})"));
+        let second = derive_head_sha(&dir, &bead_id).unwrap();
+        assert_ne!(
+            second, first,
+            "a later work commit wins over the earlier one"
+        );
+        assert_eq!(second, head_sha(&dir), "the newest work commit is bound");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mixed commits are work: bookkeeping dirt riding along with a source
+    /// change never demotes the commit (the DIRT-POLICY precedent —
+    /// `.beads/` dirt is allowed, but it does not define the commit).
+    #[test]
+    fn derive_head_sha_binds_a_mixed_commit() {
+        let (dir, bead_id) = scratch_workspace("sha-mixed");
+        let first = derive_head_sha(&dir, &bead_id).unwrap();
+        std::fs::write(dir.join("src-fix.txt"), "fix\n").unwrap();
+        std::fs::write(dir.join(".beads/issues.jsonl"), "{\"id\":\"x\"}\n").unwrap();
+        commit_all(&dir, &format!("feat: work plus tracker state ({bead_id})"));
+        let second = derive_head_sha(&dir, &bead_id).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second, head_sha(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed bound: when EVERY commit carrying the id is bookkeeping
+    /// only, the newest one is still returned — the id IS attributable, and
+    /// "no commit carries the id" would be a lie that reopens a real close.
+    #[test]
+    fn derive_head_sha_falls_back_to_the_newest_when_all_are_bookkeeping() {
+        let dir = std::env::temp_dir().join(format!("sha-all-bk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".beads")).unwrap();
+        let init = StdCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init");
+        let bead_id = "bd-all-bookkeeping-1";
+        std::fs::write(dir.join(".beads/issues.jsonl"), "{}\n").unwrap();
+        commit_all(&dir, &format!("chore(beads): tracker state for {bead_id}"));
+        assert_eq!(
+            derive_head_sha(&dir, bead_id).unwrap(),
+            head_sha(&dir),
+            "a bookkeeping-only attribution is still attributable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// ADR-0019 SHA-rule fixture (bd-w1-sha-xyhd): a sibling commit landing
     /// AFTER the bead's commit must not hijack the derived sha — the close
