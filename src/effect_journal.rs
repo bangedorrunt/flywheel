@@ -23,14 +23,14 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use anyhow::bail;
-use toron_core::index::workflow_effects::{EffectState, WorkflowEffectStore};
+use toron_core::index::workflow_effects::{EffectState, NewRun, RunStatus, WorkflowEffectStore};
 use toron_core::mailbox::SendMessage;
 use toron_core::nostr::Tag;
 use toron_mcp::workflow_host::{DispatchRequest, EffectDispatcher};
 use toron_workflow::engine::{
     ActionInvocation, ActionPartition, ActionRunner, EffectRunner, ProviderErrorClass,
-    ProviderOutcome, capability_for_action_type, classify_provider_error_msg, derive_effect_key,
-    partition,
+    ProviderOutcome, RunJournal, RunPhase, RunTransition, capability_for_action_type,
+    classify_provider_error_msg, derive_effect_key, partition,
 };
 use toron_workflow::identity::{action_digest_of, redact_value};
 use toron_workflow::stamp_workflow_emitted;
@@ -377,16 +377,28 @@ fn leaf_value(result: Result<Value>) -> Value {
     }
 }
 
-/// [`effect_runner`] against the process journal and mail plane, or `None` when
-/// no toron index is open — the engine then keeps its loud
-/// `bypassed-no-effect-runner` marker rather than a run that only looks
+/// The two halves of the host-owned journal, built over ONE store (bd-mi9n):
+/// the effect runner and the run-lifecycle journal. They belong together — the
+/// run row is the index its effect rows hang off, and both must key on the
+/// same `run_id`.
+pub struct Journals {
+    pub effect: EffectRunner,
+    pub run: RunJournal,
+}
+
+/// [`effect_runner`] + [`run_journal`] against the process journal and mail
+/// plane, or `None` when no toron index is open — the engine then keeps its
+/// loud `bypassed-no-effect-runner` marker rather than a run that only looks
 /// journaled.
-pub fn journaled(cfg: &crate::config::Config, inner: ActionRunner) -> Option<EffectRunner> {
+pub fn journals(cfg: &crate::config::Config, inner: ActionRunner) -> Option<Journals> {
     // Mail first: when it is in-process it also builds the pool the journal
     // borrows, so the two share one connection instead of opening two.
     let plane = mail_plane(cfg);
     match journal_store() {
-        Some(store) => Some(effect_runner(inner, store, plane)),
+        Some(store) => Some(Journals {
+            effect: effect_runner(inner, store.clone(), plane),
+            run: run_journal(store),
+        }),
         None => {
             eprintln!(
                 "flywheel: no toron index available — effectful workflow leaves will stay \
@@ -395,6 +407,65 @@ pub fn journaled(cfg: &crate::config::Config, inner: ActionRunner) -> Option<Eff
             None
         }
     }
+}
+
+/// The run-lifecycle half of the journal (bd-mi9n, ADR-0032 Spec 5/6).
+///
+/// The engine calls this for every phase of a run it drives, so the
+/// `workflow_runs` row exists without the embedding making its own
+/// `create_run`/`cas_run_status` calls — and because the engine supplies the
+/// `run_id` here, the run row and its effect rows agree by construction.
+///
+/// Idempotent by design (a durable run replays, so the same phase arrives more
+/// than once): the row is created if absent, then CAS'd to the target only when
+/// it differs. A terminal row never moves (toron-core refuses the CAS), so a
+/// replayed tail cannot resurrect a finished run.
+///
+/// Best-effort by the same rule as the effect path: a journal failure is
+/// reported loud and never changes the run's outcome — the run itself already
+/// happened.
+pub fn run_journal(store: WorkflowEffectStore) -> RunJournal {
+    Arc::new(move |t: &RunTransition| {
+        let target = match t.phase {
+            // `workflow_runs` is born `started`; the engine's Started/Running
+            // pair advances it to `running` exactly once (the CAS refuses a
+            // repeat).
+            RunPhase::Started | RunPhase::Running => RunStatus::Running,
+            RunPhase::Succeeded => RunStatus::Succeeded,
+            RunPhase::Failed => RunStatus::Failed,
+        };
+        let store = store.clone();
+        let run_id = t.run_id.clone();
+        let workflow = t.workflow.clone();
+        let workflow_digest = t.workflow_digest.clone();
+        let label = run_id.clone();
+        if let Err(e) = block_on_journal(async move {
+            let current = match store.get_run(&run_id).await? {
+                Some(row) => row.status,
+                None => {
+                    store
+                        .create_run(NewRun {
+                            run_id: run_id.clone(),
+                            project: None,
+                            workflow,
+                            workflow_digest,
+                        })
+                        .await?;
+                    RunStatus::Started
+                }
+            };
+            if current != target {
+                let _ = store.cas_run_status(&run_id, current, target).await?;
+            }
+            Ok(())
+        }) {
+            eprintln!(
+                "flywheel: run lifecycle row for {label} ({:?}) not journaled: {e:#} — the run \
+                 itself is unaffected (ADR-0032 Spec 5)",
+                t.phase
+            );
+        }
+    })
 }
 
 /// The production mail plane for the fenced path, or `None` when this install's
@@ -1196,5 +1267,112 @@ mod tests {
             provider_outcome(Err(anyhow::anyhow!("pane gone"))),
             ProviderOutcome::ProvenFailed(_)
         ));
+    }
+
+    // ---- bd-mi9n: run-lifecycle rows through the injected journal ----
+
+    fn transition(run_id: &str, workflow: &str, phase: RunPhase) -> RunTransition {
+        RunTransition {
+            run_id: run_id.to_string(),
+            workflow: workflow.to_string(),
+            workflow_digest: "digest-1".to_string(),
+            phase,
+        }
+    }
+
+    /// The engine's own lifecycle feed lands a run row: `Started` → `Running`
+    /// → terminal, one row, ending `succeeded`.
+    #[tokio::test]
+    async fn run_journal_writes_started_running_succeeded() {
+        let (_dir, store) = test_store().await;
+        let journal = run_journal(store.clone());
+        for phase in [RunPhase::Started, RunPhase::Running, RunPhase::Succeeded] {
+            journal(&transition("run-life-1", "ship", phase));
+        }
+        let row = store
+            .get_run("run-life-1")
+            .await
+            .expect("get_run")
+            .expect("the engine-driven run has a row");
+        assert_eq!(row.status, RunStatus::Succeeded, "terminal row: {row:?}");
+        assert_eq!(row.workflow, "ship");
+        assert_eq!(row.workflow_digest, "digest-1");
+    }
+
+    /// A failed run's row is terminal `failed` — never left `running`.
+    #[tokio::test]
+    async fn run_journal_writes_a_failed_terminal() {
+        let (_dir, store) = test_store().await;
+        let journal = run_journal(store.clone());
+        for phase in [RunPhase::Started, RunPhase::Running, RunPhase::Failed] {
+            journal(&transition("run-life-fail-1", "ship", phase));
+        }
+        let row = store
+            .get_run("run-life-fail-1")
+            .await
+            .expect("get_run")
+            .expect("row");
+        assert_eq!(row.status, RunStatus::Failed, "{row:?}");
+    }
+
+    /// Replay safety: a durable run re-delivers phases, and a terminal row must
+    /// never move back ("one ambiguity rule" would be a lie if the tail could
+    /// resurrect a finished run).
+    #[tokio::test]
+    async fn run_journal_never_moves_a_terminal_row() {
+        let (_dir, store) = test_store().await;
+        let journal = run_journal(store.clone());
+        for phase in [
+            RunPhase::Started,
+            RunPhase::Running,
+            RunPhase::Succeeded,
+            // the replay
+            RunPhase::Started,
+            RunPhase::Running,
+        ] {
+            journal(&transition("run-life-replay-1", "ship", phase));
+        }
+        let row = store
+            .get_run("run-life-replay-1")
+            .await
+            .expect("get_run")
+            .expect("row");
+        assert_eq!(
+            row.status,
+            RunStatus::Succeeded,
+            "a replayed phase must not move a terminal row: {row:?}"
+        );
+    }
+
+    /// The run row and the effect rows agree on `run_id` — that agreement is
+    /// the whole reason the engine (not the host) reports the lifecycle.
+    #[tokio::test]
+    async fn run_row_and_effect_rows_share_the_run_id() {
+        let (_dir, store) = test_store().await;
+        let journal = run_journal(store.clone());
+        for phase in [RunPhase::Started, RunPhase::Running, RunPhase::Succeeded] {
+            journal(&transition("run-life-2", "ship", phase));
+        }
+        // An effect row for the SAME run, through the same store.
+        let inner: ActionRunner = Arc::new(|_a: &Action| Ok(json!({ "ok": true })));
+        let fx = effect_runner(inner, store.clone(), None);
+        let inv = invocation(dispatch_job(), "run-life-2", "ship");
+        fx(&inv).expect("runner returns a value");
+
+        let effect = store
+            .get_effect(&effect_key_for(&inv))
+            .await
+            .expect("query")
+            .expect("the effect row exists");
+        let run = store
+            .get_run("run-life-2")
+            .await
+            .expect("get_run")
+            .expect("the run row exists");
+        assert_eq!(
+            effect.run_id, run.run_id,
+            "the run row is the index its effect rows hang off — one run_id"
+        );
+        assert_eq!(run.status, RunStatus::Succeeded, "{run:?}");
     }
 }
