@@ -34,6 +34,7 @@ mod doorbell;
 mod doorbell_host;
 mod doorbell_tick;
 mod durable;
+mod effect_journal;
 mod failure;
 mod fs_util;
 mod headless;
@@ -4542,7 +4543,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
-            "workflows": "agent-native catalog: EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; workflow run + compose layer the project tier, the read doors list/show/lint/crew are user-tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -29353,7 +29354,19 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)"
                 );
             }
-            let all = all_workflows()?;
+            // The project tier participates here exactly as it does in
+            // `workflow compose` (W6): the catalog contract is built-ins < user
+            // catalog < project, and this door already has the project in hand
+            // (`--project`, default `flywheel` — the same default compose
+            // uses). Before this, `run` resolved the user tier only, so a
+            // workflow the project itself declares failed with `unknown
+            // workflow` while compose could resolve it. The read doors
+            // (`list`/`show`/`lint`/`crew`) take no project context yet and
+            // stay user-tier — the remainder is its own bead
+            // (`bd-workflow-catalog-read-doors-project-tier-jah1`), pinned by
+            // `workflow_list_stays_user_tier_until_the_read_doors_land`.
+            let run_root = project_dir(cfg, project.as_deref().unwrap_or("flywheel"));
+            let all = all_workflows_layered(Some(&run_root))?;
             let wf = resolve_workflow(name, &all)?.clone();
             // Fail-stop gate: lint before running.
             let blocking = lint_one(name, &wf);
@@ -29371,9 +29384,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // resolve when the caller omits a defaulted input.
             crew::apply_input_defaults(&wf, &mut inputs_value);
             // engine invoke.
-            let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(|sub: &str| {
+            // W6: `call_workflow` sub-runs resolve against the same layered
+            // catalog the entry workflow came from (a project-tier workflow
+            // its project declares must resolve its own sub-workflows).
+            let resolver_root = run_root.clone();
+            let workflow_resolver: toron_workflow::WorkflowResolver = Arc::new(move |sub: &str| {
                 // bd-xmq5: shared sub-workflow resolver (catalog-first).
-                workflow_catalog::subworkflow_resolver(None)(sub)
+                workflow_catalog::subworkflow_resolver(Some(&resolver_root))(sub)
             });
             let packed = packed_from_flag(
                 cfg,
@@ -29476,7 +29493,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let mut spawn_receipts: Vec<Value> = vec![];
             let output = if let Some(pane_ctx) = pane_ctx.as_ref() {
                 let engine = std::sync::Arc::new({
-                    let eng = pane::local_engine(
+                    // bd-engine-run-path-journaling-fwlx: a pane_ctx exists
+                    // only under `--execute` — this runner really dispatches,
+                    // so its leaves journal.
+                    let eng = pane::local_engine_journaled(
+                        cfg,
                         &rt,
                         runner,
                         profile_resolver,
@@ -29537,12 +29558,27 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 // kill -9 mid-run resumes on restart regardless of
                 // --execute mode.
                 let engine = std::sync::Arc::new({
-                    let eng = pane::local_engine(
-                        &rt,
-                        runner,
-                        profile_resolver,
-                        workflow_resolver.clone(),
-                    )?;
+                    // bd-engine-run-path-journaling-fwlx: THIS arm serves both
+                    // the real headless runner (`--execute --mode headless`)
+                    // and the recording runner (no `--execute`). Only the
+                    // former performs effects; journaling a recorded no-op
+                    // would settle work nobody did.
+                    let eng = if *execute {
+                        pane::local_engine_journaled(
+                            cfg,
+                            &rt,
+                            runner,
+                            profile_resolver,
+                            workflow_resolver.clone(),
+                        )?
+                    } else {
+                        pane::local_engine(
+                            &rt,
+                            runner,
+                            profile_resolver,
+                            workflow_resolver.clone(),
+                        )?
+                    };
                     let sink = make_verify_sink(
                         cfg.clone(),
                         project.as_deref().unwrap_or("flywheel").to_string(),
@@ -30043,7 +30079,15 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 // bd-gs005: compose --run attaches the VerifySink exactly like
                 // the workflow-run arm — `action: verify` must execute, not
                 // abort with "verify sink missing".
-                let eng = pane::local_engine(&rt, runner, profile_resolver, workflow_resolver)?;
+                // bd-engine-run-path-journaling-fwlx: a compose --run dispatches
+                // to real panes, so its leaves journal.
+                let eng = pane::local_engine_journaled(
+                    cfg,
+                    &rt,
+                    runner,
+                    profile_resolver,
+                    workflow_resolver,
+                )?;
                 let sink = make_verify_sink(cfg.clone(), project_name.to_string());
                 *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
                 eng
@@ -30611,8 +30655,16 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                 // — RESONATE_URL pin > host-local serve > in-memory), never a
                 // private in-memory constructor. A live fire is a durable run
                 // when a Resonate store answers.
-                let engine =
-                    pane::local_engine(&rt, runner, profile_resolver, workflow_resolver.clone())?;
+                // bd-engine-run-path-journaling-fwlx: cron --live force-fires
+                // the body through the real runner (headless subprocess or
+                // pane `__send`), so its leaves journal.
+                let engine = pane::local_engine_journaled(
+                    cfg,
+                    &rt,
+                    runner,
+                    profile_resolver,
+                    workflow_resolver.clone(),
+                )?;
                 let result = rt.block_on(async { engine.invoke(&run_id, wf, json!({})).await });
                 match result {
                     Ok(output) => {

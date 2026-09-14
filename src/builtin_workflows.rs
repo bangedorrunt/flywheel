@@ -2065,7 +2065,9 @@ mod tests {
         };
         assert_eq!(workflow, "phase-plan");
         assert!(
-            inputs.get("data_shape").is_some_and(|v| v == "{{inputs.data_shape}}"),
+            inputs
+                .get("data_shape")
+                .is_some_and(|v| v == "{{inputs.data_shape}}"),
             "data_shape flows through to phase-plan: {inputs:?}"
         );
     }

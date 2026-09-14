@@ -72,13 +72,36 @@ fn runtime() -> Result<&'static Runtime> {
 /// `Mail::from_config`; every in-process op then reads the pre-built statics.
 fn init_mailbox() -> Result<()> {
     let _rt = runtime()?;
-    match MAILBOX.get_or_init(|| match runtime() {
-        Ok(rt) => rt.block_on(build_mailbox()).map_err(|e| format!("{e:#}")),
-        Err(e) => Err(e.to_string()),
-    }) {
+    match MAILBOX.get_or_init(build_mailbox_once) {
         Ok(_) => Ok(()),
         Err(e) => bail!("flywheel mail: in-process mailbox: {e}"),
     }
+}
+
+/// Build the shared mailbox once, from ANY thread.
+///
+/// `RUNTIME.block_on` panics when the caller is already driving async tasks,
+/// and two real callers are: the approval-drainer thread (which calls
+/// `Mail::from_config` from inside its own `rt.block_on`) and the cron daemon.
+/// Both used to die at exactly this line with "Cannot start a runtime from
+/// within a runtime", leaving its thread dead — for the drainer that means
+/// parked approvals were never resolved. Isolation is therefore chosen at the
+/// call, never assumed: inside a runtime the build runs on a dedicated thread.
+///
+/// The build is still driven by the SHARED runtime, never a throwaway one:
+/// `InProcessBus::open` spawns the bus prune tick (bd-741i) on it, and dropping
+/// that runtime would cancel the tick.
+fn build_mailbox_once() -> Result<toron_core::mailbox::Mailbox, String> {
+    let Ok(rt) = runtime() else {
+        return Err("failed to initialize tokio runtime".to_string());
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::spawn(move || rt.block_on(build_mailbox()))
+            .join()
+            .map_err(|_| "mailbox init thread panicked".to_string())?
+            .map_err(|e| format!("{e:#}"));
+    }
+    rt.block_on(build_mailbox()).map_err(|e| format!("{e:#}"))
 }
 
 /// The shared in-process mailbox. Only reachable after a successful
