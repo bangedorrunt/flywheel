@@ -1059,10 +1059,17 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
     // ADR-0012 YAML crons: the spec IS the registration (schedule + owner +
     // policy + steps body all from the YAML, one engine two input types).
     for row in rows.iter().filter(|r| r.enabled()) {
+        // bd-engine-run-path-journaling-fwlx: a cron body's `dispatch_job` is
+        // an external effect — journal it. The resolver is spelled explicitly
+        // (it is `local_with`'s default) so the combined constructor can carry
+        // the effect runner without changing what a cron body can resolve.
+        let spec_run = spec_runner(&row.spec);
         let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local_with(
-                spec_runner(&row.spec),
+            toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
+                spec_run.clone(),
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
+                toron_workflow::WorkflowEngine::default_workflow_resolver(),
+                crate::effect_journal::journaled(cfg, spec_run),
             )
             .map_err(|e| anyhow!("engine for cron {}: {e}", row.name()))?,
         );
@@ -1095,10 +1102,13 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
             .show(&reg.name)?
             .map(|m| m.entry)
             .ok_or_else(|| anyhow!("cron {:?} vanished between load and start", reg.name))?;
+        let cron_run = cron_runner(&entry);
         let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local_with(
-                cron_runner(&entry),
+            toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
+                cron_run.clone(),
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
+                toron_workflow::WorkflowEngine::default_workflow_resolver(),
+                crate::effect_journal::journaled(cfg, cron_run),
             )
             .map_err(|e| anyhow!("engine for cron {}: {e}", reg.name))?,
         );

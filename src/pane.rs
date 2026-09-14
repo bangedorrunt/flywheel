@@ -1372,7 +1372,31 @@ pub fn local_engine(
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let server_url = cli_engine_store_url();
-    local_engine_with(rt, server_url, runner, profile, workflow)
+    local_engine_with_journal(rt, server_url, runner, profile, workflow, None)
+}
+
+/// [`local_engine`] with the host-owned effect journal attached
+/// (bd-engine-run-path-journaling-fwlx, ADR-0032 Spec 5/6).
+///
+/// Use this for runners that really perform effects — [`pane_dispatch`] and
+/// `headless_dispatch`. The recording runner (`flywheel workflow run` without
+/// `--execute`, `cron run` without `--live`) must stay on plain
+/// [`local_engine`]: journaling a leaf that only *recorded* what it would have
+/// dispatched would settle an external effect nobody performed, which is the
+/// exact lie the journal exists to prevent.
+///
+/// With no toron index open, `journaled` returns `None` and the engine keeps
+/// its own loud `bypassed-no-effect-runner` marker — never a run that only
+/// looks journaled.
+pub fn local_engine_journaled(
+    cfg: &crate::config::Config,
+    rt: &tokio::runtime::Runtime,
+    runner: toron_workflow::ActionRunner,
+    profile: toron_workflow::ProfileResolver,
+    workflow: toron_workflow::WorkflowResolver,
+) -> Result<toron_workflow::WorkflowEngine> {
+    let server_url = cli_engine_store_url();
+    local_engine_with(cfg, rt, server_url, runner, profile, workflow, true)
 }
 
 /// CLI engine store selection (bd-adr22-local-resonate-tx8q). The
@@ -1400,19 +1424,42 @@ pub fn cli_engine_store_url() -> Option<String> {
 /// Store-selection seam: `Some(url)` => remote HttpNetwork-backed engine
 /// (durable), `None` => embedded in-memory runtime. Construction stays lazy;
 /// the URL is only dialed when runs/promise ops execute.
+/// [`local_engine`] / [`local_engine_journaled`] funnel: the only difference is
+/// whether an effect journal is built for this runner.
 fn local_engine_with(
+    cfg: &crate::config::Config,
     rt: &tokio::runtime::Runtime,
     server_url: Option<String>,
     runner: toron_workflow::ActionRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
+    journal: bool,
+) -> Result<toron_workflow::WorkflowEngine> {
+    let effect = if journal {
+        crate::effect_journal::journaled(cfg, runner.clone())
+    } else {
+        None
+    };
+    local_engine_with_journal(rt, server_url, runner, profile, workflow, effect)
+}
+
+/// The store-selection + constructor tail shared by both entry points.
+fn local_engine_with_journal(
+    rt: &tokio::runtime::Runtime,
+    server_url: Option<String>,
+    runner: toron_workflow::ActionRunner,
+    profile: toron_workflow::ProfileResolver,
+    workflow: toron_workflow::WorkflowResolver,
+    effect: Option<toron_workflow::engine::EffectRunner>,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let _enter = rt.enter();
     match server_url {
-        Some(url) => {
-            toron_workflow::WorkflowEngine::remote_with_resolvers(url, runner, profile, workflow)
-        }
-        None => toron_workflow::WorkflowEngine::local_with_resolvers(runner, profile, workflow),
+        Some(url) => toron_workflow::WorkflowEngine::remote_with_resolvers_and_effect(
+            url, runner, profile, workflow, effect,
+        ),
+        None => toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
+            runner, profile, workflow, effect,
+        ),
     }
 }
 
@@ -2360,12 +2407,13 @@ steps:
         let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
         let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        let engine = local_engine_with(
+        let engine = local_engine_with_journal(
             &rt,
             Some("http://127.0.0.1:59999".into()),
             runner.clone(),
             profile.clone(),
             workflow.clone(),
+            None,
         )
         .expect("remote-backed engine constructs without dialing");
 
@@ -2375,12 +2423,44 @@ steps:
             "Some(url) must wire the REMOTE HttpNetwork (transport-level failure), got: {remote_err}"
         );
 
-        let fallback =
-            local_engine_with(&rt, None, runner, profile, workflow).expect("fallback constructs");
+        let fallback = local_engine_with_journal(&rt, None, runner, profile, workflow, None)
+            .expect("fallback constructs");
         let local_err = rt.block_on(store_error_flavor(&fallback));
         assert!(
             local_err.contains("not found") && !local_err.contains("network error"),
             "None must stay embedded-local (authoritative miss, not transport failure), got: {local_err}"
+        );
+    }
+
+    /// bd-engine-run-path-journaling-fwlx: the recording (dry-run) arm is the
+    /// ONE engine rail that must stay unjournaled — its runner records what it
+    /// would have dispatched, so a `settled` row would settle an external
+    /// effect nobody performed. The engine's own bypass marker is the witness
+    /// that this path claims no journal coverage.
+    #[test]
+    fn recording_engine_keeps_the_bypass_marker() {
+        let runner: toron_workflow::ActionRunner =
+            std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
+        let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        // None → embedded-local, so the assertion cannot depend on whether a
+        // Resonate server happens to answer on this host.
+        let engine = local_engine_with_journal(&rt, None, runner, profile, workflow, None)
+            .expect("recording engine");
+        let wf = toron_workflow::parse_workflow(
+            "name: dry\nsteps:\n  - name: dispatch\n    action: dispatch_job\n    assignee: pi\n    spec:\n      task: work\n",
+        )
+        .expect("parse dry workflow");
+
+        let out = rt
+            .block_on(engine.invoke("wf-dry-journal-1", wf, json!({})))
+            .expect("invoke");
+
+        assert_eq!(
+            out["dispatch"]["effect_journal"],
+            json!("bypassed-no-effect-runner"),
+            "the dry path journals nothing and says so: {out}"
         );
     }
 
