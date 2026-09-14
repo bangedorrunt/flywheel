@@ -5365,13 +5365,13 @@ fn snapshot_runs() -> Vec<Value> {
             continue;
         };
         for e in rows {
-            let run_kind = match e.kind {
-                EventKind::Workflow => Some("workflow"),
-                EventKind::Pipeline => Some("pipeline"),
-                EventKind::Loop => Some("loop"),
-                _ => None,
-            };
-            let Some(run_kind) = run_kind else { continue };
+            if !matches!(
+                e.kind,
+                EventKind::Workflow | EventKind::Pipeline | EventKind::Loop
+            ) {
+                continue;
+            }
+            let run_kind = run_row_kind(&project, &e);
             let owner = ["workflow", "pipeline", "loop", "agent"]
                 .iter()
                 .find_map(|k| e.data.get(*k).and_then(Value::as_str).map(String::from))
@@ -5381,7 +5381,7 @@ fn snapshot_runs() -> Vec<Value> {
                 "project": project,
                 "kind": run_kind,
                 "owner": owner,
-                "state": e.data.get("status").and_then(Value::as_str).unwrap_or("done"),
+                "state": history_row_status(&e.data),
                 "ts": e.ts,
             }));
         }
@@ -21557,7 +21557,14 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
             }
         }
     }
-    log(project, EventKind::Workflow, json!({ "workflow": name }));
+    // Every step above returned Ok, so this run really did complete — say so
+    // rather than leaving a status-less row a reader would have to default
+    // (ADR-0032 Spec 9 tail).
+    log(
+        project,
+        EventKind::Workflow,
+        json!({ "workflow": name, "status": "completed" }),
+    );
     println!("workflow {name} complete");
     Ok(())
 }
@@ -22415,15 +22422,12 @@ fn cmd_loop(
     let ws_id = find_workspace(&mut c, project)?;
     let deadline = timeout_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
 
+    // A start notice, not a run outcome (ADR-0032 Spec 9 tail): it declares
+    // itself so no reader counts the monitor's launch as a run's result.
     log(
         project,
         EventKind::Loop,
-        json!({
-            "interval_secs": interval_secs,
-            "queue_len": queue_items.len(),
-            "to": to,
-            "on_blocked": on_blocked,
-        }),
+        loop_monitor_notice(interval_secs, queue_items.len(), to, on_blocked),
     );
     println!(
         "loop: monitoring {} (interval {}s, queue {}{})",
@@ -27278,6 +27282,11 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
 ///
 /// bd-cron-run-no-live-u9tg: `--json` drivers get ONE stable status
 /// vocabulary instead of each writer's local spelling.
+///
+/// ADR-0032 Spec 9 tail: rows are honest — the status is read through
+/// [`history_row_status`] (unrecorded ⇒ `unknown`, never an invented `done`)
+/// and the failure artifacts the run wrote ride the row
+/// ([`run_list_row`]).
 fn normalize_run_status(raw: &str) -> String {
     match raw {
         "done" | "success" | "succeeded" | "completed" | "ok" => "completed".to_string(),
@@ -27320,6 +27329,153 @@ fn history_row_status(data: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// A writer's own label for a row that is an annotation *about* a run rather
+/// than a run outcome (see [`annotation_kind`]).
+const NOTICE_PLAN_WARNING: &str = "plan-warning";
+const NOTICE_LOOP_MONITOR: &str = "loop-monitor";
+
+/// The annotation kind of a state-log row, or `None` when the row is a run
+/// outcome.
+///
+/// Three writers log rows that annotate a run instead of recording its
+/// outcome, sharing `EventKind::Workflow` / `EventKind::Loop` with real runs:
+/// `phase_chain` writes one phase gate per ship link, the warn-first
+/// plan-artifact gate writes warn telemetry, and the legacy loop monitor
+/// writes a start notice. Each declares itself with `notice`; the shapes
+/// written *before* `notice` existed are recognized by the markers they
+/// already carry, so old rows read honestly too. An unrecognized `notice` is
+/// still not a run — it is labeled rather than miscounted. Rows matching
+/// nothing stay `None`, so a status-less row is visibly `unknown` (loud)
+/// instead of being silently excused.
+fn annotation_kind(e: &state::LogEntry) -> Option<&'static str> {
+    let d = &e.data;
+    if d.get("phase_gate").and_then(Value::as_bool) == Some(true) {
+        return Some("phase-gate");
+    }
+    match d.get("notice").and_then(Value::as_str) {
+        Some(NOTICE_PLAN_WARNING) => return Some(NOTICE_PLAN_WARNING),
+        Some(NOTICE_LOOP_MONITOR) => return Some(NOTICE_LOOP_MONITOR),
+        Some(_) => return Some("notice"),
+        None => {}
+    }
+    if d.get("plan_artifact_missing").and_then(Value::as_bool) == Some(true) {
+        return Some(NOTICE_PLAN_WARNING);
+    }
+    if d.get("interval_secs").is_some() && d.get("on_blocked").is_some() {
+        return Some(NOTICE_LOOP_MONITOR);
+    }
+    None
+}
+
+/// True when the row annotates a run rather than recording its outcome.
+fn is_annotation_row(e: &state::LogEntry) -> bool {
+    annotation_kind(e).is_some()
+}
+
+/// The dashboard/agent `kind` for a state-log row: the annotation kind for a
+/// notice, `headless` for a `runs/` entry surfaced under its run id, else the
+/// event kind lowercased.
+fn run_row_kind(project: &str, e: &state::LogEntry) -> String {
+    if let Some(kind) = annotation_kind(e) {
+        kind.to_string()
+    } else if project.starts_with("hl-") {
+        "headless".to_string()
+    } else {
+        format!("{:?}", e.kind).to_lowercase()
+    }
+}
+
+/// The legacy loop monitor's start notice (`EventKind::Loop`). It records the
+/// state the monitor entered — never a terminal status it cannot know, and
+/// never silence that a reader would have to default.
+fn loop_monitor_notice(interval_secs: u64, queue_len: usize, to: &str, on_blocked: &str) -> Value {
+    json!({
+        "notice": NOTICE_LOOP_MONITOR,
+        "interval_secs": interval_secs,
+        "queue_len": queue_len,
+        "to": to,
+        "on_blocked": on_blocked,
+    })
+}
+
+/// The warn-first plan-artifact gate's telemetry row (`EventKind::Workflow`):
+/// an annotation about a step, not a run outcome.
+fn plan_warning_notice(workflow: &str, phase: &str) -> Value {
+    json!({
+        "notice": NOTICE_PLAN_WARNING,
+        "workflow": workflow,
+        "phase": phase,
+        "plan_artifact_missing": true,
+        "gate_mode": "warn",
+    })
+}
+
+/// Advisory per-run cost (best-effort; 0 when unrecorded).
+fn run_cost(e: &state::LogEntry) -> Value {
+    let tokens = e.data.get("tokens").and_then(Value::as_u64).unwrap_or(0);
+    let model = e.data.get("model").and_then(Value::as_str).unwrap_or("");
+    json!({ "tokens": tokens, "model": model })
+}
+
+/// Owner of a run (workflow / pipeline / loop / agent named in payload).
+fn run_owner(e: &state::LogEntry) -> String {
+    ["cron", "workflow", "pipeline", "loop", "agent"]
+        .iter()
+        .find_map(|k| e.data.get(*k).and_then(Value::as_str).map(String::from))
+        .unwrap_or_default()
+}
+
+/// One `runs list` row (ADR-0032 Spec 9 tail): terminal status, real
+/// project, owner, cost, phase, and the failure artifacts the run wrote.
+///
+/// The status goes through [`history_row_status`], so a run that recorded no
+/// status reads `unknown`. This surface used to default to `done` (printing
+/// `completed` for a run nobody could vouch for) — the dashboard never
+/// invents a success it cannot evidence.
+fn run_list_row(project: &str, e: &state::LogEntry) -> Value {
+    let state_status = history_row_status(&e.data);
+    let normalized = normalize_run_status(&state_status);
+    let mut row = json!({
+        "id": format!("{project}:{}", &e.ts),
+        "ts": e.ts,
+        "project": project,
+        "kind": run_row_kind(project, e),
+        "owner": run_owner(e),
+        "state": state_status,
+        "status": normalized,
+        "cost": run_cost(e),
+        // Spec 9 tail: the artifact paths a failed run wrote ride the row so
+        // it is diagnosable without a second lookup. Absent (and null) stay a
+        // stable `[]` for `--json` drivers.
+        "artifacts": e
+            .data
+            .get("artifact_paths")
+            .and_then(Value::as_array)
+            .cloned()
+            .map(Value::Array)
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        // ADR-0022 W4: phase column (null for state-log runs that never
+        // carried a phase; `phase_degraded` marks loud prompt-mode fallback,
+        // never silent).
+        "phase": e
+            .data
+            .get("phase")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "phase_degraded": e
+            .data
+            .get("phase_degraded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    });
+    // A gate annotation carries the verdict it actually produced; a run
+    // outcome never gains this key.
+    if let Some(ok) = e.data.get("gate_ok") {
+        row["gate_ok"] = ok.clone();
+    }
+    row
 }
 
 /// Write a failed run's terminal output to the per-run artifact dir and
@@ -27389,9 +27545,20 @@ mod runs_status_tests {
 #[cfg(test)]
 mod run_ledger_truth_tests {
     use super::{
-        history_row_status, parse_leaf_output, run_terminal_status, stage_prompt_for_project,
+        history_row_status, is_annotation_row, loop_monitor_notice, parse_leaf_output,
+        plan_warning_notice, run_list_row, run_terminal_status, stage_prompt_for_project,
     };
+    use crate::state::{EventKind, LogEntry};
     use serde_json::json;
+
+    fn row_entry(project: &str, data: serde_json::Value) -> LogEntry {
+        LogEntry {
+            ts: "2026-09-14T00:00:00Z".into(),
+            kind: EventKind::Workflow,
+            project: project.into(),
+            data,
+        }
+    }
 
     #[test]
     fn run_ledger_truth_terminal_status_maps_outcome() {
@@ -27467,6 +27634,216 @@ mod run_ledger_truth_tests {
             "evidence rides the error: {msg}"
         );
     }
+
+    /// ADR-0032 Spec 9 tail: `runs list` is the captain's daily dashboard, so
+    /// it must not invent a success. A state-log run that recorded no status
+    /// reads `unknown` — the old `unwrap_or("done")` printed `completed` for
+    /// a run nobody could vouch for.
+    #[test]
+    fn run_ledger_truth_list_row_never_invents_done() {
+        let bare = row_entry("flywheel", json!({ "workflow": "wave-swarm" }));
+        let row = run_list_row("flywheel", &bare);
+        assert_eq!(row["state"], json!("unknown"), "raw state honest: {row}");
+        assert_eq!(row["status"], json!("unknown"), "normalized honest: {row}");
+        assert_eq!(row["owner"], json!("wave-swarm"), "owner still read: {row}");
+
+        // A recorded terminal status still normalizes as it always did.
+        let failed = row_entry(
+            "flywheel",
+            json!({ "status": "failed", "workflow": "wave-swarm" }),
+        );
+        let row = run_list_row("flywheel", &failed);
+        assert_eq!(row["state"], json!("failed"));
+        assert_eq!(row["status"], json!("failed"));
+
+        let ok = row_entry("weird", json!({ "status": "succeeded", "workflow": "w" }));
+        assert_eq!(run_list_row("weird", &ok)["status"], json!("completed"));
+    }
+
+    /// Spec 9 tail "terminal status + real project + failure artifacts": the
+    /// artifact paths the run wrote ride the dashboard row, so a failed row is
+    /// diagnosable without a second lookup. Absent artifacts stay a stable
+    /// empty array for `--json` drivers.
+    #[test]
+    fn run_ledger_truth_list_row_carries_failure_artifacts() {
+        let failed = row_entry(
+            "flywheel",
+            json!({
+                "status": "failed",
+                "workflow": "w",
+                "artifact_paths": ["/tmp/flywheel/x.terminal.json"],
+            }),
+        );
+        let row = run_list_row("flywheel", &failed);
+        assert_eq!(
+            row["artifacts"],
+            json!(["/tmp/flywheel/x.terminal.json"]),
+            "failure artifacts ride the row: {row}"
+        );
+
+        let ok = row_entry("flywheel", json!({ "status": "succeeded" }));
+        assert_eq!(run_list_row("flywheel", &ok)["artifacts"], json!([]));
+
+        // A writer that set the key to null must not wedge the row either.
+        let nullish = row_entry("flywheel", json!({ "artifact_paths": null }));
+        assert_eq!(run_list_row("flywheel", &nullish)["artifacts"], json!([]));
+    }
+
+    /// `--robot-snapshot` feeds agents, so its run rows obey the same honesty
+    /// rule as `runs list`: a status-less row reads `unknown`, never a
+    /// defaulted `done`.
+    #[test]
+    fn run_ledger_truth_robot_snapshot_rows_are_honest() {
+        let _g = crate::config::test_state_home();
+        crate::log(
+            "demo-honest-snapshot",
+            EventKind::Workflow,
+            json!({ "workflow": "w" }),
+        );
+        let rows = super::snapshot_runs();
+        let row = rows
+            .iter()
+            .find(|r| r["project"] == json!("demo-honest-snapshot"))
+            .expect("the status-less run row is listed");
+        assert_eq!(row["state"], json!("unknown"), "no invented done: {row}");
+    }
+
+    /// A phase-gate annotation shares `EventKind::Workflow` with real runs but
+    /// is not a run outcome (ADR-0022 W2/W4 gates): the dashboard labels it
+    /// `phase-gate` and carries the gate's own verdict, so a ship chain's link
+    /// gates never masquerade as run rows.
+    #[test]
+    fn run_ledger_truth_list_row_labels_phase_gates() {
+        let gate = row_entry(
+            "flywheel",
+            json!({
+                "workflow": "ship",
+                "link": "verify",
+                "phase": "verify",
+                "phase_gate": true,
+                "gate_ok": false,
+                "evidence": "missing VERIFY tail",
+                "run_id": "r-link3-verify",
+            }),
+        );
+        let row = run_list_row("flywheel", &gate);
+        assert_eq!(row["kind"], json!("phase-gate"), "not a run: {row}");
+        assert_eq!(row["gate_ok"], json!(false), "verdict rides it: {row}");
+        assert_eq!(
+            row["status"],
+            json!("unknown"),
+            "no invented outcome: {row}"
+        );
+
+        // A real run row stays a run and gains no verdict key.
+        let run = row_entry("flywheel", json!({ "workflow": "w", "status": "failed" }));
+        let row = run_list_row("flywheel", &run);
+        assert_eq!(row["kind"], json!("workflow"));
+        assert!(row.get("gate_ok").is_none(), "no verdict on a run: {row}");
+    }
+
+    /// The other two annotation families: the warn-first plan-artifact gate
+    /// and the legacy loop monitor's start notice are *about* a run, not
+    /// outcomes of one. Rows written before `notice` existed are recognized by
+    /// their markers, so the historical rows read honestly too.
+    #[test]
+    fn run_ledger_truth_list_row_labels_other_annotations() {
+        let plan = row_entry(
+            "flywheel",
+            json!({
+                "workflow": "wf",
+                "phase": "implement",
+                "plan_artifact_missing": true,
+                "gate_mode": "warn",
+            }),
+        );
+        let row = run_list_row("flywheel", &plan);
+        assert_eq!(row["kind"], json!("plan-warning"), "{row}");
+        assert_eq!(
+            row["status"],
+            json!("unknown"),
+            "no invented run outcome: {row}"
+        );
+
+        let monitor = row_entry(
+            "flywheel",
+            json!({ "interval_secs": 30, "on_blocked": "mail", "queue_len": 0, "to": "all" }),
+        );
+        let row = run_list_row("flywheel", &monitor);
+        assert_eq!(row["kind"], json!("loop-monitor"), "{row}");
+
+        // A declared notice is honored even with no legacy marker present.
+        let declared = row_entry(
+            "flywheel",
+            json!({ "notice": "loop-monitor", "workflow": "w" }),
+        );
+        assert_eq!(
+            run_list_row("flywheel", &declared)["kind"],
+            json!("loop-monitor")
+        );
+
+        // An unrecognized notice is still not a run — labeled, never excused.
+        let unknown_notice = row_entry("flywheel", json!({ "notice": "future-thing" }));
+        assert_eq!(
+            run_list_row("flywheel", &unknown_notice)["kind"],
+            json!("notice")
+        );
+
+        // ...and a status-less row matching nothing stays visibly unknown.
+        let bare = row_entry("flywheel", json!({ "workflow": "w" }));
+        assert_eq!(run_list_row("flywheel", &bare)["kind"], json!("workflow"));
+    }
+
+    /// The writers declare what their rows are, so the reader never has to
+    /// guess: the loop monitor's start notice and the plan-warn telemetry each
+    /// carry their `notice` label, and the legacy runner records the outcome
+    /// it actually observed instead of leaving the row status-less.
+    #[test]
+    fn run_ledger_truth_writer_payloads_self_describe() {
+        let monitor = loop_monitor_notice(30, 2, "all", "mail");
+        assert_eq!(monitor["notice"], json!("loop-monitor"), "{monitor}");
+        assert_eq!(monitor["interval_secs"], json!(30));
+        assert_eq!(monitor["queue_len"], json!(2));
+        assert_eq!(monitor["to"], json!("all"));
+        assert_eq!(monitor["on_blocked"], json!("mail"));
+        assert!(
+            monitor.get("status").is_none(),
+            "a start notice records no terminal status: {monitor}"
+        );
+
+        let warn = plan_warning_notice("wf", "implement");
+        assert_eq!(warn["notice"], json!("plan-warning"), "{warn}");
+        assert_eq!(warn["plan_artifact_missing"], json!(true));
+        assert_eq!(warn["gate_mode"], json!("warn"));
+
+        // Both are recognized as annotations by the reader that labels rows.
+        let e = |data: serde_json::Value| LogEntry {
+            ts: "2026-09-14T00:00:00Z".into(),
+            kind: EventKind::Loop,
+            project: "flywheel".into(),
+            data,
+        };
+        assert!(is_annotation_row(&e(monitor)));
+        assert!(is_annotation_row(&e(warn)));
+    }
+
+    /// The agent feed labels gate annotations too — an agent must not read a
+    /// ship link's gate as a run outcome.
+    #[test]
+    fn run_ledger_truth_robot_snapshot_labels_phase_gates() {
+        let _g = crate::config::test_state_home();
+        crate::log(
+            "demo-honest-gate",
+            EventKind::Workflow,
+            json!({ "workflow": "ship", "phase_gate": true, "gate_ok": true }),
+        );
+        let rows = super::snapshot_runs();
+        let row = rows
+            .iter()
+            .find(|r| r["project"] == json!("demo-honest-gate"))
+            .expect("the gate annotation is listed");
+        assert_eq!(row["kind"], json!("phase-gate"), "{row}");
+    }
 }
 
 fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
@@ -27503,21 +27880,6 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
         }
         out.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
         Ok(out)
-    }
-
-    /// Advisory per-run cost (best-effort; 0 when unrecorded).
-    fn run_cost(e: &LogEntry) -> Value {
-        let tokens = e.data.get("tokens").and_then(Value::as_u64).unwrap_or(0);
-        let model = e.data.get("model").and_then(Value::as_str).unwrap_or("");
-        json!({ "tokens": tokens, "model": model })
-    }
-
-    /// Owner of a run (workflow / pipeline / loop / agent named in payload).
-    fn run_owner(e: &LogEntry) -> String {
-        ["cron", "workflow", "pipeline", "loop", "agent"]
-            .iter()
-            .find_map(|k| e.data.get(*k).and_then(Value::as_str).map(String::from))
-            .unwrap_or_default()
     }
 
     /// A run is pending when its payload carries a suspend/park marker.
@@ -27564,40 +27926,7 @@ fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
             }
             let rows: Vec<Value> = runs
                 .iter()
-                .map(|(project, e)| {
-                    let raw_status = e
-                        .data
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("done");
-                    json!({
-                        "id": format!("{project}:{}", &e.ts),
-                        "ts": e.ts,
-                        "project": project,
-                        "kind": if project.starts_with("hl-") {
-                            "headless".to_string()
-                        } else {
-                            format!("{:?}", e.kind).to_lowercase()
-                        },
-                        "owner": run_owner(e),
-                        "state": raw_status,
-                        "status": normalize_run_status(raw_status),
-                        "cost": run_cost(e),
-                        // ADR-0022 W4: phase column (null for state-log runs
-                        // that never carried a phase; `phase_degraded` marks
-                        // loud prompt-mode fallback, never silent).
-                        "phase": e
-                            .data
-                            .get("phase")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        "phase_degraded": e
-                            .data
-                            .get("phase_degraded")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    })
-                })
+                .map(|(project, e)| run_list_row(project, e))
                 .collect();
             if *json {
                 // bd-cron-run-no-live-u9tg: one JSON array for drivers —
@@ -29854,6 +30183,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         rows.push(json!({
                             "ts": e.ts,
                             "project": project,
+                            // A ship chain's link-gate annotations share the
+                            // Workflow kind; label them so `workflow history`
+                            // never reads one as a run outcome.
+                            "kind": run_row_kind(&project, &e),
                             "run_id": e.data.get("run_id"),
                             "status": history_row_status(&e.data),
                             "crew": e.data.get("crew"),
@@ -32965,12 +33298,7 @@ pub(crate) fn headless_dispatch(
         crate::state::log_event(
             "flywheel",
             crate::state::EventKind::Workflow,
-            serde_json::json!({
-                "workflow": wf_name,
-                "phase": "implement",
-                "plan_artifact_missing": true,
-                "gate_mode": "warn",
-            }),
+            plan_warning_notice(wf_name, "implement"),
         )
         .ok();
     }

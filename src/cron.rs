@@ -1310,6 +1310,11 @@ pub fn cron_history(name: &str) -> Vec<CronRun> {
             if owner != Some(name) {
                 continue;
             }
+            // Annotation rows (ship link gates, plan-warn telemetry, loop
+            // monitor notices) share the run event kinds; they are not runs.
+            if crate::is_annotation_row(&e) {
+                continue;
+            }
             rows.push(CronRun {
                 ts: e.ts.clone(),
                 project: project.clone(),
@@ -1318,12 +1323,10 @@ pub fn cron_history(name: &str) -> Vec<CronRun> {
                     .get("run_id")
                     .and_then(Value::as_i64)
                     .map(|i| i.to_string()),
-                status: e
-                    .data
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("done")
-                    .to_string(),
+                // ADR-0032 Spec 9 tail: an unrecorded status is `unknown`,
+                // never a defaulted `done` (shared with `runs list` /
+                // `--robot-snapshot`).
+                status: crate::history_row_status(&e.data),
                 bead: e
                     .data
                     .get("bead")
@@ -1371,6 +1374,42 @@ mod tests {
             enabled: true,
             created_at: "2026-08-08T00:00:00Z".to_string(),
         }
+    }
+
+    /// ADR-0032 Spec 9 tail: `cron history` reads the same run rows as
+    /// `runs list`, so a status-less workflow row reads `unknown` — never an
+    /// invented `done` for a run nothing recorded an outcome for.
+    #[test]
+    fn cron_history_never_invents_done() {
+        let _g = crate::config::test_state_home();
+        crate::log(
+            "demo-honest-cron",
+            crate::state::EventKind::Workflow,
+            serde_json::json!({ "workflow": "weekly-honest" }),
+        );
+        let rows = cron_history("weekly-honest");
+        assert!(!rows.is_empty(), "the recorded row is returned");
+        assert_eq!(rows[0].status, "unknown", "no invented done");
+    }
+
+    /// A phase-gate annotation shares the Workflow event kind with cron runs;
+    /// `cron history` must not list a ship link's gate as a cron run.
+    #[test]
+    fn cron_history_skips_phase_gate_rows() {
+        let _g = crate::config::test_state_home();
+        crate::log(
+            "demo-honest-cron-gate",
+            crate::state::EventKind::Workflow,
+            serde_json::json!({
+                "workflow": "weekly-honest",
+                "phase_gate": true,
+                "gate_ok": true,
+            }),
+        );
+        assert!(
+            cron_history("weekly-honest").is_empty(),
+            "gate annotations are not runs"
+        );
     }
 
     /// save → load round-trips every field (nothing dropped).
