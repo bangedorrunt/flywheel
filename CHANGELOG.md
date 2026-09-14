@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
+### Fixed — goal workflow render (bd-pqwx)
+- The `goal` meta-workflow no longer dies at render with `unresolved template ref {{inputs.data_shape}}` on a bare objective: `phase-plan`'s `data_shape` input now defaults to empty (every caller — goal, ship, the beads-lifecycle graph — renders clean), and `goal` declares `data_shape` and passes it through to `phase-plan` like the `ship` chain already did, so a caller that knows the data shape can feed it through.
 ### Added — portable profile codec (ADR-0013 P2-11, bd-8ana)
 - `flywheel profile export <name> [--out <file>]` writes the versioned portable doc (`{"codec":1,"name",..."profile"}` JSON); `flywheel profile import <path|-> [--name] [--dry-run]` upserts it into the user `profiles.toml` (importing a built-in name lands as a deliberate local override). Unknown codec versions refuse loud naming the supported one; absent fields take the same defaults as the TOML loader.
 ### Fixed — run-ledger truth (ADR-0032 Spec 9 tail)

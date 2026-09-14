@@ -89,6 +89,7 @@ crew: auto
 inputs:
   - name: goal
   - name: data_shape
+    default: ""
 steps:
   - name: phase-plan
     action: dispatch_job
@@ -307,6 +308,8 @@ trigger:
 crew: auto
 inputs:
   - name: objective
+  - name: data_shape
+    default: ""
 steps:
   - name: ideate
     action: call_workflow
@@ -315,7 +318,7 @@ steps:
   - name: plan
     action: call_workflow
     workflow: phase-plan
-    inputs: { goal: "{{inputs.objective}}" }
+    inputs: { goal: "{{inputs.objective}}", data_shape: "{{inputs.data_shape}}" }
   - name: track
     action: call_workflow
     workflow: beads
@@ -2012,6 +2015,59 @@ mod tests {
         // strategy at invoke: auto | <squad>).
         assert_eq!(goal.crew, Some(CrewSpec::Auto));
         assert_eq!(direct.crew, Some(CrewSpec::Auto));
+    }
+
+    /// bd-pqwx: goal's plan step under-supplied phase-plan's declared
+    /// `data_shape`, so phase-plan's task kept the literal
+    /// `{{inputs.data_shape}}`; that payload flowed into `steps.track` and
+    /// the strict execution render of goal's build `$.spec.plan` failed
+    /// loud (2026-09-14 live: `render: workflow "goal" node "build" field
+    /// "$.spec.plan"`). goal now declares `data_shape` with an empty
+    /// default (`bind_input_defaults` fills it on a bare-objective invoke)
+    /// and passes it through exactly like the ship chain does.
+    #[test]
+    fn goal_render_supplies_phase_plan_data_shape() {
+        let wfs = builtin_workflows();
+        // ROOT fix: phase-plan defaults data_shape to empty, so EVERY caller
+        // (goal, ship, the beads-lifecycle graph at line ~1404 that passes
+        // only goal) renders its task clean — no literal
+        // {{inputs.data_shape}} can leak into step outputs.
+        let phase_plan = &wfs["phase-plan"];
+        let shape = phase_plan
+            .inputs
+            .iter()
+            .find(|i| i.name == "data_shape")
+            .expect("phase-plan declares data_shape");
+        assert_eq!(
+            shape.default.as_ref().and_then(|v| v.as_str()),
+            Some(""),
+            "omittable — callers without a data shape still render"
+        );
+        let goal = &wfs["goal"];
+        let shape = goal
+            .inputs
+            .iter()
+            .find(|i| i.name == "data_shape")
+            .expect("goal declares data_shape");
+        assert_eq!(
+            shape.default.as_ref().and_then(|v| v.as_str()),
+            Some(""),
+            "empty default — the meta-workflow runs on a bare objective"
+        );
+        use toron_workflow::schema::Action;
+        let plan = goal
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("plan"))
+            .expect("plan step");
+        let Action::CallWorkflow { workflow, inputs } = &plan.action else {
+            panic!("plan is a call_workflow: {:?}", plan.action);
+        };
+        assert_eq!(workflow, "phase-plan");
+        assert!(
+            inputs.get("data_shape").is_some_and(|v| v == "{{inputs.data_shape}}"),
+            "data_shape flows through to phase-plan: {inputs:?}"
+        );
     }
 
     /// WORKFLOW-COMPOSE (bd-2pcq #6): the call_workflow chain resolves across
