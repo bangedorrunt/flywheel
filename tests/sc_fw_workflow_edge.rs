@@ -17,6 +17,8 @@
 //!
 //! governed-by: ADR-0005 Spec 2, P3.1
 
+use std::path::Path;
+use std::process::{Command, Output};
 use std::sync::Arc;
 
 use toron_workflow::engine::{ActionRunner, WorkflowEngine};
@@ -26,6 +28,118 @@ use toron_workflow::schema::{Action, Workflow, parse_workflow};
 /// runner is injected; this test exercises the engine, not the mailbox).
 fn noop_runner() -> ActionRunner {
     Arc::new(|_a: &Action| Ok(serde_json::Value::Null))
+}
+
+fn flywheel() -> &'static str {
+    env!("CARGO_BIN_EXE_flywheel")
+}
+
+/// One hermetic project carrying a PROJECT-tier workflow
+/// (`<project>/.flywheel/workflows/project-tier-demo.yaml`) plus isolated
+/// config/state homes. The project key is an ABSOLUTE path so `project_dir`
+/// resolves it verbatim (bd-test-tmp-hygiene-pq5b).
+struct TieredProject {
+    _dir: tempfile::TempDir,
+    project: std::path::PathBuf,
+    config_home: std::path::PathBuf,
+    state_home: std::path::PathBuf,
+}
+
+impl TieredProject {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let project = dir.path().join("proj");
+        let workflows = project.join(".flywheel/workflows");
+        std::fs::create_dir_all(&workflows).expect("workflow dir");
+        std::fs::write(
+            workflows.join("project-tier-demo.yaml"),
+            "name: project-tier-demo\nsteps:\n  - name: noop\n    action: delay\n    secs: 0\n",
+        )
+        .expect("write project-tier workflow");
+        Self {
+            config_home: dir.path().join("config"),
+            state_home: dir.path().join("state"),
+            project,
+            _dir: dir,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(flywheel())
+            .args(args)
+            .arg("--project")
+            .arg(&self.project)
+            .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("XDG_STATE_HOME", &self.state_home)
+            .output()
+            .expect("spawn flywheel")
+    }
+
+    /// For the verbs that carry no project context at all (the read doors).
+    fn run_without_project(&self, args: &[&str]) -> Output {
+        Command::new(flywheel())
+            .args(args)
+            .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("XDG_STATE_HOME", &self.state_home)
+            .output()
+            .expect("spawn flywheel")
+    }
+}
+
+/// The catalog contract is built-ins < user catalog < PROJECT tier, and
+/// `workflow compose` already layers it (W6). `workflow run` is the other
+/// door into the same catalog and has the project in hand (`--project`), so a
+/// workflow authored into the project must resolve there — before this, run
+/// resolved the user tier only and bailed `unknown workflow` on a workflow the
+/// project itself declares.
+#[test]
+fn workflow_run_resolves_the_project_tier() {
+    let h = TieredProject::new();
+    let out = h.run(&["workflow", "run", "project-tier-demo"]);
+
+    assert!(
+        out.status.success(),
+        "workflow run must resolve a project-tier workflow: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The remainder is deliberate, not accidental
+/// (`bd-workflow-catalog-read-doors-project-tier-jah1`): `workflow
+/// list`/`show`/`lint`/`crew` carry no
+/// project context, so they stay user-tier and do NOT list a project-tier
+/// workflow that `workflow run` can now execute. Flipping this test is the
+/// bead's job, together with those four verbs.
+#[test]
+fn workflow_list_stays_user_tier_until_the_read_doors_land() {
+    let h = TieredProject::new();
+    let out = h.run_without_project(&["workflow", "list"]);
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "workflow list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !listing.contains("project-tier-demo"),
+        "workflow list is user-tier today; if it now lists the project tier, \
+         flip this test and close the read-doors bead: {listing}"
+    );
+    // The reason it cannot layer yet: the verb carries no project context.
+    let refused = h.run_without_project(&["workflow", "list", "--project", "whatever"]);
+    assert!(
+        !refused.status.success(),
+        "workflow list takes no --project today; if it does now, it can layer \
+         the project tier and this test should be flipped"
+    );
+}
+
+/// The project key must be an absolute path for the layering to be reachable
+/// from a scratch dir (documents the `--project` contract the test relies on).
+#[test]
+fn tiered_project_key_is_absolute() {
+    let h = TieredProject::new();
+    assert!(Path::new(&h.project).is_absolute());
 }
 
 /// Static contract: the cargo edge exists.
