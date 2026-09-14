@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
+### Fixed — run-ledger truth (ADR-0032 Spec 9 tail)
+- `runs list`, `--robot-snapshot`, and `cron history` no longer default a run row's status to `done`. A row with no recorded status now reads `unknown`, the same honest reader `workflow history` already used; measured on the live state dir this stops 354 of 2658 rows (13%) from being reported as `completed` with no evidence behind them.
+- `runs list` rows carry the failure artifacts the run wrote (`artifacts`, a stable `[]` when none), so a failed row is diagnosable without a second lookup.
+- A ship chain's link-gate annotations share the `Workflow` event kind with real runs but are not run outcomes. `runs list` and `--robot-snapshot` label them `kind: "phase-gate"` and carry the gate's own `gate_ok` verdict; `workflow history` labels them too, and `cron history` no longer lists them as cron runs.
+- The remaining status-less writers now say what their rows are: the legacy loop monitor writes a self-declared start notice (`kind: "loop-monitor"`), the warn-first plan-artifact gate declares its telemetry (`kind: "plan-warning"`), and the legacy workflow runner records the `completed` outcome it actually observed. Rows written before the `notice` label existed are recognized by the markers they carry, so no historical row is left for the reader to guess at.
 ### Fixed — swarm coordination hardening (bd-ytr6, bd-8vci, bd-ykqd, bd-0gmw)
 - Pane-mode workflow steps that pin a harness no longer strand the run when the host's profile resolution yields no such pane: dispatch falls back to the step's `@role` pane with a loud downgrade warning, and only bails when no role pane exists (bd-ytr6).
 - `send --wait` timeouts no longer discard the landed fact: observed rows are emitted with an `observed_status` read-back and an ambiguous may-have-started error; same-second wake stamps retry once past the second boundary instead of false-failing the advance gate (bd-8vci).
