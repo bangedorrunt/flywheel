@@ -288,7 +288,7 @@ Honest rescore vs **post-merge tip** `772abd8…` (2026-09-12 ~19:55 AEST). Audi
 | **P1-8** | Skills attach bounded digest | **FOLDED (flywheel ledger)** — `SpawnEntry.skills_digest` | was **STILL** |
 | **P1-9** | Fallback chains + Spec 7 effect-safety | **FOLDED** — journaled taxonomy I4/I5 | was **CHANGED**/incomplete |
 | **P1-10** | Wake + presence as profile attach | **CHANGED** / full contract **STILL** | unchanged |
-| **P2-11** | Versioned portable profile codec | **STILL** | **STILL** |
+| **P2-11** | Versioned portable profile codec | **FOLDED** (Rev 7, `bd-8ana`) | was **STILL** |
 | **P2-12** | Capability plugins without OTP | **STILL** | **STILL** |
 | **P2-13** | Fleet CoS control surface | **STILL** | **STILL** |
 | **P2-14** | Clean `dead_code` / profile CLI | **FOLDED** — the blanket `#![allow(dead_code)]` is gone; `check --all-targets` reports zero dead-code warnings | was **STILL** |
@@ -415,3 +415,4 @@ Accepted by captain word on this file (2026-09-12). The checklist records the ev
 | 4 | 2026-09-12 | P0-5 narrowed but **not** folded: `decide_trigger_for` is now DERIVED from the one routing table (the duplicate 32-arm match deleted; all 32 phrases were measured equal to `matchers[0]` first, so output is unchanged), `UNROUTED_PRIMITIVES` is the single "not routed" declaration, and the table loads loud against the merged workflow catalog. Profile tier, portable codec, `dead_code` cleanup remain open. D1-adjacent: every file under `integrations/` is now ASCII-only (the launch guard rejects non-ASCII launch text), so the SoT is 10804 B with the chrome at 1458 B. |
 | 5 | 2026-09-13 | P0-5 **folded** as option (a) of `bd-wave-c-profiles-routing-source-zymc` (captain, stack-reset grilling `bd-2o1v`): affinity derived from steps + loud profile-exists gate; `decide --json` + `briefing` name the role. Still open: portable codec (P2-11), `dead_code` cleanup (P2-14). |
 | 6 | 2026-09-14 | P2-14 **folded** (`bd-5es8`): the blanket `#![allow(dead_code)]` in `src/profile.rs` is deleted now the CLI is the sole `profiles.toml` mutation path; `check --all-targets` is clean without it. Not claimed: P2-11 (portable codec) stays open. |
+| 7 | 2026-09-14 | P2-11 **folded** (`bd-8ana`): `profile_to_portable` / `profile_from_portable` wrap a named Profile in the versioned `{codec:1,name,profile}` JSON envelope (unknown versions refuse loud naming the supported one; absent fields take the TOML loader's serde defaults), with `profile export` / `profile import` as the consumer verbs — a codec with no caller would be the dead code P2-14 just deleted. Import upserts the RAW user file (bd-2dao), so a built-in name lands as a deliberate local override. |
