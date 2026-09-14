@@ -1372,7 +1372,15 @@ pub fn local_engine(
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let server_url = cli_engine_store_url();
-    local_engine_with_journal(rt, server_url, runner, profile, workflow, None)
+    local_engine_with_journal(
+        rt,
+        server_url,
+        runner,
+        profile,
+        workflow,
+        None,
+        toron_workflow::engine::EffectJournalMode::Recording,
+    )
 }
 
 /// [`local_engine`] with the host-owned effect journal attached
@@ -1425,7 +1433,8 @@ pub fn cli_engine_store_url() -> Option<String> {
 /// (durable), `None` => embedded in-memory runtime. Construction stays lazy;
 /// the URL is only dialed when runs/promise ops execute.
 /// [`local_engine`] / [`local_engine_journaled`] funnel: the only difference is
-/// whether an effect journal is built for this runner.
+/// whether an effect journal is built for this runner (and which
+/// [`EffectJournalMode`] the engine enforces).
 fn local_engine_with(
     cfg: &crate::config::Config,
     rt: &tokio::runtime::Runtime,
@@ -1440,7 +1449,18 @@ fn local_engine_with(
     } else {
         None
     };
-    local_engine_with_journal(rt, server_url, runner, profile, workflow, effect)
+    // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): a journaled
+    // constructor is Enforced — its leaves really perform external effects,
+    // so an uncovered sink must refuse, never run unjournaled. The plain
+    // constructor (dry arms: `workflow run` without `--execute`, `cron run`
+    // without `--live`) stays Recording — it records instead of performs, so
+    // its leaves MUST stay unjournaled, visibly.
+    let mode = if journal && effect.is_some() {
+        toron_workflow::engine::EffectJournalMode::Enforced
+    } else {
+        toron_workflow::engine::EffectJournalMode::Recording
+    };
+    local_engine_with_journal(rt, server_url, runner, profile, workflow, effect, mode)
 }
 
 /// The store-selection + constructor tail shared by both entry points.
@@ -1451,14 +1471,15 @@ fn local_engine_with_journal(
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
     effect: Option<toron_workflow::engine::EffectRunner>,
+    mode: toron_workflow::engine::EffectJournalMode,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let _enter = rt.enter();
     match server_url {
-        Some(url) => toron_workflow::WorkflowEngine::remote_with_resolvers_and_effect(
-            url, runner, profile, workflow, effect,
+        Some(url) => toron_workflow::WorkflowEngine::remote_with_resolvers_and_effect_mode(
+            url, runner, profile, workflow, effect, mode,
         ),
-        None => toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
-            runner, profile, workflow, effect,
+        None => toron_workflow::WorkflowEngine::local_with_resolvers_and_effect_mode(
+            runner, profile, workflow, effect, mode,
         ),
     }
 }
@@ -2414,6 +2435,7 @@ steps:
             profile.clone(),
             workflow.clone(),
             None,
+            toron_workflow::engine::EffectJournalMode::Recording,
         )
         .expect("remote-backed engine constructs without dialing");
 
@@ -2423,8 +2445,16 @@ steps:
             "Some(url) must wire the REMOTE HttpNetwork (transport-level failure), got: {remote_err}"
         );
 
-        let fallback = local_engine_with_journal(&rt, None, runner, profile, workflow, None)
-            .expect("fallback constructs");
+        let fallback = local_engine_with_journal(
+            &rt,
+            None,
+            runner,
+            profile,
+            workflow,
+            None,
+            toron_workflow::engine::EffectJournalMode::Recording,
+        )
+        .expect("fallback constructs");
         let local_err = rt.block_on(store_error_flavor(&fallback));
         assert!(
             local_err.contains("not found") && !local_err.contains("network error"),
@@ -2446,8 +2476,16 @@ steps:
         let rt = tokio::runtime::Runtime::new().expect("rt");
         // None → embedded-local, so the assertion cannot depend on whether a
         // Resonate server happens to answer on this host.
-        let engine = local_engine_with_journal(&rt, None, runner, profile, workflow, None)
-            .expect("recording engine");
+        let engine = local_engine_with_journal(
+            &rt,
+            None,
+            runner,
+            profile,
+            workflow,
+            None,
+            toron_workflow::engine::EffectJournalMode::Recording,
+        )
+        .expect("recording engine");
         let wf = toron_workflow::parse_workflow(
             "name: dry\nsteps:\n  - name: dispatch\n    action: dispatch_job\n    assignee: pi\n    spec:\n      task: work\n",
         )

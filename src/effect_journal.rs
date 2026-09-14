@@ -165,13 +165,43 @@ pub fn effect_runner(
                     }),
                 )))
             }
-            // `verify` is sequenced by the engine through the embedding's
-            // `VerifySink`, never the leaf runner.
+            // `verify` (bd-engine-run-path-journaling-fwlx, the Spec 6 flip):
+            // the engine runs the embedding's VerifySink FIRST and hands the
+            // already-executed result to this runner via
+            // `RunContext.provider_result` — the sink stays the executor
+            // (ADR-0024 Spec 2); the journal observes the result, it never
+            // re-runs the command. No provider_result means the invocation
+            // came from outside the engine's verify path, so there is no
+            // observed effect to journal and the row would be a lie.
+            SINK_VERIFY => {
+                let Some(result) = inv.run.provider_result.clone() else {
+                    return Ok(uncovered_sink(
+                        &inner,
+                        inv,
+                        sink,
+                        "no engine-observed verify result on this invocation — the VerifySink \
+                         never ran, so there is no effect to journal",
+                    ));
+                };
+                // The SINK is verify's provider, so this is the one sink whose
+                // "provider" is not the leaf runner: the engine already
+                // executed it and handed us the result. The leaf runner is
+                // deliberately NOT invoked — for a verify action both live
+                // runners (`pane_dispatch`, `headless_dispatch`) return a bare
+                // `{action: …}` no-op, so calling it adds no evidence, and
+                // calling it wholesale would double-perform the command the
+                // moment a runner grew real verify handling.
+                Ok(fenced_outcome(dispatch_once(
+                    &dispatcher,
+                    inv,
+                    Box::new(move || provider_outcome(Ok(result))),
+                )))
+            }
             other => Ok(uncovered_sink(
                 &inner,
                 inv,
                 other,
-                "the engine sequences this sink itself, never the leaf runner",
+                "no provider performs this sink",
             )),
         }
     })
@@ -183,6 +213,10 @@ const SINK_JOB: &str = "job";
 
 /// The named sink this module performs itself, through [`MailSender`].
 const SINK_MAILBOX: &str = "mailbox";
+
+/// The verify sink: executed by the engine through the embedding's
+/// `VerifySink`, journaled here around the observed result.
+const SINK_VERIFY: &str = "verify";
 
 /// Where a workflow mailbox effect actually goes: deliver one assembled
 /// [`SendMessage`] and report the wire count. Injected, so the sink's assembly
@@ -584,6 +618,12 @@ mod tests {
         }
     }
 
+    fn verify() -> Action {
+        Action::Verify {
+            command: "cargo test --lib".to_string(),
+        }
+    }
+
     /// A plane that captures what the sink assembled and reports a wire count.
     /// The actor is fixed here so the assembly (tags, counts) is what is under
     /// test; the real ladder is pinned separately.
@@ -607,6 +647,7 @@ mod tests {
                 iteration_key: None,
                 effect_key: None,
                 attempt: 1,
+                provider_result: None,
             },
             execution: ExecutionPolicy {
                 max_attempts: 1,
@@ -1032,6 +1073,103 @@ mod tests {
         assert!(
             row.transport_corr.is_some(),
             "the row links its transport corr (Spec 5.4)"
+        );
+    }
+
+    /// bd-engine-run-path-journaling-fwlx (the Spec 6 flip): verify journals
+    /// around the engine-observed VerifySink result carried on the invocation.
+    #[tokio::test]
+    async fn verify_sink_journals_around_the_engine_observed_result() {
+        let (_dir, store) = test_store().await;
+        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let fx = effect_runner(inner, store.clone(), None);
+        let mut inv = invocation(verify(), "run-verify", "gate");
+        inv.run.provider_result = Some(json!({
+            "ok": true,
+            "exit": 0,
+            "stdout_path": ".flywheel/receipts/verify-1.txt",
+        }));
+
+        let out = fx(&inv).expect("runner returns a value");
+
+        assert_eq!(out["ok"], json!(true), "the observed result replays: {out}");
+        let key = effect_key_for(&inv);
+        let row = store.get_effect(&key).await.unwrap().expect("row");
+        assert_eq!(row.state, EffectState::Settled);
+        assert_eq!(row.action_type, "verify");
+        let attempts = store.list_attempts(&key).await.unwrap();
+        assert!(
+            attempts.iter().any(|a| a.state == EffectState::Settled),
+            "the settle is journaled evidence: {attempts:?}"
+        );
+    }
+
+    /// A failed verify (the command exited non-zero) journals a PROVEN
+    /// failure — the process exit is evidence, not transport ambiguity.
+    #[tokio::test]
+    async fn failed_verify_journals_failed_not_unknown() {
+        let (_dir, store) = test_store().await;
+        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let fx = effect_runner(inner, store.clone(), None);
+        let mut inv = invocation(verify(), "run-verify-red", "gate");
+        inv.run.provider_result =
+            Some(json!({ "ok": false, "exit": 101, "error": "tests failed" }));
+
+        let out = fx(&inv).expect("runner returns a value");
+
+        assert_eq!(out["effect_state"], json!("failed"), "{out}");
+        let row = store
+            .get_effect(&effect_key_for(&inv))
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.state, EffectState::Failed);
+    }
+
+    /// A verify invocation with NO observed result (outside the engine's
+    /// verify path) is marked uncovered — journaling it would settle a
+    /// command nobody ran.
+    #[tokio::test]
+    async fn verify_without_an_observed_result_is_marked_not_settled() {
+        let (_dir, store) = test_store().await;
+        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let fx = effect_runner(inner, store.clone(), None);
+        let inv = invocation(verify(), "run-verify-nores", "gate");
+
+        let out = fx(&inv).expect("runner returns a value");
+
+        assert_eq!(
+            out["effect_journal"],
+            json!(toron_workflow::engine::EFFECT_JOURNAL_SINK_UNCOVERED),
+            "no observed effect, no journal row: {out}"
+        );
+        assert!(
+            store
+                .get_effect(&effect_key_for(&inv))
+                .await
+                .unwrap()
+                .is_none(),
+            "no journal row for a command nobody ran"
+        );
+    }
+
+    /// A journaled verify replays its stored outcome without re-running — the
+    /// second dispatch must not re-execute the command.
+    #[tokio::test]
+    async fn terminal_verify_effect_replays_without_rerunning() {
+        let (_dir, store) = test_store().await;
+        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let fx = effect_runner(inner, store.clone(), None);
+        let mut inv = invocation(verify(), "run-verify-replay", "gate");
+        inv.run.provider_result = Some(json!({ "ok": true, "exit": 0 }));
+
+        fx(&inv).expect("first");
+        let second = fx(&inv).expect("replay");
+
+        assert_eq!(
+            second["ok"],
+            json!(true),
+            "the stored outcome replays: {second}"
         );
     }
 

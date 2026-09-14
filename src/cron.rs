@@ -1064,12 +1064,23 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         // (it is `local_with`'s default) so the combined constructor can carry
         // the effect runner without changing what a cron body can resolve.
         let spec_run = spec_runner(&row.spec);
+        let effect = crate::effect_journal::journaled(cfg, spec_run.clone());
+        // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): a live cron
+        // body really dispatches, so its engine is Enforced when the journal
+        // opened; with no journal the mode stays Recording so the bypass
+        // marker keeps the gap visible instead of failing every fire.
+        let mode = if effect.is_some() {
+            toron_workflow::engine::EffectJournalMode::Enforced
+        } else {
+            toron_workflow::engine::EffectJournalMode::Recording
+        };
         let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
+            toron_workflow::WorkflowEngine::local_with_resolvers_and_effect_mode(
                 spec_run.clone(),
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
                 toron_workflow::WorkflowEngine::default_workflow_resolver(),
-                crate::effect_journal::journaled(cfg, spec_run),
+                effect,
+                mode,
             )
             .map_err(|e| anyhow!("engine for cron {}: {e}", row.name()))?,
         );
@@ -1103,12 +1114,20 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
             .map(|m| m.entry)
             .ok_or_else(|| anyhow!("cron {:?} vanished between load and start", reg.name))?;
         let cron_run = cron_runner(&entry);
+        let effect = crate::effect_journal::journaled(cfg, cron_run.clone());
+        // Same flip as the YAML cron above: Enforced only when journaled.
+        let mode = if effect.is_some() {
+            toron_workflow::engine::EffectJournalMode::Enforced
+        } else {
+            toron_workflow::engine::EffectJournalMode::Recording
+        };
         let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
+            toron_workflow::WorkflowEngine::local_with_resolvers_and_effect_mode(
                 cron_run.clone(),
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
                 toron_workflow::WorkflowEngine::default_workflow_resolver(),
-                crate::effect_journal::journaled(cfg, cron_run),
+                effect,
+                mode,
             )
             .map_err(|e| anyhow!("engine for cron {}: {e}", reg.name))?,
         );
