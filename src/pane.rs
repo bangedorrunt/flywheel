@@ -1380,6 +1380,10 @@ pub fn local_engine(
         workflow,
         None,
         toron_workflow::engine::EffectJournalMode::Recording,
+        // Dry engine: no effect journal, so no run rows either — the engine
+        // performs nothing, and a row claiming otherwise is the lie the
+        // journal exists to prevent (bd-mi9n).
+        None,
     )
 }
 
@@ -1393,7 +1397,7 @@ pub fn local_engine(
 /// dispatched would settle an external effect nobody performed, which is the
 /// exact lie the journal exists to prevent.
 ///
-/// With no toron index open, `journaled` returns `None` and the engine keeps
+/// With no toron index open, the journal cannot be built and the engine keeps
 /// its own loud `bypassed-no-effect-runner` marker — never a run that only
 /// looks journaled.
 pub fn local_engine_journaled(
@@ -1444,10 +1448,18 @@ fn local_engine_with(
     workflow: toron_workflow::WorkflowResolver,
     journal: bool,
 ) -> Result<toron_workflow::WorkflowEngine> {
-    let effect = if journal {
-        crate::effect_journal::journaled(cfg, runner.clone())
+    // bd-mi9n: the journal is claimed in TWO halves — the effect runner the
+    // leaves dispatch through, and the run-lifecycle journal the engine feeds
+    // its own Started → Running → terminal rows through. Both come from one
+    // store, so the run row and its effect rows are keyed by the same run_id.
+    let built = if journal {
+        crate::effect_journal::journals(cfg, runner.clone())
     } else {
         None
+    };
+    let (effect, run_journal) = match built {
+        Some(j) => (Some(j.effect), Some(j.run)),
+        None => (None, None),
     };
     // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): a journaled
     // constructor is Enforced — its leaves really perform external effects,
@@ -1460,10 +1472,20 @@ fn local_engine_with(
     } else {
         toron_workflow::engine::EffectJournalMode::Recording
     };
-    local_engine_with_journal(rt, server_url, runner, profile, workflow, effect, mode)
+    local_engine_with_journal(
+        rt,
+        server_url,
+        runner,
+        profile,
+        workflow,
+        effect,
+        mode,
+        run_journal,
+    )
 }
 
 /// The store-selection + constructor tail shared by both entry points.
+#[allow(clippy::too_many_arguments)]
 fn local_engine_with_journal(
     rt: &tokio::runtime::Runtime,
     server_url: Option<String>,
@@ -1472,14 +1494,28 @@ fn local_engine_with_journal(
     workflow: toron_workflow::WorkflowResolver,
     effect: Option<toron_workflow::engine::EffectRunner>,
     mode: toron_workflow::engine::EffectJournalMode,
+    run_journal: Option<toron_workflow::engine::RunJournal>,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let _enter = rt.enter();
     match server_url {
-        Some(url) => toron_workflow::WorkflowEngine::remote_with_resolvers_and_effect_mode(
-            url, runner, profile, workflow, effect, mode,
-        ),
-        None => toron_workflow::WorkflowEngine::local_with_resolvers_and_effect_mode(
-            runner, profile, workflow, effect, mode,
+        Some(url) => {
+            toron_workflow::WorkflowEngine::remote_with_resolvers_effect_mode_and_run_journal(
+                url,
+                runner,
+                profile,
+                workflow,
+                effect,
+                mode,
+                run_journal,
+            )
+        }
+        None => toron_workflow::WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
+            runner,
+            profile,
+            workflow,
+            effect,
+            mode,
+            run_journal,
         ),
     }
 }
@@ -2436,6 +2472,7 @@ steps:
             workflow.clone(),
             None,
             toron_workflow::engine::EffectJournalMode::Recording,
+            None,
         )
         .expect("remote-backed engine constructs without dialing");
 
@@ -2453,6 +2490,7 @@ steps:
             workflow,
             None,
             toron_workflow::engine::EffectJournalMode::Recording,
+            None,
         )
         .expect("fallback constructs");
         let local_err = rt.block_on(store_error_flavor(&fallback));
@@ -2484,6 +2522,7 @@ steps:
             workflow,
             None,
             toron_workflow::engine::EffectJournalMode::Recording,
+            None,
         )
         .expect("recording engine");
         let wf = toron_workflow::parse_workflow(
