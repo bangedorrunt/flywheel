@@ -1279,7 +1279,9 @@ graph:
       spec:
         profile: "@reviewer"
         context: fresh
-        task: "Evaluate iteration 1 for {{inputs.bead_id}} against VERIFY {{inputs.verify}} and ledger {{inputs.ledger_path}}. Return JSON {done, remaining_work, failures, validation_evidence}."
+        stage: ce-evaluate
+        plan: "Repair iteration 1 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}."
+        task: "Evaluate iteration 1 and return the ce-evaluate JSON contract."
       on_error: fail_run
       error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-1:
@@ -1304,7 +1306,9 @@ graph:
       spec:
         profile: "@reviewer"
         context: fresh
-        task: "Evaluate iteration 2 for {{inputs.bead_id}}."
+        stage: ce-evaluate
+        plan: "Repair iteration 2 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}. Prior evaluator report: {{steps.evaluate-1}}"
+        task: "Evaluate iteration 2 and return the ce-evaluate JSON contract."
       on_error: fail_run
       error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-2:
@@ -1329,7 +1333,9 @@ graph:
       spec:
         profile: "@reviewer"
         context: fresh
-        task: "Evaluate iteration 3 for {{inputs.bead_id}}."
+        stage: ce-evaluate
+        plan: "Repair iteration 3 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}. Prior evaluator report: {{steps.evaluate-2}}"
+        task: "Evaluate iteration 3 and return the ce-evaluate JSON contract."
       on_error: fail_run
       error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-3:

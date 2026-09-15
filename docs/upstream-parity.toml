@@ -1,0 +1,89 @@
+schema = "flywheel-upstream-parity.v1"
+checked_at = "2026-09-15"
+refresh_policy = "Refresh refs and re-run offline validation after an upstream release or material workflow change. Network access is intentionally not required by the build."
+
+[[sources]]
+name = "compound-engineering"
+repository = "https://github.com/EveryInc/compound-engineering-plugin"
+ref = "0ec66db4e9f7391c6df9e363b65c664265ccd538"
+version = "3.26.2"
+observed_at = "2026-09-15T06:58:03Z"
+
+[[sources]]
+name = "pstack"
+repository = "https://github.com/cursor/plugins/tree/main/pstack"
+ref = "5bf2b1544db739998121a306340631963c2ff3de"
+version = "0.15.2"
+observed_at = "2026-09-13T03:38:59Z"
+
+[[capabilities]]
+source = "compound-engineering"
+name = "ce-lifecycle"
+upstream = "ce-brainstorm → ce-plan → ce-plan-review → ce-execute → ce-review → ce-compound"
+local_surface = "src/stages.rs; src/builtin_workflows.rs; docs/decisions/0009-compound-spine-ce-vocabulary-and-learnings-corpus.md"
+status = "adopted"
+evidence = ["src/stages.rs", "src/builtin_workflows.rs", "docs/decisions/0009-compound-spine-ce-vocabulary-and-learnings-corpus.md"]
+notes = "The local lifecycle is compiled into the stage/workflow catalogs and keeps the ce- vocabulary without copying upstream prompt files."
+
+[[capabilities]]
+source = "compound-engineering"
+name = "evidence-quoted-review"
+upstream = "ce-code-review detection conditions, quoted evidence, confidence, independence, and residual findings"
+local_surface = "src/stages.rs; src/phase_contracts.rs; src/phase_chain.rs"
+status = "adopted"
+evidence = ["src/stages.rs", "src/phase_contracts.rs", "src/phase_chain.rs"]
+notes = "Review remains report-only; phase gates and durable artifacts prevent a reviewer claim from becoming proof."
+
+[[capabilities]]
+source = "compound-engineering"
+name = "learning-return-arrow"
+upstream = "ce-compound / ce-compound-refresh and repo-local durable solutions"
+local_surface = "docs/learnings/; src/builtin_workflows.rs; integrations/beads-body.md.tpl"
+status = "adopted"
+evidence = ["docs/learnings/README.md", "src/builtin_workflows.rs", "integrations/beads-body.md.tpl"]
+notes = "Learnings are project-scoped, frontmatter-indexed, and fed back into the gate/brief rather than copied into a global prompt."
+
+[[capabilities]]
+source = "compound-engineering"
+name = "bakeoff-and-cost-routing"
+upstream = "ce-plan bake-off for costly open choices and cheap review for low-consequence diffs"
+local_surface = "src/builtin_workflows.rs; src/decide.rs; src/profile.rs"
+status = "partial"
+evidence = ["src/builtin_workflows.rs", "src/decide.rs", "src/profile.rs"]
+notes = "Arena/prototype and strict model slots exist; automatic cost-triggered bake-off selection is not claimed until it has a measured need."
+
+[[capabilities]]
+source = "pstack"
+name = "session-pickup-and-pause"
+upstream = "session-pickup, pause, shipping, and explicit resume handoff"
+local_surface = "src/builtin_workflows.rs; src/decide.rs; docs/guides/loop.mdx"
+status = "adopted"
+evidence = ["src/builtin_workflows.rs", "src/decide.rs", "docs/guides/loop.mdx"]
+notes = "Pickup and pause are cataloged primitives; pause preserves working panes unless force-working is explicit."
+
+[[capabilities]]
+source = "pstack"
+name = "long-running-supervision"
+upstream = "autopilot-stack, babysitting, bounded orchestration, and durable pickup"
+local_surface = "src/workspace.rs; src/doorbell.rs; src/durable.rs; src/builtin_workflows.rs"
+status = "adopted"
+evidence = ["src/workspace.rs", "src/doorbell.rs", "src/durable.rs", "src/builtin_workflows.rs"]
+notes = "The local implementation uses the WorkspaceModel/Tick Law, doorbell wake fabric, and durable loop rather than a polling prompt macro."
+
+[[capabilities]]
+source = "pstack"
+name = "host-evaluated-evidence"
+upstream = "eval playbook: inspect surviving artifacts and transcripts, then retain a verdict"
+local_surface = "src/artifact.rs; src/phase_contracts.rs; src/phase_chain.rs"
+status = "adopted"
+evidence = ["src/artifact.rs", "src/phase_contracts.rs", "src/phase_chain.rs"]
+notes = "Phase gates now persist bounded redacted snapshots, complete-value hashes, evaluator identity, contract evidence, and an integrity hash."
+
+[[capabilities]]
+source = "pstack"
+name = "budgeted-model-routing"
+upstream = "setup-pstack budget selection and role/effort remapping"
+local_surface = "src/profile.rs; src/models.rs; src/crew.rs"
+status = "partial"
+evidence = ["src/profile.rs", "src/models.rs", "src/crew.rs"]
+notes = "Flywheel has operator-controlled crew caps and strict provider/model slots; pstack's setup-time effort table is not copied as a separate config plane."

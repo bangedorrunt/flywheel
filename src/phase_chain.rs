@@ -248,13 +248,30 @@ pub async fn run_ship_chain(
             })
             .unwrap_or_else(|| json!({}));
         let sub_run_id = format!("{run_id}-link{i}-{name}");
-        let link_out = engine.invoke(&sub_run_id, sub, link_inputs).await?;
+        let link_out = engine.invoke(&sub_run_id, sub, link_inputs.clone()).await?;
         let mut step_out = phase_dispatch_output(&link_out);
         let phase = link_phase(name);
         if phase == "plan" {
             merge_dep_cycles_into_step(&mut step_out, project_dir);
         }
         let verdict = check_phase(phase, &step_out);
+        // The child engine run is useful for execution tracing, but the
+        // evaluation belongs to the parent ship run so `artifacts stitch
+        // <run_id>` exposes the complete chain in one evidence trail.
+        let evaluation = crate::artifact::EvaluationEvidence::from_phase_contract(
+            run_id,
+            "ship",
+            name,
+            &link_inputs,
+            &step_out,
+            &verdict,
+        );
+        let (evaluation_path, evaluation_error) =
+            match crate::artifact::write_evaluation_evidence(project, &evaluation) {
+                Ok(path) => (Some(path.display().to_string()), None),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            };
+        let gate_ok = verdict.ok && evaluation_path.is_some();
         crate::state::log_event(
             project,
             crate::state::EventKind::Workflow,
@@ -263,33 +280,42 @@ pub async fn run_ship_chain(
                 "link": name,
                 "phase": phase,
                 "phase_gate": true,
-                "gate_ok": verdict.ok,
+                "gate_ok": gate_ok,
+                "contract_ok": verdict.ok,
                 "gate_mode": format!("{mode:?}").to_lowercase(),
                 "evidence": verdict.evidence,
+                "evaluation_artifact": evaluation_path,
+                "evaluation_error": evaluation_error,
                 "run_id": sub_run_id,
             }),
         )
         .ok();
-        if !verdict.ok {
+        if !gate_ok {
             failed_gates += 1;
+            let failure = evaluation_error
+                .as_deref()
+                .map(|error| format!("evaluation evidence was not persisted: {error}"))
+                .unwrap_or_else(|| format!("phase contract failed: {}", verdict.evidence));
             eprintln!(
-                "flywheel: ship gate {name} FAILED ({}) — {}",
-                verdict.evidence,
+                "flywheel: ship gate {name} FAILED ({failure}) — {}",
                 match mode {
-                    GateMode::Warn => "warn-first: chain continues",
+                    GateMode::Warn => "warn-first: chain continues with gate-warnings",
                     GateMode::Block => "BLOCKING: chain refuses to continue",
                 }
             );
             if mode == GateMode::Block {
-                anyhow::bail!(
-                    "ship chain blocked at link {name}: {} (evidence: {})",
-                    "phase contract failed",
-                    verdict.evidence
-                );
+                anyhow::bail!("ship chain blocked at link {name}: {failure}");
             }
         }
         gates.push(json!({
-            "link": name, "phase": phase, "ok": verdict.ok, "evidence": verdict.evidence,
+            "link": name,
+            "phase": phase,
+            "ok": gate_ok,
+            "contract_ok": verdict.ok,
+            "evidence": verdict.evidence,
+            "evaluation_artifact": evaluation_path,
+            "evaluation_hash": evaluation.evidence_hash,
+            "evaluation_error": evaluation_error,
         }));
         steps_out.insert(name.clone(), step_out);
     }

@@ -54,8 +54,9 @@ inside a swarm, headlessly, or directly; it is not itself an execution
 topology.
 
 
-A **stage** is one prompt (`send --stage`). A **compose token**
-(`wave-swarm`, `repair-until-verified`) expands to a compiled-in
+A **stage** is one prompt (`send --stage`). The verify-phase `ce-evaluate`
+stage is advisory and structured; the following host `VerifySink` owns the
+verdict. A **compose token** (`wave-swarm`, `repair-until-verified`) expands to a compiled-in
 workflow when used as a bare `--parts` name. A **profile** is role →
 harness/model; `crew: auto` counts `@roles`. `flywheel squad` /
 `recipes list` is a group of profiles (spawn shape) — say "squad," not

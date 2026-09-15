@@ -47,6 +47,8 @@ Door map (one door per intent):
 
 Invariants (each stated once): **preview ≠ started** — compose without `--run` only lints + previews the crew. **SIGNOFF outer-only** — nested captain+crew via `call_workflow` / `dispatch_job` never open a second `request_approval`. Ordinary builtins enter via `workflow run <name> --execute` — never bare `--parts`.
 
+Evaluation contract: `ce-evaluate` is a fresh-context, read-only reviewer stage used by `repair-until-verified`. It returns structured findings only; its `done` field is advisory. The host `VerifySink` and phase contract own pass/fail, and ship-chain evaluations are persisted as bounded, redacted `EvaluationEvidence` under the parent run. Inspect them with `flywheel artifacts stitch <run_id> --project <p>`; do not treat worker status fields as proof.
+
 **beads-lifecycle** (third token): preferred `workflow compose "<objective>" --parts beads-lifecycle --run --project <p>`; legacy alias `workflow run beads-lifecycle --execute`. Nests ordinary builtins (phase-plan, beads, ce-plan-review, phase-implement, phase-verify) via call_workflow; `inputs.until` early-exits SUCCESS after any phase; SIGNOFF outer-only. Sibling of wave-swarm: after integrate, hand off with `until=integrate`, never merge.
 
 ```

@@ -63,6 +63,7 @@ mod standing_orders;
 mod state;
 mod steer_brief;
 mod toron_embed;
+mod upstream_parity;
 mod verdict;
 mod work;
 mod workflow_catalog;
@@ -4538,12 +4539,14 @@ fn main() {
             "tool": "flywheel",
             "version": VERSION,
             "backend": format!("herdr (socket protocol v{})", herdr_shim::HDR_PROTOCOL),
+            "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts",
-            "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
+                "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
+                "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes)",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
             "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
@@ -4555,7 +4558,7 @@ fn main() {
             "tracker": "br/bv (CLI, no MCP)",
             "coordination": "toron mail",
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
-            "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-compound", "commit-and-push"],
+            "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-evaluate", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
             "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
@@ -38878,19 +38881,33 @@ mod repair_recipe_tests {
     }
 
     #[test]
-    fn repair_recipe_evaluator_schema_is_present() {
+    fn repair_recipe_evaluator_stage_is_fresh_and_structured() {
+        use toron_workflow::schema::{Action, ContextMode};
         let wf = crate::builtin_workflows::builtin_recipe("repair-until-verified").expect("recipe");
-        let eval_task = format!(
-            "{:?}",
-            wf.graph
-                .as_ref()
-                .unwrap()
-                .nodes
-                .get("evaluate-1")
-                .expect("evaluate-1")
-                .action
-        );
-        assert!(eval_task.contains("done") || eval_task.contains("remaining_work"));
+        let graph = wf.graph.as_ref().expect("repair graph");
+        for name in ["evaluate-1", "evaluate-2", "evaluate-3"] {
+            let Action::DispatchJob { spec, .. } = &graph.nodes[name].action else {
+                panic!("{name} is a dispatch");
+            };
+            assert_eq!(spec.stage.as_deref(), Some("ce-evaluate"), "{name} stage");
+            assert_eq!(
+                spec.context,
+                Some(ContextMode::Fresh),
+                "{name} uses a fresh context"
+            );
+            assert!(
+                spec.plan
+                    .as_deref()
+                    .is_some_and(|plan| plan.contains("VERIFY")),
+                "{name} carries the verification contract"
+            );
+            assert!(
+                spec.task
+                    .as_deref()
+                    .is_some_and(|task| task.contains("ce-evaluate JSON contract")),
+                "{name} names the structured evaluator contract"
+            );
+        }
     }
 
     #[test]

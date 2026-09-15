@@ -95,7 +95,7 @@ Never spawn, steer, or compose before briefing prints argv. Never invent a secon
 
 Workflows, stages, and the compose grammar change; this file does not chase them. Source of truth is always the CLI:
 
-- `flywheel workflow list` (pick from `description` + `run` + `decide_trigger` like a skill catalog), `flywheel stage list`, `flywheel decide` for routing.
+- `flywheel workflow list` (pick from `description` + `run` + `decide_trigger` like a skill catalog), `flywheel stage list`, `flywheel decide` for routing. The verify-phase `ce-evaluate` stage is advisory; inspect the host `EvaluationEvidence` through `flywheel artifacts stitch <run_id>` before treating a phase as proved.
 - `workflow run <name> --execute` runs an ordinary builtin; `workflow compose "<t>" --parts <spec> --run` splices compose tokens (`wave-swarm`, `repair-until-verified`, `beads-lifecycle`) or `role:stage` / `phase:stage` / `workflow:name` / `each:` `when:` `retry(n):` `parallel:` forms. `--dry-run` previews, `--keep <n>` graduates a green run, `--agent` authors a novel workflow, `--from-yaml -|file` runs full YAML.
 - `toron` workflows are YAML-authored (`toron workflow lint|validate|run|invoke|dry-run`); `br triage|next|plan|insights` are analysis, not workflows.
 - Authoring ladder: `stage new` → `stage lint` → `stage promote`; `workflow new` → `workflow lint` (fail-stop) → `promote`. A same-named catalog file overrides a builtin; never edit the builtin.
