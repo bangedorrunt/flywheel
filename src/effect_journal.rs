@@ -471,6 +471,12 @@ pub fn run_journal(store: WorkflowEffectStore) -> RunJournal {
 /// The production mail plane for the fenced path, or `None` when this install's
 /// mail plane cannot carry one.
 ///
+/// GS-048 residual honesty: expand journal coverage **only** when a real
+/// provider exists (job / in-process mailbox / engine-observed verify).
+/// Remote mail stays UNJOURNALED — never invent-green a settled row for a
+/// wire that cannot carry `corr == effect_key`. Uncovered sinks keep the
+/// loud `EFFECT_JOURNAL_SINK_UNCOVERED` marker.
+///
 /// A remote `[mail.toron] url` is refused deliberately: the daemon's wire
 /// surface cannot carry the `corr` tag the journal needs (Spec 5.4, and
 /// `mail_shim` refuses that same send), and the journal's index is the LOCAL

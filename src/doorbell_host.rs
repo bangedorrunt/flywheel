@@ -268,6 +268,17 @@ impl Host for RtHost {
         // The tick is the decider; the effect layer runs, then intents map.
         let (next, cmds) = workspace::tick(&self.model, &wmsg);
         self.model = next;
+        // GS-048: expand Reclassify → DecisionReady cmds so Prompt announces
+        // reach Effect::Prompt (nested handle would drop them).
+        let cmds = workspace::expand_reclassify_cmds(&mut self.model, cmds, &|goal| {
+            let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
+            (
+                d.primitive.to_string(),
+                d.topology.to_string(),
+                d.argv.clone(),
+                d.reason.clone(),
+            )
+        });
         crate::handle_workspace_cmds(
             &mut self.model,
             &cmds,

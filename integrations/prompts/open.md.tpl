@@ -97,6 +97,10 @@ mailbox is write-only until you do, and the human must never become the relay:
 
 Builtin playbooks are discoverable via `flywheel decide <target>` (routes to the playbook) and `flywheel workflow list --json` (lists builtins with their decide trigger).
 
+## MATERIAL RECLASSIFY (GS-048)
+
+On AUTHORITATIVE objective change or other material triggers: re-run `flywheel decide --json`, `flywheel workflow list --brief`, and `flywheel stage list`; announce `vehicle: …` or `none: raw`. Do not silently continue a stale first-prompt vehicle. Preserve open unless the operator explicitly asks for loop/swarm/join. Routine doorbell pull hints are not argv.
+
 Continue the supplied task. Report what you changed and what you verified;
 do not claim bead closure or swarm completion unless those actions were
 explicitly performed.

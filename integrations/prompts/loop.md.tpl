@@ -11,6 +11,10 @@ parallel lanes, no wave fan-out; a reviewer at checkpoints is an exception,
 not a second crew. The solo agent is its own captain for reversible
 decisions; the human objective and scope stay authoritative.
 
+## MATERIAL RECLASSIFY (GS-048)
+
+On material mid-session triggers (new AUTHORITATIVE objective, explicit topology ask, new work-unit class, classifier miss, stage-chain exhaustion): re-run `decide --json` + `workflow list --brief` + `stage list` and announce `vehicle: …` or `none: raw`. Do not flip loop→swarm without an explicit request.
+
 ## The loop
 
 0. ARRIVE then BRIEF (ADR-0011): `flywheel arrive <project> --as <pin>`
