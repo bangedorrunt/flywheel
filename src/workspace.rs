@@ -1240,6 +1240,28 @@ pub fn vehicle_announcement(primitive: &str, topology: &str) -> String {
     }
 }
 
+/// GS-049 sticky-open airtight: when sticky-held, do **not** name the invent
+/// swarm/join/compose primitive under the held topology. Open → `none: raw`;
+/// loop held against invent swarm → loop-work vehicle only.
+pub fn sticky_held_vehicle_announcement(invent_primitive: &str, held_topology: &str) -> String {
+    match held_topology {
+        "open" => "none: raw".into(),
+        "loop" => {
+            let invent = invent_primitive.trim();
+            if invent == "wave-swarm"
+                || invent == "join"
+                || invent == "repair-until-verified"
+                || invent == "beads-lifecycle"
+            {
+                vehicle_announcement("loop-work", "loop")
+            } else {
+                vehicle_announcement(invent_primitive, held_topology)
+            }
+        }
+        _ => vehicle_announcement(invent_primitive, held_topology),
+    }
+}
+
 /// Full Prompt line for a DecisionReady announce — urgent by `[reclassify]` head.
 pub fn reclassify_announce_line(
     vehicle: &str,
@@ -2087,9 +2109,22 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 explicit_topology.as_deref(),
             );
             next.session_topology = Some(final_topo.clone());
-            let vehicle = vehicle_announcement(primitive, &final_topo);
+            // Sticky-open airtight: never announce invent wave-swarm under open
+            // (or invent swarm under held loop) — `none: raw` / open|loop vehicle only.
+            let vehicle = if sticky_held {
+                sticky_held_vehicle_announcement(primitive, &final_topo)
+            } else {
+                vehicle_announcement(primitive, &final_topo)
+            };
             next.last_vehicle = Some(vehicle.clone());
-            let line = reclassify_announce_line(&vehicle, decide_reason, sticky_held);
+            // Sticky-held announce must not name invent swarm primitive in
+            // the Prompt line (vehicle or reason) — audit keeps raw classify.
+            let announce_reason = if sticky_held {
+                "session topology held (invent vehicle suppressed)"
+            } else {
+                decide_reason.as_str()
+            };
+            let line = reclassify_announce_line(&vehicle, announce_reason, sticky_held);
             if let Some(pin) = doorbell_core::fact_captain_pin(&next.roles) {
                 // Urgent reclassify announces break through Busy (same E5
                 // breakthrough as plane-P); Unknown/Dead stay Audit-only.
@@ -5642,10 +5677,8 @@ mod gs048_reclassify_tests {
             },
         );
         assert_eq!(next.session_topology.as_deref(), Some("open"));
-        assert_eq!(
-            next.last_vehicle.as_deref(),
-            Some("vehicle: wave-swarm (topology=open)")
-        );
+        // Sticky-open airtight: do not name invent wave-swarm under open.
+        assert_eq!(next.last_vehicle.as_deref(), Some("none: raw"));
         let prompts: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
@@ -5655,13 +5688,72 @@ mod gs048_reclassify_tests {
             .collect();
         assert!(
             prompts.iter().any(|l| l.starts_with("[reclassify]")
-                && l.contains("vehicle: wave-swarm (topology=open)")
+                && l.contains("none: raw")
                 && l.contains("sticky-open held")),
             "expected sticky announce: {prompts:?}"
         );
         assert!(
+            prompts.iter().all(|l| !l.contains("wave-swarm")),
+            "announce must not name invent wave-swarm under open: {prompts:?}"
+        );
+        assert!(
             prompts.iter().all(|l| is_urgent_line(l)),
             "reclassify announce must be urgent/deliverable: {prompts:?}"
+        );
+    }
+
+    /// GS-049 airtight: loop sticky vs invent swarm announce — no wave-swarm name.
+    #[test]
+    fn decision_ready_loop_sticky_vs_swarm_announces_loop_vehicle() {
+        let mut m = idle_captain();
+        m.session_topology = Some("loop".into());
+        let (next, cmds) = tick(
+            &m,
+            &Msg::DecisionReady {
+                goal: "fan out a swarm".into(),
+                primitive: "wave-swarm".into(),
+                topology: "swarm".into(),
+                argv: vec!["workflow".into(), "compose".into()],
+                decide_reason: "matched wave-swarm".into(),
+                explicit_topology: None,
+            },
+        );
+        assert_eq!(next.session_topology.as_deref(), Some("loop"));
+        assert_eq!(
+            next.last_vehicle.as_deref(),
+            Some("vehicle: loop-work (topology=loop)")
+        );
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Prompt { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            prompts.iter().any(|l| l.contains("vehicle: loop-work (topology=loop)")
+                && l.contains("sticky-open held")),
+            "{prompts:?}"
+        );
+        assert!(
+            prompts.iter().all(|l| !l.contains("wave-swarm")),
+            "must not name invent wave-swarm under held loop: {prompts:?}"
+        );
+    }
+
+    #[test]
+    fn sticky_held_vehicle_announcement_open_is_none_raw() {
+        assert_eq!(
+            sticky_held_vehicle_announcement("wave-swarm", "open"),
+            "none: raw"
+        );
+        assert_eq!(
+            sticky_held_vehicle_announcement("join", "open"),
+            "none: raw"
+        );
+        assert_eq!(
+            sticky_held_vehicle_announcement("wave-swarm", "loop"),
+            "vehicle: loop-work (topology=loop)"
         );
     }
 

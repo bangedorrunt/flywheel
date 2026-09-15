@@ -23,3 +23,10 @@
 
 ## Rejected
 Redis / AgentServer / OTP / dual SoT / new kinds / new MCP / GS-046 / GS-001 reopen / invent-green settlement.
+
+## Auto-fix fold (sticky_open_airtight)
+1. Sticky-held **open**: clear `proposal.workflow` → `none`, clear compose token, **empty argv** — never `workflow run <wave-swarm|…> --mode headless` (crew-confirm skipped for open).
+2. Sticky-held **loop** vs invent swarm: rewrite workflow → `loop-work` + loop-mode argv (no wave-swarm name).
+3. DecisionReady announce under sticky-held open: `none: raw` + `sticky-open held` — never `vehicle: wave-swarm (topology=open)`.
+4. Tests: sticky_held_open × swarm|join|loop → argv empty / non-swarm; announce string has no invent swarm primitive; commit path fail-closed on empty argv.
+
