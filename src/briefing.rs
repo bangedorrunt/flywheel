@@ -225,21 +225,26 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
 /// GS-049: after sticky-open `[reclassify]` announce, briefing must not present
 /// a conflicting second topology surface (dual SoT). Align proposal + question
 /// default with sticky `session_topology`; when sticky-held against any invent
-/// flip (open×loop|swarm|join|none, loop×swarm), rewrite argv so `--commit`
-/// cannot exec the suppressed vehicle under an open/loop label (crew-confirm
-/// is skipped for open — leaving loop argv would auto-dispatch).
+/// flip (open×loop|swarm|join|none, loop×swarm), clear invent workflow and
+/// rewrite argv so `--commit` cannot exec invent swarm/join/loop under an
+/// open/loop label (crew-confirm is skipped for open — invent headless
+/// `workflow run wave-swarm` would auto-dispatch).
 pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held: bool) {
     let session = session.trim();
     if session.is_empty() {
         return;
     }
     if b.proposal.topology == session {
-        if sticky_held && !b.proposal.why.contains("sticky") {
-            b.proposal.why = format!("{} — sticky session topology held", b.proposal.why);
-        }
-        // Still rewrite argv when sticky-held: topology label may already match
-        // after a prior align, while argv still carries a suppressed vehicle.
         if sticky_held {
+            // Airtight print: never leave invent swarm primitive in why under open/loop hold.
+            if b.proposal.why.contains("wave-swarm")
+                || b.proposal.why.contains("repair-until-verified")
+                || b.proposal.why.contains("beads-lifecycle")
+                || !b.proposal.why.contains("sticky")
+            {
+                b.proposal.why =
+                    format!("session_topology={session} sticky-held — invent vehicle suppressed");
+            }
             rewrite_sticky_held_argv(b, session);
         }
         return;
@@ -249,10 +254,15 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
     if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
         q.default = session.to_string();
     }
+    let prior_why = if sticky_held {
+        // Do not echo invent swarm/join/loop primitive names into the print surface.
+        format!("suppressed invent topology={classified}")
+    } else {
+        b.proposal.why.clone()
+    };
     b.proposal.why = format!(
-        "session_topology={session}{} — aligned (suppressed dual classify surface was topology={classified}): {}",
+        "session_topology={session}{} — aligned ({prior_why})",
         if sticky_held { " sticky-held" } else { "" },
-        b.proposal.why
     );
     // ALL sticky-held cases — not only classified∈{swarm,join}.
     if sticky_held {
@@ -260,31 +270,49 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
     }
 }
 
-/// Rewrite commit argv to the held session vehicle; clear crew spawn surfaces.
+/// Invent spawn / compose / join / loop vehicles suppressed under sticky-open.
+fn is_invent_spawn_under_open(workflow: &str) -> bool {
+    let w = workflow.trim();
+    w.is_empty()
+        || w == "none"
+        || w == "join"
+        || w == "loop-work"
+        || is_compose_token(w)
+}
+
+/// Rewrite commit argv to the held session vehicle; clear invent swarm surfaces.
+///
+/// Sticky-open airtight: never keep invent `wave-swarm`/`join`/`loop-work`
+/// workflow or `workflow run <invent> --mode headless` argv under an open
+/// label — crew-confirm is skipped for open, so that would invent-green spawn.
+/// Fail-closed: empty argv (commit bails) + workflow cleared to `none`.
 fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
     match session {
         "open" => {
-            // none / empty workflow: fail-closed empty argv (commit bails) —
-            // never invent a workflow name. Otherwise headless run of the
-            // classified workflow (no spawn/crew, no loop-mode).
-            if b.proposal.workflow.is_empty() || b.proposal.workflow == "none" {
-                b.proposal.argv.clear();
-            } else {
-                b.proposal.argv = vec![
-                    "flywheel".into(),
-                    "workflow".into(),
-                    "run".into(),
-                    b.proposal.workflow.clone(),
-                    "--mode".into(),
-                    "headless".into(),
-                ];
-            }
+            // Always clear invent spawn surfaces under sticky-held open.
+            // Open-safe non-invent workflows are not reachable via sticky_held
+            // (held only against classified loop|swarm|join|none) — so every
+            // sticky-held open path is invent-spawn and must fail-closed.
+            debug_assert!(
+                is_invent_spawn_under_open(&b.proposal.workflow)
+                    || b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"])
+                    || b.proposal.argv.iter().any(|a| a == "arrive"),
+                "sticky-held open expected invent spawn, got workflow={} argv={:?}",
+                b.proposal.workflow,
+                b.proposal.argv
+            );
+            b.proposal.workflow = "none".into();
+            b.proposal.token = None;
+            b.proposal.argv.clear();
             b.proposal.crew.clear();
             b.proposal.crew_total = 0;
             b.proposal.add.clear();
             b.proposal.remove.clear();
         }
         "loop" => {
+            // Hold loop against invent swarm: loop vehicle only (no wave-swarm).
+            b.proposal.workflow = "loop-work".into();
+            b.proposal.token = None;
             b.proposal.argv = vec![
                 "flywheel".into(),
                 "loop-mode".into(),
@@ -433,7 +461,7 @@ mod tests {
             Some("open")
         );
         assert!(b.proposal.why.contains("sticky-held"), "{}", b.proposal.why);
-        assert!(b.proposal.why.contains("suppressed dual"), "{}", b.proposal.why);
+        assert!(b.proposal.why.contains("suppressed invent"), "{}", b.proposal.why);
         assert!(
             !b.proposal.argv.iter().any(|a| a == "--crew"),
             "spawn crew argv suppressed: {:?}",
@@ -444,6 +472,23 @@ mod tests {
             "must not leave loop-mode under open: {:?}",
             b.proposal.argv
         );
+        assert!(
+            b.proposal.argv.is_empty(),
+            "sticky_held open×swarm: argv must be empty (no invent workflow run): {:?}",
+            b.proposal.argv
+        );
+        assert_eq!(
+            b.proposal.workflow, "none",
+            "proposal.workflow must clear invent wave-swarm on align"
+        );
+        assert!(b.proposal.token.is_none(), "compose token cleared");
+        assert!(
+            !b.proposal.argv.iter().any(|a| a == "wave-swarm"),
+            "argv must not name invent wave-swarm: {:?}",
+            b.proposal.argv
+        );
+        assert_eq!(b.proposal.crew_total, 0);
+        assert!(b.proposal.crew.is_empty());
     }
 
     /// GS-049 adversarial: open held against loop must rewrite argv — else
@@ -471,12 +516,14 @@ mod tests {
             b.proposal.argv
         );
         assert!(
-            b.proposal.argv.is_empty()
-                || b.proposal
-                    .argv
-                    .windows(2)
-                    .any(|w| w == ["workflow", "run"]),
-            "open vehicle is headless workflow run or fail-closed empty: {:?}",
+            b.proposal.argv.is_empty(),
+            "sticky_held open×loop: fail-closed empty argv (no invent workflow run): {:?}",
+            b.proposal.argv
+        );
+        assert_eq!(b.proposal.workflow, "none");
+        assert!(
+            !b.proposal.argv.windows(2).any(|w| w == ["workflow", "run"]),
+            "must not invent workflow run under open: {:?}",
             b.proposal.argv
         );
         assert_eq!(b.proposal.crew_total, 0);
@@ -497,6 +544,7 @@ mod tests {
             "open×none sticky-held: fail-closed empty argv, got {:?}",
             b.proposal.argv
         );
+        assert_eq!(b.proposal.workflow, "none");
         assert!(
             !b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
             "{:?}",
@@ -504,5 +552,127 @@ mod tests {
         );
         assert_eq!(b.proposal.crew_total, 0);
         assert!(b.proposal.why.contains("sticky-held"), "{}", b.proposal.why);
+    }
+
+    /// GS-049 airtight: sticky_held open×join → empty argv, no arrive/swarm.
+    #[test]
+    fn sticky_held_open_x_join_clears_invent_argv() {
+        let world = World {
+            project: "toron".into(),
+            dispatcher: "up".into(),
+            joinable: true,
+            pin_count: 3,
+            coalition_id: Some("coal-1".into()),
+            ..World::default()
+        };
+        let mut b = assemble("wave-swarm the auth lanes", &world, &["coder".into()], 5);
+        assert_eq!(b.proposal.topology, "join", "precondition: join");
+        assert_eq!(b.proposal.argv[1], "arrive");
+        align_with_session_topology(&mut b, "open", true);
+        assert_eq!(b.proposal.topology, "open");
+        assert!(
+            b.proposal.argv.is_empty(),
+            "sticky_held open×join: empty argv, got {:?}",
+            b.proposal.argv
+        );
+        assert_eq!(b.proposal.workflow, "none");
+        assert!(
+            !b.proposal.argv.iter().any(|a| a == "arrive" || a == "wave-swarm"),
+            "{:?}",
+            b.proposal.argv
+        );
+        assert_eq!(b.proposal.crew_total, 0);
+    }
+
+    /// BAR sticky_open_airtight: sticky_held open × swarm|join → argv non-swarm/empty;
+    /// print/align surface names no invent swarm primitive; --commit cannot
+    /// spawn invent crew (empty argv → commit bail).
+    #[test]
+    fn sticky_open_airtight_open_x_swarm_and_join() {
+        for (label, world) in [
+            (
+                "swarm",
+                World {
+                    project: "toron".into(),
+                    dispatcher: "absent".into(),
+                    ..World::default()
+                },
+            ),
+            (
+                "join",
+                World {
+                    project: "toron".into(),
+                    dispatcher: "up".into(),
+                    joinable: true,
+                    pin_count: 2,
+                    coalition_id: Some("c1".into()),
+                    ..World::default()
+                },
+            ),
+        ] {
+            let mut b = assemble("wave-swarm the auth lanes", &world, &["coder".into()], 5);
+            assert!(
+                matches!(b.proposal.topology.as_str(), "swarm" | "join"),
+                "{label}: precondition topology={}",
+                b.proposal.topology
+            );
+            align_with_session_topology(&mut b, "open", true);
+            assert_eq!(b.proposal.topology, "open", "{label}");
+            assert!(
+                b.proposal.argv.is_empty(),
+                "{label}: argv must be empty for --commit fail-closed, got {:?}",
+                b.proposal.argv
+            );
+            assert_eq!(b.proposal.workflow, "none", "{label}");
+            assert!(b.proposal.token.is_none(), "{label}");
+            let surface = format!(
+                "{} {} {:?} {}",
+                b.proposal.workflow, b.proposal.topology, b.proposal.argv, b.proposal.why
+            );
+            assert!(
+                !surface.contains("wave-swarm"),
+                "{label}: invent swarm must not appear in align surface: {surface}"
+            );
+            assert!(
+                !b.proposal.argv.iter().any(|a| a == "--crew" || a == "arrive"),
+                "{label}: no invent crew spawn argv: {:?}",
+                b.proposal.argv
+            );
+            assert_eq!(b.proposal.crew_total, 0, "{label}");
+            // --commit path: empty argv ⇒ bail!("briefing commit: empty argv")
+            assert!(
+                b.proposal.argv.len() < 2,
+                "{label}: commit gate treats len<2 as empty"
+            );
+        }
+    }
+
+    /// GS-049 airtight: loop sticky vs invent swarm → loop-work vehicle only.
+    #[test]
+    fn sticky_held_loop_x_swarm_rewrites_to_loop_not_wave_swarm() {
+        let world = world_empty();
+        let mut b = assemble("wave-swarm the auth lanes", &world, &["coder".into()], 5);
+        assert_eq!(b.proposal.topology, "swarm");
+        assert_eq!(b.proposal.workflow, "wave-swarm");
+        align_with_session_topology(&mut b, "loop", true);
+        assert_eq!(b.proposal.topology, "loop");
+        assert_eq!(b.proposal.workflow, "loop-work");
+        assert!(b.proposal.token.is_none());
+        assert!(
+            b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            "{:?}",
+            b.proposal.argv
+        );
+        assert!(
+            !b.proposal.argv.iter().any(|a| a == "wave-swarm" || a == "--crew"),
+            "must not keep invent swarm argv: {:?}",
+            b.proposal.argv
+        );
+        assert_eq!(b.proposal.crew_total, 0);
+        assert!(
+            !b.proposal.why.contains("wave-swarm"),
+            "why must not name invent wave-swarm: {}",
+            b.proposal.why
+        );
     }
 }
