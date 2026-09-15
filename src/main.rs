@@ -29112,6 +29112,7 @@ fn planner_author_response(wf_name: &str, prompt: &str) -> Result<String> {
     if let Ok(cat) = profile::ProfileCatalog::load()
         && let Some(p) = cat.get("planner")
         && !p.model.is_empty()
+        && models::slot_alias(&p.model).is_none()
     {
         cmd.arg("--model").arg(&p.model);
     }
@@ -33427,7 +33428,10 @@ pub(crate) fn headless_dispatch(
     if let Some(cron) = cron {
         cmd.arg("--cron").arg(cron);
     }
-    if !profile.model.is_empty() {
+    // Slot aliases (for example `@cheap`) must be resolved by the leaf's
+    // canonical profile-routing path. Forward only concrete model ids;
+    // passing a slot as an explicit override bypasses strict slot resolution.
+    if !profile.model.is_empty() && models::slot_alias(&profile.model).is_none() {
         cmd.arg("--model").arg(&profile.model);
     }
     let output = cmd
