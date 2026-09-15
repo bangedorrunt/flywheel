@@ -19,7 +19,8 @@ each lane verifiable.
    per profile; blank keeps default.
 
 1. CLASSIFY + RUN: `flywheel workflow compose "<objective>" --parts wave-swarm
-   --run --inputs '{"objective": "<target>"}'`.
+   --run --inputs '{"objective": "<target>"}'. Re-check the catalog each
+   objective; add lanes only for declared multi-lane need.
    GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF; parks at SIGNOFF,
    resolve via `flywheel workflow approve`. DISPATCH briefs `--stage
    ce-execute`, never raw. Alias `workflow run wave-swarm --execute`

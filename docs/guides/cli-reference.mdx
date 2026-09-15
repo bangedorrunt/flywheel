@@ -55,4 +55,4 @@ Rebuild after source changes: `mbx +nightly-aarch64-apple-darwin install --path 
 
 ## Output contract
 
-Exit codes: `0` ok, `1` herdr or server error, `2` usage error. stdout carries data (`--json` for machines); stderr carries messages and progress. `NO_COLOR` or a piped stdout disables color. `workflow list --json` rows carry `description`, `run`, `compose_token`, and `decide_trigger`. Crew cap: `FLYWHEEL_CREW_MAX` env beats `[crew].max` in `~/.config/flywheel/config.toml`, default 5; `--crew-max` is the per-run operator override.
+Exit codes: `0` ok, `1` herdr or server error, `2` usage error. stdout carries data (`--json` for machines); stderr carries messages and progress. `NO_COLOR` or a piped stdout disables color. `workflow list --json` rows carry `description`, `family`, `selection`, `run`, `compose_token`, and `decide_trigger`; `workflow list --brief --json` omits long descriptions for low-context agents. Crew cap: `FLYWHEEL_CREW_MAX` env beats `[crew].max` in `~/.config/flywheel/config.toml`, default 5; `--crew-max` is the per-run operator override.

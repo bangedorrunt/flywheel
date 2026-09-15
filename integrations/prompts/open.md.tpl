@@ -95,7 +95,19 @@ mailbox is write-only until you do, and the human must never become the relay:
 - `/swarm-mode`: captain-led multi-crew execution with lanes and optional
   work-graph supervision.
 
-Builtin playbooks are discoverable via `flywheel decide <target>` (routes to the playbook) and `flywheel workflow list --json` (lists builtins with their decide trigger).
+Builtin playbooks are discoverable via `flywheel decide <target>` (routes to the playbook) and `flywheel workflow list --brief --json` (bounded family/selection/run cues; use `workflow show <name>` for detail). Stages are discoverable via `flywheel stage list`; use `flywheel send --stage <name>` when the instruction is the value. Open mode may run an ordinary workflow directly when the current pane is the intended executor:
+`flywheel workflow run <name> --execute --mode headless` for a bounded one-shot, or `--mode pane --project <p> --reuse <workspace>` for an existing managed pane. Compose tokens remain explicit (`workflow compose ... --parts <token> --run`) and must not silently change open mode into a swarm.
+
+## SESSION-TIME ROUTING (not first-call-only)
+
+At every new human objective, follow-up, or material change in understanding:
+1. Re-read the current objective and acceptance/VERIFY; do not inherit a stale workflow decision.
+2. Check `flywheel workflow list --brief --json` and `flywheel stage list`; choose the smallest matching vehicle.
+3. Run a workflow/stage when it reduces risk or repeated reasoning; otherwise state `vehicle: none: raw` and continue directly.
+4. After each meaningful work unit, re-check whether the task became a bug-fix, review, verification, compound-learning, or resume-pickup shape. Trigger the smallest matching stage/workflow then, not only at session start.
+5. Keep topology stable: open stays current-pane unless the operator explicitly chooses loop/swarm; workflow use is a procedure, not permission to spawn or delegate.
+
+Do not narrate this checklist on every turn; apply it and announce only the selected vehicle and why when it changes.
 
 ## MATERIAL RECLASSIFY (GS-048)
 

@@ -26,8 +26,8 @@ On material mid-session triggers (new AUTHORITATIVE objective, explicit topology
    the default; record the choice in the launch/report summary.
 
 1. SETUP: `flywheel loop-mode run <project> --work` after briefing
-   commits loop. One pane via `flywheel spawn <proj> --profile <role>`
-   (or run in-place if already pane'd). Write the objective as a brief
+   commits loop. Re-check the catalog on follow-up/context changes; choose
+   the smallest vehicle. Write the objective as a brief
    with GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY / TIMEBOX /
    FORBIDDEN / REPORT. Reserve files before edit (toron reserve acquire;
    renew 4min); build slot for cargo. Wake is the workspace doorbell:

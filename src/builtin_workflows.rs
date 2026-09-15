@@ -1575,6 +1575,217 @@ pub fn is_compose_token(name: &str) -> bool {
     )
 }
 
+/// Compact agent-facing guidance for the built-in catalog:
+/// `(family, selection)`. The full workflow description remains available
+/// from `workflow show`; list consumers should use this bounded projection
+/// first so catalog discovery does not spend context on prose.
+pub const WORKFLOW_GUIDANCE: &[(&str, &str, &str)] = &[
+    (
+        "arena",
+        "design-space",
+        "compare model arms; choose selection rule up front",
+    ),
+    (
+        "autonomous-work",
+        "operations",
+        "resume the real bead loop overnight, then ship",
+    ),
+    (
+        "awareness-digest",
+        "operations",
+        "read-only captain digest of presence and locks",
+    ),
+    (
+        "babysit-bead",
+        "operations",
+        "drive one existing bead; never create work",
+    ),
+    (
+        "beads",
+        "lifecycle",
+        "turn an accepted plan into tracker beads",
+    ),
+    (
+        "beads-lifecycle",
+        "lifecycle",
+        "compose-token full plan/review/implement/verify lifecycle",
+    ),
+    (
+        "bug-fix",
+        "repair",
+        "reproduce, repair-until-verified, independently prove",
+    ),
+    (
+        "captain-audit",
+        "review",
+        "read-only scoped audit with a durable report",
+    ),
+    (
+        "ce-brainstorm",
+        "compound",
+        "diverge, then reduce requirements to one artifact",
+    ),
+    (
+        "ce-compound",
+        "compound",
+        "capture one durable lesson after verified work",
+    ),
+    (
+        "ce-plan",
+        "compound",
+        "make a bead-ready plan with approval",
+    ),
+    (
+        "ce-plan-review",
+        "compound",
+        "review a plan before implementation",
+    ),
+    (
+        "ce-sweep",
+        "compound",
+        "maintain and consolidate the learning corpus",
+    ),
+    (
+        "debate",
+        "review",
+        "small adversarial synthesis; use interrogate for N models",
+    ),
+    (
+        "feature",
+        "delivery",
+        "shape a domain, build it, and independently prove it",
+    ),
+    (
+        "forensics",
+        "review",
+        "diagnose only; hand accepted fixes to bug-fix",
+    ),
+    (
+        "goal",
+        "delivery",
+        "full bead-backed objective-to-ship path",
+    ),
+    (
+        "goal-direct",
+        "delivery",
+        "captain-free path for explicitly non-bead work",
+    ),
+    (
+        "hillclimb",
+        "measurement",
+        "capped repeated measure/keep/discard loop",
+    ),
+    (
+        "interrogate",
+        "review",
+        "N-model read-only adversarial review",
+    ),
+    (
+        "onboard",
+        "operations",
+        "cold-start a project and propose first work",
+    ),
+    (
+        "pause",
+        "operations",
+        "checkpoint and hand off without killing working panes",
+    ),
+    (
+        "perf",
+        "measurement",
+        "one measured improvement with explicit keep/discard",
+    ),
+    (
+        "phase-implement",
+        "phase",
+        "implement one reviewed plan against acceptance",
+    ),
+    (
+        "phase-plan",
+        "phase",
+        "produce verifiable beads and dependency proof",
+    ),
+    (
+        "phase-resolve",
+        "phase",
+        "reduce an objective to a machine-checkable goal",
+    ),
+    (
+        "phase-review",
+        "phase",
+        "adversarially review an artifact with a fanout",
+    ),
+    ("phase-verify", "phase", "run the named verification gate"),
+    (
+        "pickup",
+        "operations",
+        "resume stranded work and inspect ledger gaps",
+    ),
+    (
+        "plan-direct",
+        "delivery",
+        "plan explicitly without the approval gate",
+    ),
+    (
+        "prototype",
+        "design-space",
+        "explore alternatives on one model family",
+    ),
+    (
+        "refactoring",
+        "delivery",
+        "baseline, simplify, and preserve an invariant",
+    ),
+    (
+        "reflect",
+        "compound",
+        "turn recurring corrections into structure",
+    ),
+    (
+        "repair-until-verified",
+        "repair",
+        "compose-token bounded fresh-context repair loop",
+    ),
+    (
+        "ship",
+        "phase",
+        "resolve/plan/implement/review/verify gated chain",
+    ),
+    (
+        "ship-beads",
+        "operations",
+        "ship only when the bead ledger predicate is true",
+    ),
+    (
+        "triage",
+        "operations",
+        "react to one inbound message payload",
+    ),
+    (
+        "triage-deep",
+        "operations",
+        "deep backlog triage and assignment",
+    ),
+    (
+        "wave-swarm",
+        "delivery",
+        "compose-token parallel wave with gates and learning",
+    ),
+    (
+        "weekly-review",
+        "review",
+        "scheduled scoped review with one follow-up bead",
+    ),
+];
+
+/// Return bounded catalog guidance for one built-in workflow.
+pub fn workflow_guidance(name: &str) -> Option<(&'static str, &'static str)> {
+    WORKFLOW_GUIDANCE
+        .iter()
+        .find(|(workflow, _, _)| *workflow == name)
+        .map(|(_, family, selection)| (*family, *selection))
+}
+
 /// ADR-0006 D3: a compose token's parsed workflow for compose expansion
 /// (the token expands where it sits; its `inputs:` declarations merge
 /// into the composed workflow so template refs lint clean). Pure.
@@ -1588,6 +1799,17 @@ mod tests {
     use crate::crew;
     use toron_workflow::lint_yaml;
     use toron_workflow::schema::CrewSpec;
+
+    /// Every built-in has bounded agent-facing guidance, so discovery never
+    /// depends on rereading the full workflow description.
+    #[test]
+    fn workflow_guidance_covers_every_builtin() {
+        let wfs = builtin_workflows();
+        assert_eq!(WORKFLOW_GUIDANCE.len(), wfs.len());
+        for name in wfs.keys() {
+            assert!(workflow_guidance(name).is_some(), "guidance for {name}");
+        }
+    }
 
     /// All built-ins parse (ADR-0005 Spec 2b acceptance).
     #[test]
