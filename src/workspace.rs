@@ -385,8 +385,8 @@ pub struct WorkspaceModel {
     /// ADR-0010 D5 (bd-65he): wall-clock of the last emitted digest.
     pub last_digest_unix: u64,
     /// GS-048: last committed session topology (sticky-open source of truth).
-    /// `None` until a DecisionReady lands; open stays open unless loop/swarm
-    /// is explicit on the MaterialContext Msg.
+    /// `None` until a DecisionReady lands; open stays open unless
+    /// loop/swarm/join/none is explicit on the MaterialContext Msg.
     pub session_topology: Option<String>,
     /// GS-048: last announced vehicle line (`vehicle: …` or `none: raw`).
     pub last_vehicle: Option<String>,
@@ -863,7 +863,7 @@ pub enum Msg {
     MaterialContext {
         goal: String,
         /// Operator-explicit topology (`open`/`loop`/`swarm`/`join`). `None`
-        /// preserves sticky-open (do not flip open→loop/swarm).
+        /// preserves sticky-open (do not flip open→loop/swarm/join/none).
         explicit_topology: Option<String>,
         /// Why this is material (audit + announce).
         reason: String,
@@ -1124,9 +1124,10 @@ fn prompt_allowed(model: &WorkspaceModel, pin: &str) -> bool {
     }
 }
 
-/// GS-048 sticky-open: preserve open topology unless loop/swarm/join is
-/// explicit on the MaterialContext. Classified topology still wins when the
-/// session is not open, or when the operator named a topology.
+/// GS-048 sticky-open: preserve open unless loop/swarm/join/none is
+/// **explicit** on the MaterialContext. Catalog miss (`none`) must not wipe
+/// `session_topology` open→none invent-flip. Also hold loop against swarm
+/// without an explicit request (matches loop.md.tpl speech).
 pub fn sticky_open_topology(
     current: Option<&str>,
     classified: &str,
@@ -1138,10 +1139,96 @@ pub fn sticky_open_topology(
             return (e, false);
         }
     }
-    if current == Some("open") && matches!(classified, "loop" | "swarm") {
+    // Hold open against invent flips (loop|swarm|join|none) without explicit.
+    if current == Some("open") && matches!(classified, "loop" | "swarm" | "join" | "none") {
         return ("open".into(), true);
     }
+    // Hold loop against swarm without explicit (docs: do not flip loop→swarm).
+    if current == Some("loop") && classified == "swarm" {
+        return ("loop".into(), true);
+    }
     (classified.to_string(), false)
+}
+
+/// GS-048: parse an operator-explicit topology request from free text.
+/// Returns `Some` only when the human named open/loop/swarm/join (slash-mode
+/// or explicit words) — never invent from classifier output.
+pub fn parse_explicit_topology(text: &str) -> Option<String> {
+    let t = text.to_ascii_lowercase();
+    if t.contains("/swarm-mode") || t.contains("topology=swarm") || t.contains("topology swarm") {
+        return Some("swarm".into());
+    }
+    if t.contains("/loop-mode") || t.contains("topology=loop") || t.contains("topology loop") {
+        return Some("loop".into());
+    }
+    if t.contains("/open-mode") || t.contains("topology=open") || t.contains("topology open") {
+        return Some("open".into());
+    }
+    if t.contains("/join") || t.contains("topology=join") || t.contains("topology join") {
+        return Some("join".into());
+    }
+    // Bare "switch to swarm/loop/open/join" / "use swarm topology"
+    for topo in ["swarm", "loop", "open", "join"] {
+        let needles = [
+            format!("switch to {topo}"),
+            format!("use {topo} topology"),
+            format!("explicit {topo}"),
+            format!("want {topo}"),
+        ];
+        if needles.iter().any(|n| t.contains(n)) {
+            return Some(topo.into());
+        }
+    }
+    None
+}
+
+/// GS-048: classify whether a Fact / steer / operator summary is **material**
+/// (must enter `Msg::MaterialContext`) vs routine Prompt-only wake.
+/// Returns `Some(reason)` when material.
+pub fn material_context_reason(summary: &str) -> Option<&'static str> {
+    let s = summary;
+    let lower = summary.to_ascii_lowercase();
+    if s.contains("AUTHORITATIVE") || lower.contains("authoritative operator objective") {
+        return Some("authoritative-objective");
+    }
+    if parse_explicit_topology(summary).is_some() {
+        return Some("explicit-topology-request");
+    }
+    if lower.contains("stage-chain") && (lower.contains("exhaust") || lower.contains("complete")) {
+        return Some("stage-chain-exhaustion");
+    }
+    if lower.contains("classifier miss") || lower.contains("catalog miss") {
+        return Some("classifier-miss");
+    }
+    if lower.contains("new work unit")
+        || lower.contains("new work-unit")
+        || lower.contains("new bead")
+        || lower.contains("new wave")
+    {
+        return Some("new-work-unit");
+    }
+    if lower.contains("reclassify") || lower.contains("material context") {
+        return Some("material-reclassify");
+    }
+    // Goal-change markers from steer / operator pane text.
+    if lower.contains("new objective")
+        || lower.contains("objective change")
+        || lower.contains("changed objective")
+        || lower.starts_with("goal:")
+        || lower.starts_with("objective:")
+    {
+        return Some("operator-goal-change");
+    }
+    None
+}
+
+/// Build a MaterialContext Msg from a material summary (Fact / steer / CLI).
+pub fn material_context_msg(goal: &str, reason: &str) -> Msg {
+    Msg::MaterialContext {
+        goal: goal.to_string(),
+        explicit_topology: parse_explicit_topology(goal),
+        reason: reason.to_string(),
+    }
 }
 
 /// GS-048 vehicle announcement line body (without the `[reclassify]` head).
@@ -5456,12 +5543,48 @@ mod gs048_reclassify_tests {
         let (t, held) = sticky_open_topology(Some("open"), "loop", None);
         assert_eq!(t, "open");
         assert!(held);
+        let (t, held) = sticky_open_topology(Some("open"), "join", None);
+        assert_eq!(t, "open");
+        assert!(held);
+        let (t, held) = sticky_open_topology(Some("open"), "none", None);
+        assert_eq!(t, "open");
+        assert!(held, "catalog miss must not wipe open→none");
         let (t, held) = sticky_open_topology(Some("open"), "swarm", Some("swarm"));
         assert_eq!(t, "swarm");
         assert!(!held);
         let (t, held) = sticky_open_topology(None, "swarm", None);
         assert_eq!(t, "swarm");
         assert!(!held);
+        // loop.md.tpl: do not flip loop→swarm without explicit request
+        let (t, held) = sticky_open_topology(Some("loop"), "swarm", None);
+        assert_eq!(t, "loop");
+        assert!(held);
+        let (t, held) = sticky_open_topology(Some("loop"), "swarm", Some("swarm"));
+        assert_eq!(t, "swarm");
+        assert!(!held);
+    }
+
+    #[test]
+    fn catalog_miss_does_not_invent_flip_open_to_none() {
+        let mut m = idle_captain();
+        m.session_topology = Some("open".into());
+        let (next, _cmds) = tick(
+            &m,
+            &Msg::DecisionReady {
+                goal: "obscure gibberish xyzzy".into(),
+                primitive: "none".into(),
+                topology: "none".into(),
+                argv: vec![],
+                decide_reason: "catalog miss".into(),
+                explicit_topology: None,
+            },
+        );
+        assert_eq!(
+            next.session_topology.as_deref(),
+            Some("open"),
+            "catalog miss must hold sticky-open, not invent-flip to none"
+        );
+        assert_eq!(next.last_vehicle.as_deref(), Some("none: raw"));
     }
 
     #[test]
@@ -5584,6 +5707,48 @@ mod gs048_reclassify_tests {
                 .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.starts_with("[reclassify]"))),
             "routine wake must not announce reclassify: {cmds:?}"
         );
+    }
+
+    /// GS-048: Job (kind 43001) and reservation (kind 30031) wakes stay
+    /// Prompt-only — same golden posture as Channel (kind 9).
+    #[test]
+    fn routine_job_and_kind30031_wake_stays_prompt_only_no_reclassify() {
+        let m = idle_captain();
+        for (kind, id, content) in [
+            (43001u16, "job1", "job ready"),
+            (30031u16, "rsv1", "reservation conflict"),
+        ] {
+            let line = format!(
+                r#"{{"kind":{kind},"id":"{id}","tags":[["p","cap"],["h","ch-1"]],"content":"{content}"}}"#
+            );
+            let (_next, cmds) = tick(&m, &Msg::WatchNdjson { line });
+            assert!(
+                !cmds.iter().any(|c| matches!(c, Cmd::Reclassify { .. })),
+                "kind {kind} must not emit Reclassify: {cmds:?}"
+            );
+            assert!(
+                !cmds.iter().any(|c| matches!(
+                    c,
+                    Cmd::Prompt { line, .. } if line.starts_with("[reclassify]")
+                )),
+                "kind {kind} must not announce reclassify: {cmds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn material_fact_reason_detects_authoritative_and_skips_chatter() {
+        assert_eq!(
+            material_context_reason("AUTHORITATIVE OPERATOR OBJECTIVE: ship it"),
+            Some("authoritative-objective")
+        );
+        assert_eq!(
+            material_context_reason("please switch to swarm topology"),
+            Some("explicit-topology-request")
+        );
+        assert_eq!(parse_explicit_topology("please switch to swarm topology").as_deref(), Some("swarm"));
+        assert!(material_context_reason("@cap hi from channel").is_none());
+        assert!(material_context_reason("kind 9 pull hint").is_none());
     }
 
     #[test]

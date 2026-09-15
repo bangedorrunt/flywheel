@@ -39,7 +39,7 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 
 ## Mid-session reclassify (GS-048)
 
-Doorbell wakes ≠ classify. On **material** context (AUTHORITATIVE objective change, explicit topology ask, new work-unit class, classifier miss, stage-chain exhaustion then continued asks): re-run `decide --json` + `workflow list --brief` + `stage list`, announce `vehicle: …` or `none: raw`. Sticky-open: preserve open unless loop/swarm/join is explicit. Tick Law: `Msg::MaterialContext` → `Cmd::Reclassify` (effect runs decide) → `Msg::DecisionReady` announce. CLI: `flywheel reclassify "<goal>"` aliases `briefing`. Non-material Channel/Job wakes stay Prompt pull-hints only.
+Doorbell wakes ≠ classify. On **material** context (AUTHORITATIVE objective change, explicit topology ask, new work-unit class, classifier miss, stage-chain exhaustion then continued asks): re-run `decide --json` + `workflow list --brief` + `stage list`, announce `vehicle: …` or `none: raw`. Sticky-open: preserve open unless loop/swarm/join is explicit; catalog miss must not invent-flip open→none; hold loop against swarm without explicit. Tick Law: `Msg::MaterialContext` → `Cmd::Reclassify` (effect runs decide) → `Msg::DecisionReady` announce. CLI: `flywheel reclassify "<goal>"` ticks MaterialContext (sticky-open) then prints briefing. Non-material Channel/Job wakes stay Prompt pull-hints only.
 
 
 ## Operating topologies
