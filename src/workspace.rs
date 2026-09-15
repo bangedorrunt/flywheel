@@ -1240,6 +1240,28 @@ pub fn vehicle_announcement(primitive: &str, topology: &str) -> String {
     }
 }
 
+/// GS-049 sticky-open airtight: when sticky-held, do **not** name the invent
+/// swarm/join/compose primitive under the held topology. Open → `none: raw`;
+/// loop held against invent swarm → loop-work vehicle only.
+pub fn sticky_held_vehicle_announcement(invent_primitive: &str, held_topology: &str) -> String {
+    match held_topology {
+        "open" => "none: raw".into(),
+        "loop" => {
+            let invent = invent_primitive.trim();
+            if invent == "wave-swarm"
+                || invent == "join"
+                || invent == "repair-until-verified"
+                || invent == "beads-lifecycle"
+            {
+                vehicle_announcement("loop-work", "loop")
+            } else {
+                vehicle_announcement(invent_primitive, held_topology)
+            }
+        }
+        _ => vehicle_announcement(invent_primitive, held_topology),
+    }
+}
+
 /// Full Prompt line for a DecisionReady announce — urgent by `[reclassify]` head.
 pub fn reclassify_announce_line(
     vehicle: &str,
@@ -2087,9 +2109,22 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 explicit_topology.as_deref(),
             );
             next.session_topology = Some(final_topo.clone());
-            let vehicle = vehicle_announcement(primitive, &final_topo);
+            // Sticky-open airtight: never announce invent wave-swarm under open
+            // (or invent swarm under held loop) — `none: raw` / open|loop vehicle only.
+            let vehicle = if sticky_held {
+                sticky_held_vehicle_announcement(primitive, &final_topo)
+            } else {
+                vehicle_announcement(primitive, &final_topo)
+            };
             next.last_vehicle = Some(vehicle.clone());
-            let line = reclassify_announce_line(&vehicle, decide_reason, sticky_held);
+            // Sticky-held announce must not name invent swarm primitive in
+            // the Prompt line (vehicle or reason) — audit keeps raw classify.
+            let announce_reason = if sticky_held {
+                "session topology held (invent vehicle suppressed)"
+            } else {
+                decide_reason.as_str()
+            };
+            let line = reclassify_announce_line(&vehicle, announce_reason, sticky_held);
             if let Some(pin) = doorbell_core::fact_captain_pin(&next.roles) {
                 // Urgent reclassify announces break through Busy (same E5
                 // breakthrough as plane-P); Unknown/Dead stay Audit-only.
@@ -5642,10 +5677,8 @@ mod gs048_reclassify_tests {
             },
         );
         assert_eq!(next.session_topology.as_deref(), Some("open"));
-        assert_eq!(
-            next.last_vehicle.as_deref(),
-            Some("vehicle: wave-swarm (topology=open)")
-        );
+        // Sticky-open airtight: do not name invent wave-swarm under open.
+        assert_eq!(next.last_vehicle.as_deref(), Some("none: raw"));
         let prompts: Vec<_> = cmds
             .iter()
             .filter_map(|c| match c {
@@ -5655,13 +5688,72 @@ mod gs048_reclassify_tests {
             .collect();
         assert!(
             prompts.iter().any(|l| l.starts_with("[reclassify]")
-                && l.contains("vehicle: wave-swarm (topology=open)")
+                && l.contains("none: raw")
                 && l.contains("sticky-open held")),
             "expected sticky announce: {prompts:?}"
         );
         assert!(
+            prompts.iter().all(|l| !l.contains("wave-swarm")),
+            "announce must not name invent wave-swarm under open: {prompts:?}"
+        );
+        assert!(
             prompts.iter().all(|l| is_urgent_line(l)),
             "reclassify announce must be urgent/deliverable: {prompts:?}"
+        );
+    }
+
+    /// GS-049 airtight: loop sticky vs invent swarm announce — no wave-swarm name.
+    #[test]
+    fn decision_ready_loop_sticky_vs_swarm_announces_loop_vehicle() {
+        let mut m = idle_captain();
+        m.session_topology = Some("loop".into());
+        let (next, cmds) = tick(
+            &m,
+            &Msg::DecisionReady {
+                goal: "fan out a swarm".into(),
+                primitive: "wave-swarm".into(),
+                topology: "swarm".into(),
+                argv: vec!["workflow".into(), "compose".into()],
+                decide_reason: "matched wave-swarm".into(),
+                explicit_topology: None,
+            },
+        );
+        assert_eq!(next.session_topology.as_deref(), Some("loop"));
+        assert_eq!(
+            next.last_vehicle.as_deref(),
+            Some("vehicle: loop-work (topology=loop)")
+        );
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Prompt { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            prompts.iter().any(|l| l.contains("vehicle: loop-work (topology=loop)")
+                && l.contains("sticky-open held")),
+            "{prompts:?}"
+        );
+        assert!(
+            prompts.iter().all(|l| !l.contains("wave-swarm")),
+            "must not name invent wave-swarm under held loop: {prompts:?}"
+        );
+    }
+
+    #[test]
+    fn sticky_held_vehicle_announcement_open_is_none_raw() {
+        assert_eq!(
+            sticky_held_vehicle_announcement("wave-swarm", "open"),
+            "none: raw"
+        );
+        assert_eq!(
+            sticky_held_vehicle_announcement("join", "open"),
+            "none: raw"
+        );
+        assert_eq!(
+            sticky_held_vehicle_announcement("wave-swarm", "loop"),
+            "vehicle: loop-work (topology=loop)"
         );
     }
 
@@ -5814,5 +5906,187 @@ mod gs048_reclassify_tests {
         );
         // Sticky-open: open session without explicit topology stays open.
         assert_eq!(m.session_topology.as_deref(), Some("open"));
+    }
+
+    /// GS-049 / GS-045 P1-1 (TURN-INV / ADR-0032 I8a): identical source Msg
+    /// yields identical Cmds (same effect identity). Honesty: Rust `&Msg`
+    /// borrow already prevents mutation — the real invariant is same-log →
+    /// same Cmds, not an `&Msg` tautology.
+    #[test]
+    fn source_msg_immutable_same_log_same_effects_watch_ndjson() {
+        let m = idle_captain();
+        let line = r#"{"id":"evt-1","kind":9,"content":"hello"}"#.to_string();
+        let msg = Msg::WatchNdjson { line: line.clone() };
+        let (m1, c1) = tick(&m, &msg);
+        let (m2, c2) = tick(&m, &msg);
+        assert_eq!(c1, c2, "same source Msg must keep the same effect Cmds");
+        assert_eq!(m1.seq, m2.seq);
+        let _ = line; // source bytes owned by caller; tick never consumes them
+        // Distinct source-action payload → distinct Cmd identity (not an
+        // `&Msg` tautology). Unaddressed kind-9 chatter may collapse to the
+        // same no-ring Cmds, so use MaterialContext goals as the witness.
+        let (_, ca) = tick(
+            &m,
+            &Msg::MaterialContext {
+                goal: "goal-A".into(),
+                explicit_topology: None,
+                reason: "authoritative-objective".into(),
+            },
+        );
+        let (_, cb) = tick(
+            &m,
+            &Msg::MaterialContext {
+                goal: "goal-B".into(),
+                explicit_topology: None,
+                reason: "authoritative-objective".into(),
+            },
+        );
+        assert_ne!(
+            ca, cb,
+            "different MaterialContext goals must not collapse to same Cmds"
+        );
+    }
+
+    /// GS-049 / GS-045 P1-1: MaterialContext goal/reason is the logical
+    /// source-action identity for Reclassify retries.
+    ///
+    /// Honesty (tip `Cmd::Reclassify`): there is **no** `effect_key` field on
+    /// the Reclassify Cmd yet — journaled `effect_key` exists on rebind /
+    /// workflow effect paths (`agent_ref`, `effect_journal`), not on this
+    /// mid-session classify node. See
+    /// `source_action_reclassify_post_effect_retry_keeps_identity` for the
+    /// strongest post-effect retry invariant available on tip.
+    #[test]
+    fn source_action_reclassify_goal_stable_across_retries() {
+        let m = idle_captain();
+        let goal = "AUTHORITATIVE OPERATOR OBJECTIVE: ship residuals".to_string();
+        let msg = Msg::MaterialContext {
+            goal: goal.clone(),
+            explicit_topology: None,
+            reason: "authoritative-objective".into(),
+        };
+        let (_n1, cmds1) = tick(&m, &msg);
+        let (_n2, cmds2) = tick(&m, &msg);
+        assert_eq!(cmds1, cmds2);
+        let keys: Vec<_> = cmds1
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Reclassify {
+                    goal,
+                    reason,
+                    pin,
+                    explicit_topology,
+                } => Some((
+                    goal.clone(),
+                    reason.clone(),
+                    pin.clone(),
+                    explicit_topology.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 1, "one Reclassify Cmd: {cmds1:?}");
+        assert_eq!(keys[0].0, goal);
+        assert_eq!(keys[0].1, "authoritative-objective");
+        assert!(keys[0].3.is_none());
+        // Same identity fields on both retries (pin included).
+        let keys2: Vec<_> = cmds2
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Reclassify {
+                    goal,
+                    reason,
+                    pin,
+                    explicit_topology,
+                } => Some((
+                    goal.clone(),
+                    reason.clone(),
+                    pin.clone(),
+                    explicit_topology.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, keys2);
+    }
+
+    /// I8a: post-effect retry — DecisionReady fold then re-tick the same
+    /// MaterialContext; logical identity (goal/reason/explicit) is unchanged.
+    /// Tip cannot assert `effect_key` on Reclassify (field absent); this is
+    /// the strongest real invariant on this node.
+    #[test]
+    fn source_action_reclassify_post_effect_retry_keeps_identity() {
+        let mut m = idle_captain();
+        m.session_topology = Some("open".into());
+        let goal = "AUTHORITATIVE OPERATOR OBJECTIVE: deepen elm".to_string();
+        let msg = Msg::MaterialContext {
+            goal: goal.clone(),
+            explicit_topology: None,
+            reason: "authoritative-objective".into(),
+        };
+        let (m1, cmds1) = tick(&m, &msg);
+        let reclass: Vec<_> = cmds1
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Reclassify {
+                    goal,
+                    reason,
+                    pin,
+                    explicit_topology,
+                } => Some((
+                    goal.clone(),
+                    reason.clone(),
+                    pin.clone(),
+                    explicit_topology.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reclass.len(), 1);
+        // Effect layer: fold DecisionReady from a pure decide result.
+        let ready = Msg::DecisionReady {
+            goal: reclass[0].0.clone(),
+            primitive: "babysit-bead".into(),
+            topology: "swarm".into(), // invent flip — sticky must hold open
+            argv: vec![
+                "flywheel".into(),
+                "workflow".into(),
+                "compose".into(),
+                "wave-swarm".into(),
+            ],
+            decide_reason: "test-swarm".into(),
+            explicit_topology: reclass[0].3.clone(),
+        };
+        let (m2, cmds_ready) = tick(&m1, &ready);
+        assert_eq!(
+            m2.session_topology.as_deref(),
+            Some("open"),
+            "sticky-open holds against swarm invent flip"
+        );
+        assert!(
+            cmds_ready
+                .iter()
+                .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.contains("sticky-open held") || line.starts_with("[reclassify]"))),
+            "DecisionReady must announce: {cmds_ready:?}"
+        );
+        // Retry same source MaterialContext on post-effect model — identity.
+        let (_m3, cmds3) = tick(&m2, &msg);
+        let reclass3: Vec<_> = cmds3
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Reclassify {
+                    goal,
+                    reason,
+                    explicit_topology,
+                    ..
+                } => Some((goal.clone(), reason.clone(), explicit_topology.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reclass3,
+            vec![(goal, "authoritative-objective".into(), None)],
+            "post-effect retry must keep same source-action identity (no effect_key on tip Reclassify)"
+        );
     }
 }

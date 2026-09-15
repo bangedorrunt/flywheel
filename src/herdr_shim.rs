@@ -35,6 +35,25 @@ pub use toron_core::backend::herdr::{
 };
 pub use toron_core::backend::types::AgentStatus;
 
+/// GS-049 / bd-a2bw: herdr `launch_pending` is stale when the pane is already
+/// input-ready (idle/working/blocked/done). Shared by snapshot assemble and
+/// spawn/send readiness so live decide Snapshot never invent-greens 0.
+pub fn agent_still_booting(a: &AgentInfo) -> bool {
+    if !a.launch_pending {
+        return false;
+    }
+    if a.interactive_ready
+        && matches!(
+            a.agent_status,
+            AgentStatus::Idle | AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done
+        )
+    {
+        return false;
+    }
+    true
+}
+
+
 /// bd-bug-omp-herdr-wedge: the HERDR_* integration env a herdr-launched
 /// harness needs to activate its herdr extension (omp's
 /// herdr-omp-agent-state.ts gates on HERDR_ENV=1 + socket + pane id).
@@ -2675,5 +2694,44 @@ mod shell_prompt_tests {
             ),
             "w37"
         );
+    }
+}
+
+#[cfg(test)]
+mod gs049_launch_pending_tests {
+    use super::*;
+    use toron_core::backend::types::AgentStatus;
+
+    fn agent(pending: bool, ready: bool, status: AgentStatus) -> AgentInfo {
+        AgentInfo {
+            agent: Some("omp".into()),
+            agent_status: status,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: ready,
+            launch_pending: pending,
+            name: Some("Pin".into()),
+            pane_id: "p1".into(),
+            revision: 0,
+            state_change_seq: 0,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term".into(),
+            terminal_title: None,
+            workspace_id: "ws".into(),
+        }
+    }
+
+    #[test]
+    fn agent_still_booting_clears_stale_ready() {
+        assert!(!agent_still_booting(&agent(false, false, AgentStatus::Idle)));
+        assert!(agent_still_booting(&agent(true, false, AgentStatus::Unknown)));
+        assert!(!agent_still_booting(&agent(
+            true,
+            true,
+            AgentStatus::Idle
+        )));
     }
 }

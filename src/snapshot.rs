@@ -90,6 +90,10 @@ pub struct Snapshot {
     pub held_paths: Vec<String>,
     #[serde(default)]
     pub coalitions: Vec<String>,
+    /// GS-049: agents still honestly launch-pending (bd-a2bw). Assembled from
+    /// herdr — never invent-green hardcoded 0 in live decide Snapshot.
+    #[serde(default)]
+    pub launch_pending: u32,
 }
 
 /// Top-level keys the robot JSON must carry (schema validation).
@@ -111,6 +115,7 @@ pub fn schema_keys() -> Vec<&'static str> {
         "dispatcher",
         "held_paths",
         "coalitions",
+        "launch_pending",
     ]
 }
 
@@ -215,11 +220,15 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
 
     // Pins: herdr agent list for this workspace (best effort).
     let mut pins = Vec::new();
+    let mut launch_pending: u32 = 0;
     match crate::herdr_shim::Client::connect(Some(&cfg.socket_path())) {
         Ok(mut c) => match crate::find_workspace(&mut c, project) {
             Ok(ws_id) => match c.agent_list() {
                 Ok(agents) => {
                     for a in agents.iter().filter(|a| a.workspace_id == ws_id) {
+                        if crate::herdr_shim::agent_still_booting(a) {
+                            launch_pending = launch_pending.saturating_add(1);
+                        }
                         let herdr_status = a.agent_status.as_str();
                         let verdict = crate::workspace::verdict_for(
                             None,
@@ -322,6 +331,7 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         dispatcher,
         held_paths,
         coalitions,
+        launch_pending,
     }
 }
 
@@ -623,6 +633,7 @@ mod adr0010_d10_tests {
             dispatcher: "absent".into(),
             held_paths: vec![],
             coalitions: vec![],
+            launch_pending: 0,
         }
     }
 

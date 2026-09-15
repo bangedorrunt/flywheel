@@ -66,12 +66,29 @@ pub struct ClassifiedFailure {
     pub retryable: bool,
     pub reroute_eligible: bool,
     pub evidence: String,
+    /// GS-049 / GS-045 P1-3: ActionStage spelling when known
+    /// (`normalize|input|execute|output|effect|park`). Harness/stderr
+    /// classification defaults to `execute`.
+    pub stage: &'static str,
 }
 
 pub fn classify(
     stderr_tail: &str,
     exit_code: Option<i32>,
     body: Option<&str>,
+) -> ClassifiedFailure {
+    classify_with_stage(stderr_tail, exit_code, body, None)
+}
+
+/// GS-049 P1-3: same classifier with an optional known ActionStage.
+/// Pass `Some("normalize"|"input"|"output"|"park"|"effect"|"execute")` when the
+/// call site knows the phase; `None` keeps kind-based defaults (Blocked→park,
+/// else execute). Does not invent stages outside that vocabulary.
+pub fn classify_with_stage(
+    stderr_tail: &str,
+    exit_code: Option<i32>,
+    body: Option<&str>,
+    stage: Option<&'static str>,
 ) -> ClassifiedFailure {
     let body_str = body.unwrap_or("");
     let combined = format!("{stderr_tail} {body_str}");
@@ -97,6 +114,7 @@ pub fn classify(
             retryable: false,
             reroute_eligible: true,
             evidence,
+            stage: stage.unwrap_or("execute"),
         };
     }
     if lower.contains("401")
@@ -112,6 +130,7 @@ pub fn classify(
             retryable: false,
             reroute_eligible: true,
             evidence,
+            stage: stage.unwrap_or("execute"),
         };
     }
     if lower.contains("429")
@@ -126,6 +145,7 @@ pub fn classify(
             retryable: true,
             reroute_eligible: false,
             evidence,
+            stage: stage.unwrap_or("execute"),
         };
     }
     if lower.contains("unsupported_agent_kind")
@@ -143,6 +163,7 @@ pub fn classify(
             retryable: false,
             reroute_eligible: true,
             evidence,
+            stage: stage.unwrap_or("execute"),
         };
     }
     if lower.contains("timeout")
@@ -156,6 +177,7 @@ pub fn classify(
             retryable: true,
             reroute_eligible: false,
             evidence,
+            stage: stage.unwrap_or("execute"),
         };
     }
     if lower.contains("reservation conflict")
@@ -168,6 +190,8 @@ pub fn classify(
             retryable: false,
             reroute_eligible: false,
             evidence,
+            // Reservation conflict parks the work unit — not an execute miss.
+            stage: stage.unwrap_or("park"),
         };
     }
     ClassifiedFailure {
@@ -175,6 +199,7 @@ pub fn classify(
         retryable: false,
         reroute_eligible: false,
         evidence: truncate_evidence(stderr_tail, 512),
+        stage: stage.unwrap_or("execute"),
     }
 }
 
@@ -357,5 +382,29 @@ mod tests {
         assert_eq!(c.kind, FailureKind::Billing);
         let c = classify("RATE LIMIT exceeded", None, None);
         assert_eq!(c.kind, FailureKind::RateLimit);
+    }
+
+    #[test]
+    fn stage_defaults_to_execute_on_classified_failures() {
+        let cf = classify("timeout after 30s", None, None);
+        assert_eq!(cf.stage, "execute");
+        assert_eq!(cf.kind, FailureKind::Timeout);
+    }
+
+    #[test]
+    fn blocked_defaults_to_park_stage() {
+        let cf = classify("reservation conflict: path held", None, None);
+        assert_eq!(cf.kind, FailureKind::Blocked);
+        assert_eq!(cf.stage, "park");
+    }
+
+    #[test]
+    fn classify_with_stage_honors_known_context() {
+        let cf = classify_with_stage("timeout after 30s", None, None, Some("input"));
+        assert_eq!(cf.kind, FailureKind::Timeout);
+        assert_eq!(cf.stage, "input");
+        let cf = classify_with_stage("429 rate limit", None, None, Some("effect"));
+        assert_eq!(cf.kind, FailureKind::RateLimit);
+        assert_eq!(cf.stage, "effect");
     }
 }
