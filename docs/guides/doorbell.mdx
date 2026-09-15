@@ -26,6 +26,25 @@ sequenceDiagram
 - Journals (v2, rotated, seq-stamped) and subscriptions persist, so pending wakes survive crashes at-least-once.
 - `flywheel doorbell why <project> <pin> --seq <n> --corr <id>` folds the tick from default and explains a named wake.
 
+
+## Sensor→Msg edges (vocabulary only)
+
+GS-045 P1-4 / ADR-0027–0028: sensors are **Msg producers**, not a GenServer
+module. The live edges that feed `workspace::tick` (and the doorbell plane) are:
+
+| Sensor edge | Msg arm | Role |
+|-------------|---------|------|
+| **WatchNdjson** | `Msg::WatchNdjson` | Room/kind-9 / job / reservation wire lines |
+| **Herdr** | `Msg::HerdrStatus` | Pane presence / status observations |
+| **AckSla** | `Msg::AckSlaTick` | Ack SLA clock payload (clock enters as Msg only) |
+| **Presence** | presence updates via Herdr + roles | Injectable / busy / dead classification |
+| **InboxSweep** | `Msg::InboxItems` / `Msg::InboxRows` / `FetchInbox` Cmd | Mail inbox drain → classified wakes |
+
+There is **no** `Sensor` OTP/GenServer module — adapters emit Msg; the pure
+tick owns transitions; the effect layer applies Cmds. Do not invent a second
+sensor bus.
+
+
 ## Hosting (how a subscription becomes a wake)
 
 Subscriptions alone wake nothing — a hosted loop does. The daemon hosts a
