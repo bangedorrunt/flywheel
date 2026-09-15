@@ -35,7 +35,9 @@ Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --
 - **Tracker:** `br` CLI + `--json`; bare `br` is the human TUI, never automation. `bv` is deprecated.
 - **TDD. No script-based code edits. No file deletion without permission.**
 - **Engineering principles (ADR-0019 Spec 5/6):** `flywheel principles list`; cite the name that changed the decision.
-- **Compound spine (ADR-0009):** `ce-*` stages, `compound` phase, per-project `docs/learnings/`; `p-code` aliases are retired (`ce-execute`, not `p6`).
+- **Compound spine (ADR-0009):** `ce-*` stages, `compound` phase, per-project `docs/learnings/`; `p-code` aliases are retired (`ce-execute`, not `p6`). `ce-evaluate` is the verify-phase, fresh-context, read-only evaluator used by repair loops; its result is advisory, never the host verdict.
+- **Host evaluation evidence:** ship-chain phase contracts persist bounded redacted `EvaluationEvidence` under the parent run. `phase_contracts`/`VerifySink` derive the verdict; `artifacts stitch <run_id>` renders the evidence; missing persistence fails the gate (warn mode may continue as `gate-warnings`). Worker `criterion_status` and `claim_support_status` never self-admit artifacts.
+- **Upstream parity:** `docs/upstream-parity.toml` pins the checked refs and local witnesses for Compound Engineering and pstack. The offline `upstream_parity` tests and `--robot-capabilities` summary are the parity doors; network refresh is manual, never a build dependency.
 - **Preflight:** `steer`/`loop-mode run`/`workflow run --execute` auto-run prerequisite checks; `--skip-preflight` bypasses; standalone `flywheel preflight --mode {steer|loop|workflow|cron}`.
 - Wave/swarm/doorbell/crew-control semantics live in the flywheel skill; the Tick Law (`workspace::tick` owns the live path, slice reducers private) holds on every path touching `src/workspace.rs`.
 - **The journal has two halves, one store (bd-mi9n, ADR-0032 Spec 5/6 tail):** `effect_journal::journals` builds the effect runner AND a `RunJournal` from one store. The engine reports its own run lifecycle (`Started` → `Running` → `Succeeded`/`Failed`) through the `RunJournal`, so a flywheel-driven run has a `workflow_runs` row with no embedding lifecycle call, and the run row and its effect rows agree on `run_id` by construction. Idempotent by design (durable replay re-delivers phases): create-if-absent, CAS only when the status differs, terminal rows never move. Every journaled constructor passes it (`pane.rs` live arms, both `cron.rs` live engines); dry arms pass `None` — an engine that performs nothing must not mint a row claiming it ran.
@@ -72,6 +74,7 @@ verb not in the toron skill is invisible. Do not paste every clap variant into t
 
 - [Backends + config](docs/agent-instructions/backends.md)
 - [Orchestration](docs/agent-instructions/orchestration.md)
+- [Compound/pstack deep dives](docs/guides/compound-engineering.mdx), [pstack](docs/guides/pstack.mdx), [parity manifest](docs/upstream-parity.toml)
 - [Durable loop](docs/agent-instructions/loop.md)
 - Workflow DSL: [docs/workflow-authoring.md](docs/workflow-authoring.md)
 - Sibling mailbox: `../toron/AGENTS.md`

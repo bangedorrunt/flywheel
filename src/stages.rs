@@ -136,6 +136,7 @@ const SEED_AFFINITY: &[(&str, &str)] = &[
     ("fresh-eyes-explore", "scout"),
     ("ce-brainstorm", "planner"),
     ("ce-review", "reviewer"),
+    ("ce-evaluate", "reviewer"),
     ("ce-plan", "planner"),
     ("ce-plan-review", "planner"),
     ("ce-execute", "coder"),
@@ -167,6 +168,7 @@ const SEED_PHASE: &[(&str, &str)] = &[
     ("ce-execute", "implement"),
     ("ce-simplify", "implement"),
     ("ce-review", "review"),
+    ("ce-evaluate", "verify"),
     ("ce-compound", "compound"),
 ];
 
@@ -208,6 +210,10 @@ impl StageLibrary {
             (
                 "ce-review",
                 "Review the code written by your fellow agents - issues, bugs, errors, problems, inefficiencies, security problems, reliability issues, etc. - and carefully diagnose their underlying root causes using first-principle analysis. Don't restrict yourself to the latest commits; cast a wider net and go super deep. Use ultrathink. Principles in force: prove-it-works (check the real artifact - run the change's VERIFY or the ledger proof, never a self-report), fix-root-causes (reproduce first; name the root, not the symptom), minimize-reader-load (count layers and hidden state; collapse one-caller wrappers). BLOCKER: a REPORT line that cites a PRINCIPLES name without its decision (`<name> - <the decision it changed>`) is a cargo-cult citation - reject it and require the decision the principle changed; on a non-trivial bead (priority <= 2) an empty PRINCIPLES field is an incomplete report (the loop's `principles` checker enforces the same rule: known name + decision clause, required on P0-P2). Review contract (ADR-0009): a finding exists only under a DETECTION CONDITION - the observable circumstance in the work under review, never a topic to opine on; HIGH confidence requires quoted evidence (file:line + the offending text), unquoted high confidence is a reject; INDEPENDENCE - two lenses reasoned in one pane are two perspectives, not two witnesses, so claim corroboration only across separately-dispatched contexts. Each finding carries severity (P0 breakage ... P3 advisory) and an AUTOFIX CLASS: gated_auto | manual | advisory. A finding that merely prefers a different approach than a `settled:` captain decision routes report-only (settled_conflict); a real defect inside a settled approach keeps full severity. Findings land as JSON {\"findings\": [{\"id\", \"severity\", \"condition\", \"evidence\", \"autofix\", \"confidence\"}]}. Review is REPORT-ONLY - applying fixes is a separate authorized pass. Ask-user authority (ADR-0010 D15): a review finding that asks the user a question (an ask-user finding) is never self-answered by the reviewer. Findings that merely restore accepted behavior note the restoration and its evidence. Findings that expand scope (new guarantee, threat model, architecture, destructive, security) escalate report-only with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) and park in OPEN DECISIONS. Only an answer/--verdict closes the call.",
+            ),
+            (
+                "ce-evaluate",
+                "Evaluate a repair iteration from a FRESH context (pstack eval contract, ADR-0024). Read the actual artifact and ledger paths named by the plan, inspect the current repository state, and test the VERIFY command against the acceptance criteria. Do not trust a worker's done claim, transcript summary, or self-rated status. Return ONLY JSON {\"done\": <bool>, \"remaining_work\": [\"...\"], \"failures\": [{\"condition\": \"...\", \"evidence\": \"file:line or command output\", \"confidence\": \"high|medium|low\"}], \"validation_evidence\": [\"...\"]}. READ-ONLY: do not edit files, create or close beads, write verdicts, or promote worker metadata. `done` is advisory input to the following host VerifySink; it is never the pass/fail authority. Missing artifacts or unsupported claims are unknown, not success.",
             ),
             (
                 "ce-plan",
@@ -1026,6 +1032,7 @@ mod tests {
             "ce-execute",
             "ce-simplify",
             "ce-review",
+            "ce-evaluate",
             "ce-compound",
             "commit-and-push",
         ] {
@@ -1054,6 +1061,31 @@ mod tests {
             lib.get_stage("ce-execute").unwrap().phase.as_deref(),
             Some("implement")
         );
+        assert_eq!(
+            lib.get_stage("ce-evaluate").unwrap().phase.as_deref(),
+            Some("verify")
+        );
+        assert_eq!(
+            lib.get_stage("ce-evaluate").unwrap().role.as_deref(),
+            Some("reviewer")
+        );
+    }
+
+    /// The evaluator stage is advisory and structured; host verification remains authoritative.
+    #[test]
+    fn ce_evaluate_is_fresh_context_advisory_contract() {
+        let lib = StageLibrary::compiled_in();
+        let evaluate = lib.resolve("ce-evaluate").expect("ce-evaluate resolves");
+        for needle in [
+            "FRESH context",
+            "remaining_work",
+            "validation_evidence",
+            "READ-ONLY",
+            "VerifySink",
+            "never the pass/fail authority",
+        ] {
+            assert!(evaluate.contains(needle), "ce-evaluate must name {needle}");
+        }
     }
 
     /// bd-close-ceremony-gate-sha-68ms (GS-028 B13-B15+B3): the taught close
