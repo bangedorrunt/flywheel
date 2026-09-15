@@ -78,7 +78,7 @@ flowchart LR
 
 ## Authoring and graduation
 
-Ladder: `stage new`, `stage lint`, `stage promote`; `workflow new`, `workflow lint` (fail-stop), promote. A same-named catalog file overrides a builtin; never edit the builtin. Ephemeral compose stays out of the catalog: `--keep <n>` graduates a green run through `workflow new` + lint. `--agent`-authored YAML is lint-gated: a failing lint bails before any dispatch.
+Ladder: `stage new`, `stage lint`, `stage promote`; `workflow new`, `workflow lint` (fail-stop), `workflow evaluate` (GS-049 evaluate-without-commit — validated partition candidates, no journal), promote. A same-named catalog file overrides a builtin; never edit the builtin. Ephemeral compose stays out of the catalog: `--keep <n>` graduates a green run through `workflow new` + lint. `--agent`-authored YAML is lint-gated: a failing lint bails before any dispatch.
 
 Cron: `flywheel cron lint` then `flywheel cron start` owns recurring ticks. `cron run <name>` is a 25-second dry-run by default; `--live` force-fires once through the durable-loop runner. Cron YAML authoring mirrors workflow YAML; the P4.3 manager ticks off the registry.
 

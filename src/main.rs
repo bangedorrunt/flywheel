@@ -3464,6 +3464,19 @@ enum WorkflowCmd {
         #[arg(long)]
         project: Option<String>,
     },
+    /// GS-049 / GS-045 P1-2: evaluate-without-commit — lint + partition each
+    /// step into validated candidate outcomes without journal dispatch.
+    /// Host path (`workflow run --execute`) stays authoritative for live effects.
+    Evaluate {
+        /// workflow name
+        name: String,
+        /// project whose `.flywheel/workflows/` joins the catalog
+        #[arg(long)]
+        project: Option<String>,
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a workflow by name through the unified engine (lint gate first).
     /// Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`.
     /// Compose tokens (`wave-swarm`, `repair-until-verified`,
@@ -4502,19 +4515,9 @@ fn registry_entry_for_token<'a>(
 /// bd-a2bw: herdr `launch_pending` is stale when the pane is already
 /// input-ready (omp at `π >` with a session, status idle/working/blocked/
 /// done). Spawn/send must not treat that as still-booting.
+/// GS-049: shared with `snapshot::assemble` via `herdr_shim::agent_still_booting`.
 fn is_still_booting(a: &AgentInfo) -> bool {
-    if !a.launch_pending {
-        return false;
-    }
-    if a.interactive_ready
-        && matches!(
-            a.agent_status,
-            AgentStatus::Idle | AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done
-        )
-    {
-        return false;
-    }
-    true
+    herdr_shim::agent_still_booting(a)
 }
 
 /// Log an event with a compact payload.
@@ -4580,7 +4583,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-evaluate", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
-            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger; `workflow list --brief` is name/trigger/topology only (GS-048) — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/evaluate/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger; `workflow list --brief` is name/trigger/topology only (GS-048) — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -14557,6 +14560,9 @@ fn cmd_decide(
         if snap.profiled_panes == 0 {
             snap.profiled_panes = live.pins.len() as u32;
         }
+        if snap.launch_pending == 0 {
+            snap.launch_pending = live.launch_pending;
+        }
         if !snap.contention {
             snap.contention = !live.held_paths.is_empty();
         }
@@ -14798,7 +14804,8 @@ pub(crate) fn live_decide_snapshot(cfg: &Config, project: &str) -> decide::Snaps
             .filter(|l| l.status == "open" || l.status == "ready")
             .count() as u32,
         profiled_panes: live.pins.len() as u32,
-        launch_pending: 0,
+        // GS-049: real assemble value — never invent-green hardcoded 0.
+        launch_pending: live.launch_pending,
         contention: !live.held_paths.is_empty(),
     }
 }
@@ -14894,6 +14901,7 @@ fn cmd_briefing(
         pin_count: snap.pins.len() as u32,
         held_paths: snap.held_paths.clone(),
         coalition_id: snap.coalitions.first().cloned(),
+        launch_pending: snap.launch_pending,
     };
     if world.joinable {
         eprintln!("{}", briefing::join_banner(&world));
@@ -14919,6 +14927,19 @@ fn cmd_briefing(
     // the workflow's steps, never re-declared) so the crew-confirm gate
     // above and the captain see the same dispatch relation.
     b.proposal.role = routed_role(&b.proposal.workflow);
+    // GS-049: after sticky-open [reclassify] announce, do not present a
+    // conflicting second topology surface. Sticky-held is derived via
+    // `sticky_open_topology` (single SoT) — never a re-derived CLI predicate
+    // that ignores explicit_topology.
+    if let Some(sticky) = state::load_session_topology(project) {
+        let explicit = workspace::parse_explicit_topology(objective);
+        let (final_topo, held) = workspace::sticky_open_topology(
+            Some(sticky.as_str()),
+            b.proposal.topology.as_str(),
+            explicit.as_deref(),
+        );
+        briefing::align_with_session_topology(&mut b, &final_topo, held);
+    }
     if json {
         print_json(&serde_json::to_value(&b)?);
     } else {
@@ -27548,6 +27569,22 @@ fn normalize_run_status(raw: &str) -> String {
 /// engine outcome — failed, blocked, suspended, succeeded, or unknown.
 /// Explicit outcome evidence wins; a null outcome is unknown (never an
 /// invented success); a completed invoke without failure evidence succeeded.
+/// GS-049 P1-3: pull ActionStage from a structured failure value when present.
+fn output_action_stage(output: &Value) -> Option<String> {
+    output
+        .get("stage")
+        .or_else(|| output.get("action_stage"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            output
+                .get("error")
+                .and_then(|e| e.get("stage"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 fn run_terminal_status(output: &Value) -> &'static str {
     if let Some(s) = output.get("status").and_then(Value::as_str) {
         return match s {
@@ -27717,6 +27754,13 @@ fn run_list_row(project: &str, e: &state::LogEntry) -> Value {
             .get("phase_degraded")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // GS-049 P1-3: ActionStage when a structured failure recorded it.
+        "action_stage": e
+            .data
+            .get("stage")
+            .or_else(|| e.data.get("action_stage"))
+            .cloned()
+            .unwrap_or(Value::Null),
     });
     // A gate annotation carries the verdict it actually produced; a run
     // outcome never gains this key.
@@ -29002,14 +29046,29 @@ fn cmd_steer(
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
     }
-    // GS-048: AUTHORITATIVE steer objective is material — queue into the live
-    // doorbell Fact drain so Host::tick emits Msg::MaterialContext (not a
+    // GS-049: AUTHORITATIVE steer always queues MaterialContext — require
+    // `--project` or inherit from workspace cwd (`cron::detect_project`).
+    // Fail loud when material context has no project (no invent-green skip).
+    let explicit_project = project.is_some();
+    let project_owned = cron::detect_project(cfg, project).ok_or_else(|| {
+        anyhow!(
+            "steer: --project is required for AUTHORITATIVE MaterialContext path              (pass --project <slug> or run from a workspace/<project> cwd)"
+        )
+    })?;
+    if !explicit_project {
+        eprintln!(
+            "flywheel: steer: inheriting --project={project_owned} from workspace cwd"
+        );
+    }
+    let project: Option<&str> = Some(project_owned.as_str());
+    // GS-048/049: AUTHORITATIVE steer objective is material — queue into the
+    // live doorbell Fact drain so Host::tick emits Msg::MaterialContext (not a
     // parallel classifier plane).
-    if let Some(p) = project {
-        let summary = format!("AUTHORITATIVE OPERATOR OBJECTIVE: {objective}");
-        if let Err(e) = append_pending_fact(p, &summary) {
-            eprintln!("flywheel: [reclassify] could not queue material steer fact: {e:#}");
-        }
+    let summary = format!("AUTHORITATIVE OPERATOR OBJECTIVE: {objective}");
+    if let Err(e) = append_pending_fact(&project_owned, &summary) {
+        bail!(
+            "steer: could not queue material MaterialContext fact for project {project_owned}: {e:#}"
+        );
     }
     let mut crew_owned = crew.map(|s| s.to_string());
     // bd-xe9r: on an INTERACTIVE TTY — skipped by --json, --yes, or an
@@ -29301,6 +29360,77 @@ fn planner_author_response(wf_name: &str, prompt: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("planner authoring leaf returned no response"))
 }
 
+
+/// GS-049 / GS-045 P1-2: direct evaluate-without-commit (Jido cmd/3 adapt).
+/// Lints the workflow, partitions each step action into a validated candidate
+/// outcome, and returns that data — never opens the effect journal and never
+/// dispatches. Live effects stay on `workflow run --execute`.
+fn cmd_workflow_evaluate(
+    cfg: &Config,
+    name: &str,
+    project: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let project_root = project.map(|p| project_dir(cfg, p));
+    let all = workflow_catalog::all_workflows_merged(project_root.as_deref())?;
+    let (wf, source) = all
+        .get(name)
+        .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))?;
+    let blocking = lint_flywheel_tier(name, wf);
+    if blocking > 0 {
+        bail!("workflow evaluate: lint blocked on {name} ({blocking} finding(s))");
+    }
+    let mut candidates = Vec::new();
+    for (idx, step) in wf.steps.iter().enumerate() {
+        let part = toron_workflow::engine::partition(&step.action);
+        let (partition_kind, detail) = match part {
+            toron_workflow::engine::ActionPartition::EngineControl => {
+                ("engine_control".to_string(), serde_json::Value::Null)
+            }
+            toron_workflow::engine::ActionPartition::HostSink { sink } => {
+                ("host_sink".to_string(), json!({ "sink": sink }))
+            }
+            toron_workflow::engine::ActionPartition::Unsupported { reason } => {
+                ("unsupported".to_string(), json!({ "reason": reason }))
+            }
+        };
+        candidates.push(json!({
+            "step": step.name.clone().unwrap_or_else(|| format!("step-{idx}")),
+            "action": step.action.type_name(),
+            "partition": partition_kind,
+            "detail": detail,
+            "committed": false,
+            "journaled": false,
+        }));
+    }
+    let body = json!({
+        "schema": "flywheel-evaluate.v1",
+        "workflow": name,
+        "source": source,
+        "evaluate_without_commit": true,
+        "lint": "clean",
+        "candidates": candidates,
+        "note": "validated candidates only — host `workflow run --execute` remains authoritative for live effects (GS-045 P1-2 / ADR-0032)",
+    });
+    if json {
+        print_json(&body);
+    } else {
+        println!("evaluate-without-commit {name} (source={source}) lint=clean");
+        for c in &candidates {
+            println!(
+                "  step={} action={} partition={} committed=false",
+                c["step"].as_str().unwrap_or("?"),
+                c["action"].as_str().unwrap_or("?"),
+                c["partition"].as_str().unwrap_or("?"),
+            );
+        }
+        println!(
+            "note: no journal dispatch — use `workflow run --execute` for live effects"
+        );
+    }
+    Ok(())
+}
+
 fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     use toron_workflow::schema::{Action, CrewSpec, Workflow};
     use toron_workflow::{Level, lint_workflow_with_principles};
@@ -29521,6 +29651,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 println!("lint clean: {} workflow(s)", all.len());
                 Ok(())
             }
+        }
+        WorkflowCmd::Evaluate { name, project, json } => {
+            cmd_workflow_evaluate(cfg, name, project.as_deref(), *json)
         }
         WorkflowCmd::Run {
             name,
@@ -29850,6 +29983,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let run_project = project.as_deref().unwrap_or("flywheel");
             let terminal = run_terminal_status(&output);
             let artifact_paths = write_terminal_artifact(run_project, &run_id, &output, terminal);
+            let action_stage = output_action_stage(&output);
             log(
                 run_project,
                 EventKind::Workflow,
@@ -29862,6 +29996,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "panes": pane_ctx.as_ref().map(|c| c.entries.len()),
                     "reaped": reaped,
                     "artifact_paths": artifact_paths,
+                    "stage": action_stage,
                 }),
             );
             if *json {
@@ -30404,6 +30539,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // artifacts. The --keep gate below reads the same status.
             let terminal = run_terminal_status(&output);
             let artifact_paths = write_terminal_artifact(project_name, &run_id, &output, terminal);
+            let action_stage = output_action_stage(&output);
             log(
                 project_name,
                 EventKind::Workflow,
@@ -30417,6 +30553,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "reaped": reaped,
                     "policy_events": policy_receipts_count,
                     "artifact_paths": artifact_paths,
+                    "stage": action_stage,
                 }),
             );
             // W6 (§3.7 T3): graduate a GREEN composed run into the project
