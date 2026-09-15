@@ -100,6 +100,10 @@ impl RtHost {
         if let Some(pin) = state::load_captain_alias(project) {
             model.roles.insert("captain".into(), pin);
         }
+        // GS-048: restore sticky-open topology across host restarts.
+        if let Some(topo) = state::load_session_topology(project) {
+            model.session_topology = Some(topo);
+        }
         // Same seeds as the old loop head (fail-loud on I/O, never skip).
         crate::durable::seed_workspace_from_active_loop(&mut model, project)?;
         crate::seed_roles_from_binds(&mut model, project)?;
@@ -235,12 +239,24 @@ impl Host for RtHost {
                 },
                 false,
             ),
-            BrainMsg::Fact { summary } => (
-                workspace::Msg::Fact {
-                    summary: summary.clone(),
-                },
-                false,
-            ),
+            // GS-048: material Fact (AUTHORITATIVE / goal change / explicit
+            // topology / …) enters Msg::MaterialContext so sticky-open and
+            // DecisionReady ride the Elm plane. Routine facts stay Prompt-only.
+            BrainMsg::Fact { summary } => {
+                if let Some(reason) = workspace::material_context_reason(summary) {
+                    (
+                        workspace::material_context_msg(summary, reason),
+                        false,
+                    )
+                } else {
+                    (
+                        workspace::Msg::Fact {
+                            summary: summary.clone(),
+                        },
+                        false,
+                    )
+                }
+            },
             BrainMsg::AckSlaTick { now } => (workspace::Msg::AckSlaTick { now: *now }, false),
             BrainMsg::Presence { pin, state } => (
                 workspace::Msg::Presence {
@@ -269,9 +285,11 @@ impl Host for RtHost {
         let (next, cmds) = workspace::tick(&self.model, &wmsg);
         self.model = next;
         // GS-048: expand Reclassify → DecisionReady cmds so Prompt announces
-        // reach Effect::Prompt (nested handle would drop them).
+        // reach Effect::Prompt (nested handle would drop them). Live Snapshot
+        // from briefing world facts — never Snapshot::default() invent-green.
+        let snap = crate::live_decide_snapshot(&self.cfg, &self.project);
         let cmds = workspace::expand_reclassify_cmds(&mut self.model, cmds, &|goal| {
-            let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
+            let d = crate::decide::decide(goal, &snap);
             (
                 d.primitive.to_string(),
                 d.topology.to_string(),
@@ -279,6 +297,9 @@ impl Host for RtHost {
                 d.reason.clone(),
             )
         });
+        if let Some(topo) = self.model.session_topology.as_deref() {
+            let _ = crate::state::save_session_topology(&self.project, topo);
+        }
         crate::handle_workspace_cmds(
             &mut self.model,
             &cmds,

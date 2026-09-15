@@ -733,9 +733,10 @@ enum Commands {
         #[arg(long)]
         crew: Option<u32>,
     },
-    /// GS-048: mid-session reclassify — thin alias of `briefing` (decide leaf).
-    /// Prefer Tick-Law `Msg::MaterialContext` when a live workspace owns the
-    /// model; this CLI is the agent-initiated discoverable verb.
+    /// GS-048: mid-session reclassify — enters Elm plane via
+    /// `Msg::MaterialContext` → `Cmd::Reclassify` → `Msg::DecisionReady`
+    /// (sticky-open applied). Also prints the briefing proposal (same leaf
+    /// facts as `briefing`). Prefer this over inventing a second classifier.
     Reclassify {
         objective: String,
         #[arg(long)]
@@ -4705,7 +4706,8 @@ fn main() {
             *yes,
             *crew,
         ),
-        // GS-048: thin alias — same leaf as briefing.
+        // GS-048: Elm-plane reclassify (MaterialContext → sticky DecisionReady)
+        // plus briefing proposal print (same live Snapshot as CLI decide).
         Some(Commands::Reclassify {
             objective,
             project,
@@ -4713,7 +4715,7 @@ fn main() {
             commit,
             yes,
             crew,
-        }) => cmd_briefing(
+        }) => cmd_reclassify(
             &cfg,
             objective,
             project.as_deref(),
@@ -11898,13 +11900,14 @@ fn handle_workspace_cmds(
                 reason,
             } => {
                 // GS-048: prefer expand_reclassify_cmds at the host boundary so
-                // Prompt announces map to Effect::Prompt. This arm remains for
-                // callers that pass raw tick output without expanding first.
+                // Prompt announces map to Effect::Prompt. Live Snapshot — never
+                // Snapshot::default() invent-green. Persist sticky topology.
                 eprintln!(
                     "flywheel: [Reclassify] reason={reason} goal_len={} sticky_explicit={:?}",
                     goal.len(),
                     explicit_topology
                 );
+                let snap = live_decide_snapshot(cfg, project);
                 let more = workspace::expand_reclassify_cmds(
                     workspace_model,
                     vec![workspace::Cmd::Reclassify {
@@ -11914,7 +11917,7 @@ fn handle_workspace_cmds(
                         reason: reason.clone(),
                     }],
                     &|g| {
-                        let d = crate::decide::decide(g, &crate::decide::Snapshot::default());
+                        let d = crate::decide::decide(g, &snap);
                         (
                             d.primitive.to_string(),
                             d.topology.to_string(),
@@ -11923,6 +11926,9 @@ fn handle_workspace_cmds(
                         )
                     },
                 );
+                if let Some(topo) = workspace_model.session_topology.as_deref() {
+                    let _ = state::save_session_topology(project, topo);
+                }
                 let _ = handle_workspace_cmds(workspace_model, &more, project, cfg, false);
             }
         }
@@ -14777,6 +14783,87 @@ fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     print_json(&serde_json::to_value(&snap)?);
     Ok(())
+}
+
+/// GS-048: live decide Snapshot from the same world facts as `briefing` /
+/// `decide --project` — ready beads, profiled panes, contention. Never use
+/// `Snapshot::default()` in production expand_reclassify paths (invent-green).
+pub(crate) fn live_decide_snapshot(cfg: &Config, project: &str) -> decide::Snapshot {
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let live = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    decide::Snapshot {
+        ready_bead_count: live
+            .lanes
+            .iter()
+            .filter(|l| l.status == "open" || l.status == "ready")
+            .count() as u32,
+        profiled_panes: live.pins.len() as u32,
+        launch_pending: 0,
+        contention: !live.held_paths.is_empty(),
+    }
+}
+
+/// GS-048: mid-session reclassify enters the Elm plane
+/// (`Msg::MaterialContext` → expand → `DecisionReady` sticky announce), then
+/// prints the briefing proposal with the same live Snapshot. Does **not**
+/// bypass sticky-open via a bare `cmd_briefing` alias.
+fn cmd_reclassify(
+    cfg: &Config,
+    objective: &str,
+    project: Option<&str>,
+    json: bool,
+    commit: bool,
+    yes: bool,
+    crew: Option<u32>,
+) -> Result<()> {
+    let project = project.unwrap_or("toron");
+    // Seed model with sticky topology from prior DecisionReady (if any).
+    let mut model = workspace::WorkspaceModel::default();
+    if let Some(topo) = state::load_session_topology(project) {
+        model.session_topology = Some(topo);
+    }
+    // Seed captain role so DecisionReady can Prompt announce.
+    if let Some(pin) = state::load_captain_alias(project) {
+        model.roles.insert("captain".into(), pin.clone());
+        model
+            .presence
+            .insert(pin.clone(), workspace::Presence::Idle { source: "reclassify".into() });
+        model.doorbell.index.insert_pin(pin, None);
+    }
+    let reason = workspace::material_context_reason(objective)
+        .unwrap_or("operator-goal-change");
+    let msg = workspace::material_context_msg(objective, reason);
+    let (next, cmds) = workspace::tick(&model, &msg);
+    model = next;
+    let snap = live_decide_snapshot(cfg, project);
+    let expanded = workspace::expand_reclassify_cmds(&mut model, cmds, &|goal| {
+        let d = decide::decide(goal, &snap);
+        (
+            d.primitive.to_string(),
+            d.topology.to_string(),
+            d.argv.clone(),
+            d.reason.clone(),
+        )
+    });
+    if let Some(topo) = model.session_topology.as_deref() {
+        let _ = state::save_session_topology(project, topo);
+    }
+    // Surface announce lines for the CLI user (Elm plane result).
+    for c in &expanded {
+        if let workspace::Cmd::Prompt { line, .. } = c {
+            if line.starts_with("[reclassify]") {
+                eprintln!("{line}");
+            }
+        }
+        if let workspace::Cmd::Audit { kind, detail, .. } = c {
+            if kind == "reclassify_ready" || kind == "reclassify_requested" {
+                eprintln!("flywheel: [{kind}] {detail}");
+            }
+        }
+    }
+    // Briefing proposal print / optional commit — same leaf as before, but
+    // sticky already applied above on the Elm plane.
+    cmd_briefing(cfg, objective, Some(project), json, commit, yes, crew)
 }
 
 /// ADR-0010 D10 (bd-67qg): the one session-start drain over the snapshot.
@@ -28915,6 +29002,15 @@ fn cmd_steer(
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
     }
+    // GS-048: AUTHORITATIVE steer objective is material — queue into the live
+    // doorbell Fact drain so Host::tick emits Msg::MaterialContext (not a
+    // parallel classifier plane).
+    if let Some(p) = project {
+        let summary = format!("AUTHORITATIVE OPERATOR OBJECTIVE: {objective}");
+        if let Err(e) = append_pending_fact(p, &summary) {
+            eprintln!("flywheel: [reclassify] could not queue material steer fact: {e:#}");
+        }
+    }
     let mut crew_owned = crew.map(|s| s.to_string());
     // bd-xe9r: on an INTERACTIVE TTY — skipped by --json, --yes, or an
     // explicit --crew (an agent driver knows its fleet already) — brief the
@@ -36640,7 +36736,8 @@ mod integration_tests {
         );
     }
 
-    /// GS-048: `workflow list --brief` projects name/trigger/topology.
+    /// GS-048: `workflow list --brief` projects name/trigger/topology via the
+    /// real `WorkflowCmd::List { brief: true }` / `cmd_workflow` path.
     #[test]
     fn workflow_list_brief_projects_name_trigger_topology() {
         let wfs = builtin_workflows::builtin_workflows();
@@ -36657,6 +36754,14 @@ mod integration_tests {
             crate::decide::topology_for_primitive("wave-swarm"),
             "swarm"
         );
+        // Actually invoke WorkflowCmd::List { brief: true } / cmd_workflow.
+        let cfg = Config::default();
+        let cmd = WorkflowCmd::List {
+            json: false,
+            brief: true,
+            project: None,
+        };
+        cmd_workflow(&cfg, &cmd).expect("WorkflowCmd::List { brief: true } must succeed");
     }
 
     /// bd-oj9o #3: a rendered workflow command = frontmatter (with the

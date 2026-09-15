@@ -817,6 +817,36 @@ pub fn is_captain_alias_cleared(project: &str) -> bool {
     load_captain_alias(project).is_none()
 }
 
+/// GS-048: last committed session topology for sticky-open across CLI reclassify
+/// and host restarts. File: `state_dir/session_topology/<key>.json`.
+fn session_topology_file(project: &str) -> PathBuf {
+    state_dir()
+        .join("session_topology")
+        .join(format!("{}.json", state_key(project)))
+}
+
+pub fn load_session_topology(project: &str) -> Option<String> {
+    let path = session_topology_file(project);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("topology")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .map(std::string::ToString::to_string)
+}
+
+pub fn save_session_topology(project: &str, topology: &str) -> Result<()> {
+    let path = session_topology_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(&serde_json::json!({ "topology": topology }))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// GS-033 B8: last-writer-wins crew role → pin snapshot so the doorbell
 /// owner can seed `WorkspaceModel.roles` without waiting on watch.
 /// File: `state_dir/role_binds/<key>.json` (`{"coder":"DustySparrow",...}`).
