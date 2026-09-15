@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **GS-049 Elm deepen (GS-045 P1):** `workflow evaluate` — lint + partition candidates without journal dispatch (evaluate-without-commit). Source-Msg immutability tests (I8a). Sensor→Msg vocabulary in `docs/guides/doorbell.mdx` (WatchNdjson / Herdr / AckSla / Presence / InboxSweep; no Sensor GenServer).
+- **GS-049 Elm deepen (GS-045 P1):** `workflow evaluate` — lint + partition candidates without journal dispatch (evaluate-without-commit). Source-Msg / post-effect retry identity tests (I8a; tip Reclassify has no `effect_key` yet). Sensor→Msg vocabulary in `docs/guides/doorbell.mdx` (WatchNdjson / Herdr / AckSla / InboxSweep; Presence via Herdr+roles — not a Sensor GenServer arm).
 
 ### Fixed
-- **GS-049 residuals (GS-048):** briefing aligns with sticky `session_topology` after `[reclassify]` announce (no dual topology SoT). `steer` requires `--project` (or cwd inherit) for AUTHORITATIVE MaterialContext. `live_decide_snapshot` / briefing use real assemble `launch_pending` (no invent-green hardcoded 0). Phase-bearing failures carry `stage` (ActionStage) on ClassifiedFailure, pane/effect journal outs, and run ledger rows.
+- **GS-049 residuals (GS-048):** briefing aligns with sticky `session_topology` after `[reclassify]` announce (no dual topology SoT). Sticky-held argv rewrite covers open×loop|swarm|join|none (commit must not exec suppressed loop under open / skip crew-confirm). Held flag from `sticky_open_topology` (single SoT). `steer` requires `--project` (or cwd inherit) for AUTHORITATIVE MaterialContext. `live_decide_snapshot` / briefing use real assemble `launch_pending` (no invent-green hardcoded 0). Phase-bearing failures carry `stage` (ActionStage: `classify_with_stage`; Blocked→park) on ClassifiedFailure, pane/effect journal outs, and run ledger rows.
 
 ### Fixed — the workflow catalog layers the project tier at every door
 - `flywheel workflow run <name> --project <p>` resolves built-ins < user catalog < `<p>/.flywheel/workflows/*.yaml` — the catalog contract the skill and ADR-0032 both state, and the one `workflow compose` already honored (W6). Before this, a project-tier workflow failed at `workflow run` with `unknown workflow` while `compose` could resolve it, and `call_workflow` sub-runs resolved user-tier only. Sub-runs resolve against the same layered catalog the entry workflow came from.

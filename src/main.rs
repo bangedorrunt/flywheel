@@ -14928,13 +14928,17 @@ fn cmd_briefing(
     // above and the captain see the same dispatch relation.
     b.proposal.role = routed_role(&b.proposal.workflow);
     // GS-049: after sticky-open [reclassify] announce, do not present a
-    // conflicting second topology surface. Align print/commit with
-    // session_topology (suppress spawn argv when sticky-held).
+    // conflicting second topology surface. Sticky-held is derived via
+    // `sticky_open_topology` (single SoT) — never a re-derived CLI predicate
+    // that ignores explicit_topology.
     if let Some(sticky) = state::load_session_topology(project) {
-        let held = (sticky == "open"
-            && matches!(b.proposal.topology.as_str(), "loop" | "swarm" | "join" | "none"))
-            || (sticky == "loop" && b.proposal.topology == "swarm");
-        briefing::align_with_session_topology(&mut b, &sticky, held);
+        let explicit = workspace::parse_explicit_topology(objective);
+        let (final_topo, held) = workspace::sticky_open_topology(
+            Some(sticky.as_str()),
+            b.proposal.topology.as_str(),
+            explicit.as_deref(),
+        );
+        briefing::align_with_session_topology(&mut b, &final_topo, held);
     }
     if json {
         print_json(&serde_json::to_value(&b)?);

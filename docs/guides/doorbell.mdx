@@ -35,10 +35,15 @@ module. The live edges that feed `workspace::tick` (and the doorbell plane) are:
 | Sensor edge | Msg arm | Role |
 |-------------|---------|------|
 | **WatchNdjson** | `Msg::WatchNdjson` | Room/kind-9 / job / reservation wire lines |
-| **Herdr** | `Msg::HerdrStatus` | Pane presence / status observations |
+| **Herdr** | `Msg::HerdrStatus` | Pane status observations (feeds presence verdict) |
 | **AckSla** | `Msg::AckSlaTick` | Ack SLA clock payload (clock enters as Msg only) |
-| **Presence** | presence updates via Herdr + roles | Injectable / busy / dead classification |
 | **InboxSweep** | `Msg::InboxItems` / `Msg::InboxRows` / `FetchInbox` Cmd | Mail inbox drain → classified wakes |
+
+**Presence is not a Sensor GenServer and not a primary sensor Msg arm.**
+Reachability / injectable|busy|dead is derived via **Herdr status + roles**
+(and the trusted dispatcher-internal `Msg::Presence` edge for jsonl-timeout
+paths). Do not invent a `PresencePoll` sensor module or a second presence
+oracle beside `Model.presence`.
 
 There is **no** `Sensor` OTP/GenServer module — adapters emit Msg; the pure
 tick owns transitions; the effect layer applies Cmds. Do not invent a second

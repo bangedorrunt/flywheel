@@ -224,8 +224,10 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
 
 /// GS-049: after sticky-open `[reclassify]` announce, briefing must not present
 /// a conflicting second topology surface (dual SoT). Align proposal + question
-/// default with sticky `session_topology`; when sticky-held against a spawn
-/// classify, rewrite argv so `--commit` cannot spawn the suppressed vehicle.
+/// default with sticky `session_topology`; when sticky-held against any invent
+/// flip (open×loop|swarm|join|none, loop×swarm), rewrite argv so `--commit`
+/// cannot exec the suppressed vehicle under an open/loop label (crew-confirm
+/// is skipped for open — leaving loop argv would auto-dispatch).
 pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held: bool) {
     let session = session.trim();
     if session.is_empty() {
@@ -234,6 +236,11 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
     if b.proposal.topology == session {
         if sticky_held && !b.proposal.why.contains("sticky") {
             b.proposal.why = format!("{} — sticky session topology held", b.proposal.why);
+        }
+        // Still rewrite argv when sticky-held: topology label may already match
+        // after a prior align, while argv still carries a suppressed vehicle.
+        if sticky_held {
+            rewrite_sticky_held_argv(b, session);
         }
         return;
     }
@@ -247,13 +254,22 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
         if sticky_held { " sticky-held" } else { "" },
         b.proposal.why
     );
-    // Sticky-held open/loop must not leave swarm/join spawn argv as the commit surface.
-    if sticky_held
-        && matches!(session, "open" | "loop")
-        && matches!(classified.as_str(), "swarm" | "join")
-    {
-        match session {
-            "open" => {
+    // ALL sticky-held cases — not only classified∈{swarm,join}.
+    if sticky_held {
+        rewrite_sticky_held_argv(b, session);
+    }
+}
+
+/// Rewrite commit argv to the held session vehicle; clear crew spawn surfaces.
+fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
+    match session {
+        "open" => {
+            // none / empty workflow: fail-closed empty argv (commit bails) —
+            // never invent a workflow name. Otherwise headless run of the
+            // classified workflow (no spawn/crew, no loop-mode).
+            if b.proposal.workflow.is_empty() || b.proposal.workflow == "none" {
+                b.proposal.argv.clear();
+            } else {
                 b.proposal.argv = vec![
                     "flywheel".into(),
                     "workflow".into(),
@@ -262,26 +278,26 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
                     "--mode".into(),
                     "headless".into(),
                 ];
-                b.proposal.crew.clear();
-                b.proposal.crew_total = 0;
-                b.proposal.add.clear();
-                b.proposal.remove.clear();
             }
-            "loop" => {
-                b.proposal.argv = vec![
-                    "flywheel".into(),
-                    "loop-mode".into(),
-                    "run".into(),
-                    b.world.project.clone(),
-                    "--work".into(),
-                ];
-                b.proposal.crew.clear();
-                b.proposal.crew_total = 0;
-                b.proposal.add.clear();
-                b.proposal.remove.clear();
-            }
-            _ => {}
+            b.proposal.crew.clear();
+            b.proposal.crew_total = 0;
+            b.proposal.add.clear();
+            b.proposal.remove.clear();
         }
+        "loop" => {
+            b.proposal.argv = vec![
+                "flywheel".into(),
+                "loop-mode".into(),
+                "run".into(),
+                b.world.project.clone(),
+                "--work".into(),
+            ];
+            b.proposal.crew.clear();
+            b.proposal.crew_total = 0;
+            b.proposal.add.clear();
+            b.proposal.remove.clear();
+        }
+        _ => {}
     }
 }
 
@@ -423,5 +439,70 @@ mod tests {
             "spawn crew argv suppressed: {:?}",
             b.proposal.argv
         );
+        assert!(
+            !b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            "must not leave loop-mode under open: {:?}",
+            b.proposal.argv
+        );
+    }
+
+    /// GS-049 adversarial: open held against loop must rewrite argv — else
+    /// `--commit` skips crew-confirm (open label) and execs suppressed loop.
+    #[test]
+    fn sticky_held_open_x_loop_rewrites_argv_not_loop_mode() {
+        let world = World {
+            project: "toron".into(),
+            ready_beads: 3,
+            dispatcher: "absent".into(),
+            ..World::default()
+        };
+        let mut b = assemble("work the ready beads", &world, &["coder".into()], 5);
+        assert_eq!(b.proposal.topology, "loop", "precondition: loop classify");
+        assert!(
+            b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            "precondition loop argv: {:?}",
+            b.proposal.argv
+        );
+        align_with_session_topology(&mut b, "open", true);
+        assert_eq!(b.proposal.topology, "open");
+        assert!(
+            !b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            "open sticky-held must not keep loop-mode argv (commit would skip crew-confirm): {:?}",
+            b.proposal.argv
+        );
+        assert!(
+            b.proposal.argv.is_empty()
+                || b.proposal
+                    .argv
+                    .windows(2)
+                    .any(|w| w == ["workflow", "run"]),
+            "open vehicle is headless workflow run or fail-closed empty: {:?}",
+            b.proposal.argv
+        );
+        assert_eq!(b.proposal.crew_total, 0);
+        assert!(b.proposal.crew.is_empty());
+    }
+
+    /// GS-049 adversarial: open held against none — argv must not invent a
+    /// spawn vehicle; commit stays fail-closed.
+    #[test]
+    fn sticky_held_open_x_none_clears_spawn_argv() {
+        let world = world_empty();
+        let mut b = assemble("zzzz-unmatched-objective-qqq", &world, &[], 5);
+        assert_eq!(b.proposal.topology, "none", "precondition: none classify");
+        align_with_session_topology(&mut b, "open", true);
+        assert_eq!(b.proposal.topology, "open");
+        assert!(
+            b.proposal.argv.is_empty(),
+            "open×none sticky-held: fail-closed empty argv, got {:?}",
+            b.proposal.argv
+        );
+        assert!(
+            !b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            "{:?}",
+            b.proposal.argv
+        );
+        assert_eq!(b.proposal.crew_total, 0);
+        assert!(b.proposal.why.contains("sticky-held"), "{}", b.proposal.why);
     }
 }
