@@ -728,6 +728,8 @@ pub fn is_urgent_line(line: &str) -> bool {
         || line.contains("kind 30031")
         || line.contains("ack-sla-expired")
         || line.contains("unacked for")
+        // GS-048: mid-session reclassify vehicle announce must deliver (counts as wake).
+        || line.starts_with("[reclassify]")
 }
 
 /// Expand an inbox JSON blob into row values: array, single object, or the
@@ -929,6 +931,11 @@ mod tests {
         roles.insert("captain".into(), "PinC".into());
         assert_eq!(fact_captain_pin(&roles).as_deref(), Some("PinC"));
         assert_eq!(fact_prompt_line("deploy"), "[doorbell] deploy");
+        assert!(
+            is_urgent_line("[reclassify] vehicle: none (topology=open) — miss"),
+            "GS-048 reclassify announce must deliver"
+        );
+        assert!(!is_urgent_line("[doorbell] kind 9. Pull: toron channel read"));
     }
 
     #[test]
