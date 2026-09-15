@@ -35,7 +35,12 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 | spawn-send | `spawn --profile` (never `add --oc`) |
 | cron-start | `cron start` |
 
-`workflow run` without `--execute` records control-flow only (no pane dispatch). Real work needs `--execute`. `--mode` default is **headless**. `steer` always `--execute --mode pane`. `/swarm-mode` pins `compose --parts wave-swarm --run` (do not re-run decide). `/loop-mode` pins `loop-mode run <project> --work`.
+`workflow run` without `--execute` records control-flow only (no pane dispatch). Real work needs `--execute`. `--mode` default is **headless**. `steer` always `--execute --mode pane`. `/swarm-mode` pins `compose --parts wave-swarm --run` (do not casually re-run decide until a material event). `/loop-mode` pins `loop-mode run <project> --work`.
+
+## Mid-session reclassify (GS-048)
+
+Doorbell wakes ≠ classify. On **material** context (AUTHORITATIVE objective change, explicit topology ask, new work-unit class, classifier miss, stage-chain exhaustion then continued asks): re-run `decide --json` + `workflow list --brief` + `stage list`, announce `vehicle: …` or `none: raw`. Sticky-open: preserve open unless loop/swarm/join is explicit. Tick Law: `Msg::MaterialContext` → `Cmd::Reclassify` (effect runs decide) → `Msg::DecisionReady` announce. CLI: `flywheel reclassify "<goal>"` aliases `briefing`. Non-material Channel/Job wakes stay Prompt pull-hints only.
+
 
 ## Operating topologies
 
@@ -134,3 +139,40 @@ Never invoke `__*` except documented `__wait-output`.
 | **profile** | role conditioning (harness/model/effort/behavior) referenced by stage/workflow/compose-token | always — model routing is strict; compose tokens/stages name profiles | model registry |
 
 Announce the vehicle on every dispatch (stage / workflow / compose token / `none: raw`) — crews restate it in reports (2026-09-04 contract).
+
+
+## Control planes (GS-048 diagram)
+
+One Tick Law. WorkflowHost is an **adapter**, not an AgentServer/OTP actor.
+
+```mermaid
+flowchart TB
+  subgraph elm ["Elm plane — pure"]
+    M["WorkspaceModel"]
+    MSG["Msg (WatchNdjson / MaterialContext / DecisionReady / …)"]
+    T["workspace::tick"]
+    CMD["Vec&lt;Cmd&gt; (Prompt / Reclassify / Invoke / …)"]
+    M --> T
+    MSG --> T
+    T --> M
+    T --> CMD
+  end
+  subgraph effect ["Effect actor — I/O only"]
+    H["handle_workspace_cmds / doorbell host"]
+    D["decide / briefing / herdr / toron / journal"]
+    H --> D
+    D -->|"results re-enter as Msg"| MSG
+  end
+  subgraph beads ["Beads work graph — tracker"]
+    B["br ready / claim / gate / close"]
+  end
+  CMD --> H
+  D -.->|"never mutates Model directly"| M
+  B -.->|"facts via Snapshot / Msg::Fact"| MSG
+  WH["WorkflowHost = adapter to engine + journal"] -.-> H
+```
+
+- **Elm plane:** `(Model, Msg) → (Model, Vec<Cmd>)` — no I/O, no decide-inside-tick.
+- **Effect actor:** applies Cmd; journals effects (ADR-0032); feeds DecisionReady / receipts back as Msg.
+- **Beads:** work graph / close ceremony — not a second control plane.
+- **REJECT:** Redis / AgentServer / OTP / dual peer-aware SoT as reclassify substrate.

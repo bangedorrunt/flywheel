@@ -384,6 +384,12 @@ pub struct WorkspaceModel {
     pub last_now: u64,
     /// ADR-0010 D5 (bd-65he): wall-clock of the last emitted digest.
     pub last_digest_unix: u64,
+    /// GS-048: last committed session topology (sticky-open source of truth).
+    /// `None` until a DecisionReady lands; open stays open unless loop/swarm
+    /// is explicit on the MaterialContext Msg.
+    pub session_topology: Option<String>,
+    /// GS-048: last announced vehicle line (`vehicle: …` or `none: raw`).
+    pub last_vehicle: Option<String>,
 }
 
 /// ADR-0010 D2 (bd-8jlv): one presented wake — the line as prompted,
@@ -849,6 +855,31 @@ pub enum Msg {
     Herdr {
         event: crate::durable::PollEvent,
     },
+    /// GS-048 / GS-047 §E.1: material context change (AUTHORITATIVE objective,
+    /// explicit topology ask, new work-unit class, classifier miss, stage-chain
+    /// exhaustion). Tick emits caller-applied `Cmd::Reclassify` — never runs
+    /// decide I/O inside the pure reducer. Routine Channel/Job wakes stay
+    /// WatchNdjson → Prompt-only and do NOT use this arm.
+    MaterialContext {
+        goal: String,
+        /// Operator-explicit topology (`open`/`loop`/`swarm`/`join`). `None`
+        /// preserves sticky-open (do not flip open→loop/swarm).
+        explicit_topology: Option<String>,
+        /// Why this is material (audit + announce).
+        reason: String,
+    },
+    /// GS-048: effect-layer result of `Cmd::Reclassify` (decide/briefing ran
+    /// outside tick). Re-enters the Elm plane; tick applies sticky-open and
+    /// emits the vehicle announcement Prompt.
+    DecisionReady {
+        goal: String,
+        primitive: String,
+        topology: String,
+        argv: Vec<String>,
+        decide_reason: String,
+        /// Passthrough from MaterialContext (sticky predicate).
+        explicit_topology: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -959,6 +990,15 @@ pub enum Cmd {
         harness: Option<String>,
         effect_key: String,
         note: String,
+    },
+    /// GS-048: caller-applied mid-session reclassify. Effect runs pure
+    /// `decide` (+ briefing assemble when a World is available) and
+    /// re-enters as `Msg::DecisionReady`. Tick never performs I/O here.
+    Reclassify {
+        goal: String,
+        pin: String,
+        explicit_topology: Option<String>,
+        reason: String,
     },
 }
 
@@ -1083,6 +1123,87 @@ fn prompt_allowed(model: &WorkspaceModel, pin: &str) -> bool {
         | None => false,
     }
 }
+
+/// GS-048 sticky-open: preserve open topology unless loop/swarm/join is
+/// explicit on the MaterialContext. Classified topology still wins when the
+/// session is not open, or when the operator named a topology.
+pub fn sticky_open_topology(
+    current: Option<&str>,
+    classified: &str,
+    explicit: Option<&str>,
+) -> (String, bool) {
+    if let Some(e) = explicit {
+        let e = e.trim().to_ascii_lowercase();
+        if !e.is_empty() {
+            return (e, false);
+        }
+    }
+    if current == Some("open") && matches!(classified, "loop" | "swarm") {
+        return ("open".into(), true);
+    }
+    (classified.to_string(), false)
+}
+
+/// GS-048 vehicle announcement line body (without the `[reclassify]` head).
+pub fn vehicle_announcement(primitive: &str, topology: &str) -> String {
+    if primitive.is_empty() || primitive == "none" {
+        "none: raw".into()
+    } else {
+        format!("vehicle: {primitive} (topology={topology})")
+    }
+}
+
+/// Full Prompt line for a DecisionReady announce — urgent by `[reclassify]` head.
+pub fn reclassify_announce_line(
+    vehicle: &str,
+    decide_reason: &str,
+    sticky_held: bool,
+) -> String {
+    let sticky = if sticky_held {
+        " sticky-open held"
+    } else {
+        ""
+    };
+    format!("[reclassify] {vehicle} — {decide_reason}{sticky}")
+}
+
+/// GS-048 effect helper: replace each `Cmd::Reclassify` with the cmds from
+/// folding `Msg::DecisionReady` after a pure `decide` call. Callers in the
+/// effect layer run this **before** mapping Prompt→delivery so the vehicle
+/// announce is not lost inside a nested handle.
+pub fn expand_reclassify_cmds(
+    model: &mut WorkspaceModel,
+    cmds: Vec<Cmd>,
+    decide: &dyn Fn(&str) -> (String, String, Vec<String>, String),
+) -> Vec<Cmd> {
+    let mut out = Vec::with_capacity(cmds.len());
+    for cmd in cmds {
+        match cmd {
+            Cmd::Reclassify {
+                goal,
+                pin: _,
+                explicit_topology,
+                reason: _,
+            } => {
+                let (primitive, topology, argv, decide_reason) = decide(&goal);
+                let ready = Msg::DecisionReady {
+                    goal,
+                    primitive,
+                    topology,
+                    argv,
+                    decide_reason,
+                    explicit_topology,
+                };
+                let (next, more) = tick(model, &ready);
+                *model = next;
+                out.extend(more);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 
 fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> Vec<Cmd> {
     // bd-7qg6: the old filter silently dropped every non-Idle Prompt — including
@@ -1845,6 +1966,68 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             let (sm, c) = swarm_slice(&model.swarm, crate::durable::LoopMsg::Herdr(event.clone()));
             next.swarm = sm;
             cmds.extend(c);
+        }
+        Msg::MaterialContext {
+            goal,
+            explicit_topology,
+            reason,
+        } => {
+            // Pure: schedule caller-applied effect. No decide I/O here.
+            let pin = doorbell_core::fact_captain_pin(&next.roles).unwrap_or_default();
+            cmds.push(Cmd::Reclassify {
+                goal: goal.clone(),
+                pin,
+                explicit_topology: explicit_topology.clone(),
+                reason: reason.clone(),
+            });
+            cmds.push(Cmd::Audit {
+                kind: "reclassify_requested".into(),
+                pin: doorbell_core::fact_captain_pin(&next.roles).unwrap_or_default(),
+                detail: format!("material={reason}; goal_len={}", goal.len()),
+            });
+        }
+        Msg::DecisionReady {
+            goal: _,
+            primitive,
+            topology,
+            argv,
+            decide_reason,
+            explicit_topology,
+        } => {
+            let (final_topo, sticky_held) = sticky_open_topology(
+                next.session_topology.as_deref(),
+                topology,
+                explicit_topology.as_deref(),
+            );
+            next.session_topology = Some(final_topo.clone());
+            let vehicle = vehicle_announcement(primitive, &final_topo);
+            next.last_vehicle = Some(vehicle.clone());
+            let line = reclassify_announce_line(&vehicle, decide_reason, sticky_held);
+            if let Some(pin) = doorbell_core::fact_captain_pin(&next.roles) {
+                // Urgent reclassify announces break through Busy (same E5
+                // breakthrough as plane-P); Unknown/Dead stay Audit-only.
+                let busy = matches!(next.presence.get(&pin), Some(Presence::Busy { .. }));
+                if prompt_allowed(&next, &pin) || busy {
+                    cmds.push(Cmd::Prompt {
+                        pin: pin.clone(),
+                        line: line.clone(),
+                    });
+                } else {
+                    cmds.push(Cmd::Audit {
+                        kind: "prompt_filtered".into(),
+                        pin,
+                        detail: format!("non-injectable presence held reclassify: {line}"),
+                    });
+                }
+            }
+            cmds.push(Cmd::Audit {
+                kind: "reclassify_ready".into(),
+                pin: doorbell_core::fact_captain_pin(&next.roles).unwrap_or_default(),
+                detail: format!(
+                    "primitive={primitive} topology={final_topo} sticky={sticky_held} argv_len={} vehicle={vehicle}",
+                    argv.len()
+                ),
+            });
         }
     }
 
@@ -5247,5 +5430,224 @@ mod adr0010_d5_tests {
             WakeClass::Urgent,
             "re-ring prompts bypass batching"
         );
+    }
+}
+
+
+
+#[cfg(test)]
+mod gs048_reclassify_tests {
+    use super::*;
+
+    fn idle_captain() -> WorkspaceModel {
+        let mut m = WorkspaceModel::default();
+        m.roles.insert("captain".into(), "cap".into());
+        m.presence
+            .insert("cap".into(), Presence::Idle { source: "presence".into() });
+        m.doorbell.index.insert_pin("cap".into(), None);
+        m
+    }
+
+    #[test]
+    fn sticky_open_holds_without_explicit_topology() {
+        let (t, held) = sticky_open_topology(Some("open"), "swarm", None);
+        assert_eq!(t, "open");
+        assert!(held);
+        let (t, held) = sticky_open_topology(Some("open"), "loop", None);
+        assert_eq!(t, "open");
+        assert!(held);
+        let (t, held) = sticky_open_topology(Some("open"), "swarm", Some("swarm"));
+        assert_eq!(t, "swarm");
+        assert!(!held);
+        let (t, held) = sticky_open_topology(None, "swarm", None);
+        assert_eq!(t, "swarm");
+        assert!(!held);
+    }
+
+    #[test]
+    fn vehicle_announcement_none_raw() {
+        assert_eq!(vehicle_announcement("none", "open"), "none: raw");
+        assert_eq!(vehicle_announcement("", "open"), "none: raw");
+        assert_eq!(
+            vehicle_announcement("wave-swarm", "swarm"),
+            "vehicle: wave-swarm (topology=swarm)"
+        );
+    }
+
+    #[test]
+    fn material_context_emits_reclassify_cmd_not_decide_io() {
+        let m = idle_captain();
+        let (next, cmds) = tick(
+            &m,
+            &Msg::MaterialContext {
+                goal: "ship the mid-session reclassify".into(),
+                explicit_topology: None,
+                reason: "authoritative-objective".into(),
+            },
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::Reclassify {
+                    goal,
+                    reason,
+                    ..
+                } if goal.contains("mid-session") && reason == "authoritative-objective"
+            )),
+            "expected Cmd::Reclassify: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "material tick must not Prompt before DecisionReady: {cmds:?}"
+        );
+        assert_eq!(next.session_topology, None, "topology waits for DecisionReady");
+    }
+
+    #[test]
+    fn decision_ready_announces_vehicle_and_sticky_open() {
+        let mut m = idle_captain();
+        m.session_topology = Some("open".into());
+        let (next, cmds) = tick(
+            &m,
+            &Msg::DecisionReady {
+                goal: "fan out a swarm".into(),
+                primitive: "wave-swarm".into(),
+                topology: "swarm".into(),
+                argv: vec!["workflow".into(), "compose".into()],
+                decide_reason: "matched wave-swarm".into(),
+                explicit_topology: None,
+            },
+        );
+        assert_eq!(next.session_topology.as_deref(), Some("open"));
+        assert_eq!(
+            next.last_vehicle.as_deref(),
+            Some("vehicle: wave-swarm (topology=open)")
+        );
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Prompt { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            prompts.iter().any(|l| l.starts_with("[reclassify]")
+                && l.contains("vehicle: wave-swarm (topology=open)")
+                && l.contains("sticky-open held")),
+            "expected sticky announce: {prompts:?}"
+        );
+        assert!(
+            prompts.iter().all(|l| is_urgent_line(l)),
+            "reclassify announce must be urgent/deliverable: {prompts:?}"
+        );
+    }
+
+    #[test]
+    fn decision_ready_explicit_swarm_overrides_sticky() {
+        let mut m = idle_captain();
+        m.session_topology = Some("open".into());
+        let (next, cmds) = tick(
+            &m,
+            &Msg::DecisionReady {
+                goal: "please swarm this".into(),
+                primitive: "wave-swarm".into(),
+                topology: "swarm".into(),
+                argv: vec![],
+                decide_reason: "explicit".into(),
+                explicit_topology: Some("swarm".into()),
+            },
+        );
+        assert_eq!(next.session_topology.as_deref(), Some("swarm"));
+        let line = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::Prompt { line, .. } => Some(line.clone()),
+                _ => None,
+            })
+            .expect("announce");
+        assert!(line.contains("topology=swarm"), "{line}");
+        assert!(!line.contains("sticky-open held"), "{line}");
+    }
+
+    #[test]
+    fn routine_channel_wake_stays_prompt_only_no_reclassify() {
+        let m = idle_captain();
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","cap"],["h","ch-1"]],"content":"@cap hi"}"#;
+        let (_next, cmds) = tick(&m, &Msg::WatchNdjson { line: line.into() });
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Reclassify { .. })),
+            "routine wake must not emit Reclassify: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.starts_with("[reclassify]"))),
+            "routine wake must not announce reclassify: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn same_log_same_effects_material_and_decision_ready() {
+        let m = idle_captain();
+        let msg = Msg::MaterialContext {
+            goal: "goal".into(),
+            explicit_topology: None,
+            reason: "new-work-unit".into(),
+        };
+        let (m1, c1) = tick(&m, &msg);
+        let (m2, c2) = tick(&m, &msg);
+        assert_eq!(c1, c2);
+        assert_eq!(m1.seq, m2.seq);
+
+        let ready = Msg::DecisionReady {
+            goal: "goal".into(),
+            primitive: "none".into(),
+            topology: "none".into(),
+            argv: vec![],
+            decide_reason: "catalog miss".into(),
+            explicit_topology: None,
+        };
+        let (r1, d1) = tick(&m, &ready);
+        let (r2, d2) = tick(&m, &ready);
+        assert_eq!(d1, d2);
+        assert_eq!(r1.last_vehicle, r2.last_vehicle);
+        assert_eq!(r1.last_vehicle.as_deref(), Some("none: raw"));
+    }
+
+    #[test]
+    fn expand_reclassify_cmds_runs_decide_outside_tick() {
+        let mut m = idle_captain();
+        m.session_topology = Some("open".into());
+        let (_, cmds) = tick(
+            &m,
+            &Msg::MaterialContext {
+                goal: "compose a wave swarm for the lanes".into(),
+                explicit_topology: None,
+                reason: "explicit-topology-request".into(),
+            },
+        );
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Reclassify { .. })));
+        let expanded = expand_reclassify_cmds(&mut m, cmds, &|goal| {
+            // Pure decide leaf — mirrors effect layer.
+            let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
+            (
+                d.primitive.to_string(),
+                d.topology.to_string(),
+                d.argv.clone(),
+                d.reason.clone(),
+            )
+        });
+        assert!(
+            !expanded.iter().any(|c| matches!(c, Cmd::Reclassify { .. })),
+            "expand must consume Reclassify: {expanded:?}"
+        );
+        assert!(
+            expanded
+                .iter()
+                .any(|c| matches!(c, Cmd::Prompt { line, .. } if line.starts_with("[reclassify]"))),
+            "expand must produce announce Prompt: {expanded:?}"
+        );
+        // Sticky-open: open session without explicit topology stays open.
+        assert_eq!(m.session_topology.as_deref(), Some("open"));
     }
 }

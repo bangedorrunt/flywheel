@@ -733,6 +733,22 @@ enum Commands {
         #[arg(long)]
         crew: Option<u32>,
     },
+    /// GS-048: mid-session reclassify — thin alias of `briefing` (decide leaf).
+    /// Prefer Tick-Law `Msg::MaterialContext` when a live workspace owns the
+    /// model; this CLI is the agent-initiated discoverable verb.
+    Reclassify {
+        objective: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        commit: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        crew: Option<u32>,
+    },
     /// ADR-0011 D5/D6: arrive on a project — helm, join-loud, doorbell, FCFS captain.
     Arrive {
         project: String,
@@ -3423,6 +3439,9 @@ enum WorkflowCmd {
         /// accepted: list is always JSON (agent `--json` parity)
         #[arg(long)]
         json: bool,
+        /// GS-048: name / trigger / topology only (policy speech match)
+        #[arg(long)]
+        brief: bool,
         /// project whose `.flywheel/workflows/` shadows the user catalog
         #[arg(long)]
         project: Option<String>,
@@ -4560,7 +4579,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-evaluate", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
-            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger; `workflow list --brief` is name/trigger/topology only (GS-048) — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -4671,6 +4690,23 @@ fn main() {
         Some(Commands::Snapshot { project }) => cmd_snapshot(&cfg, project),
         Some(Commands::Helm { project }) => cmd_helm(&cfg, project),
         Some(Commands::Briefing {
+            objective,
+            project,
+            json,
+            commit,
+            yes,
+            crew,
+        }) => cmd_briefing(
+            &cfg,
+            objective,
+            project.as_deref(),
+            *json,
+            *commit,
+            *yes,
+            *crew,
+        ),
+        // GS-048: thin alias — same leaf as briefing.
+        Some(Commands::Reclassify {
             objective,
             project,
             json,
@@ -11854,6 +11890,40 @@ fn handle_workspace_cmds(
                     harness.as_deref(),
                     Some(note.as_str()),
                 );
+            }
+            workspace::Cmd::Reclassify {
+                goal,
+                pin: _,
+                explicit_topology,
+                reason,
+            } => {
+                // GS-048: prefer expand_reclassify_cmds at the host boundary so
+                // Prompt announces map to Effect::Prompt. This arm remains for
+                // callers that pass raw tick output without expanding first.
+                eprintln!(
+                    "flywheel: [Reclassify] reason={reason} goal_len={} sticky_explicit={:?}",
+                    goal.len(),
+                    explicit_topology
+                );
+                let more = workspace::expand_reclassify_cmds(
+                    workspace_model,
+                    vec![workspace::Cmd::Reclassify {
+                        goal: goal.clone(),
+                        pin: String::new(),
+                        explicit_topology: explicit_topology.clone(),
+                        reason: reason.clone(),
+                    }],
+                    &|g| {
+                        let d = crate::decide::decide(g, &crate::decide::Snapshot::default());
+                        (
+                            d.primitive.to_string(),
+                            d.topology.to_string(),
+                            d.argv.clone(),
+                            d.reason.clone(),
+                        )
+                    },
+                );
+                let _ = handle_workspace_cmds(workspace_model, &more, project, cfg, false);
             }
         }
     }
@@ -29228,10 +29298,27 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     }
 
     match cmd {
-        WorkflowCmd::List { json: _, project } => {
+        WorkflowCmd::List {
+            json: _,
+            brief,
+            project,
+        } => {
             let all = read_door_workflows(cfg, project)?;
             if all.is_empty() {
                 println!("no workflows defined");
+                return Ok(());
+            }
+            if *brief {
+                // GS-048: name / trigger / topology — matches AGENTS speech.
+                let mut rows: Vec<Value> = Vec::new();
+                for (name, (wf, _source)) in &all {
+                    rows.push(json!({
+                        "name": name,
+                        "trigger": wf.trigger.as_ref().map(toron_workflow::Trigger::type_name),
+                        "topology": crate::decide::topology_for_primitive(name),
+                    }));
+                }
+                print_json(&json!({ "workflows": rows }));
                 return Ok(());
             }
             // Agent-native selection surface (ADR-0009): every row carries
@@ -36550,6 +36637,25 @@ mod integration_tests {
                 .as_deref()
                 .unwrap()
                 .contains("docs/learnings")
+        );
+    }
+
+    /// GS-048: `workflow list --brief` projects name/trigger/topology.
+    #[test]
+    fn workflow_list_brief_projects_name_trigger_topology() {
+        let wfs = builtin_workflows::builtin_workflows();
+        for (name, wf) in &wfs {
+            let topology = crate::decide::topology_for_primitive(name);
+            assert!(
+                matches!(topology, "open" | "loop" | "swarm" | "join" | "none"),
+                "{name} topology={topology}"
+            );
+            let _trigger = wf.trigger.as_ref().map(toron_workflow::Trigger::type_name);
+            let _ = (name, topology, _trigger);
+        }
+        assert_eq!(
+            crate::decide::topology_for_primitive("wave-swarm"),
+            "swarm"
         );
     }
 

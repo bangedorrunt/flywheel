@@ -59,6 +59,8 @@ One incident (2026-09-09) motivates this section: an agent skipped the session d
 
 **P2 — NO SELF-ROUTING.** The briefing classifier picks the vehicle (spawn/join/loop/open). Never decide "too small to dispatch" yourself. Done when the classifier verdict is in your transcript and you execute its argv.
 
+**P2b — MATERIAL RECLASSIFY (GS-048).** Mid-session, when context is material (AUTHORITATIVE objective change, explicit topology request, new work-unit class, classifier miss, stage-chain exhaustion then continued asks): re-run `flywheel decide --json`, `flywheel workflow list --brief`, and `flywheel stage list`; announce `vehicle: …` or `none: raw`. Preserve open unless loop/swarm/join is explicit. Routine doorbell wakes are pull hints only — never treat them as argv. Prefer `flywheel reclassify "<goal>"` (briefing alias) or the Tick Law MaterialContext path when the workspace owns the model.
+
 **P3 — CHOKEPOINT GATES STAY SHUT.** Fail-closed mechanisms (pre-commit guard, `br close` gate+sha, catalog freshness, presence gates) are enforced at the tool. Their escape hatches (`TORON_GUARD_STRICT=0`, `--no-verify`, protocol-strictness edits, prompt bypass strings) are operator-only. Done when you pass every gate on its own terms; a wrong gate triggers P4, never a hatch.
 
 **P4 — BYPASS LEDGER: LOUD OR IT DIDN'T HAPPEN.** A genuinely broken, unavailable, or wrong gate may be passed only with a written record carrying the literal token `BYPASS`, the gate name, and the reason (bead comment, memory record, or report line), one record per incident, before the next gated action. Done when the record exists. Silent workarounds are the worst failure in this file.

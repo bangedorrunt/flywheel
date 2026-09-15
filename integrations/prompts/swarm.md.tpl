@@ -70,6 +70,10 @@ each lane verifiable.
    `flywheel kill <project> --force --force-working`; br sync; commit
    .beads.
 
+## MATERIAL RECLASSIFY (GS-048)
+
+Once pinned, do not casually re-run decide — **until** a material event (AUTHORITATIVE objective change, explicit topology switch, new work-unit class, classifier miss, stage-chain exhaustion). Then: `decide --json` + `workflow list --brief` + `stage list`, announce vehicle / `none: raw`. Sticky-open still applies if the session was open.
+
 ## NO HARNESS-NATIVE DELEGATION (ADR-0010 D13)
 
 No harness-native delegation tools (agent/subagent/task/workflow/spawn/
