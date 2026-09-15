@@ -5815,4 +5815,47 @@ mod gs048_reclassify_tests {
         // Sticky-open: open session without explicit topology stays open.
         assert_eq!(m.session_topology.as_deref(), Some("open"));
     }
+
+    /// GS-049 / GS-045 P1-1 (TURN-INV / ADR-0032 I8a): source Msg payload is
+    /// immutable through tick — the reducer never rewrites the input Msg;
+    /// identical source Msg yields identical Cmds (same effect identity).
+    #[test]
+    fn source_msg_immutable_same_log_same_effects_watch_ndjson() {
+        let m = idle_captain();
+        let line = r#"{"id":"evt-1","kind":9,"content":"hello"}"#.to_string();
+        let msg = Msg::WatchNdjson { line: line.clone() };
+        let (m1, c1) = tick(&m, &msg);
+        // Source payload unchanged (by-ref borrow through tick).
+        assert!(matches!(&msg, Msg::WatchNdjson { line: l } if l == &line));
+        let (m2, c2) = tick(&m, &msg);
+        assert_eq!(c1, c2, "same source Msg must keep the same effect Cmds");
+        assert_eq!(m1.seq, m2.seq);
+    }
+
+    /// GS-049 / GS-045 P1-1: MaterialContext goal is the source-action identity
+    /// for Reclassify — retries keep the same goal / reason (effect_key surface).
+    #[test]
+    fn source_action_reclassify_goal_stable_across_retries() {
+        let m = idle_captain();
+        let goal = "AUTHORITATIVE OPERATOR OBJECTIVE: ship residuals".to_string();
+        let msg = Msg::MaterialContext {
+            goal: goal.clone(),
+            explicit_topology: None,
+            reason: "authoritative-objective".into(),
+        };
+        let (_n1, cmds1) = tick(&m, &msg);
+        let (_n2, cmds2) = tick(&m, &msg);
+        assert_eq!(cmds1, cmds2);
+        let goals: Vec<_> = cmds1
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Reclassify { goal, reason, .. } => Some((goal.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            goals,
+            vec![(goal, "authoritative-objective".into())]
+        );
+    }
 }

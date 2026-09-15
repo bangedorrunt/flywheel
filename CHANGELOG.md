@@ -4,7 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
 ## [Unreleased]
+
+### Added
+- **GS-049 Elm deepen (GS-045 P1):** `workflow evaluate` — lint + partition candidates without journal dispatch (evaluate-without-commit). Source-Msg immutability tests (I8a). Sensor→Msg vocabulary in `docs/guides/doorbell.mdx` (WatchNdjson / Herdr / AckSla / Presence / InboxSweep; no Sensor GenServer).
+
+### Fixed
+- **GS-049 residuals (GS-048):** briefing aligns with sticky `session_topology` after `[reclassify]` announce (no dual topology SoT). `steer` requires `--project` (or cwd inherit) for AUTHORITATIVE MaterialContext. `live_decide_snapshot` / briefing use real assemble `launch_pending` (no invent-green hardcoded 0). Phase-bearing failures carry `stage` (ActionStage) on ClassifiedFailure, pane/effect journal outs, and run ledger rows.
+
 ### Fixed — the workflow catalog layers the project tier at every door
 - `flywheel workflow run <name> --project <p>` resolves built-ins < user catalog < `<p>/.flywheel/workflows/*.yaml` — the catalog contract the skill and ADR-0032 both state, and the one `workflow compose` already honored (W6). Before this, a project-tier workflow failed at `workflow run` with `unknown workflow` while `compose` could resolve it, and `call_workflow` sub-runs resolved user-tier only. Sub-runs resolve against the same layered catalog the entry workflow came from.
 - The read doors land the same tiering (`bd-workflow-catalog-read-doors-project-tier-jah1`): `workflow {list,show,lint,crew}` take `--project` and read the layered catalog, so a project-tier workflow is visible, inspectable, crew-previewable, and — the point of the fail-stop gate — LINTED with the project's own workflows. A broken project-tier workflow now fails `workflow lint --project <p>` instead of shipping unlinted; bare (no `--project`) stays user-tier because nothing names the project.

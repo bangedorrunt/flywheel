@@ -66,6 +66,10 @@ pub struct ClassifiedFailure {
     pub retryable: bool,
     pub reroute_eligible: bool,
     pub evidence: String,
+    /// GS-049 / GS-045 P1-3: ActionStage spelling when known
+    /// (`normalize|input|execute|output|effect|park`). Harness/stderr
+    /// classification defaults to `execute`.
+    pub stage: &'static str,
 }
 
 pub fn classify(
@@ -97,6 +101,7 @@ pub fn classify(
             retryable: false,
             reroute_eligible: true,
             evidence,
+            stage: "execute",
         };
     }
     if lower.contains("401")
@@ -112,6 +117,7 @@ pub fn classify(
             retryable: false,
             reroute_eligible: true,
             evidence,
+            stage: "execute",
         };
     }
     if lower.contains("429")
@@ -126,6 +132,7 @@ pub fn classify(
             retryable: true,
             reroute_eligible: false,
             evidence,
+            stage: "execute",
         };
     }
     if lower.contains("unsupported_agent_kind")
@@ -143,6 +150,7 @@ pub fn classify(
             retryable: false,
             reroute_eligible: true,
             evidence,
+            stage: "execute",
         };
     }
     if lower.contains("timeout")
@@ -156,6 +164,7 @@ pub fn classify(
             retryable: true,
             reroute_eligible: false,
             evidence,
+            stage: "execute",
         };
     }
     if lower.contains("reservation conflict")
@@ -168,6 +177,7 @@ pub fn classify(
             retryable: false,
             reroute_eligible: false,
             evidence,
+            stage: "execute",
         };
     }
     ClassifiedFailure {
@@ -175,6 +185,7 @@ pub fn classify(
         retryable: false,
         reroute_eligible: false,
         evidence: truncate_evidence(stderr_tail, 512),
+        stage: "execute",
     }
 }
 
@@ -357,5 +368,12 @@ mod tests {
         assert_eq!(c.kind, FailureKind::Billing);
         let c = classify("RATE LIMIT exceeded", None, None);
         assert_eq!(c.kind, FailureKind::RateLimit);
+    }
+
+    #[test]
+    fn stage_defaults_to_execute_on_classified_failures() {
+        let cf = classify("timeout after 30s", None, None);
+        assert_eq!(cf.stage, "execute");
+        assert_eq!(cf.kind, FailureKind::Timeout);
     }
 }

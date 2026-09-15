@@ -27,6 +27,9 @@ pub struct World {
     pub pin_count: u32,
     pub held_paths: Vec<String>,
     pub coalition_id: Option<String>,
+    /// GS-049: agents still launch-pending (from snapshot assemble).
+    #[serde(default)]
+    pub launch_pending: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +120,7 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
     let snap = decide::Snapshot {
         ready_bead_count: world.ready_beads,
         profiled_panes: world.pin_count,
-        launch_pending: 0,
+        launch_pending: world.launch_pending,
         contention: !world.held_paths.is_empty(),
     };
     let decision = decide::decide(objective, &snap);
@@ -218,6 +221,70 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
         ],
     }
 }
+
+/// GS-049: after sticky-open `[reclassify]` announce, briefing must not present
+/// a conflicting second topology surface (dual SoT). Align proposal + question
+/// default with sticky `session_topology`; when sticky-held against a spawn
+/// classify, rewrite argv so `--commit` cannot spawn the suppressed vehicle.
+pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held: bool) {
+    let session = session.trim();
+    if session.is_empty() {
+        return;
+    }
+    if b.proposal.topology == session {
+        if sticky_held && !b.proposal.why.contains("sticky") {
+            b.proposal.why = format!("{} — sticky session topology held", b.proposal.why);
+        }
+        return;
+    }
+    let classified = b.proposal.topology.clone();
+    b.proposal.topology = session.to_string();
+    if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
+        q.default = session.to_string();
+    }
+    b.proposal.why = format!(
+        "session_topology={session}{} — aligned (suppressed dual classify surface was topology={classified}): {}",
+        if sticky_held { " sticky-held" } else { "" },
+        b.proposal.why
+    );
+    // Sticky-held open/loop must not leave swarm/join spawn argv as the commit surface.
+    if sticky_held
+        && matches!(session, "open" | "loop")
+        && matches!(classified.as_str(), "swarm" | "join")
+    {
+        match session {
+            "open" => {
+                b.proposal.argv = vec![
+                    "flywheel".into(),
+                    "workflow".into(),
+                    "run".into(),
+                    b.proposal.workflow.clone(),
+                    "--mode".into(),
+                    "headless".into(),
+                ];
+                b.proposal.crew.clear();
+                b.proposal.crew_total = 0;
+                b.proposal.add.clear();
+                b.proposal.remove.clear();
+            }
+            "loop" => {
+                b.proposal.argv = vec![
+                    "flywheel".into(),
+                    "loop-mode".into(),
+                    "run".into(),
+                    b.world.project.clone(),
+                    "--work".into(),
+                ];
+                b.proposal.crew.clear();
+                b.proposal.crew_total = 0;
+                b.proposal.add.clear();
+                b.proposal.remove.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -333,5 +400,28 @@ mod tests {
         assert_eq!(d.primitive, "babysit-bead");
         assert_eq!(b.proposal.topology, d.topology);
         assert_eq!(b.proposal.topology, "open");
+    }
+
+    #[test]
+    fn sticky_held_suppresses_conflicting_swarm_proposal() {
+        let world = world_empty();
+        let mut b = assemble("wave-swarm the auth lanes", &world, &["coder".into()], 5);
+        assert_eq!(b.proposal.topology, "swarm");
+        align_with_session_topology(&mut b, "open", true);
+        assert_eq!(b.proposal.topology, "open");
+        assert_eq!(
+            b.questions
+                .iter()
+                .find(|q| q.id == "topology")
+                .map(|q| q.default.as_str()),
+            Some("open")
+        );
+        assert!(b.proposal.why.contains("sticky-held"), "{}", b.proposal.why);
+        assert!(b.proposal.why.contains("suppressed dual"), "{}", b.proposal.why);
+        assert!(
+            !b.proposal.argv.iter().any(|a| a == "--crew"),
+            "spawn crew argv suppressed: {:?}",
+            b.proposal.argv
+        );
     }
 }

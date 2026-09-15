@@ -924,6 +924,8 @@ pub fn pane_dispatch(
             "error": if err.trim().is_empty() { raw } else { err },
             "profile": profile_name,
             "agent": entry.name,
+            // GS-049 P1-3: phase-bearing failure (ActionStage)
+            "stage": cf.stage,
         });
         if cf.kind != crate::failure::FailureKind::Unknown {
             out["kind"] = json!(cf.kind.to_string());

@@ -373,7 +373,12 @@ fn mail_outcome(plane: &MailPlane, effect_key: &str, delivery: MailDelivery) -> 
 fn leaf_value(result: Result<Value>) -> Value {
     match result {
         Ok(value) => value,
-        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "error": e.to_string(),
+            // GS-049 P1-3: phase-bearing — leaf Err is an execute-stage failure
+            "stage": "execute",
+        }),
     }
 }
 
@@ -645,10 +650,13 @@ fn fenced_outcome(result: Result<toron_mcp::workflow_host::DispatchResult>) -> V
             "effect_key": res.effect_key,
             "effect_state": res.state.as_str(),
             "outcome": res.outcome,
+            "stage": "effect",
         }),
         Err(e) => serde_json::json!({
             "ok": false,
             "error": format!("{e:#}"),
+            // GS-049 P1-3: fence dispatch Err — effect stage
+            "stage": "effect",
         }),
     }
 }
