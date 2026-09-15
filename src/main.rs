@@ -733,6 +733,23 @@ enum Commands {
         #[arg(long)]
         crew: Option<u32>,
     },
+    /// GS-048: mid-session reclassify — enters Elm plane via
+    /// `Msg::MaterialContext` → `Cmd::Reclassify` → `Msg::DecisionReady`
+    /// (sticky-open applied). Also prints the briefing proposal (same leaf
+    /// facts as `briefing`). Prefer this over inventing a second classifier.
+    Reclassify {
+        objective: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        commit: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        crew: Option<u32>,
+    },
     /// ADR-0011 D5/D6: arrive on a project — helm, join-loud, doorbell, FCFS captain.
     Arrive {
         project: String,
@@ -3423,6 +3440,9 @@ enum WorkflowCmd {
         /// accepted: list is always JSON (agent `--json` parity)
         #[arg(long)]
         json: bool,
+        /// GS-048: name / trigger / topology only (policy speech match)
+        #[arg(long)]
+        brief: bool,
         /// project whose `.flywheel/workflows/` shadows the user catalog
         #[arg(long)]
         project: Option<String>,
@@ -4560,7 +4580,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-evaluate", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
-            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger; `workflow list --brief` is name/trigger/topology only (GS-048) — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -4678,6 +4698,24 @@ fn main() {
             yes,
             crew,
         }) => cmd_briefing(
+            &cfg,
+            objective,
+            project.as_deref(),
+            *json,
+            *commit,
+            *yes,
+            *crew,
+        ),
+        // GS-048: Elm-plane reclassify (MaterialContext → sticky DecisionReady)
+        // plus briefing proposal print (same live Snapshot as CLI decide).
+        Some(Commands::Reclassify {
+            objective,
+            project,
+            json,
+            commit,
+            yes,
+            crew,
+        }) => cmd_reclassify(
             &cfg,
             objective,
             project.as_deref(),
@@ -11855,6 +11893,44 @@ fn handle_workspace_cmds(
                     Some(note.as_str()),
                 );
             }
+            workspace::Cmd::Reclassify {
+                goal,
+                pin: _,
+                explicit_topology,
+                reason,
+            } => {
+                // GS-048: prefer expand_reclassify_cmds at the host boundary so
+                // Prompt announces map to Effect::Prompt. Live Snapshot — never
+                // Snapshot::default() invent-green. Persist sticky topology.
+                eprintln!(
+                    "flywheel: [Reclassify] reason={reason} goal_len={} sticky_explicit={:?}",
+                    goal.len(),
+                    explicit_topology
+                );
+                let snap = live_decide_snapshot(cfg, project);
+                let more = workspace::expand_reclassify_cmds(
+                    workspace_model,
+                    vec![workspace::Cmd::Reclassify {
+                        goal: goal.clone(),
+                        pin: String::new(),
+                        explicit_topology: explicit_topology.clone(),
+                        reason: reason.clone(),
+                    }],
+                    &|g| {
+                        let d = crate::decide::decide(g, &snap);
+                        (
+                            d.primitive.to_string(),
+                            d.topology.to_string(),
+                            d.argv.clone(),
+                            d.reason.clone(),
+                        )
+                    },
+                );
+                if let Some(topo) = workspace_model.session_topology.as_deref() {
+                    let _ = state::save_session_topology(project, topo);
+                }
+                let _ = handle_workspace_cmds(workspace_model, &more, project, cfg, false);
+            }
         }
     }
     if drain_waits {
@@ -14707,6 +14783,87 @@ fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     print_json(&serde_json::to_value(&snap)?);
     Ok(())
+}
+
+/// GS-048: live decide Snapshot from the same world facts as `briefing` /
+/// `decide --project` — ready beads, profiled panes, contention. Never use
+/// `Snapshot::default()` in production expand_reclassify paths (invent-green).
+pub(crate) fn live_decide_snapshot(cfg: &Config, project: &str) -> decide::Snapshot {
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let live = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    decide::Snapshot {
+        ready_bead_count: live
+            .lanes
+            .iter()
+            .filter(|l| l.status == "open" || l.status == "ready")
+            .count() as u32,
+        profiled_panes: live.pins.len() as u32,
+        launch_pending: 0,
+        contention: !live.held_paths.is_empty(),
+    }
+}
+
+/// GS-048: mid-session reclassify enters the Elm plane
+/// (`Msg::MaterialContext` → expand → `DecisionReady` sticky announce), then
+/// prints the briefing proposal with the same live Snapshot. Does **not**
+/// bypass sticky-open via a bare `cmd_briefing` alias.
+fn cmd_reclassify(
+    cfg: &Config,
+    objective: &str,
+    project: Option<&str>,
+    json: bool,
+    commit: bool,
+    yes: bool,
+    crew: Option<u32>,
+) -> Result<()> {
+    let project = project.unwrap_or("toron");
+    // Seed model with sticky topology from prior DecisionReady (if any).
+    let mut model = workspace::WorkspaceModel::default();
+    if let Some(topo) = state::load_session_topology(project) {
+        model.session_topology = Some(topo);
+    }
+    // Seed captain role so DecisionReady can Prompt announce.
+    if let Some(pin) = state::load_captain_alias(project) {
+        model.roles.insert("captain".into(), pin.clone());
+        model
+            .presence
+            .insert(pin.clone(), workspace::Presence::Idle { source: "reclassify".into() });
+        model.doorbell.index.insert_pin(pin, None);
+    }
+    let reason = workspace::material_context_reason(objective)
+        .unwrap_or("operator-goal-change");
+    let msg = workspace::material_context_msg(objective, reason);
+    let (next, cmds) = workspace::tick(&model, &msg);
+    model = next;
+    let snap = live_decide_snapshot(cfg, project);
+    let expanded = workspace::expand_reclassify_cmds(&mut model, cmds, &|goal| {
+        let d = decide::decide(goal, &snap);
+        (
+            d.primitive.to_string(),
+            d.topology.to_string(),
+            d.argv.clone(),
+            d.reason.clone(),
+        )
+    });
+    if let Some(topo) = model.session_topology.as_deref() {
+        let _ = state::save_session_topology(project, topo);
+    }
+    // Surface announce lines for the CLI user (Elm plane result).
+    for c in &expanded {
+        if let workspace::Cmd::Prompt { line, .. } = c {
+            if line.starts_with("[reclassify]") {
+                eprintln!("{line}");
+            }
+        }
+        if let workspace::Cmd::Audit { kind, detail, .. } = c {
+            if kind == "reclassify_ready" || kind == "reclassify_requested" {
+                eprintln!("flywheel: [{kind}] {detail}");
+            }
+        }
+    }
+    // Briefing proposal print / optional commit — same leaf as before, but
+    // sticky already applied above on the Elm plane.
+    cmd_briefing(cfg, objective, Some(project), json, commit, yes, crew)
 }
 
 /// ADR-0010 D10 (bd-67qg): the one session-start drain over the snapshot.
@@ -28845,6 +29002,15 @@ fn cmd_steer(
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
     }
+    // GS-048: AUTHORITATIVE steer objective is material — queue into the live
+    // doorbell Fact drain so Host::tick emits Msg::MaterialContext (not a
+    // parallel classifier plane).
+    if let Some(p) = project {
+        let summary = format!("AUTHORITATIVE OPERATOR OBJECTIVE: {objective}");
+        if let Err(e) = append_pending_fact(p, &summary) {
+            eprintln!("flywheel: [reclassify] could not queue material steer fact: {e:#}");
+        }
+    }
     let mut crew_owned = crew.map(|s| s.to_string());
     // bd-xe9r: on an INTERACTIVE TTY — skipped by --json, --yes, or an
     // explicit --crew (an agent driver knows its fleet already) — brief the
@@ -29228,10 +29394,27 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     }
 
     match cmd {
-        WorkflowCmd::List { json: _, project } => {
+        WorkflowCmd::List {
+            json: _,
+            brief,
+            project,
+        } => {
             let all = read_door_workflows(cfg, project)?;
             if all.is_empty() {
                 println!("no workflows defined");
+                return Ok(());
+            }
+            if *brief {
+                // GS-048: name / trigger / topology — matches AGENTS speech.
+                let mut rows: Vec<Value> = Vec::new();
+                for (name, (wf, _source)) in &all {
+                    rows.push(json!({
+                        "name": name,
+                        "trigger": wf.trigger.as_ref().map(toron_workflow::Trigger::type_name),
+                        "topology": crate::decide::topology_for_primitive(name),
+                    }));
+                }
+                print_json(&json!({ "workflows": rows }));
                 return Ok(());
             }
             // Agent-native selection surface (ADR-0009): every row carries
@@ -36551,6 +36734,34 @@ mod integration_tests {
                 .unwrap()
                 .contains("docs/learnings")
         );
+    }
+
+    /// GS-048: `workflow list --brief` projects name/trigger/topology via the
+    /// real `WorkflowCmd::List { brief: true }` / `cmd_workflow` path.
+    #[test]
+    fn workflow_list_brief_projects_name_trigger_topology() {
+        let wfs = builtin_workflows::builtin_workflows();
+        for (name, wf) in &wfs {
+            let topology = crate::decide::topology_for_primitive(name);
+            assert!(
+                matches!(topology, "open" | "loop" | "swarm" | "join" | "none"),
+                "{name} topology={topology}"
+            );
+            let _trigger = wf.trigger.as_ref().map(toron_workflow::Trigger::type_name);
+            let _ = (name, topology, _trigger);
+        }
+        assert_eq!(
+            crate::decide::topology_for_primitive("wave-swarm"),
+            "swarm"
+        );
+        // Actually invoke WorkflowCmd::List { brief: true } / cmd_workflow.
+        let cfg = Config::default();
+        let cmd = WorkflowCmd::List {
+            json: false,
+            brief: true,
+            project: None,
+        };
+        cmd_workflow(&cfg, &cmd).expect("WorkflowCmd::List { brief: true } must succeed");
     }
 
     /// bd-oj9o #3: a rendered workflow command = frontmatter (with the
