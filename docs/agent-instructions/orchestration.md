@@ -54,9 +54,22 @@ These are not interchangeable with workflow definitions:
   It may use `loop-mode --work` for bead supervision, but peer wake does not
   depend on the loop.
 
-A **workflow** is a reusable engine procedure. It can run inside a loop,
-inside a swarm, headlessly, or directly; it is not itself an execution
+A **workflow** is a reusable engine procedure. It can run inside open mode,
+a loop, a swarm, headlessly, or directly; it is not itself an execution
 topology.
+
+Open mode is not workflow-blind: when the current pane is the intended
+executor, use `workflow run <name> --execute --mode headless` for a bounded
+one-shot, or pane mode with an existing workspace. Compose tokens remain
+explicit and do not authorize spawning by themselves. On every follow-up or
+material context change, re-read `workflow list --brief --json` and `stage
+list`, select the smallest useful vehicle, or explicitly use `none: raw`;
+do not reuse a first-prompt route after the task has changed.
+
+Nested `call_workflow` runs are durable and now fail closed on recursive call
+chains, maximum depth (`8` including the root), or exhausted child budget
+(`32` child calls per lineage branch). The guard runs before `ctx.run` creates
+the child and the lineage is carried in the serialized trigger for replay.
 
 
 A **stage** is one prompt (`send --stage`). The verify-phase `ce-evaluate`

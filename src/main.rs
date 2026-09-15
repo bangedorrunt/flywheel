@@ -3440,7 +3440,7 @@ enum WorkflowCmd {
         /// accepted: list is always JSON (agent `--json` parity)
         #[arg(long)]
         json: bool,
-        /// GS-048: name / trigger / topology only (policy speech match)
+        /// emit the bounded family/selection projection instead of full descriptions
         #[arg(long)]
         brief: bool,
         /// project whose `.flywheel/workflows/` shadows the user catalog
@@ -4584,6 +4584,7 @@ fn main() {
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-evaluate", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
             "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/evaluate/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger; `workflow list --brief` is name/trigger/topology only (GS-048) — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): `workflow list --brief --json` is the low-context selector (family + selection + run); default list carries full descriptions; use `workflow show` for detail. Built-in catalog currently has 40 workflows. Select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -29558,9 +29559,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 } else {
                     format!("workflow run {name} --execute")
                 };
+                let (family, selection) = crate::builtin_workflows::workflow_guidance(name)
+                    .unwrap_or(("custom", "inspect workflow show before running"));
                 rows.push(json!({
                     "name": name,
                     "description": wf.description,
+                    "family": family,
+                    "selection": selection,
                     "run": run,
                     "compose_token": token,
                     "source": source,
@@ -29576,7 +29581,25 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "decide_trigger": crate::decide::decide_trigger_for(name),
                 }));
             }
-            print_json(&json!({ "workflows": rows }));
+            if *brief {
+                let compact: Vec<Value> = rows
+                    .into_iter()
+                    .map(|row| {
+                        json!({
+                            "name": row["name"],
+                            "family": row["family"],
+                            "selection": row["selection"],
+                            "run": row["run"],
+                            "compose_token": row["compose_token"],
+                            "source": row["source"],
+                            "decide_trigger": row["decide_trigger"],
+                        })
+                    })
+                    .collect();
+                print_json(&json!({ "workflows": compact }));
+            } else {
+                print_json(&json!({ "workflows": rows }));
+            }
             Ok(())
         }
         WorkflowCmd::Show { name, project } => {

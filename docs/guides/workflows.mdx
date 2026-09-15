@@ -7,7 +7,7 @@ Three nouns, precisely: a **stage** is one named prompt (catalog: `stage list`).
 
 Ordinary builtins (`captain-audit` and friends) are not tokens: `workflow run <name> --execute` runs them. The `recipes` command is the legacy squad surface (spawn shapes), not compose; say "squad" for spawn shapes.
 
-Every `workflow list --json` row carries `description`, `run` (the exact invocation), and `decide_trigger`, so selection works like a skill catalog.
+Every `workflow list --json` row carries `description`, `family`, `selection`, `run` (the exact invocation), and `decide_trigger`, so selection works like a skill catalog. Use `workflow list --brief --json` for the bounded low-context projection; use `workflow show <name>` for the full definition. The one-by-one review is in [workflow-catalog-review](./workflow-catalog-review).
 
 ## The --parts grammar
 
@@ -47,7 +47,9 @@ Actions: `spawn` (the workhorse: `profile`, `stage`, `await`, per-step `harness`
 
 Step policies: `on_error: continue` (default) or `fail_run` (the step's failure fails the run, kind-46012 `status=failed`); `await: true` blocks for the agent's result. Role conditioning is always on: every spawn and dispatch prompt is prepended with the profile's behavior preamble, which is how a role takes effect at runtime.
 
-Execution modes: `--mode pane` (crew pre-spawned in herdr panes, bus-auditable, best for interactive work) and `--mode headless` (one-shot harness run, no panes, local, best for cron and short idempotent work). `--execute` opts into real dispatch; without it, `workflow run` records control flow only. Lint (fail-stop) checks graph acyclicity, stage and alias resolution, `@profile` resolution, required inputs, and guard syntax.
+Execution modes: `--mode pane` (crew pre-spawned in herdr panes, bus-auditable, best for interactive work) and `--mode headless` (one-shot harness run, no panes, local, best for cron and short idempotent work). `--execute` opts into real dispatch; without it, `workflow run` records control flow only. A workflow is usable from open mode too: keep the current pane as the topology, and invoke a bounded workflow directly (`workflow run <name> --execute --mode headless`, or pane mode against an existing workspace); compose tokens remain explicit and do not silently spawn. Lint (fail-stop) checks graph acyclicity, stage and alias resolution, `@profile` resolution, required inputs, and guard syntax.
+
+Session routing is continuous, not a first-prompt decision: on each new objective or material context change, inspect `workflow list --brief --json` and `stage list`, trigger the smallest matching workflow/stage, or explicitly choose `none: raw`. Re-run selection after each meaningful work unit when the task changes shape (bug-fix, review, verify, compound, or resume), while preserving the current topology unless the operator chooses loop/swarm.
 
 Three gates validate the same closed action contracts: parse/normalize, lint, and invoke. Unknown fields, bad refs, invalid collections, and phase typos fail loud at the earliest gate; a valid template that renders an invalid runtime value is re-validated at invoke. Guards are explicit: a false guard is a skipped outcome with node identity, while a syntax/type/unresolved-ref error is a contract failure, never a silent false.
 
@@ -75,6 +77,8 @@ flowchart LR
 ```
 
 `workflow run` without `--execute` records control flow only; no pane dispatches, and a `runs/` row can still show completed. `--mode` defaults to `headless`; `flywheel steer` is `--execute --mode pane`. Interactive TTY runs brief before dispatch (crew counts, model menus, stage chain, go/no-go) and a confirmed pane count mutates the spawn plan; `--json`, `--yes`, or an explicit `--crew N` skips it, and non-TTY is byte-identical.
+
+Nested workflows use durable `ctx.run` children. The engine carries a serialized lineage envelope and refuses cycles, nesting beyond 8 workflows, or more than 32 child calls along one lineage branch before creating the child promise. This is an execution guard, not prompt guidance.
 
 ## Authoring and graduation
 

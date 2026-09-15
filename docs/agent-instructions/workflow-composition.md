@@ -45,7 +45,9 @@ Door map (one door per intent):
 | Supervise a solo durable lane | topology `loop-mode` | "run the loop workflow" |
 | Human gate on outer wave | SIGNOFF = `request_approval` on **outer** run only | nested crew inventing signoff |
 
-Invariants (each stated once): **preview ≠ started** — compose without `--run` only lints + previews the crew. **SIGNOFF outer-only** — nested captain+crew via `call_workflow` / `dispatch_job` never open a second `request_approval`. Ordinary builtins enter via `workflow run <name> --execute` — never bare `--parts`.
+Invariants (each stated once): **preview ≠ started** — compose without `--run` only lints + previews the crew. **SIGNOFF outer-only** — nested captain+crew via `call_workflow` / `dispatch_job` never open a second `request_approval`. Ordinary builtins enter via `workflow run <name> --execute` — never bare `--parts`. Open mode may run a bounded ordinary workflow or stage in the current pane; that procedure does not change topology or grant delegation permission. On every follow-up/material context change, re-check `workflow list --brief --json` and `stage list`, choose the smallest vehicle, or announce `none: raw` rather than replaying a stale first-prompt choice.
+
+Recursive `call_workflow` is durable Inception-style composition, but host-bounded: serialized lineage rejects cycles, depth beyond 8 (root included), and exhausted 32-child budget per lineage branch before `ctx.run` creates the child. The guard is an engine contract, not a prompt suggestion.
 
 Evaluation contract: `ce-evaluate` is a fresh-context, read-only reviewer stage used by `repair-until-verified`. It returns structured findings only; its `done` field is advisory. The host `VerifySink` and phase contract own pass/fail, and ship-chain evaluations are persisted as bounded, redacted `EvaluationEvidence` under the parent run. Inspect them with `flywheel artifacts stitch <run_id> --project <p>`; do not treat worker status fields as proof.
 
