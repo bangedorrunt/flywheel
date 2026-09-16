@@ -404,6 +404,10 @@ pub fn seed_swarm_resume(
                     bead_id: v.clone(),
                     grace_polls: DRAIN_GRACE_POLLS,
                     defers: 0,
+                    // A crash deliberately drops a declared pause: the pane
+                    // re-declares on the next poll's tail read, and a stale
+                    // clock must never resurrect a wait nobody is holding.
+                    paused: None,
                 },
             )
         })
@@ -468,6 +472,34 @@ pub struct DrainState {
     /// 0 via the resume seed (fresh grace, never force-kill immediately).
     #[serde(default)]
     pub defers: u32,
+    /// ADR-0010 D4/D12 declared-`paused:` wait. While set, the grace
+    /// countdown is HELD — a declared wait is not a stuck pane — and the loop
+    /// re-surfaces the wait to its named owner every `resurface_secs`,
+    /// re-arming the clock each window so a human wait can never hang
+    /// silently (never auto-interrupt; auto-kill stays `--force-working`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<PausedWait>,
+}
+
+/// One declared `paused:` wait on a drained pane (ADR-0010 D4/D12): the human
+/// who owns it, the paused-since clock, and the resurface cadence.
+///
+/// `instant`/`resurface_secs` travel ON the declaration (the shell stamps them
+/// from `write_liveness::WalkOpts`), so the reducer reads no environment and a
+/// journaled declaration replays to the same decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PausedWait {
+    /// The human named by the declaration (`paused: <owner>`).
+    pub owner: String,
+    /// Tick-clock secs of the FIRST declaration. A repeat never re-stamps
+    /// this, so the reported age (and the resurface) stays honest.
+    pub since: u64,
+    /// Resurface window in secs (default 3600 — the doorbell's pending-wait
+    /// park TTL, so both wait kinds age the same).
+    pub resurface_secs: u64,
+    /// Windows already resurfaced (bounded, observable repeats).
+    #[serde(default)]
+    pub resurfaced: u32,
 }
 
 /// THE grace bound (bd-zfnx.10): a drained pane gets this many polls to
@@ -528,6 +560,18 @@ pub enum LoopMsg {
     DrainRequest {
         name: String,
         bead_id: String,
+    },
+    /// ADR-0010 D4/D12: a drained pane DECLARED a wait on a human
+    /// (`paused: <owner>`) instead of finishing its fence. Folded by the shell
+    /// before the Tick that would count grace down; the declaration carries
+    /// its own clock (`now`) and resurface window (no environment read in the
+    /// reducer). A declaration for a pane with no open drain is ignored — the
+    /// loop does not invent a wait.
+    PauseDeclared {
+        name: String,
+        owner: String,
+        now: u64,
+        resurface_secs: u64,
     },
     /// ADR-0011 D7 / ADR-0029 Wave 1: rot scorer input for one pane.
     Rot {
@@ -709,11 +753,33 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
                     bead_id: bead_id.clone(),
                     grace_polls: DRAIN_GRACE_POLLS,
                     defers: 0,
+                    paused: None,
                 });
             actions.push(LoopAction::Send {
                 name: name.clone(),
                 text: drain_prompt(bead_id),
             });
+        }
+        LoopMsg::PauseDeclared {
+            name,
+            owner,
+            now,
+            resurface_secs,
+        } => {
+            // D12: every waiting state names its owner. Only an OPEN drain can
+            // hold a declared wait, and only the FIRST declaration starts the
+            // clock — a re-declaration (the pane repeats itself, or a crash
+            // replay re-delivers) must not re-base the age.
+            if let Some(ds) = next.drain_pending.get_mut(name)
+                && ds.paused.is_none()
+            {
+                ds.paused = Some(PausedWait {
+                    owner: owner.clone(),
+                    since: *now,
+                    resurface_secs: *resurface_secs,
+                    resurfaced: 0,
+                });
+            }
         }
         LoopMsg::Rot { name, events } => match crate::rot::action(events) {
             crate::rot::RotAction::Respawn => actions.push(LoopAction::Respawn {
@@ -738,12 +804,37 @@ pub fn tick(model: &LoopModel, msg: &LoopMsg) -> (LoopModel, Vec<LoopAction>) {
             // the record (executor kills + LoudMiss). Exit via Heal fulfills
             // first (arm above), so a finished pane is never force-stopped.
             let mut expired: Vec<(String, String, u32)> = Vec::new();
+            let mut resurfaced: Vec<(String, String, String, u64)> = Vec::new();
             for (name, ds) in &mut next.drain_pending {
+                let bead_id = ds.bead_id.clone();
+                // ADR-0010 D4/D12: a drain holding a DECLARED `paused:` wait is
+                // not a stuck pane — grace is HELD (never force-stopped) and
+                // the wait is re-surfaced to its named owner once per window.
+                // `paused_resurface_due` is the one predicate for "is this wait
+                // due to re-surface"; re-arming `since` keeps each repeat
+                // bounded and observable instead of a per-tick spam.
+                if let Some(p) = ds.paused.as_mut() {
+                    let age_secs = now.saturating_sub(p.since);
+                    if crate::write_liveness::paused_resurface_due(age_secs, p.resurface_secs) {
+                        resurfaced.push((name.clone(), bead_id, p.owner.clone(), age_secs));
+                        p.since = *now;
+                        p.resurfaced = p.resurfaced.saturating_add(1);
+                    }
+                    continue;
+                }
                 if ds.grace_polls == 0 {
-                    expired.push((name.clone(), ds.bead_id.clone(), ds.defers));
+                    expired.push((name.clone(), bead_id, ds.defers));
                 } else {
                     ds.grace_polls -= 1;
                 }
+            }
+            for (name, bead_id, owner, age_secs) in resurfaced {
+                actions.push(LoopAction::PausedResurface {
+                    name,
+                    bead_id,
+                    owner,
+                    age_secs,
+                });
             }
             for (name, bead_id, defers) in expired {
                 next.drain_pending.remove(&name);
@@ -1299,6 +1390,49 @@ async fn reservation_board_live(project: &str) -> Vec<(String, String)> {
     let raw = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
     parse_reservation_rows(&v)
+}
+
+/// Recent terminal text for one pane (`__read`), a LIVE read with the same
+/// degrade-to-empty contract as [`reservation_board_live`]: any failure logs
+/// and returns empty, so a pane whose tail cannot be read keeps the ordinary
+/// drain path (never a stalled loop, never an invented declaration).
+async fn read_pane_terminal_live(project: &str, name: &str) -> String {
+    let exe = match self_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("flywheel: pane tail read skipped (continuing): {e:#}");
+            return String::new();
+        }
+    };
+    let mut cmd = Command::new(&exe);
+    cmd.args(["__read", project, name]);
+    let out = match run_leaf_cmd(cmd, "__read").await {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("flywheel: pane tail read failed (continuing): {e:#}");
+            return String::new();
+        }
+    };
+    if !out.status.success() {
+        eprintln!(
+            "flywheel: pane tail read failed (continuing): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return String::new();
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<serde_json::Value>(raw.trim())
+        .map(|v| parse_read_output(&v).terminal)
+        .unwrap_or_default()
+}
+
+/// ADR-0010 D4/D12: the one rendering of a declared-pause resurface — who the
+/// wait names, which bead it holds, and how long it has been held. Pure, so
+/// both the durable and sync executors surface byte-identical text.
+pub fn pause_resurface_line(name: &str, bead_id: &str, owner: &str, age_secs: u64) -> String {
+    format!(
+        "pause-resurface: {name} declared `paused: {owner}` ({age_secs}s held, bead {bead_id}) — the wait needs {owner}; the pane is held, never auto-interrupted"
+    )
 }
 
 /// Args for the `__close-check` leaf (ADR-0019, bd-w1-reopen-f6tw).
@@ -4159,6 +4293,15 @@ pub enum LoopAction {
     Blocked {
         name: String,
     },
+    /// ADR-0010 D4/D12: re-surface a drained pane's declared `paused:` wait to
+    /// the human who owns it. Emitted once per resurface window and re-armed,
+    /// so the wait repeats loudly instead of parking forever.
+    PausedResurface {
+        name: String,
+        bead_id: String,
+        owner: String,
+        age_secs: u64,
+    },
     Nudge {
         name: String,
     },
@@ -4514,7 +4657,10 @@ pub fn close_nudge_prompt(bead_id: &str, title: &str) -> String {
 pub fn drain_prompt(bead_id: &str) -> String {
     format!(
         "[drain-stop] Finish your current VERIFY fence for {bead_id} and report on its thread now; \
-         do not start new work. You are being drained, not re-tasked."
+         do not start new work. You are being drained, not re-tasked. \
+         If you are WAITING ON A HUMAN instead, declare it: reply `paused: <who>` (\
+         the named owner) — the loop holds your grace and re-surfaces the wait \
+         to that owner every 3600s (ADR-0010 D4/D12); it does not auto-interrupt you."
     )
 }
 
@@ -7132,6 +7278,43 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 LoopMsg::Herdr(pe.clone()),
             ));
         }
+        // ADR-0010 D4/D12 producer: a drained pane may DECLARE a wait on a
+        // human (`paused: <owner>`) instead of finishing its fence. Read each
+        // drained pane's tail ONCE per poll (bounded by the open drains) and
+        // fold the declaration BEFORE the Tick that would count grace down, so
+        // a declared wait holds grace instead of being force-stopped. Folded
+        // through `tick_from_loop_msg` + journalled exactly like `fold` above —
+        // the shell never writes the model directly.
+        let pause_secs = crate::write_liveness::WalkOpts::from_env().pause_resurface_secs;
+        let drained: Vec<String> = swarm.drain_pending.keys().cloned().collect();
+        for name in drained {
+            if swarm
+                .drain_pending
+                .get(&name)
+                .is_none_or(|ds| ds.paused.is_some())
+            {
+                continue; // fulfilled already, or the clock owns the cadence
+            }
+            let terminal = read_pane_terminal_live(&params.project, &name).await;
+            let Some(declared) = crate::write_liveness::parse_paused_declaration(&terminal) else {
+                continue;
+            };
+            let journal_msg = LoopMsg::PauseDeclared {
+                name: name.clone(),
+                owner: declared.owner.clone(),
+                now,
+                resurface_secs: pause_secs,
+            };
+            let before = swarm.clone();
+            let (folded, acts) = crate::workspace::tick_from_loop_msg(&swarm, &journal_msg);
+            swarm = folded;
+            let _ = crate::state::journal_loop_msg(&params.project, &journal_msg, &before, &acts);
+            poll_actions.extend(acts);
+            eprintln!(
+                "flywheel: {name} declared `paused: {}` — grace held, resurfacing every {pause_secs}s (never auto-interrupt)",
+                declared.owner
+            );
+        }
         poll_actions.extend(fold(
             &mut swarm,
             crate::workspace::Msg::Tick { now },
@@ -7700,6 +7883,32 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         }
                     }
                 }
+                LoopAction::PausedResurface {
+                    name,
+                    bead_id,
+                    owner,
+                    age_secs,
+                } => {
+                    // ADR-0010 D4/D12: the declared wait is re-surfaced to its
+                    // named owner. The durable side's surface is the loop's own
+                    // log + the event journal (the workspace fold additionally
+                    // queues a captain-relevant Audit row for the digest).
+                    // Never a silent park, never an auto-interrupt.
+                    let line = pause_resurface_line(name, bead_id, owner, *age_secs);
+                    eprintln!("flywheel: {line}");
+                    let _ = crate::state::log_event(
+                        &params.project,
+                        crate::state::EventKind::Loop,
+                        serde_json::json!({
+                            "status": "pause_resurface",
+                            "agent": name,
+                            "bead": bead_id,
+                            "owner": owner,
+                            "age_secs": *age_secs,
+                        }),
+                    );
+                    any_work = true;
+                }
                 LoopAction::Nudge { name } => {
                     let rot_hit = bump_nudge_streak(&mut states, name);
                     if rot_hit == crate::rot::RotAction::Compact {
@@ -7865,6 +8074,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                                 bead_id: bead.to_string(),
                                                 grace_polls: DRAIN_GRACE_POLLS,
                                                 defers,
+                                                paused: None,
                                             },
                                         );
                                         eprintln!(
@@ -13065,7 +13275,7 @@ mod tests {
                 kind: "reclaim",
                 content: format!("{bead_id}:{pin}:{reason}"),
             }),
-            LoopAction::Wait => None,
+            LoopAction::Wait | LoopAction::PausedResurface { .. } => None,
         }
     }
 
@@ -16009,6 +16219,216 @@ mod loop_invoke_vehicle_tests {
             !m4.drain_pending.contains_key("oc"),
             "expired drain leaves no pending entry"
         );
+    }
+
+    #[test]
+    fn declared_pause_holds_grace_and_resurfaces_on_the_window() {
+        // ADR-0010 D4/D12: a drained pane that declares `paused: <owner>` is
+        // NOT a stuck pane — grace is HELD (never force-stopped) and the wait
+        // is re-surfaced to its named owner once per window.
+        let model = LoopModel::default();
+        let (m, a1) = tick(
+            &model,
+            &LoopMsg::DrainRequest {
+                name: "oc".into(),
+                bead_id: "bd-1".into(),
+            },
+        );
+        assert!(
+            a1.iter().any(|a| matches!(a, LoopAction::Send { .. })),
+            "the drain ask is sent"
+        );
+        assert!(
+            m.drain_pending
+                .get("oc")
+                .is_some_and(|d| d.paused.is_none()),
+            "a fresh drain has no declaration"
+        );
+        let (m2, a2) = tick(
+            &m,
+            &LoopMsg::PauseDeclared {
+                name: "oc".into(),
+                owner: "CooperSparrow".into(),
+                now: 1_000,
+                resurface_secs: 3_600,
+            },
+        );
+        assert_eq!(
+            m2.drain_pending["oc"]
+                .paused
+                .as_ref()
+                .map(|p| (p.owner.as_str(), p.since)),
+            Some(("CooperSparrow", 1_000)),
+            "the first declaration starts the clock"
+        );
+        assert!(a2.is_empty(), "declaring is state, not an effect");
+        // A repeat declaration must NOT re-base the age (or steal the owner):
+        // the reported age, and therefore the resurface, stays honest.
+        let (m3, _) = tick(
+            &m2,
+            &LoopMsg::PauseDeclared {
+                name: "oc".into(),
+                owner: "NavyDog".into(),
+                now: 3_000,
+                resurface_secs: 3_600,
+            },
+        );
+        assert_eq!(m3.drain_pending["oc"].paused.as_ref().unwrap().since, 1_000);
+        assert_eq!(
+            m3.drain_pending["oc"].paused.as_ref().unwrap().owner,
+            "CooperSparrow"
+        );
+        // Past the original grace with a DECLARED pause: parked, never killed.
+        let mut parked = m3;
+        for now in [1_001u64, 2_000, 4_599] {
+            let (next, acts) = tick(&parked, &LoopMsg::Tick { now });
+            assert!(
+                !acts.iter().any(|a| matches!(a, LoopAction::Respawn { .. })),
+                "a declared pause is never force-stopped (now {now}): {acts:?}"
+            );
+            assert!(
+                next.drain_pending.contains_key("oc"),
+                "the drain stays open while the wait is declared (now {now})"
+            );
+            parked = next;
+        }
+        // Due exactly at since + window, addressed to the declared owner.
+        let (after, acts) = tick(&parked, &LoopMsg::Tick { now: 4_600 });
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                LoopAction::PausedResurface { name, bead_id, owner, age_secs }
+                    if name == "oc" && bead_id == "bd-1" && owner == "CooperSparrow" && *age_secs == 3_600
+            )),
+            "the wait re-surfaces to its owner on the window: {acts:?}"
+        );
+        assert_eq!(
+            after.drain_pending["oc"]
+                .paused
+                .as_ref()
+                .unwrap()
+                .resurfaced,
+            1
+        );
+        // Re-armed: the next tick is silent, the following window fires again.
+        let (quiet, acts) = tick(&after, &LoopMsg::Tick { now: 4_601 });
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, LoopAction::PausedResurface { .. })),
+            "resurface is once per window, not once per tick"
+        );
+        assert_eq!(
+            quiet.drain_pending["oc"]
+                .paused
+                .as_ref()
+                .unwrap()
+                .resurfaced,
+            1
+        );
+        let (_, acts) = tick(&quiet, &LoopMsg::Tick { now: 8_200 });
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                LoopAction::PausedResurface { age_secs, .. } if *age_secs == 3_600
+            )),
+            "each window re-surfaces, bounded and observable: {acts:?}"
+        );
+    }
+
+    #[test]
+    fn pause_declaration_is_ignored_without_an_open_drain() {
+        // The loop does not invent a wait: a declaration for a pane with no
+        // open drain (or a fulfilled one) changes nothing.
+        let model = LoopModel::default();
+        let (next, acts) = tick(
+            &model,
+            &LoopMsg::PauseDeclared {
+                name: "ghost".into(),
+                owner: "CooperSparrow".into(),
+                now: 10,
+                resurface_secs: 3_600,
+            },
+        );
+        assert!(acts.is_empty());
+        assert!(next.drain_pending.is_empty(), "no drain is invented");
+    }
+
+    #[test]
+    fn declared_pause_replays_log_identically() {
+        // Tick Law: same log -> same model + same effects (the resurface is a
+        // decision, so it must be reproducible from the journal alone).
+        let log = [
+            LoopMsg::DrainRequest {
+                name: "oc".into(),
+                bead_id: "bd-1".into(),
+            },
+            LoopMsg::PauseDeclared {
+                name: "oc".into(),
+                owner: "CooperSparrow".into(),
+                now: 5,
+                resurface_secs: 3_600,
+            },
+            LoopMsg::Tick { now: 3_605 },
+            LoopMsg::Tick { now: 3_606 },
+            LoopMsg::Tick { now: 7_205 },
+        ];
+        let run = || {
+            let mut m = LoopModel::default();
+            let mut acts = Vec::new();
+            for msg in &log {
+                let (next, a) = tick(&m, msg);
+                m = next;
+                acts.push(a);
+            }
+            (m, acts)
+        };
+        let (m1, a1) = run();
+        let (m2, a2) = run();
+        assert_eq!(m1, m2, "same log folds to the same model");
+        assert_eq!(a1, a2, "same log produces the same effects");
+        assert!(
+            a1.iter()
+                .flatten()
+                .any(|a| matches!(a, LoopAction::PausedResurface { .. })),
+            "the log really exercised the resurface"
+        );
+    }
+
+    #[test]
+    fn drain_state_pause_round_trips_and_legacy_rows_load() {
+        // The pause is ADDITIVE on the drain row: a pre-pause ActiveLoop file
+        // must still deserialize (paused: None) or every live loop breaks on
+        // upgrade.
+        let ds: DrainState =
+            serde_json::from_str(r#"{"bead_id":"bd-1","grace_polls":3,"defers":0}"#)
+                .expect("legacy drain row loads");
+        assert_eq!(ds.paused, None);
+        let with_pause = DrainState {
+            bead_id: "bd-1".into(),
+            grace_polls: 3,
+            defers: 0,
+            paused: Some(PausedWait {
+                owner: "CooperSparrow".into(),
+                since: 1_000,
+                resurface_secs: 3_600,
+                resurfaced: 2,
+            }),
+        };
+        let json = serde_json::to_string(&with_pause).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DrainState>(&json).unwrap(),
+            with_pause
+        );
+    }
+
+    #[test]
+    fn pause_resurface_line_names_owner_bead_and_age() {
+        let line = pause_resurface_line("oc", "bd-1", "CooperSparrow", 3_600);
+        assert!(line.contains("pause-resurface"), "{line}");
+        assert!(line.contains("CooperSparrow"), "{line}");
+        assert!(line.contains("bd-1"), "{line}");
+        assert!(line.contains("3600"), "{line}");
     }
 
     #[test]

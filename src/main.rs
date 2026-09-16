@@ -18529,6 +18529,33 @@ fn cmd_loop(
                         }
                     }
                 }
+                durable::LoopAction::PausedResurface {
+                    name,
+                    bead_id,
+                    owner,
+                    age_secs,
+                } => {
+                    // ADR-0010 D4/D12: re-surface a declared `paused:` wait to
+                    // its named owner. The sync loop's surface is the operator
+                    // channel + the event journal (the workspace fold also
+                    // queues the captain-relevant digest row). Never silent.
+                    println!(
+                        "{} {}",
+                        dim("[loop]"),
+                        durable::pause_resurface_line(name, bead_id, owner, *age_secs)
+                    );
+                    log(
+                        project,
+                        EventKind::Loop,
+                        json!({
+                            "status": "pause_resurface",
+                            "agent": name,
+                            "bead": bead_id,
+                            "owner": owner,
+                            "age_secs": *age_secs,
+                        }),
+                    );
+                }
                 durable::LoopAction::Wait => {}
                 // Self-heal actions never come out of plan_actions (the
                 // durable loop's heal step is a separate phase); if one ever

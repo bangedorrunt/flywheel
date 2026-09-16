@@ -998,6 +998,25 @@ impl Cmd {
                 herdr_name,
                 reason,
             },
+            // ADR-0010 D4/D12: the declared wait's human re-surface path. The
+            // Audit is the captain-relevant record `classify_cmd` queues for
+            // the digest, so a pause that nobody answers keeps surfacing
+            // instead of parking silently (detail text is the shared line, so
+            // every plane renders the resurface identically).
+            crate::durable::LoopAction::PausedResurface {
+                name,
+                bead_id,
+                owner,
+                age_secs,
+            } => {
+                let detail =
+                    crate::durable::pause_resurface_line(&name, &bead_id, &owner, age_secs);
+                Self::Audit {
+                    kind: "pause_resurface".into(),
+                    pin: owner,
+                    detail,
+                }
+            }
             crate::durable::LoopAction::Wait => Self::Wait,
         }
     }
@@ -2906,6 +2925,35 @@ mod tests {
             let (next, _) = tick(&m, &msg);
             assert_eq!(next.seq, 1, "seq must increment for {:?}", msg);
         }
+    }
+
+    #[test]
+    fn declared_pause_resurface_rides_the_captain_relevant_audit() {
+        // ADR-0010 D4/D12: the declared wait's human re-surface path is the
+        // Audit row — `classify_cmd` reads every Audit as CaptainRelevant, so
+        // it lands in the AFK digest (D6) and in the journal, and it is never
+        // silently dropped on the floor.
+        let cmd = Cmd::from_loop(crate::durable::LoopAction::PausedResurface {
+            name: "oc".into(),
+            bead_id: "bd-1".into(),
+            owner: "CooperSparrow".into(),
+            age_secs: 3_600,
+        });
+        match &cmd {
+            Cmd::Audit { kind, pin, detail } => {
+                assert_eq!(kind, "pause_resurface");
+                assert_eq!(pin, "CooperSparrow", "the row is addressed to the owner");
+                assert!(
+                    detail.contains("bd-1") && detail.contains("3600"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected a captain-relevant Audit, got {other:?}"),
+        }
+        assert_eq!(classify_cmd(&cmd), WakeClass::CaptainRelevant);
+        // The Audit has no loop-action inverse: a replay of the journal must
+        // not synthesize a second resurface action from the row itself.
+        assert!(cmd.to_loop_action().is_none());
     }
 
     #[test]
