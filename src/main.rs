@@ -3440,7 +3440,7 @@ enum WorkflowCmd {
         /// accepted: list is always JSON (agent `--json` parity)
         #[arg(long)]
         json: bool,
-        /// emit the bounded family/selection projection instead of full descriptions
+        /// GS-048: emit name/trigger/topology only (bounded selector; full rows need bare list + workflow show)
         #[arg(long)]
         brief: bool,
         /// project whose `.flywheel/workflows/` shadows the user catalog
@@ -4583,8 +4583,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-evaluate", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
-            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/evaluate/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + run + compose_token + decide_trigger; `workflow list --brief` is name/trigger/topology only (GS-048) — select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
-            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/crew/run/compose — takes --project and layers the project tier): `workflow list --brief --json` is the low-context selector (family + selection + run); default list carries full descriptions; use `workflow show` for detail. Built-in catalog currently has 40 workflows. Select from list exactly like a skill catalog, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/evaluate/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + family + selection + run + compose_token + decide_trigger; `workflow list --brief` is name/trigger/topology only (GS-048 — ONE contract; no dead family/selection brief path) — select from brief, then `workflow show` / bare list for detail, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -11899,15 +11898,17 @@ fn handle_workspace_cmds(
             }
             workspace::Cmd::Reclassify {
                 goal,
-                pin: _,
+                pin,
                 explicit_topology,
                 reason,
+                effect_key,
             } => {
-                // GS-048: prefer expand_reclassify_cmds at the host boundary so
-                // Prompt announces map to Effect::Prompt. Live Snapshot — never
-                // Snapshot::default() invent-green. Persist sticky topology.
+                // GS-048 / GS-050: prefer expand_reclassify_cmds at the host
+                // boundary so Prompt announces map to Effect::Prompt. Live
+                // Snapshot — never Snapshot::default() invent-green. Persist
+                // sticky topology. Pass through journal effect_key (I8a).
                 eprintln!(
-                    "flywheel: [Reclassify] reason={reason} goal_len={} sticky_explicit={:?}",
+                    "flywheel: [Reclassify] effect_key={effect_key} reason={reason} goal_len={} sticky_explicit={:?}",
                     goal.len(),
                     explicit_topology
                 );
@@ -11916,9 +11917,10 @@ fn handle_workspace_cmds(
                     workspace_model,
                     vec![workspace::Cmd::Reclassify {
                         goal: goal.clone(),
-                        pin: String::new(),
+                        pin: pin.clone(),
                         explicit_topology: explicit_topology.clone(),
                         reason: reason.clone(),
+                        effect_key: effect_key.clone(),
                     }],
                     &|g| {
                         let d = crate::decide::decide(g, &snap);
@@ -29581,25 +29583,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "decide_trigger": crate::decide::decide_trigger_for(name),
                 }));
             }
-            if *brief {
-                let compact: Vec<Value> = rows
-                    .into_iter()
-                    .map(|row| {
-                        json!({
-                            "name": row["name"],
-                            "family": row["family"],
-                            "selection": row["selection"],
-                            "run": row["run"],
-                            "compose_token": row["compose_token"],
-                            "source": row["source"],
-                            "decide_trigger": row["decide_trigger"],
-                        })
-                    })
-                    .collect();
-                print_json(&json!({ "workflows": compact }));
-            } else {
-                print_json(&json!({ "workflows": rows }));
-            }
+            // Full list (not --brief): family/selection/run live here.
+            // --brief early-returns above with name/trigger/topology only (GS-048).
+            print_json(&json!({ "workflows": rows }));
             Ok(())
         }
         WorkflowCmd::Show { name, project } => {
@@ -36896,8 +36882,9 @@ mod integration_tests {
         );
     }
 
-    /// GS-048: `workflow list --brief` projects name/trigger/topology via the
-    /// real `WorkflowCmd::List { brief: true }` / `cmd_workflow` path.
+    /// GS-048 / GS-050 H1: `workflow list --brief` projects **only**
+    /// name/trigger/topology (ONE contract). Family/selection/run belong on
+    /// the full list — the unreachable compact brief path was deleted.
     #[test]
     fn workflow_list_brief_projects_name_trigger_topology() {
         let wfs = builtin_workflows::builtin_workflows();
@@ -36907,8 +36894,21 @@ mod integration_tests {
                 matches!(topology, "open" | "loop" | "swarm" | "join" | "none"),
                 "{name} topology={topology}"
             );
-            let _trigger = wf.trigger.as_ref().map(toron_workflow::Trigger::type_name);
-            let _ = (name, topology, _trigger);
+            let trigger = wf.trigger.as_ref().map(toron_workflow::Trigger::type_name);
+            // Shape of the live brief row (mirrors cmd_workflow early-return).
+            let row = json!({
+                "name": name,
+                "trigger": trigger,
+                "topology": topology,
+            });
+            let obj = row.as_object().unwrap();
+            assert_eq!(obj.len(), 3, "brief row must be exactly 3 keys: {obj:?}");
+            assert!(obj.contains_key("name"));
+            assert!(obj.contains_key("trigger"));
+            assert!(obj.contains_key("topology"));
+            assert!(!obj.contains_key("family"));
+            assert!(!obj.contains_key("selection"));
+            assert!(!obj.contains_key("run"));
         }
         assert_eq!(
             crate::decide::topology_for_primitive("wave-swarm"),
