@@ -491,7 +491,7 @@ impl ProfileCatalog {
                     npub: npub.clone(),
                     spec,
                     signing: SigningContext::ProjectAgent {
-                        npub: npub.clone(),
+                        npub,
                         project_slug: slug.to_string(),
                     },
                 })
