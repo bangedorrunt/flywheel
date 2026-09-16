@@ -273,11 +273,7 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
 /// Invent spawn / compose / join / loop vehicles suppressed under sticky-open.
 fn is_invent_spawn_under_open(workflow: &str) -> bool {
     let w = workflow.trim();
-    w.is_empty()
-        || w == "none"
-        || w == "join"
-        || w == "loop-work"
-        || is_compose_token(w)
+    w.is_empty() || w == "none" || w == "join" || w == "loop-work" || is_compose_token(w)
 }
 
 /// Rewrite commit argv to the held session vehicle; clear invent swarm surfaces.
@@ -295,7 +291,10 @@ fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
             // sticky-held open path is invent-spawn and must fail-closed.
             debug_assert!(
                 is_invent_spawn_under_open(&b.proposal.workflow)
-                    || b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"])
+                    || b.proposal
+                        .argv
+                        .windows(2)
+                        .any(|w| w == ["loop-mode", "run"])
                     || b.proposal.argv.iter().any(|a| a == "arrive"),
                 "sticky-held open expected invent spawn, got workflow={} argv={:?}",
                 b.proposal.workflow,
@@ -328,7 +327,6 @@ fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
         _ => {}
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -461,14 +459,21 @@ mod tests {
             Some("open")
         );
         assert!(b.proposal.why.contains("sticky-held"), "{}", b.proposal.why);
-        assert!(b.proposal.why.contains("suppressed invent"), "{}", b.proposal.why);
+        assert!(
+            b.proposal.why.contains("suppressed invent"),
+            "{}",
+            b.proposal.why
+        );
         assert!(
             !b.proposal.argv.iter().any(|a| a == "--crew"),
             "spawn crew argv suppressed: {:?}",
             b.proposal.argv
         );
         assert!(
-            !b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            !b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["loop-mode", "run"]),
             "must not leave loop-mode under open: {:?}",
             b.proposal.argv
         );
@@ -504,14 +509,20 @@ mod tests {
         let mut b = assemble("work the ready beads", &world, &["coder".into()], 5);
         assert_eq!(b.proposal.topology, "loop", "precondition: loop classify");
         assert!(
-            b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["loop-mode", "run"]),
             "precondition loop argv: {:?}",
             b.proposal.argv
         );
         align_with_session_topology(&mut b, "open", true);
         assert_eq!(b.proposal.topology, "open");
         assert!(
-            !b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            !b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["loop-mode", "run"]),
             "open sticky-held must not keep loop-mode argv (commit would skip crew-confirm): {:?}",
             b.proposal.argv
         );
@@ -546,7 +557,10 @@ mod tests {
         );
         assert_eq!(b.proposal.workflow, "none");
         assert!(
-            !b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            !b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["loop-mode", "run"]),
             "{:?}",
             b.proposal.argv
         );
@@ -577,7 +591,10 @@ mod tests {
         );
         assert_eq!(b.proposal.workflow, "none");
         assert!(
-            !b.proposal.argv.iter().any(|a| a == "arrive" || a == "wave-swarm"),
+            !b.proposal
+                .argv
+                .iter()
+                .any(|a| a == "arrive" || a == "wave-swarm"),
             "{:?}",
             b.proposal.argv
         );
@@ -634,7 +651,10 @@ mod tests {
                 "{label}: invent swarm must not appear in align surface: {surface}"
             );
             assert!(
-                !b.proposal.argv.iter().any(|a| a == "--crew" || a == "arrive"),
+                !b.proposal
+                    .argv
+                    .iter()
+                    .any(|a| a == "--crew" || a == "arrive"),
                 "{label}: no invent crew spawn argv: {:?}",
                 b.proposal.argv
             );
@@ -659,12 +679,18 @@ mod tests {
         assert_eq!(b.proposal.workflow, "loop-work");
         assert!(b.proposal.token.is_none());
         assert!(
-            b.proposal.argv.windows(2).any(|w| w == ["loop-mode", "run"]),
+            b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["loop-mode", "run"]),
             "{:?}",
             b.proposal.argv
         );
         assert!(
-            !b.proposal.argv.iter().any(|a| a == "wave-swarm" || a == "--crew"),
+            !b.proposal
+                .argv
+                .iter()
+                .any(|a| a == "wave-swarm" || a == "--crew"),
             "must not keep invent swarm argv: {:?}",
             b.proposal.argv
         );

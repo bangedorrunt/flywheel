@@ -244,10 +244,7 @@ impl Host for RtHost {
             // DecisionReady ride the Elm plane. Routine facts stay Prompt-only.
             BrainMsg::Fact { summary } => {
                 if let Some(reason) = workspace::material_context_reason(summary) {
-                    (
-                        workspace::material_context_msg(summary, reason),
-                        false,
-                    )
+                    (workspace::material_context_msg(summary, reason), false)
                 } else {
                     (
                         workspace::Msg::Fact {
@@ -256,7 +253,7 @@ impl Host for RtHost {
                         false,
                     )
                 }
-            },
+            }
             BrainMsg::AckSlaTick { now } => (workspace::Msg::AckSlaTick { now: *now }, false),
             BrainMsg::Presence { pin, state } => (
                 workspace::Msg::Presence {
@@ -288,15 +285,16 @@ impl Host for RtHost {
         // reach Effect::Prompt (nested handle would drop them). Live Snapshot
         // from briefing world facts — never Snapshot::default() invent-green.
         let snap = crate::live_decide_snapshot(&self.cfg, &self.project);
-        let cmds = workspace::expand_reclassify_cmds(&mut self.model, cmds, &self.project, &|goal| {
-            let d = crate::decide::decide(goal, &snap);
-            (
-                d.primitive.to_string(),
-                d.topology.to_string(),
-                d.argv.clone(),
-                d.reason.clone(),
-            )
-        });
+        let cmds =
+            workspace::expand_reclassify_cmds(&mut self.model, cmds, &self.project, &|goal| {
+                let d = crate::decide::decide(goal, &snap);
+                (
+                    d.primitive.to_string(),
+                    d.topology.to_string(),
+                    d.argv.clone(),
+                    d.reason.clone(),
+                )
+            });
         if let Some(topo) = self.model.session_topology.as_deref() {
             let _ = crate::state::save_session_topology(&self.project, topo);
         }

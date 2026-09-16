@@ -1122,7 +1122,10 @@ mod tests {
         assert!(log.contains("\"journal\":\"reclassify\""), "{log}");
         assert!(log.contains(&key), "journal carries effect_key: {log}");
         for state in ["prepared", "in_flight", "settled"] {
-            assert!(log.contains(&format!("\"state\":\"{state}\"")), "{state}: {log}");
+            assert!(
+                log.contains(&format!("\"state\":\"{state}\"")),
+                "{state}: {log}"
+            );
         }
         // Every row for this logical effect shares the same primary key.
         let rows: Vec<_> = log

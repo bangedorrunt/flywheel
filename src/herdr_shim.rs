@@ -53,7 +53,6 @@ pub fn agent_still_booting(a: &AgentInfo) -> bool {
     true
 }
 
-
 /// bd-bug-omp-herdr-wedge: the HERDR_* integration env a herdr-launched
 /// harness needs to activate its herdr extension (omp's
 /// herdr-omp-agent-state.ts gates on HERDR_ENV=1 + socket + pane id).
@@ -2726,12 +2725,16 @@ mod gs049_launch_pending_tests {
 
     #[test]
     fn agent_still_booting_clears_stale_ready() {
-        assert!(!agent_still_booting(&agent(false, false, AgentStatus::Idle)));
-        assert!(agent_still_booting(&agent(true, false, AgentStatus::Unknown)));
         assert!(!agent_still_booting(&agent(
-            true,
-            true,
+            false,
+            false,
             AgentStatus::Idle
         )));
+        assert!(agent_still_booting(&agent(
+            true,
+            false,
+            AgentStatus::Unknown
+        )));
+        assert!(!agent_still_booting(&agent(true, true, AgentStatus::Idle)));
     }
 }

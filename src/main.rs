@@ -14836,13 +14836,15 @@ fn cmd_reclassify(
     // Seed captain role so DecisionReady can Prompt announce.
     if let Some(pin) = state::load_captain_alias(project) {
         model.roles.insert("captain".into(), pin.clone());
-        model
-            .presence
-            .insert(pin.clone(), workspace::Presence::Idle { source: "reclassify".into() });
+        model.presence.insert(
+            pin.clone(),
+            workspace::Presence::Idle {
+                source: "reclassify".into(),
+            },
+        );
         model.doorbell.index.insert_pin(pin, None);
     }
-    let reason = workspace::material_context_reason(objective)
-        .unwrap_or("operator-goal-change");
+    let reason = workspace::material_context_reason(objective).unwrap_or("operator-goal-change");
     let msg = workspace::material_context_msg(objective, reason);
     let (next, cmds) = workspace::tick(&model, &msg);
     model = next;
@@ -29060,9 +29062,7 @@ fn cmd_steer(
         )
     })?;
     if !explicit_project {
-        eprintln!(
-            "flywheel: steer: inheriting --project={project_owned} from workspace cwd"
-        );
+        eprintln!("flywheel: steer: inheriting --project={project_owned} from workspace cwd");
     }
     let project: Option<&str> = Some(project_owned.as_str());
     // GS-048/049: AUTHORITATIVE steer objective is material — queue into the
@@ -29364,7 +29364,6 @@ fn planner_author_response(wf_name: &str, prompt: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("planner authoring leaf returned no response"))
 }
 
-
 /// GS-049 / GS-045 P1-2: direct evaluate-without-commit (Jido cmd/3 adapt).
 /// Lints the workflow, partitions each step action into a validated candidate
 /// outcome, and returns that data — never opens the effect journal and never
@@ -29428,13 +29427,10 @@ fn cmd_workflow_evaluate(
                 c["partition"].as_str().unwrap_or("?"),
             );
         }
-        println!(
-            "note: no journal dispatch — use `workflow run --execute` for live effects"
-        );
+        println!("note: no journal dispatch — use `workflow run --execute` for live effects");
     }
     Ok(())
 }
-
 
 /// Shared hybrid selection fields for one workflow name.
 /// Used by brief + full list projections so family/selection/run/compose_token
@@ -29695,9 +29691,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 Ok(())
             }
         }
-        WorkflowCmd::Evaluate { name, project, json } => {
-            cmd_workflow_evaluate(cfg, name, project.as_deref(), *json)
-        }
+        WorkflowCmd::Evaluate {
+            name,
+            project,
+            json,
+        } => cmd_workflow_evaluate(cfg, name, project.as_deref(), *json),
         WorkflowCmd::Run {
             name,
             inputs,
@@ -36930,11 +36928,17 @@ mod integration_tests {
             .as_array()
             .expect("workflows array");
         assert!(!workflows.is_empty(), "brief must project builtins");
-        let expect: std::collections::BTreeSet<_> =
-            ["name", "family", "selection", "run", "topology", "compose_token"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
+        let expect: std::collections::BTreeSet<_> = [
+            "name",
+            "family",
+            "selection",
+            "run",
+            "topology",
+            "compose_token",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         for row in workflows {
             let obj = row.as_object().expect("brief row object");
             let keyset: std::collections::BTreeSet<_> = obj.keys().cloned().collect();
@@ -36968,10 +36972,7 @@ mod integration_tests {
             .expect("wave-swarm in brief");
         assert_eq!(wave["topology"], "swarm");
         assert_eq!(wave["compose_token"], true);
-        assert_eq!(
-            crate::decide::topology_for_primitive("wave-swarm"),
-            "swarm"
-        );
+        assert_eq!(crate::decide::topology_for_primitive("wave-swarm"), "swarm");
         // Smoke: real cmd_workflow List { brief: true } succeeds (prints the
         // live projection above).
         let cfg = Config::default();
@@ -37012,10 +37013,7 @@ mod integration_tests {
         for row in workflows {
             let obj = row.as_object().expect("full row object");
             for key in required {
-                assert!(
-                    obj.contains_key(key),
-                    "full list missing {key}: {obj:?}"
-                );
+                assert!(obj.contains_key(key), "full list missing {key}: {obj:?}");
             }
             // Brief-only topology must not appear on full list.
             assert!(
@@ -37027,10 +37025,12 @@ mod integration_tests {
             if crate::builtin_workflows::builtin_workflows()
                 .contains_key(obj["name"].as_str().unwrap_or(""))
             {
-                let s = desc
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                assert!(!s.is_empty(), "{}: nonempty description on full list", obj["name"]);
+                let s = desc.and_then(|v| v.as_str()).unwrap_or("");
+                assert!(
+                    !s.is_empty(),
+                    "{}: nonempty description on full list",
+                    obj["name"]
+                );
             }
         }
         // Hybrid fields must match the shared helper (no brief/full drift).
@@ -37068,7 +37068,6 @@ mod integration_tests {
             "robot-capabilities must describe the live hybrid brief"
         );
     }
-
 
     /// bd-oj9o #3: a rendered workflow command = frontmatter (with the
     /// workflow description) + the focus section + stamps; no beads body.
