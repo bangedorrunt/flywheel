@@ -201,7 +201,10 @@ pub fn die(err: &anyhow::Error, hint: Option<&str>) -> ! {
 
 /// Print a JSON value to stdout.
 pub fn print_json(v: &serde_json::Value) {
-    println!("{}", serde_json::to_string_pretty(v).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).expect("serde_json::Value serializes infallibly")
+    );
 }
 
 #[cfg(test)]

@@ -61,7 +61,10 @@ pub fn redact_evidence(raw: &str) -> String {
                 continue;
             }
         }
-        let ch = raw[i..].chars().next().unwrap();
+        let ch = raw[i..]
+            .chars()
+            .next()
+            .expect("redaction cursor stays on a char boundary");
         out.push(ch);
         i += ch.len_utf8();
     }
