@@ -29436,6 +29436,21 @@ fn cmd_workflow_evaluate(
 }
 
 
+/// Shared hybrid selection fields for one workflow name.
+/// Used by brief + full list projections so family/selection/run/compose_token
+/// cannot drift between `--brief` and bare `list --json`.
+fn workflow_hybrid_fields(name: &str) -> (String, &'static str, &'static str, bool) {
+    let compose_token = crate::builtin_workflows::is_compose_token(name);
+    let run = if compose_token {
+        format!("workflow compose \"<objective>\" --parts {name} --run")
+    } else {
+        format!("workflow run {name} --execute")
+    };
+    let (family, selection) = crate::builtin_workflows::workflow_guidance(name)
+        .unwrap_or(("custom", "inspect workflow show before running"));
+    (run, family, selection, compose_token)
+}
+
 /// GS-052: live `--brief` projection used by [`cmd_workflow`].
 /// ONE hybrid contract = name / family / selection / run / topology / compose_token
 /// (not a local test mirror; no competing brief path).
@@ -29444,21 +29459,47 @@ fn workflow_list_brief_rows(
 ) -> Vec<serde_json::Value> {
     let mut rows: Vec<serde_json::Value> = Vec::new();
     for (name, (_wf, _source)) in all {
-        let token = crate::builtin_workflows::is_compose_token(name);
-        let run = if token {
-            format!("workflow compose \"<objective>\" --parts {name} --run")
-        } else {
-            format!("workflow run {name} --execute")
-        };
-        let (family, selection) = crate::builtin_workflows::workflow_guidance(name)
-            .unwrap_or(("custom", "inspect workflow show before running"));
+        let (run, family, selection, compose_token) = workflow_hybrid_fields(name);
         rows.push(serde_json::json!({
             "name": name,
             "family": family,
             "selection": selection,
             "run": run,
             "topology": crate::decide::topology_for_primitive(name),
-            "compose_token": token,
+            "compose_token": compose_token,
+        }));
+    }
+    rows
+}
+
+/// Live bare `workflow list --json` projection used by [`cmd_workflow`].
+/// Same hybrid fields as brief via [`workflow_hybrid_fields`], plus full-row
+/// description/trigger/source/crew/inputs/decide_trigger (no topology).
+fn workflow_list_full_rows(
+    all: &std::collections::BTreeMap<String, (toron_workflow::schema::Workflow, &'static str)>,
+) -> Vec<serde_json::Value> {
+    use toron_workflow::schema::CrewSpec;
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for (name, (wf, source)) in all {
+        let (run, family, selection, compose_token) = workflow_hybrid_fields(name);
+        rows.push(serde_json::json!({
+            "name": name,
+            "description": wf.description,
+            "family": family,
+            "selection": selection,
+            "run": run,
+            "compose_token": compose_token,
+            "source": source,
+            "trigger": wf.trigger.as_ref().map(toron_workflow::Trigger::type_name),
+            "crew": match &wf.crew {
+                Some(CrewSpec::Auto) => "auto",
+                Some(CrewSpec::Explicit(_)) => "explicit",
+                None => "none",
+            },
+            "steps": wf.steps.len(),
+            "graph_nodes": wf.graph.as_ref().map(|g| g.nodes.len()),
+            "inputs": wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(),
+            "decide_trigger": crate::decide::decide_trigger_for(name),
         }));
     }
     rows
@@ -29579,36 +29620,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // Agent-native selection surface (ADR-0009): every row carries
             // the skill-style description + the preferred run form, so an
             // agent picks from `list` exactly like a skill catalog.
-            let mut rows: Vec<Value> = Vec::new();
-            for (name, (wf, source)) in &all {
-                let token = crate::builtin_workflows::is_compose_token(name);
-                let run = if token {
-                    format!("workflow compose \"<objective>\" --parts {name} --run")
-                } else {
-                    format!("workflow run {name} --execute")
-                };
-                let (family, selection) = crate::builtin_workflows::workflow_guidance(name)
-                    .unwrap_or(("custom", "inspect workflow show before running"));
-                rows.push(json!({
-                    "name": name,
-                    "description": wf.description,
-                    "family": family,
-                    "selection": selection,
-                    "run": run,
-                    "compose_token": token,
-                    "source": source,
-                    "trigger": wf.trigger.as_ref().map(toron_workflow::Trigger::type_name),
-                    "crew": match &wf.crew {
-                        Some(CrewSpec::Auto) => "auto",
-                        Some(CrewSpec::Explicit(_)) => "explicit",
-                        None => "none",
-                    },
-                    "steps": wf.steps.len(),
-                    "graph_nodes": wf.graph.as_ref().map(|g| g.nodes.len()),
-                    "inputs": wf.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(),
-                    "decide_trigger": crate::decide::decide_trigger_for(name),
-                }));
-            }
+            // Hybrid fields share [`workflow_hybrid_fields`] with --brief.
+            let rows = workflow_list_full_rows(&all);
             // Full list (not --brief): description + family/selection/run + rest.
             // --brief early-returns above with the GS-052 hybrid projection.
             print_json(&json!({ "workflows": rows }));
@@ -29642,18 +29655,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let token = crate::builtin_workflows::is_compose_token(&wf.name);
-            let run = if token {
-                format!("workflow compose \"<objective>\" --parts {} --run", wf.name)
-            } else {
-                format!("workflow run {} --execute", wf.name)
-            };
+            let (run, _family, _selection, compose_token) = workflow_hybrid_fields(&wf.name);
             print_json(&json!({
                 "name": wf.name,
                 "source": source,
                 "description": wf.description,
                 "run": run,
-                "compose_token": token,
+                "compose_token": compose_token,
                 "trigger": wf.trigger.as_ref().map(toron_workflow::Trigger::type_name),
                 "guard": wf.guard,
                 "crew": crew,
@@ -36975,27 +36983,76 @@ mod integration_tests {
         cmd_workflow(&cfg, &cmd).expect("WorkflowCmd::List { brief: true } must succeed");
     }
 
-    /// GS-052: bare list still carries full description + rest; brief is not
-    /// a second invent-green mirror of full rows.
+    /// GS-052: live bare `list --json` projection from [`workflow_list_full_rows`]
+    /// (same function `cmd_workflow` prints) — description/trigger/source/crew/
+    /// decide_trigger present; topology is brief-only (not required on full).
     #[test]
-    fn workflow_list_full_keeps_description_and_rest() {
+    fn workflow_list_full_projects_description_and_rest() {
         let all = workflow_catalog::all_workflows_merged(None).expect("catalog");
-        let mut saw_description = false;
-        for (name, (wf, _source)) in &all {
-            let desc = wf.description.as_deref().unwrap_or("");
-            if !desc.is_empty() {
-                saw_description = true;
+        let full_stdout = serde_json::json!({ "workflows": workflow_list_full_rows(&all) });
+        let workflows = full_stdout["workflows"]
+            .as_array()
+            .expect("workflows array");
+        assert!(!workflows.is_empty(), "full list must project builtins");
+        let required = [
+            "name",
+            "description",
+            "family",
+            "selection",
+            "run",
+            "compose_token",
+            "source",
+            "trigger",
+            "crew",
+            "steps",
+            "graph_nodes",
+            "inputs",
+            "decide_trigger",
+        ];
+        for row in workflows {
+            let obj = row.as_object().expect("full row object");
+            for key in required {
+                assert!(
+                    obj.contains_key(key),
+                    "full list missing {key}: {obj:?}"
+                );
             }
-            let token = crate::builtin_workflows::is_compose_token(name);
-            let (_family, _selection) = crate::builtin_workflows::workflow_guidance(name)
-                .unwrap_or(("custom", "inspect workflow show before running"));
-            if crate::builtin_workflows::builtin_workflows().contains_key(name.as_str()) {
-                assert!(!desc.is_empty(), "{name}: builtins keep description on full list/show");
+            // Brief-only topology must not appear on full list.
+            assert!(
+                !obj.contains_key("topology"),
+                "topology is brief-only; full row: {obj:?}"
+            );
+            let desc = obj.get("description");
+            // Builtins carry non-empty description strings (Option may be Some).
+            if crate::builtin_workflows::builtin_workflows()
+                .contains_key(obj["name"].as_str().unwrap_or(""))
+            {
+                let s = desc
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert!(!s.is_empty(), "{}: nonempty description on full list", obj["name"]);
             }
-            let _ = token;
         }
-        assert!(saw_description, "full catalog still has descriptions");
-        // robot-capabilities: exactly one top-level "workflows" key string (no dual).
+        // Hybrid fields must match the shared helper (no brief/full drift).
+        let wave = workflows
+            .iter()
+            .find(|r| r["name"] == "wave-swarm")
+            .expect("wave-swarm in full list");
+        let (run, family, selection, token) = workflow_hybrid_fields("wave-swarm");
+        assert_eq!(wave["run"], run);
+        assert_eq!(wave["family"], family);
+        assert_eq!(wave["selection"], selection);
+        assert_eq!(wave["compose_token"], token);
+        assert!(wave.get("decide_trigger").is_some());
+        // Smoke: real cmd_workflow List { brief: false } succeeds.
+        let cfg = Config::default();
+        let cmd = WorkflowCmd::List {
+            json: false,
+            brief: false,
+            project: None,
+        };
+        cmd_workflow(&cfg, &cmd).expect("WorkflowCmd::List bare must succeed");
+        // robot-capabilities: exactly one top-level "workflows" key (no dual).
         let src = include_str!("main.rs");
         let robot_block_start = src
             .find("if cli.robot_capabilities")
@@ -37008,7 +37065,7 @@ mod integration_tests {
         );
         assert!(
             robot_block.contains("GS-052 HYBRID ONE contract"),
-            "robot-capabilities must describe the live hybrid brief (no invent-green GS-048-only docs)"
+            "robot-capabilities must describe the live hybrid brief"
         );
     }
 
