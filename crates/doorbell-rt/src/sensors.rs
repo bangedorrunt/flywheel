@@ -37,14 +37,15 @@ impl SensorHandle {
         }
     }
 }
-pub fn supervise<F, Fut>(
+pub fn supervise<F, Fut, E>(
     name: impl Into<String>,
     tx: mpsc::Sender<BrainMsg>,
     task: F,
 ) -> SensorHandle
 where
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display + Send,
 {
     let name = name.into();
     let task_name = name.clone();

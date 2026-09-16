@@ -7,6 +7,7 @@
 //! silently dropped). Graceful stop closes queues and returns everything
 //! still held as [`Undelivered`] so resume redelivers from the journal.
 
+use crate::error::RtError;
 use crate::msg::BrainMsg;
 use crate::policy::RestartPolicy;
 use std::collections::{HashMap, VecDeque};
@@ -16,7 +17,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 /// Delivery endpoint. The brain's only delivery intent is `Prompt{pin,line}`;
 /// adapters translate it (herdr prompt today, webhook/DM in Phase 2).
 pub trait PromptSink: Send + 'static {
-    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()>;
+    fn send(&mut self, pin: &str, line: &str) -> Result<(), RtError>;
     fn name(&self) -> &str;
 }
 
@@ -399,7 +400,7 @@ impl MockSink {
 }
 
 impl PromptSink for MockSink {
-    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()> {
+    fn send(&mut self, pin: &str, line: &str) -> Result<(), RtError> {
         if self.stall_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(self.stall_ms));
         }
@@ -408,7 +409,7 @@ impl PromptSink for MockSink {
         if let Some(n) = fail_after
             && sent.len() >= n
         {
-            anyhow::bail!("mock endpoint down");
+            return Err(RtError::EndpointDown);
         }
         sent.push((pin.into(), line.into()));
         Ok(())
@@ -456,7 +457,7 @@ impl CliPromptSink {
 }
 
 impl PromptSink for CliPromptSink {
-    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()> {
+    fn send(&mut self, pin: &str, line: &str) -> Result<(), RtError> {
         let name = self
             .targets
             .lock()
@@ -468,12 +469,11 @@ impl PromptSink for CliPromptSink {
             return Ok(());
         }
         let out = crate::file_host::run_cli(&self.bin, &["agent", "prompt", &name, line], 30)
-            .ok_or_else(|| anyhow::anyhow!("herdr prompt spawn/timeout failed"))?;
+            .ok_or(RtError::PromptSpawnFailed)?;
         if !out.status.success() {
-            anyhow::bail!(
-                "herdr prompt failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            return Err(RtError::PromptFailed(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            ));
         }
         Ok(())
     }
@@ -586,13 +586,13 @@ impl WebhookSink {
         url: impl Into<String>,
         allowlist: &EgressAllowlist,
         full_line: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, RtError> {
         let url = url.into();
         if !allowlist.allows(&url) {
-            anyhow::bail!("webhook host not allowlisted: {url}");
+            return Err(RtError::NotAllowlisted(url));
         }
         let Some((host, port, path)) = url_host_port_path(&url) else {
-            anyhow::bail!("webhook url needs a scheme and a host: {url}");
+            return Err(RtError::InvalidUrl(url));
         };
         Ok(Self {
             host,
@@ -622,7 +622,7 @@ impl WebhookSink {
         .to_string()
     }
 
-    fn post(&self, body: &str) -> anyhow::Result<()> {
+    fn post(&self, body: &str) -> Result<(), RtError> {
         use std::io::{Read, Write};
         let host = self.host.as_str();
         let authority = if self.port == 80 {
@@ -631,7 +631,9 @@ impl WebhookSink {
             format!("{host}:{}", self.port)
         };
         let mut stream = std::net::TcpStream::connect_timeout(
-            &authority.parse().map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            &authority
+                .parse()
+                .map_err(|e| RtError::InvalidUrl(format!("{authority}: {e:?}")))?,
             self.timeout,
         )?;
         // Only plain-http loopback/allowlisted hosts in Phase 2 (TLS via
@@ -648,14 +650,17 @@ impl WebhookSink {
         stream.read_exact(&mut resp)?;
         let status: u16 = String::from_utf8_lossy(&resp[9..12]).parse().unwrap_or(0);
         if !(200..300).contains(&status) {
-            anyhow::bail!("webhook {host} answered {status}");
+            return Err(RtError::BadStatus {
+                host: host.to_string(),
+                status,
+            });
         }
         Ok(())
     }
 }
 
 impl PromptSink for WebhookSink {
-    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()> {
+    fn send(&mut self, pin: &str, line: &str) -> Result<(), RtError> {
         // Subscriber identity rides from the subscription store binding in
         // bd-asr2.11; until then the pin scopes the payload.
         self.post(&self.render(pin, pin, line))
@@ -677,7 +682,7 @@ pub struct DmSink {
 
 /// DM transport seam (real NIP-17 gift-wrap binds in Phase 4).
 pub trait DmTransport: Send + 'static {
-    fn send_dm(&mut self, to: &str, hint: &str) -> anyhow::Result<()>;
+    fn send_dm(&mut self, to: &str, hint: &str) -> Result<(), RtError>;
 }
 
 /// Key custody gate: only `svc:` service identities minted by the daemon.
@@ -687,10 +692,10 @@ impl DmSink {
     pub fn for_service(
         service_id: impl Into<String>,
         transport: Box<dyn DmTransport>,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, RtError> {
         let service_id = service_id.into();
         if !service_id.starts_with("svc:") {
-            anyhow::bail!("DM sink refuses non-service identity (daemon never holds human keys)");
+            return Err(RtError::DmRefused);
         }
         Ok(Self {
             service_id,
@@ -700,7 +705,7 @@ impl DmSink {
 }
 
 impl PromptSink for DmSink {
-    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()> {
+    fn send(&mut self, pin: &str, line: &str) -> Result<(), RtError> {
         let hint: String = line.chars().take(120).collect();
         self.transport.send_dm(&self.service_id_for(pin), &hint)
     }
@@ -740,9 +745,9 @@ impl Default for MockDmTransport {
 }
 
 impl DmTransport for MockDmTransport {
-    fn send_dm(&mut self, to: &str, hint: &str) -> anyhow::Result<()> {
+    fn send_dm(&mut self, to: &str, hint: &str) -> Result<(), RtError> {
         if self.fail {
-            anyhow::bail!("dm transport down");
+            return Err(RtError::DmDown);
         }
         self.sent.push((to.into(), hint.into()));
         Ok(())
@@ -1029,9 +1034,9 @@ mod tests {
             fail: bool,
         }
         impl PromptSink for Counting {
-            fn send(&mut self, _pin: &str, _line: &str) -> anyhow::Result<()> {
+            fn send(&mut self, _pin: &str, _line: &str) -> Result<(), RtError> {
                 if self.fail {
-                    anyhow::bail!("down");
+                    return Err(RtError::EndpointDown);
                 }
                 self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
