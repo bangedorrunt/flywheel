@@ -51,7 +51,9 @@ pub(crate) use history::{
 };
 pub(crate) use ledger::{LedgerCmd, cmd_ledger};
 pub(crate) use loop_mode::LoopCmd;
-pub(crate) use mail::{MailCmd, MailContactCmd, MailLockCmd, MailProductCmd, MailSlotCmd};
+pub(crate) use mail::{
+    MailCmd, MailContactCmd, MailLockCmd, MailProductCmd, MailSlotCmd, cmd_mail,
+};
 pub(crate) use model::{ModelCmd, cmd_models};
 pub(crate) use policy::{PolicyCmd, cmd_policy};
 pub(crate) use principles::{PrinciplesCmd, cmd_principles};
