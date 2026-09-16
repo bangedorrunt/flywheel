@@ -4,7 +4,7 @@
 //! governed-by: ADR-0002, ADR-0003
 //!
 //! Selection precedence (flag > env > `.env` > config.toml > default):
-//! - `FLYWHEEL_BACKEND` (`herdr` default; `superlogical`/`tmux` future/stub)
+//! - `FLYWHEEL_BACKEND` (`herdr` default; `superlogical` future/stub)
 //! - `FLYWHEEL_MAIL`    (`toron` default; `agentmail` opt-in)
 //!
 //! Mail backend routing (ADR-0003 V2/V3 — fixes the BUG1 shared-url misroute):
@@ -16,7 +16,7 @@
 //! `http://127.0.0.1:8765`). The old `[agent_mail]` url is never a routing
 //! source.
 //!
-//! Stub backends (`superlogical`, `tmux`) land in `bd-toron-superlogical-
+//! Stub backend (`superlogical`) lands in `bd-toron-superlogical-
 //! stubs` (R0.7); until then an unrecognized name returns a clear
 //! `BackendError::Unsupported` so a user who typos the env var gets an
 //! actionable error, not a silent fallback.
@@ -67,15 +67,13 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
                     .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
             Ok(Box::new(backend))
         }
-        // superlogical/tmux: stub backends (bd-toron-superlogical-stubs). With
+        // superlogical: stub backend (bd-toron-superlogical-stubs). With
         // the feature on, construct the stub (name() enumerable, method
         // defaults give the clear "not yet released / on hold" error). With
         // the feature off, the arm is compiled out and the name falls through
         // to `other` -> "not compiled in".
         #[cfg(feature = "backend-superlogical")]
         "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
-        #[cfg(feature = "backend-tmux")]
-        "tmux" => Ok(Box::new(crate::backend::tmux::TmuxBackend)),
         other => Err(backend_not_compiled_or_unknown(
             other,
             "multiplexer",
@@ -161,10 +159,6 @@ pub fn compiled_backends() -> Vec<&'static str> {
     {
         out.extend(["superlogical"]);
     }
-    #[cfg(feature = "backend-tmux")]
-    {
-        out.extend(["tmux"]);
-    }
     #[cfg(feature = "mail-agentmail")]
     {
         out.extend(["agentmail"]);
@@ -217,12 +211,12 @@ mod tests {
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "") };
         let cfg = Config {
             backend: Some(crate::config::BackendConfig {
-                multiplexer: "tmux".into(),
+                multiplexer: "superlogical".into(),
                 mail: "agentmail".into(),
             }),
             ..Config::default()
         };
-        assert_eq!(resolve_backend_name(&cfg), "tmux");
+        assert_eq!(resolve_backend_name(&cfg), "superlogical");
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
@@ -289,14 +283,12 @@ mod tests {
             backends.contains(&"agentmail"),
             "agentmail missing: {backends:?}"
         );
-        // superlogical/tmux are opt-in: present IFF their feature is on
+        // superlogical is opt-in: present IFF its feature is on
         #[cfg(not(feature = "backend-superlogical"))]
         assert!(
             !backends.contains(&"superlogical"),
             "superlogical should be opt-in (feature off)"
         );
-        #[cfg(not(feature = "backend-tmux"))]
-        assert!(!backends.contains(&"tmux"), "tmux should be opt-in");
     }
 
     /// A backend name with its feature off produces the feature-aware error

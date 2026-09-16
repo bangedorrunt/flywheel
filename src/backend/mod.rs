@@ -1,4 +1,4 @@
-//! Pluggable backend abstraction — multiplexer (herdr / superlogical / tmux)
+//! Pluggable backend abstraction — multiplexer (herdr / superlogical)
 //! via the UNIFIED toron-core `Backend` trait (ADR-0005 P1), and the mail
 //! fabric (toron / agent-mail MCP) via the UNIFIED toron-core `MailSurface`
 //! trait (ADR-0007 D2 / R1, consumed by flywheel in bead bd-adr7-mail-adapt-se2.3).
@@ -35,8 +35,6 @@ pub mod herdr;
 mod parity;
 #[cfg(feature = "backend-superlogical")]
 pub mod superlogical;
-#[cfg(feature = "backend-tmux")]
-pub mod tmux;
 #[cfg(feature = "mail-toron")]
 pub mod toron;
 pub mod wire;

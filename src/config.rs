@@ -174,7 +174,7 @@ pub struct MailSections {
 /// may themselves be set by `.env`). Defaults: herdr / agentmail.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendConfig {
-    /// multiplexer backend name (`herdr` default; `superlogical`/`tmux` future)
+    /// multiplexer backend name (`herdr` default; `superlogical` future)
     pub multiplexer: String,
     /// mail backend name (`agentmail` default; `toron` future)
     pub mail: String,

@@ -47,14 +47,13 @@ dialoguer = "0.11"
 [features]
 # Default build: the `serve` HTTP surface + herdr multiplexer + BOTH mail
 # backends (toron is the default selection; agent-mail remains compiled in as
-# opt-in via FLYWHEEL_MAIL). Optional multiplexers (superlogical/tmux) are
-# opt-in; their stub impls land in bd-toron-superlogical-stubs (R0.7).
+# opt-in via FLYWHEEL_MAIL). Optional multiplexer (superlogical) is
+# opt-in; its stub impl lands in bd-toron-superlogical-stubs (R0.7).
 default = ["serve", "backend-herdr", "mail-agentmail", "mail-toron"]
 serve = ["dep:axum", "dep:tokio-stream", "dep:futures-core"]
 # Multiplexer backends (ADR-0002)
 backend-herdr = []
 backend-superlogical = []
-backend-tmux = []
 # Mail backends (ADR-0002)
 mail-agentmail = []
 mail-toron = []

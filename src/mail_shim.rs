@@ -3223,13 +3223,13 @@ mod tests {
         unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
     }
 
-    /// c3b.7: the active multiplexer is NOT herdr (tmux) → the cleanup is
+    /// c3b.7: the active multiplexer is NOT herdr (superlogical) → the cleanup is
     /// genuinely not applicable → Ok with the not-wired note (a config fact,
     /// not a failure).
     #[test]
     fn cleanup_pane_identities_non_herdr_mux_is_ok_note() {
         let _g = crate::config::lock_env();
-        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "tmux") };
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let v = mail
             .cleanup_pane_identities("c3b7-not-herdr")
