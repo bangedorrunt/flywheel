@@ -10,7 +10,6 @@ pub mod api;
 pub mod binpath;
 pub mod brain;
 pub mod file_host;
-pub mod hear;
 pub mod host;
 pub mod lease;
 pub mod msg;
@@ -23,14 +22,13 @@ pub mod subscribe;
 pub mod tailprobe;
 pub mod watchbeat;
 pub use api::{AskError, Ping, Stats, ask};
-pub use brain::{Brain, BrainConfig, RunReport};
+pub use brain::{Brain, BrainConfig, HearTracker, RunReport};
 pub use doorbell_core::registry_key;
 pub use doorbell_core::{PinBudget, take_allowed, take_allowed_like};
 pub use file_host::{
     FileHost, FileHostConfig, WATCH_KINDS, ensure_daemon_gen, presence_path, resolve_registry_file,
     toron_data_root,
 };
-pub use hear::HearTracker;
 pub use host::{CoreReducer, Effect, Host, MockHost};
 pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_stale};
 pub use msg::{AskKind, AskReply, BrainMsg};
