@@ -2539,6 +2539,9 @@ mod tests {
     /// project creation, no identity registration.
     #[test]
     fn list_active_boards_and_filters() {
+        // bd-0rzv: reads the shared mail root — serialize under the
+        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = "locks-list-board";
         mail.ensure_project(project).expect("ensure");
@@ -2629,6 +2632,9 @@ mod tests {
     /// must overwrite the task — never preserve the stale bead id.
     #[test]
     fn register_upsert_clears_stale_task_on_reuse() {
+        // bd-0rzv: reads the shared mail root — serialize under the
+        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = "upsert-stale-task";
         mail.ensure_project(project).expect("ensure");
@@ -2818,6 +2824,9 @@ mod tests {
     /// send_message round trips so the projection is the code under test.
     #[test]
     fn inbox_honors_urgent_flag_parity_with_mcp() {
+        // bd-0rzv: reads the shared mail root — serialize under the
+        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
         // bd-mail-surface-drift-7r2o: `inbox(urgent_only=true)` must return
         // the SAME id set as `inbox_filtered(urgent_only=true)` — the flag
         // is not decorative. The legacy surface ignored it entirely, so an
@@ -2870,6 +2879,9 @@ mod tests {
 
     #[test]
     fn inbox_filtered_applies_urgent_and_since_on_toron() {
+        // bd-0rzv: reads the shared mail root — serialize under the
+        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("c3b3-filter-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
@@ -2980,6 +2992,9 @@ mod tests {
     /// the thread, not a full-inbox drain.
     #[test]
     fn inbox_filtered_applies_thread_filter_on_toron() {
+        // bd-0rzv: reads the shared mail root — serialize under the
+        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("harvest-thread-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
@@ -3142,6 +3157,9 @@ mod tests {
 
     #[test]
     fn inbox_filtered_since_boundary_equal_ts_excluded() {
+        // bd-0rzv: reads the shared mail root — serialize under the
+        // crate-wide env lock; sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
         // bd-55nx.12: a row stamped exactly at the bound is excluded once
         // (toron uses strict-newer), never twice-wrong.
         let mail = Mail::from_config(None).expect("ok").expect("Some");
