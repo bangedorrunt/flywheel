@@ -10731,26 +10731,29 @@ pub(crate) fn bind_pane_mail_identity(
     }
 }
 
-/// Deterministic herdr-agent-name → agent-mail adjective+noun mapping.
+/// Deterministic herdr-agent-name → adjective+noun pin mapping.
 ///
-/// agent-mail's `register_agent` validates names against a FIXED whitelist:
-/// `VALID_ADJECTIVES` (75) × `VALID_NOUNS` (132), lowercase-split + PascalCase
-/// (bd-odc; verified from `mcp_agent_mail_core::models`). Any other shape is
-/// rejected, INCLUDING lookalikes like `FrostDolphin` (dolphin isn't in the
-/// noun list). This maps any herdr name (`flywheel-flywheel-oc`) to a stable
-/// adjective+noun from the SAME whitelist via FNV-1a hash into the lists.
+/// The pin shape follows the legacy agent-mail whitelist: a FIXED
+/// `VALID_ADJECTIVES` (75) × `VALID_NOUNS` (132) pair, lowercase-split +
+/// PascalCase (bd-odc). Any other shape is off-shape, INCLUDING lookalikes
+/// like `FrostDolphin` (dolphin isn't in the noun list). This maps any herdr
+/// name (`flywheel-flywheel-oc`) to a stable adjective+noun from that
+/// whitelist via FNV-1a hash into the lists.
 ///
 /// The mapping is deterministic — the same herdr name always maps to the
-/// same agent-mail name, across runs and machines — so re-registration is
-/// idempotent and the reverse lookup (herdr name in task_description) is
-/// stable. Collisions (different herdr names → same pair) are possible but
-/// harmless: register_agent is an upsert per name, and the herdr name is
-/// preserved in task_description, so no information is lost.
+/// same pin, across runs and machines — so re-registration is idempotent and
+/// the reverse lookup (herdr name in task_description) is stable. Collisions
+/// (different herdr names → same pair) are possible but harmless: the
+/// registry is an upsert per name, and the herdr name is preserved in
+/// task_description, so no information is lost.
 ///
-/// Lists copied verbatim from mcp_agent_mail_rust
-/// crates/mcp-agent-mail-core/src/models.rs (Apache/MIT). If the server
-/// updates its lists, flywheel's copy must follow or registration breaks.
-/// If `s` lowercases to a VALID_ADJECTIVES+VALID_NOUNS pair (the server's
+/// The lists are that agent-mail whitelist copied verbatim from
+/// mcp_agent_mail_rust crates/mcp-agent-mail-core/src/models.rs (Apache/MIT).
+/// The agent-mail server is gone (bd-euav: toron is the only mail backend), so
+/// nothing validates against the lists live any more — they are flywheel's own
+/// pin vocabulary now and are FROZEN: derivation is index-based, so editing or
+/// reordering either list re-derives every existing pin and breaks identity.
+/// If `s` lowercases to a VALID_ADJECTIVES+VALID_NOUNS pair (the frozen
 /// whitelist shape, PascalCase after normalization), return the canonical
 /// PascalCase form; else None. This is the identity gate for
 /// [`agent_mail_name`]: an input already shaped as a pair passes through.
@@ -10778,7 +10781,7 @@ fn agent_mail_name(herdr_name: &str) -> String {
     if let Some(pair) = valid_pair(herdr_name, &ADJECTIVES, &NOUNS) {
         return pair;
     }
-    // Keep in lockstep with mcp_agent_mail_core::models::VALID_ADJECTIVES.
+    // FROZEN whitelist (see `agent_mail_name`): index-addressed, never edited.
     // Module-scope: the S9 pin draw (unique_adjnoun_pin) shares the whitelist.
     let h = state::fnv1a64(herdr_name);
     adjnoun_from_fnv(h)
@@ -10823,8 +10826,8 @@ pub(crate) fn unique_adjnoun_pin(taken: &std::collections::HashSet<String>, seed
     }
 }
 
-/// Keep in lockstep with mcp_agent_mail_core::models::VALID_ADJECTIVES.
-/// (75 adjectives — the S9 pin-draw candidate space.)
+/// The FROZEN adjective whitelist — 75 entries, index-addressed by pin
+/// derivation (`agent_mail_name`); never reorder or edit.
 const ADJECTIVES: [&str; 75] = [
     "red",
     "orange",
@@ -10902,8 +10905,8 @@ const ADJECTIVES: [&str; 75] = [
     "noble",
     "proud",
 ];
-/// Keep in lockstep with mcp_agent_mail_core::models::VALID_NOUNS.
-/// (132 nouns — the S9 pin-draw candidate space.)
+/// The FROZEN noun whitelist — 132 entries, index-addressed by pin
+/// derivation (`agent_mail_name`); never reorder or edit.
 const NOUNS: [&str; 132] = [
     "stone",
     "lake",
@@ -11120,10 +11123,11 @@ mod agent_mail_name_tests {
         assert_eq!(a, agent_mail_name("flywheel-flywheel-oc"));
     }
 
-    /// The output is a valid agent-mail name per the server contract
-    /// (mcp_agent_mail_core::models::normalize_agent_name): a VALID_ADJECTIVES
-    /// member + VALID_NOUNS member, total length >= 5. This is the REAL gate
-    /// — bd-odc proved lookalikes like FrostDolphin are rejected.
+    /// The output is a whitelist pair: a VALID_ADJECTIVES member + a
+    /// VALID_NOUNS member, total length >= 5. This is the REAL gate — it is
+    /// what makes `agent_mail_name` idempotent (a mapped pin passes back
+    /// through `valid_pair`), and bd-odc proved off-shape pairs like
+    /// FrostDolphin are rejected.
     #[test]
     fn mapping_produces_valid_agent_mail_name() {
         for name in [

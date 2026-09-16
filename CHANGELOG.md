@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **One mail backend: toron (bd-euav).** `src/backend/agentmail.rs` and the `tmux` multiplexer stub (`src/backend/tmux.rs`) are deleted, with the `mail-agentmail` / `backend-tmux` cargo features and the `[mail.agentmail]` config section. `FLYWHEEL_MAIL` accepts `toron` only; `[mail.toron] url` selects the remote daemon and absent means in-process. The agent-mail env vars were renamed — `FLYWHEEL_AGENTMAIL_URL` / `FLYWHEEL_AGENTMAIL_TOKEN` are now `FLYWHEEL_TORON_URL` / `FLYWHEEL_TORON_TOKEN` — and the shared `[agent_mail]` section survives as the mail identity (`name`) and shared token source.
+
 ### Changed
 
 - **GS-052 hybrid `workflow list --brief` (FM-050-STEER → FM-052):** ONE live projection = `name` + `family` + `selection` + `run` + `topology` + `compose_token` (`workflow_list_brief_rows` / `cmd_workflow`). Sticky-open still sees `topology`. Bare `list --json` adds description + decide_trigger + rest; `show` is prose/graph detail (**not** decide_trigger/family/selection/topology). Docs (AGENTS, catalog-review, workflows, cli-reference, robot-capabilities) aligned to live fields — no invent-green GS-048-only brief docs; no dual `--robot-capabilities` `workflows` key. Rejected: Redis/OTP/new kinds/MCP/GS-046 cuts/GS-051 full packet.

@@ -22,8 +22,13 @@ fn flywheel() -> &'static str {
 }
 
 /// Column-0 `fn name(` — skips tripwire string literals that quote the needle.
+/// Handles `pub(crate) fn` too (bd-mngn: handlers migrate into cmd/ modules).
 fn find_toplevel_fn(src: &str, name: &str) -> usize {
     let needle = format!("\nfn {name}(");
+    if let Some(i) = src.find(&needle) {
+        return i + 1;
+    }
+    let needle = format!("\npub(crate) fn {name}(");
     src.find(&needle)
         .map(|i| i + 1)
         .unwrap_or_else(|| panic!("expected toplevel `fn {name}(`"))
@@ -160,10 +165,11 @@ fn run_doorbell_once(stdin_line: &str, status: &[&str]) -> String {
 /// herdr prompt delivers). Same contracts, new addresses.
 #[test]
 fn sc_d1_live_dispatcher_uses_apply_watch_line() {
-    let cmd = read("src/main.rs");
+    // bd-mngn: cmd_internal_doorbell moved to src/cmd/doorbell.rs, where it is
+    // the last fn in the file — so the dispatch slice runs to EOF.
+    let cmd = read("src/cmd/doorbell.rs");
     let start = find_toplevel_fn(&cmd, "cmd_internal_doorbell");
-    let end = find_toplevel_fn(&cmd, "project_base");
-    let dispatch = &cmd[start..end];
+    let dispatch = &cmd[start..];
     // Host selection lives in the command: daemon mode never runs a loop.
     assert!(
         dispatch.contains("resolve_host") && dispatch.contains("run_embedded"),
@@ -308,7 +314,9 @@ fn sc_d6_digest_needs_no_loop() {
 fn sc_d7_spawn_identity_without_dispatcher() {
     let src = read("src/main.rs");
     let start = find_toplevel_fn(&src, "cmd_spawn");
-    let end = find_toplevel_fn(&src, "cmd_internal_doorbell");
+    // bd-mngn: cmd_internal_doorbell moved to cmd/doorbell.rs —
+    // doorbell_project_workspaces is the next surviving fn marker.
+    let end = find_toplevel_fn(&src, "doorbell_project_workspaces");
     let body = &src[start..end];
     assert!(body.contains("doorbell::identity_prime"));
     assert!(body.contains("if peer_aware"));

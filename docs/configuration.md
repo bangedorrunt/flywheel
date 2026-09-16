@@ -116,7 +116,7 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 | Var | Effect |
 |---|---|
 | `XDG_STATE_HOME` | state root (unset macOS fallback: `~/.local/state` — unified 2026-09-13, was Application Support for the CLI only) |
-| `FLYWHEEL_SOCKET/ROOT/TIMEOUT/BACKEND/MAIL/AGENTMAIL_URL/TOKEN/MAIL_NAME/CREW_MAX/VERIFY_STRICT/COMPOSE_MAX_SECONDS/DISPATCH_TTL_SECS/PANE_STALL_SECS/RECLAIM_*/MCP_TIMEOUT_SECS/NO_DOORBELL_ENSURE` | per-name overrides (TIMEOUT fail-loud) |
+| `FLYWHEEL_SOCKET/ROOT/TIMEOUT/BACKEND/MAIL/TORON_URL/TOKEN/MAIL_NAME/CREW_MAX/VERIFY_STRICT/COMPOSE_MAX_SECONDS/DISPATCH_TTL_SECS/PANE_STALL_SECS/RECLAIM_*/MCP_TIMEOUT_SECS/NO_DOORBELL_ENSURE` | per-name overrides (TIMEOUT fail-loud) |
 | `DOORBELL_STATE_DIR` / `DOORBELL_FLYWHEEL_STATE_DIR` / `DOORBELL_PORT` | daemon dir/port resolution (unit exports the first) |
 | `DOORBELL_TORON_BIN` / `DOORBELL_HERDR_BIN` | watch/prompt child binaries (tests set `true`) |
 | `DOORBELL_WEBHOOK_ALLOWLIST` | egress hosts allowed for `--sink webhook` rows (comma/space separated, exact or `.suffix`; absent = the daemon registers no webhook adapter and those wakes stay digest-visible) |

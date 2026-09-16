@@ -15,7 +15,7 @@ mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force # p
 # codesign --force --sign - ~/.cargo/bin/doorbell && launchctl kickstart -k gui/$(id -u)/com.doorbell.serve
 ```
 
-Rust runs through mbx (cargo cache): prefix every cargo invocation with `mbx +nightly-aarch64-apple-darwin` (bare `cargo` misparses under the mbx shim).
+Rust runs through mbx (cargo cache): prefix every cargo invocation with `mbx +nightly-aarch64-apple-darwin` (bare `cargo` misparses under the mbx shim). `test` runs all four workspace packages (flywheel + doorbell-core/rt/cli) via `[workspace] default-members`, so a doorbell-crate regression is not invisible to the default command.
 
 Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --exclude-ignored` is invalid.
 

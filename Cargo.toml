@@ -7,6 +7,18 @@ license = "MIT"
 
 [workspace]
 members = ["crates/doorbell-core", "crates/doorbell-rt", "crates/doorbell-cli"]
+# default-members: the root package is implied, so without this a bare
+# `cargo test` at the root ran ONLY flywheel and the doorbell crates' tests
+# (doorbell-rt's brain/sinks, doorbell-cli's lifecycle) silently never ran.
+# Listing them makes the documented `mbx +nightly-aarch64-apple-darwin test`
+# cover the whole workspace — the same four-package fence
+# scripts/verify-clippy.sh applies to the lint gates (bd-hj36).
+default-members = [
+    ".",
+    "crates/doorbell-core",
+    "crates/doorbell-rt",
+    "crates/doorbell-cli",
+]
 
 [dependencies]
 doorbell-core = { path = "crates/doorbell-core" }

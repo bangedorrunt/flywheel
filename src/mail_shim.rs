@@ -11,7 +11,9 @@
 //!   `Mail` construction (`init_mailbox`, se2.1 Phase A).
 //! - REMOTE-DAEMON (OPTIONAL, bd-o8j.3): a standalone `toron serve --mcp-http
 //!   <addr>` over Streamable HTTP (MCP), driven by a minimal MCP client
-//!   (`crate::mcp_http::McpClient`). Selected when `[agent_mail] url` is set.
+//!   (`crate::mcp_http::McpClient`). Selected when `[mail.toron] url` is set
+//!   (`Config::toron_mail_config`); the legacy `[agent_mail] url` is never a
+//!   routing source (bd-euav, ADR-0003 V2/V3).
 //!
 //! flywheel main.rs dispatch is sync, so each in-process op is `block_on`'d on
 //! a shared tokio runtime (the remote path is ureq-sync, no runtime needed).
@@ -419,11 +421,12 @@ impl Mail {
         self
     }
 
-    /// Construct the mail facade from `[agent_mail]` config. Picks the
-    /// backend: `cfg.url` Some → remote-daemon (bd-o8j.3); None/unset →
-    /// integrated in-process mailbox (default). The config section stays
-    /// OPTIONAL — no config means the integrated mailbox with identity
-    /// `flywheel`.
+    /// Construct the mail facade from `Config::toron_mail_config()` — shared
+    /// identity `name` from `[agent_mail]`, transport `url` from
+    /// `[mail.toron]` only. Picks the backend: `cfg.url` Some → remote-daemon
+    /// (bd-o8j.3); None/unset → integrated in-process mailbox (default). The
+    /// config section stays OPTIONAL — no config means the integrated mailbox
+    /// with identity `flywheel`.
     pub fn from_config(cfg: Option<&MailConfig>) -> Result<Option<Self>> {
         match cfg.and_then(|c| c.url.as_deref()) {
             Some(url) if !url.is_empty() => Self::remote(cfg),

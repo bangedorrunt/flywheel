@@ -602,7 +602,7 @@ graph:
         assignee: x
         spec:
           profile: "@scout"
-          task: "Scout the toron + flywheel repos: (1) internal gaps — code health, deferred ADR-0005/0010/0011 items still open, open seams, test gaps; (2) upstream parity — Dicklesworthstone/mcp_agent_mail_rust and block/buzz patterns not yet ported. Return COMPRESSED findings JSON: [{area, finding, evidence, ev}]. No academic literature."
+          task: "Scout the toron + flywheel repos: (1) internal gaps — code health, deferred ADR-0005/0010/0011 items still open, open seams, test gaps; (2) upstream parity — the docs/upstream-parity.toml pins (compound-engineering, pstack) plus block/buzz patterns not yet ported. Return COMPRESSED findings JSON: [{area, finding, evidence, ev}]. No academic literature."
     oracle:
       action: dispatch_job
       assignee: x
