@@ -1,0 +1,35 @@
+toron mail coordination surfaces
+
+Usage: flywheel mail [OPTIONS] <COMMAND>
+
+Commands:
+  inbox         fetch inbox (default: config identity; override with --as / FLYWHEEL_MAIL_AS / AGENT_NAME)
+  reply         reply to a message in its thread (thread = the message id or thread id)
+  read          mark a message read (read receipt; the projection honors it once read-state lands toron-side — bd-5icg)
+  ack           acknowledge a message that had ack_required=true
+  search        FTS5 search over the project's indexed messages
+  summarize     summarize a thread (participants, key points, action items)
+  whois         resolve an agent's profile (npub, program, model, task)
+  register      register/refresh an agent identity (upsert). One operator is one identity (bd-register-portability-3c2b): a name is REQUIRED — bind an existing key with --from-project/--adopt-unnamed instead of minting
+  renew         renew this identity's file reservations (extend the TTL)
+  force-unlock  operator force-release of a stale reservation (herdr-down / abandoned)
+  slot          build slots: acquire/renew/release the advisory 'cargo' slot
+  policy        set this agent's inbound contact policy
+  digest        per-agent mail digest: unread/urgent counts + last sender/subject (orchestrator "who has mail" view; default = own identity)
+  watch         wait until a thread gains a new message (blocks; Ctrl-C to abort)
+  send          send a message to registered agents
+  locks         reserve / inspect file locks (advisory; subcommands: reserve, list, show)
+  unlock        release this identity's reservations
+  conflicts     check reservation conflicts for paths
+  agents        list registered agents in the project (active within 24h by default; --all shows the full history incl. stale registrations)
+  contact       cross-project contact (request_contact / respond / list)
+  resend        ADR-0010 D8 (bd-d8e4): corr-preserving resend. Re-runs the send under the SAME corr — toron's idempotent claim dedupes within TTL and the receipt stays corr-keyed. Refuses resulted (resend would duplicate) and degraded (bookkeeping failed after enqueue — likely delivered). A plain re-run of `mail send` mints a NEW corr and duplicates
+  product       product grouping for multi-project search/inbox
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --robot-snapshot      Full JSON state snapshot of all flywheel swarms (scripts/agents)
+      --robot-capabilities  List flywheel's machine-readable capabilities as JSON
+      --skip-preflight      Skip preflight checks (steer/loop/workflow auto-verify before dispatch)
+      --robot-status        Compact JSON status of all flywheel swarms
+  -h, --help                Print help

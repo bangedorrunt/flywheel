@@ -16075,24 +16075,29 @@ mod verify_gate_tests {
         assert!(!is_cargo_test_verify("cargo build --tests"));
     }
 
+    /// Table-driven cargo-test count parsing: (output, passed, filtered).
+    /// One table instead of one test per literal (bd-1qqo seam pattern).
     #[test]
-    fn verify_gate_parses_counts_ok() {
-        let out = "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s";
-        assert_eq!(parse_cargo_test_counts(out), (Some(4), Some(1)));
-    }
-
-    #[test]
-    fn verify_gate_parses_zero_vacuous() {
-        let out = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s";
-        assert_eq!(parse_cargo_test_counts(out), (Some(0), Some(42)));
-    }
-
-    #[test]
-    fn verify_gate_parses_counts_no_filter() {
-        let out = "test result: ok. 3 passed; 0 failed;";
-        let (passed, filtered) = parse_cargo_test_counts(out);
-        assert_eq!(passed, Some(3));
-        assert_eq!(filtered, None);
+    fn verify_gate_parses_counts_table() {
+        for (out, passed, filtered) in [
+            (
+                "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+                Some(4),
+                Some(1),
+            ),
+            (
+                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s",
+                Some(0),
+                Some(42),
+            ),
+            ("test result: ok. 3 passed; 0 failed;", Some(3), None),
+        ] {
+            assert_eq!(
+                parse_cargo_test_counts(out),
+                (passed, filtered),
+                "input: {out}"
+            );
+        }
     }
 
     #[test]
