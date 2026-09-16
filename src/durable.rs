@@ -15082,8 +15082,11 @@ mod reclaim_tests {
     }
     #[test]
     fn reclaim_env_override() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        // bd-0rzv follow-up: the crate-wide env lock, not a module-local
+        // one — these vars are read by reclaim threshold fns in OTHER
+        // tests running concurrently (observed: reclaim_human_86400
+        // reclaiming at HUMAN_SECS=20).
+        let _guard = crate::config::lock_env();
         unsafe {
             std::env::set_var("FLYWHEEL_RECLAIM_SWARM_SECS", "10");
             std::env::set_var("FLYWHEEL_RECLAIM_HUMAN_SECS", "20");
