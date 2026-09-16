@@ -45,7 +45,7 @@ impl HerdrPromptSink {
 }
 
 impl doorbell_rt::PromptSink for HerdrPromptSink {
-    fn send(&mut self, pin: &str, line: &str) -> anyhow::Result<()> {
+    fn send(&mut self, pin: &str, line: &str) -> Result<(), doorbell_rt::RtError> {
         let registry = state::load_spawn_registry(&self.project);
         let delivered = crate::doorbell_prompt(
             self.client.as_mut(),
@@ -56,7 +56,7 @@ impl doorbell_rt::PromptSink for HerdrPromptSink {
             &self.workspace,
         );
         if delivered.is_empty() {
-            anyhow::bail!("prompt for {pin} delivered nowhere");
+            return Err(doorbell_rt::RtError::UndeliveredPin(pin.to_string()));
         }
         Ok(())
     }

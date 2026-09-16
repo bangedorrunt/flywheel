@@ -1698,9 +1698,9 @@ mod tests {
             fail: bool,
         }
         impl crate::sinks::PromptSink for FailingThenOk {
-            fn send(&mut self, _pin: &str, _line: &str) -> anyhow::Result<()> {
+            fn send(&mut self, _pin: &str, _line: &str) -> Result<(), crate::error::RtError> {
                 if self.fail {
-                    anyhow::bail!("endpoint down");
+                    return Err(crate::error::RtError::EndpointDown);
                 }
                 self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())

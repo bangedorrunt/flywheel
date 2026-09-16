@@ -471,7 +471,11 @@ impl FileStore {
             .unwrap_or_default()
     }
 
-    pub fn save_wake(&self, workspace: &str, st: &doorbell_core::WakeState) -> anyhow::Result<()> {
+    pub fn save_wake(
+        &self,
+        workspace: &str,
+        st: &doorbell_core::WakeState,
+    ) -> Result<(), crate::error::RtError> {
         let json = serde_json::to_string(st)?;
         let path = self.wake_file(workspace);
         if let Some(parent) = path.parent() {
