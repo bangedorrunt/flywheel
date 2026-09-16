@@ -1013,7 +1013,9 @@ mod tests {
         let out = fx(&inv).expect("runner returns a value");
 
         let key = effect_key_for(&inv);
-        let sent = seen.lock().unwrap();
+        // Clone out of the guard so no `MutexGuard` is live across the awaits
+        // below (clippy::await_holding_lock); the guard drops here.
+        let sent = seen.lock().unwrap().clone();
         assert_eq!(sent.len(), 1, "exactly one delivery for one logical effect");
         let msg = &sent[0];
         assert_eq!(msg.project_slug, "demo");
@@ -1045,8 +1047,6 @@ mod tests {
                 .any(|t| t.get(1).map(String::as_str) == Some("toron:workflow-emitted")),
             "the loop-prevention stamp rides the rumor (ADR-0007 F6): {tags:?}"
         );
-        drop(sent);
-
         assert_eq!(out["count"], json!(1));
         assert_eq!(out["effect_key"], json!(key.as_str()));
         let row = store.get_effect(&key).await.unwrap().expect("row");

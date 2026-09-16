@@ -6,9 +6,6 @@
 //
 // The pub items here are the wave-1 spine: consumers (br gate wrappers, the
 // `flywheel ledger` CLI, the loop close-detect path) land in the next beads.
-// Until then nothing outside this module references them, so dead_code is
-// allowed — with the clippy -D warnings gate kept green.
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 
@@ -52,18 +49,6 @@ pub enum Blast {
     High,
 }
 
-impl Blast {
-    /// ADR-0019 derivation rule: High iff overlapping reserved paths OR the AC
-    /// is judgment.
-    pub fn of(overlap: bool, ac: AcShape) -> Self {
-        if overlap || ac == AcShape::Judgment {
-            Self::High
-        } else {
-            Self::Normal
-        }
-    }
-}
-
 /// The unit of work (ADR-0019 Spec 1). Pure data; no IO.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeadUnit {
@@ -105,21 +90,6 @@ pub enum VerdictKind {
 }
 
 impl VerdictKind {
-    /// Every kind; the exhaustive-match surface for `legal_close`. The order
-    /// matches br's `verify::VerdictKind::ALL` so a drift in either table is
-    /// visible side by side (bd-tfxv: one gate-name authority).
-    pub const ALL: [Self; 9] = [
-        Self::CommandVerified,
-        Self::UnitTestVerified,
-        Self::LiveVerified,
-        Self::ReviewerSigned,
-        Self::WorkerReceipt,
-        Self::OperatorDirected,
-        Self::TriageVerified,
-        Self::VerifierBlocked,
-        Self::VerifierFailed,
-    ];
-
     /// br gate name (kebab-cased `VerdictKind`, ADR-0019 Spec 1). Only PASS
     /// verdicts become gate rows; Blocked/Failed are loop state, but the names
     /// exist so the mapping is total. Every name br's transition policy
@@ -156,6 +126,21 @@ impl VerdictKind {
             _ => return None,
         })
     }
+    /// Every kind; the exhaustive-match surface for `legal_close`. The order
+    /// matches br's `verify::VerdictKind::ALL` so a drift in either table is
+    /// visible side by side (bd-tfxv: one gate-name authority).
+    #[cfg(test)]
+    pub const ALL: [Self; 9] = [
+        Self::CommandVerified,
+        Self::UnitTestVerified,
+        Self::LiveVerified,
+        Self::ReviewerSigned,
+        Self::WorkerReceipt,
+        Self::OperatorDirected,
+        Self::TriageVerified,
+        Self::VerifierBlocked,
+        Self::VerifierFailed,
+    ];
 }
 
 /// A recorded proof (ADR-0019 Spec 1). Non-Option by construction: a close
@@ -366,26 +351,6 @@ use std::process::Command as StdCommand;
 /// unarmed — workers never write verdicts (ADR-0019 Spec 1).
 static LOOP_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Serializes tests that arm the loop reporter: arming is process-global, so
-/// a parallel armed test would race another test's unarmed-refusal
-/// assertions. Tests take this lock for the whole arming sequence.
-#[doc(hidden)]
-pub static LOOP_REPORTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Test seam: reset the process-global arm flag (call under
-/// `LOOP_REPORTER_LOCK` at the start of an arming test — the flag persists
-/// across tests once armed).
-#[doc(hidden)]
-pub fn test_reset_loop_reporter() {
-    LOOP_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Arm the loop reporter. Called once by the durable loop at startup
-/// (durable.rs, bd-w1-reopen-f6tw wiring). Idempotent.
-pub fn arm_loop_reporter() {
-    LOOP_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
 fn loop_armed() -> bool {
     LOOP_ARMED.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -412,11 +377,11 @@ pub struct GateRow {
 }
 
 /// `br gate list <id> --json` (unknown fields — legacy_results,
-/// gated_transitions, … — are ignored by serde).
+/// gated_transitions, … — are ignored by serde). Only `history` is read; the
+/// gate path never needs the row's own id/status, and dropping the two
+/// unread fields makes the deserializer strictly more permissive.
 #[derive(Clone, Debug, Deserialize)]
 pub struct GateList {
-    pub issue_id: String,
-    pub current_status: String,
     pub history: Vec<GateRow>,
 }
 
@@ -700,6 +665,7 @@ pub struct CloseReasonCheck {
 impl CloseReasonCheck {
     /// The advisory stance: decoration detection is a lint warning, not a
     /// gate, until proven in practice (ADR-0006 D3 VERIFY stage).
+    #[cfg(test)]
     pub fn is_hard_fail(&self) -> bool {
         false
     }
@@ -971,6 +937,29 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
         sha,
         receipt_eligible,
     })
+}
+
+/// Serializes tests that arm the loop reporter: arming is process-global, so
+/// a parallel armed test would race another test's unarmed-refusal
+/// assertions. Tests take this lock for the whole arming sequence.
+#[cfg(test)]
+#[doc(hidden)]
+pub static LOOP_REPORTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Arm the loop reporter. Called once by the durable loop at startup
+/// (durable.rs, bd-w1-reopen-f6tw wiring). Idempotent.
+#[cfg(test)]
+pub fn arm_loop_reporter() {
+    LOOP_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test seam: reset the process-global arm flag (call under
+/// `LOOP_REPORTER_LOCK` at the start of an arming test — the flag persists
+/// across tests once armed).
+#[cfg(test)]
+#[doc(hidden)]
+pub fn test_reset_loop_reporter() {
+    LOOP_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -2179,5 +2168,18 @@ PRINCIPLES: prove-it-works — ran the fixture suite before plumbing";
         let reason = "VERIFY: cargo test -> ok\nPRINCIPLES: prove-it-works —";
         let err = verify_close_reason(reason).expect_err("bare name, no decision");
         assert!(err.contains("prove-it-works"), "must name it: {err}");
+    }
+}
+
+#[cfg(test)]
+impl Blast {
+    /// ADR-0019 derivation rule: High iff overlapping reserved paths OR the AC
+    /// is judgment.
+    pub fn of(overlap: bool, ac: AcShape) -> Self {
+        if overlap || ac == AcShape::Judgment {
+            Self::High
+        } else {
+            Self::Normal
+        }
     }
 }

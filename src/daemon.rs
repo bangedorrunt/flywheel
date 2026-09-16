@@ -52,7 +52,11 @@ pub fn addr_alive(addr: &str) -> bool {
 pub enum DaemonState {
     /// Running under launchd (macOS).
     RunningLaunchd,
-    /// Running under systemd (Linux).
+    /// Running under systemd (Linux). Constructed only inside the
+    /// `cfg(target_os = "linux")` branch of [`detect_state`], so on macOS the
+    /// variant is reachable in `match` arms but never built — a platform
+    /// difference the lint cannot see.
+    #[allow(dead_code)]
     RunningSystemd,
     /// Running via pidfile spawn (fallback).
     RunningPidfile(u32),
@@ -194,11 +198,6 @@ pub fn plist_xml(label: &str, binary: &Path, port: u16, out_log: &Path, err_log:
         out_log.display(),
         err_log.display(),
     )
-}
-
-/// The CLI `serve` verb string the unit runs.
-pub fn serve_verb() -> &'static str {
-    "serve"
 }
 
 #[cfg(target_os = "macos")]

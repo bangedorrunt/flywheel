@@ -6,6 +6,7 @@
 //!   - `.flywheel/stages.toml` — the project tier (seed < repo < user < project)
 //!   - `.flywheel/standing-orders.md` — the project fence + compound orders
 //!   - `docs/learnings/README.md` — the learnings corpus convention
+//!
 //! Re-runnable: existing files are never overwritten (reported as kept).
 
 use std::path::{Path, PathBuf};

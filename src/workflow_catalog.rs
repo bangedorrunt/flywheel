@@ -423,11 +423,11 @@ pub fn write_workflow_yaml(dir: &Path, wf: &Workflow) -> Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg(test)]
 /// Parse the provenance tokens a kept workflow carries in its description
 /// (`origin: composed; from: <parts>; first-run: <ts>; author: <pin>`).
 /// Returns (origin, from, first_run, author) — None where absent. The
 /// keep-without-green-run refusal + provenance tests ride on these tokens.
+#[cfg(test)]
 pub fn parse_provenance(description: &str) -> Option<(String, String, String, String)> {
     let start = description.find("[origin:")?;
     let end = description[start..].find(']')? + start;

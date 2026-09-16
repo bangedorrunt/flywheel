@@ -9,7 +9,6 @@
 //! status / view / watch / steer_brief render from `assemble`; `helm`
 //! drains the three captain sections from it.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Versioned schema id. Robot JSON validates on this + the top-level keys.
@@ -94,29 +93,6 @@ pub struct Snapshot {
     /// herdr — never invent-green hardcoded 0 in live decide Snapshot.
     #[serde(default)]
     pub launch_pending: u32,
-}
-
-/// Top-level keys the robot JSON must carry (schema validation).
-pub fn schema_keys() -> Vec<&'static str> {
-    vec![
-        "schema",
-        "generated_at",
-        "workspace",
-        "freshness_epoch",
-        "pins",
-        "lanes",
-        "decisions",
-        "mail",
-        "journal",
-        "drain_pending",
-        "afk",
-        "degraded",
-        "joinable",
-        "dispatcher",
-        "held_paths",
-        "coalitions",
-        "launch_pending",
-    ]
 }
 
 /// Journal value → tick Msg (workspace first, legacy doorbell second).
@@ -571,13 +547,28 @@ pub fn render_helm(snap: &Snapshot, now: u64) -> String {
     out
 }
 
-/// Wake counters summary for bears (BTreeMap label → count).
-pub fn counters_line(counters: &BTreeMap<String, u64>) -> String {
-    ["benign", "routine", "captain", "urgent"]
-        .iter()
-        .map(|k| format!("{k}={}", counters.get(*k).copied().unwrap_or(0)))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Top-level keys the robot JSON must carry (schema validation).
+#[cfg(test)]
+pub fn schema_keys() -> Vec<&'static str> {
+    vec![
+        "schema",
+        "generated_at",
+        "workspace",
+        "freshness_epoch",
+        "pins",
+        "lanes",
+        "decisions",
+        "mail",
+        "journal",
+        "drain_pending",
+        "afk",
+        "degraded",
+        "joinable",
+        "dispatcher",
+        "held_paths",
+        "coalitions",
+        "launch_pending",
+    ]
 }
 
 #[cfg(test)]

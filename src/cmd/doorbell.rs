@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 
 use crate::config::Config;
-use crate::output::print_json;
 
 /// Subcommands of `flywheel doorbell` (bd-durable-doorbell-lngf): the
 /// supervised pane-wake layer surface.
@@ -562,7 +561,7 @@ pub(crate) fn cmd_internal_doorbell(
     ) {
         crate::doorbell::DoorbellHost::Proxy { url } => {
             eprintln!("flywheel doorbell: daemon host {url} — no local loop (attach only)");
-            return Ok(());
+            Ok(())
         }
         crate::doorbell::DoorbellHost::Embedded => {
             crate::doorbell_host::run_embedded(cfg, project, workspace)

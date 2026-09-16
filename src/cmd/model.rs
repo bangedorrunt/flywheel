@@ -488,7 +488,7 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                         format!("{p}/{raw}")
                     }
                 };
-                if compiled.contains_key(&key) && reg.models.get(&key).is_none() {
+                if compiled.contains_key(&key) && !reg.models.contains_key(&key) {
                     skipped.push(key);
                     continue;
                 }

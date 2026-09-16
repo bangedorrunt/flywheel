@@ -23,9 +23,6 @@
 //! method except `name()` has a default body returning an Unsupported error.
 //! Real impls override what they support (ADR-0002 §6 — open-to-extension).
 
-// TODO(bd-p2-cli-wn8): re-evaluate this allow when the catalog CLI lands.
-#![allow(dead_code)]
-
 pub mod factory;
 pub mod herdr;
 #[cfg(test)]
@@ -40,7 +37,10 @@ pub mod wire;
 /// object-safe, Unsupported-open. The ONE trait source lives in toron-core;
 /// this re-export keeps flywheel call sites on the historical name.
 pub use toron_core::backend::Backend as MultiplexerBackend;
-/// Coded `agent.prompt` landing data (unified in toron-core).
+/// Coded `agent.prompt` landing data (unified in toron-core). Reached only
+/// from the `__send` parity mapper (`herdr::map_prompt_result`), which is
+/// itself test-only here, so the name ships with that caller.
+#[cfg(test)]
 pub use toron_core::backend::PromptLanding;
 
 // ===========================================================================
@@ -50,24 +50,30 @@ pub use toron_core::backend::PromptLanding;
 // ===========================================================================
 #[allow(unused_imports)]
 pub use toron_core::index::slots::{BuildSlot, GrantedSlot, SlotConflict};
+#[allow(unused_imports)]
 pub use toron_core::mailbox::build_slots::AcquireBuildSlotResult;
+#[allow(unused_imports)]
 pub use toron_core::mailbox::contacts::ContactLink;
 pub use toron_core::mailbox::error::MailError;
+#[allow(unused_imports)]
 pub use toron_core::mailbox::ids::MessageId;
 #[allow(unused_imports)]
 pub use toron_core::mailbox::infra::{HealthReport, ProjectState};
+#[allow(unused_imports)]
 pub use toron_core::mailbox::product::ProductInfo;
 #[allow(unused_imports)]
 pub use toron_core::mailbox::reservations::{
     AcquireResult, ConflictReport, GrantedReservation, PathConflict, ReleaseResult, ReleasedLease,
     RenewResult,
 };
+#[allow(unused_imports)]
 pub use toron_core::mailbox::search::ThreadSummary;
+#[allow(unused_imports)]
 pub use toron_core::mailbox::surface::{
     ContactRequest, ContactResponse, DeliveryLine, InboxQuery, MailItem, MailSurface, ProductHit,
     ReceiptOp, ReceiptOutcome, ReplyMail, SearchQuery, SendMail, SendReceipt,
 };
-pub use toron_core::mailbox::unwrap::ContactPolicy;
+#[allow(unused_imports)]
 pub use toron_core::mailbox::{AgentProfile, RegisteredAgent, WhoIs};
 
 // Factory entry points — consumers (the durable-loop leaf handlers in main.rs)
@@ -145,17 +151,7 @@ impl From<toron_core::backend::BackendError> for BackendError {
     }
 }
 
-impl BackendError {
-    /// Helper for default trait method bodies: the named op is unsupported by
-    /// the named backend.
-    fn unsupported(backend: &str, method: &'static str) -> Self {
-        Self::Unsupported {
-            backend: backend.to_string(),
-            method,
-            reason: format!("backend '{backend}' does not implement '{method}'"),
-        }
-    }
-}
+impl BackendError {}
 
 /// Type alias for multiplexer + factory errors (the mail surface returns
 /// toron-core's `MailError` directly — no double error taxonomy, ADR-0007 F9).

@@ -253,12 +253,12 @@ impl ModelRegistry {
             for key in file.models.keys() {
                 validate_key(key).with_context(|| format!("parse {}", path.display()))?;
             }
-            if let Some(d) = &file.defaults {
-                if d.model.starts_with('@') {
-                    anyhow::bail!(
-                        "models.toml: [defaults] model must be a concrete id — defaults cannot alias slots"
-                    );
-                }
+            if let Some(d) = &file.defaults
+                && d.model.starts_with('@')
+            {
+                anyhow::bail!(
+                    "models.toml: [defaults] model must be a concrete id — defaults cannot alias slots"
+                );
             }
             models = file.models;
             slots = file.slots;
@@ -399,7 +399,7 @@ impl ModelRegistry {
 
     /// Canonical slot spec after alias normalization (`@cheap` / `free` / …).
     pub fn slot(&self, name: &str) -> Option<&SlotSpec> {
-        let key = slot_alias(name).or_else(|| {
+        let key = slot_alias(name).or({
             // slot set / [slots.cheap] use the bare name, not `@cheap`.
             match name {
                 SLOT_CHEAP | "free" | "smol" => Some(SLOT_CHEAP),
@@ -570,19 +570,6 @@ impl ModelRegistry {
         self.slots.get(name).map(|s| s.model.clone())
     }
 
-    /// Implicit kind→slot: a bare-harness spawn with no profile uses this
-    /// slot's model (ADR-0007 D1). Unknown kind → None.
-    ///
-    /// NOTE (bd-ovew): the returned model's provider is NOT harness-checked
-    /// — notably `grok` maps here for its budget band while its model is a
-    /// zai id the grok harness cannot run. Consumers launching on grok must
-    /// go through [`Self::grok_default_model`] (route) or fail loud, never
-    /// imply this slot's model onto that harness.
-    pub fn implied_slot_for_harness(&self, kind: &str) -> Option<&SlotSpec> {
-        let name = implied_slot_name_for_harness(kind)?;
-        self.slots.get(name)
-    }
-
     /// Save the full file to `~/.config/flywheel/models.toml` (the `add`/
     /// `remove` write path).
     pub fn save(&self) -> Result<()> {
@@ -701,6 +688,19 @@ impl ModelRegistry {
         })?;
         std::fs::write(path, raw).with_context(|| format!("write {}", path.display()))?;
         Ok(())
+    }
+    /// Implicit kind→slot: a bare-harness spawn with no profile uses this
+    /// slot's model (ADR-0007 D1). Unknown kind → None.
+    ///
+    /// NOTE (bd-ovew): the returned model's provider is NOT harness-checked
+    /// — notably `grok` maps here for its budget band while its model is a
+    /// zai id the grok harness cannot run. Consumers launching on grok must
+    /// go through [`Self::grok_default_model`] (route) or fail loud, never
+    /// imply this slot's model onto that harness.
+    #[cfg(test)]
+    pub fn implied_slot_for_harness(&self, kind: &str) -> Option<&SlotSpec> {
+        let name = implied_slot_name_for_harness(kind)?;
+        self.slots.get(name)
     }
 }
 
@@ -981,24 +981,6 @@ mod tests {
         let reloaded = ModelRegistry::load().expect("load");
         let ids: Vec<&String> = reloaded.models.keys().collect();
         assert_eq!(ids, vec!["anthropic/grok-4"]);
-    }
-
-    /// Cost fields are advisory and default to 0 (no requirement to set).
-    #[expect(clippy::float_cmp, reason = "default-cost contract is exact zero")]
-    fn cost_defaults_to_zero() {
-        let _g = with_config_dir();
-        let toml = r#"
-[models."local/free-model"]
-"#;
-        let path = crate::config::config_dir().join("models.toml");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, toml).unwrap();
-        let reg = ModelRegistry::load().expect("load");
-        let e = reg.get("free-model").expect("entry");
-        assert_eq!(e.cost_in_per_mtok, 0.0);
-        assert_eq!(e.cost_out_per_mtok, 0.0);
-        assert!(e.caps.is_empty());
-        assert!(e.fallback.is_none());
     }
 
     // ---- ADR-0019 Spec 4: verifier family resolution + single-family degrade
@@ -1501,7 +1483,7 @@ mod tests {
             e.caps = vec!["omp".into()];
         }
         // Step 3 first: a caps-compatible model_fallback id wins.
-        let (h, m, route) = reg
+        let (h, _m, route) = reg
             .resolve_profile_route_full(
                 "",
                 "@cheap",

@@ -1,8 +1,6 @@
 // governed-by: ADR-0026
 //! Failure taxonomy (ADR-0026 Spec 1).
 
-#![allow(dead_code)]
-
 use std::fmt;
 
 #[allow(dead_code)]

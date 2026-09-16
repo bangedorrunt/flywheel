@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::Subcommand;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::config::Config;
 use crate::output::print_json;

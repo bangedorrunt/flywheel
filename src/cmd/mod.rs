@@ -37,7 +37,7 @@ pub(crate) use backend::{BackendCmd, cmd_backend};
 pub(crate) use checkpoint::{CheckpointCmd, cmd_checkpoint};
 pub(crate) use coalition::CoalitionCmd;
 pub(crate) use config::{ConfigCmd, cmd_config};
-pub(crate) use crew::{ControlVerbCmd, CrewCmd, cmd_crew};
+pub(crate) use crew::{CrewCmd, cmd_crew};
 pub(crate) use cron::CronCmd;
 #[cfg(feature = "serve")]
 pub(crate) use daemon::DaemonCmd;
@@ -51,9 +51,7 @@ pub(crate) use history::{
 };
 pub(crate) use ledger::{LedgerCmd, cmd_ledger};
 pub(crate) use loop_mode::LoopCmd;
-pub(crate) use mail::{
-    MailCmd, MailContactCmd, MailLockCmd, MailProductCmd, MailSlotCmd, cmd_mail,
-};
+pub(crate) use mail::{MailCmd, cmd_mail};
 pub(crate) use model::{ModelCmd, cmd_models};
 pub(crate) use policy::{PolicyCmd, cmd_policy};
 pub(crate) use principles::{PrinciplesCmd, cmd_principles};

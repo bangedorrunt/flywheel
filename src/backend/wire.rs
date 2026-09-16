@@ -257,11 +257,6 @@ pub fn conflicts_args(project_key: &str, agent_name: &str, paths: &[String]) -> 
     })
 }
 
-/// `resolve_pane_identity`.
-pub fn resolve_pane_identity_args(project_key: &str, pane_id: &str) -> Value {
-    json!({ "project_key": project_key, "pane_id": pane_id })
-}
-
 /// `cleanup_pane_identities`.
 pub fn cleanup_pane_identities_args(project_key: &str) -> Value {
     json!({ "project_key": project_key })

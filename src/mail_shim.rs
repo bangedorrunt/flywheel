@@ -1049,10 +1049,10 @@ impl Mail {
                 }))?;
                 // Echo wake in the JSON receipt so operators see non-null.
                 let mut v = result.to_json();
-                if let Some(w) = wake.filter(|s| !s.is_empty()) {
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.insert("wake".into(), serde_json::json!(w));
-                    }
+                if let Some(w) = wake.filter(|s| !s.is_empty())
+                    && let Some(obj) = v.as_object_mut()
+                {
+                    obj.insert("wake".into(), serde_json::json!(w));
                 }
                 Ok(v)
             }
@@ -1988,30 +1988,30 @@ impl Mail {
     /// previous occupant. Any herdr failure degrades to the file bridge
     /// below, never an error.
     pub fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Value {
-        if multiplexer_is_herdr() {
-            if let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None) {
-                let mut client = backend.client();
-                if let Ok(workspaces) = client.workspace_list() {
-                    for ws in workspaces {
-                        let panes = client.pane_list(Some(&ws.workspace_id)).unwrap_or_default();
-                        match panes.iter().find(|p| p.pane_id == pane_id) {
-                            Some(pane) => {
-                                if let Some(pin) = pane
-                                    .tokens
-                                    .get(toron_core::backend::herdr::TOKEN_PIN)
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                {
-                                    return json!({
-                                        "agent_name": pin,
-                                        "pane_id": pane_id,
-                                        "source": "pane-token",
-                                    });
-                                }
-                                break; // pane live but unstamped → file bridge
+        if multiplexer_is_herdr()
+            && let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None)
+        {
+            let mut client = backend.client();
+            if let Ok(workspaces) = client.workspace_list() {
+                for ws in workspaces {
+                    let panes = client.pane_list(Some(&ws.workspace_id)).unwrap_or_default();
+                    match panes.iter().find(|p| p.pane_id == pane_id) {
+                        Some(pane) => {
+                            if let Some(pin) = pane
+                                .tokens
+                                .get(toron_core::backend::herdr::TOKEN_PIN)
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
+                                return json!({
+                                    "agent_name": pin,
+                                    "pane_id": pane_id,
+                                    "source": "pane-token",
+                                });
                             }
-                            None => continue, // not in this workspace → keep looking
+                            break; // pane live but unstamped → file bridge
                         }
+                        None => continue, // not in this workspace → keep looking
                     }
                 }
             }

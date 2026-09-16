@@ -95,15 +95,15 @@ pub fn apply_opencode_go_api_key_alias(env: &mut std::collections::BTreeMap<Stri
     if std::env::var_os("OPENCODE_API_KEY").is_some() {
         return;
     }
-    if let Ok(v) = std::env::var("OPENCODE_GO_API_KEY") {
-        if !v.is_empty() {
-            env.insert("OPENCODE_API_KEY".to_string(), v);
-            // Also keep the GO name so auth.json `$OPENCODE_GO_API_KEY` refs work.
-            if !env.contains_key("OPENCODE_GO_API_KEY") {
-                if let Ok(go) = std::env::var("OPENCODE_GO_API_KEY") {
-                    env.insert("OPENCODE_GO_API_KEY".to_string(), go);
-                }
-            }
+    if let Ok(v) = std::env::var("OPENCODE_GO_API_KEY")
+        && !v.is_empty()
+    {
+        env.insert("OPENCODE_API_KEY".to_string(), v);
+        // Also keep the GO name so auth.json `$OPENCODE_GO_API_KEY` refs work.
+        if !env.contains_key("OPENCODE_GO_API_KEY")
+            && let Ok(go) = std::env::var("OPENCODE_GO_API_KEY")
+        {
+            env.insert("OPENCODE_GO_API_KEY".to_string(), go);
         }
     }
 }
@@ -1651,7 +1651,7 @@ mod herdr_env_tests {
         let mut map = std::collections::BTreeMap::new();
         apply_opencode_go_api_key_alias(&mut map);
         assert!(
-            map.get("OPENCODE_API_KEY").is_none(),
+            !map.contains_key("OPENCODE_API_KEY"),
             "must not invent a pane override when process already has API key"
         );
         unsafe {

@@ -19,11 +19,7 @@ use crate::backend::MultiplexerBackend;
 /// backend), so any use is an honest "not yet released" error.
 pub struct SuperlogicalBackend;
 
-impl SuperlogicalBackend {
-    /// Why operations fail today (surfaced by the factory's error path too).
-    pub const REASON: &'static str =
-        "superlogical is not yet released (superlogical.com beta); set FLYWHEEL_BACKEND=herdr";
-}
+impl SuperlogicalBackend {}
 
 impl MultiplexerBackend for SuperlogicalBackend {
     fn name(&self) -> &'static str {

@@ -17,7 +17,6 @@
 //!
 //! Most of this API is a published contract consumed by dependent beads
 //! (`bd-prompt-state-file` writer, `bd-read-state-fallback-zwa` reader).
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -159,15 +158,6 @@ pub fn is_fresh_at(ts: &str, now_unix: u64, max_age: Duration) -> bool {
         Some(t) => now_unix.saturating_sub(max_age.as_secs()) <= t,
         None => false,
     }
-}
-
-/// `is_fresh_at` with the wall clock.
-pub fn is_fresh(ts: &str, max_age: Duration) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    is_fresh_at(ts, now, max_age)
 }
 
 // ---- parsing helpers ----
