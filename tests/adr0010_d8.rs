@@ -15,6 +15,9 @@ use toron_core::mailbox::send_tags::Wake;
 
 const MESSAGING: &str = include_str!("../../toron/crates/toron-core/src/mailbox/messaging.rs");
 const MAIN: &str = include_str!("../src/main.rs");
+// The mail dispatcher (MailCmd + cmd_mail) migrated out of main.rs into
+// src/cmd/mail.rs (bd-hj3v), so the resend assertions read that module.
+const CMD_MAIL: &str = include_str!("../src/cmd/mail.rs");
 
 async fn test_store(tag: &str) -> (ReceiptStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -186,11 +189,11 @@ fn adr0010_d8_upsert_workspace_receipt_maps_degraded() {
 #[test]
 fn adr0010_d8_mail_resend_command_refuses_duplicate_shaped_states() {
     assert!(
-        MAIN.contains("Resend {"),
+        CMD_MAIL.contains("Resend {"),
         "D8: MailCmd must carry a Resend variant (the printed command must exist)"
     );
     assert!(
-        MAIN.contains("already resulted") && MAIN.contains("resend"),
+        CMD_MAIL.contains("already resulted") && CMD_MAIL.contains("resend"),
         "D8: mail resend must refuse a resulted corr (resend would duplicate)"
     );
 }
