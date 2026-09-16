@@ -1330,6 +1330,8 @@ enum Commands {
     /// Daemon lifecycle (toron-parity): start|stop|restart|status over the
     /// `serve` HTTP surface. macOS launchd / Linux systemd user unit /
     /// pidfile fallback. `restart` VERIFIES the new daemon answers.
+    /// (feature: serve — compiled out without it)
+    #[cfg(feature = "serve")]
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
@@ -5124,6 +5126,7 @@ fn main() {
         ),
         Some(Commands::Upgrade) => cmd_upgrade(),
         Some(Commands::Tutorial) => cmd_tutorial(),
+        #[cfg(feature = "serve")]
         Some(Commands::Daemon { cmd }) => cmd_daemon(cmd),
         Some(Commands::Serve { port }) => cmd_serve(&cfg, *port),
         Some(Commands::Toron { cmd }) => cmd_toron(&cfg, cmd),
@@ -36387,6 +36390,7 @@ enum DaemonCmd {
     },
 }
 
+#[cfg(feature = "serve")]
 fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
     let state = daemon::default_state_dir();
     std::fs::create_dir_all(&state)?;
@@ -36415,6 +36419,7 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
     }
 }
 
+#[cfg(feature = "serve")]
 fn cmd_serve(cfg: &Config, port: u16) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(serve_async(cfg.clone(), port))
