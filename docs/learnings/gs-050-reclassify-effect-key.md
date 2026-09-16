@@ -18,6 +18,9 @@ GS-049 documented that tip `Cmd::Reclassify` had **no** `effect_key` — journal
 
 ## H1 verdict — keep GS-048 brief
 
+> **Superseded by GS-052 (hybrid brief):** captain later chose name+family+selection+run+topology(+compose_token) as the single live `--brief` contract; topology retained for sticky-open. Historical H1 text below kept for audit.
+
+
 Investigate family/selection/run compact (catalog-review mid-work) vs name/trigger/topology:
 
 - **Keep GS-048** (`name` / `trigger` / `topology`) as the SINGLE live `--brief` contract.
