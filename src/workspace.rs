@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Model
@@ -991,14 +992,17 @@ pub enum Cmd {
         effect_key: String,
         note: String,
     },
-    /// GS-048: caller-applied mid-session reclassify. Effect runs pure
-    /// `decide` (+ briefing assemble when a World is available) and
+    /// GS-048 / GS-050: caller-applied mid-session reclassify. Effect runs
+    /// pure `decide` (+ briefing assemble when a World is available) and
     /// re-enters as `Msg::DecisionReady`. Tick never performs I/O here.
+    /// `effect_key` is the stable journal identity for one logical
+    /// reclassify (ADR-0032 I8a) — retries keep the same key.
     Reclassify {
         goal: String,
         pin: String,
         explicit_topology: Option<String>,
         reason: String,
+        effect_key: String,
     },
 }
 
@@ -1276,6 +1280,27 @@ pub fn reclassify_announce_line(
     format!("[reclassify] {vehicle} — {decide_reason}{sticky}")
 }
 
+/// GS-050 / ADR-0032 I8a: stable journal identity for one logical
+/// reclassify. Excludes attempt number — same goal/reason/explicit/pin
+/// always yields the same key (retries keep it).
+pub fn reclassify_effect_key(
+    goal: &str,
+    reason: &str,
+    explicit_topology: Option<&str>,
+    pin: &str,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(b"gs050-reclassify-v1\0");
+    h.update(goal.as_bytes());
+    h.update(b"\0");
+    h.update(reason.as_bytes());
+    h.update(b"\0");
+    h.update(explicit_topology.unwrap_or("").as_bytes());
+    h.update(b"\0");
+    h.update(pin.as_bytes());
+    format!("reclassify:{}", hex::encode(h.finalize()))
+}
+
 /// GS-048 effect helper: replace each `Cmd::Reclassify` with the cmds from
 /// folding `Msg::DecisionReady` after a pure `decide` call. Callers in the
 /// effect layer run this **before** mapping Prompt→delivery so the vehicle
@@ -1293,6 +1318,7 @@ pub fn expand_reclassify_cmds(
                 pin: _,
                 explicit_topology,
                 reason: _,
+                effect_key: _,
             } => {
                 let (primitive, topology, argv, decide_reason) = decide(&goal);
                 let ready = Msg::DecisionReady {
@@ -2083,16 +2109,26 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         } => {
             // Pure: schedule caller-applied effect. No decide I/O here.
             let pin = doorbell_core::fact_captain_pin(&next.roles).unwrap_or_default();
+            let effect_key = reclassify_effect_key(
+                goal,
+                reason,
+                explicit_topology.as_deref(),
+                &pin,
+            );
             cmds.push(Cmd::Reclassify {
                 goal: goal.clone(),
                 pin,
                 explicit_topology: explicit_topology.clone(),
                 reason: reason.clone(),
+                effect_key: effect_key.clone(),
             });
             cmds.push(Cmd::Audit {
                 kind: "reclassify_requested".into(),
                 pin: doorbell_core::fact_captain_pin(&next.roles).unwrap_or_default(),
-                detail: format!("material={reason}; goal_len={}", goal.len()),
+                detail: format!(
+                    "material={reason}; goal_len={}; effect_key={effect_key}",
+                    goal.len()
+                ),
             });
         }
         Msg::DecisionReady {
@@ -5947,15 +5983,10 @@ mod gs048_reclassify_tests {
         );
     }
 
-    /// GS-049 / GS-045 P1-1: MaterialContext goal/reason is the logical
-    /// source-action identity for Reclassify retries.
-    ///
-    /// Honesty (tip `Cmd::Reclassify`): there is **no** `effect_key` field on
-    /// the Reclassify Cmd yet — journaled `effect_key` exists on rebind /
-    /// workflow effect paths (`agent_ref`, `effect_journal`), not on this
-    /// mid-session classify node. See
-    /// `source_action_reclassify_post_effect_retry_keeps_identity` for the
-    /// strongest post-effect retry invariant available on tip.
+    /// GS-050 / GS-049 / GS-045 P1-1: MaterialContext goal/reason (+ pin /
+    /// explicit) is the logical source-action identity; `effect_key` is the
+    /// journal spelling of that identity (ADR-0032 I8a). Retries keep the
+    /// same key — never mint a fresh one per attempt.
     #[test]
     fn source_action_reclassify_goal_stable_across_retries() {
         let m = idle_captain();
@@ -5976,11 +6007,13 @@ mod gs048_reclassify_tests {
                     reason,
                     pin,
                     explicit_topology,
+                    effect_key,
                 } => Some((
                     goal.clone(),
                     reason.clone(),
                     pin.clone(),
                     explicit_topology.clone(),
+                    effect_key.clone(),
                 )),
                 _ => None,
             })
@@ -5989,7 +6022,19 @@ mod gs048_reclassify_tests {
         assert_eq!(keys[0].0, goal);
         assert_eq!(keys[0].1, "authoritative-objective");
         assert!(keys[0].3.is_none());
-        // Same identity fields on both retries (pin included).
+        let expected = reclassify_effect_key(
+            &goal,
+            "authoritative-objective",
+            None,
+            &keys[0].2,
+        );
+        assert_eq!(keys[0].4, expected, "effect_key must derive from logical identity");
+        assert!(
+            keys[0].4.starts_with("reclassify:"),
+            "effect_key prefix: {}",
+            keys[0].4
+        );
+        // Same identity fields + effect_key on both retries (pin included).
         let keys2: Vec<_> = cmds2
             .iter()
             .filter_map(|c| match c {
@@ -5998,22 +6043,23 @@ mod gs048_reclassify_tests {
                     reason,
                     pin,
                     explicit_topology,
+                    effect_key,
                 } => Some((
                     goal.clone(),
                     reason.clone(),
                     pin.clone(),
                     explicit_topology.clone(),
+                    effect_key.clone(),
                 )),
                 _ => None,
             })
             .collect();
         assert_eq!(keys, keys2);
+        assert_eq!(keys[0].4, keys2[0].4, "retries keep the same effect_key");
     }
 
     /// I8a: post-effect retry — DecisionReady fold then re-tick the same
-    /// MaterialContext; logical identity (goal/reason/explicit) is unchanged.
-    /// Tip cannot assert `effect_key` on Reclassify (field absent); this is
-    /// the strongest real invariant on this node.
+    /// MaterialContext; logical identity and journal `effect_key` unchanged.
     #[test]
     fn source_action_reclassify_post_effect_retry_keeps_identity() {
         let mut m = idle_captain();
@@ -6033,16 +6079,23 @@ mod gs048_reclassify_tests {
                     reason,
                     pin,
                     explicit_topology,
+                    effect_key,
                 } => Some((
                     goal.clone(),
                     reason.clone(),
                     pin.clone(),
                     explicit_topology.clone(),
+                    effect_key.clone(),
                 )),
                 _ => None,
             })
             .collect();
         assert_eq!(reclass.len(), 1);
+        let key1 = reclass[0].4.clone();
+        assert_eq!(
+            key1,
+            reclassify_effect_key(&goal, "authoritative-objective", None, &reclass[0].2)
+        );
         // Effect layer: fold DecisionReady from a pure decide result.
         let ready = Msg::DecisionReady {
             goal: reclass[0].0.clone(),
@@ -6078,15 +6131,42 @@ mod gs048_reclassify_tests {
                     goal,
                     reason,
                     explicit_topology,
+                    effect_key,
                     ..
-                } => Some((goal.clone(), reason.clone(), explicit_topology.clone())),
+                } => Some((
+                    goal.clone(),
+                    reason.clone(),
+                    explicit_topology.clone(),
+                    effect_key.clone(),
+                )),
                 _ => None,
             })
             .collect();
         assert_eq!(
             reclass3,
-            vec![(goal, "authoritative-objective".into(), None)],
-            "post-effect retry must keep same source-action identity (no effect_key on tip Reclassify)"
+            vec![(
+                goal,
+                "authoritative-objective".into(),
+                None,
+                key1.clone(),
+            )],
+            "post-effect retry must keep same source-action identity + effect_key"
+        );
+        assert_eq!(reclass3[0].3, key1, "retries keep the same effect_key");
+    }
+
+    /// Distinct logical reclassify identities must not collide on effect_key.
+    #[test]
+    fn reclassify_effect_key_distinct_for_distinct_goals() {
+        let a = reclassify_effect_key("goal-A", "authoritative-objective", None, "cap");
+        let b = reclassify_effect_key("goal-B", "authoritative-objective", None, "cap");
+        let c = reclassify_effect_key("goal-A", "authoritative-objective", Some("swarm"), "cap");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(
+            a,
+            reclassify_effect_key("goal-A", "authoritative-objective", None, "cap"),
+            "derivation is pure / stable"
         );
     }
 }
