@@ -12,6 +12,7 @@ pub(crate) mod cron;
 #[cfg(feature = "serve")]
 pub(crate) mod daemon;
 pub(crate) mod doorbell;
+pub(crate) mod history;
 pub(crate) mod ledger;
 pub(crate) mod loop_mode;
 pub(crate) mod mail;
@@ -33,7 +34,7 @@ pub(crate) mod xproj;
 pub(crate) use artifacts::ArtifactsCmd;
 pub(crate) use asset::{AssetCmd, cmd_asset};
 pub(crate) use backend::{BackendCmd, cmd_backend};
-pub(crate) use checkpoint::CheckpointCmd;
+pub(crate) use checkpoint::{CheckpointCmd, cmd_checkpoint};
 pub(crate) use coalition::CoalitionCmd;
 pub(crate) use config::{ConfigCmd, cmd_config};
 pub(crate) use crew::{ControlVerbCmd, CrewCmd, cmd_crew};
@@ -41,6 +42,9 @@ pub(crate) use cron::CronCmd;
 #[cfg(feature = "serve")]
 pub(crate) use daemon::DaemonCmd;
 pub(crate) use doorbell::DoorbellCmd;
+pub(crate) use history::{
+    cmd_analytics, cmd_audit, cmd_changes, cmd_history, cmd_resume, cmd_timeline,
+};
 pub(crate) use ledger::{LedgerCmd, cmd_ledger};
 pub(crate) use loop_mode::LoopCmd;
 pub(crate) use mail::{MailCmd, MailContactCmd, MailLockCmd, MailProductCmd, MailSlotCmd};
@@ -51,10 +55,10 @@ pub(crate) use profile::ProfileCmd;
 pub(crate) use runs::{RunsCmd, cmd_runs};
 pub(crate) use slot::{SlotCmd, cmd_slot};
 pub(crate) use squad::SquadCmd;
-pub(crate) use stage::StageCmd;
+pub(crate) use stage::{StageCmd, cmd_stage};
 pub(crate) use standing_orders::{StandingOrdersCmd, cmd_standing_orders};
 pub(crate) use toron::{ToronCmd, ToronMailCmd};
 pub(crate) use work::{WorkCmd, cmd_work};
 pub(crate) use workflow::WorkflowCmd;
-pub(crate) use worktree::WorktreeCmd;
-pub(crate) use xproj::XprojCmd;
+pub(crate) use worktree::{WorktreeCmd, cmd_worktree};
+pub(crate) use xproj::{XprojCmd, cmd_xproj};
