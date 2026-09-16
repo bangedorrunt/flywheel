@@ -1265,16 +1265,8 @@ pub fn sticky_held_vehicle_announcement(invent_primitive: &str, held_topology: &
 }
 
 /// Full Prompt line for a DecisionReady announce — urgent by `[reclassify]` head.
-pub fn reclassify_announce_line(
-    vehicle: &str,
-    decide_reason: &str,
-    sticky_held: bool,
-) -> String {
-    let sticky = if sticky_held {
-        " sticky-open held"
-    } else {
-        ""
-    };
+pub fn reclassify_announce_line(vehicle: &str, decide_reason: &str, sticky_held: bool) -> String {
+    let sticky = if sticky_held { " sticky-open held" } else { "" };
     format!("[reclassify] {vehicle} — {decide_reason}{sticky}")
 }
 
@@ -1291,7 +1283,6 @@ pub fn reclassify_effect_key(
 ) -> String {
     crate::agent_ref::ReclassifyIntent::derive_effect_key(goal, reason, explicit_topology, pin)
 }
-
 
 /// GS-048 / GS-050 effect helper: replace each `Cmd::Reclassify` with the
 /// cmds from folding `Msg::DecisionReady` after a pure `decide` call.
@@ -1316,12 +1307,8 @@ pub fn expand_reclassify_cmds(
                 effect_key,
             } => {
                 // USE the key — never match `_` (Cmd theater without journal).
-                let expected = reclassify_effect_key(
-                    &goal,
-                    &reason,
-                    explicit_topology.as_deref(),
-                    &pin,
-                );
+                let expected =
+                    reclassify_effect_key(&goal, &reason, explicit_topology.as_deref(), &pin);
                 if effect_key != expected {
                     eprintln!(
                         "flywheel: reclassify effect_key drift cmd={effect_key} derived={expected}"
@@ -2162,12 +2149,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         } => {
             // Pure: schedule caller-applied effect. No decide I/O here.
             let pin = doorbell_core::fact_captain_pin(&next.roles).unwrap_or_default();
-            let effect_key = reclassify_effect_key(
-                goal,
-                reason,
-                explicit_topology.as_deref(),
-                &pin,
-            );
+            let effect_key =
+                reclassify_effect_key(goal, reason, explicit_topology.as_deref(), &pin);
             cmds.push(Cmd::Reclassify {
                 goal: goal.clone(),
                 pin,
@@ -5644,8 +5627,6 @@ mod adr0010_d5_tests {
     }
 }
 
-
-
 #[cfg(test)]
 mod gs048_reclassify_tests {
     use super::*;
@@ -5653,8 +5634,12 @@ mod gs048_reclassify_tests {
     fn idle_captain() -> WorkspaceModel {
         let mut m = WorkspaceModel::default();
         m.roles.insert("captain".into(), "cap".into());
-        m.presence
-            .insert("cap".into(), Presence::Idle { source: "presence".into() });
+        m.presence.insert(
+            "cap".into(),
+            Presence::Idle {
+                source: "presence".into(),
+            },
+        );
         m.doorbell.index.insert_pin("cap".into(), None);
         m
     }
@@ -5747,7 +5732,10 @@ mod gs048_reclassify_tests {
             !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
             "material tick must not Prompt before DecisionReady: {cmds:?}"
         );
-        assert_eq!(next.session_topology, None, "topology waits for DecisionReady");
+        assert_eq!(
+            next.session_topology, None,
+            "topology waits for DecisionReady"
+        );
     }
 
     #[test]
@@ -5820,8 +5808,10 @@ mod gs048_reclassify_tests {
             })
             .collect();
         assert!(
-            prompts.iter().any(|l| l.contains("vehicle: loop-work (topology=loop)")
-                && l.contains("sticky-open held")),
+            prompts
+                .iter()
+                .any(|l| l.contains("vehicle: loop-work (topology=loop)")
+                    && l.contains("sticky-open held")),
             "{prompts:?}"
         );
         assert!(
@@ -5927,7 +5917,10 @@ mod gs048_reclassify_tests {
             material_context_reason("please switch to swarm topology"),
             Some("explicit-topology-request")
         );
-        assert_eq!(parse_explicit_topology("please switch to swarm topology").as_deref(), Some("swarm"));
+        assert_eq!(
+            parse_explicit_topology("please switch to swarm topology").as_deref(),
+            Some("swarm")
+        );
         assert!(material_context_reason("@cap hi from channel").is_none());
         assert!(material_context_reason("kind 9 pull hint").is_none());
     }
@@ -6076,13 +6069,11 @@ mod gs048_reclassify_tests {
         assert_eq!(keys[0].0, goal);
         assert_eq!(keys[0].1, "authoritative-objective");
         assert!(keys[0].3.is_none());
-        let expected = reclassify_effect_key(
-            &goal,
-            "authoritative-objective",
-            None,
-            &keys[0].2,
+        let expected = reclassify_effect_key(&goal, "authoritative-objective", None, &keys[0].2);
+        assert_eq!(
+            keys[0].4, expected,
+            "effect_key must derive from logical identity"
         );
-        assert_eq!(keys[0].4, expected, "effect_key must derive from logical identity");
         assert!(
             keys[0].4.starts_with("reclassify:"),
             "effect_key prefix: {}",
@@ -6198,12 +6189,7 @@ mod gs048_reclassify_tests {
             .collect();
         assert_eq!(
             reclass3,
-            vec![(
-                goal,
-                "authoritative-objective".into(),
-                None,
-                key1.clone(),
-            )],
+            vec![(goal, "authoritative-objective".into(), None, key1.clone(),)],
             "post-effect retry must keep same source-action identity + effect_key"
         );
         assert_eq!(reclass3[0].3, key1, "retries keep the same effect_key");
@@ -6260,17 +6246,15 @@ mod gs048_reclassify_tests {
             })
             .expect("Reclassify carries effect_key");
         let _ = expand_reclassify_cmds(&mut m, cmds, project, &|g| {
-            (
-                "none".into(),
-                "none".into(),
-                vec![],
-                format!("decided:{g}"),
-            )
+            ("none".into(), "none".into(), vec![], format!("decided:{g}"))
         });
         let log = std::fs::read_to_string(crate::state::project_log_path(project))
             .expect("reclassify journal written");
         assert!(log.contains("\"journal\":\"reclassify\""), "{log}");
-        assert!(log.contains(&key), "journal must carry Cmd effect_key: {log}");
+        assert!(
+            log.contains(&key),
+            "journal must carry Cmd effect_key: {log}"
+        );
         for state in ["prepared", "in_flight", "settled"] {
             assert!(
                 log.contains(&format!("\"state\":\"{state}\"")),
@@ -6308,5 +6292,4 @@ mod gs048_reclassify_tests {
             loaded.attempt
         );
     }
-
 }

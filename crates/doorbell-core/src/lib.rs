@@ -935,7 +935,9 @@ mod tests {
             is_urgent_line("[reclassify] vehicle: none (topology=open) — miss"),
             "GS-048 reclassify announce must deliver"
         );
-        assert!(!is_urgent_line("[doorbell] kind 9. Pull: toron channel read"));
+        assert!(!is_urgent_line(
+            "[doorbell] kind 9. Pull: toron channel read"
+        ));
     }
 
     #[test]
