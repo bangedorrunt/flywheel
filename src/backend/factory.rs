@@ -184,7 +184,7 @@ mod tests {
         let cfg = Config {
             backend: Some(crate::config::BackendConfig {
                 multiplexer: "superlogical".into(),
-                mail: "agentmail".into(),
+                mail: "toron".into(),
             }),
             ..Config::default()
         };
