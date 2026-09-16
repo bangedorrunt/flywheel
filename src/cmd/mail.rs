@@ -1,6 +1,11 @@
 //! `flywheel mail` subcommand types (split from `main.rs`, bd-qbi8).
 
+use anyhow::Result;
 use clap::Subcommand;
+use serde_json::{Value, json};
+
+use crate::config::Config;
+use crate::output::print_json;
 
 #[derive(Subcommand)]
 pub(crate) enum MailCmd {
@@ -333,6 +338,706 @@ pub(crate) enum MailCmd {
         #[command(subcommand)]
         cmd: MailProductCmd,
     },
+}
+
+pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
+    match cmd {
+        MailCmd::Inbox {
+            project,
+            project_flag,
+            urgent,
+            unread,
+            limit,
+            since,
+            thread_id,
+            as_agent,
+            json,
+        } => {
+            let project = crate::mail_project(project, project_flag, "inbox")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            // 2026-08-15: an UNREGISTERED --as identity previously made the
+            // inbox projection scan without an agent scope (multi-second
+            // hang). Fail fast with the registration command instead.
+            if mail.whois(&key, &name).is_err() {
+                anyhow::bail!(
+                    "mail identity {name} is not registered for {project} — register it \
+                     first: flywheel mail register {project} --name <adjnoun-pin>"
+                );
+            }
+            // --unread needs the filtered surface; --urgent rides the same
+            // inbox() call, which honors the flag with id-set parity to
+            // inbox_filtered/MCP urgent_only (bd-mail-surface-drift-7r2o).
+            // bd-zd2v: --since (RFC3339 or the `last` cursor) rides the
+            // filtered surface with the other flags passed through; without
+            // it the legacy path below is byte-identical to before.
+            // bd-44hw: --thread-id rides it too (post-unwrap server-side).
+            let v = match crate::inbox_cli_filter(
+                *urgent,
+                *unread,
+                since.as_deref(),
+                thread_id.as_deref(),
+                *limit,
+            ) {
+                Some(f) => mail.inbox_filtered(&key, &name, &f)?,
+                None => mail.inbox(&key, &name, *urgent, *limit)?,
+            };
+            // bd-mail-inbox-json-a7wc: --json is the DOCUMENTED machine
+            // contract (stable keys + types); the default dump stays
+            // byte-identical to before.
+            print_json(&if *json {
+                crate::mail_shim::inbox_json_rows(&v)
+            } else {
+                v
+            });
+        }
+        MailCmd::Reply {
+            project,
+            project_flag,
+            message_id,
+            body,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "reply")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let v = mail.reply(&key, message_id, body, None)?;
+            print_json(&v);
+        }
+        MailCmd::Read {
+            project,
+            project_flag,
+            message_id,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "read")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.mark_read(&key, &name, message_id)?;
+            print_json(&v);
+        }
+        MailCmd::Ack {
+            project,
+            project_flag,
+            message_id,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "ack")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.ack(&key, &name, message_id)?;
+            print_json(&v);
+        }
+        MailCmd::Search {
+            project,
+            project_flag,
+            query,
+            limit,
+            sender,
+            importance,
+            thread_id,
+            recency,
+            bodies,
+        } => {
+            let project = crate::mail_project(project, project_flag, "search")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            let v = mail.search(
+                &key,
+                query,
+                *limit,
+                &crate::mail_shim::MailSearchFilter {
+                    sender: sender.clone(),
+                    importance: importance.clone(),
+                    thread_id: thread_id.clone(),
+                    ranking: Some(if *recency { "recency" } else { "relevance" }.to_string()),
+                    include_body_md: *bodies,
+                    ..Default::default()
+                },
+            )?;
+            print_json(&v);
+        }
+        MailCmd::Summarize {
+            project,
+            project_flag,
+            thread_id,
+            examples,
+        } => {
+            let project = crate::mail_project(project, project_flag, "summarize")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            let v = mail.summarize_thread(&key, thread_id, *examples)?;
+            print_json(&v);
+        }
+        MailCmd::Whois {
+            project,
+            project_flag,
+            agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "whois")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            let v = mail.whois(&key, agent)?;
+            print_json(&v);
+        }
+        MailCmd::Register {
+            project,
+            project_flag,
+            name,
+            program,
+            model,
+            task,
+            from_project,
+            adopt_unnamed,
+        } => {
+            let project = crate::mail_project(project, project_flag, "register")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            // bd-register-portability-3c2b: never mint an unnamed identity.
+            let mut decided = crate::resolve_register_name(name.clone(), from_project.as_deref())?;
+            if let Some(adopt) = adopt_unnamed.as_deref() {
+                let (data_dir, _) = crate::mail_shim::mailbox_roots();
+                crate::adopt_unnamed_key(&data_dir, project, adopt)?;
+                if decided.is_empty() {
+                    decided = adopt.to_string();
+                }
+            }
+            if decided.is_empty() {
+                anyhow::bail!(
+                    "--from-project needs --name <pin> — the pin selects WHICH of that \
+                     project's identities binds here"
+                );
+            }
+            // Import: copy the source project's key into this project's
+            // named slot BEFORE registering — register_agent then REUSES
+            // that npub instead of minting a second identity. bd-zugo: a
+            // missing source key is a LOUD refusal, never a silent fresh
+            // mint (the ghost holder that could lease but never commit).
+            if let Some(from) = from_project.as_deref()
+                && from != project
+            {
+                let (data_dir, _) = crate::mail_shim::mailbox_roots();
+                crate::bind_source_key(&data_dir, from, project, &decided)?;
+            }
+            let v = mail.register_agent(
+                &key,
+                &decided,
+                program,
+                model,
+                task.as_deref().unwrap_or("flywheel mail CLI actor"),
+            )?;
+            print_json(&v);
+        }
+        MailCmd::Renew {
+            project,
+            project_flag,
+            extend_seconds,
+            paths,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "renew")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.renew(&key, &name, *extend_seconds, Some(paths), None)?;
+            print_json(&v);
+        }
+        MailCmd::ForceUnlock {
+            project,
+            project_flag,
+            path,
+            holder,
+            note,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "force-unlock")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.force_release_file_reservation(
+                &key,
+                &name,
+                path,
+                holder.as_deref(),
+                note.as_deref(),
+                false,
+            )?;
+            print_json(&v);
+        }
+        MailCmd::Slot { cmd } => match cmd {
+            MailSlotCmd::Acquire {
+                project,
+                project_flag,
+                slot,
+                exclusive,
+                ttl_seconds,
+                as_agent,
+            } => {
+                let project = crate::mail_project(project, project_flag, "slot-acquire")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let name = mail.name.clone();
+                let v = mail.acquire_slot(&key, &name, slot, *exclusive, *ttl_seconds)?;
+                print_json(&v);
+            }
+            MailSlotCmd::Renew {
+                project,
+                project_flag,
+                slot,
+                extend_seconds,
+                as_agent,
+            } => {
+                let project = crate::mail_project(project, project_flag, "slot-renew")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let name = mail.name.clone();
+                let v = mail.renew_slot(&key, &name, slot, *extend_seconds)?;
+                print_json(&v);
+            }
+            MailSlotCmd::Release {
+                project,
+                project_flag,
+                slot,
+                as_agent,
+            } => {
+                let project = crate::mail_project(project, project_flag, "slot-release")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let name = mail.name.clone();
+                let v = mail.release_slot(&key, &name, slot)?;
+                print_json(&v);
+            }
+        },
+        MailCmd::Policy {
+            project,
+            project_flag,
+            policy,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "policy")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            let name = mail.name.clone();
+            let v = mail.set_contact_policy(&key, &name, policy)?;
+            print_json(&v);
+        }
+        MailCmd::Digest {
+            project,
+            project_flag,
+            as_agent,
+            all,
+        } => {
+            let project = crate::mail_project(project, project_flag, "digest")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            if *all {
+                let mail = crate::mail_or_die(cfg)?;
+                mail.ensure_project(&key)?;
+                let agents = mail.list_agents(&key, None)?;
+                let mut out = Vec::new();
+                let mut seen_identities = std::collections::HashSet::new();
+                if let Some(arr) = agents.as_array() {
+                    for a in arr {
+                        let n = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                        if let Ok(d) = crate::digest_for(&mail, &key, n) {
+                            // bd-dbre: name-alias identities resolve to the
+                            // same pin inbox — emit one row per identity.
+                            let id = d.get("mail_identity").and_then(|v| v.as_str());
+                            if id.is_some_and(|i| !seen_identities.insert(i.to_string())) {
+                                continue;
+                            }
+                            out.push(d);
+                        }
+                    }
+                }
+                print_json(&json!(out));
+            } else {
+                let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                let name = mail.name.clone();
+                print_json(&crate::digest_for(&mail, &key, &name)?);
+            }
+        }
+        MailCmd::Watch {
+            project,
+            project_flag,
+            thread_id,
+            as_agent,
+            timeout_secs,
+            interval_secs,
+        } => {
+            let project = crate::mail_project(project, project_flag, "watch")?;
+            crate::cmd_mail_watch(
+                cfg,
+                project,
+                thread_id,
+                as_agent.as_deref(),
+                *timeout_secs,
+                *interval_secs,
+            )?;
+        }
+        MailCmd::Send {
+            project,
+            project_flag,
+            to,
+            crew,
+            subject,
+            body,
+            importance,
+            ack,
+            as_agent,
+            thread_id,
+            wake,
+            resolve_bead,
+        } => {
+            let project = crate::mail_project(project, project_flag, "send")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            // bd-mail-crew-fanout-xq6b: --crew expands the project spawn
+            // registry into recipients (sender excluded, deduped); explicit
+            // --to entries union on top. toron rejects broadcast=true (AM
+            // invariant) — this is the supported per-recipient alternative.
+            let mut targets: Vec<String> = Vec::new();
+            if *crew {
+                let entries = crate::state::load_spawn_registry(project);
+                if entries.is_empty() {
+                    anyhow::bail!(
+                        "mail send --crew: no live crew in the {project} spawn registry — \
+                         spawn a swarm first (flywheel spawn) or pass explicit --to"
+                    );
+                }
+                let sender = Some(mail.name.as_str());
+                for r in crate::state::crew_recipients(&entries, sender) {
+                    if !targets.contains(&r) {
+                        targets.push(r);
+                    }
+                }
+            }
+            match to.as_deref() {
+                Some(tos) => {
+                    for s in tos.split(',') {
+                        let t = crate::resolve_mail_target_registry(project, s.trim());
+                        if !targets.contains(&t) {
+                            targets.push(t);
+                        }
+                    }
+                }
+                None if !*crew => anyhow::bail!(
+                    "mail send: pass --to <recipients> or --crew (spawn-registry fan-out)"
+                ),
+                None => {}
+            }
+            // ADR-0025 Spec 4: alias cleared under continue/adopt — --to captain fails loud until rebound
+            for t in &targets {
+                if t.eq_ignore_ascii_case("captain") {
+                    crate::state::resolve_captain_target(project, t)?;
+                }
+            }
+            // GS-006 plane tripwire: mail is gift-wrap private. Job-assign via private gift-wrap is the wrong plane
+            // (should be channel/doorbell/job). Secret→public does not fire here (mail is private, safe), but job→private does.
+            {
+                let has_p = !targets.is_empty();
+                if let Err(e) = crate::plane_route::check_job_tripwire(
+                    body, has_p, false, false, true, None, false, false,
+                ) {
+                    anyhow::bail!(e);
+                }
+            }
+            let v = mail.send_with_wake(
+                &key,
+                &targets,
+                subject,
+                body,
+                importance,
+                *ack,
+                thread_id.as_deref(),
+                Some(wake.as_str()),
+                None,
+                resolve_bead.as_deref(),
+            )?;
+            print_json(&v);
+        }
+        MailCmd::Resend {
+            project,
+            project_flag,
+            corr,
+            to,
+            subject,
+            body,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "resend")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            // ADR-0010 D8 (bd-d8e4): look the receipt up FIRST — the resend is
+            // only safe while the corr is genuinely outstanding.
+            let receipt = crate::mail_shim::block_on(async {
+                let mb = crate::mail_shim::try_mailbox()
+                    .ok_or_else(|| anyhow::anyhow!("no in-process toron mailbox"))?;
+                let store = mb
+                    .receipt_store()
+                    .map_err(|e| anyhow::anyhow!("receipts store unavailable: {e}"))?;
+                store.get(corr.trim()).await
+            })?;
+            match receipt {
+                None => anyhow::bail!(
+                    "no receipt for corr {corr} — nothing to correlate; a fresh send is a NEW corr"
+                ),
+                Some(r) if r.state == toron_core::mailbox::ReceiptState::Resulted => {
+                    anyhow::bail!(
+                        "corr {corr} already resulted — do NOT resend (a resend would duplicate)"
+                    );
+                }
+                Some(r) if r.state == toron_core::mailbox::ReceiptState::Degraded => {
+                    anyhow::bail!("{}", toron_core::mailbox::receipts::DEGRADED_NOTE);
+                }
+                Some(r) => {
+                    // Preserve the original wake tag; default tasked (the
+                    // send default) when the receipt carries none.
+                    let wake = r
+                        .wake
+                        .map(|w| w.as_str().to_string())
+                        .unwrap_or_else(|| "tasked".to_string());
+                    let targets: Vec<String> = to
+                        .split(',')
+                        .map(|s| crate::resolve_mail_target_registry(project, s.trim()))
+                        .collect();
+                    let v = mail.send_with_wake(
+                        &key,
+                        &targets,
+                        subject,
+                        body,
+                        "normal",
+                        false,
+                        None,
+                        Some(&wake),
+                        Some(corr.trim()),
+                        None,
+                    )?;
+                    print_json(&v);
+                }
+            }
+        }
+        MailCmd::Locks { cmd } => match cmd {
+            MailLockCmd::Reserve {
+                project,
+                project_flag,
+                paths,
+                ttl_seconds,
+                exclusive,
+                reason,
+                as_agent,
+            } => {
+                let project = crate::mail_project(project, project_flag, "locks-reserve")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+                mail.ensure_project(&key)?;
+                // bd-reservation-identity-tlnf: the lease holder is the
+                // RESOLVED actor (mail.name), never the raw `--as` spelling —
+                // the guard attributes commits to the resolved identity, so a
+                // slug-held lease and its pin-attributed commit were two
+                // different holders.
+                let agent = mail.name.clone();
+                let v = mail.reserve(&key, &agent, paths, *ttl_seconds, *exclusive, reason)?;
+                print_json(&v);
+            }
+            MailLockCmd::List {
+                project,
+                project_flag,
+                holder,
+            } => {
+                let project = crate::mail_project(project, project_flag, "locks-list")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_or_die(cfg)?;
+                let v = mail.list_active(&key, holder.as_deref(), None)?;
+                print_json(&v);
+            }
+            MailLockCmd::Show {
+                project,
+                project_flag,
+                path,
+            } => {
+                let project = crate::mail_project(project, project_flag, "locks-show")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_or_die(cfg)?;
+                let v = mail.list_active(&key, None, Some(path))?;
+                print_json(&v);
+            }
+        },
+        MailCmd::Unlock {
+            project,
+            project_flag,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "unlock")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            // bd-reservation-identity-tlnf: resolved actor, never the raw slug.
+            let agent = mail.name.clone();
+            let v = mail.release_paths(&key, &agent, &[])?;
+            print_json(&v);
+        }
+        MailCmd::Conflicts {
+            project,
+            project_flag,
+            paths,
+            as_agent,
+        } => {
+            let project = crate::mail_project(project, project_flag, "conflicts")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_as(cfg, &key, as_agent.as_deref())?;
+            mail.ensure_project(&key)?;
+            // bd-reservation-identity-tlnf: resolved actor, never the raw slug.
+            let agent = mail.name.clone();
+            let v = mail.conflicts_for(&key, &agent, paths)?;
+            print_json(&v);
+        }
+        MailCmd::Agents {
+            project,
+            project_flag,
+            all,
+        } => {
+            let project = crate::mail_project(project, project_flag, "agents")?;
+            let key = crate::project_dir_str(cfg, project)?;
+            let mail = crate::mail_or_die(cfg)?;
+            mail.ensure_project(&key)?;
+            // Roster = CURRENT agents by default (active <24h); --all shows
+            // the full registration history (ADR-0018 keeps legacy
+            // identities registered for attribution).
+            let active_within = if *all { None } else { Some(1) };
+            let v = mail.list_agents(&key, active_within)?;
+            print_json(&v);
+        }
+        MailCmd::Contact { cmd } => match cmd {
+            MailContactCmd::Request {
+                project,
+                project_flag,
+                to,
+                to_project,
+                reason,
+            } => {
+                let project = crate::mail_project(project, project_flag, "contact-request")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, None)?;
+                mail.ensure_project(&key)?;
+                let from = mail.name.clone();
+                // bd-aseq: registry pin first (same-project peers); a
+                // cross-project target misses and falls back to the hash.
+                let to_mail = crate::resolve_mail_target_registry(project, to);
+                let to_proj = to_project
+                    .as_ref()
+                    .map(|p| crate::project_dir_str(cfg, p))
+                    .transpose()?;
+                let v =
+                    mail.request_contact(&key, &from, &to_mail, to_proj.as_deref(), reason, None)?;
+                print_json(&v);
+            }
+            MailContactCmd::Approve {
+                project,
+                project_flag,
+                from,
+            } => {
+                let project = crate::mail_project(project, project_flag, "contact-approve")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, None)?;
+                let to = mail.name.clone();
+                // bd-aseq: registry pin first (same-project peers); a
+                // cross-project requester misses and falls back to the hash.
+                let from_mail = crate::resolve_mail_target_registry(project, from);
+                let v = mail.respond_contact(&key, &to, &from_mail, true)?;
+                print_json(&v);
+            }
+            MailContactCmd::Deny {
+                project,
+                project_flag,
+                from,
+            } => {
+                let project = crate::mail_project(project, project_flag, "contact-deny")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, None)?;
+                let to = mail.name.clone();
+                let from_mail = crate::resolve_mail_target_registry(project, from);
+                let v = mail.respond_contact(&key, &to, &from_mail, false)?;
+                print_json(&v);
+            }
+            MailContactCmd::List {
+                project,
+                project_flag,
+            } => {
+                let project = crate::mail_project(project, project_flag, "contact-list")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, None)?;
+                let name = mail.name.clone();
+                let v = mail.list_contacts(&key, &name)?;
+                print_json(&v);
+            }
+            MailContactCmd::Policy {
+                project,
+                project_flag,
+                policy,
+            } => {
+                let project = crate::mail_project(project, project_flag, "contact-policy")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_as(cfg, &key, None)?;
+                let name = mail.name.clone();
+                let v = mail.set_contact_policy(&key, &name, policy)?;
+                print_json(&v);
+            }
+        },
+        MailCmd::Product { cmd } => match cmd {
+            MailProductCmd::Ensure { name } => {
+                let mail = crate::mail_or_die(cfg)?;
+                let v = mail.ensure_product(name, Some(name))?;
+                print_json(&v);
+            }
+            MailProductCmd::Link {
+                product,
+                project,
+                project_flag,
+            } => {
+                let project = crate::mail_project(project, project_flag, "product-link")?;
+                let key = crate::project_dir_str(cfg, project)?;
+                let mail = crate::mail_or_die(cfg)?;
+                mail.ensure_project(&key)?;
+                let v = mail.products_link(product, &key)?;
+                print_json(&v);
+            }
+            MailProductCmd::Search {
+                product,
+                query,
+                limit,
+            } => {
+                let mail = crate::mail_or_die(cfg)?;
+                let v = mail.search_product(product, query, *limit)?;
+                print_json(&v);
+            }
+            MailProductCmd::Inbox { product, limit } => {
+                let mail = crate::mail_or_die(cfg)?;
+                let name = mail.name.clone();
+                let v = mail.inbox_product(product, &name, *limit)?;
+                print_json(&v);
+            }
+        },
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
