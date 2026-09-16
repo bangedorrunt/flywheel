@@ -1178,7 +1178,10 @@ async fn drain_policy_sink(sink: toron_workflow::PolicySink, project: Option<Str
         };
         for ev in drained {
             if ev.bundle.workflow == "weekly-review" && ev.output.as_ref().is_some() {
-                let out = ev.output.as_ref().unwrap();
+                let out = ev
+                    .output
+                    .as_ref()
+                    .expect("output presence checked in the guard above");
                 if let Some(idea) = review_idea_from_output(out) {
                     match spawn_review_bead(out, ev.tick) {
                         Ok(Some(id)) => eprintln!(

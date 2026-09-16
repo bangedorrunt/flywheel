@@ -23379,7 +23379,9 @@ fn upsert_opencode_toron(path: &std::path::Path, url: &str, dry: bool) -> Result
     if !obj.contains_key("mcp") || !obj["mcp"].is_object() {
         obj.insert("mcp".into(), serde_json::json!({}));
     }
-    let mcp = obj["mcp"].as_object_mut().unwrap();
+    let mcp = obj["mcp"]
+        .as_object_mut()
+        .expect("mcp object ensured just above");
     let prev = mcp.get("toron").cloned();
     let want = serde_json::json!({"type":"remote","url":url,"enabled":true});
     let action = if prev.is_some() {
@@ -23407,7 +23409,9 @@ fn upsert_pi_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<Strin
     if !obj.contains_key("mcpServers") || !obj["mcpServers"].is_object() {
         obj.insert("mcpServers".into(), serde_json::json!({}));
     }
-    let servers = obj["mcpServers"].as_object_mut().unwrap();
+    let servers = obj["mcpServers"]
+        .as_object_mut()
+        .expect("mcpServers object ensured just above");
     let prev = servers.get("toron").cloned();
     let want = serde_json::json!({"url":url,"directTools":true});
     let action = if prev.is_some() {
@@ -27731,7 +27735,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         cfg.clone(),
                         project.as_deref().unwrap_or("flywheel").to_string(),
                     );
-                    *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+                    *eng.verify_sink().0.lock().expect("verify-sink mutex") =
+                        sink.0.lock().expect("verify-sink mutex").clone();
                     eng
                 });
                 let approval_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -27807,7 +27812,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         cfg.clone(),
                         project.as_deref().unwrap_or("flywheel").to_string(),
                     );
-                    *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+                    *eng.verify_sink().0.lock().expect("verify-sink mutex") =
+                        sink.0.lock().expect("verify-sink mutex").clone();
                     eng
                 });
                 let approval_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -28315,7 +28321,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     workflow_resolver,
                 )?;
                 let sink = make_verify_sink(cfg.clone(), project_name.to_string());
-                *eng.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
+                *eng.verify_sink().0.lock().expect("verify-sink mutex") =
+                    sink.0.lock().expect("verify-sink mutex").clone();
                 eng
             });
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -33709,7 +33716,7 @@ fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::Ver
     let sink = toron_workflow::engine::VerifySink::default();
     let cfg_clone = cfg.clone();
     let project_clone = project.clone();
-    *sink.0.lock().unwrap() = Some(std::sync::Arc::new(
+    *sink.0.lock().expect("verify-sink mutex") = Some(std::sync::Arc::new(
         move |req: &toron_workflow::engine::VerifyRequest| {
             let cmd = req.command.clone();
             let cwd = project_dir(&cfg_clone, &project_clone);
@@ -34378,7 +34385,7 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
                 "workspace_id": a.workspace_id, "pane_id": a.pane_id
             })).collect::<Vec<_>>()
         }))
-        .unwrap())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
     }
 
     async fn send(State(st): State<Arc<AppState>>, body: String) -> Result<String, StatusCode> {

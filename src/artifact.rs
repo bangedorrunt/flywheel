@@ -503,7 +503,9 @@ pub fn write_artifact(record: &ArtifactRecord) -> anyhow::Result<PathBuf> {
         &record.run_id,
         node_id,
     );
-    let dir = path.parent().unwrap();
+    let dir = path
+        .parent()
+        .expect("artifact_path always joins parent dirs");
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(record)?;
     std::fs::write(&path, json)?;
@@ -517,7 +519,9 @@ pub fn write_artifact_for_project(
 ) -> anyhow::Result<PathBuf> {
     let node_id = record.node_id.as_deref().unwrap_or("unknown");
     let path = artifact_path(project, &record.run_id, node_id);
-    let dir = path.parent().unwrap();
+    let dir = path
+        .parent()
+        .expect("artifact_path always joins parent dirs");
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(record)?;
     std::fs::write(&path, json)?;

@@ -1035,7 +1035,7 @@ fn ensure_loops_migrated() -> Result<()> {
     // content, so the NEWEST .migrated-* marker is the single recoverable
     // backup; older ones are duplicates of the same legacy file. Names are
     // epoch seconds — fixed width, so lexicographic order is chronological.
-    if let Ok(rd) = std::fs::read_dir(legacy.parent().unwrap()) {
+    if let Ok(rd) = std::fs::read_dir(legacy.parent().expect("legacy path has a parent dir")) {
         let mut markers: Vec<PathBuf> = rd
             .filter_map(std::result::Result::ok)
             .map(|e| e.path())

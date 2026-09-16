@@ -917,7 +917,10 @@ fn pick(mut hits: Vec<((usize, usize), &RouteEntry)>, target: &str, snap: &Snaps
     prims.sort_unstable();
     prims.dedup();
     if prims.len() == 1 {
-        let entry = top.into_iter().find(|e| e.primitive == prims[0]).unwrap();
+        let entry = top
+            .into_iter()
+            .find(|e| e.primitive == prims[0])
+            .expect("prims[0] derives from top, so the find always hits");
         return build_decision(entry, target, snap);
     }
     none_decision(
