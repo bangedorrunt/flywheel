@@ -31,7 +31,7 @@ fn adr0010_d12_projection_pure_layer_present() {
 #[test]
 fn adr0010_d12_ttls_in_structure() {
     assert!(STAGES.contains("30"), "aging TTL 30d in stages.rs");
-    assert!(STAGES.contains("7"), "perishable TTL 7d in stages.rs");
+    assert!(STAGES.contains('7'), "perishable TTL 7d in stages.rs");
     assert!(
         STAGES.contains("4000") || STAGES.contains("4_000") || MAIN.contains("4000"),
         "default GATE budget ~4k tokens"

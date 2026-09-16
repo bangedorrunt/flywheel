@@ -71,7 +71,7 @@ fn write_dispatch_artifact(
         let _ = std::fs::write(&path, "");
     }
     let rec = match crate::artifact::ArtifactRecord::new(
-        path.clone(),
+        path,
         kind,
         crate::artifact::ExecutionStatus::Running,
         crate::artifact::CriterionStatus::Unknown,
@@ -890,7 +890,7 @@ pub fn pane_dispatch(
                                         evidence: if err_str.trim().is_empty() {
                                             "(empty)".into()
                                         } else {
-                                            err_str.clone()
+                                            err_str
                                         },
                                     },
                                     0,
@@ -1190,7 +1190,7 @@ pub fn launch_spawn_job(
             .cloned()
     };
     let (pane_id, name) = if let Some(e) = existing {
-        (e.pane_id.clone(), name)
+        (e.pane_id, name)
     } else {
         let dir = crate::project_dir(cfg, project);
         let panes = c.pane_list(Some(ws_id))?;
@@ -1300,7 +1300,7 @@ pub fn launch_spawn_job(
             &agent.pane_id,
             mail_identity.as_deref(),
         );
-        (agent.pane_id.clone(), name)
+        (agent.pane_id, name)
     };
     let harness = plan.harness.clone();
     let mail_identity = crate::register_spawned_agent(cfg, project, &name, &harness, &pane_id);

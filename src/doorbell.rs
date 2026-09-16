@@ -3023,7 +3023,7 @@ mod tests {
         assert_eq!(rows[1].bead, "bd-1");
         let rendered = render_roster(&rows);
         assert!(rendered[0].starts_with("ROSTER"));
-        assert!(rendered[2].contains("Q") && rendered[2].contains("bd-1"));
+        assert!(rendered[2].contains('Q') && rendered[2].contains("bd-1"));
     }
 
     #[test]
