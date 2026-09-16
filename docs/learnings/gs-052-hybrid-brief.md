@@ -19,7 +19,7 @@ GS-050 kept GS-048 brief (`name` / `trigger` / `topology`) because family/select
 - `topology` (sticky-open airtight)
 - `compose_token` (cheap boolean)
 
-Bare `workflow list --json` / `workflow show` keep full `description` + trigger/source/crew/inputs/decide_trigger + rest.
+Bare `workflow list --json` adds full `description`, source, crew, inputs, steps/graph_nodes, and **decide_trigger** (+ family/selection/run/compose_token). `workflow show` emits name/source/description/run/compose_token/trigger/guard/crew/inputs/steps/graph/graph_nodes — **not** decide_trigger (or family/selection/topology).
 
 ## Rejected
 
