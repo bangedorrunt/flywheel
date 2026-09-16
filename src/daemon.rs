@@ -504,7 +504,7 @@ pub fn stop(state: &Path, addr: &str, force: bool) -> anyhow::Result<()> {
 }
 
 /// `status`: print the detection result.
-pub fn status(state: &Path, addr: &str) -> anyhow::Result<()> {
+pub fn status(state: &Path, addr: &str) {
     let pidfile = state.join("flywheel.pid");
     match detect_state(DAEMON_LABEL, &pidfile, addr) {
         DaemonState::RunningLaunchd => println!("running (launchd {DAEMON_LABEL})"),
@@ -519,7 +519,6 @@ pub fn status(state: &Path, addr: &str) -> anyhow::Result<()> {
         }
         DaemonState::Stopped => println!("stopped"),
     }
-    Ok(())
 }
 
 /// `restart`: stop, then start, then VERIFY the new daemon actually serves

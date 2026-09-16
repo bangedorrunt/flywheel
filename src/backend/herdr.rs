@@ -19,8 +19,8 @@ pub fn map_prompt_result(
         toron_core::backend::herdr::AgentInfo,
         toron_core::backend::BackendError,
     >,
-) -> crate::backend::Result<crate::backend::PromptLanding> {
-    Ok(match r {
+) -> crate::backend::PromptLanding {
+    match r {
         Ok(info) => crate::backend::PromptLanding {
             status: Some(info.agent_status),
             code: None,
@@ -29,5 +29,5 @@ pub fn map_prompt_result(
             status: None,
             code: Some(e.code().as_str().to_string()),
         },
-    })
+    }
 }

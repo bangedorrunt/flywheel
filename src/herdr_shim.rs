@@ -1090,14 +1090,14 @@ pub fn pane_wait_output(
 /// canonical line limit). Poll every 250ms until the prompt appears (→
 /// `Ok(true)`), the probe errors continuously, or `timeout` elapses (→
 /// `Ok(false)` — the caller warns; the old race is the fallback).
-pub fn wait_shell_prompt(c: &mut Client, pane_id: &str, timeout: Duration) -> Result<bool> {
+pub fn wait_shell_prompt(c: &mut Client, pane_id: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     let mut last_err: Option<String> = None;
     while std::time::Instant::now() < deadline {
         match pane_recent_text(c, pane_id) {
             Ok(text) => {
                 if shell_prompt_rendered(&text) {
-                    return Ok(true);
+                    return true;
                 }
             }
             Err(e) => last_err = Some(format!("{e:#}")),
@@ -1107,7 +1107,7 @@ pub fn wait_shell_prompt(c: &mut Client, pane_id: &str, timeout: Duration) -> Re
     if let Some(e) = last_err {
         eprintln!("flywheel: shell-readiness gate for {pane_id}: last probe error: {e}");
     }
-    Ok(false)
+    false
 }
 
 /// Recent text of a pane (`pane.read`, source=recent, format=text).
@@ -1273,8 +1273,8 @@ pub fn pane_agent_alive(info: &PaneProcessInfo, kind: &str) -> Option<bool> {
 /// foreground group leader exactly when its TUI owns the pane, so its
 /// presence is the readiness signal.
 ///
-/// Polls every 500ms until the agent appears (→ `Ok(true)`), the probe
-/// errors continuously, or `timeout` elapses (→ `Ok(false)` — the caller
+/// Polls every 500ms until the agent appears (→ `true`), the probe
+/// errors continuously, or `timeout` elapses (→ `false` — the caller
 /// warns; the pane may still boot late, but dispatch now risks the race).
 pub fn wait_agent_foreground(
     c: &mut Client,
@@ -1282,14 +1282,14 @@ pub fn wait_agent_foreground(
     kind: &str,
     name: &str,
     timeout: Duration,
-) -> Result<bool> {
+) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     let mut last_err: Option<String> = None;
     while std::time::Instant::now() < deadline {
         match pane_process_info(c, pane_id) {
             Ok(pi) => {
                 if pane_agent_alive(&pi, kind) == Some(true) {
-                    return Ok(true);
+                    return true;
                 }
             }
             Err(e) => last_err = Some(format!("{e:#}")),
@@ -1299,7 +1299,7 @@ pub fn wait_agent_foreground(
     if let Some(e) = last_err {
         eprintln!("flywheel: readiness gate for {name} ({pane_id}): last probe error: {e}");
     }
-    Ok(false)
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,9 +1468,8 @@ impl EventStream {
     }
 
     /// Bound (or unbound) each blocking read. `None` restores blocking reads.
-    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
-        Ok(())
     }
 }
 

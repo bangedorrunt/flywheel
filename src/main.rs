@@ -7385,7 +7385,7 @@ projects available: {}",
             // mid-quote and zsh parks at `>....` — agent never starts
             // (2026-08-18 coder2/coder3). Wait for the rendered prompt.
             let shell_ready =
-                herdr_shim::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15))?;
+                herdr_shim::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -7410,7 +7410,7 @@ projects available: {}",
                 &kind,
                 &name,
                 Duration::from_secs(15),
-            )?;
+            );
             if !ready {
                 eprintln!(
                     "flywheel: warn: {name} not foreground within 15s of spawn — the boot window race (bd-eign.6) still applies; prompts dispatched before the TUI is up may be lost"
@@ -8140,8 +8140,7 @@ fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) -> Result<()>
         vec![workspace.to_string()]
     };
     for ws in workspaces {
-        doorbell::stop(&config::state_dir(), &ws)
-            .with_context(|| format!("doorbell stop {project}/{ws}"))?;
+        doorbell::stop(&config::state_dir(), &ws);
         println!("{project}/{ws}: stopped");
     }
     Ok(())
@@ -10116,10 +10115,7 @@ fn doorbell_prompt(
             // back to the pane primitives, then count the wake as delivered.
             Err(e) if is_agent_not_ready(&e.code) => {
                 let pane = entry.pane_id.clone();
-                if matches!(
-                    try_send_text_delivery(client, project, &entry.name, &pane, &msg),
-                    Ok(true)
-                ) {
+                if try_send_text_delivery(client, project, &entry.name, &pane, &msg) {
                     ok.push(pin.clone())
                 } else {
                     eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name);
@@ -12209,8 +12205,7 @@ fn cmd_add(
             ));
             // bd-pattern-peer-triggered: same shell-readiness gate as spawn —
             // typing into a booting shell mangles long single-quoted args.
-            let shell_ready =
-                herdr_shim::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15))?;
+            let shell_ready = herdr_shim::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({prev}) did not render a prompt \
@@ -13984,8 +13979,7 @@ fn cmd_send(
                         // H2 (bd-harness-jcode) arm is terminal (break or
                         // return on every path) — no re-delivery guard needed.
                         None => {
-                            if try_send_text_delivery(&mut c, project, &name, &target, &send_text)?
-                            {
+                            if try_send_text_delivery(&mut c, project, &name, &target, &send_text) {
                                 // Pane send-text delivered bytes — that is
                                 // NOT herdr settled-wait. With --wait, refuse
                                 // invent-green landed/receipt (GS-037).
@@ -14647,27 +14641,27 @@ fn try_send_text_delivery(
     name: &str,
     pane_id: &str,
     text: &str,
-) -> Result<bool> {
+) -> bool {
     let recipe_kind = state::load_spawn_registry(project)
         .iter()
         .find(|en| en.name == name)
         .map(|en| en.harness.clone().unwrap_or_default())
         .or_else(|| spawn_kinds_from_log(project).get(name).cloned());
     let Some(kind) = recipe_kind else {
-        return Ok(false);
+        return false;
     };
     let has_recipe = ProfileCatalog::load()
         .ok()
         .and_then(|cat| cat.harness(&kind).and_then(|h| h.spawn_cmd.clone()))
         .is_some();
     if !has_recipe {
-        return Ok(false);
+        return false;
     }
     eprintln!(
         "flywheel: {name} ({pane_id}) is a recipe-harness pane (kind {kind}) — delivering via pane.send_text"
     );
     prime_line_via_send_text(c, pane_id, text);
-    Ok(true)
+    true
 }
 
 /// bd-4pxy: a launch_pending agent is NOT idle — it is still booting
@@ -15419,10 +15413,10 @@ fn cmd_watch(
             // without a read timeout, a silent stream blocks forever and the
             // deadline above is never reached — bound each blocking read
             if let Some(s) = stream.as_mut() {
-                s.set_read_timeout(Some(d.saturating_duration_since(std::time::Instant::now())))?;
+                s.set_read_timeout(Some(d.saturating_duration_since(std::time::Instant::now())));
             }
         } else if let Some(s) = stream.as_mut() {
-            s.set_read_timeout(None)?;
+            s.set_read_timeout(None);
         }
         if let Some(s) = stream.as_mut() {
             match s.read_event() {
@@ -15640,7 +15634,7 @@ fn cmd_kill(
             // Continue/Adopt without --reap-crews: crews+doorbell stay, alias cleared.
             let remaining = config::registry_after_captain_death(&registry, &captain_pin, policy);
             let _ = state::save_spawn_registry(project, &remaining);
-            let _ = state::clear_captain_alias_file(project);
+            state::clear_captain_alias_file(project);
             // Fall back to closing only if no children remain (empty workspace
             // is still torn down); otherwise keep workspace alive so child panes
             // stay listed. For now the workspace still closes when only the
@@ -15662,9 +15656,7 @@ fn cmd_kill(
         _ => {}
     }
     c.workspace_close(&ws_id, false)?;
-    if let Err(e) = doorbell::stop(&config::state_dir(), &ws_label) {
-        eprintln!("flywheel: doorbell stop failed: {e:#}");
-    }
+    doorbell::stop(&config::state_dir(), &ws_label);
     // bd-2o1v lifecycle symmetry: a full close drops THIS spawn's wake
     // subscription rows — panes are gone, so their herdr-sink rows are
     // stale weight (20-row graveyards were the finding). Operator/cli
@@ -15689,7 +15681,7 @@ fn cmd_kill(
     let remaining =
         config::registry_after_captain_death(&registry, &captain_pin, config::OnCaptainDeath::Stop);
     let _ = state::save_spawn_registry(project, &remaining);
-    let _ = state::clear_captain_alias_file(project);
+    state::clear_captain_alias_file(project);
     // tidy-up: drop the project's agent state files (stale context signals
     // must not survive into the next spawn — freshness only protects so much)
     let _ = std::fs::remove_dir_all(agentstate::project_state_dir(&project_dir(cfg, project)));
@@ -32709,7 +32701,7 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
         }
         DaemonCmd::Stop { port, force } => daemon::stop(&state, &addr(*port), *force),
         DaemonCmd::Restart { port, force } => daemon::restart(&state, &addr(*port), *force),
-        DaemonCmd::Status { port } => daemon::status(&state, &addr(*port)),
+        DaemonCmd::Status { port } => Ok(daemon::status(&state, &addr(*port))),
     }
 }
 
