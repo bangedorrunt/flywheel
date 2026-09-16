@@ -4,31 +4,27 @@
 **Ship:** HOLD merge · branch push only · no PR
 **Base:** flywheel main `ed1fca3f9af02e381a4841ba02e74cba9f33f73a`
 
-## Residual closed (FM-049-BAR)
+## Residual closed (FM-049-BAR + adversarial HIGH)
 
-GS-049 documented that tip `Cmd::Reclassify` had **no** `effect_key` — journaled keys lived only on rebind / workflow effect paths. That was an honesty gap vs ADR-0032 I8a (retries keep source-action identity).
+GS-049 documented that tip `Cmd::Reclassify` had **no** `effect_key` — journaled keys lived only on rebind / workflow effect paths. Tip `b4628d3` added a Cmd field but expand matched `_` (Cmd/stderr theater). Autofix makes `effect_key` a durable I8a journal identity.
 
 ## Fix
 
-1. `Cmd::Reclassify` gains `effect_key: String`.
-2. `reclassify_effect_key(goal, reason, explicit, pin)` → `reclassify:<sha256>` (domain `gs050-reclassify-v1`). Attempt number is excluded.
-3. `Msg::MaterialContext` tick mints the key once; same-log and post-effect retries emit the same key.
-4. Effect layer logs `effect_key` on apply; `reclassify_requested` Audit detail carries it.
-5. Tests: stable across retries, distinct goals diverge, post-effect DecisionReady retry keeps key.
+1. `Cmd::Reclassify` carries `effect_key: String`.
+2. `reclassify_effect_key` → `ReclassifyIntent::derive_effect_key` — length-prefixed / tagged encode (`gs050-reclassify-v2`); `None` ≠ `Some("")`; no raw `\0` concat.
+3. Host `expand_reclassify_cmds(project, …)` **uses** the key: `insert_or_load_reclassify` → `commit_reclassify` journals Prepared → InFlight → Settled|Failed under that primary key (agent_ref, flywheel event log — not mailbox). Retries bump attempt, same `effect_key`.
+4. Decide stays outside pure `tick` (Tick Law).
+5. Tests: journal PK / idempotent resume; collision; same-log + post-effect retries.
 
-## H1 — ONE `workflow list --brief` contract
+## H1 verdict — keep GS-048 brief
 
-Live path (GS-048 early-return): **name / trigger / topology**.
-Deleted: unreachable family/selection compact `--brief` branch (never ran after the early return).
-Fixed: dual `--robot-capabilities` `"workflows"` key (JSON last-wins invent-green of the dead contract) + docs/CHANGELOG invent-green of family/selection-as-brief.
+Investigate family/selection/run compact (catalog-review mid-work) vs name/trigger/topology:
 
-## Docs sync (GS-048 / GS-049 tip)
-
-- MaterialContext → Reclassify → DecisionReady
-- Sticky-open airtight
-- `workflow list --brief` = name/trigger/topology (ONE contract)
-- Elm deepen: I8a, dry evaluate (`workflow evaluate`), ActionStage, sensor vocab (docs only)
+- **Keep GS-048** (`name` / `trigger` / `topology`) as the SINGLE live `--brief` contract.
+- Family/selection compact omitted **topology** (needed for sticky-open mid-session reclassify) and was early-return shadowed (never live). Finishing it as brief winner would regress the GS-048/049 session-routing bar or bloat brief into near-full-list.
+- Skill-catalog pickup (family/selection/run) remains on bare `workflow list --json` / `workflow show`.
+- Live projection: `workflow_list_brief_rows` (what `cmd_workflow` prints). Dual `--robot-capabilities` `workflows` key fixed. `.agents/skills/**` unchanged this tip.
 
 ## Rejected
 
-Redis / OTP / new kinds / MCP / GS-046 / invent-green.
+Redis / OTP / new kinds / MCP / invent-green skills sync / invent-green brief dual path.
