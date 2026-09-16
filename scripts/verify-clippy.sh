@@ -3,9 +3,9 @@
 # Mirrors beads scripts/ci-local.sh + .github/workflows/ci.yml steps.
 # Runs the exact discipline commands; exits non-zero on any failure.
 #
-# Deviation from beads: no `--no-default-features` clippy gate — flywheel
-# does not build without default features (E0425/E0428/E0433), so that gate
-# would fail loud on main. Fix the feature-gating before adding it.
+# bd-iaza: the `--no-default-features` check gate is live — the serve-gated
+# DaemonCmd/cmd_serve/cmd_daemon sites are cfg-gated, so the minimal build
+# compiles. Keep it green when adding feature-gated code.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 echo "-> fmt"
@@ -17,3 +17,7 @@ echo "-> clippy (all features)"
 cargo clippy --all-targets --all-features --locked -- -D warnings
 echo "-> check (all targets)"
 cargo check --all-targets --all-features --locked
+echo "-> check (no default features)"
+cargo check --locked --no-default-features
+echo "-> check (lean backend-only)"
+cargo check --locked --no-default-features --features backend-herdr,mail-toron
