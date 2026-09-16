@@ -1,11 +1,11 @@
-//! Canonical agent-mail wire-argument builders (c3b.5 — single source of
+//! Canonical mail wire-argument builders (c3b.5 — single source of
 //! truth for the MCP tool argument JSON).
 //!
-//! BOTH remote backends (`AgentMailBackend` and the `Mail` facade's remote
-//! path) call the same MCP server wire via `McpClient::call_tool`, so the
-//! argument JSON must be byte-identical between them. Before this module each
-//! backend kept an independent copy of the arg-mapping code — a drift
-//! compiles fine and silently breaks one backend. Here the mapping lives ONCE;
+//! The `Mail` facade's remote path calls the toron MCP server wire via
+//! `McpClient::call_tool`, so the argument JSON must stay byte-identical
+//! to the server contract. Before this module each caller kept an
+//! independent copy of the arg-mapping code — a drift
+//! compiles fine and silently breaks one path. Here the mapping lives ONCE;
 //! the golden-JSON unit tests at the bottom pin every shape so a contract
 //! change is a one-place edit + one test update.
 //!

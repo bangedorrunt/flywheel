@@ -1,12 +1,9 @@
 //! Minimal MCP-over-Streamable-HTTP client (protocol 2026-07-28, stateless).
 //!
-//! Used by BOTH remote mail backends (ADR-0003 V1): flywheel POSTs JSON-RPC to
-//! a server's `/mcp` endpoint and drives that server's tool surface. One
-//! parameterized transport serves the real agent-mail server (`ServerKind::AgentMail`)
-//! and the toron daemon (`ServerKind::Toron`) — the label is what differs (it
-//! names error strings truthfully). No rmcp dep — the wire contract below was
-//! verified byte-for-byte against the live daemon on 2026-08-06 (the strict
-//! toron envelope returns 200 + correct `health_check` on agent-mail too).
+//! Used by the toron remote mail facade (ADR-0003 V1, bd-euav single-backend):
+//! flywheel POSTs JSON-RPC to the toron daemon's `/mcp` endpoint and drives
+//! its tool surface. No rmcp dep — the wire contract below was
+//! verified byte-for-byte against the live daemon on 2026-08-06.
 //!
 //! Wire contract (2026-07-28 stateless, SEP-2567):
 //! - every POST carries `MCP-Protocol-Version: 2026-07-28`;
@@ -33,12 +30,10 @@ use serde_json::{Value, json};
 const PROTOCOL_VERSION: &str = "2026-07-28";
 
 /// Which server a client targets. Drives error-string labels only — the wire
-/// envelope is identical (ADR-0003 V1: one transport, the label is what
-/// differs).
+/// envelope is identical across servers (ADR-0003 V1). Single variant since
+/// bd-euav (toron only); kept as an enum so error labels stay explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerKind {
-    /// The real mcp_agent_mail server (default `http://127.0.0.1:8765`).
-    AgentMail,
     /// The toron daemon (default `http://127.0.0.1:18080`).
     Toron,
 }
@@ -47,7 +42,6 @@ impl ServerKind {
     /// The truthful backend label used in error strings (BUG3 fix).
     pub fn label(self) -> &'static str {
         match self {
-            Self::AgentMail => "agent-mail",
             Self::Toron => "toron",
         }
     }
@@ -396,7 +390,7 @@ mod tests {
                 r#"{"jsonrpc":"2.0","error":{"code":-32600,"message":"bad protocol"}}"#,
             )
         });
-        let client = McpClient::new(&base, None, ServerKind::AgentMail).expect("client");
+        let client = McpClient::new(&base, None, ServerKind::Toron).expect("client");
         let err = client.call_tool("health_check", json!({})).unwrap_err();
         assert!(
             matches!(err, McpError::Tool(_)),
@@ -502,7 +496,7 @@ mod tests {
                 )
             }
         });
-        let client = McpClient::new(&base, None, ServerKind::AgentMail).expect("client");
+        let client = McpClient::new(&base, None, ServerKind::Toron).expect("client");
         let out = client
             .call_tool("health_check", json!({}))
             .expect("tool call succeeds");

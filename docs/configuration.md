@@ -45,7 +45,7 @@ beads_poller = false             # Phase-4 flags, all default off
 cron_doorbell_sink = false
 ```
 
-Also supported: `[mail.agentmail]` url+token, `[mail.toron]` url+token,
+Also supported: `[mail.toron]` url+token, `[backend]` multiplexer/mail,
 `[backend]` multiplexer/mail, `[crew] max` (default 5), `[loop]`
 thresholds (unknown_diagnose, respawn_budget, detect_grace, drain_grace,
 claim_nudge), `socket_path`, `workspace_root`, `resonate_url`,

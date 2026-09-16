@@ -7,7 +7,7 @@ Pluggable multiplexer + mail (ADR-0002). Spine targets traits, not concretes.
 | Role | Trait | Default | Stubs |
 |------|-------|---------|-------|
 | Multiplexer | `toron_core::backend::Backend` (re-export `MultiplexerBackend`) | herdr (`backend-herdr`) | superlogical (`Unsupported`) |
-| Mail | `toron_core::mailbox::surface::MailSurface` | toron (`mail-toron`) | none. agentmail is a real peer |
+| Mail | `toron_core::mailbox::surface::MailSurface` | toron (`mail-toron`) | none (bd-euav: single backend) |
 
 Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
@@ -18,8 +18,8 @@ Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 | Var / key | Values | Default |
 |-----------|--------|---------|
 | `FLYWHEEL_BACKEND` / `[backend] multiplexer` | herdr \| superlogical | herdr |
-| `FLYWHEEL_MAIL` / `[backend] mail` | toron \| agentmail | toron |
-| `FLYWHEEL_AGENTMAIL_URL` / `TOKEN` | `[mail.agentmail]` only | config.toml |
+| `FLYWHEEL_MAIL` / `[backend] mail` | toron | toron |
+| `FLYWHEEL_TORON_URL` / `TOKEN` | `[mail.toron]` only | config.toml |
 | `FLYWHEEL_MAIL_NAME` | `[agent_mail] name` | `flywheel` |
 
 `[mail.toron] url` = daemon. Absent = in-process embed. Legacy `[agent_mail] url` is not a routing source.
