@@ -2786,17 +2786,17 @@ mod tests {
     }
 
     /// Live remote-daemon smoke: with a `toron serve --mcp-http` daemon up and
-    /// `FLYWHEEL_AGENTMAIL_URL` set, exercises the facade's remote path
+    /// `FLYWHEEL_TORON_URL` set, exercises the facade's remote path
     /// end-to-end — `health` carries the `http` transport marker and
     /// `list_agents` returns `[]` from the daemon's fresh mailbox.
     #[test]
-    #[ignore = "requires a live toron serve --mcp-http daemon (FLYWHEEL_AGENTMAIL_URL)"]
+    #[ignore = "requires a live toron serve --mcp-http daemon (FLYWHEEL_TORON_URL)"]
     fn remote_facade_against_live_daemon() {
-        let Some(url) = std::env::var("FLYWHEEL_AGENTMAIL_URL")
+        let Some(url) = std::env::var("FLYWHEEL_TORON_URL")
             .ok()
             .filter(|s| !s.is_empty())
         else {
-            eprintln!("skipping: FLYWHEEL_AGENTMAIL_URL not set");
+            eprintln!("skipping: FLYWHEEL_TORON_URL not set");
             return;
         };
         let cfg = MailConfig {

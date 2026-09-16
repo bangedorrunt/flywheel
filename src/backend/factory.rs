@@ -5,16 +5,13 @@
 //!
 //! Selection precedence (flag > env > `.env` > config.toml > default):
 //! - `FLYWHEEL_BACKEND` (`herdr` default; `superlogical` future/stub)
-//! - `FLYWHEEL_MAIL`    (`toron` default; `agentmail` opt-in)
+//! - `FLYWHEEL_MAIL`    (`toron`; the agentmail backend is deleted, bd-euav)
 //!
 //! Mail backend routing (ADR-0003 V2/V3 — fixes the BUG1 shared-url misroute):
-//! each backend reads ONLY its own config section. `FLYWHEEL_MAIL=toron`
-//! (the default) → the toron facade (`src/backend/toron.rs` over
-//! `mail_shim::Mail`), reading `[mail.toron]` (absent → embedded in-process).
-//! `FLYWHEEL_MAIL=agentmail` → the REAL agent-mail server backend
-//! (`src/backend/agentmail.rs`), reading `[mail.agentmail]` (url default
-//! `http://127.0.0.1:8765`). The old `[agent_mail]` url is never a routing
-//! source.
+//! `FLYWHEEL_MAIL=toron` (the default and only backend) → the toron facade
+//! (`src/backend/toron.rs` over `mail_shim::Mail`), reading `[mail.toron]`
+//! (absent → embedded in-process). The old `[agent_mail]` url is never a
+//! routing source.
 //!
 //! Stub backend (`superlogical`) lands in `bd-toron-superlogical-
 //! stubs` (R0.7); until then an unrecognized name returns a clear
@@ -82,32 +79,11 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
     }
 }
 
-/// Construct the active mail backend. Default = toron; unrecognized →
-/// actionable error. The `mail-agentmail` cargo feature gates the agentmail
-/// impl; when it's off, the name falls through to `other` with a feature-aware
-/// error.
+/// Construct the active mail backend. Toron only (bd-euav) — any other
+/// name is an actionable error (no silent fallback to toron — ADR-0002 §6).
 pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailSurface>> {
     let name = resolve_mail_name(cfg);
     match name.as_str() {
-        // FLYWHEEL_MAIL=agentmail -> the REAL agent-mail server backend
-        // (ADR-0003 V2). Reads `[mail.agentmail]` (url defaults to
-        // 127.0.0.1:8765). LAZY: construction never dials; ops report the
-        // actionable "not reachable" error when `am` is down (ADR-0003 V4).
-        #[cfg(feature = "mail-agentmail")]
-        "agentmail" => {
-            let server = cfg.agentmail_server();
-            let name = cfg
-                .agent_mail
-                .as_ref()
-                .and_then(|m| m.name.clone())
-                .unwrap_or_else(|| "flywheel".to_string());
-            let url = server.url.unwrap_or_default();
-            Ok(Box::new(crate::backend::agentmail::AgentMailBackend::new(
-                &url,
-                server.token,
-                name,
-            )?))
-        }
         // FLYWHEEL_MAIL=toron -> the toron facade (`Mail::from_config`):
         // embedded in-process by default; the `[mail.toron]` daemon when its
         // url is set (ADR-0003 V2/V3).
@@ -158,10 +134,6 @@ pub fn compiled_backends() -> Vec<&'static str> {
     #[cfg(feature = "backend-superlogical")]
     {
         out.extend(["superlogical"]);
-    }
-    #[cfg(feature = "mail-agentmail")]
-    {
-        out.extend(["agentmail"]);
     }
     #[cfg(feature = "mail-toron")]
     {
@@ -267,21 +239,20 @@ mod tests {
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
-    /// The default build compiles herdr + toron + agentmail (the `default`
-    /// feature set is `["serve", "backend-herdr", "mail-agentmail",
-    /// "mail-toron"]`). This is the feature-matrix contract —
+    /// The default build compiles herdr + toron (the `default`
+    /// feature set is `["serve", "backend-herdr", "mail-toron"]`).
+    /// This is the feature-matrix contract —
     /// compiled_backends() must reflect the actual cfg gates (it's what
     /// `flywheel backend list` will surface in R0.10).
     #[test]
-    fn default_build_compiles_herdr_toron_and_agentmail() {
+    fn default_build_compiles_herdr_and_toron() {
         let backends = super::compiled_backends();
         assert!(backends.contains(&"herdr"), "herdr missing: {backends:?}");
         #[cfg(feature = "mail-toron")]
         assert!(backends.contains(&"toron"), "toron missing: {backends:?}");
-        #[cfg(feature = "mail-agentmail")]
         assert!(
-            backends.contains(&"agentmail"),
-            "agentmail missing: {backends:?}"
+            !backends.contains(&"agentmail"),
+            "agentmail backend is deleted (bd-euav)"
         );
         // superlogical is opt-in: present IFF its feature is on
         #[cfg(not(feature = "backend-superlogical"))]

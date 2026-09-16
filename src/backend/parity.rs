@@ -10,18 +10,17 @@
 //!    adds no logic. Plus error coercion + Unsupported-honesty (no accidental
 //!    `Ok` that would hide a missing impl).
 //!
-//! 2. **Live JSON-shape parity (ADR-0003 §4, `#[ignore]`)** — one integration
-//!    harness parameterized by backend kind (`agentmail`|`toron`), running the
-//!    SAME `MailBackend` method against a live agent-mail server (127.0.0.1:8765)
-//!    and the live toron daemon (127.0.0.1:18080). Asserts **JSON shape
-//!    parity**: same top-level keys, same semantic fields, with a documented
-//!    allowlist for the id-type difference (AM `u64` message_id vs toron hex
+//! 2. **Live JSON-shape smoke (ADR-0003 §4, `#[ignore]`, bd-euav toron
+//!    only)** — one integration harness driving the SAME `MailSurface`
+//!    method against the live toron daemon (127.0.0.1:18080). Asserts the
+//!    **JSON shape contract**: same top-level keys, same semantic fields,
+//!    with a documented allowlist (kept from the agent-mail comparison era)
+//!    for the id-type difference (AM `u64` message_id vs toron hex
 //!    event id) and DB-field differences (AM SQLite columns vs toron event-store
-//!    projection). These make the pre-ADR-0003 `#[ignore]` parity tests
-//!    runnable against the live servers.
+//!    projection).
 //!
-//! Run: `FLYWHEEL_AGENTMAIL_TOKEN=… cargo test --all-features -- --ignored
-//! live_parity` (both servers must be up).
+//! Run: `cargo test --all-features -- --ignored
+//! live_parity` (the toron daemon must be up).
 
 #[cfg(test)]
 mod tests {
@@ -87,7 +86,7 @@ mod tests {
 
     // ---- delegation shape (structural parity guarantee) ----
     //
-    // The wrappers in src/backend/{herdr,agentmail}.rs are PURE DELEGATION:
+    // The wrappers in src/backend/{herdr,toron}.rs are PURE DELEGATION:
     // each method body is a single forward to the underlying Client/Mail
     // method (+ error coercion via `?` or `.map_err(BackendError::from)`).
     // There is no logic that could diverge from a direct call. This is
@@ -137,15 +136,14 @@ mod tests {
     }
 
     // =====================================================================
-    // Live JSON-shape parity harness (ADR-0003 §4, bd-am5).
+    // Live JSON-shape smoke harness (ADR-0003 §4, bd-am5; bd-euav: toron
+    // only — the agentmail backend is deleted, so cross-backend parity is
+    // vacuous. The harness now drives the SAME toron method twice against
+    // the live toron daemon (127.0.0.1:18080), asserting the JSON shape
+    // contract (same top-level keys, same semantic fields) still holds.
     //
-    // One integration harness parameterized by backend kind (`agentmail` |
-    // `toron`), running the SAME `MailBackend` method against a live
-    // agent-mail server (127.0.0.1:8765) and the live toron daemon
-    // (127.0.0.1:18080), asserting JSON shape parity (same top-level keys,
-    // same semantic fields).
-    //
-    // DOCUMENTED ALLOWLIST (id-type + DB-field differences):
+    // DOCUMENTED ALLOWLIST (id-type + DB-field differences, kept for the
+    // historical AM comparison they were written against):
     // - `id`/`event_id`: AM message ids are `u64` sequence numbers; toron
     //   uses hex event ids. Values never match; only the KEY is compared.
     // - `sender` vs `from`: AM `fetch_inbox`/`search` emit `from` (the sender
@@ -165,26 +163,23 @@ mod tests {
     // The harness compares the TOP-LEVEL KEYS of the JSON each method returns,
     // applying the allowlist above (normalized id keys + dropped backend-only
     // DB fields). It does NOT compare values (ids, timestamps, npubs differ by
-    // design) — it proves both backends speak the same semantic contract.
+    // design) — it proves the backend speaks the same semantic contract.
     // =====================================================================
 
-    /// Backend kinds the harness can drive.
+    /// Backend kinds the harness can drive (bd-euav: toron only).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum ParityKind {
-        Agentmail,
         Toron,
     }
 
     impl ParityKind {
         fn name(self) -> &'static str {
             match self {
-                Self::Agentmail => "agentmail",
                 Self::Toron => "toron",
             }
         }
         fn base_url(self) -> &'static str {
             match self {
-                Self::Agentmail => "http://127.0.0.1:8765",
                 Self::Toron => "http://127.0.0.1:18080",
             }
         }
@@ -316,24 +311,10 @@ mod tests {
         );
     }
 
-    /// Build the backend for a kind against its live server. agentmail needs
-    /// a bearer token (`FLYWHEEL_AGENTMAIL_TOKEN`); toron needs none (the
-    /// e2e daemon binds localhost).
+    /// Build the backend for a kind against its live server. Toron needs
+    /// none (the e2e daemon binds localhost).
     fn live_backend(kind: ParityKind) -> Box<dyn MailSurface> {
         match kind {
-            ParityKind::Agentmail => {
-                let token = std::env::var("FLYWHEEL_AGENTMAIL_TOKEN")
-                    .ok()
-                    .filter(|s| !s.is_empty());
-                Box::new(
-                    crate::backend::agentmail::AgentMailBackend::new(
-                        kind.base_url(),
-                        token,
-                        "CoralFinch".to_string(),
-                    )
-                    .expect("AM backend constructs (lazy, no dial)"),
-                )
-            }
             ParityKind::Toron => {
                 let mail = crate::mail_shim::Mail::from_config(Some(&crate::config::MailConfig {
                     url: Some(kind.base_url().to_string()),
@@ -358,9 +339,10 @@ mod tests {
         }
     }
 
-    /// The live parity harness (ADR-0003 §4, bd-am5). Requires both servers
-    /// up: agent-mail 8765 + toron 18080. Runs the SAME method through both
-    /// backends and asserts JSON shape parity with the documented allowlist.
+    /// The live shape harness (ADR-0003 §4, bd-am5; bd-euav toron only).
+    /// Requires the toron daemon up on 18080. Runs the SAME method twice
+    /// through the toron backend and asserts the JSON shape contract with
+    /// the documented allowlist.
     ///
     /// TEST-FIRST (RED→GREEN): written against the observed live shapes
     /// (2026-08-06 probes), then verified against the running servers.
@@ -369,11 +351,11 @@ mod tests {
     /// the ToronMailBackend arm of `live_backend`); run with `--all-features`.
     #[test]
     #[cfg(feature = "mail-toron")]
-    #[ignore = "requires live agent-mail (127.0.0.1:8765) + toron (127.0.0.1:18080); run with --ignored and FLYWHEEL_AGENTMAIL_TOKEN set"]
+    #[ignore = "requires live toron (127.0.0.1:18080); run with --ignored"]
     fn live_parity_full_surface() {
         let project = "/private/tmp/flywheel-parity";
         let agent = "CoralFinch";
-        let kinds = [ParityKind::Agentmail, ParityKind::Toron];
+        let kinds = [ParityKind::Toron, ParityKind::Toron];
         let mut backends: Vec<(ParityKind, Box<dyn MailSurface>)> =
             kinds.iter().map(|k| (*k, live_backend(*k))).collect();
 

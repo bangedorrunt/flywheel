@@ -1035,7 +1035,6 @@ mod parity_tests {
         fn remote_cfg() -> crate::config::Config {
             let mut cfg = crate::config::Config::default();
             cfg.mail = Some(crate::config::MailSections {
-                agentmail: None,
                 toron: Some(crate::config::MailServerConfig {
                     url: Some("http://127.0.0.1:9/mcp".into()),
                     token: None,

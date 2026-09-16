@@ -2830,7 +2830,7 @@ enum BackendCmd {
     Default {
         /// multiplexer | mail
         kind: String,
-        /// backend name (herdr|agentmail|superlogical|toron)
+        /// backend name (herdr|superlogical|toron)
         name: String,
     },
 }
@@ -5478,7 +5478,7 @@ fn snapshot_runs() -> Vec<Value> {
 
 /// Only used by the serve-gated SSE server; gate it so the lean
 /// backend-only build (`--no-default-features --features backend-herdr,
-/// mail-agentmail`) has no dead-code warning (bd-cargo-feature-flags).
+/// mail-toron`) has no dead-code warning (bd-cargo-feature-flags).
 #[cfg(feature = "serve")]
 fn chrono_like_ts() -> String {
     state::now_iso()
@@ -23087,7 +23087,6 @@ mod verifier_dispatch_tests {
                     url: Some("http://127.0.0.1:1".to_string()),
                     token: None,
                 }),
-                agentmail: None,
             }),
             ..Default::default()
         }
@@ -23305,7 +23304,6 @@ mod loop_run_verify_tests {
                     url: Some("http://127.0.0.1:1".to_string()),
                     token: None,
                 }),
-                agentmail: None,
             }),
             ..Default::default()
         }
@@ -25525,7 +25523,7 @@ fn toron_setup_mcp(
         println!("restart the agent editor for a new session to pick up the MCP server.");
         if flywheel {
             println!(
-                "flywheel backend: next session routes mail through {url} (env FLYWHEEL_AGENTMAIL_URL overrides config)."
+                "flywheel backend: next session routes mail through {url} (env FLYWHEEL_TORON_URL overrides config)."
             );
         }
     } else {
@@ -25709,7 +25707,7 @@ fn boot_toron_server(port: u16) -> Result<()> {
 /// Writes/updates the `[mail.toron] url` line in the flywheel config.toml so
 /// flywheel and all registered agents converge on ONE toron mailbox (the
 /// shared `[agent_mail]` section keeps the identity name). The env
-/// `FLYWHEEL_AGENTMAIL_URL` still wins at load time (config.rs merges env over
+/// `FLYWHEEL_TORON_URL` still wins at load time (config.rs merges env over
 /// the file) — config.toml is the durable default, env is the per-session
 /// override. Idempotent; only touches the `[mail.toron]` block's `url`.
 fn setup_flywheel_backend(url: &str, dry: bool) -> Result<String> {
@@ -26190,8 +26188,8 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                     "compiled_feature": compiled.contains(&name),
                 }));
             }
-            // mail: agentmail = real agent-mail backend; toron = toron facade
-            for (name, stub) in [("agentmail", false), ("toron", false)] {
+            // mail: toron is the only backend (bd-euav)
+            for (name, stub) in [("toron", false)] {
                 rows.push(json!({
                     "name": name,
                     "kind": "mail",

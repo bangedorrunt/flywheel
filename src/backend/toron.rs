@@ -5,9 +5,10 @@
 //!
 //! governed-by: ADR-0002, ADR-0003, ADR-0007
 //!
-//! This file is the TORON side of the unified mail surface. The flywheel-local
-//! `MailBackend` trait was deleted with se2.3 — both toron and agent-mail
-//! implement the ONE trait from toron-core. Value→DTO conversion happens
+//! This file is the TORON side of the unified mail surface (bd-euav: the
+//! only backend). The flywheel-local
+//! `MailBackend` trait was deleted with se2.3 — toron implements
+//! the ONE trait from toron-core. Value→DTO conversion happens
 //! here at the facade edge: the facade's JSON is the AM-parity wire shape
 //! (`toron_mcp::ToJson`), and every surface DTO derives `Deserialize`, so the
 //! conversion is `serde_json::from_value` except where the envelope differs

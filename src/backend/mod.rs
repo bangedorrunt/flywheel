@@ -16,9 +16,7 @@
 //! (not dual-lived). The coordination-fabric trait is
 //! `toron_core::mailbox::surface::MailSurface` — async, `&self`, `MessageId`
 //! string ids end-to-end, machine-coded `MailError`. flywheel re-exports it
-//! as `MailSurface`; `ToronMailBackend` (toron.rs) and `AgentMailBackend`
-//! (agentmail.rs) implement it. The AM adapter converts u64 ↔ String ONLY at
-//! the MCP JSON edge, with a parse error (never `unwrap_or(0)` — se2.2).
+//! as `MailSurface`; `ToronMailBackend` (toron.rs) implements it.
 //! `BackendError` now serves the multiplexer + factory only.
 //!
 //! Design (inherited from the unified trait): every `MultiplexerBackend`
@@ -28,7 +26,6 @@
 // TODO(bd-p2-cli-wn8): re-evaluate this allow when the catalog CLI lands.
 #![allow(dead_code)]
 
-pub mod agentmail;
 pub mod factory;
 pub mod herdr;
 #[cfg(test)]
