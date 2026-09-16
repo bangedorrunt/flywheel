@@ -57,16 +57,24 @@ fn check_file(name: &str, src: &str) {
         // Replay folds (pure tick over journal + local render, no dispatcher,
         // no binds, no writes) are not live owners: cmd_doorbell_why,
         // cmd_doorbell_afk (bd-65he reverify: read-only digest render).
+        // Throwaway folds (GS-048 reclassify, bd-dv22): one synthetic
+        // MaterialContext tick over a Default-seeded model, rendered to
+        // stderr, model dropped. No dispatcher, no binds, no sends, no
+        // presence publish — the single scalar `save_session_topology`
+        // write converges with the live path (same file, same value
+        // domain) and is required for loop-less sticky-open; it produces
+        // no wake and owns nothing. Proven structurally below.
         let allowed = cur_test
             || cur_fn == "tick_loop_owner"
             || (name == "main.rs" && cur_fn == "cmd_internal_doorbell")
             || (name == "main.rs" && cur_fn == "cmd_doorbell_why")
-            || (name == "main.rs" && cur_fn == "cmd_doorbell_afk");
+            || (name == "main.rs" && cur_fn == "cmd_doorbell_afk")
+            || (name == "main.rs" && cur_fn == "cmd_reclassify");
         assert!(
             allowed,
             "D0 (bd-aucr): {name}:{} live WorkspaceModel::default() inside fn {cur_fn} — \
              second live owner (allowed: tick_loop_owner, cmd_internal_doorbell, \
-             cmd_doorbell_why/cmd_doorbell_afk replay, tests)",
+             cmd_doorbell_why/cmd_doorbell_afk replay, cmd_reclassify throwaway, tests)",
             idx + 1
         );
     }
@@ -80,4 +88,57 @@ fn fn_def_name(t: &str) -> Option<String> {
         .or_else(|| t.strip_prefix("pub fn "))
         .or_else(|| t.strip_prefix("fn "))?;
     Some(rest.chars().take_while(|c| *c != '(').collect())
+}
+
+/// bd-dv22: the throwaway-fold property, proven structurally instead of by
+/// fn-name alone. The non-owner allowed folds (why/afk/reclassify) must
+/// never execute commands or inject prompts: no `handle_workspace_cmds`
+/// (the dispatch sink), no `agent.prompt(` (the prompt hop), no presence
+/// publish. If a future fold gains any of these, it is a live owner by
+/// construction and this test fails naming it — the allowlist above cannot
+/// silently cover it.
+#[test]
+fn adr0010_d0_throwaway_folds_never_dispatch() {
+    for name in ["cmd_doorbell_why", "cmd_doorbell_afk", "cmd_reclassify"] {
+        let body = fn_body(MAIN, name);
+        for forbidden in [
+            "handle_workspace_cmds",
+            "agent.prompt(",
+            "presence.publish",
+            "presence_publish",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "D0 (bd-dv22): throwaway fold {name} contains {forbidden:?} — \
+                 it dispatches, so it is a live owner, not a throwaway"
+            );
+        }
+    }
+}
+
+/// Slice one top-level fn body (def line through its balanced close).
+fn fn_body(src: &str, name: &str) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| {
+            let t = l.trim_start();
+            fn_def_name(t).as_deref() == Some(name)
+        })
+        .unwrap_or_else(|| panic!("D0 (bd-dv22): fn {name} not found"));
+    let mut depth = 0;
+    let mut started = false;
+    let mut end = start;
+    for (j, line) in lines.iter().enumerate().skip(start) {
+        depth += line.chars().filter(|c| *c == '{').count() as i32
+            - line.chars().filter(|c| *c == '}').count() as i32;
+        if depth > 0 {
+            started = true;
+        }
+        if started && depth == 0 {
+            end = j;
+            break;
+        }
+    }
+    lines[start..=end].join("\n")
 }
