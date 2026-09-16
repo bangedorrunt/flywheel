@@ -126,6 +126,16 @@ fn backend_not_compiled_or_unknown(name: &str, _kind: &str, env_var: &str) -> Ba
 /// clippy-clean pattern: each feature contributes a cfg-gated slice; the vec
 /// concatenates them (no `push`-after-`Vec::new` lint).
 pub fn compiled_backends() -> Vec<&'static str> {
+    // `mut` is needed iff at least one backend feature is compiled in; in a
+    // fully stripped build no `extend` survives, so scope the allow to that.
+    #[cfg_attr(
+        not(any(
+            feature = "backend-herdr",
+            feature = "backend-superlogical",
+            feature = "mail-toron"
+        )),
+        allow(unused_mut)
+    )]
     let mut out: Vec<&'static str> = Vec::new();
     #[cfg(feature = "backend-herdr")]
     {

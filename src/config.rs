@@ -679,24 +679,6 @@ pub fn registry_after_captain_death(
     }
 }
 
-/// Mocked captain-alias store helpers for phase-1 tests.
-///
-/// Production alias lives in toron (`contact captain --clear` / --pin);
-/// phase 1 proves the semantics with an in-memory map so tests do not
-/// require a daemon.
-pub fn apply_captain_adopt(alias_map: &mut BTreeMap<String, String>, project: &str, new_pin: &str) {
-    alias_map.insert(project.to_string(), new_pin.to_string());
-}
-
-pub fn clear_captain_alias(alias_map: &mut BTreeMap<String, String>, project: &str) {
-    alias_map.remove(project);
-}
-
-/// Whether the alias for `project` is cleared (absent) in the mocked store.
-pub fn captain_alias_cleared(alias_map: &BTreeMap<String, String>, project: &str) -> bool {
-    !alias_map.contains_key(project)
-}
-
 /// The XDG config BASE (is1.6): `$XDG_CONFIG_HOME` when set, else
 /// `~/.config`. `config_dir()` appends `/flywheel`; the herdr socket appends
 /// `/herdr/herdr.sock` — both converge on this base (matches the canonical
@@ -901,6 +883,27 @@ impl Policy {
             })
             .map(std::string::String::as_str)
     }
+}
+
+/// Mocked captain-alias store helpers for phase-1 tests.
+///
+/// Production alias lives in toron (`contact captain --clear` / --pin);
+/// phase 1 proves the semantics with an in-memory map so tests do not
+/// require a daemon.
+#[cfg(test)]
+pub fn apply_captain_adopt(alias_map: &mut BTreeMap<String, String>, project: &str, new_pin: &str) {
+    alias_map.insert(project.to_string(), new_pin.to_string());
+}
+
+/// Whether the alias for `project` is cleared (absent) in the mocked store.
+#[cfg(test)]
+pub fn captain_alias_cleared(alias_map: &BTreeMap<String, String>, project: &str) -> bool {
+    !alias_map.contains_key(project)
+}
+
+#[cfg(test)]
+pub fn clear_captain_alias(alias_map: &mut BTreeMap<String, String>, project: &str) {
+    alias_map.remove(project);
 }
 
 #[cfg(test)]

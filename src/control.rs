@@ -40,20 +40,6 @@ pub fn op_prompt(body: &str) -> String {
     format!("{OP_MARKER}{OP_TAG}{body}")
 }
 
-/// Is this text a control-plane prompt?
-pub fn is_op_prompt(text: &str) -> bool {
-    text.starts_with(OP_MARKER) && text[OP_MARKER.len_utf8()..].starts_with(OP_TAG)
-}
-
-/// Strip the marker, returning the exact original body.
-pub fn strip_op_marker(text: &str) -> &str {
-    if is_op_prompt(text) {
-        &text[OP_MARKER.len_utf8() + OP_TAG.len()..]
-    } else {
-        text
-    }
-}
-
 /// Interrupt decision (pure). The keys are always Escape — this plane never
 /// sends kill-style keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,23 +60,6 @@ pub fn interrupt_plan(status: crate::herdr_shim::AgentStatus) -> InterruptPlan {
         confirmed: status == AgentStatus::Idle,
     }
 }
-
-/// Exit postcondition — asserted by the caller after the pane close: the
-/// agent is gone while its toron file reservations and dirty worktree files
-/// are untouched (exit releases nothing, cleans nothing).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExitPostcondition {
-    pub agent_gone: bool,
-    pub reservations_preserved: bool,
-    pub dirty_preserved: bool,
-}
-
-/// The exact postcondition an exit MUST satisfy.
-pub const EXIT_POSTCONDITION: ExitPostcondition = ExitPostcondition {
-    agent_gone: true,
-    reservations_preserved: true,
-    dirty_preserved: true,
-};
 
 /// Relaunch decision (pure): only a launch error after the stop rolls the
 /// durable record back. A published-but-unconfirmed agent KEEPS the new
@@ -183,6 +152,41 @@ pub fn rollback_relaunch(project: &str, journal: &RelaunchJournal) -> Result<()>
         entries.push(journal.old.clone());
     }
     crate::state::save_spawn_registry(project, &entries)
+}
+
+/// The exact postcondition an exit MUST satisfy.
+#[cfg(test)]
+pub const EXIT_POSTCONDITION: ExitPostcondition = ExitPostcondition {
+    agent_gone: true,
+    reservations_preserved: true,
+    dirty_preserved: true,
+};
+
+/// Exit postcondition — asserted by the caller after the pane close: the
+/// agent is gone while its toron file reservations and dirty worktree files
+/// are untouched (exit releases nothing, cleans nothing).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitPostcondition {
+    pub agent_gone: bool,
+    pub reservations_preserved: bool,
+    pub dirty_preserved: bool,
+}
+
+/// Is this text a control-plane prompt?
+#[cfg(test)]
+pub fn is_op_prompt(text: &str) -> bool {
+    text.starts_with(OP_MARKER) && text[OP_MARKER.len_utf8()..].starts_with(OP_TAG)
+}
+
+/// Strip the marker, returning the exact original body.
+#[cfg(test)]
+pub fn strip_op_marker(text: &str) -> &str {
+    if is_op_prompt(text) {
+        &text[OP_MARKER.len_utf8() + OP_TAG.len()..]
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]

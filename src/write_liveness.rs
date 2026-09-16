@@ -58,7 +58,7 @@ impl Default for WalkOpts {
 impl WalkOpts {
     pub(crate) fn from_env() -> Self {
         let mut o = Self::default();
-        if let Some(v) = std::env::var("FLYWHEEL_WRITE_WALK_PRUNE").ok() {
+        if let Ok(v) = std::env::var("FLYWHEEL_WRITE_WALK_PRUNE") {
             let ps: Vec<String> = v
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -200,7 +200,7 @@ pub(crate) fn walk(root: &Path, globs: &[String], opts: &WalkOpts) -> WalkOutcom
         };
         for entry in rd.flatten() {
             checked += 1;
-            if checked % 256 == 0 && Instant::now() > deadline {
+            if checked.is_multiple_of(256) && Instant::now() > deadline {
                 return WalkOutcome::WalkFailed {
                     reason: "timeout".into(),
                 };
@@ -216,10 +216,10 @@ pub(crate) fn walk(root: &Path, globs: &[String], opts: &WalkOpts) -> WalkOutcom
                 if depth >= opts.maxdepth {
                     continue;
                 }
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if opts.prune.iter().any(|p| p == name) {
-                        continue;
-                    }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && opts.prune.iter().any(|p| p == name)
+                {
+                    continue;
                 }
                 stack.push((path, depth + 1));
                 continue;
@@ -332,7 +332,7 @@ pub(crate) fn resolve_project_root(slug: &str) -> PathBuf {
     if p.is_dir() {
         return p.to_path_buf();
     }
-    if let Some(home) = std::env::var("HOME").ok() {
+    if let Ok(home) = std::env::var("HOME") {
         let ws = PathBuf::from(home).join("workspace").join(slug);
         if ws.is_dir() {
             return ws;

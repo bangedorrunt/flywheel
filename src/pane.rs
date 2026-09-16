@@ -6,7 +6,6 @@
 //! workflow's `crew` plan, then each `dispatch_job` step sent to the running
 //! pane via the loop's proven `__send` confirmed-send leaf.
 
-#![allow(dead_code, clippy::all, unused)]
 //!
 //! - **Crew pre-spawn**: [`pre_spawn_crew`] turns a [`CrewPlan`] (role →
 //!   count) into real herdr panes: profile → harness/model → pane split +
@@ -34,7 +33,6 @@ use serde_json::{Value, json};
 
 use toron_workflow::schema::Action;
 
-use crate::artifact;
 use crate::config::Config;
 use crate::crew::CrewPlan;
 use crate::herdr_shim::{AgentStatus, Client};
@@ -54,44 +52,6 @@ pub struct PaneRunCtx {
     /// true when the workspace must NOT be reaped at run end (--reuse or
     /// --retain)
     pub retained: bool,
-}
-
-/// Write an artifact for a dispatch (Spec 2). Best-effort, never fails the dispatch.
-fn write_dispatch_artifact(
-    project: &str,
-    run_id: &str,
-    node_id: &str,
-    bead_id: Option<&str>,
-    pin: &str,
-    kind: crate::artifact::ArtifactKind,
-    path: std::path::PathBuf,
-) {
-    // Ensure the file exists for sha256 (create an empty file if not)
-    if !path.exists() {
-        let _ = std::fs::write(&path, "");
-    }
-    let rec = match crate::artifact::ArtifactRecord::new(
-        path,
-        kind,
-        crate::artifact::ExecutionStatus::Running,
-        crate::artifact::CriterionStatus::Unknown,
-        crate::artifact::GroundingStatus::Cited,
-        crate::artifact::ClaimSupportStatus::WorkerAsserted,
-        None,
-        bead_id.map(std::string::ToString::to_string),
-        run_id.to_string(),
-        Some(node_id.to_string()),
-        pin.to_string(),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("artifact write failed for dispatch {node_id}: {e}");
-            return;
-        }
-    };
-    if let Err(e) = crate::artifact::write_artifact_for_project(project, &rec) {
-        eprintln!("artifact write failed for dispatch {node_id}: {e}");
-    }
 }
 
 /// Names a crew pane: `crew-<workflow>-<role><ordinal>` (1-based per role),
@@ -1563,7 +1523,7 @@ pub fn start_approval_drainer(
                 loop {
                     pass = pass.wrapping_add(1);
                     let ids: Vec<String> = {
-                        let mut sink = engine.approval_sink().lock().await;
+                        let sink = engine.approval_sink().lock().await;
                         let mut new_ids = Vec::new();
                         for id in sink.iter() {
                             if !seen.contains(id) {
@@ -1577,9 +1537,9 @@ pub fn start_approval_drainer(
                     };
                     for promise_id in ids {
                         // Surface to captain: the decision token they reply with.
+                        let run_tag = format!("run-{}", &promise_id[..promise_id.len().min(8)]);
                         eprintln!(
                             "flywheel: approval parked: promise {promise_id} for project {project} — resolve with: flywheel workflow approve {run_tag} {promise_id} --decision approve|reject --project {project}",
-                            run_tag = format!("run-{}", &promise_id[..promise_id.len().min(8)])
                         );
                         // ADR-0011 D7: SIGNOFF auto-pass iff REVIEW residual
                         // empty AND OPEN DECISIONS empty. Irreversible
@@ -1644,7 +1604,7 @@ pub fn start_approval_drainer(
                             let sink = engine.approval_sink().lock().await;
                             sink.iter().cloned().collect()
                         };
-                        if !parked.is_empty() && pass % 13 == 0 {
+                        if !parked.is_empty() && pass.is_multiple_of(13) {
                             for promise_id in &parked {
                                 let token_a = format!("approve:{promise_id}");
                                 let token_r = format!("reject:{promise_id}");
@@ -2577,7 +2537,6 @@ steps:
 }
 
 #[cfg(test)]
-#[allow(unused_imports)]
 mod kind_classify_tests {
     use crate::failure;
 

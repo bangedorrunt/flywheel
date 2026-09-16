@@ -16,7 +16,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::config::config_dir;
@@ -692,11 +691,11 @@ pub mod learning {
     /// `budget_tokens`. pinned entries never age out; aging/perishable
     /// decay past their TTL unreinforced; never-reinforced entries rank
     /// last but stay eligible ONLY when pinned.
-    pub fn gate_projection<'a>(
-        entries: &'a [LearningEntry],
+    pub fn gate_projection(
+        entries: &[LearningEntry],
         today: NaiveDate,
         budget_tokens: usize,
-    ) -> Vec<&'a LearningEntry> {
+    ) -> Vec<&LearningEntry> {
         let mut eligible: Vec<&LearningEntry> = entries
             .iter()
             .filter(|e| match e.tier {
@@ -728,6 +727,7 @@ pub mod learning {
     }
 }
 
+#[cfg(test)]
 mod adr0010_d12_tests {
     // governed-by: ADR-0010 D12 (bd-fmya) — learnings tier/reinforced +
     // bounded GATE projection.

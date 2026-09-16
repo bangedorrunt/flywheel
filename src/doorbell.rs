@@ -5,7 +5,7 @@
 //! gate. The live dispatcher process is spawn-owned; this module is the
 //! functional core the e2e gate tests.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,11 +16,14 @@ use anyhow::{Context, Result};
 // it (single source) and keeps the effect layer (pid files, supervision,
 // journal, inject). No signature changes in the move.
 pub use doorbell_core::{
-    DoorbellQueue, EventClass, REDELIVERY_LOOKBACK_HOURS, RingInput, SelfIndex, UNANSWERED_SECS,
-    WakeState, classify, doorbell_line, doorbell_line_with_event, inbox_high_water,
-    inbox_high_water_from_values, inbox_high_water_micros, is_drain_transition, note_wake,
-    parse_inbox_item, parse_rfc3339_micros, parse_status_pair, parse_watch_ndjson, row_created_us,
-    should_inject, watch_created_at, watch_id, watch_pubkey, watch_targets,
+    EventClass, SelfIndex, WakeState, doorbell_line, note_wake, parse_status_pair, should_inject,
+};
+// The rest of doorbell-core's surface is exercised only by this module's own
+// tests, so the re-export is test-gated — in the bin build it would be unused.
+#[cfg(test)]
+pub use doorbell_core::{
+    DoorbellQueue, RingInput, UNANSWERED_SECS, classify, inbox_high_water, is_drain_transition,
+    parse_inbox_item, parse_rfc3339_micros, parse_watch_ndjson, watch_pubkey, watch_targets,
 };
 
 /// Pid file: `~/.local/state/flywheel/doorbell/<workspace>.pid`.
@@ -119,6 +122,7 @@ pub struct PinBudget {
 }
 
 impl PinBudget {
+    #[cfg(test)]
     pub fn adr_default(started_unix: u64) -> Self {
         Self::new(30, 3, started_unix)
     }
@@ -158,25 +162,6 @@ impl PinBudget {
             .retain(|t| now_unix.saturating_sub(*t) < window);
         self.prompts.push(now_unix);
     }
-}
-
-/// Drop injects that exceed the pin's 5/30/3 budget (rolling).
-pub fn take_allowed(
-    injects: Vec<(String, String)>,
-    budgets: &mut BTreeMap<String, PinBudget>,
-    now_unix: u64,
-) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for (pin, msg) in injects {
-        let b = budgets
-            .entry(pin.clone())
-            .or_insert_with(|| PinBudget::adr_default(now_unix));
-        if b.allows(now_unix) {
-            b.record_at(now_unix);
-            out.push((pin, msg));
-        }
-    }
-    out
 }
 
 pub fn read_pid(path: &Path) -> Option<u32> {
@@ -737,129 +722,6 @@ pub fn inject_wake_in(
     Ok(summary)
 }
 
-/// Cross-workspace scopes (bd-asr2.18, D5, flag-gated): widen one pin's
-/// Scope stays explicit (Scope::Many, deduped) — never an implicit
-/// all-workspace watch. Flag off or non-operator actor refuses.
-#[derive(Debug, PartialEq, Eq)]
-pub enum CrossScopeDeny {
-    FlagOff,
-    NoSubscription,
-    NeedsOperator,
-    Store(doorbell_rt::subscribe::Refusal),
-}
-
-pub fn subscribe_extra_workspace(
-    state_dir: &Path,
-    workspace: &str,
-    pin: &str,
-    extra: &str,
-    operator: bool,
-) -> Result<Vec<String>, CrossScopeDeny> {
-    let on = crate::config::Config::load()
-        .ok()
-        .map(|c| c.doorbell_cross_workspace())
-        .unwrap_or(false);
-    subscribe_extra_workspace_in(state_dir, workspace, pin, extra, operator, on)
-}
-
-pub fn subscribe_extra_workspace_in(
-    state_dir: &Path,
-    workspace: &str,
-    pin: &str,
-    extra: &str,
-    operator: bool,
-    cross_on: bool,
-) -> Result<Vec<String>, CrossScopeDeny> {
-    use doorbell_rt::subscribe::{Actor, Scope, SubscriptionStore};
-    if !cross_on {
-        return Err(CrossScopeDeny::FlagOff);
-    }
-    if !operator {
-        return Err(CrossScopeDeny::NeedsOperator);
-    }
-    let mut store = SubscriptionStore::open(state_dir);
-    let id = format!("spawn-{workspace}-{pin}");
-    let mut sub = store.get(&id).ok_or(CrossScopeDeny::NoSubscription)?;
-    let mut ws = sub.scope.workspaces();
-    if !ws.contains(&extra.to_string()) {
-        ws.push(extra.to_string());
-    }
-    sub.scope = Scope::Many(ws.clone());
-    store
-        .subscribe(Actor::operator(), sub, workspace)
-        .map_err(CrossScopeDeny::Store)?;
-    Ok(ws)
-}
-
-/// Parse an external-block corr (`external:<project>:<bead>`).
-pub fn parse_external_corr(corr: &str) -> Option<(String, String)> {
-    let rest = corr.strip_prefix("external:")?;
-    let (proj, bead) = rest.split_once(':')?;
-    if proj.is_empty() || bead.is_empty() {
-        return None;
-    }
-    Some((proj.to_string(), bead.to_string()))
-}
-
-/// Cross-project re-ring (bd-asr2.18, D5/E9, flag-gated, same-host): for
-/// every open captain hold parked behind `external:<proj>:<bead>`, check
-/// resolve the hold and queue one wake (one wake within one sweep, zero
-/// swarm). The `run` seam keeps this testable (prod shells br).
-pub fn check_external_unblocks(
-    project: &str,
-    foreign_paths: &std::collections::HashMap<String, String>,
-    run: &dyn Fn(&str, &[&str], Option<&str>) -> Option<String>,
-) -> Vec<String> {
-    let on = crate::config::Config::load()
-        .ok()
-        .map(|c| c.doorbell_cross_workspace())
-        .unwrap_or(false);
-    check_external_unblocks_in(project, foreign_paths, run, on)
-}
-
-pub fn check_external_unblocks_in(
-    project: &str,
-    foreign_paths: &std::collections::HashMap<String, String>,
-    run: &dyn Fn(&str, &[&str], Option<&str>) -> Option<String>,
-    cross_on: bool,
-) -> Vec<String> {
-    if !cross_on {
-        return Vec::new();
-    }
-    let holds_raw = run("br", &["hold", "--list", "--json"], None).unwrap_or_default();
-    let holds: serde_json::Value =
-        serde_json::from_str(&holds_raw).unwrap_or(serde_json::Value::Null);
-    let rows = holds
-        .get("holds")
-        .and_then(|h| h.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut rerung = Vec::new();
-    for row in rows {
-        let corr = row.get("corr").and_then(|c| c.as_str()).unwrap_or("");
-        let Some((fproj, fbead)) = parse_external_corr(corr) else {
-            continue;
-        };
-        let Some(fpath) = foreign_paths.get(&fproj) else {
-            continue;
-        };
-        let show = run("br", &["show", &fbead, "--json"], Some(fpath)).unwrap_or_default();
-        let st = serde_json::from_str::<serde_json::Value>(&show)
-            .ok()
-            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
-            .unwrap_or_default();
-        if st != "closed" {
-            continue;
-        }
-        run("br", &["hold", "--resolve", "--corr", corr], None);
-        let summary = format!("external {fproj}:{fbead} closed — re-ring {corr}");
-        if crate::append_pending_fact(project, &summary).is_ok() {
-            rerung.push(corr.to_string());
-        }
-    }
-    rerung
-}
-
 fn spawn_child(
     exe: &Path,
     project: &str,
@@ -1098,27 +960,15 @@ pub fn fanout_now(
 
 // bd-drub: the heard-or-deaf tracker lives in ONE place now —
 // `doorbell_rt::HearTracker` (byte-identical to the struct + impl that stood
-// here). Re-exported so `doorbell::HearTracker` paths keep compiling.
+// here). Only the tests still reach it through this path, so the re-export is
+// test-gated: in the bin build it would be an unused import.
+#[cfg(test)]
 pub use doorbell_rt::HearTracker;
 
 pub fn unanswered_file(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir
         .join("doorbell")
         .join(format!("{workspace}.unanswered"))
-}
-
-pub fn write_unanswered(path: &Path, pins: &[String]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    let body = if pins.is_empty() {
-        String::new()
-    } else {
-        let mut pins = pins.to_vec();
-        pins.sort();
-        format!("{}\n", pins.join("\n"))
-    };
-    fs::write(path, body).with_context(|| format!("write {}", path.display()))
 }
 
 pub fn read_unanswered(path: &Path) -> Vec<String> {
@@ -1131,8 +981,6 @@ pub fn read_unanswered(path: &Path) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
-
-/// Poster pubkey on a `toron watch` NDJSON line.
 
 pub fn wake_state_file(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir.join(format!("doorbell-wake-{workspace}.json"))
@@ -1272,13 +1120,12 @@ pub fn audit_append(state_dir: &Path, workspace: &str, entry: serde_json::Value)
     }
 }
 
-/// Pins addressed by this watch line: `p`/`assignee` (pin or npub) plus
-/// kind-9 `@pin` in content (live posts do both; `p` is npub).
+// Pins addressed by this watch line: `p`/`assignee` (pin or npub) plus
+// kind-9 `@pin` in content (live posts do both; `p` is npub).
 
-/// Second reducers deleted per bd-3wzl.
-/// Live dispatcher now routes every watch/status edge through `workspace::tick` (tick(&WorkspaceModel, &Msg)).
+// Second reducers deleted per bd-3wzl.
+// Live dispatcher now routes every watch/status edge through `workspace::tick` (tick(&WorkspaceModel, &Msg)).
 /// Tests below port the same scenarios to `workspace::tick` (see `sc_d1_*`).
-
 /// herdr-mock: stdin watch lines + pin statuses → JSON injects via tick (no second reducer).
 pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> String {
     let index = SelfIndex::from_pins(status_by_pin.keys().cloned());
@@ -1311,46 +1158,6 @@ pub fn once_json(stdin: &str, status_by_pin: &BTreeMap<String, String>) -> Strin
 }
 
 // ---- bd-yw4s: doorbell journal — the `doorbell why` trust surface --------
-
-/// One journaled tick: the Msg in, the Actions out, what the effect layer
-/// actually did. `doorbell why <pin>` replays this — never log tailing.
-pub fn journal_file(state_dir: &Path, workspace: &str) -> PathBuf {
-    state_dir
-        .join("journals")
-        .join(format!("doorbell-journal-{workspace}.jsonl"))
-}
-
-pub fn journal_append(
-    state_dir: &Path,
-    workspace: &str,
-    msg: &crate::doorbell_tick::DoorbellMsg,
-    actions: &[crate::doorbell_tick::DoorbellAction],
-    executed: serde_json::Value,
-) {
-    let path = journal_file(state_dir, workspace);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let entry = serde_json::json!({
-        "v": 1,
-        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "workspace": workspace,
-        "msg": msg,
-        "actions": actions,
-        "executed": executed,
-    });
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{entry}");
-    }
-    // F8: no second retention impl here — rotation plus audit lives in
-    // doorbell-rt FileStore (RETENTION_LINES/BYTES). Legacy silent head-trim
-    // deleted; live path uses journal_append_workspace via the store.
-}
 
 /// Workspace-tick journal entry writer. `pins` is the inject-relevant pin set
 /// (bd-z54w honesty contract): the fold restores the SelfIndex from it so
@@ -1523,6 +1330,187 @@ pub fn render_roster(rows: &[RosterRow]) -> Vec<String> {
     }
     out
 }
+
+/// Cross-workspace scopes (bd-asr2.18, D5, flag-gated): widen one pin's
+/// Scope stays explicit (Scope::Many, deduped) — never an implicit
+/// all-workspace watch. Flag off or non-operator actor refuses.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum CrossScopeDeny {
+    FlagOff,
+    NoSubscription,
+    NeedsOperator,
+    Store(doorbell_rt::subscribe::Refusal),
+}
+
+/// The `br`-shaped command seam: `(cmd, args, stdin) -> Some(stdout)`, or
+/// `None` when the command could not run. Prod shells out to `br`; tests
+/// inject a closure so the cross-project sweep stays offline.
+#[cfg(test)]
+type BlockRun<'a> = &'a dyn Fn(&str, &[&str], Option<&str>) -> Option<String>;
+
+#[cfg(test)]
+pub fn check_external_unblocks_in(
+    project: &str,
+    foreign_paths: &std::collections::HashMap<String, String>,
+    run: BlockRun<'_>,
+    cross_on: bool,
+) -> Vec<String> {
+    if !cross_on {
+        return Vec::new();
+    }
+    let holds_raw = run("br", &["hold", "--list", "--json"], None).unwrap_or_default();
+    let holds: serde_json::Value =
+        serde_json::from_str(&holds_raw).unwrap_or(serde_json::Value::Null);
+    let rows = holds
+        .get("holds")
+        .and_then(|h| h.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut rerung = Vec::new();
+    for row in rows {
+        let corr = row.get("corr").and_then(|c| c.as_str()).unwrap_or("");
+        let Some((fproj, fbead)) = parse_external_corr(corr) else {
+            continue;
+        };
+        let Some(fpath) = foreign_paths.get(&fproj) else {
+            continue;
+        };
+        let show = run("br", &["show", &fbead, "--json"], Some(fpath)).unwrap_or_default();
+        let st = serde_json::from_str::<serde_json::Value>(&show)
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        if st != "closed" {
+            continue;
+        }
+        run("br", &["hold", "--resolve", "--corr", corr], None);
+        let summary = format!("external {fproj}:{fbead} closed — re-ring {corr}");
+        if crate::append_pending_fact(project, &summary).is_ok() {
+            rerung.push(corr.to_string());
+        }
+    }
+    rerung
+}
+
+#[cfg(test)]
+pub fn journal_append(
+    state_dir: &Path,
+    workspace: &str,
+    msg: &crate::doorbell_tick::DoorbellMsg,
+    actions: &[crate::doorbell_tick::DoorbellAction],
+    executed: serde_json::Value,
+) {
+    let path = journal_file(state_dir, workspace);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = serde_json::json!({
+        "v": 1,
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "workspace": workspace,
+        "msg": msg,
+        "actions": actions,
+        "executed": executed,
+    });
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{entry}");
+    }
+    // F8: no second retention impl here — rotation plus audit lives in
+    // doorbell-rt FileStore (RETENTION_LINES/BYTES). Legacy silent head-trim
+    // deleted; live path uses journal_append_workspace via the store.
+}
+
+/// One journaled tick: the Msg in, the Actions out, what the effect layer
+/// actually did. `doorbell why <pin>` replays this — never log tailing.
+#[cfg(test)]
+pub fn journal_file(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir
+        .join("journals")
+        .join(format!("doorbell-journal-{workspace}.jsonl"))
+}
+
+/// Parse an external-block corr (`external:<project>:<bead>`).
+#[cfg(test)]
+pub fn parse_external_corr(corr: &str) -> Option<(String, String)> {
+    let rest = corr.strip_prefix("external:")?;
+    let (proj, bead) = rest.split_once(':')?;
+    if proj.is_empty() || bead.is_empty() {
+        return None;
+    }
+    Some((proj.to_string(), bead.to_string()))
+}
+
+#[cfg(test)]
+pub fn subscribe_extra_workspace_in(
+    state_dir: &Path,
+    workspace: &str,
+    pin: &str,
+    extra: &str,
+    operator: bool,
+    cross_on: bool,
+) -> Result<Vec<String>, CrossScopeDeny> {
+    use doorbell_rt::subscribe::{Actor, Scope, SubscriptionStore};
+    if !cross_on {
+        return Err(CrossScopeDeny::FlagOff);
+    }
+    if !operator {
+        return Err(CrossScopeDeny::NeedsOperator);
+    }
+    let mut store = SubscriptionStore::open(state_dir);
+    let id = format!("spawn-{workspace}-{pin}");
+    let mut sub = store.get(&id).ok_or(CrossScopeDeny::NoSubscription)?;
+    let mut ws = sub.scope.workspaces();
+    if !ws.contains(&extra.to_string()) {
+        ws.push(extra.to_string());
+    }
+    sub.scope = Scope::Many(ws.clone());
+    store
+        .subscribe(Actor::operator(), sub, workspace)
+        .map_err(CrossScopeDeny::Store)?;
+    Ok(ws)
+}
+
+/// Drop injects that exceed the pin's 5/30/3 budget (rolling).
+#[cfg(test)]
+pub fn take_allowed(
+    injects: Vec<(String, String)>,
+    budgets: &mut BTreeMap<String, PinBudget>,
+    now_unix: u64,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (pin, msg) in injects {
+        let b = budgets
+            .entry(pin.clone())
+            .or_insert_with(|| PinBudget::adr_default(now_unix));
+        if b.allows(now_unix) {
+            b.record_at(now_unix);
+            out.push((pin, msg));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub fn write_unanswered(path: &Path, pins: &[String]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let body = if pins.is_empty() {
+        String::new()
+    } else {
+        let mut pins = pins.to_vec();
+        pins.sort();
+        format!("{}\n", pins.join("\n"))
+    };
+    fs::write(path, body).with_context(|| format!("write {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

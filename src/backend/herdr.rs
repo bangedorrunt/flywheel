@@ -14,6 +14,7 @@
 /// a transport failure. Returns `Ok` for both (landed → status, coded error →
 /// `code`), preserving the parity contract the flywheel `__send` leaf
 /// classifies on.
+#[cfg(test)]
 pub fn map_prompt_result(
     r: std::result::Result<
         toron_core::backend::herdr::AgentInfo,

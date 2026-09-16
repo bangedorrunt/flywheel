@@ -50,7 +50,8 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                 }));
             }
             // mail: toron is the only backend (bd-euav)
-            for (name, stub) in [("toron", false)] {
+            {
+                let (name, stub) = ("toron", false);
                 rows.push(json!({
                     "name": name,
                     "kind": "mail",

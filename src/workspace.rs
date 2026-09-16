@@ -65,21 +65,6 @@ impl Presence {
             doorbell_core::PresenceVerdict::Unknown => Self::Unknown,
         }
     }
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::Busy { .. } => "busy",
-            Self::Idle { .. } => "idle",
-            Self::Dead { .. } => "dead",
-        }
-    }
-    /// Evidence source of this verdict ("none" for Unknown).
-    pub fn source(&self) -> &str {
-        match self {
-            Self::Unknown => "none",
-            Self::Busy { source } | Self::Idle { source } | Self::Dead { source } => source,
-        }
-    }
     /// Status-render token: verdict plus source, so `flywheel status`
     /// prints verdict+source per pin (D3). Unknown renders bare.
     pub fn status_token(&self) -> String {
@@ -219,34 +204,6 @@ pub fn open_decisions(model: &WorkspaceModel) -> Vec<OpenDecision> {
         .collect();
     rows.sort_by(|a, b| (a.created_at, &a.corr).cmp(&(b.created_at, &b.corr)));
     rows
-}
-
-/// OPEN DECISIONS from a journal-msg sequence (status/helm consumer
-/// path): fold ticks from Default over the msgs and return the open
-/// fold. Same replay rule as cmd_doorbell_why; commands are discarded —
-/// only the open_human cache matters here.
-pub fn open_decisions_from_msgs(msgs: &[Msg]) -> Vec<OpenDecision> {
-    let mut model = WorkspaceModel::default();
-    for m in msgs {
-        let (next, _) = tick(&model, m);
-        model = next;
-    }
-    open_decisions(&model)
-}
-
-/// Status/helm/digest rendering of the fold. Always prints the section
-/// (even empty — "none" is a fact); entries are never cut off.
-pub fn render_open_decisions(model: &WorkspaceModel) -> String {
-    let rows = open_decisions(model);
-    let mut out = String::from("OPEN DECISIONS");
-    if rows.is_empty() {
-        out.push_str(": none");
-        return out;
-    }
-    for r in &rows {
-        let _ = write!(out, "\n- [{}] {}", r.corr, r.body);
-    }
-    out
 }
 
 /// A recorded divergence between the call ledger and the bead ledger.
@@ -538,17 +495,17 @@ pub fn render_digest(entries: &[DigestEntry], now: u64) -> String {
             0 => "age unknown".to_string(),
             t => format!("{}s ago", now.saturating_sub(t)),
         };
-        let _ = write!(out, "- [{age}] {} {}: {}\n", e.kind, e.pin, e.detail);
+        let _ = writeln!(out, "- [{age}] {} {}: {}", e.kind, e.pin, e.detail);
     }
     let beads = digest_bead_ids(entries);
     if beads.is_empty() {
         out.push_str("beads: none in this digest\n");
     } else {
-        let _ = write!(out, "beads: {}\n", beads.join(", "));
+        let _ = writeln!(out, "beads: {}", beads.join(", "));
     }
     out.push_str("commands:\n");
     for b in &beads {
-        let _ = write!(out, "  br show {b}\n");
+        let _ = writeln!(out, "  br show {b}");
     }
     if beads.is_empty() {
         out.push_str("  (no bead commands)\n");
@@ -575,16 +532,6 @@ pub fn sorted_holds(model: &WorkspaceModel) -> Vec<(String, u64)> {
     holds
 }
 
-/// bd-2fxx: holds whose needed-by has passed — the wedge-pattern
-/// escalation signal (mirrors digest_overdue: fail loud, never silently
-/// batch). Non-empty means escalate now.
-pub fn overdue_holds(model: &WorkspaceModel, now: u64) -> Vec<(String, u64)> {
-    sorted_holds(model)
-        .into_iter()
-        .filter(|(_, d)| *d <= now)
-        .collect()
-}
-
 /// bd-2fxx: digest render with the hold section appended, earliest
 /// needed-by first; overdue rows carry ESCALATE. Pure — both the afk
 /// CLI and the Digest effect share it. render_digest delegates with
@@ -599,17 +546,17 @@ pub fn render_digest_with_holds(
         out.push_str("holds: none\n");
         return out;
     }
-    let _ = write!(out, "holds ({} earliest-deadline first):\n", holds.len());
+    let _ = writeln!(out, "holds ({} earliest-deadline first):", holds.len());
     for (corr, needed_by) in holds {
         if *needed_by <= now {
             let overdue = now.saturating_sub(*needed_by);
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "- ESCALATE {corr} needed-by {needed_by} ({overdue}s overdue)\n"
+                "- ESCALATE {corr} needed-by {needed_by} ({overdue}s overdue)"
             );
         } else {
             let remaining = needed_by.saturating_sub(now);
-            let _ = write!(out, "- {corr} needed-by {needed_by} ({remaining}s left)\n");
+            let _ = writeln!(out, "- {corr} needed-by {needed_by} ({remaining}s left)");
         }
     }
     out
@@ -1279,6 +1226,9 @@ pub fn reclassify_effect_key(
 
 /// GS-048 / GS-050 effect helper: replace each `Cmd::Reclassify` with the
 /// cmds from folding `Msg::DecisionReady` after a pure `decide` call.
+/// The classify leaf's answer: `(topology, src, argv, reason)`.
+type ReclassifyDecision = (String, String, Vec<String>, String);
+
 /// Journals Prepared → InFlight → Settled|Failed under the Cmd's
 /// `effect_key` (ADR-0032 I8a) via insert-or-load — retries attach to the
 /// same journal primary key. Callers in the effect/host path run this
@@ -1287,7 +1237,7 @@ pub fn expand_reclassify_cmds(
     model: &mut WorkspaceModel,
     cmds: Vec<Cmd>,
     project: &str,
-    decide: &dyn Fn(&str) -> (String, String, Vec<String>, String),
+    decide: &dyn Fn(&str) -> ReclassifyDecision,
 ) -> Vec<Cmd> {
     let mut out = Vec::with_capacity(cmds.len());
     for cmd in cmds {
@@ -1384,10 +1334,11 @@ fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> Vec<Cmd> {
     cmds.into_iter()
         .flat_map(|c| match c {
             Cmd::Prompt { pin, line } => {
-                if prompt_allowed(model, &pin) {
-                    vec![Cmd::Prompt { pin, line }]
-                } else if is_urgent_line(&line)
-                    && matches!(model.presence.get(&pin), Some(Presence::Busy { .. }))
+                // Idle prompts and Busy+urgent break-throughs deliver the SAME
+                // Cmd — one condition, not two identical branches.
+                if prompt_allowed(model, &pin)
+                    || (is_urgent_line(&line)
+                        && matches!(model.presence.get(&pin), Some(Presence::Busy { .. })))
                 {
                     vec![Cmd::Prompt { pin, line }]
                 } else {
@@ -1425,6 +1376,9 @@ fn apply_human_decision(next: &mut WorkspaceModel, cmds: &mut Vec<Cmd>, corr: &s
     }
 }
 
+// One positional per assignment field the mail row carries; grouping them would
+// only move the field list into a struct.
+#[allow(clippy::too_many_arguments)]
 fn apply_assignment(
     next: &mut WorkspaceModel,
     cmds: &mut Vec<Cmd>,
@@ -1656,79 +1610,73 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 // pubkey; when either is absent forgery is unprovable so the
                 // claim is accepted (bootstrap + pre-npub tests). Missing
                 // key = Unknown; Unknown never prompts (see prompt_allowed).
-                if v.get("kind").and_then(serde_json::Value::as_u64) == Some(20001) {
-                    if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
-                        // content is like "idle" or JSON with pin/state? For test, content is state, tags contain p tag for pin
-                        let state = content.to_string();
-                        let author = v
-                            .get("pubkey")
-                            .and_then(|p| p.as_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
-                            for tag in tags {
-                                if let Some(arr) = tag.as_array() {
-                                    if arr.len() >= 2 && arr[0].as_str() == Some("p") {
-                                        let pin = arr[1].as_str().unwrap_or("").to_string();
-                                        if !pin.is_empty() {
-                                            let expected = next
-                                                .doorbell
-                                                .index
-                                                .npub(&pin)
-                                                .unwrap_or("")
-                                                .to_lowercase();
-                                            if !expected.is_empty()
-                                                && !author.is_empty()
-                                                && author != expected
-                                            {
-                                                cmds.push(Cmd::LoudMiss {
-                                                    why: format!(
-                                                        "forged 20001 for {pin}: author is not the pin"
-                                                    ),
-                                                });
-                                                cmds.push(Cmd::Audit {
-                                                    kind: "presence_forge".into(),
-                                                    pin: pin.clone(),
-                                                    detail: "20001 author != pin npub".into(),
-                                                });
-                                                continue;
-                                            }
-                                            next.presence
-                                                .insert(pin.clone(), Presence::from_str(&state));
-                                        }
+                if v.get("kind").and_then(serde_json::Value::as_u64) == Some(20001)
+                    && let Some(content) = v.get("content").and_then(|c| c.as_str())
+                {
+                    // content is like "idle" or JSON with pin/state? For test, content is state, tags contain p tag for pin
+                    let state = content.to_string();
+                    let author = v
+                        .get("pubkey")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
+                        for tag in tags {
+                            if let Some(arr) = tag.as_array()
+                                && arr.len() >= 2
+                                && arr[0].as_str() == Some("p")
+                            {
+                                let pin = arr[1].as_str().unwrap_or("").to_string();
+                                if !pin.is_empty() {
+                                    let expected =
+                                        next.doorbell.index.npub(&pin).unwrap_or("").to_lowercase();
+                                    if !expected.is_empty()
+                                        && !author.is_empty()
+                                        && author != expected
+                                    {
+                                        cmds.push(Cmd::LoudMiss {
+                                            why: format!(
+                                                "forged 20001 for {pin}: author is not the pin"
+                                            ),
+                                        });
+                                        cmds.push(Cmd::Audit {
+                                            kind: "presence_forge".into(),
+                                            pin: pin.clone(),
+                                            detail: "20001 author != pin npub".into(),
+                                        });
+                                        continue;
                                     }
+                                    next.presence
+                                        .insert(pin.clone(), Presence::from_str(&state));
                                 }
                             }
-                        } else {
-                            // Fallback: if no p tag, use pin from content? For test, just use a dummy
                         }
-                    } else if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
-                        // Alternative: tags contain state?
+                    } else {
+                        // Fallback: if no p tag, use pin from content? For test, just use a dummy
                     }
                 }
                 // 30013 role binding
-                if v.get("kind").and_then(serde_json::Value::as_u64) == Some(30013) {
-                    if let Some(tags) = v.get("tags").and_then(|t| t.as_array()) {
-                        let mut pin: Option<String> = None;
-                        let mut roles: Vec<String> = Vec::new();
-                        for tag in tags {
-                            if let Some(arr) = tag.as_array() {
-                                if arr.len() >= 2 {
-                                    let k = arr[0].as_str().unwrap_or("");
-                                    let val = arr[1].as_str().unwrap_or("").to_string();
-                                    if k == "d" {
-                                        pin =
-                                            Some(val.split(':').last().unwrap_or(&val).to_string());
-                                    } else if k == "role" {
-                                        roles.push(val);
-                                    }
-                                }
+                if v.get("kind").and_then(serde_json::Value::as_u64) == Some(30013)
+                    && let Some(tags) = v.get("tags").and_then(|t| t.as_array())
+                {
+                    let mut pin: Option<String> = None;
+                    let mut roles: Vec<String> = Vec::new();
+                    for tag in tags {
+                        if let Some(arr) = tag.as_array()
+                            && arr.len() >= 2
+                        {
+                            let k = arr[0].as_str().unwrap_or("");
+                            let val = arr[1].as_str().unwrap_or("").to_string();
+                            if k == "d" {
+                                pin = Some(val.split(':').next_back().unwrap_or(&val).to_string());
+                            } else if k == "role" {
+                                roles.push(val);
                             }
                         }
-                        if let Some(p) = pin {
-                            for role in roles {
-                                next.roles.insert(role, p.clone());
-                            }
+                    }
+                    if let Some(p) = pin {
+                        for role in roles {
+                            next.roles.insert(role, p.clone());
                         }
                     }
                 }
@@ -1740,19 +1688,19 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     let mut priority: Option<String> = None;
                     let mut verdict: Option<String> = None;
                     for tag in tags {
-                        if let Some(arr) = tag.as_array() {
-                            if arr.len() >= 2 {
-                                let k = arr[0].as_str().unwrap_or("");
-                                let val = arr[1].as_str().unwrap_or("").to_string();
-                                match k {
-                                    "corr" => corr = Some(val),
-                                    "wake" => wake = Some(val),
-                                    "audience" => audience = Some(val),
-                                    "result_path" => result_path = Some(val),
-                                    "priority" => priority = Some(val),
-                                    "verdict" => verdict = Some(val),
-                                    _ => {}
-                                }
+                        if let Some(arr) = tag.as_array()
+                            && arr.len() >= 2
+                        {
+                            let k = arr[0].as_str().unwrap_or("");
+                            let val = arr[1].as_str().unwrap_or("").to_string();
+                            match k {
+                                "corr" => corr = Some(val),
+                                "wake" => wake = Some(val),
+                                "audience" => audience = Some(val),
+                                "result_path" => result_path = Some(val),
+                                "priority" => priority = Some(val),
+                                "verdict" => verdict = Some(val),
+                                _ => {}
                             }
                         }
                     }
@@ -2371,18 +2319,57 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
     if let Some(now) = match msg {
         Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
         _ => None,
-    } {
-        if !next.digest_queue.is_empty()
-            && (next.digest_queue.len() >= digest_threshold()
-                || now.saturating_sub(next.last_digest_unix) >= digest_interval_secs())
-        {
-            let entries = std::mem::take(&mut next.digest_queue);
-            next.last_digest_unix = now;
-            cmds.push(Cmd::Digest { entries });
-        }
+    } && !next.digest_queue.is_empty()
+        && (next.digest_queue.len() >= digest_threshold()
+            || now.saturating_sub(next.last_digest_unix) >= digest_interval_secs())
+    {
+        let entries = std::mem::take(&mut next.digest_queue);
+        next.last_digest_unix = now;
+        cmds.push(Cmd::Digest { entries });
     }
 
     (next, cmds)
+}
+
+/// OPEN DECISIONS from a journal-msg sequence (status/helm consumer
+/// path): fold ticks from Default over the msgs and return the open
+/// fold. Same replay rule as cmd_doorbell_why; commands are discarded —
+/// only the open_human cache matters here.
+#[cfg(test)]
+pub fn open_decisions_from_msgs(msgs: &[Msg]) -> Vec<OpenDecision> {
+    let mut model = WorkspaceModel::default();
+    for m in msgs {
+        let (next, _) = tick(&model, m);
+        model = next;
+    }
+    open_decisions(&model)
+}
+
+/// bd-2fxx: holds whose needed-by has passed — the wedge-pattern
+/// escalation signal (mirrors digest_overdue: fail loud, never silently
+/// batch). Non-empty means escalate now.
+#[cfg(test)]
+pub fn overdue_holds(model: &WorkspaceModel, now: u64) -> Vec<(String, u64)> {
+    sorted_holds(model)
+        .into_iter()
+        .filter(|(_, d)| *d <= now)
+        .collect()
+}
+
+/// Status/helm/digest rendering of the fold. Always prints the section
+/// (even empty — "none" is a fact); entries are never cut off.
+#[cfg(test)]
+pub fn render_open_decisions(model: &WorkspaceModel) -> String {
+    let rows = open_decisions(model);
+    let mut out = String::from("OPEN DECISIONS");
+    if rows.is_empty() {
+        out.push_str(": none");
+        return out;
+    }
+    for r in &rows {
+        let _ = write!(out, "\n- [{}] {}", r.corr, r.body);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2561,7 +2548,7 @@ mod tests {
     #[test]
     fn ws_model_presence_missing_is_unknown() {
         let m = empty_model();
-        assert!(m.presence.get("GhostPin").is_none());
+        assert!(!m.presence.contains_key("GhostPin"));
         let (next, _) = tick(
             &m,
             &Msg::Presence {
@@ -2997,7 +2984,7 @@ mod tests {
             "live waits survive Sweep"
         );
         assert!(
-            next.pending_wait.len() <= PENDING_WAIT_CAP as usize,
+            next.pending_wait.len() <= PENDING_WAIT_CAP,
             "cap holds: {}",
             next.pending_wait.len()
         );
@@ -3017,7 +3004,7 @@ mod tests {
             "live corr gets no timeout record"
         );
         assert!(
-            timeouts.len() >= 1 + 2,
+            timeouts.len() > 2,
             "over-cap evictions recorded too ({} timeouts)",
             timeouts.len()
         );
@@ -3088,7 +3075,6 @@ mod bell_fold_tests {
         let wn = ["WriteNcryptsec", " {"].concat();
         let sub = ["Cmd::Sub", "scribe"].concat();
         let cw = ["Msg::Claim", "Watch"].concat();
-        let inv = ["Inv", "oke {"].concat();
         assert!(
             !src.contains(&wn),
             "RED (zfnx.4): WriteNcryptsec arm still present — delete it, flywheel never writes ncryptsec"
@@ -3467,8 +3453,6 @@ mod loop_fold_tests {
         // Also check that durable.rs does not have loop-local heal_states map at 5672 after tick
         let durable = include_str!("durable.rs");
         // The loop-local map `let mut heal_states: HashMap` should be gone or be on ActiveLoop
-        let has_local_map =
-            durable.contains("let mut heal_states") && !durable.contains("ActiveLoop");
         // We just check that state.rs has it; loop-local mutate at 7472 should be gone
         assert!(
             !durable.contains("apply_diagnose_outcome") || state.contains("heal_states"),
@@ -3574,7 +3558,7 @@ mod assignment_tick_tests {
         );
         assert!(!has_result, "standing empty must not write result");
         assert!(
-            next.assignment.get("FM-GS-012").is_none(),
+            !next.assignment.contains_key("FM-GS-012"),
             "standing empty must not create assignment"
         );
     }
@@ -3785,7 +3769,7 @@ mod role_model_tests {
 
     #[test]
     fn role_model_corr_inheritance_on_rebind() {
-        let mut m = empty_model();
+        let m = empty_model();
         // Initial bind wheelhouse -> OldPin and an open corr for that role
         let (m1, _) = tick(
             &m,
@@ -3830,7 +3814,7 @@ mod role_model_tests {
 
     #[test]
     fn role_model_mail_to_role_resolves_live_pin() {
-        let mut m = empty_model();
+        let m = empty_model();
         let (m1, _) = tick(
             &m,
             &Msg::RoleBound {
@@ -3868,7 +3852,7 @@ mod role_model_tests {
         let m = empty_model();
         let row = serde_json::json!({"corr": "C1", "wake": "tasked", "body": "hi", "audience": "agents", "role": "wheelhouse"});
         // No role bound, so mail to role should be loud miss, not spawn
-        let (next, cmds) = tick(
+        let (next, _cmds) = tick(
             &m,
             &Msg::InboxRows {
                 rows: vec![row],
@@ -3876,7 +3860,7 @@ mod role_model_tests {
             },
         );
         // Should not have created a role or spawned, just handled as normal assignment
-        assert!(next.roles.get("wheelhouse").is_none());
+        assert!(!next.roles.contains_key("wheelhouse"));
     }
 
     #[test]
@@ -3917,7 +3901,7 @@ mod presence_model_tests {
     #[test]
     fn presence_model_unknown_stays_unknown() {
         let m = empty_model();
-        assert!(m.presence.get("Ghost").is_none());
+        assert!(!m.presence.contains_key("Ghost"));
         let (next, _) = tick(
             &m,
             &Msg::Presence {
@@ -4076,7 +4060,7 @@ mod presence_model_tests {
             "forged 20001 must fail loud, got {cmds:?}"
         );
         assert!(
-            next.presence.get("BlueRidge").is_none(),
+            !next.presence.contains_key("BlueRidge"),
             "forged 20001 must not write presence"
         );
     }
@@ -4487,7 +4471,7 @@ mod human_decision_tests {
 
     #[test]
     fn human_decision_from_inbox_verdict_closes_open_question() {
-        let mut m = empty_model();
+        let m = empty_model();
         // E4: happy path needs no test-only pre-seed — the question is
         // minted by the live Publish path (audience=human InboxRow), then
         // the correlated answer closes it.

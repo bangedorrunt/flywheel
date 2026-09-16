@@ -1,5 +1,4 @@
 // governed-by: ADR-0025
-#![allow(dead_code, clippy::all, unused)]
 // Wired: `check_send_plane_tripwires` (cmd_send) + `check_job_tripwire`
 // direct call in cmd_mail Send (gift-wrap private must not carry job-assign).
 // Channel post is toron-owned (`toron channel post`) — no flywheel wrapper.
@@ -16,33 +15,6 @@
 //! - `toron mail send` = gift-wrap. Public only via explicit `--plane s` / `channel post`.
 //! - Only `--unsafe-plane` escapes, audited to stderr JSON; `--raw` never escapes.
 
-/// The four dispatch surfaces in priority order (Spec 5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Plane {
-    Job,      // 43001–43006
-    Doorbell, // watch + herdr agent.prompt
-    Kind9,    // crew-visible
-    GiftWrap, // 1059 / rumor 14 (private)
-}
-
-/// Dispatch-surface priority: job > doorbell > kind9 > gift-wrap (fixed, not user-tunable).
-pub fn dispatch_surface_priority(
-    is_job_assign: bool,
-    is_doorbell: bool,
-    is_kind9: bool,
-    _is_gift_wrap: bool,
-) -> Plane {
-    if is_job_assign {
-        Plane::Job
-    } else if is_doorbell {
-        Plane::Doorbell
-    } else if is_kind9 {
-        Plane::Kind9
-    } else {
-        Plane::GiftWrap
-    }
-}
-
 /// Secret patterns per Spec 5: (?i)(nsec1|ncryptsec|TORON_KEY_PASSPHRASE|-----BEGIN .*PRIVATE KEY-----)
 fn is_secret_pattern(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
@@ -55,10 +27,10 @@ fn is_secret_pattern(body: &str) -> bool {
     // -----BEGIN ... PRIVATE KEY-----  (case-insensitive, .* between)
     if lower.contains("-----begin") && lower.contains("private key") {
         // Ensure the BEGIN comes before PRIVATE KEY in the lowercased body
-        if let (Some(b), Some(p)) = (lower.find("-----begin"), lower.find("private key")) {
-            if b < p {
-                return true;
-            }
+        if let (Some(b), Some(p)) = (lower.find("-----begin"), lower.find("private key"))
+            && b < p
+        {
+            return true;
         }
     }
     false
@@ -172,7 +144,37 @@ pub fn check_job_tripwire(
     )
 }
 
+/// The four dispatch surfaces in priority order (Spec 5).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Plane {
+    Job,      // 43001–43006
+    Doorbell, // watch + herdr agent.prompt
+    Kind9,    // crew-visible
+    GiftWrap, // 1059 / rumor 14 (private)
+}
+
+/// Dispatch-surface priority: job > doorbell > kind9 > gift-wrap (fixed, not user-tunable).
+#[cfg(test)]
+pub fn dispatch_surface_priority(
+    is_job_assign: bool,
+    is_doorbell: bool,
+    is_kind9: bool,
+    _is_gift_wrap: bool,
+) -> Plane {
+    if is_job_assign {
+        Plane::Job
+    } else if is_doorbell {
+        Plane::Doorbell
+    } else if is_kind9 {
+        Plane::Kind9
+    } else {
+        Plane::GiftWrap
+    }
+}
+
 /// Human-readable dispatch-surface priority for display.
+#[cfg(test)]
 pub fn plane_label(plane: Plane) -> &'static str {
     match plane {
         Plane::Job => "job",

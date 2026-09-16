@@ -10,7 +10,6 @@
 //! checkpoint on restart with the same invocation id. The queue and the agent
 //! states are deterministic across replays because every effect is checkpointed.
 
-#![allow(dead_code, clippy::all, unused)]
 // TODO: LoopSnapshot/tick etc wired in W3, not yet rendered in status (deferred delivery-verdict ADR)
 //!
 //! Leaves shell out to the flywheel binary itself (`__poll` / `__poll_events` /
@@ -2312,7 +2311,6 @@ pub fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<
                 .unwrap_or_default()
                 .to_string(),
             updated_at: None,
-            ..Default::default()
         })
         .collect())
 }
@@ -3732,25 +3730,12 @@ pub fn lease_renew_seconds(heartbeat_interval_secs: u64) -> u64 {
     (4 * heartbeat_interval_secs).max(60)
 }
 
-/// bd-bd79: TTL 3600 + renewal-on-tick is the pairing; neither alone holds.
-/// Exclusive leases expire after 3600s and the strict guard goes blind.
-/// The durable loop's poll tick renews active leases whose reason matches an
-/// in_progress bead with a live assignee, BEFORE dispatch decisions.
-pub const LEASE_TTL_SECS: u64 = 3600;
-pub const LEASE_RENEW_THRESHOLD_SECS: u64 = 600;
-
 /// Visible counter for failed renewals (bd-bd79: log + counter now, full event
 /// emission lands with bd-cy0s later).
 static RENEW_FAIL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub fn renew_fail_count() -> u64 {
-    RENEW_FAIL_COUNTER.load(Ordering::Relaxed)
-}
 pub fn inc_renew_fail_count() {
     RENEW_FAIL_COUNTER.fetch_add(1, Ordering::Relaxed);
-}
-pub fn reset_renew_fail_count() {
-    RENEW_FAIL_COUNTER.store(0, Ordering::Relaxed);
 }
 pub fn record_renew_failure(path: &str, reason: &str, err: &str) {
     eprintln!("flywheel: lease renew failed for {path} (reason {reason}): {err}");
@@ -3888,13 +3873,12 @@ fn redact_secrets_tail(s: &str) -> String {
         if is_secret_line {
             // Replace known token substrings, then mask the line.
             // We keep a marker so the evidence still shows a secret was present.
-            let mut redacted = line.to_string();
             // Mask common token prefixes — simple substring replace (case-sensitive
             // variants covered by lower check, but we replace case-insensitively by
             // scanning lower and replacing slice).
             // For now, replace entire line with a safe marker to avoid leaking.
             // A full value redaction is more important than preserving surrounding text.
-            redacted = "[REDACTED secret]".to_string();
+            let redacted = "[REDACTED secret]".to_string();
             out_lines.push(redacted);
         } else {
             // Inline nsec/ncryptsec token may appear in otherwise benign line —
@@ -4059,24 +4043,6 @@ where
         });
     }
     out
-}
-
-/// Convenience: tiered detection without evidence (empty tail, silent_idle reason).
-pub fn detect_stalled_panes_tiered(
-    in_progress: &[ReadyBead],
-    states: &[AgentState],
-    now_secs: i64,
-    threshold_secs: u64,
-    watching_threshold_secs: u64,
-) -> Vec<IngressEvent> {
-    detect_stalled_panes_with_evidence(
-        in_progress,
-        states,
-        now_secs,
-        threshold_secs,
-        watching_threshold_secs,
-        |_| String::new(),
-    )
 }
 
 /// Internal: emit a fact to journal + handle_ingress (captain surface).
@@ -4849,100 +4815,6 @@ pub fn apply_events_to_states(states: &mut [AgentState], events: &[PollEvent]) {
     }
 }
 
-/// Event-shaped decision path (bd-event-dispatch-zero-latency).
-///
-/// Pure: updates `dispatch_pending` and may pop the queue front (FIFO, same
-/// as `plan_actions`). Returns at most one action per event.
-///
-/// Double-dispatch guard: if `name` is already in `dispatch_pending`, a
-/// further `done`/`idle` does not re-pop the queue until a `working` event
-/// clears the flag (or `clear_dispatch_pending` after send landing).
-pub fn route_event(
-    states: &[AgentState],
-    ev: &PollEvent,
-    queue: &mut Vec<String>,
-    dispatch_pending: &mut std::collections::HashSet<String>,
-) -> Option<LoopAction> {
-    let name = name_for_pane(states, &ev.pane_id).or_else(|| {
-        // fallback: single-agent swarm with empty pane_id map — match by kind
-        // only when exactly one agent shares the event's agent field
-        let kind = ev.agent.as_deref()?;
-        let matches: Vec<_> = states.iter().filter(|s| s.kind == kind).collect();
-        if matches.len() == 1 {
-            Some(matches[0].name.clone())
-        } else {
-            None
-        }
-    });
-
-    let status = ev.status.as_deref().unwrap_or("");
-    match ev.event_type.as_str() {
-        "pane.agent_status_changed" => {
-            let name = name?;
-            match status {
-                "working" => {
-                    // landing confirmed — clear pending so next done can redispatch
-                    dispatch_pending.remove(&name);
-                    None
-                }
-                "blocked" => Some(LoopAction::Blocked { name }),
-                "done" | "idle" => {
-                    if dispatch_pending.contains(&name) {
-                        // flutter: already dispatched, wait for working
-                        return None;
-                    }
-                    if queue.is_empty() {
-                        return None;
-                    }
-                    let text = queue.remove(0);
-                    // bd-pin-public-plane-s-easy.2: {AGENT_NAME} is the pin
-                    // when the state knows it, else the herdr name.
-                    let display = states
-                        .iter()
-                        .find(|s| s.name == name)
-                        .and_then(|s| s.mail_identity.clone())
-                        .unwrap_or_else(|| name.clone());
-                    let text = text.replace("{AGENT_NAME}", &display);
-                    dispatch_pending.insert(name.clone());
-                    Some(LoopAction::DispatchImmediate { name, text })
-                }
-                _ => None,
-            }
-        }
-        "pane.agent_detected" => {
-            // new agent available — dispatch if free and queue non-empty
-            let name = name?;
-            if dispatch_pending.contains(&name) || queue.is_empty() {
-                return None;
-            }
-            // only if not already working
-            if status == "working" {
-                return None;
-            }
-            let text = queue.remove(0);
-            let display = states
-                .iter()
-                .find(|s| s.name == name)
-                .and_then(|s| s.mail_identity.clone())
-                .unwrap_or_else(|| name.clone());
-            let text = text.replace("{AGENT_NAME}", &display);
-            dispatch_pending.insert(name.clone());
-            Some(LoopAction::DispatchImmediate { name, text })
-        }
-        "pane.exited" => {
-            let name = name.unwrap_or_else(|| format!("pane:{}", ev.pane_id));
-            dispatch_pending.remove(&name);
-            // Diagnose immediately on exit (bd-event-self-heal subtask 4);
-            // the heal state machine escalates to Respawn next tick if needed.
-            Some(LoopAction::Diagnose {
-                name,
-                reason: "pane_exited".into(),
-            })
-        }
-        _ => None,
-    }
-}
-
 /// Clear dispatch-pending after a confirmed send landing (or fail-stop).
 pub fn clear_dispatch_pending(
     pending: &mut std::collections::HashSet<String>,
@@ -5337,10 +5209,10 @@ pub fn stale_reclaim_due(
     {
         return false;
     }
-    if let Some(ts) = last_comment_ts {
-        if now_secs.saturating_sub(ts) < 3600 {
-            return false;
-        }
+    if let Some(ts) = last_comment_ts
+        && now_secs.saturating_sub(ts) < 3600
+    {
+        return false;
     }
     if let Some(body) = last_comment_body {
         for f in dirty_files {
@@ -8694,6 +8566,130 @@ pub async fn loop_doctor(cfg: &Config, fix: bool) -> anyhow::Result<serde_json::
             "pruned": pruned,
         },
     }))
+}
+
+/// Convenience: tiered detection without evidence (empty tail, silent_idle reason).
+#[cfg(test)]
+pub fn detect_stalled_panes_tiered(
+    in_progress: &[ReadyBead],
+    states: &[AgentState],
+    now_secs: i64,
+    threshold_secs: u64,
+    watching_threshold_secs: u64,
+) -> Vec<IngressEvent> {
+    detect_stalled_panes_with_evidence(
+        in_progress,
+        states,
+        now_secs,
+        threshold_secs,
+        watching_threshold_secs,
+        |_| String::new(),
+    )
+}
+
+#[cfg(test)]
+pub fn renew_fail_count() -> u64 {
+    RENEW_FAIL_COUNTER.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn reset_renew_fail_count() {
+    RENEW_FAIL_COUNTER.store(0, Ordering::Relaxed);
+}
+
+/// Event-shaped decision path (bd-event-dispatch-zero-latency).
+///
+/// Pure: updates `dispatch_pending` and may pop the queue front (FIFO, same
+/// as `plan_actions`). Returns at most one action per event.
+///
+/// Double-dispatch guard: if `name` is already in `dispatch_pending`, a
+/// further `done`/`idle` does not re-pop the queue until a `working` event
+/// clears the flag (or `clear_dispatch_pending` after send landing).
+#[cfg(test)]
+pub fn route_event(
+    states: &[AgentState],
+    ev: &PollEvent,
+    queue: &mut Vec<String>,
+    dispatch_pending: &mut std::collections::HashSet<String>,
+) -> Option<LoopAction> {
+    let name = name_for_pane(states, &ev.pane_id).or_else(|| {
+        // fallback: single-agent swarm with empty pane_id map — match by kind
+        // only when exactly one agent shares the event's agent field
+        let kind = ev.agent.as_deref()?;
+        let matches: Vec<_> = states.iter().filter(|s| s.kind == kind).collect();
+        if matches.len() == 1 {
+            Some(matches[0].name.clone())
+        } else {
+            None
+        }
+    });
+
+    let status = ev.status.as_deref().unwrap_or("");
+    match ev.event_type.as_str() {
+        "pane.agent_status_changed" => {
+            let name = name?;
+            match status {
+                "working" => {
+                    // landing confirmed — clear pending so next done can redispatch
+                    dispatch_pending.remove(&name);
+                    None
+                }
+                "blocked" => Some(LoopAction::Blocked { name }),
+                "done" | "idle" => {
+                    if dispatch_pending.contains(&name) {
+                        // flutter: already dispatched, wait for working
+                        return None;
+                    }
+                    if queue.is_empty() {
+                        return None;
+                    }
+                    let text = queue.remove(0);
+                    // bd-pin-public-plane-s-easy.2: {AGENT_NAME} is the pin
+                    // when the state knows it, else the herdr name.
+                    let display = states
+                        .iter()
+                        .find(|s| s.name == name)
+                        .and_then(|s| s.mail_identity.clone())
+                        .unwrap_or_else(|| name.clone());
+                    let text = text.replace("{AGENT_NAME}", &display);
+                    dispatch_pending.insert(name.clone());
+                    Some(LoopAction::DispatchImmediate { name, text })
+                }
+                _ => None,
+            }
+        }
+        "pane.agent_detected" => {
+            // new agent available — dispatch if free and queue non-empty
+            let name = name?;
+            if dispatch_pending.contains(&name) || queue.is_empty() {
+                return None;
+            }
+            // only if not already working
+            if status == "working" {
+                return None;
+            }
+            let text = queue.remove(0);
+            let display = states
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.mail_identity.clone())
+                .unwrap_or_else(|| name.clone());
+            let text = text.replace("{AGENT_NAME}", &display);
+            dispatch_pending.insert(name.clone());
+            Some(LoopAction::DispatchImmediate { name, text })
+        }
+        "pane.exited" => {
+            let name = name.unwrap_or_else(|| format!("pane:{}", ev.pane_id));
+            dispatch_pending.remove(&name);
+            // Diagnose immediately on exit (bd-event-self-heal subtask 4);
+            // the heal state machine escalates to Respawn next tick if needed.
+            Some(LoopAction::Diagnose {
+                name,
+                reason: "pane_exited".into(),
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -13042,33 +13038,6 @@ mod tests {
         }
     }
 
-    #[allow(clippy::ptr_arg)]
-    fn poll_dispatch(states: &[AgentState], queue: &mut Vec<String>) -> Vec<DispatchRec> {
-        let model = LoopModel {
-            queue: queue.clone(),
-            per_bead_phase: Default::default(),
-            wake_suppression: Default::default(),
-            done_mailed: Default::default(),
-            event_cursor: None,
-            escalation: Default::default(),
-            respawn: Default::default(),
-            mail_health: Default::default(),
-            mail_degraded: false,
-            heal_states: Default::default(),
-            heal_grace: Default::default(),
-            heal_threshold: Default::default(),
-            heal_budget: Default::default(),
-            pending_events: Default::default(),
-            states: Default::default(),
-            dispatch_pending: Default::default(),
-            drain_pending: Default::default(),
-        };
-        let msg = LoopMsg::Tick { now: 0 };
-        let (next, actions) = tick(&model, &msg);
-        *queue = next.queue;
-        actions.iter().filter_map(rec_from_action).collect()
-    }
-
     fn event_dispatch(
         states: &[AgentState],
         events: &[PollEvent],
@@ -13086,14 +13055,9 @@ mod tests {
         out
     }
 
-    fn parity_report(poll: &[DispatchRec], event: &[DispatchRec]) -> String {
-        format!("poll={poll:?}\nevent={event:?}")
-    }
-
     #[test]
     fn event_poll_parity_done_dispatch_same_content() {
         // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-        assert!(true);
     }
 
     #[test]
@@ -13118,13 +13082,11 @@ mod tests {
     #[test]
     fn event_poll_parity_blocked_identical() {
         // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-        assert!(true);
     }
 
     #[test]
     fn event_poll_parity_unknown_no_dispatch() {
         // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-        assert!(true);
     }
 
     #[test]
@@ -13148,13 +13110,11 @@ mod tests {
     #[test]
     fn event_poll_parity_agent_name_subst_identical() {
         // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-        assert!(true);
     }
 
     #[test]
     fn event_poll_parity_self_heal_diagnose_tick_agreement() {
         // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-        assert!(true);
     }
 
     // ---- bd-w4-events-primary-gt0e: events primary, poll = heartbeat ----
@@ -13320,7 +13280,6 @@ mod tests {
     #[test]
     fn events_primary_parity_dispatch_and_settled_agree() {
         // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-        assert!(true);
     }
 
     // ---- bd-bd79: lease renewal before dispatch (fake clock) ----
@@ -13524,7 +13483,8 @@ mod tests {
                 nudge_streak: 0,
             },
         ];
-        let stalled = detect_stalled_panes(&[old_bead.clone()], &states, now, threshold);
+        let stalled =
+            detect_stalled_panes(std::slice::from_ref(&old_bead), &states, now, threshold);
         assert_eq!(stalled.len(), 1, "old idle bead should stall");
         match &stalled[0] {
             IngressEvent::PaneStalled {
@@ -13685,7 +13645,7 @@ mod tests {
         ];
         // watching bead should emit watching severity
         let watching_events = detect_stalled_panes_tiered(
-            &[watching_bead.clone()],
+            std::slice::from_ref(&watching_bead),
             &states,
             now,
             threshold,
@@ -13702,8 +13662,13 @@ mod tests {
             other => panic!("expected PaneStalled watching, got {other:?}"),
         }
         // stalled bead should emit stalled severity
-        let stalled_events =
-            detect_stalled_panes_tiered(&[stalled_bead.clone()], &states, now, threshold, watching);
+        let stalled_events = detect_stalled_panes_tiered(
+            std::slice::from_ref(&stalled_bead),
+            &states,
+            now,
+            threshold,
+            watching,
+        );
         assert_eq!(stalled_events.len(), 1);
         match &stalled_events[0] {
             IngressEvent::PaneStalled { severity, .. } => {
@@ -13885,7 +13850,7 @@ mod tests {
         }];
         let mut read_count = 0usize;
         let _ = detect_stalled_panes_with_evidence(
-            &[old_bead.clone()],
+            std::slice::from_ref(&old_bead),
             &states,
             now,
             threshold,
@@ -15282,7 +15247,6 @@ mod loop_phase_tests {
 #[cfg(test)]
 mod tick_replay_tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
 
     fn base_model() -> LoopModel {
         LoopModel {
@@ -15809,13 +15773,11 @@ mod loop_invoke_vehicle_tests {
     #[test]
     fn loop_runtime_tick_delegates_to_plan_actions() {
         // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-        assert!(true);
     }
 
     #[test]
     fn loop_replay_journal_re_drives_identical_actions() {
         // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-        assert!(true);
     }
 
     #[test]

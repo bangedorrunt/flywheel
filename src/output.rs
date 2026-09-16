@@ -56,7 +56,12 @@ pub enum Slot {
     FgDefault,
     FgMuted,
     FgEmphasis,
+    /// Palette completeness: every slot has an rgb + ANSI arm in the three
+    /// tables below, and widget code paints from this slot set — an unused
+    /// background slot is intentional surface, not dead logic.
+    #[allow(dead_code)]
     BgBase,
+    #[allow(dead_code)]
     BgSurface,
     BgOverlay,
     AccentCyan,
@@ -134,14 +139,6 @@ fn paint_slot(s: &str, slot: Slot) -> String {
     format!("\x1b[{}m{s}\x1b[0m", slot_ansi(slot))
 }
 
-fn paint(s: &str, code: &str) -> String {
-    if color_enabled() {
-        format!("\x1b[{code}m{s}\x1b[0m")
-    } else {
-        s.to_string()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // public paint helpers — now semantic, still backwards-compatible names
 // ---------------------------------------------------------------------------
@@ -184,10 +181,6 @@ pub fn accent(s: &str) -> String {
 /// Lavender secondary accent.
 pub fn accent_lav(s: &str) -> String {
     paint_slot(s, Slot::AccentLav)
-}
-/// Muted helper (alias for dim, semantic name).
-pub fn muted(s: &str) -> String {
-    paint_slot(s, Slot::FgMuted)
 }
 
 /// Print a fatal error to stderr with a hint, exit 1.

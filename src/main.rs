@@ -11,9 +11,13 @@
 //! governed-by: ADR-0022 §3.6 (workflow compose --from-yaml / --dry-run
 //! surface + budget-cap fail-closed gate in the Compose arm), ADR-0026
 
-#![allow(dead_code, clippy::all, unused, clippy::collapsible_if)]
-#![allow(clippy::collapsible_if)]
-#![allow(dead_code, clippy::all, unused)]
+// A feature-reduced build compiles the `serve` surface out whole — the daemon
+// probe/supervision, the HTTP serve lifelines, and the mailbox/backend wire
+// helpers that only those paths drive — so items live in the default build read
+// as dead there. Scope the allow to exactly those configurations instead of
+// hiding dead code unconditionally: the default and `--all-features` builds,
+// which `scripts/verify-clippy.sh` judges with `-D warnings`, stay strict.
+#![cfg_attr(not(feature = "serve"), allow(dead_code))]
 
 mod agent_ref;
 mod agentstate;
@@ -86,12 +90,11 @@ use serde_json::{Value, json};
 #[cfg(feature = "serve")]
 use cmd::DaemonCmd;
 use cmd::{
-    ArtifactsCmd, AssetCmd, BackendCmd, CheckpointCmd, CoalitionCmd, ConfigCmd, ControlVerbCmd,
-    CrewCmd, CronCmd, DoorbellCmd, LedgerCmd, LoopCmd, MailCmd, MailContactCmd, MailLockCmd,
-    MailProductCmd, MailSlotCmd, ModelCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd,
-    SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd,
-    WorktreeCmd, XprojCmd, cmd_analytics, cmd_asset, cmd_audit, cmd_backend, cmd_changes,
-    cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject,
+    ArtifactsCmd, AssetCmd, BackendCmd, CheckpointCmd, CoalitionCmd, ConfigCmd, CrewCmd, CronCmd,
+    DoorbellCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd, PrinciplesCmd, ProfileCmd,
+    RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd, ToronMailCmd, WorkCmd,
+    WorkflowCmd, WorktreeCmd, XprojCmd, cmd_analytics, cmd_asset, cmd_audit, cmd_backend,
+    cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject,
     cmd_doorbell_re_inject, cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop,
     cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_ledger, cmd_mail, cmd_models,
     cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders,
@@ -188,6 +191,39 @@ fn check_send_plane_tripwires(
             .map_err(|e| anyhow!(e))?;
     }
     Ok(())
+}
+
+/// bd-adr0027-proven-leftovers-55nx.9: budget-gate outcome as journal data.
+/// `raw` is tick's complete Prompt injects, `allowed` is take_allowed's
+/// survivors (an order-preserving subsequence); the difference is the drop
+/// set `why` must not replay as injected. Tick output stays complete —
+/// effect rides the `executed` JSON beside cmds, never inside tick.
+#[cfg(test)]
+fn budget_effect(raw: &[(String, String)], allowed: &[(String, String)]) -> serde_json::Value {
+    let mut remaining: Vec<(String, String)> = allowed.to_vec();
+    let mut injected: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (pin, line) in raw {
+        if let Some(pos) = remaining.iter().position(|(p, l)| p == pin && l == line) {
+            remaining.remove(pos);
+            if !injected.contains(pin) {
+                injected.push(pin.clone());
+            }
+        } else if !dropped.contains(pin) {
+            dropped.push(pin.clone());
+        }
+    }
+    serde_json::json!({ "injected": injected, "dropped": dropped })
+}
+
+/// Registry pane ids not yet covered by a live forwarder (pure — tested).
+#[cfg(test)]
+fn doorbell_uncovered_panes(covered: &HashSet<String>, pane_ids: &[String]) -> Vec<String> {
+    pane_ids
+        .iter()
+        .filter(|p| !p.is_empty() && !covered.contains(*p))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -377,26 +413,6 @@ pub(crate) fn stage_prompt(name: &str) -> Result<String> {
                     .join(", ")
             )
         })
-}
-
-/// ADR-0006 D1: resolve a stage and render its payload params. Missing
-/// required slots are a usage error naming the slot; zero `--param` on a
-/// param-free stage is byte-identical to [`stage_prompt`].
-pub(crate) fn stage_prompt_with_params(name: &str, raw_params: &[String]) -> Result<String> {
-    let lib = stages::StageLibrary::load()?;
-    let unknown = || {
-        anyhow!(
-            "unknown stage: {name} (known: {})",
-            lib.list()
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    let stage = lib.get_stage(name).ok_or_else(unknown)?;
-    let params = stages::parse_params(raw_params)?;
-    stages::render_stage(&stage.prompt.clone(), &stage.params.clone(), &params)
 }
 
 /// ADR-0032 Spec 9 tail (bd-40d1): project-tier stage resolve for runs.
@@ -1809,8 +1825,8 @@ struct AgentCounts {
     gk: Option<u32>,
 }
 
-/// Command-group subcommand types live in `src/cmd/` (bd-qbi8) — one module
-/// per group, re-exported through `cmd`. `Commands` (dispatch) stays here.
+// Command-group subcommand types live in `src/cmd/` (bd-qbi8) — one module
+// per group, re-exported through `cmd`. `Commands` (dispatch) stays here.
 
 fn parse_kind_count(s: &str) -> Result<(String, u32)> {
     let (k, v) = s
@@ -2514,7 +2530,6 @@ fn main() {
                 profile_count: *count,
                 bare_model: model.clone().unwrap_or_default(),
                 bare_provider: provider.clone().unwrap_or_default(),
-                idempotency_key: None,
                 escape: *escape,
                 yes: *yes,
                 join: *join,
@@ -5747,9 +5762,8 @@ mod tripwire {
     /// too (bd-mngn: handlers migrate into cmd/ modules).
     pub fn find_fn(src: &str, name: &str) -> usize {
         let needle = format!("\nfn {name}(");
-        let plain = src.find(&needle).map(|i| i + 1);
-        if plain.is_some() {
-            return plain.unwrap();
+        if let Some(i) = src.find(&needle) {
+            return i + 1;
         }
         let needle = format!("\npub(crate) fn {name}(");
         src.find(&needle)
@@ -6284,30 +6298,6 @@ mod spawn_boot_reliability_tests {
         handle.join().expect("clap probe thread");
     }
 
-    fn gs040_collab_watch_waits_empty_thread() {
-        // GS-040: mail watch must NOT process::exit(1) on an empty thread
-        // mid-wait (collab asker outbound is invisible in inbox). Source
-        // tripwire — keep polling until timeout.
-        let src = include_str!("main.rs");
-        assert!(
-            src.contains("waiting for reply"),
-            "mail_watch must wait on empty thread (GS-040 collab)"
-        );
-        assert!(
-            src.contains("empty_noted"),
-            "mail_watch must rate-limit empty-thread note via empty_noted"
-        );
-        // Old early-exit pattern must be gone (invent-fail on empty thread).
-        let bad = concat!(
-            "has no messages yet\");\n",
-            "                    std::process::exit(1);"
-        );
-        assert!(
-            !src.contains(bad),
-            "mail_watch must not early-exit(1) on empty thread"
-        );
-    }
-
     #[test]
     fn gs039_cos_honest_folds_present() {
         // bd-asr2.5 topology: the Status arm lives in the rt Brain
@@ -6825,8 +6815,6 @@ struct SpawnOpts {
     /// bd-j3so: bare harness+model override (kind/count spawns, no profile)
     bare_model: String,
     bare_provider: String,
-    /// ADR-0025 W5: stable idempotency key for spawn (project, run_id|bead_id, profile)
-    idempotency_key: Option<String>,
     /// Operator labeled this spawn as an escape from compose/wave-swarm.
     escape: bool,
     /// Skip the pre-spawn model reconfirm (bd-ll3k). CLI `--yes` passes
@@ -6857,7 +6845,6 @@ impl Default for SpawnOpts {
             profile_count: 1,
             bare_model: String::new(),
             bare_provider: String::new(),
-            idempotency_key: None,
             escape: false,
             yes: true,
             join: false,
@@ -7694,13 +7681,11 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
                     && (a.name.as_deref().is_none_or(|n| n.is_empty())
                         || a.name.as_deref() != Some(e.name.as_str()))
             });
-            if unbound {
-                if let Err(err) = c.agent_rename(&e.pane_id, &e.name) {
-                    eprintln!(
-                        "flywheel: GS-039 P0-4 name-bind rename {} → {} failed: {err:#}",
-                        e.pane_id, e.name
-                    );
-                }
+            if unbound && let Err(err) = c.agent_rename(&e.pane_id, &e.name) {
+                eprintln!(
+                    "flywheel: GS-039 P0-4 name-bind rename {} → {} failed: {err:#}",
+                    e.pane_id, e.name
+                );
             }
         }
         let agents_after = c.agent_list()?;
@@ -8503,7 +8488,7 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
     // isolation as `why`; one shared fold mixed foreign presence into the
     // digest proof). Entries sort oldest-first; counters sum.
     let mut queue: Vec<workspace::DigestEntry> = Vec::new();
-    let mut last_digest_unix: u64 = u64::MAX;
+    let last_digest_unix: u64 = u64::MAX;
     let mut counters: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
     for m in models.values() {
         queue.extend(m.digest_queue.iter().cloned());
@@ -8640,8 +8625,9 @@ fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
         &pins, &roles, &presence, &beads, now,
     ))
 }
-/// Operator console inject (D8, bd-woha): thin CLI over
-/// [`doorbell::inject_wake_in`]. Prints the queued summary; ratchet and
+// Operator console inject (D8, bd-woha): thin CLI over
+// [`doorbell::inject_wake_in`]. Prints the queued summary; ratchet and
+// (bd-mngn: the inject handler itself lives in src/cmd/doorbell.rs.)
 
 fn cmd_doorbell_subscriptions(_cfg: &Config) -> Result<()> {
     use doorbell_rt::subscribe::SubscriptionStore;
@@ -9041,9 +9027,15 @@ fn sleep_to_next_second() {
     ));
 }
 
-/// bd-durable-doorbell-lngf: persist the wake state after a delivery pass —
-/// since high-waters + the last-wake stamp survive a crash (at-least-once
-/// redelivery reads this on restart; the `[doorbell]` line is idempotent).
+// bd-durable-doorbell-lngf: persist the wake state after a delivery pass —
+// since high-waters + the last-wake stamp survive a crash (at-least-once
+// redelivery reads this on restart; the `[doorbell]` line is idempotent).
+//
+// Kept, not deleted: `gs037_send_wake_presence_folds_present` asserts this
+// body stays fail-loud (no `let _ =` around the save, GS-037 P0-C), and it is
+// the only door the host may persist through, so `cmd_send` cannot re-invent
+// a green stamp. Nothing calls it until that persist path lands.
+#[allow(dead_code)]
 fn doorbell_persist_wake(
     workspace: &str,
     since_by_pin: &BTreeMap<String, String>,
@@ -9065,6 +9057,9 @@ fn doorbell_persist_wake(
     Ok(())
 }
 
+// Plane-S sibling of [`doorbell_persist_wake`]: same fail-loud save, plus the
+// plane-S cursor high-water (doorbell-rt tracks it in-process today).
+#[allow(dead_code)]
 fn doorbell_persist_wake_with_plane_s(
     workspace: &str,
     since_by_pin: &BTreeMap<String, String>,
@@ -9102,22 +9097,22 @@ fn doorbell_note_observed_wake(workspace: &str, pin: &str) -> Result<()> {
     let path = doorbell::wake_state_file(&config::state_dir(), workspace);
     let mut st = doorbell::load_wake_state(&path);
     let mut now = doorbell_now_unix();
-    if let Some(prev) = st.last_wake_unix {
-        if now <= prev {
-            // Same-second or clock-behind re-note: keep prior (no false
-            // advance). bd-8vci: a second send landing in the same wall
-            // second no-ops here and the caller's wake-advance gate
-            // false-fails with "last_wake did not advance" — sleep to the
-            // next second boundary and re-stamp once (bounded).
-            sleep_to_next_second();
-            now = doorbell_now_unix();
-            // Re-load: another writer may have advanced the state meanwhile.
-            st = doorbell::load_wake_state(&path);
-            if let Some(prev) = st.last_wake_unix
-                && now <= prev
-            {
-                return Ok(());
-            }
+    if let Some(prev) = st.last_wake_unix
+        && now <= prev
+    {
+        // Same-second or clock-behind re-note: keep prior (no false
+        // advance). bd-8vci: a second send landing in the same wall
+        // second no-ops here and the caller's wake-advance gate
+        // false-fails with "last_wake did not advance" — sleep to the
+        // next second boundary and re-stamp once (bounded).
+        sleep_to_next_second();
+        now = doorbell_now_unix();
+        // Re-load: another writer may have advanced the state meanwhile.
+        st = doorbell::load_wake_state(&path);
+        if let Some(prev) = st.last_wake_unix
+            && now <= prev
+        {
+            return Ok(());
         }
     }
     doorbell::note_wake(&mut st, pin, now);
@@ -9154,57 +9149,13 @@ fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
         updated_at: chrono::Utc::now().timestamp_millis(),
     };
     let _ = crate::mail_shim::block_on(async {
-        if let Some(mb) = crate::mail_shim::try_mailbox() {
-            if let Ok(store) = mb.receipt_store() {
-                let _ = store.upsert(&r).await;
-            }
+        if let Some(mb) = crate::mail_shim::try_mailbox()
+            && let Ok(store) = mb.receipt_store()
+        {
+            let _ = store.upsert(&r).await;
         }
         Ok::<(), anyhow::Error>(())
     });
-}
-
-fn prompt_injects(cmds: &[workspace::Cmd]) -> Vec<(String, String)> {
-    cmds.iter()
-        .filter_map(|c| match c {
-            workspace::Cmd::Prompt { pin, line } => Some((pin.clone(), line.clone())),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Pin-set snapshot for the why-fold honesty contract (bd-z54w): journal
-/// callers pass `Some(&journal_pins(model))` so the fold restores the
-/// SelfIndex and classification reproduces deterministically. Paths without a
-/// live model pass `None` — those entries fold with Unknown semantics.
-fn journal_pins(model: &workspace::WorkspaceModel) -> Vec<String> {
-    model
-        .doorbell
-        .index
-        .pin_names()
-        .map(str::to_string)
-        .collect()
-}
-
-/// bd-adr0027-proven-leftovers-55nx.9: budget-gate outcome as journal data.
-/// `raw` is tick's complete Prompt injects, `allowed` is take_allowed's
-/// survivors (an order-preserving subsequence); the difference is the drop
-/// set `why` must not replay as injected. Tick output stays complete —
-/// effect rides the `executed` JSON beside cmds, never inside tick.
-fn budget_effect(raw: &[(String, String)], allowed: &[(String, String)]) -> serde_json::Value {
-    let mut remaining: Vec<(String, String)> = allowed.to_vec();
-    let mut injected: Vec<String> = Vec::new();
-    let mut dropped: Vec<String> = Vec::new();
-    for (pin, line) in raw {
-        if let Some(pos) = remaining.iter().position(|(p, l)| p == pin && l == line) {
-            remaining.remove(pos);
-            if !injected.contains(pin) {
-                injected.push(pin.clone());
-            }
-        } else if !dropped.contains(pin) {
-            dropped.push(pin.clone());
-        }
-    }
-    serde_json::json!({ "injected": injected, "dropped": dropped })
 }
 
 /// Pins the journal effect marks dropped for one entry (`executed.effect`).
@@ -9703,23 +9654,22 @@ fn seed_why_presence(
 }
 
 fn rebuild_assignment_from_receipts(workspace_model: &mut crate::workspace::WorkspaceModel) {
-    if let Some(mb) = crate::mail_shim::try_mailbox() {
-        if let Ok(store) = mb.receipt_store() {
-            if let Ok(receipts) = crate::mail_shim::block_on(store.list(None)) {
-                for r in receipts {
-                    let w = r
-                        .wake
-                        .map(|w| w.as_str().to_string())
-                        .unwrap_or_else(|| "tasked".to_string());
-                    let rec = crate::workspace::Receipt {
-                        state: r.state.as_str().to_string(),
-                        wake: w,
-                        due_at: r.due_at.map(|v| v as u64),
-                        result_path: r.result_path.clone(),
-                    };
-                    workspace_model.assignment.insert(r.corr.clone(), rec);
-                }
-            }
+    if let Some(mb) = crate::mail_shim::try_mailbox()
+        && let Ok(store) = mb.receipt_store()
+        && let Ok(receipts) = crate::mail_shim::block_on(store.list(None))
+    {
+        for r in receipts {
+            let w = r
+                .wake
+                .map(|w| w.as_str().to_string())
+                .unwrap_or_else(|| "tasked".to_string());
+            let rec = crate::workspace::Receipt {
+                state: r.state.as_str().to_string(),
+                wake: w,
+                due_at: r.due_at.map(|v| v as u64),
+                result_path: r.result_path.clone(),
+            };
+            workspace_model.assignment.insert(r.corr.clone(), rec);
         }
     }
 }
@@ -9803,20 +9753,6 @@ fn doorbell_prompt(
         }
     }
     ok
-}
-
-/// Registry pane ids, materialized for the delta check.
-fn registry_pane_ids(registry: &[state::SpawnEntry]) -> Vec<String> {
-    registry.iter().map(|e| e.pane_id.clone()).collect()
-}
-
-/// Registry pane ids not yet covered by a live forwarder (pure — tested).
-fn doorbell_uncovered_panes(covered: &HashSet<String>, pane_ids: &[String]) -> Vec<String> {
-    pane_ids
-        .iter()
-        .filter(|p| !p.is_empty() && !covered.contains(*p))
-        .cloned()
-        .collect()
 }
 
 /// bd-unpinned-loud-1mlt (GS-028 B6+B7): names of registry entries with no
@@ -10033,38 +9969,36 @@ pub(crate) fn start_agent_with_retry_profile(
                         // next profile via the shared helper (audited, ONE hop
                         // per class, second same-class failure terminal).
                         if cf.reroute_eligible && !already_rerouted {
-                            if let Some(orig) = current_profile.as_deref() {
-                                if let Some(next) = reroute_next_profile(
+                            if let Some(orig) = current_profile.as_deref()
+                                && let Some(next) = reroute_next_profile(
                                     orig,
                                     cf.kind,
                                     &cf.evidence,
                                     &attempted_profiles,
                                     attempt as u32,
-                                ) {
-                                    if let Ok(cat) = ProfileCatalog::load() {
-                                        if let Some(next_prof) = cat.get(&next) {
-                                            let next_kind = if next_prof.harness.is_empty() {
-                                                current_kind.clone()
-                                            } else {
-                                                next_prof.harness.clone()
-                                            };
-                                            if let Ok(next_args) =
-                                                profile_launch_args(&next_kind, next_prof, None)
-                                            {
-                                                eprintln!(
-                                                    "flywheel: pane reroute {} -> {} (profile fallback)",
-                                                    orig, next
-                                                );
-                                                current_kind = next_kind;
-                                                current_args = next_args;
-                                                current_profile = Some(next.clone());
-                                                attempted_profiles.push(next);
-                                                already_rerouted = true;
-                                                std::thread::sleep(Duration::from_secs(1));
-                                                continue;
-                                            }
-                                        }
-                                    }
+                                )
+                                && let Ok(cat) = ProfileCatalog::load()
+                                && let Some(next_prof) = cat.get(&next)
+                            {
+                                let next_kind = if next_prof.harness.is_empty() {
+                                    current_kind.clone()
+                                } else {
+                                    next_prof.harness.clone()
+                                };
+                                if let Ok(next_args) =
+                                    profile_launch_args(&next_kind, next_prof, None)
+                                {
+                                    eprintln!(
+                                        "flywheel: pane reroute {} -> {} (profile fallback)",
+                                        orig, next
+                                    );
+                                    current_kind = next_kind;
+                                    current_args = next_args;
+                                    current_profile = Some(next.clone());
+                                    attempted_profiles.push(next);
+                                    already_rerouted = true;
+                                    std::thread::sleep(Duration::from_secs(1));
+                                    continue;
                                 }
                             }
                             // No hop available or not profiled: terminal if no fallback chain
@@ -10193,38 +10127,36 @@ fn start_agent_with_retry_dyn_profile(
                             );
                         }
                         if cf.reroute_eligible && !already_rerouted {
-                            if let Some(orig) = current_profile.as_deref() {
-                                if let Some(next) = reroute_next_profile(
+                            if let Some(orig) = current_profile.as_deref()
+                                && let Some(next) = reroute_next_profile(
                                     orig,
                                     cf.kind,
                                     &cf.evidence,
                                     &attempted_profiles,
                                     attempt as u32,
-                                ) {
-                                    if let Ok(cat) = ProfileCatalog::load() {
-                                        if let Some(next_prof) = cat.get(&next) {
-                                            let next_kind = if next_prof.harness.is_empty() {
-                                                current_kind.clone()
-                                            } else {
-                                                next_prof.harness.clone()
-                                            };
-                                            if let Ok(next_args) =
-                                                profile_launch_args(&next_kind, next_prof, None)
-                                            {
-                                                eprintln!(
-                                                    "flywheel: pane reroute {} -> {} (profile fallback)",
-                                                    orig, next
-                                                );
-                                                current_kind = next_kind;
-                                                current_args = next_args;
-                                                current_profile = Some(next.clone());
-                                                attempted_profiles.push(next);
-                                                already_rerouted = true;
-                                                std::thread::sleep(Duration::from_secs(1));
-                                                continue;
-                                            }
-                                        }
-                                    }
+                                )
+                                && let Ok(cat) = ProfileCatalog::load()
+                                && let Some(next_prof) = cat.get(&next)
+                            {
+                                let next_kind = if next_prof.harness.is_empty() {
+                                    current_kind.clone()
+                                } else {
+                                    next_prof.harness.clone()
+                                };
+                                if let Ok(next_args) =
+                                    profile_launch_args(&next_kind, next_prof, None)
+                                {
+                                    eprintln!(
+                                        "flywheel: pane reroute {} -> {} (profile fallback)",
+                                        orig, next
+                                    );
+                                    current_kind = next_kind;
+                                    current_args = next_args;
+                                    current_profile = Some(next.clone());
+                                    attempted_profiles.push(next);
+                                    already_rerouted = true;
+                                    std::thread::sleep(Duration::from_secs(1));
+                                    continue;
                                 }
                             }
                             let fallback_key = profile_name.unwrap_or(kind);
@@ -10698,15 +10630,14 @@ pub(crate) fn bind_pane_mail_identity(
                 let npub = backend::run_mail(mail.whois(&key, pin))
                     .map(|w| w.npub)
                     .unwrap_or_default();
-                if !npub.is_empty() {
-                    if let Err(e) = backend
+                if !npub.is_empty()
+                    && let Err(e) = backend
                         .client()
                         .pane_report_metadata(pane_id, pin, &key, &npub)
-                    {
-                        eprintln!(
-                            "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
-                        );
-                    }
+                {
+                    eprintln!(
+                        "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
+                    );
                 }
             }
             Err(e) => {
@@ -12006,6 +11937,9 @@ fn routed_role(primitive: &str) -> Option<String> {
 }
 
 /// Classify only. Never dispatches.
+// The CLI leaf mirrors its flag surface 1:1; grouping into a struct would only
+// move the argument list behind another hop.
+#[allow(clippy::too_many_arguments)]
 fn cmd_decide(
     cfg: &Config,
     target: &str,
@@ -12334,15 +12268,15 @@ fn cmd_reclassify(
     }
     // Surface announce lines for the CLI user (Elm plane result).
     for c in &expanded {
-        if let workspace::Cmd::Prompt { line, .. } = c {
-            if line.starts_with("[reclassify]") {
-                eprintln!("{line}");
-            }
+        if let workspace::Cmd::Prompt { line, .. } = c
+            && line.starts_with("[reclassify]")
+        {
+            eprintln!("{line}");
         }
-        if let workspace::Cmd::Audit { kind, detail, .. } = c {
-            if kind == "reclassify_ready" || kind == "reclassify_requested" {
-                eprintln!("flywheel: [{kind}] {detail}");
-            }
+        if let workspace::Cmd::Audit { kind, detail, .. } = c
+            && (kind == "reclassify_ready" || kind == "reclassify_requested")
+        {
+            eprintln!("flywheel: [{kind}] {detail}");
         }
     }
     // Briefing proposal print / optional commit — same leaf as before, but
@@ -12391,10 +12325,9 @@ fn cmd_briefing(
     let unique: Vec<String> = Vec::new();
     let mut b = briefing::assemble(objective, &world, &unique, cfg.crew_max());
     if let Some(n) = crew {
-        b.questions
-            .iter_mut()
-            .find(|q| q.id == "crew")
-            .map(|q| q.default = n.to_string());
+        if let Some(q) = b.questions.iter_mut().find(|q| q.id == "crew") {
+            q.default = n.to_string();
+        }
         if !b.proposal.argv.iter().any(|a| a == "--crew") && b.proposal.topology != "join" {
             b.proposal.argv.push("--crew".into());
             b.proposal.argv.push(n.to_string());
@@ -13870,12 +13803,12 @@ fn cmd_send(
                         Some(target.to_string())
                     }
                 });
-            if let Some(pin) = pin {
-                if let Err(e) = doorbell_note_observed_wake(&ws_label, &pin) {
-                    eprintln!(
-                        "flywheel: observed-wake stamp FAILED after send --wait land for pin={pin}: {e:#} — refuse silent drop (GS-039 P0-1)"
-                    );
-                }
+            if let Some(pin) = pin
+                && let Err(e) = doorbell_note_observed_wake(&ws_label, &pin)
+            {
+                eprintln!(
+                    "flywheel: observed-wake stamp FAILED after send --wait land for pin={pin}: {e:#} — refuse silent drop (GS-039 P0-1)"
+                );
             }
         }
         let after =
@@ -14060,11 +13993,10 @@ fn running_run_row_exists(project: &str, run_id: &str) -> bool {
     };
     events
         .iter()
-        .filter(|e| {
+        .rfind(|e| {
             e.kind == state::EventKind::Workflow
                 && e.data.get("run_id").and_then(Value::as_str) == Some(run_id)
         })
-        .next_back()
         .and_then(|e| e.data.get("status").and_then(Value::as_str))
         == Some("running")
 }
@@ -14084,6 +14016,8 @@ fn read_pane_status(c: &mut Client, target: &str, name: &str) -> Option<String> 
 /// landed row and return Ok. Otherwise one read-back becomes the row's
 /// `observed_status`, the ambiguous row is pushed into `results`, the caller's
 /// row emitter runs, and the returned error exits nonzero with the hint.
+// One positional per probed field keeps the read-back call sites obvious.
+#[allow(clippy::too_many_arguments)]
 fn wait_failure_exit(
     c: &mut Client,
     target: &str,
@@ -15412,11 +15346,11 @@ pub(crate) fn sum_counts_before(output: &str, needle: &str) -> Option<u32> {
         while start > 0 && before.as_bytes()[start - 1].is_ascii_digit() {
             start -= 1;
         }
-        if start != end {
-            if let Ok(n) = before[start..end].parse::<u32>() {
-                total = total.saturating_add(n);
-                found = true;
-            }
+        if start != end
+            && let Ok(n) = before[start..end].parse::<u32>()
+        {
+            total = total.saturating_add(n);
+            found = true;
         }
         search_start = abs_idx + needle.len();
     }
@@ -15993,11 +15927,12 @@ fn mail_project<'a>(
 
 // ---- toron (in-process embed) ----
 
-/// `flywheel toron <subcommand>`: drive the in-process toron mailbox / MCP
-/// server (ADR-0003 Decision 3A, bd-o8j.1). The embed is async (toron-mcp's
-/// mailbox is built over tokio), so build a fresh tokio runtime and block_on
-/// the dispatch — mirroring how cmd_loop drives the durable workflow. `cfg` is
-/// forwarded but unused by the embed: the demo mailbox is fully in-process.
+// `flywheel toron <subcommand>`: drive the in-process toron mailbox / MCP
+// server (ADR-0003 Decision 3A, bd-o8j.1). The embed is async (toron-mcp's
+// mailbox is built over tokio), so build a fresh tokio runtime and block_on
+// the dispatch — mirroring how cmd_loop drives the durable workflow. `cfg` is
+// forwarded but unused by the embed: the demo mailbox is fully in-process.
+// (bd-mngn: the handler itself lives in src/cmd/toron.rs.)
 
 // ---- mail digest / watch / collab (real-time collab primitives) ----
 
@@ -18078,13 +18013,12 @@ fn cmd_loop_replay(project: &str) -> Result<()> {
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
             }
-            if let Some(pb) = snap.get("per_bead_phase") {
-                if let Ok(map) = serde_json::from_value::<
+            if let Some(pb) = snap.get("per_bead_phase")
+                && let Ok(map) = serde_json::from_value::<
                     std::collections::BTreeMap<String, crate::durable::LoopPhase>,
                 >(pb.clone())
-                {
-                    model.per_bead_phase = map;
-                }
+            {
+                model.per_bead_phase = map;
             }
             if let Some(md) = snap
                 .get("mail_degraded")
@@ -18412,13 +18346,13 @@ fn cmd_loop(
                     // per poll on this hot path).
                     let to_assign: Vec<durable::ReadyBead> = dispatchable
                         .into_iter()
-                        .cloned()
-                        .filter(|b| !wave_held.contains(&b.id))
-                        .filter(|b| match (&scope_ids, &scope_block) {
+                        .filter(|&b| !wave_held.contains(&b.id))
+                        .filter(|&b| match (&scope_ids, &scope_block) {
                             (Some(ids), _) => ids.contains(&b.id),
                             (None, Some(_)) => false,
                             (None, None) => true,
                         })
+                        .cloned()
                         .collect();
                     let to_assign: Vec<String> =
                         work_prompts(&[], &to_assign, &mut assigned, project);
@@ -22107,7 +22041,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
             let rendered = serde_json::to_string_pretty(&doc)?;
             match out {
                 Some(out_path) => {
-                    std::fs::write(&out_path, rendered + "\n")?;
+                    std::fs::write(out_path, rendered + "\n")?;
                     println!("exported profile {name} -> {out_path}");
                 }
                 None => println!("{rendered}"),
@@ -22124,7 +22058,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 std::io::stdin().read_to_string(&mut buf)?;
                 buf
             } else {
-                std::fs::read_to_string(&path)?
+                std::fs::read_to_string(path)?
             };
             let doc: serde_json::Value = serde_json::from_str(raw.trim())?;
             let (doc_name, imported) = profile::profile_from_portable(&doc)?;
@@ -25480,7 +25414,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             );
             mail.send(
                 &key,
-                &[target.clone()],
+                std::slice::from_ref(&target),
                 &subject,
                 &body,
                 "high",
@@ -28080,54 +28014,51 @@ fn cmd_internal_run_headless(
             );
             if let Some(next_profile) =
                 reroute_next_profile(profile_name, cf.kind, &cf.evidence, &[], 0)
+                && let Some(fb_prof) = catalog.get(&next_profile)
             {
-                if let Some(fb_prof) = catalog.get(&next_profile) {
-                    let fb_harness = if fb_prof.harness.is_empty() {
-                        harness
-                    } else {
-                        fb_prof.harness.as_str()
-                    };
-                    let fb_model_id = if fb_prof.model.is_empty() {
-                        model_id.clone()
-                    } else {
-                        fb_prof.model.clone()
-                    };
-                    let fb_model = registry.resolve(&fb_model_id, fb_harness);
-                    eprintln!(
-                        "flywheel: headless reroute {} -> {} (profile fallback)",
-                        profile_name, next_profile
-                    );
-                    let agent = agent_ref::AgentRef::new("flywheel", profile_name);
-                    let intent = agent_ref::RebindIntent::prepare(
-                        agent,
-                        agent_ref::AgentBinding {
-                            profile_name: profile_name.to_string(),
-                            model: model_id.clone(),
-                            harness: harness.to_string(),
-                        },
-                        agent_ref::AgentBinding {
-                            profile_name: next_profile.clone(),
-                            model: fb_model_id.clone(),
-                            harness: fb_harness.to_string(),
-                        },
-                        agent_ref::RebindReason::ProfileFallback {
-                            kind: cf.kind.to_string(),
-                            evidence: cf.evidence.clone(),
-                        },
-                        0,
-                    );
-                    match agent_ref::commit_rebind("flywheel", intent, |_| {
-                        run_once(fb_harness, &fb_model_id, &fb_model, &fb_prof.effort)
-                    }) {
-                        Ok(fb) => {
-                            attempt = fb;
-                            retried_fallback = true;
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "flywheel: profile fallback run {next_profile} failed: {e:#}"
-                            );
-                        }
+                let fb_harness = if fb_prof.harness.is_empty() {
+                    harness
+                } else {
+                    fb_prof.harness.as_str()
+                };
+                let fb_model_id = if fb_prof.model.is_empty() {
+                    model_id.clone()
+                } else {
+                    fb_prof.model.clone()
+                };
+                let fb_model = registry.resolve(&fb_model_id, fb_harness);
+                eprintln!(
+                    "flywheel: headless reroute {} -> {} (profile fallback)",
+                    profile_name, next_profile
+                );
+                let agent = agent_ref::AgentRef::new("flywheel", profile_name);
+                let intent = agent_ref::RebindIntent::prepare(
+                    agent,
+                    agent_ref::AgentBinding {
+                        profile_name: profile_name.to_string(),
+                        model: model_id.clone(),
+                        harness: harness.to_string(),
+                    },
+                    agent_ref::AgentBinding {
+                        profile_name: next_profile.clone(),
+                        model: fb_model_id.clone(),
+                        harness: fb_harness.to_string(),
+                    },
+                    agent_ref::RebindReason::ProfileFallback {
+                        kind: cf.kind.to_string(),
+                        evidence: cf.evidence.clone(),
+                    },
+                    0,
+                );
+                match agent_ref::commit_rebind("flywheel", intent, |_| {
+                    run_once(fb_harness, &fb_model_id, &fb_model, &fb_prof.effort)
+                }) {
+                    Ok(fb) => {
+                        attempt = fb;
+                        retried_fallback = true;
+                    }
+                    Err(e) => {
+                        eprintln!("flywheel: profile fallback run {next_profile} failed: {e:#}");
                     }
                 }
             }
@@ -31229,7 +31160,10 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
         }
         DaemonCmd::Stop { port, force } => daemon::stop(&state, &addr(*port), *force),
         DaemonCmd::Restart { port, force } => daemon::restart(&state, &addr(*port), *force),
-        DaemonCmd::Status { port } => Ok(daemon::status(&state, &addr(*port))),
+        DaemonCmd::Status { port } => {
+            daemon::status(&state, &addr(*port));
+            Ok(())
+        }
     }
 }
 
@@ -31263,13 +31197,13 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         let agents = c
             .agent_list()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        Ok(serde_json::to_string(&json!({
+        serde_json::to_string(&json!({
             "agents": agents.iter().map(|a| json!({
                 "name": a.name, "kind": a.agent, "status": a.agent_status.as_str(),
                 "workspace_id": a.workspace_id, "pane_id": a.pane_id
             })).collect::<Vec<_>>()
         }))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     }
 
     async fn send(State(st): State<Arc<AppState>>, body: String) -> Result<String, StatusCode> {
@@ -34265,7 +34199,6 @@ mod repair_recipe_tests {
 
 #[cfg(test)]
 mod approval_drain_tests {
-    use super::*;
     use toron_workflow::engine::{Decision, RunInput};
 
     fn approval_workflow() -> toron_workflow::schema::Workflow {
@@ -34371,7 +34304,6 @@ steps:
 
 #[cfg(test)]
 mod idempot_tests {
-    use super::*;
 
     #[test]
     fn idempot_spawn_same_key_returns_first_pin() {
@@ -34474,13 +34406,10 @@ mod idempot_tests {
 
 #[cfg(test)]
 mod ingress_wiring_tests {
-    use super::*;
     use crate::ingress::{HerdrEvent, IngressEvent, WatchHit};
 
     #[test]
     fn ingress_wiring_pane_exited_and_trigger_go_through_handle_ingress() {
-        let mut herdr_seen = false;
-        let mut trigger_seen = false;
         let adapters = crate::ingress::IngressAdapters {
             herdr: Box::new(|e: &HerdrEvent| {
                 if matches!(e, HerdrEvent::PaneExited { .. }) {
@@ -34507,11 +34436,7 @@ mod ingress_wiring_tests {
         // We verify by checking that handle_ingress was called (no panic) and that
         // a second call with different variant also routes
         crate::ingress::handle_ingress(&posted, &adapters);
-        // If we reach here, both went through handle_ingress without bypass
-        assert!(
-            true,
-            "both pane_exited and Trigger::MessagePosted went through handle_ingress"
-        );
+        // Reaching here means both went through handle_ingress without bypass.
     }
 
     #[test]
@@ -34579,10 +34504,10 @@ mod ingress_wiring_tests {
         );
         let h = hits.lock().unwrap();
         assert_eq!(h.len(), 4);
-        assert!(h.iter().any(|s| *s == "herdr"));
-        assert!(h.iter().any(|s| *s == "watch"));
-        assert!(h.iter().any(|s| *s == "workflow"));
-        assert!(h.iter().any(|s| *s == "cron"));
+        assert!(h.contains(&"herdr"));
+        assert!(h.contains(&"watch"));
+        assert!(h.contains(&"workflow"));
+        assert!(h.contains(&"cron"));
     }
 
     #[test]
@@ -34956,7 +34881,6 @@ mod adr0010_d7_tests {
     // governed-by: ADR-0010 D7 (bd-w5fn) — crew control verbs + FLYWHEEL_OP
     // marker. Code-pointer gates over the imperative wiring; the pure
     // postconditions live in src/control.rs (adr0010_d7_* tests).
-    use super::*;
 
     #[test]
     fn adr0010_d7_no_arbitrary_text_entry_point() {
@@ -35062,6 +34986,7 @@ mod adr0010_d7_tests {
     }
 }
 
+#[cfg(test)]
 mod adr0010_d1_tests {
     // governed-by: ADR-0010 D1 (bd-w98c) — fire-and-forget delivery-id bind.
     use super::*;

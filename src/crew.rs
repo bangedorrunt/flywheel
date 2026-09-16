@@ -49,6 +49,7 @@ impl CrewPlan {
     }
 
     /// Sum of spawned panes.
+    #[cfg(test)]
     pub fn total(&self) -> u32 {
         self.members.values().copied().sum()
     }
@@ -621,26 +622,6 @@ pub fn compose_workflow(
     parts: &[ComposePart],
 ) -> Result<Workflow> {
     compose_workflow_with(name, objective, base, parts, &|_| None)
-}
-
-/// Assemble with a stage-affinity resolver (§3.8 stage-first).
-pub fn compose_workflow_with(
-    name: &str,
-    objective: &str,
-    base: Option<&Workflow>,
-    parts: &[ComposePart],
-    affinity: &dyn Fn(&str) -> Option<String>,
-) -> Result<Workflow> {
-    compose_workflow_with_resolvers(
-        name,
-        objective,
-        base,
-        parts,
-        affinity,
-        // Test/default arm: compiled-in tokens only (bd-qd87 keeps the
-        // production surface catalog-first).
-        &|n| crate::builtin_workflows::builtin_recipe(n),
-    )
 }
 
 /// [`compose_workflow_with`] plus a compose-token resolver: the same
@@ -1426,6 +1407,27 @@ pub async fn bounded_invoke(
     }
 }
 
+/// Assemble with a stage-affinity resolver (§3.8 stage-first).
+#[cfg(test)]
+pub fn compose_workflow_with(
+    name: &str,
+    objective: &str,
+    base: Option<&Workflow>,
+    parts: &[ComposePart],
+    affinity: &dyn Fn(&str) -> Option<String>,
+) -> Result<Workflow> {
+    compose_workflow_with_resolvers(
+        name,
+        objective,
+        base,
+        parts,
+        affinity,
+        // Test/default arm: compiled-in tokens only (bd-qd87 keeps the
+        // production surface catalog-first).
+        &|n| crate::builtin_workflows::builtin_recipe(n),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1993,7 +1995,7 @@ steps:
             "composed-override",
             "obj",
             None,
-            &[part.clone()],
+            std::slice::from_ref(&part),
             &affinity,
             &resolver,
         )

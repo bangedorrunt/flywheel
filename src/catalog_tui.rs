@@ -176,11 +176,7 @@ fn profile_rows(cat: &ProfileCatalog) -> Vec<CatalogRow> {
 /// Terminal-cell style helper: panel title uses cyan when focused.
 fn panel_block(title: &'static str, focused: bool) -> Block<'static> {
     let title_span = Span::styled(
-        if focused {
-            format!(" {title} ")
-        } else {
-            format!(" {title} ")
-        },
+        format!(" {title} "),
         if focused {
             slot_style(Slot::AccentCyan).add_modifier(Modifier::BOLD)
         } else {

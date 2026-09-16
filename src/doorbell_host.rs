@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::herdr_shim::{Client, Subscription};
 use crate::{config, doorbell, state, workspace};
 use doorbell_rt::{BrainMsg, Effect, FileStore, Host};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -899,8 +899,8 @@ mod parity_tests {
             toron_dir.join("presence.jsonl"),
             format!(
                 "{}\n{}\n",
-                serde_json::json!({"name": "PinA", "state": "idle", "ts": now}).to_string(),
-                serde_json::json!({"name": "PinB", "state": "idle", "ts": now}).to_string(),
+                serde_json::json!({"name": "PinA", "state": "idle", "ts": now}),
+                serde_json::json!({"name": "PinB", "state": "idle", "ts": now}),
             ),
         )
         .unwrap();

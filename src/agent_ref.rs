@@ -54,12 +54,10 @@ pub fn redact_evidence(raw: &str) -> String {
                 .next_back()
                 .map(|c| c.is_ascii_alphanumeric())
                 .unwrap_or(false);
-        if at_boundary {
-            if let Some((skip, repl)) = match_secret_at(raw, i) {
-                out.push_str(repl);
-                i += skip;
-                continue;
-            }
+        if at_boundary && let Some((skip, repl)) = match_secret_at(raw, i) {
+            out.push_str(repl);
+            i += skip;
+            continue;
         }
         let ch = raw[i..]
             .chars()
@@ -174,15 +172,6 @@ impl AgentRef {
         }
     }
 
-    /// Freeze npub once bound (A1): a second `with_npub` is a no-op when
-    /// already `Some` — AgentRef identity is immutable for a pane lifetime.
-    pub fn with_npub(mut self, npub: impl Into<String>) -> Self {
-        if self.npub.is_none() {
-            self.npub = Some(npub.into());
-        }
-        self
-    }
-
     /// Fail-closed after settle: pin must be non-empty; when `require_npub`,
     /// npub must be bound (GS-038/039 name-bind honesty).
     pub fn assert_bound_after_settle(&self, require_npub: bool) -> Result<(), String> {
@@ -202,6 +191,15 @@ impl AgentRef {
             ));
         }
         Ok(())
+    }
+    /// Freeze npub once bound (A1): a second `with_npub` is a no-op when
+    /// already `Some` — AgentRef identity is immutable for a pane lifetime.
+    #[cfg(test)]
+    pub fn with_npub(mut self, npub: impl Into<String>) -> Self {
+        if self.npub.is_none() {
+            self.npub = Some(npub.into());
+        }
+        self
     }
 }
 
@@ -318,6 +316,7 @@ impl RebindIntent {
     }
 
     /// Profile.fallback hop vs model_fallback hop for a classified kind.
+    #[cfg(test)]
     pub fn hop_kind(kind: FailureKind) -> Option<&'static str> {
         match kind {
             FailureKind::Billing | FailureKind::Auth | FailureKind::Provider => Some("profile"),
@@ -437,63 +436,6 @@ pub fn journal_effect(project: &str, effect: &AgentEffect) -> anyhow::Result<()>
         for_log.evidence.as_deref().unwrap_or("no evidence")
     );
     Ok(())
-}
-
-/// Commit Prepared → InFlight → Settled|Failed around a fallible apply.
-pub fn commit_effect<F, T>(project: &str, mut effect: AgentEffect, apply: F) -> anyhow::Result<T>
-where
-    F: FnOnce(&AgentEffect) -> anyhow::Result<T>,
-{
-    effect.state = EffectState::Prepared;
-    journal_effect(project, &effect)?;
-    effect.state = EffectState::InFlight;
-    journal_effect(project, &effect)?;
-    match apply(&effect) {
-        Ok(v) => {
-            effect.state = EffectState::Settled;
-            journal_effect(project, &effect)?;
-            Ok(v)
-        }
-        Err(e) => {
-            effect.state = EffectState::Failed;
-            let _ = journal_effect(project, &effect);
-            Err(e)
-        }
-    }
-}
-
-/// I4 lifecycle with visible Unknown for spawn effects: `None` from apply is
-/// not invent-green Settled and not Failed — it journals
-/// [`EffectState::Unknown`] (skipped verification / unobservable publish).
-pub fn commit_effect_opt<F, T>(
-    project: &str,
-    mut effect: AgentEffect,
-    apply: F,
-) -> anyhow::Result<Option<T>>
-where
-    F: FnOnce(&AgentEffect) -> anyhow::Result<Option<T>>,
-{
-    effect.state = EffectState::Prepared;
-    journal_effect(project, &effect)?;
-    effect.state = EffectState::InFlight;
-    journal_effect(project, &effect)?;
-    match apply(&effect) {
-        Ok(Some(v)) => {
-            effect.state = EffectState::Settled;
-            journal_effect(project, &effect)?;
-            Ok(Some(v))
-        }
-        Ok(None) => {
-            effect.state = EffectState::Unknown;
-            journal_effect(project, &effect)?;
-            Ok(None)
-        }
-        Err(e) => {
-            effect.state = EffectState::Failed;
-            let _ = journal_effect(project, &effect);
-            Err(e)
-        }
-    }
 }
 
 /// RAII form of [`commit_effect`] for the long, many-exit spawn path.
@@ -688,6 +630,26 @@ impl ReclassifyIntent {
         format!("reclassify:{}", hex::encode(h.finalize()))
     }
 
+    /// Attach to an already-derived journal key (from `Cmd::Reclassify`).
+    pub fn from_cmd_key(
+        effect_key: String,
+        goal: impl Into<String>,
+        reason: impl Into<String>,
+        explicit_topology: Option<String>,
+        pin: impl Into<String>,
+        attempt: u32,
+    ) -> Self {
+        Self {
+            effect_key,
+            goal: goal.into(),
+            reason: reason.into(),
+            explicit_topology,
+            pin: pin.into(),
+            state: EffectState::Prepared,
+            attempt,
+        }
+    }
+    #[cfg(test)]
     pub fn prepare(
         goal: impl Into<String>,
         reason: impl Into<String>,
@@ -706,26 +668,6 @@ impl ReclassifyIntent {
             reason,
             explicit_topology,
             pin,
-            state: EffectState::Prepared,
-            attempt,
-        }
-    }
-
-    /// Attach to an already-derived journal key (from `Cmd::Reclassify`).
-    pub fn from_cmd_key(
-        effect_key: String,
-        goal: impl Into<String>,
-        reason: impl Into<String>,
-        explicit_topology: Option<String>,
-        pin: impl Into<String>,
-        attempt: u32,
-    ) -> Self {
-        Self {
-            effect_key,
-            goal: goal.into(),
-            reason: reason.into(),
-            explicit_topology,
-            pin: pin.into(),
             state: EffectState::Prepared,
             attempt,
         }
@@ -818,31 +760,60 @@ where
     }
 }
 
-/// Like [`commit_reclassify`] but `None` from apply journals Unknown (I5).
-pub fn commit_reclassify_opt<F, T>(
+/// Commit Prepared → InFlight → Settled|Failed around a fallible apply.
+#[cfg(test)]
+pub fn commit_effect<F, T>(project: &str, mut effect: AgentEffect, apply: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&AgentEffect) -> anyhow::Result<T>,
+{
+    effect.state = EffectState::Prepared;
+    journal_effect(project, &effect)?;
+    effect.state = EffectState::InFlight;
+    journal_effect(project, &effect)?;
+    match apply(&effect) {
+        Ok(v) => {
+            effect.state = EffectState::Settled;
+            journal_effect(project, &effect)?;
+            Ok(v)
+        }
+        Err(e) => {
+            effect.state = EffectState::Failed;
+            let _ = journal_effect(project, &effect);
+            Err(e)
+        }
+    }
+}
+
+/// I4 lifecycle with visible Unknown for spawn effects: `None` from apply is
+/// not invent-green Settled and not Failed — it journals
+/// [`EffectState::Unknown`] (skipped verification / unobservable publish).
+#[cfg(test)]
+pub fn commit_effect_opt<F, T>(
     project: &str,
-    mut intent: ReclassifyIntent,
+    mut effect: AgentEffect,
     apply: F,
 ) -> anyhow::Result<Option<T>>
 where
-    F: FnOnce(&ReclassifyIntent) -> anyhow::Result<Option<T>>,
+    F: FnOnce(&AgentEffect) -> anyhow::Result<Option<T>>,
 {
-    intent.state = EffectState::InFlight;
-    journal_reclassify(project, &intent)?;
-    match apply(&intent) {
+    effect.state = EffectState::Prepared;
+    journal_effect(project, &effect)?;
+    effect.state = EffectState::InFlight;
+    journal_effect(project, &effect)?;
+    match apply(&effect) {
         Ok(Some(v)) => {
-            intent.state = EffectState::Settled;
-            journal_reclassify(project, &intent)?;
+            effect.state = EffectState::Settled;
+            journal_effect(project, &effect)?;
             Ok(Some(v))
         }
         Ok(None) => {
-            intent.state = EffectState::Unknown;
-            journal_reclassify(project, &intent)?;
+            effect.state = EffectState::Unknown;
+            journal_effect(project, &effect)?;
             Ok(None)
         }
         Err(e) => {
-            intent.state = EffectState::Failed;
-            let _ = journal_reclassify(project, &intent);
+            effect.state = EffectState::Failed;
+            let _ = journal_effect(project, &effect);
             Err(e)
         }
     }
@@ -1119,8 +1090,7 @@ mod tests {
         assert_eq!(attached.effect_key, key, "retries attach to same PK");
         assert_eq!(attached.attempt, 1, "attempt bumps on resume");
 
-        let settled: () = commit_reclassify(project, attached, |_| Ok(())).expect("settle");
-        let _ = settled;
+        commit_reclassify(project, attached, |_| Ok(())).expect("settle");
         let log = effect_log(project);
         assert!(log.contains("\"journal\":\"reclassify\""), "{log}");
         assert!(log.contains(&key), "journal carries effect_key: {log}");

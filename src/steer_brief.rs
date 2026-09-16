@@ -118,7 +118,7 @@ pub fn run_briefing(
         cap,
         default_n
     )?;
-    for (role, _) in &ctx.crew_plan {
+    for role in ctx.crew_plan.keys() {
         writeln!(out, "  - {role}")?;
     }
     write!(out, "  N > ")?;

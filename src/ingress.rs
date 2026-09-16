@@ -182,10 +182,26 @@ impl Default for IngressAdapters {
     }
 }
 
+/// One router: every external fact enters the system here. A `pane_exited`
+/// and a `message_posted` trigger cannot bypass it — they ARE this enum.
+pub fn handle_ingress(event: &IngressEvent, adapters: &IngressAdapters) {
+    match event {
+        IngressEvent::Herdr(e) => (adapters.herdr)(e),
+        IngressEvent::Watch(w) => (adapters.watch)(w),
+        IngressEvent::WorkflowTrigger(t) => (adapters.workflow)(t),
+        IngressEvent::CronTick { name } => (adapters.cron)(name),
+        IngressEvent::LedgerFact { .. }
+        | IngressEvent::PaneStalled { .. }
+        | IngressEvent::LeaseLapsed { .. }
+        | IngressEvent::GitFact { .. } => (adapters.fact)(event),
+    }
+}
+
 /// bd-0or2 seam: map the unified [`IngressEvent`] bus into the typed
 /// [`crate::durable::LoopMsg`] boundary (ADR-0025 Spec 6 deviation noted in
 /// AGENTS.md 2026-08-30). Zero behavior change — `tick` + journal stay the
 /// reducer pins; this is the typed conversion at the `handle_ingress` seam.
+#[cfg(test)]
 pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopMsg> {
     match event {
         IngressEvent::Herdr(he) => {
@@ -227,21 +243,6 @@ pub fn ingress_to_loop_msg(event: &IngressEvent) -> Option<crate::durable::LoopM
         // they fan into doorbell or fact journal, not LoopMsg. The seam
         // exists so a future tick arm can be added without a second bus.
         _ => None,
-    }
-}
-
-/// One router: every external fact enters the system here. A `pane_exited`
-/// and a `message_posted` trigger cannot bypass it — they ARE this enum.
-pub fn handle_ingress(event: &IngressEvent, adapters: &IngressAdapters) {
-    match event {
-        IngressEvent::Herdr(e) => (adapters.herdr)(e),
-        IngressEvent::Watch(w) => (adapters.watch)(w),
-        IngressEvent::WorkflowTrigger(t) => (adapters.workflow)(t),
-        IngressEvent::CronTick { name } => (adapters.cron)(name),
-        IngressEvent::LedgerFact { .. }
-        | IngressEvent::PaneStalled { .. }
-        | IngressEvent::LeaseLapsed { .. }
-        | IngressEvent::GitFact { .. } => (adapters.fact)(event),
     }
 }
 

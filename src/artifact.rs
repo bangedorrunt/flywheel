@@ -1,12 +1,13 @@
 // governed-by: ADR-0025
-#![allow(dead_code, clippy::all, unused)]
 #![forbid(unsafe_code)]
 
 //! Typed artifacts (Spec 2): workers write `ArtifactRecord` JSON to
 //! `~/.local/state/flywheel/{project}/artifacts/{run_id}/{node_id}.json`.
 //! The stitcher reads records only, never transcripts.
 
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -121,9 +122,15 @@ pub struct ArtifactRecord {
     pub pin: String,
 }
 
+// `new`/`admit`/`is_admitted` are reached only from tests in this binary
+// (`admit` is the embedding's VERIFY-sink action, driven through the sink
+// surface), so gate the impl with its callers rather than shipping dead code.
+#[cfg(test)]
 impl ArtifactRecord {
     /// Create a new record, computing sha256 from the file at `path`.
     /// Returns an error if the file cannot be read.
+    // One positional per recorded field; the record IS the field list.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: PathBuf,
         kind: ArtifactKind,
@@ -475,15 +482,6 @@ pub fn read_evaluation_evidence(
     Ok(evidence)
 }
 
-/// Compute sha256 hex of file bytes.
-pub fn compute_sha256(path: &Path) -> anyhow::Result<String> {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(hex::encode(hasher.finalize()))
-}
-
 /// The state dir for artifacts: `~/.local/state/flywheel/{project}/artifacts/{run_id}/{node_id}.json`
 pub fn artifact_path(project: &str, run_id: &str, node_id: &str) -> PathBuf {
     let base = dirs::data_local_dir()
@@ -493,39 +491,6 @@ pub fn artifact_path(project: &str, run_id: &str, node_id: &str) -> PathBuf {
         .join("artifacts")
         .join(run_id);
     base.join(format!("{}.json", node_id))
-}
-
-/// Write an artifact record to disk (creates parent dirs).
-pub fn write_artifact(record: &ArtifactRecord) -> anyhow::Result<PathBuf> {
-    let node_id = record.node_id.as_deref().unwrap_or("unknown");
-    let path = artifact_path(
-        &record.bead_id.as_deref().unwrap_or("unknown").to_string(),
-        &record.run_id,
-        node_id,
-    );
-    let dir = path
-        .parent()
-        .expect("artifact_path always joins parent dirs");
-    std::fs::create_dir_all(dir)?;
-    let json = serde_json::to_string_pretty(record)?;
-    std::fs::write(&path, json)?;
-    Ok(path)
-}
-
-/// Write an artifact record for a given project (more accurate).
-pub fn write_artifact_for_project(
-    project: &str,
-    record: &ArtifactRecord,
-) -> anyhow::Result<PathBuf> {
-    let node_id = record.node_id.as_deref().unwrap_or("unknown");
-    let path = artifact_path(project, &record.run_id, node_id);
-    let dir = path
-        .parent()
-        .expect("artifact_path always joins parent dirs");
-    std::fs::create_dir_all(dir)?;
-    let json = serde_json::to_string_pretty(record)?;
-    std::fs::write(&path, json)?;
-    Ok(path)
 }
 
 /// Stitcher: read records only, write stitched.md, flag Ungrounded loudly.
@@ -599,6 +564,16 @@ pub fn stitch_artifacts(project: &str, run_id: &str) -> anyhow::Result<PathBuf> 
     }
     std::fs::write(&stitched_path, md)?;
     Ok(stitched_path)
+}
+
+/// Compute sha256 hex of file bytes.
+#[cfg(test)]
+pub fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]

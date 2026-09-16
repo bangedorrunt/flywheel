@@ -116,8 +116,8 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
         .name
         .clone()
         .unwrap_or_else(|| crate::agent_target(a).to_string());
-    match verb {
-        &ControlVerbCmd::Interrupt => {
+    match *verb {
+        ControlVerbCmd::Interrupt => {
             let status = crate::herdr_shim::parse_agent_status(a.agent_status.as_str())
                 .unwrap_or(crate::herdr_shim::AgentStatus::Unknown);
             let plan = crate::control::interrupt_plan(status);
@@ -134,7 +134,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 json!({ "to": pin, "keys": plan.keys, "confirmed": plan.confirmed, "plane": "crew-control" }),
             );
         }
-        &ControlVerbCmd::Exit => {
+        ControlVerbCmd::Exit => {
             // pane.close — the agent goes with the pane. Exit deliberately
             // touches NOTHING else: reservations (toron leases) and dirty
             // worktree files are preserved (control::EXIT_POSTCONDITION).
@@ -150,7 +150,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 json!({ "op": "crew-control exit", "name": name, "pane_id": a.pane_id }),
             );
         }
-        &ControlVerbCmd::Relaunch => {
+        ControlVerbCmd::Relaunch => {
             let registry = crate::state::load_spawn_registry(project);
             let old = registry
                 .iter()
