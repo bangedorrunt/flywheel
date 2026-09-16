@@ -1,0 +1,91 @@
+Multi-agent swarm orchestrator on the herdr backend
+
+Usage: flywheel [OPTIONS] [COMMAND]
+
+Commands:
+  init             Scaffold a project (ensure dir + .beads + the project-scope compound spine: .flywheel/stages.toml, .flywheel/standing-orders.md, docs/learnings/) without spawning
+  spawn            Spawn a swarm (escape hatch). Default multi-lane is `workflow compose --parts wave-swarm --run`
+  add              Extend a running swarm with more agent panes
+  list             List flywheel swarms and their agents
+  status           Show one swarm's agents and states
+  snapshot         Print the fleet snapshot contract (flywheel-snapshot.v1) as robot JSON
+  helm             Session-start drain over the snapshot: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE — always printed, even when empty
+  briefing         ADR-0011 D3: session briefing (observe + propose). `--commit` runs argv
+  reclassify       GS-048: mid-session reclassify — enters Elm plane via `Msg::MaterialContext` → `Cmd::Reclassify` → `Msg::DecisionReady` (sticky-open applied). Also prints the briefing proposal (same leaf facts as `briefing`). Prefer this over inventing a second classifier
+  arrive           ADR-0011 D5/D6: arrive on a project — helm, join-loud, doorbell, FCFS captain
+  decide           Classify a target into one captain primitive (no dispatch)
+  rebind           Restore lost agent name bindings from the spawn registry (bd-fw-name-binding-loss-7rc): panes whose agent restarted show name:null — this renames them back to their registered names
+  binding-rebind   Journaled in-flight profile/harness rebind (GS-043 / ADR-0032 Spec 7). Updates the live SpawnEntry binding; does NOT edit profiles.toml. Pin/npub stay immutable (AgentRef). `--model` fails loud until a real spawn/pane/headless consumer reads SpawnEntry.model (never invent Settled)
+  recover          Recover a damaged swarm (bd-fw-interrupt-kills-agent-or3): for each registered agent, restore the name binding if the pane survived, or respawn the agent if it died. The durable loop self-heals on its own; this is the CLI supervision counterpart
+  send             Send a prompt to one or more agents (with optional wait)
+  crew             Crew plane: preview + lifecycle control (ADR-0010 D7). Control has NO arbitrary-text entry point — the verbs are interrupt|exit|relaunch only; text the worker reads is not a lifecycle verb
+  interrupt        Interrupt an agent (sends Escape by default — cancels the current tool call and returns to the prompt). Kill-style keys (ctrl+c) are REFUSED unless --force: they terminate the agent process and drop the pane to a shell (bd-fw-interrupt-kills-agent-or3)
+  view             Read an agent's terminal output
+  output           Read an agent's output from the opencode structured session store (bd-eign.5) — the SQLite session log, not TUI scrollback (which the alternate screen garbles). Resolves the latest session for the project directory, optionally narrowed by opencode role; --session targets an exact session id
+  watch            Watch a swarm: stream agent state changes until --until or timeout
+  doorbell         bd-durable-doorbell-lngf: supervised pane-wake layer surface. Dispatchers are lazily healed — any of these (plus `recover`/`status`) restarts a dead one for workspaces that ever ran one
+  loop-mode        Monitor a swarm: poll every N seconds, feed queued instructions to idle/finished agents, report blockers. Exits 0 when the queue is drained and the swarm settles. Runs as a durable Resonate workflow by default — crashes resume via `flywheel loop-mode run <project>` (same invocation id). For back-compat, the bare legacy form `flywheel loop <project>` (alias) is rewritten to `loop-mode run <project>` before parsing (see `rewrite_legacy_loop_args`). Renamed from `loop` to avoid harness built-in conflicts (bd-loop-mode-rename-0tqy) [alias: loop]
+  artifacts        Typed artifacts (ADR-0025 Spec 2): list or stitch per-run records
+  zoom             Zoom a pane (herdr pane.zoom)
+  attach           Attach to an agent's terminal (interactive; execs `herdr attach`)
+  kill             Close (kill) a swarm workspace
+  ledger           bead-verdict ledger (ADR-0019): br gate wrappers + receipt helper. `check` exits 0 only on a legal verdict for the current SHA; `receipt` writes only the receipt file (workers never write verdicts)
+  principles       engineering principle registry (ADR-0019 Spec 5/6): list the 21 canonical names, or show a leaf's full when+rule (unknown name -> non-zero + suggestion)
+  standing-orders  standing orders (ADR-0019 Spec 2): regen the GENERATED global file (~/.config/flywheel/standing-orders.md) from the registry + wave-1 criticals; project fences (<project>/.flywheel/standing-orders.md) are authored and preserved byte-identical
+  work             Work-graph surfaces (bv/br pass-through)
+  assign           Assign beads to agents via mail (toron default)
+  mail             toron mail coordination surfaces
+  collab           ask a peer a question over mail and wait for the in-thread reply (the real-time collab primitive: send urgent + block for the answer)
+  xproj            cross-project fan-out (contact + product; ADR-0001 §9.5)
+  worktree         git worktree swarms
+  checkpoint       Point-in-time swarm snapshots
+  timeline         Event timeline of a swarm
+  audit            Audit trail (the full event log)
+  history          Saved checkpoints (alias of checkpoint list)
+  changes          What changed since a checkpoint
+  resume           Re-attach to a swarm's state after a break
+  analytics        Aggregate counters over the event log
+  recipes          Spawn squads (legacy name: recipes) — prefer `flywheel squad`
+  workflows        Named prompt sequences (daily loop etc.)
+  pipeline         Ordered multi-workflow runs
+  template         Templates (legacy alias of the squad surface)
+  stage            Stage prompts (ADR-0005 P3.3): list semantic names + p-code aliases
+  ensemble         Squad (--recipe takes a squad name) + workflow in one launch
+  safety           Safety posture: deps + active guards
+  guards           Active policy guards (deny patterns)
+  policy           Destructive-command policy management
+  deps             Environment + toolchain health check
+  integration      Generate the beads-agent integration prompts for an agent kind. Writes the beads files (beads-{triage,execute,review,commit,create}.md), the workflow slash commands (workflow-{...}.md), and the orchestration slash commands (open.md, swarm.md, loop.md, peer-aware.md) into the tool's prompts dir. Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted); omit to list kinds. Re-run after a flywheel rebuild to refresh the generated prompts
+  config           Configuration management
+  backend          Backend discovery + selection (ADR-0002 pluggable backends)
+  profile          Agent profiles (ADR-0005 Spec 1/1b) — catalog + spawn
+  squad            Squads (ADR-0005 P6) — named groups of profiles = spawn shapes. Vocabulary: say "squad" here. A compose token (`wave-swarm`, `repair-until-verified`, `beads-lifecycle`) is a bare `--parts` name on `workflow compose … --parts <token> --run` — not a squad. `recipes`/`template` stay as legacy aliases of this surface
+  coalition        Coalitions (ADR-0011 Spec 1, P11.3a) — captain-formed crews around a goal: NIP-29 channel + goal run + intent board + manual request-release collab. Steer surface without the auto-proposer (P11.3b)
+  runs             Runs dashboard (ADR-0005 P6.3) — state + owner + per-run cost
+  steer            Captain-free steering (bd-t86p): ONE compose call at a target — `flywheel steer "<objective>"` drives the crew to completion with zero manual per-bead dispatch. Bead-tracked by default (goal → brainstorm → plan → beads → build → review → ship); `--direct` skips the tracker (non-bead targets: the plan flows straight to the coder, no approval gate — truly autonomous). Interactive TTY briefing (bd-xe9r/bd-nmzk): `steer` and `workflow run --execute` prompt before dispatch — crew counts, per-role model menus w/ cost/caps, squad/bare-harness shape, stage-chain preview, go/no-go. Skipped by `--json`, `--yes`, or explicit `--crew`; non-TTY byte-identical (`src/steer_brief.rs`, `source` fork only)
+  workflow         Unified workflow surface (ADR-0005 Spec 5 / P3.7) — catalog, lint, run, scaffold, history, and auto-crew preview. One vocabulary, one engine: built-ins + canonical `workflows/*.yaml` + absorbed legacy `workflows.toml` / `pipelines.toml`
+  model            Model registry (ADR-0010 Spec D, P10.2) — `models.toml` ids with provider/cost/caps/fallback; Profile.model resolves against it so the per-harness model flag is real, not advisory
+  slot             Routing slots (ADR-0007 D1) — cheap/standard/premium = harness+model
+  catalog          Catalog hub (ADR-0007 D4) — ratatui multi-panel over slots/models/ profiles/squads. Refuses on non-TTY / NO_COLOR / TERM=dumb and names the CLI verbs
+  cron             Smart-cron surface (ADR-0005 Spec 3 / P4.6) — the flywheel half of cron: registered schedules + schedule-triggered workflows, pause/ resume, status + history. The P4.3 cron manager drives ticks off this registry; this CLI owns the catalog + control surface
+  debate           N-round A/B debate + judge (ADR-0001 §9.1 — threaded, ack-gated)
+  plan-review      Plan → review gate → implement → verify (ADR-0001 §9.2; paper-first)
+  upgrade          Reinstall the binary from source (cargo install --path)
+  tutorial         Interactive walkthrough
+  daemon           Daemon lifecycle (toron-parity): start|stop|restart|status over the `serve` HTTP surface. macOS launchd / Linux systemd user unit / pidfile fallback. `restart` VERIFIES the new daemon answers. (feature: serve — compiled out without it)
+  serve            Local REST + SSE server (feature: serve)
+  toron            In-process toron mailbox/MCP integration (ADR-0003 Decision 3A, bd-o8j.1)
+  preflight        Preflight: verify all prerequisites for a fleet operation before dispatching. Catches environment/dependency failures in <1s instead of 30s+ into a Resonate cycle. Auto-runs before steer/loop/workflow unless --skip-preflight is passed
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+      --robot-snapshot      Full JSON state snapshot of all flywheel swarms (scripts/agents)
+      --robot-capabilities  List flywheel's machine-readable capabilities as JSON
+      --skip-preflight      Skip preflight checks (steer/loop/workflow auto-verify before dispatch)
+      --robot-status        Compact JSON status of all flywheel swarms
+  -h, --help                Print help
+  -V, --version             Print version
+
+Exit codes: 0 ok · 1 herdr/server error · 2 usage error.
+Machine output: --json on list/status/view; --robot-snapshot for full state.
+Feedback: https://github.com/bangedorrunt/flywheel/issues

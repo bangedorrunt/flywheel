@@ -1,0 +1,25 @@
+Unified workflow surface (ADR-0005 Spec 5 / P3.7) — catalog, lint, run, scaffold, history, and auto-crew preview. One vocabulary, one engine: built-ins + canonical `workflows/*.yaml` + absorbed legacy `workflows.toml` / `pipelines.toml`
+
+Usage: flywheel workflow [OPTIONS] <COMMAND>
+
+Commands:
+  list      List catalog + built-in workflows (name, source, trigger, crew). `--project` layers the project tier (built-ins < user < project), matching the `run`/`compose` resolution order
+  show      Show one workflow's definition
+  lint      Lint ALL built-in + catalog workflows (the fail-stop gate). Exit 0 clean, 1 on any blocking issue, 2 on a parse failure
+  evaluate  GS-049 / GS-045 P1-2: evaluate-without-commit — lint + partition each step into validated candidate outcomes without journal dispatch. Host path (`workflow run --execute`) stays authoritative for live effects
+  run       Run a workflow by name through the unified engine (lint gate first). Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`. Compose tokens (`wave-swarm`, `repair-until-verified`, `beads-lifecycle`): prefer `workflow compose … --parts <token> --run`; `workflow run <token> --execute` is the legacy alias. Do NOT pass ordinary builtins as bare `--parts`. Interactive TTY briefing when `--execute` (bd-nmzk): same skip matrix as `steer` — shared prompt module (`source = workflow`)
+  new       Scaffold a new workflow YAML in the config dir
+  compose   Runtime workflow composition (bd-8xca): assemble a NEW workflow from existing parts — `role:stage` dispatch parts and `workflow:name` call_workflow parts — around a target, lint it, and (with --run) execute it durably. The deterministic arm (default) assembles from the parts spec; `--agent` lets a planner agent author the workflow from the target + catalog
+  history   Run history for a workflow (from the state log)
+  crew      Preview the auto-crew a workflow would spawn (crew: auto)
+  remove    Remove a catalog workflow (deletes ~/.config/flywheel/workflows/<name>.yaml). Built-in workflows cannot be removed — override via a catalog file of the same name (catalog shadows built-ins)
+  promote   Promote a workflow up the §3.8 permanence ladder (project → user → repo). The user write goes through the SAME writer as compose --keep, so both lint identically
+  approve   Approve or reject a parked SIGNOFF promise (bd-1ub5): sends the decision mail the parked run's approval drainer resolves
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --robot-snapshot      Full JSON state snapshot of all flywheel swarms (scripts/agents)
+      --robot-capabilities  List flywheel's machine-readable capabilities as JSON
+      --skip-preflight      Skip preflight checks (steer/loop/workflow auto-verify before dispatch)
+      --robot-status        Compact JSON status of all flywheel swarms
+  -h, --help                Print help
