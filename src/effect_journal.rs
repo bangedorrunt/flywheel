@@ -327,7 +327,7 @@ fn mail_delivery(inv: &ActionInvocation) -> Result<MailDelivery> {
 /// re-triggering itself, `corr` IS the effect key so the receipt joins back to
 /// the journal row, and `wake: tasked` keeps the delivery from being wake-null
 /// theater.
-fn mail_message(delivery: &MailDelivery, sender: String, effect_key: &str) -> Result<SendMessage> {
+fn mail_message(delivery: &MailDelivery, sender: String, effect_key: &str) -> SendMessage {
     let mut extra_tags = stamp_workflow_emitted(Vec::new());
     for (k, v) in [("corr", effect_key), ("wake", "tasked")] {
         match Tag::parse([k, v]) {
@@ -335,7 +335,7 @@ fn mail_message(delivery: &MailDelivery, sender: String, effect_key: &str) -> Re
             Err(e) => eprintln!("flywheel: effect journal: {k} tag {v:?} rejected: {e}"),
         }
     }
-    Ok(SendMessage {
+    SendMessage {
         project_slug: delivery.project.clone(),
         sender_name: sender,
         to: delivery.to.clone(),
@@ -343,7 +343,7 @@ fn mail_message(delivery: &MailDelivery, sender: String, effect_key: &str) -> Re
         body_md: delivery.body.clone(),
         extra_tags,
         ..Default::default()
-    })
+    }
 }
 
 /// Resolve the sender, assemble the message, and hand it to the transport. The
@@ -354,10 +354,7 @@ fn mail_outcome(plane: &MailPlane, effect_key: &str, delivery: MailDelivery) -> 
         Ok(sender) => sender,
         Err(e) => return classify_failure(format!("{e:#}")),
     };
-    let message = match mail_message(&delivery, sender, effect_key) {
-        Ok(message) => message,
-        Err(e) => return classify_failure(format!("{e:#}")),
-    };
+    let message = mail_message(&delivery, sender, effect_key);
     match (plane.send)(message) {
         Ok(count) => ProviderOutcome::Delivered(serde_json::json!({
             "ok": true,
