@@ -7,7 +7,7 @@ Three nouns, precisely: a **stage** is one named prompt (catalog: `stage list`).
 
 Ordinary builtins (`captain-audit` and friends) are not tokens: `workflow run <name> --execute` runs them. The `recipes` command is the legacy squad surface (spawn shapes), not compose; say "squad" for spawn shapes.
 
-Every full `workflow list --json` row carries `description`, `family`, `selection`, `run` (the exact invocation), and `decide_trigger`, so selection works like a skill catalog. Use `workflow list --brief --json` for the GS-048 bounded projection (**name / trigger / topology** only); use `workflow show <name>` (or bare list) for family/selection/run/description. The one-by-one review is in [workflow-catalog-review](./workflow-catalog-review).
+Every full `workflow list --json` row carries `description`, `family`, `selection`, `run` (the exact invocation), `compose_token`, and `decide_trigger`, so selection works like a skill catalog. Use `workflow list --brief --json` for the GS-052 **hybrid** projection (**name / family / selection / run / topology / compose_token**); use bare `workflow list --json` for description + decide_trigger + rest; use `workflow show <name>` for prose/graph detail (name/source/description/run/compose_token/trigger/guard/crew/inputs/steps/graph — **not** decide_trigger/family/selection/topology). The one-by-one review is in [workflow-catalog-review](./workflow-catalog-review).
 
 ## The --parts grammar
 
