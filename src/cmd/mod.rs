@@ -41,7 +41,11 @@ pub(crate) use crew::{ControlVerbCmd, CrewCmd, cmd_crew};
 pub(crate) use cron::CronCmd;
 #[cfg(feature = "serve")]
 pub(crate) use daemon::DaemonCmd;
-pub(crate) use doorbell::DoorbellCmd;
+pub(crate) use doorbell::{
+    DoorbellCmd, cmd_doorbell_digest, cmd_doorbell_inject, cmd_doorbell_re_inject,
+    cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe,
+    cmd_internal_doorbell,
+};
 pub(crate) use history::{
     cmd_analytics, cmd_audit, cmd_changes, cmd_history, cmd_resume, cmd_timeline,
 };
@@ -57,7 +61,7 @@ pub(crate) use slot::{SlotCmd, cmd_slot};
 pub(crate) use squad::SquadCmd;
 pub(crate) use stage::{StageCmd, cmd_stage};
 pub(crate) use standing_orders::{StandingOrdersCmd, cmd_standing_orders};
-pub(crate) use toron::{ToronCmd, ToronMailCmd};
+pub(crate) use toron::{ToronCmd, ToronMailCmd, cmd_toron};
 pub(crate) use work::{WorkCmd, cmd_work};
 pub(crate) use workflow::WorkflowCmd;
 pub(crate) use worktree::{WorktreeCmd, cmd_worktree};

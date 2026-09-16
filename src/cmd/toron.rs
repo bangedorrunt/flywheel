@@ -1,6 +1,9 @@
 //! `flywheel toron` subcommand types (split from `main.rs`, bd-qbi8).
 
+use anyhow::Result;
 use clap::Subcommand;
+
+use crate::config::Config;
 
 #[derive(Subcommand)]
 pub(crate) enum ToronCmd {
@@ -81,4 +84,22 @@ pub(crate) enum ToronMailCmd {
         #[arg(long)]
         limit: Option<usize>,
     },
+}
+
+pub(crate) fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
+    // The MCP-config wiring is pure file I/O — it runs synchronously and does
+    // not need the tokio embed runtime. Handle it before delegating to the
+    // in-process mailbox dispatch.
+    if let ToronCmd::SetupMcp {
+        url,
+        agents,
+        boot_port,
+        dry_run,
+        flywheel,
+    } = cmd
+    {
+        return crate::toron_setup_mcp(url.as_deref(), agents, *boot_port, *dry_run, *flywheel);
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(crate::toron_embed::dispatch(cfg, cmd))
 }
