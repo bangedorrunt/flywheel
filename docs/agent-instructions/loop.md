@@ -31,7 +31,7 @@ Confirmed send is default (`__send --confirm` → working|blocked landing). `--n
 ## Dispatch
 
 - working → skip
-- blocked → `--on-blocked continue|stop|mail` (mail escalates T0–T3; T3 halts)
+- blocked → `--on-blocked continue|stop|mail` (mail escalates T0–T3; T3 halts). Tiers are **ack-gated**: the `notify_blocked` leaf reads the agent's own `health-<name>` thread at SLA 0 (`__ack-overdue`, toron's per-recipient `message_reads` state) before each step, and an ack resets the ladder (budget restarts, T0 marked handled). No ping yet → no gate; a read that cannot answer (no index, unregistered target, `[mail.toron] url` remote) is not an ack, so the time ladder keeps climbing — never a silent stop.
 - idle/done → next queue item
 - unknown → never dispatch; 2+ consecutive polls → respawn
 

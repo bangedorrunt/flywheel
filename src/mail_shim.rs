@@ -326,6 +326,68 @@ pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
+/// Default ack SLA in seconds (`ACK_SLA_DEFAULT_SECS`): the twin of toron's
+/// own `check_ack_sla_expired` default (`sla_secs.unwrap_or(30 * 60)`) and of
+/// the CLI's `toron ack-sla --sla-secs`. One number, named twice on purpose:
+/// drift here would mean flywheel reports a different overdue set than the
+/// wake-emitting scan that pops the ring.
+pub const ACK_SLA_DEFAULT_SECS: u64 = 30 * 60;
+
+/// Is one inbox row ack-overdue for the agent that read it? (bd-mail-ack-sla
+/// -tracking subtask 4, wired bd-blocked-escalation-protocol.)
+///
+/// The predicate reads only fields the projection already carries, so the
+/// in-process and remote backends share ONE definition:
+/// - `ack_required` — the sender asked for an ack;
+/// - `importance ∈ {high, urgent}` — toron's SLA scope (`check_ack_sla_expired`
+///   scans exactly these);
+/// - `read_ts_us` null — per-RECIPIENT read state (`message_reads`, migration
+///   0002). toron's own scan counts reads for ANY recipient, so this door is
+///   the stricter one: a co-recipient's read can never mask this agent's miss.
+///   The projection records read and ack in the same row, and toron's SLA
+///   scan treats either as handled (`fetch_inbox` itself never writes one) —
+///   so "has a receipt" is the honest available fact, never "never fetched";
+/// - age ≥ SLA — `created_ts_us` is i64 micros, same clock as `now_us`.
+///
+/// `sla_secs = 0` is legal and meaningful: "any unacked ack-required mail".
+/// The blocked-escalation gate uses it (an ack at ANY age is the handling
+/// fact there), which is why the SLA is a parameter and not a constant.
+pub fn inbox_row_ack_overdue(row: &Value, now_us: i64, sla_secs: u64) -> bool {
+    if row.get("ack_required").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    if !row
+        .get("importance")
+        .and_then(Value::as_str)
+        .map(is_urgent)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // Absent or null `read_ts_us` both mean "no receipt" — unread is the
+    // honest default when the projection omits the field.
+    if row.get("read_ts_us").is_some_and(|v| !v.is_null()) {
+        return false;
+    }
+    let created_us = row
+        .get("created_ts_us")
+        .and_then(Value::as_i64)
+        .unwrap_or(now_us);
+    now_us.saturating_sub(created_us) >= (sla_secs as i64).saturating_mul(1_000_000)
+}
+
+/// Filter bag for the ack-overdue read (bd-mail-ack-sla-tracking subtask 4).
+/// Every field is optional: `AckOverdueFilter::default()` = toron's 30-min
+/// SLA, all threads.
+#[derive(Debug, Clone, Default)]
+pub struct AckOverdueFilter {
+    /// Age threshold in seconds. `None` = [`ACK_SLA_DEFAULT_SECS`].
+    pub sla_secs: Option<u64>,
+    /// Restrict the read to one thread — the blocked-escalation gate reads
+    /// the `health-<agent>` lane so unrelated mail cannot hold the ladder up.
+    pub thread_id: Option<String>,
+}
+
 /// Full inbox filter bag (bd-mail-ack-sla-tracking). Callers construct this
 /// instead of passing 5 booleans positionally. Constructed by the toron
 /// backend (`mail-toron` feature); suppressed as dead in the default build.
@@ -336,8 +398,10 @@ pub struct MailInboxFilter {
     /// by the toron projection; rows carry `importance`).
     pub urgent_only: bool,
     pub unread_only: bool,
-    /// Not implementable on the toron projection (rows carry no ack_ts):
-    /// requesting it fails with an honest error, never a silent no-op (c3b.3).
+    /// Keep only ack-overdue rows — `ack_required` + high/urgent + no
+    /// per-recipient receipt + past the default SLA (see
+    /// [`inbox_row_ack_overdue`]). Applied as a post-filter over the rows the
+    /// projection returns, on BOTH backends; rows carry every field it needs.
     pub ack_overdue_only: bool,
     pub include_bodies: bool,
     pub limit: u32,
@@ -718,24 +782,18 @@ impl Mail {
     }
 
     /// `fetch_inbox` with the full filter bag (c3b.3). Applies every filter
-    /// the toron row model supports: `urgent_only` (rows carry `importance`)
-    /// and `since_ts` (rows carry `created_ts_us`), on top of the already-
-    /// supported `unread_only` / `include_bodies` / `limit`. `ack_overdue_only`
-    /// has NO toron projection (rows carry no ack_ts) — it fails with an
-    /// honest `Unsupported` instead of silently returning an unfiltered
-    /// inbox; the ack-SLA escalation uses the dedicated `ack_overdue()`.
+    /// the toron row model supports: `urgent_only` (rows carry `importance`),
+    /// `since_ts` (rows carry `created_ts_us`), `ack_overdue_only` (rows carry
+    /// `ack_required` + `read_ts_us` — see [`inbox_row_ack_overdue`]) on top of
+    /// the already-supported `unread_only` / `include_bodies` / `limit`. Every
+    /// filter is a real read or a loud error; none is a silent no-op.
     pub fn inbox_filtered(
         &self,
         project_key: &str,
         agent_name: &str,
         filter: &MailInboxFilter,
     ) -> Result<Value> {
-        if filter.ack_overdue_only {
-            return Err(anyhow!(
-                "toron inbox_filtered: ack_overdue_only is not supported by the toron projection \
-                 (inbox rows carry no ack_ts) — use the dedicated ack_overdue() surface"
-            ));
-        }
+        let now_us = chrono::Utc::now().timestamp_micros();
         // bd-zd2v: the literal `last` is the daemon-side cursor
         // (read-then-bump, resolved by the toron projection) — not RFC3339,
         // so it bypasses timestamp parsing AND Remote client-side filtering
@@ -770,6 +828,10 @@ impl Mail {
                     .iter()
                     .filter(|m| !filter.urgent_only || is_urgent(&m.importance))
                     .map(ToJson::to_json)
+                    .filter(|row| {
+                        !filter.ack_overdue_only
+                            || inbox_row_ack_overdue(row, now_us, ACK_SLA_DEFAULT_SECS)
+                    })
                     .collect();
                 Ok(Value::Array(rows))
             }
@@ -831,6 +893,12 @@ impl Mail {
                             .unwrap_or(false),
                         None => true,
                     })
+                    // bd-mail-ack-sla-tracking: the ack-overdue post-filter
+                    // runs on the wire rows too (same predicate, same clock).
+                    .filter(|row| {
+                        !filter.ack_overdue_only
+                            || inbox_row_ack_overdue(row, now_us, ACK_SLA_DEFAULT_SECS)
+                    })
                     .collect();
                 Ok(Value::Array(rows))
             }
@@ -889,45 +957,92 @@ impl Mail {
         }
     }
 
-    /// Messages past the ack SLA. toron has no ack-overdue projection yet —
-    /// returns the inbox (empty after all are acked), so the escalation
-    /// protocol's "nothing overdue" branch behaves as before.
+    /// Messages this agent owes an ack for, past the SLA — the read the
+    /// blocked-escalation protocol polls (ADR-0001 A6, bd-mail-ack-sla
+    /// -tracking subtask 4).
     ///
-    /// Blocked on upstream, not on wiring: the Phase-4 escalation protocol is
-    /// the intended consumer, and it cannot distinguish "nothing overdue" from
-    /// "no projection" until toron exposes an ack-overdue read. Kept
-    /// (documented) rather than deleted so the capability is not lost.
-    #[allow(dead_code)]
-    pub fn ack_overdue(&self, project_key: &str, agent_name: &str) -> Result<Value> {
-        match &self.backend {
+    /// Read-only by construction: it reuses the SAME per-recipient read state
+    /// `fetch_inbox` already projects (`message_reads`, migration 0002: only
+    /// `mark_message_read` / `acknowledge_message` ever write it, and
+    /// `fetch_inbox` itself never does), then applies
+    /// [`inbox_row_ack_overdue`]. It deliberately does NOT call toron's
+    /// `check_ack_sla_expired`: that primitive EVENTS an `ack-sla-expired`
+    /// wake per overdue post, and the doorbell's 60s scan already owns the
+    /// emit — a second emitter here would double every ring.
+    ///
+    /// The rows are the projection's own shape (`id`, `thread_id`,
+    /// `subject`, `sender`, `created_ts_us`, `read_ts_us`, …); `age_secs` and
+    /// the `sla_secs` that produced the row are added for readers.
+    pub fn ack_overdue(
+        &self,
+        project_key: &str,
+        agent_name: &str,
+        filter: &AckOverdueFilter,
+    ) -> Result<Value> {
+        let sla_secs = filter.sla_secs.unwrap_or(ACK_SLA_DEFAULT_SECS);
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let rows: Vec<Value> = match &self.backend {
             BackendKind::InProcess => {
+                // Guard the "empty because unknown" trap: an unregistered
+                // agent has no receipts, so the read would return an empty set
+                // that LOOKS like "nothing overdue". Fail loudly instead —
+                // this is exactly the distinction the escalation gate needs.
+                let canonical = block_on(mailbox().canonical_project(project_key));
+                if block_on(mailbox().agent_pubkey_hex(&canonical, agent_name)).is_none() {
+                    return Err(anyhow!(
+                        "toron ack_overdue: agent {agent_name} is not registered in {canonical} — \
+                         there is no ack state to read (register the agent first; an empty set from \
+                         an unknown identity is not 'nothing overdue')"
+                    ));
+                }
+                // The projection applies `unread_only` + `urgent_only` +
+                // `thread_id` itself (per-recipient read state, importance
+                // scope, thread bound) — the row post-filter below is the
+                // same predicate the remote half uses, so both halves agree.
                 let msgs = block_on(mailbox().fetch_inbox(&FetchInbox {
                     project_slug: project_key.to_string(),
                     agent_name: agent_name.to_string(),
-                    unread_only: false,
+                    unread_only: true,
                     limit: None,
                     include_bodies: false,
-                    urgent_only: false,
+                    urgent_only: true,
                     since_ts: None,
-                    thread_id: None,
+                    thread_id: filter.thread_id.clone(),
                 }))?;
-                Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
+                msgs.iter()
+                    .map(ToJson::to_json)
+                    .filter(|row| inbox_row_ack_overdue(row, now_us, sla_secs))
+                    .collect()
             }
-            BackendKind::Remote(_) => self.call_remote(
-                "fetch_inbox",
-                crate::backend::wire::inbox_args(
-                    project_key,
-                    agent_name,
-                    false,
-                    false,
-                    false,
-                    false,
-                    0,
-                    None,
-                    None,
-                ),
-            ),
-        }
+            BackendKind::Remote(_) => {
+                // The daemon has no ack-overdue tool or resource read; a
+                // remote caller must not be handed an unfiltered inbox that
+                // LOOKS like an overdue set (c3b.3's no-silent-no-op rule).
+                return Err(anyhow!(
+                    "toron ack_overdue: no remote projection (the daemon exposes no ack-overdue \
+                     tool; toron://views/ack-overdue is a sender-side view of the unread write \
+                     path) — read the shared index in-process, or add the tool to toron"
+                ));
+            }
+        };
+        let with_age: Vec<Value> = rows
+            .into_iter()
+            .map(|mut row| {
+                let age_secs = row
+                    .get("created_ts_us")
+                    .and_then(Value::as_i64)
+                    .map(|created| now_us.saturating_sub(created) / 1_000_000)
+                    .unwrap_or(0);
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("age_secs".into(), json!(age_secs));
+                    // name the SLA that produced the row, so a reader can
+                    // never mistake a 0-second gate for the 30-min default.
+                    obj.insert("sla_secs".into(), json!(sla_secs));
+                }
+                row
+            })
+            .collect();
+        Ok(Value::Array(with_age))
     }
 
     /// `send_message`.
@@ -3086,26 +3201,158 @@ mod tests {
     /// ack_ts) — the request fails with an honest error naming the filter,
     /// never a silent unfiltered inbox.
     #[test]
-    fn inbox_filtered_ack_overdue_is_honest_unsupported() {
+    fn inbox_filtered_ack_overdue_is_a_real_read() {
+        // bd-0rzv: reads the shared mail root — serialize under the env lock.
+        let _g = crate::config::lock_env();
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("c3b3-ackoverdue-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
-        let err = mail
+        mail.register_agent(&project, "OverdueSender", "opencode", "test", "seed")
+            .expect("sender registered");
+        mail.register_agent(&project, "OverdueRecv", "opencode", "test", "seed")
+            .expect("recipient registered");
+        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+            .expect("facade identity registered");
+        mail.send(
+            &project,
+            &["OverdueRecv".to_string()],
+            "ack me",
+            "please ack",
+            "high",
+            true,
+            Some("overdue-1"),
+        )
+        .expect("send ack-required");
+
+        let unfiltered = mail
             .inbox_filtered(
                 &project,
-                "Nobody",
+                "OverdueRecv",
                 &MailInboxFilter {
-                    ack_overdue_only: true,
                     include_bodies: false,
-                    limit: 10,
+                    limit: 50,
                     ..Default::default()
                 },
             )
-            .expect_err("ack_overdue_only must fail loudly");
+            .expect("unfiltered inbox");
+        assert_eq!(
+            unfiltered.as_array().unwrap().len(),
+            1,
+            "the ack-required mail is in the plain inbox"
+        );
+        // The row is unacked BUT younger than the 30-min SLA: the filter is a
+        // real predicate, not an unfiltered passthrough (the c3b.3 rule —
+        // never a silent no-op).
+        let filtered = mail
+            .inbox_filtered(
+                &project,
+                "OverdueRecv",
+                &MailInboxFilter {
+                    ack_overdue_only: true,
+                    include_bodies: false,
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .expect("ack-overdue inbox");
+        assert!(
+            filtered.as_array().unwrap().is_empty(),
+            "a fresh ack starts inside the SLA window: {filtered}"
+        );
+    }
+
+    /// bd-mail-ack-sla-tracking subtask 4 (wired): the dedicated ack-overdue
+    /// read is per-recipient and real. `sla_secs = 0` is the escalation gate's
+    /// form ("any unacked ack-required mail"); the agent's own ack clears it.
+    #[test]
+    fn ack_overdue_reads_real_state_and_clears_on_ack() {
+        let _g = crate::config::lock_env();
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("acksla-read-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        mail.register_agent(&project, "SlaSender", "opencode", "test", "seed")
+            .expect("sender registered");
+        mail.register_agent(&project, "SlaRecv", "opencode", "test", "seed")
+            .expect("recipient registered");
+        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+            .expect("facade identity registered");
+        let receipt = mail
+            .send(
+                &project,
+                &["SlaRecv".to_string()],
+                "[flywheel] you are blocked",
+                "resolve or report",
+                "high",
+                true,
+                Some("health-SlaRecv"),
+            )
+            .expect("send ack-required");
+        let message_id = receipt
+            .get("deliveries")
+            .and_then(|d| d.get(0))
+            .and_then(|d| d.get("payload"))
+            .and_then(|p| p.get("event_id"))
+            .and_then(Value::as_str)
+            .expect("session id")
+            .to_string();
+
+        let gate = AckOverdueFilter {
+            sla_secs: Some(0),
+            thread_id: Some("health-SlaRecv".into()),
+        };
+        // Unacked ping → the gate reports exactly it, with its age + the SLA
+        // that produced the row (a 0-second gate must say so).
+        let rows = mail
+            .ack_overdue(&project, "SlaRecv", &gate)
+            .expect("ack-overdue read");
+        let rows = rows.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "one unacked ping: {rows:?}");
+        assert_eq!(rows[0]["sla_secs"].as_u64(), Some(0));
+        assert!(rows[0]["age_secs"].is_u64(), "age is reported");
+        assert_eq!(rows[0]["thread_id"].as_str(), Some("health-SlaRecv"));
+
+        // The recipient acks → the read is empty (the handling fact).
+        mail.ack(&project, "SlaRecv", &message_id)
+            .expect("ack the ping");
+        let after = mail
+            .ack_overdue(&project, "SlaRecv", &gate)
+            .expect("ack-overdue read after ack");
+        assert!(
+            after.as_array().unwrap().is_empty(),
+            "ack clears the row: {after}"
+        );
+
+        // A sibling read narrowed to another thread sees nothing.
+        let other_thread = mail
+            .ack_overdue(
+                &project,
+                "SlaRecv",
+                &AckOverdueFilter {
+                    sla_secs: Some(0),
+                    thread_id: Some("other-thread".into()),
+                },
+            )
+            .expect("other-thread read");
+        assert!(other_thread.as_array().unwrap().is_empty());
+    }
+
+    /// The door must never answer "nothing overdue" for an identity it knows
+    /// nothing about: an unregistered agent has no receipts, and an empty set
+    /// from THAT is indistinguishable from a real all-clear (the exact trap
+    /// the escalation gate would fall into). Loud error instead.
+    #[test]
+    fn ack_overdue_unregistered_agent_is_loud() {
+        let _g = crate::config::lock_env();
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("acksla-unknown-{}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        let err = mail
+            .ack_overdue(&project, "GhostAgent", &AckOverdueFilter::default())
+            .expect_err("an unknown identity must not read as all-clear");
         let msg = err.to_string();
         assert!(
-            msg.contains("ack_overdue_only") && msg.contains("ack_ts"),
-            "error names the filter + the missing data: {msg}"
+            msg.contains("GhostAgent") && msg.contains("not registered"),
+            "error names the agent + the reason: {msg}"
         );
     }
 
