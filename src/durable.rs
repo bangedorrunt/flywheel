@@ -2753,8 +2753,8 @@ pub struct ReadOutput {
 /// Parse one `__read` JSON output into [`ReadOutput`]. A null or missing
 /// `state` yields `None` (file absent/malformed — the leaf never errors on
 /// the file channel).
-pub fn parse_read_output(v: &serde_json::Value) -> anyhow::Result<ReadOutput> {
-    Ok(ReadOutput {
+pub fn parse_read_output(v: &serde_json::Value) -> ReadOutput {
+    ReadOutput {
         terminal: v
             .get("terminal")
             .and_then(serde_json::Value::as_str)
@@ -2764,7 +2764,7 @@ pub fn parse_read_output(v: &serde_json::Value) -> anyhow::Result<ReadOutput> {
             .get("state")
             .filter(|s| !s.is_null())
             .and_then(|s| serde_json::from_value(s.clone()).ok()),
-    })
+    }
 }
 
 /// Resume-dedup verdict: should the loop (re-)send this prompt?
@@ -3018,7 +3018,7 @@ async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
     let raw = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .map_err(|e| map_err(anyhow::anyhow!("__read bad JSON: {e}: {raw}")))?;
-    let ro = parse_read_output(&v).map_err(map_err)?;
+    let ro = parse_read_output(&v);
     // freshness evaluated HERE at run time so the verdict is checkpointed
     // with the leaf result — a replay cannot re-judge a stale file later
     let now_unix = std::time::SystemTime::now()
@@ -10387,7 +10387,7 @@ mod tests {
             r#"{"terminal": "hello", "state": {"context_pct": 85, "ts": "2026-08-03T03:00:00Z"}}"#,
         )
         .unwrap();
-        let ro = parse_read_output(&v).unwrap();
+        let ro = parse_read_output(&v);
         assert_eq!(ro.terminal, "hello");
         assert_eq!(ro.state.as_ref().map(|s| s.context_pct), Some(85));
     }
@@ -10396,11 +10396,11 @@ mod tests {
     fn parse_read_output_null_and_missing_state() {
         let null_state: serde_json::Value =
             serde_json::from_str(r#"{"terminal": "x", "state": null}"#).unwrap();
-        let ro = parse_read_output(&null_state).unwrap();
+        let ro = parse_read_output(&null_state);
         assert_eq!(ro.state, None);
         // legacy plain-text output (pre-zwa) tolerated via terminal field
         let missing: serde_json::Value = serde_json::from_str(r#"{"terminal": "y"}"#).unwrap();
-        let ro = parse_read_output(&missing).unwrap();
+        let ro = parse_read_output(&missing);
         assert_eq!(ro.state, None);
         assert_eq!(ro.terminal, "y");
     }

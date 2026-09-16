@@ -121,7 +121,7 @@ fn send_receipt_from(v: Value) -> Result<SendReceipt, MailError> {
 /// envelope — defaulted honestly (the renewal never changes it). `reason`
 /// (bd-evqs) rides through so the loop's closed-bead sweep can release stale
 /// leases.
-fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
+fn renew_result_from(v: Value) -> RenewResult {
     let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0) as usize;
     let reservations = v
         .get("file_reservations")
@@ -157,10 +157,10 @@ fn renew_result_from(v: Value) -> Result<RenewResult, MailError> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(RenewResult {
+    RenewResult {
         renewed,
         reservations,
-    })
+    }
 }
 
 fn into_typed<T>(v: Value, op: &str) -> Result<T, MailError>
@@ -463,7 +463,7 @@ impl MailSurface for ToronMailBackend {
             m.renew(&project, &agent, extend, Some(&paths), None)
         })
         .await?;
-        renew_result_from(v)
+        Ok(renew_result_from(v))
     }
 
     async fn release_reservations(
@@ -707,7 +707,7 @@ impl MailSurface for ToronMailBackend {
     ) -> Result<Option<String>, MailError> {
         let mail = self.mail.clone();
         let (project, pane_id) = (project.to_string(), pane_id.to_string());
-        let v = run_facade(mail, move |m| m.resolve_pane_identity(&project, &pane_id)).await?;
+        let v = run_facade(mail, move |m| Ok(m.resolve_pane_identity(&project, &pane_id))).await?;
         Ok(v.get("agent_name")
             .and_then(Value::as_str)
             .map(String::from))
@@ -816,7 +816,7 @@ mod tests {
                 "new_expires_ts": "1786200000000000",
             }],
         });
-        let r = renew_result_from(v).expect("convert");
+        let r = renew_result_from(v);
         assert_eq!(r.renewed, 1);
         assert_eq!(r.reservations[0].id, "deadbeef");
         assert_eq!(
@@ -852,7 +852,7 @@ mod tests {
                 },
             ],
         });
-        let r = renew_result_from(v).expect("convert");
+        let r = renew_result_from(v);
         assert_eq!(r.renewed, 2);
         assert_eq!(r.reservations[0].reason, "bd-12");
         assert_eq!(r.reservations[1].reason, "", "missing reason stays empty");

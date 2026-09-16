@@ -1978,7 +1978,7 @@ impl Mail {
     /// to the current pin even when the identity file still names the
     /// previous occupant. Any herdr failure degrades to the file bridge
     /// below, never an error.
-    pub fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Result<Value> {
+    pub fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Value {
         if multiplexer_is_herdr() {
             if let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None) {
                 let mut client = backend.client();
@@ -1993,11 +1993,11 @@ impl Mail {
                                     .and_then(Value::as_str)
                                     .filter(|s| !s.is_empty())
                                 {
-                                    return Ok(json!({
+                                    return json!({
                                         "agent_name": pin,
                                         "pane_id": pane_id,
                                         "source": "pane-token",
-                                    }));
+                                    });
                                 }
                                 break; // pane live but unstamped → file bridge
                             }
@@ -2009,15 +2009,15 @@ impl Mail {
         }
         let path = canonical_identity_path(project_key, pane_id);
         match std::fs::read_to_string(&path) {
-            Ok(name) if !name.trim().is_empty() => Ok(json!({
+            Ok(name) if !name.trim().is_empty() => json!({
                 "agent_name": name.trim(),
                 "pane_id": pane_id,
                 "identity_path": path.to_string_lossy(),
-            })),
-            _ => Ok(json!({
+            }),
+            _ => json!({
                 "error": "no identity file",
                 "pane_id": pane_id,
-            })),
+            }),
         }
     }
 }
@@ -3282,9 +3282,7 @@ mod tests {
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         unsafe { std::env::set_var("HERDR_SOCKET_PATH", "/tmp/flywheel-k6cw-dead.sock") };
         let mail = Mail::from_config(None).expect("ok").expect("Some");
-        let v = mail
-            .resolve_pane_identity("k6cw-proj", "w9:p9")
-            .expect("fallback never errors");
+        let v = mail.resolve_pane_identity("k6cw-proj", "w9:p9");
         assert_eq!(v.get("pane_id").and_then(Value::as_str), Some("w9:p9"));
         assert!(
             v.get("error").is_some(),
