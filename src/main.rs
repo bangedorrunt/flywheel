@@ -539,24 +539,35 @@ fn inbox_cli_filter(
     urgent: bool,
     unread: bool,
     since: Option<&str>,
+    thread_id: Option<&str>,
     limit: u32,
 ) -> Option<mail_shim::MailInboxFilter> {
-    match (since, unread) {
-        (Some(ts), _) => Some(mail_shim::MailInboxFilter {
+    match (since, unread, thread_id) {
+        (Some(ts), _, _) => Some(mail_shim::MailInboxFilter {
             urgent_only: urgent,
             unread_only: unread,
             include_bodies: true,
             limit,
             since_ts: Some(ts.to_string()),
+            thread_id: thread_id.map(str::to_string),
             ..Default::default()
         }),
-        (None, true) => Some(mail_shim::MailInboxFilter {
+        (None, true, _) => Some(mail_shim::MailInboxFilter {
             unread_only: true,
             include_bodies: true,
             limit,
+            thread_id: thread_id.map(str::to_string),
             ..Default::default()
         }),
-        (None, false) => None,
+        // bd-44hw: a bare --thread-id rides the filtered surface too —
+        // thread filtering is post-unwrap, so bodies come along.
+        (None, false, Some(t)) => Some(mail_shim::MailInboxFilter {
+            include_bodies: true,
+            limit,
+            thread_id: Some(t.to_string()),
+            ..Default::default()
+        }),
+        (None, false, None) => None,
     }
 }
 
@@ -567,13 +578,26 @@ mod inbox_filter_tests {
     /// bd-ursy: unread-only must carry the CLI limit (default 0 = take(0)).
     #[test]
     fn unread_only_carries_limit() {
-        let f = inbox_cli_filter(false, true, None, 10).expect("filtered");
+        let f = inbox_cli_filter(false, true, None, None, 10).expect("filtered");
         assert!(f.unread_only);
         assert_eq!(f.limit, 10, "limit rides every filtered arm");
-        assert!(inbox_cli_filter(false, false, None, 10).is_none());
-        let s = inbox_cli_filter(true, false, Some("x"), 7).expect("since");
+        assert!(inbox_cli_filter(false, false, None, None, 10).is_none());
+        let s = inbox_cli_filter(true, false, Some("x"), None, 7).expect("since");
         assert_eq!(s.limit, 7);
         assert!(s.urgent_only);
+    }
+
+    /// bd-44hw: a bare --thread-id rides the filtered surface too.
+    #[test]
+    fn thread_only_rides_filtered_surface() {
+        let f = inbox_cli_filter(false, false, None, Some("bd-1"), 20).expect("filtered");
+        assert_eq!(f.thread_id.as_deref(), Some("bd-1"));
+        assert_eq!(f.limit, 20);
+        // composes with the other flags
+        let g = inbox_cli_filter(true, true, Some("2026-01-01T00:00:00Z"), Some("bd-2"), 5)
+            .expect("filtered");
+        assert_eq!(g.thread_id.as_deref(), Some("bd-2"));
+        assert!(g.urgent_only && g.unread_only);
     }
 }
 
@@ -16335,6 +16359,7 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             unread,
             limit,
             since,
+            thread_id,
             as_agent,
             json,
         } => {
@@ -16358,7 +16383,14 @@ fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             // bd-zd2v: --since (RFC3339 or the `last` cursor) rides the
             // filtered surface with the other flags passed through; without
             // it the legacy path below is byte-identical to before.
-            let v = match inbox_cli_filter(*urgent, *unread, since.as_deref(), *limit) {
+            // bd-44hw: --thread-id rides it too (post-unwrap server-side).
+            let v = match inbox_cli_filter(
+                *urgent,
+                *unread,
+                since.as_deref(),
+                thread_id.as_deref(),
+                *limit,
+            ) {
                 Some(f) => mail.inbox_filtered(&key, &name, &f)?,
                 None => mail.inbox(&key, &name, *urgent, *limit)?,
             };
