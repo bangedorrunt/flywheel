@@ -6,6 +6,7 @@
 //! Clock enters tick only as Msg payload (Tick{now}); no Instant now.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
@@ -243,7 +244,7 @@ pub fn render_open_decisions(model: &WorkspaceModel) -> String {
         return out;
     }
     for r in &rows {
-        out.push_str(&format!("\n- [{}] {}", r.corr, r.body));
+        let _ = write!(out, "\n- [{}] {}", r.corr, r.body);
     }
     out
 }
@@ -307,17 +308,13 @@ pub fn render_divergence(rows: &[Divergence]) -> String {
     for r in rows {
         match r {
             Divergence::ClosedBeadOpenCorr { bead, corr } => {
-                out.push_str(&format!(
-                    "\n- closed-bead/open-corr bead={bead} corr={corr}"
-                ));
+                let _ = write!(out, "\n- closed-bead/open-corr bead={bead} corr={corr}");
             }
             Divergence::AnsweredCorrHeldBead { corr, bead } => {
-                out.push_str(&format!(
-                    "\n- answered-corr/held-bead corr={corr} bead={bead}"
-                ));
+                let _ = write!(out, "\n- answered-corr/held-bead corr={corr} bead={bead}");
             }
             Divergence::DoneWithoutLegalClose { bead } => {
-                out.push_str(&format!("\n- done-without-legal-close bead={bead}"));
+                let _ = write!(out, "\n- done-without-legal-close bead={bead}");
             }
         }
     }
@@ -541,17 +538,17 @@ pub fn render_digest(entries: &[DigestEntry], now: u64) -> String {
             0 => "age unknown".to_string(),
             t => format!("{}s ago", now.saturating_sub(t)),
         };
-        out.push_str(&format!("- [{age}] {} {}: {}\n", e.kind, e.pin, e.detail));
+        let _ = write!(out, "- [{age}] {} {}: {}\n", e.kind, e.pin, e.detail);
     }
     let beads = digest_bead_ids(entries);
     if beads.is_empty() {
         out.push_str("beads: none in this digest\n");
     } else {
-        out.push_str(&format!("beads: {}\n", beads.join(", ")));
+        let _ = write!(out, "beads: {}\n", beads.join(", "));
     }
     out.push_str("commands:\n");
     for b in &beads {
-        out.push_str(&format!("  br show {b}\n"));
+        let _ = write!(out, "  br show {b}\n");
     }
     if beads.is_empty() {
         out.push_str("  (no bead commands)\n");
@@ -602,21 +599,17 @@ pub fn render_digest_with_holds(
         out.push_str("holds: none\n");
         return out;
     }
-    out.push_str(&format!(
-        "holds ({} earliest-deadline first):\n",
-        holds.len()
-    ));
+    let _ = write!(out, "holds ({} earliest-deadline first):\n", holds.len());
     for (corr, needed_by) in holds {
         if *needed_by <= now {
             let overdue = now.saturating_sub(*needed_by);
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "- ESCALATE {corr} needed-by {needed_by} ({overdue}s overdue)\n"
-            ));
+            );
         } else {
             let remaining = needed_by.saturating_sub(now);
-            out.push_str(&format!(
-                "- {corr} needed-by {needed_by} ({remaining}s left)\n"
-            ));
+            let _ = write!(out, "- {corr} needed-by {needed_by} ({remaining}s left)\n");
         }
     }
     out
