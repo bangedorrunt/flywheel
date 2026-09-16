@@ -102,12 +102,11 @@ impl DoorbellQueue {
     }
 
     /// Direct insertion with explicit channel/hint key (preserves per-channel).
-    #[allow(dead_code)]
     pub fn push_with_hint(&mut self, class: EventClass, hint: String, line: String) {
         self.pending.insert((class, hint), line);
     }
 
-    #[allow(dead_code)] // asserted by queue coalesce tests
+    /// Queue depth (asserted by the queue coalesce tests).
     pub fn len(&self) -> usize {
         self.pending.len()
     }
@@ -278,7 +277,6 @@ pub fn watch_id(line: &str) -> Option<String> {
 }
 
 /// `created_at` unix secs on a watch NDJSON line (gap 1 fix: plane-S cursor).
-#[allow(dead_code)]
 pub fn watch_created_at(line: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     v.get("created_at").and_then(serde_json::Value::as_u64)

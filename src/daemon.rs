@@ -56,7 +56,7 @@ pub enum DaemonState {
     /// `cfg(target_os = "linux")` branch of [`detect_state`], so on macOS the
     /// variant is reachable in `match` arms but never built — a platform
     /// difference the lint cannot see.
-    #[allow(dead_code)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     RunningSystemd,
     /// Running via pidfile spawn (fallback).
     RunningPidfile(u32),

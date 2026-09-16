@@ -130,10 +130,6 @@ pub struct MailHealth {
 }
 
 impl MailHealth {
-    #[allow(dead_code)]
-    pub fn is_default(&self) -> bool {
-        self.consecutive_failures == 0 && self.last_ok_ts == 0
-    }
     pub fn should_escalate(&self, n: u32) -> bool {
         n != 0 && self.consecutive_failures >= n
     }

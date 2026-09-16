@@ -297,7 +297,7 @@ pub(crate) fn inspect_due(
 /// (default 3600s, the pending_wait TTL twin) is due for resurface.
 /// NOTE (bd-8j7m): no paused-since clock exists in the drain leaf yet;
 /// shipped as tested API for the lane that tracks pause declarations.
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn paused_resurface_due(paused_age_secs: u64, resurface_secs: u64) -> bool {
     paused_age_secs >= resurface_secs
 }

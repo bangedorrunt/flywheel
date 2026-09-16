@@ -5895,13 +5895,18 @@ mod spawn_boot_reliability_tests {
                 && !giveup_slice.contains("break agent"),
             "GiveUp must return Err(stall_giveup_error), never break agent into landed"
         );
-        let persist = crate::tripwire::find_fn(src, "doorbell_persist_wake");
-        let persist_body = &src[persist..persist + 800];
+        // GS-037 P0-C now rides the host's LIVE persist door: the retired
+        // plane-P pair had no caller (plane D owns wake-state persistence —
+        // `doorbell-rt::{brain,store}`), so the fail-loud contract follows the
+        // code that actually saves.
+        let persist = crate::tripwire::find_fn(src, "doorbell_note_observed_wake");
+        let persist_end = crate::tripwire::find_fn(src, "upsert_workspace_receipt");
+        let persist_body = &src[persist..persist_end];
         assert!(
             persist_body.contains("-> Result<()>")
                 && persist_body.contains("save_wake_state")
                 && !persist_body.contains("let _ = doorbell::save_wake_state"),
-            "doorbell_persist_wake must fail-loud on save (no let _ =)"
+            "doorbell_note_observed_wake must fail-loud on save (no let _ =)"
         );
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
         let spawn_body = &src[spawn..spawn + 40000];
@@ -6338,13 +6343,12 @@ mod spawn_boot_reliability_tests {
         );
         // It MAY stamp via doorbell_note_observed_wake when --wait OBSERVED
         // herdr settled_status working|idle|done|blocked after land (GS-039).
+        // The old negative guard (cmd_send must not call the retired
+        // `doorbell_persist_wake`) is subsumed: that symbol no longer exists, so
+        // the positive OBSERVED-status gate below is the whole contract.
         let send = crate::tripwire::find_fn(src, "cmd_send");
         let send_end = crate::tripwire::find_fn(src, "stall_step");
         let send_body = &src[send..send_end];
-        assert!(
-            !send_body.contains("doorbell_persist_wake("),
-            "cmd_send must not invent-green last_wake via doorbell_persist_wake"
-        );
         assert!(
             send_body.contains("doorbell_note_observed_wake(")
                 && send_body.contains("settled_status")
@@ -9027,62 +9031,16 @@ fn sleep_to_next_second() {
     ));
 }
 
-// bd-durable-doorbell-lngf: persist the wake state after a delivery pass —
-// since high-waters + the last-wake stamp survive a crash (at-least-once
-// redelivery reads this on restart; the `[doorbell]` line is idempotent).
-//
-// Kept, not deleted: `gs037_send_wake_presence_folds_present` asserts this
-// body stays fail-loud (no `let _ =` around the save, GS-037 P0-C), and it is
-// the only door the host may persist through, so `cmd_send` cannot re-invent
-// a green stamp. Nothing calls it until that persist path lands.
-#[allow(dead_code)]
-fn doorbell_persist_wake(
-    workspace: &str,
-    since_by_pin: &BTreeMap<String, String>,
-    woke_pin: Option<&str>,
-) -> Result<()> {
-    let path = doorbell::wake_state_file(&config::state_dir(), workspace);
-    let mut st = doorbell::load_wake_state(&path);
-    st.since_by_pin = since_by_pin.clone();
-    if let Some(pin) = woke_pin {
-        doorbell::note_wake(&mut st, pin, doorbell_now_unix());
-    }
-    // GS-037 P0-C save-fail-silent: never discard save errors.
-    doorbell::save_wake_state(&path, &st).with_context(|| {
-        format!(
-            "doorbell wake state save failed at {} — refuse silent drop (GS-037 P0-C)",
-            path.display()
-        )
-    })?;
-    Ok(())
-}
-
-// Plane-S sibling of [`doorbell_persist_wake`]: same fail-loud save, plus the
-// plane-S cursor high-water (doorbell-rt tracks it in-process today).
-#[allow(dead_code)]
-fn doorbell_persist_wake_with_plane_s(
-    workspace: &str,
-    since_by_pin: &BTreeMap<String, String>,
-    plane_s_cursor_us: Option<i64>,
-    woke_pin: Option<&str>,
-) -> Result<()> {
-    let path = doorbell::wake_state_file(&config::state_dir(), workspace);
-    let mut st = doorbell::load_wake_state(&path);
-    st.since_by_pin = since_by_pin.clone();
-    if plane_s_cursor_us.is_some() {
-        st.plane_s_cursor_us = plane_s_cursor_us;
-    }
-    if let Some(pin) = woke_pin {
-        doorbell::note_wake(&mut st, pin, doorbell_now_unix());
-    }
-    doorbell::save_wake_state(&path, &st).with_context(|| {
-        format!(
-            "doorbell wake state save failed at {} — refuse silent drop (GS-037 P0-C)",
-            path.display()
-        )
-    })?;
-    Ok(())
-}
+// bd-durable-doorbell-lngf retired as a plane-P pair (bd-durable-wake-persist):
+// `doorbell_persist_wake` / `doorbell_persist_wake_with_plane_s` had no caller
+// because the delivery-pass persistence they described moved to its one home —
+// plane D. `crates/doorbell-rt/src/brain.rs` writes `since_by_pin` (the
+// plane-P inbox high-water) and `plane_s_cursor_us` (the plane-S high-water)
+// onto `WakeState`, and `doorbell-rt::store::save_wake` persists it, exactly as
+// ADR-0012 Phase 1/3 requires (ONE store, never both planes). The fail-loud
+// contract those doors carried (GS-037 P0-C: no `let _ =` around the save)
+// lives on the host's own live door, `doorbell_note_observed_wake`, which the
+// tripwire below asserts.
 
 /// GS-039 P0-1: stamp last_wake from a REAL observation without clobbering
 /// plane-P/S high-waters (refresh/sweep callers lack the live since map).
@@ -30526,7 +30484,10 @@ fn cmd_internal_loop_run_verify(
     Ok(())
 }
 
-#[allow(dead_code)] // TODO: wire VerifySink into status rendering for delivery-verdict ADR (deferred)
+/// Workflow-graph verify leaf (ADR-0024 Spec 6): the engine hands a templated
+/// verify command to this sink, which reuses `loop_run_verify_exec`'s exec path
+/// (slot held, TIMEBOX, receipt via `write_receipt`) so no second verify path
+/// exists. Attached on every `compose --run` / `workflow run --execute` arm.
 fn make_verify_sink(cfg: Config, project: String) -> toron_workflow::engine::VerifySink {
     let sink = toron_workflow::engine::VerifySink::default();
     let cfg_clone = cfg.clone();

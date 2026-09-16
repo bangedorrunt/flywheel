@@ -70,19 +70,17 @@ where
 /// `send`/`reply` envelope: the facade JSON is `{deliveries, count,
 /// verified_sender}` with `deliveries[].payload = {recipient, event_id}` —
 /// the surface `SendReceipt` derives its `id` from the first delivery, so the
-/// conversion is explicit.
+/// conversion is explicit. `verified_sender` / delivery `project` keys are not
+/// consumed by this conversion (serde ignores the extra keys) — they are not
+/// deleted from the wire, only from this struct.
 #[derive(Deserialize)]
 struct SendEnvelope {
     deliveries: Vec<DeliveryEnvelope>,
     count: usize,
-    #[allow(dead_code)]
-    verified_sender: bool,
 }
 
 #[derive(Deserialize)]
 struct DeliveryEnvelope {
-    #[allow(dead_code)]
-    project: String,
     payload: DeliveryPayloadEnvelope,
 }
 

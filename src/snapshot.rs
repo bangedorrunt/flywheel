@@ -93,6 +93,11 @@ pub struct Snapshot {
     /// herdr — never invent-green hardcoded 0 in live decide Snapshot.
     #[serde(default)]
     pub launch_pending: u32,
+    /// ADR-0010 D10 delivery-verdict loop projection: per-bead phase, the
+    /// mail-degraded dispatch hold, queue depth, and the event watermark as
+    /// last persisted by the durable loop. `loop` on the wire.
+    #[serde(default, rename = "loop")]
+    pub loop_state: crate::durable::LoopSnapshot,
 }
 
 /// Journal value → tick Msg (workspace first, legacy doorbell second).
@@ -290,6 +295,18 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
     let coalitions = list_active_coalitions(project, now);
     let joinable = fleet_joinable(&dispatcher, &pins);
 
+    // ADR-0010 D10: the durable loop's projection. A run with no loop recorded
+    // (or an unreadable file, which degrades loudly) reports the default shape
+    // — never a fabricated phase.
+    let loop_state = match crate::state::load_active_loop(project) {
+        Ok(Some(al)) => crate::durable::LoopSnapshot::from_active_loop(&al),
+        Ok(None) => crate::durable::LoopSnapshot::default(),
+        Err(_) => {
+            degraded.push("loop".to_string());
+            crate::durable::LoopSnapshot::default()
+        }
+    };
+
     Snapshot {
         schema: SNAPSHOT_SCHEMA.to_string(),
         generated_at: now,
@@ -308,6 +325,7 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         held_paths,
         coalitions,
         launch_pending,
+        loop_state,
     }
 }
 
@@ -500,6 +518,9 @@ pub fn render_helm(snap: &Snapshot, now: u64) -> String {
         if snap.afk > 0 {
             v.push(format!("{} afk queued", snap.afk));
         }
+        if snap.loop_state.mail_degraded {
+            v.push("mail-degraded dispatch hold".to_string());
+        }
         v
     };
     if unread_bits.is_empty() {
@@ -568,6 +589,7 @@ pub fn schema_keys() -> Vec<&'static str> {
         "held_paths",
         "coalitions",
         "launch_pending",
+        "loop",
     ]
 }
 
@@ -625,6 +647,7 @@ mod adr0010_d10_tests {
             held_paths: vec![],
             coalitions: vec![],
             launch_pending: 0,
+            loop_state: crate::durable::LoopSnapshot::default(),
         }
     }
 

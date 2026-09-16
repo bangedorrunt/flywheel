@@ -10,7 +10,9 @@
 //! checkpoint on restart with the same invocation id. The queue and the agent
 //! states are deterministic across replays because every effect is checkpointed.
 
-// TODO: LoopSnapshot/tick etc wired in W3, not yet rendered in status (deferred delivery-verdict ADR)
+// LoopSnapshot and `tick` are wired: `tick` is the pure reducer folded by
+// every poll, and `LoopSnapshot` is the status projection consumed by
+// `loop status` + the fleet snapshot (delivery-verdict ADR-0010 D10).
 //!
 //! Leaves shell out to the flywheel binary itself (`__poll` / `__poll_events` /
 //! `__send` hidden subcommands) so the blocking herdr socket client never runs
@@ -180,7 +182,6 @@ fn default_drain_grace_polls() -> u32 {
 }
 
 /// Loop-owned bead lifecycle (Spec 3) — closed enum, illegal transitions unrepresentable.
-#[allow(dead_code)] // TODO: wire LoopSnapshot into status rendering for delivery-verdict ADR (deferred)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LoopPhase {
     #[default]
@@ -192,6 +193,26 @@ pub enum LoopPhase {
     WaveHeld,
     Blocked,
     Reclaim,
+}
+
+impl LoopPhase {
+    /// Parse the persisted phase token — the same spelling serde emits for this
+    /// enum (also what `ActiveLoop.per_bead_phase` holds). Unknown tokens return
+    /// `None` so a hand-edited or future phase string degrades to "not reported"
+    /// instead of failing the whole status read.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "Idle" => Some(Self::Idle),
+            "Dispatched" => Some(Self::Dispatched),
+            "ClaimWatch" => Some(Self::ClaimWatch),
+            "Verify" => Some(Self::Verify),
+            "Complete" => Some(Self::Complete),
+            "WaveHeld" => Some(Self::WaveHeld),
+            "Blocked" => Some(Self::Blocked),
+            "Reclaim" => Some(Self::Reclaim),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,8 +539,15 @@ pub enum LoopMsg {
     },
 }
 
-#[allow(dead_code)] // TODO: wire into status rendering for delivery-verdict ADR (deferred)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Delivery-verdict status projection of the durable loop (ADR-0010 D10):
+/// per-bead phase, mail-degraded dispatch hold, queued work, and the event
+/// watermark — exactly the state `loop status` and the fleet snapshot render.
+///
+/// Read-time projection of the persisted [`crate::state::ActiveLoop`]. The
+/// status doors run in a different process than the loop and never hold the
+/// `LoopModel`, so nothing derived is persisted twice: the `ActiveLoop` file is
+/// the single source of truth.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoopSnapshot {
     pub per_bead_phase: std::collections::BTreeMap<String, LoopPhase>,
     pub mail_degraded: bool,
@@ -527,14 +555,22 @@ pub struct LoopSnapshot {
     pub event_cursor: Option<crate::state::EventCursor>,
 }
 
-#[allow(dead_code)] // TODO: see LoopSnapshot
 impl LoopSnapshot {
-    pub fn from_model(model: &LoopModel) -> Self {
+    pub fn from_active_loop(al: &crate::state::ActiveLoop) -> Self {
         Self {
-            per_bead_phase: model.per_bead_phase.clone(),
-            mail_degraded: model.mail_degraded,
-            queue_len: model.queue.len(),
-            event_cursor: model.event_cursor.clone(),
+            per_bead_phase: al
+                .per_bead_phase
+                .iter()
+                .filter_map(|(k, v)| LoopPhase::parse(v).map(|p| (k.clone(), p)))
+                .collect(),
+            mail_degraded: al.mail_degraded,
+            queue_len: al
+                .params
+                .get("queue")
+                .and_then(|q| q.as_array())
+                .map(Vec::len)
+                .unwrap_or(0),
+            event_cursor: al.event_cursor.clone(),
         }
     }
 }
@@ -5253,7 +5289,11 @@ pub fn plan_reclaim(
     out
 }
 
-#[allow(dead_code)]
+// NOTE: gated with `cfg_attr`, never an inner test attribute — two tripwires in
+// this file slice the "non-test source" at the first inner test attribute
+// (`split(..).next()`), so no such marker may appear above them.
+// Test-referenced only, hence the narrower gate.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn plan_reclaim_ex(
     now_secs: i64,
     beads: &[ReadyBead],
@@ -5882,20 +5922,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
             al.per_bead_phase
                 .iter()
-                .filter_map(|(k, v)| {
-                    let phase = match v.as_str() {
-                        "Idle" => LoopPhase::Idle,
-                        "Dispatched" => LoopPhase::Dispatched,
-                        "ClaimWatch" => LoopPhase::ClaimWatch,
-                        "Verify" => LoopPhase::Verify,
-                        "Complete" => LoopPhase::Complete,
-                        "WaveHeld" => LoopPhase::WaveHeld,
-                        "Blocked" => LoopPhase::Blocked,
-                        "Reclaim" => LoopPhase::Reclaim,
-                        _ => return None,
-                    };
-                    Some((k.clone(), phase))
-                })
+                .filter_map(|(k, v)| LoopPhase::parse(v).map(|p| (k.clone(), p)))
                 .collect()
         } else {
             std::collections::BTreeMap::new()
@@ -8399,6 +8426,10 @@ pub async fn loop_status(cfg: &Config, project: &str) -> anyhow::Result<serde_js
         "value": rec.map(|r| r.value),
         "mail_degraded": al.mail_degraded,
         "mail_health": al.mail_health,
+        // ADR-0010 D10: the per-bead phase / queue / watermark projection the
+        // delivery-verdict status doors render (same source as the fleet
+        // snapshot's `loop` section).
+        "loop": LoopSnapshot::from_active_loop(&al),
     }))
 }
 

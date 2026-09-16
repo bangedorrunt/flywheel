@@ -3,7 +3,6 @@
 
 use std::fmt;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FailureKind {
     Auth,
@@ -32,8 +31,9 @@ impl fmt::Display for FailureKind {
     }
 }
 
-#[allow(dead_code)]
 impl FailureKind {
+    /// Frozen taxonomy spelling (frozen by the test below).
+    #[cfg(test)]
     pub const ALL: [Self; 8] = [
         Self::Auth,
         Self::RateLimit,
@@ -44,6 +44,7 @@ impl FailureKind {
         Self::Unknown,
         Self::Billing,
     ];
+    #[cfg(test)]
     pub fn variant_name(&self) -> &'static str {
         match self {
             Self::Auth => "Auth",
@@ -192,6 +193,22 @@ pub fn classify_with_stage(
             stage: stage.unwrap_or("park"),
         };
     }
+    // ADR-0026 Spec 1 taxonomy arm: an operator/agent cancellation is its own
+    // kind (never retried, never rerouted). Deliberately narrow needles — a
+    // generic "interrupted" substring would reclassify transport noise.
+    if lower.contains("cancelled")
+        || lower.contains("canceled")
+        || lower.contains("sigint")
+        || lower.contains("interrupted by user")
+    {
+        return ClassifiedFailure {
+            kind: FailureKind::Cancelled,
+            retryable: false,
+            reroute_eligible: false,
+            evidence,
+            stage: stage.unwrap_or("execute"),
+        };
+    }
     ClassifiedFailure {
         kind: FailureKind::Unknown,
         retryable: false,
@@ -209,7 +226,9 @@ fn truncate_evidence(s: &str, max: usize) -> String {
     }
 }
 
-#[allow(dead_code)]
+/// ADR-0026 rule, kept as the tested statement of the contract: two failures
+/// of the SAME kind in a row are terminal (a different kind is a new episode).
+#[cfg(test)]
 pub fn is_terminal_on_second_failure(first_kind: FailureKind, second_kind: FailureKind) -> bool {
     first_kind == second_kind
 }
@@ -356,6 +375,17 @@ mod tests {
     #[test]
     fn failure_classify_blocked_never_without_reservation_signal() {
         let c = classify("agent is blocked", None, None);
+        assert_eq!(c.kind, FailureKind::Unknown);
+    }
+    #[test]
+    fn failure_classify_cancelled_is_its_own_kind() {
+        let c = classify("request cancelled by operator", None, None);
+        assert_eq!(c.kind, FailureKind::Cancelled);
+        assert!(!c.retryable);
+        assert!(!c.reroute_eligible);
+        // Narrow needles: a bare "interrupted" substring is transport noise,
+        // not a cancellation — it must stay Unknown.
+        let c = classify("connection interrupted", None, None);
         assert_eq!(c.kind, FailureKind::Unknown);
     }
     #[test]

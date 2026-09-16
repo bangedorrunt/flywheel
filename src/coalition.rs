@@ -648,8 +648,6 @@ impl CoalitionStore {
     /// leases are released here. `member_intents`/`member_reservations` stop
     /// surfacing the departed member immediately (the members filter).
     ///
-    /// `#[allow(dead_code)]` — same main.rs wiring note as `join`.
-    #[allow(dead_code)]
     pub fn leave(&self, id: &str, agent: &str) -> Result<CoalitionManifest> {
         let mut manifest = self.load_manifest(id)?;
         if manifest.status != "active" {

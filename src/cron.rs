@@ -81,7 +81,7 @@ pub fn crons_file() -> PathBuf {
     crate::config::config_dir().join("crons.toml")
 }
 
-#[allow(dead_code)] // legacy crons.toml write surface — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))] // legacy crons.toml write surface — P4 (bd-25g7.4) migrates/retires
 impl Crons {
     /// Load the registry from the real XDG path (missing file = empty).
     pub fn load() -> Result<Self> {
@@ -139,7 +139,7 @@ impl Crons {
 
 /// A cron as surfaced by `flywheel cron list`: a registry entry OR a
 /// schedule-triggered workflow from the catalog/built-ins.
-#[allow(dead_code)] // legacy merged view — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))] // legacy merged view — P4 (bd-25g7.4) migrates/retires
 #[derive(Debug, Clone)]
 pub struct MergedCron {
     pub entry: CronEntry,
@@ -534,7 +534,7 @@ pub fn derive_status(enabled: bool, in_flight: bool, last_status: Option<&str>) 
 }
 
 /// The `--json` row shape for list/status (agent-driver surface).
-#[allow(dead_code)] // legacy merged-row shape — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))] // legacy merged-row shape — P4 (bd-25g7.4) migrates/retires
 pub fn row_json(mc: &MergedCron, status: &str, next_due_ts: Option<i64>) -> Value {
     json!({
         "name": mc.entry.name,
@@ -558,7 +558,7 @@ pub fn row_json(mc: &MergedCron, status: &str, next_due_ts: Option<i64>) -> Valu
 
 /// A cron's derived status row (Spec 3): paused | due | running | succeeded |
 /// failed, plus the next-due tick for the scheduler.
-#[allow(dead_code)] // legacy derived-status row — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))] // legacy derived-status row — P4 (bd-25g7.4) migrates/retires
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronStatus {
     pub name: String,
@@ -590,7 +590,7 @@ pub struct CronRun {
 ///
 /// `add` MUST fail closed on an unresolvable template / unparsable cron /
 /// unknown owner (the lint-gate contract); the CLI does not re-validate.
-#[allow(dead_code)] // legacy manager contract — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))] // legacy manager contract — P4 (bd-25g7.4) migrates/retires
 pub trait CronManager {
     /// The merged view: registry entries + schedule-triggered workflows.
     fn list(&self) -> Result<Vec<MergedCron>>;
@@ -1283,7 +1283,7 @@ impl CronManager for RegistryCronManager {
 }
 
 /// Derive a [`CronStatus`] row for a merged cron (registry state + state log).
-#[allow(dead_code)] // legacy — P4 (bd-25g7.4) migrates/retires
+#[cfg_attr(not(test), allow(dead_code))] // legacy — P4 (bd-25g7.4) migrates/retires
 fn cron_status(mc: &MergedCron) -> CronStatus {
     let (last, in_flight) = last_run_state(&mc.entry.name);
     let status = derive_status(mc.entry.enabled, in_flight, last.as_deref());
