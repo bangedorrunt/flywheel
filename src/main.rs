@@ -13505,6 +13505,15 @@ fn cmd_send(
     }
 
     let timeout = timeout_ms.or_else(|| wait.then(|| cfg.timeout_ms()));
+    // bd-cx0r: announce the wait bound up front — the default is the 30min
+    // dispatch timeout, and a silent wait reads as a hang (observed: an
+    // operator tool-killed a healthy 90-minute brief at 180s).
+    if wait {
+        eprintln!(
+            "flywheel: --wait: expecting settle (idle|done|blocked), waiting up to {}s…",
+            timeout.unwrap_or_default() / 1000
+        );
+    }
     // bd-98gd: Spec C everywhere — the captain-facing send resolves each
     // target's profile from the spawn registry (same lookup the loop's
     // __profile leaf uses) and conditions its prompt. Loaded once; the
