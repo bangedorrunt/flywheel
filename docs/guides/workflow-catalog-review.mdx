@@ -64,7 +64,7 @@ Compound Engineering supplies the understand → plan → execute → review →
 
 ## What was reduced
 
-- **Discovery context:** `workflow list --brief` returns **name / trigger / topology** only (GS-048). Full descriptions, family, selection cue, run form, source, compose-token, and decide_trigger live on bare `workflow list --json` / `workflow show`.
+- **Discovery context:** `workflow list --brief` returns the GS-052 **hybrid** contract: **name / family / selection / run / topology / compose_token** (single live projection; topology kept for sticky-open). Full descriptions, source, crew, inputs, and decide_trigger live on bare `workflow list --json` / `workflow show`.
 - **Prompt authority:** stages carry reusable Compound/pstack contracts; workflow steps carry only local inputs, artifact paths, and control flow. A worker's `done` claim never replaces host verification.
 - **Overlap:** similar workflows remain separate only when their supervision/evidence contract differs. The catalog now states those boundaries instead of asking an agent to infer them from long descriptions.
 - **Long-running safety:** pickup, pause, babysit, autonomous work, and ship-beads remain operationally distinct; none creates a second loop or tracker.
