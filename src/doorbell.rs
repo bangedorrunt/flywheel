@@ -1097,100 +1097,10 @@ pub fn fanout_now(
     out
 }
 
-#[derive(Debug, Clone)]
-struct PendingRing {
-    npub: String,
-    injected_unix: u64,
-}
-
-/// Heard-or-deaf: a ring that is not heard is a conflict-shaped event.
-#[derive(Debug, Default, Clone)]
-pub struct HearTracker {
-    pending: BTreeMap<String, PendingRing>,
-    unanswered: BTreeSet<String>,
-    /// pin → npub, kept after expire so a late post still clears deaf.
-    npubs: BTreeMap<String, String>,
-}
-
-impl HearTracker {
-    pub fn note_inject(&mut self, pin: &str, npub: Option<&str>, now: u64) {
-        self.unanswered.remove(pin);
-        let npub = npub.unwrap_or("").to_lowercase();
-        if !npub.is_empty() {
-            self.npubs.insert(pin.to_string(), npub.clone());
-        }
-        self.pending.insert(
-            pin.to_string(),
-            PendingRing {
-                npub,
-                injected_unix: now,
-            },
-        );
-    }
-
-    /// Fill npubs learned later (whois on the 1s tick).
-    pub fn remember_npub(&mut self, pin: &str, npub: Option<&str>) {
-        let Some(n) = npub.filter(|s| !s.is_empty()) else {
-            return;
-        };
-        let n = n.to_lowercase();
-        self.npubs.insert(pin.to_string(), n.clone());
-        if let Some(ring) = self.pending.get_mut(pin) {
-            ring.npub = n;
-        }
-    }
-
-    pub fn note_heard_pin(&mut self, pin: &str) {
-        self.pending.remove(pin);
-        self.unanswered.remove(pin);
-    }
-
-    pub fn note_heard_pubkey(&mut self, pubkey: &str) {
-        let key = pubkey.to_lowercase();
-        let mut pins: Vec<String> = self
-            .pending
-            .iter()
-            .filter(|(_, r)| !r.npub.is_empty() && r.npub == key)
-            .map(|(p, _)| p.clone())
-            .collect();
-        pins.extend(
-            self.npubs
-                .iter()
-                .filter(|(_, n)| *n == &key)
-                .map(|(p, _)| p.clone()),
-        );
-        pins.sort();
-        pins.dedup();
-        for pin in pins {
-            self.note_heard_pin(&pin);
-        }
-    }
-
-    /// Move timed-out pending pins to unanswered. Returns newly expired pins.
-    pub fn expire(&mut self, now: u64, timeout_secs: u64) -> Vec<String> {
-        let mut expired = Vec::new();
-        self.pending.retain(|pin, ring| {
-            if now.saturating_sub(ring.injected_unix) >= timeout_secs {
-                expired.push(pin.clone());
-                false
-            } else {
-                true
-            }
-        });
-        for pin in &expired {
-            self.unanswered.insert(pin.clone());
-        }
-        expired
-    }
-
-    pub fn unanswered_pins(&self) -> Vec<String> {
-        self.unanswered.iter().cloned().collect()
-    }
-
-    pub fn seed_unanswered(&mut self, pins: impl IntoIterator<Item = String>) {
-        self.unanswered.extend(pins);
-    }
-}
+// bd-drub: the heard-or-deaf tracker lives in ONE place now —
+// `doorbell_rt::HearTracker` (byte-identical to the struct + impl that stood
+// here). Re-exported so `doorbell::HearTracker` paths keep compiling.
+pub use doorbell_rt::HearTracker;
 
 pub fn unanswered_file(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir
