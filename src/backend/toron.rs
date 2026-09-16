@@ -707,7 +707,10 @@ impl MailSurface for ToronMailBackend {
     ) -> Result<Option<String>, MailError> {
         let mail = self.mail.clone();
         let (project, pane_id) = (project.to_string(), pane_id.to_string());
-        let v = run_facade(mail, move |m| Ok(m.resolve_pane_identity(&project, &pane_id))).await?;
+        let v = run_facade(mail, move |m| {
+            Ok(m.resolve_pane_identity(&project, &pane_id))
+        })
+        .await?;
         Ok(v.get("agent_name")
             .and_then(Value::as_str)
             .map(String::from))

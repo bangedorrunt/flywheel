@@ -1092,8 +1092,7 @@ mod parity_tests {
         let dir_b = std::env::temp_dir().join(format!("parity-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir_b);
         let (tx_b, rx_b) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
-        let mut fcfg =
-            FileHostConfig::new(crate::config::state_dir(), project, ws.to_string());
+        let mut fcfg = FileHostConfig::new(crate::config::state_dir(), project, ws.to_string());
         fcfg.toron_bin = "true".into();
         fcfg.herdr_bin = "true".into();
         let file_host = FileHost::new(fcfg).with_tx(tx_b.clone());
