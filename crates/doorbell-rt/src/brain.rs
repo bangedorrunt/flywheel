@@ -976,9 +976,9 @@ mod tests {
             .await;
         for ts in [90, 95, 95] {
             brain
-                .dispatch(BrainMsg::Watch(
-                    format!("{{\"kind\":9,\"created_at\":{ts}}}").into(),
-                ))
+                .dispatch(BrainMsg::Watch(format!(
+                    "{{\"kind\":9,\"created_at\":{ts}}}"
+                )))
                 .await;
         }
         let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
@@ -994,7 +994,7 @@ mod tests {
         // Drive the REAL core reducer twice over one Msg log: byte-identical
         // effect sequences (the Phase-1 parity property, host-side).
         use crate::host::CoreReducer;
-        let log = vec![
+        let log = [
             BrainMsg::Watch("{\"kind\":9,\"tags\":[[\"p\",\"x\"]]}".into()),
             BrainMsg::HerdrStatus {
                 pin: "p".into(),
@@ -1362,7 +1362,7 @@ mod tests {
                 "body_md": "hi",
             })],
         );
-        assert!(brain.wake.since_by_pin.get("p").is_none());
+        assert!(!brain.wake.since_by_pin.contains_key("p"));
         brain.dispatch(BrainMsg::Sweep { now }).await;
         let hw = brain
             .wake

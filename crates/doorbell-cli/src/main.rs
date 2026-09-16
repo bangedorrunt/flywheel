@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve | Cmd::InternalServe => serve::run(&cfg).await,
         Cmd::Migrate { from } => {
             let copied = migrate::migrate(&from, &cfg.state_dir)?;
-            println!("{}", serde_json::json!({"migrated": copied}).to_string());
+            println!("{}", serde_json::json!({"migrated": copied}));
             Ok(())
         }
         Cmd::Ping {
