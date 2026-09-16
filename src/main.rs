@@ -2830,7 +2830,7 @@ enum BackendCmd {
     Default {
         /// multiplexer | mail
         kind: String,
-        /// backend name (herdr|agentmail|superlogical|tmux|toron)
+        /// backend name (herdr|agentmail|superlogical|toron)
         name: String,
     },
 }
@@ -26181,7 +26181,7 @@ fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             let compiled = backend::compiled_backends();
             let mut rows: Vec<Value> = Vec::new();
             // multiplexers
-            for (name, stub) in [("herdr", false), ("superlogical", true), ("tmux", true)] {
+            for (name, stub) in [("herdr", false), ("superlogical", true)] {
                 rows.push(json!({
                     "name": name,
                     "kind": "multiplexer",
