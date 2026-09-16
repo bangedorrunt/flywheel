@@ -7883,7 +7883,34 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
     // incident class). --if-missing keeps re-spawns idempotent (no duplicate
     // bus event). Best-effort: a failed join never fails the spawn (the
     // gate's remedy error still names the exact join command).
+    // bd-ka0w: ensure the room exists FIRST, idempotently, as the operator
+    // (captain owns creation; a crew pin must never become creator via a
+    // join race). Create-on-existing is a no-op preserving the creator.
     if !opts.join_channels.is_empty() {
+        let captain = operator_pin();
+        for ch in &opts.join_channels {
+            let ensured = Command::new("toron")
+                .args([
+                    "channel",
+                    "create",
+                    "--name",
+                    ch,
+                    "--project",
+                    project,
+                    "--as",
+                    &captain,
+                    ch,
+                ])
+                .output();
+            match ensured {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!(
+                    "flywheel: warn: channel ensure {ch} failed for {captain}: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => eprintln!("flywheel: warn: channel ensure {ch} failed: {e}"),
+            }
+        }
         for e in &registry {
             let Some(pin) = &e.mail_identity else {
                 continue;
