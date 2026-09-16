@@ -3440,7 +3440,7 @@ enum WorkflowCmd {
         /// accepted: list is always JSON (agent `--json` parity)
         #[arg(long)]
         json: bool,
-        /// GS-052: hybrid brief — name/family/selection/run/topology (+ compose_token); full rows need bare list + workflow show
+        /// GS-052: hybrid brief — name/family/selection/run/topology (+ compose_token); decide_trigger/full row on bare list; show is prose/graph (no decide_trigger)
         #[arg(long)]
         brief: bool,
         /// project whose `.flywheel/workflows/` shadows the user catalog
@@ -4583,7 +4583,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-evaluate", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
-            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/evaluate/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + family + selection + run + compose_token + decide_trigger; `workflow list --brief` is the GS-052 HYBRID ONE contract: name + family + selection + run + topology + compose_token (sticky-open still sees topology); bare `workflow list --json` / `workflow show` keep full description + rest — select from brief, then show/full list for prose detail, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/evaluate/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + family + selection + run + compose_token + decide_trigger; `workflow list --brief` is the GS-052 HYBRID ONE contract: name + family + selection + run + topology + compose_token (sticky-open still sees topology); bare `workflow list --json` adds description + source/crew/inputs/decide_trigger (plus hybrid fields); `workflow show` emits name/source/description/run/compose_token/trigger/guard/crew/inputs/steps/graph/graph_nodes — not decide_trigger/family/selection/topology — select from brief, then bare list for decide_trigger or show for prose/graph detail, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -29611,8 +29611,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             if *brief {
                 // GS-052 ONE hybrid contract: name/family/selection/run/topology
                 // (+ compose_token). Topology stays for sticky-open mid-session
-                // reclassify. Full description/trigger/source/crew stay on bare
-                // list + workflow show — no dual brief projection.
+                // reclassify. Bare list keeps description/trigger/source/crew/
+                // decide_trigger; show is prose/graph (no decide_trigger) — no dual brief projection.
                 let rows = workflow_list_brief_rows(&all);
                 print_json(&json!({ "workflows": rows }));
                 return Ok(());
@@ -36920,7 +36920,7 @@ mod integration_tests {
     /// contract = name/family/selection/run/topology/compose_token. Keys come
     /// from [`workflow_list_brief_rows`] — the same function `cmd_workflow`
     /// prints (not a local test mirror). Topology stays for sticky-open.
-    /// Full list/show keep description + rest; no competing brief path.
+    /// Bare list keeps description + decide_trigger + rest; show is separate (no decide_trigger); no competing brief path.
     #[test]
     fn workflow_list_brief_projects_hybrid_contract() {
         let all = workflow_catalog::all_workflows_merged(None).expect("catalog");
