@@ -29758,6 +29758,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let run_root = project_dir(cfg, project.as_deref().unwrap_or("flywheel"));
             let all = all_workflows_layered(Some(&run_root))?;
             let wf = resolve_workflow(name, &all)?.clone();
+            // bd-6tmi: the legacy compose-token alias warns (stderr only, so
+            // --json stdout stays pure) and still runs — deprecate, not break.
+            if *execute && crate::builtin_workflows::is_compose_token(name) {
+                eprintln!(
+                    "flywheel: deprecated: `workflow run {name} --execute` is the legacy alias; prefer `workflow compose \"<objective>\" --parts {name} --run`"
+                );
+            }
             // Fail-stop gate: lint before running.
             let blocking = lint_one(name, &wf);
             if blocking > 0 {
@@ -35071,6 +35078,204 @@ fn resolve_planner_for_bead(project_dir: &str, bead_id: &str, fallback: &str) ->
     fallback.to_string()
 }
 
+/// Loop-originated mails: one enum over the four loop mails (bd-6tmi unify).
+/// Each arm builds its envelope; [`send_loop_mail`] is the single send path.
+/// Envelopes are identical to the pre-unify per-fn sends: `done` keeps its
+/// structural `bead` tag (ADR-0010 D9 — the dispatch guard matches the TAG,
+/// so the other kinds stay tagless); importance/ack/thread per kind below.
+enum LoopMail<'a> {
+    NotReady {
+        bead_id: &'a str,
+        title: &'a str,
+        planner: &'a str,
+        reason: Option<&'a str>,
+    },
+    Done {
+        bead_id: &'a str,
+        title: &'a str,
+        report: &'a str,
+        captain: &'a str,
+    },
+    VerifierFamilyMissing {
+        bead_id: &'a str,
+        captain: &'a str,
+    },
+    UnverifiedClose {
+        bead_id: &'a str,
+        sha: &'a str,
+        planner: &'a str,
+    },
+}
+
+/// The send-ready envelope: recipient, subject, body, importance, ack flag,
+/// thread, and the optional structural bead tag (done only).
+struct LoopMailEnvelope {
+    to: String,
+    subject: String,
+    body: String,
+    importance: &'static str,
+    ack: bool,
+    thread: String,
+    bead: Option<String>,
+}
+
+/// Pure envelope builders, moved verbatim from the four pre-unify fns.
+fn loop_mail_envelope(kind: &LoopMail) -> LoopMailEnvelope {
+    match kind {
+        LoopMail::NotReady {
+            bead_id,
+            title,
+            planner,
+            reason,
+        } => {
+            let subject = match reason {
+                Some(r) => format!("[{bead_id}] NOT ready: {r} — fix before dispatch"),
+                None => {
+                    format!(
+                        "[{bead_id}] NOT ready: missing/invalid VERIFY fence — fix before dispatch"
+                    )
+                }
+            };
+            // bd-4spn: a PRINCIPLES-blocked bead (priority<=2, incomplete section)
+            // carries the check's exact reason; the legacy VERIFY body is unchanged
+            // when no reason is supplied (byte-identical path).
+            let body = match reason {
+                Some(r) => format!(
+                    "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: {r}.\n\n\
+                     ADR-0019 Spec 6 requires priority <= 2 beads to carry a `## PRINCIPLES` section in \
+                     the description — every line `<principle-name> — <the decision it changed>`, names \
+                     from the canonical 21 (see `flywheel principles list`). A missing section, a \
+                     name-only citation, or an unknown name keeps the bead ready-but-undispatchable \
+                     until the planner fixes the description."
+                ),
+                None => format!(
+                    "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: \
+                     its `## VERIFY` fence is missing, empty, or multi-line (ADR-0019).\n\n\
+                     Required block in the bead description, exact shape:\n\n\
+                     ```text\n## VERIFY\n```\n\
+                     <one command, one line>\n```\n```\n\n\
+                     Name one cheap command the loop can run (e.g. `cargo test -p X name`). \
+                     Until then the bead stays ready-but-undispatchable — the loop has \
+                     no fallback verifier for the whole workspace matrix."
+                ),
+            };
+            LoopMailEnvelope {
+                to: planner.to_string(),
+                subject,
+                body,
+                importance: "high",
+                ack: true,
+                thread: bead_id.to_string(),
+                bead: None,
+            }
+        }
+        LoopMail::Done {
+            bead_id,
+            title,
+            report,
+            captain,
+        } => {
+            let subject = format!("[{bead_id}] done");
+            let body = if report.is_empty() {
+                format!("Bead **{bead_id}** (`{title}`) closed with a legal verdict.")
+            } else {
+                format!(
+                    "Bead **{bead_id}** (`{title}`) closed with a legal verdict.\n\nReport:\n```text\n{report}\n```"
+                )
+            };
+            // ADR-0010 D9 (bd-l0fz): the reporter-of-record keeps the `[{id}] done`
+            // subject for humans and gains the structural `bead=<id>` tag — the
+            // dispatch guard matches the TAG, never the subject.
+            LoopMailEnvelope {
+                to: captain.to_string(),
+                subject,
+                body,
+                importance: "normal",
+                ack: true,
+                thread: bead_id.to_string(),
+                bead: Some(bead_id.to_string()),
+            }
+        }
+        LoopMail::VerifierFamilyMissing { bead_id, captain } => {
+            let subject = format!("[{bead_id}] verifier family missing — bead blocked");
+            let body = format!(
+                "Bead **{bead_id}** needs an independent verifier (priority <= 1, high blast, or \
+                 judgment AC) but the model registry cannot supply a second model family and no \
+                 `verifier_family_override` is set. Blocked `verifier-family-missing` \
+                 (ADR-0019 Spec 4).\n\n\
+                 Fixes: register a model from another provider in `models.toml`, or set \
+                 `[loop] verifier_family_override` in the flywheel config to allow the same family. \
+                 The bead was NOT reopened — no respawn loop."
+            );
+            LoopMailEnvelope {
+                to: captain.to_string(),
+                subject,
+                body,
+                importance: "high",
+                ack: true,
+                thread: bead_id.to_string(),
+                bead: None,
+            }
+        }
+        LoopMail::UnverifiedClose {
+            bead_id,
+            sha,
+            planner,
+        } => {
+            let subject = format!("[{bead_id}] unverified close reopened");
+            let body = if sha.is_empty() {
+                format!(
+                    "Bead **{bead_id}** was closed but **no commit carries its id** — the close is \
+                     ILLEGAL under the ADR-0019 SHA rule (`git log --all --grep={bead_id}` finds \
+                     nothing). In a shared tree bare HEAD may not contain this bead's work at all, \
+                     so a verdict cannot bind to it. The loop reopened the bead.\n\n\
+                     Missing: the commit whose message contains `{bead_id}`."
+                )
+            } else {
+                format!(
+                    "Bead **{bead_id}** was closed without a legal verdict for sha `{sha}` — the \
+                     close is unverified under ADR-0019 and the loop reopened the bead.\n\n\
+                     Commit the work (message must carry `{bead_id}`), run the bead's ## VERIFY, \
+                     record the verdict (`flywheel ledger` / `br gate report` with sha={sha}), \
+                     then close."
+                )
+            };
+            LoopMailEnvelope {
+                to: planner.to_string(),
+                subject,
+                body,
+                importance: "urgent",
+                ack: true,
+                thread: bead_id.to_string(),
+                bead: None,
+            }
+        }
+    }
+}
+
+/// The single send path for loop mails: envelope → one `mail.send`.
+/// Separated from the leaf commands so the "planner mailed" acceptance is
+/// testable with a real in-process toron facade.
+fn send_loop_mail(
+    mail: &dyn backend::MailSurface,
+    key: &str,
+    kind: &LoopMail,
+) -> Result<backend::SendReceipt> {
+    let e = loop_mail_envelope(kind);
+    Ok(backend::run_mail(mail.send(&backend::SendMail {
+        project: key.to_string(),
+        sender: mail.agent_name().to_string(),
+        to: vec![e.to],
+        subject: e.subject,
+        body_md: e.body,
+        importance: Some(e.importance.to_string()),
+        ack_required: e.ack,
+        thread_id: Some(e.thread),
+        bead: e.bead,
+        ..Default::default()
+    }))?)
+}
+
 /// The not-ready mail itself: thread = the bead id, so the planner's reply
 /// stays on the bead's thread (ADR-0019 Spec 0). Separated from the leaf
 /// command so the "planner mailed" acceptance is testable with a real
@@ -35083,44 +35288,15 @@ fn send_not_ready_mail(
     planner: &str,
     reason: Option<&str>,
 ) -> Result<backend::SendReceipt> {
-    let subject = match reason {
-        Some(r) => format!("[{bead_id}] NOT ready: {r} — fix before dispatch"),
-        None => {
-            format!("[{bead_id}] NOT ready: missing/invalid VERIFY fence — fix before dispatch")
-        }
-    };
-    // bd-4spn: a PRINCIPLES-blocked bead (priority<=2, incomplete section)
-    // carries the check's exact reason; the legacy VERIFY body is unchanged
-    // when no reason is supplied (byte-identical path).
-    let body = match reason {
-        Some(r) => format!(
-            "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: {r}.\n\n\
-             ADR-0019 Spec 6 requires priority <= 2 beads to carry a `## PRINCIPLES` section in \
-             the description — every line `<principle-name> — <the decision it changed>`, names \
-             from the canonical 21 (see `flywheel principles list`). A missing section, a \
-             name-only citation, or an unknown name keeps the bead ready-but-undispatchable \
-             until the planner fixes the description."
-        ),
-        None => format!(
-            "Bead **{bead_id}** (`{title}`) sits in the ready set but was **NOT dispatched**: \
-             its `## VERIFY` fence is missing, empty, or multi-line (ADR-0019).\n\n\
-             Required block in the bead description, exact shape:\n\n\
-             ```text\n## VERIFY\n```\n\
-             <one command, one line>\n```\n```\n\n\
-             Name one cheap command the loop can run (e.g. `cargo test -p X name`). \
-             Until then the bead stays ready-but-undispatchable — the loop has \
-             no fallback verifier for the whole workspace matrix."
-        ),
-    };
-    mail_send(
+    send_loop_mail(
         mail,
         key,
-        std::slice::from_ref(&planner.to_string()),
-        &subject,
-        &body,
-        "high",
-        true,
-        Some(bead_id),
+        &LoopMail::NotReady {
+            bead_id,
+            title,
+            planner,
+            reason,
+        },
     )
 }
 
@@ -35242,29 +35418,16 @@ fn send_done_mail(
     report: &str,
     captain: &str,
 ) -> Result<backend::SendReceipt> {
-    let subject = format!("[{bead_id}] done");
-    let body = if report.is_empty() {
-        format!("Bead **{bead_id}** (`{title}`) closed with a legal verdict.")
-    } else {
-        format!(
-            "Bead **{bead_id}** (`{title}`) closed with a legal verdict.\n\nReport:\n```text\n{report}\n```"
-        )
-    };
-    // ADR-0010 D9 (bd-l0fz): the reporter-of-record keeps the `[{id}] done`
-    // subject for humans and gains the structural `bead=<id>` tag — the
-    // dispatch guard matches the TAG, never the subject.
-    Ok(backend::run_mail(mail.send(&backend::SendMail {
-        project: key.to_string(),
-        sender: mail.agent_name().to_string(),
-        to: vec![captain.to_string()],
-        subject,
-        body_md: body,
-        importance: Some("normal".to_string()),
-        ack_required: true,
-        thread_id: Some(bead_id.to_string()),
-        bead: Some(bead_id.to_string()),
-        ..Default::default()
-    }))?)
+    send_loop_mail(
+        mail,
+        key,
+        &LoopMail::Done {
+            bead_id,
+            title,
+            report,
+            captain,
+        },
+    )
 }
 
 /// internal leaf: close-detect SHA check (ADR-0019 SHA rule, bd-w1-sha-xyhd).
@@ -35486,26 +35649,10 @@ fn send_verifier_family_missing_mail(
     bead_id: &str,
     captain: &str,
 ) -> Result<backend::SendReceipt> {
-    let captain = captain.to_string();
-    let subject = format!("[{bead_id}] verifier family missing — bead blocked");
-    let body = format!(
-        "Bead **{bead_id}** needs an independent verifier (priority <= 1, high blast, or \
-         judgment AC) but the model registry cannot supply a second model family and no \
-         `verifier_family_override` is set. Blocked `verifier-family-missing` \
-         (ADR-0019 Spec 4).\n\n\
-         Fixes: register a model from another provider in `models.toml`, or set \
-         `[loop] verifier_family_override` in the flywheel config to allow the same family. \
-         The bead was NOT reopened — no respawn loop."
-    );
-    mail_send(
+    send_loop_mail(
         mail,
         key,
-        std::slice::from_ref(&captain),
-        &subject,
-        &body,
-        "high",
-        true,
-        Some(bead_id),
+        &LoopMail::VerifierFamilyMissing { bead_id, captain },
     )
 }
 
@@ -36083,33 +36230,14 @@ fn send_unverified_close_mail(
     sha: &str,
     planner: &str,
 ) -> Result<backend::SendReceipt> {
-    let subject = format!("[{bead_id}] unverified close reopened");
-    let body = if sha.is_empty() {
-        format!(
-            "Bead **{bead_id}** was closed but **no commit carries its id** — the close is \
-             ILLEGAL under the ADR-0019 SHA rule (`git log --all --grep={bead_id}` finds \
-             nothing). In a shared tree bare HEAD may not contain this bead's work at all, \
-             so a verdict cannot bind to it. The loop reopened the bead.\n\n\
-             Missing: the commit whose message contains `{bead_id}`."
-        )
-    } else {
-        format!(
-            "Bead **{bead_id}** was closed without a legal verdict for sha `{sha}` — the \
-             close is unverified under ADR-0019 and the loop reopened the bead.\n\n\
-             Commit the work (message must carry `{bead_id}`), run the bead's ## VERIFY, \
-             record the verdict (`flywheel ledger` / `br gate report` with sha={sha}), \
-             then close."
-        )
-    };
-    mail_send(
+    send_loop_mail(
         mail,
         key,
-        std::slice::from_ref(&planner.to_string()),
-        &subject,
-        &body,
-        "urgent",
-        true,
-        Some(bead_id),
+        &LoopMail::UnverifiedClose {
+            bead_id,
+            sha,
+            planner,
+        },
     )
 }
 

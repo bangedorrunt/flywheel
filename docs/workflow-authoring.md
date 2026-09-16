@@ -347,3 +347,21 @@ Headless run logs (`runs/*.jsonl`) feed this view; pane runs feed from the proje
 > `workflow run` (no `--execute`) is the no-op control-flow-only path; the **live swarm path
 > remains the bead-backed path `flywheel loop-mode run <project> --work`**. The broader
 > loop-mode surface is durable solo execution; `--work` is its bead-dispatch specialization.
+
+---
+
+## 7. Canonical spelling (bd-6tmi) — one graph, one runner, one verifier
+
+| Concern | Canonical | Sugar / legacy | Owner |
+|---|---|---|---|
+| Workflow shape | `graph:` (nodes + needs) | `steps:` lists desugar to chain graphs at parse time | toron-workflow engine |
+| Running a compose token | `workflow compose "<t>" --parts <token> --run` | `workflow run <token> --execute` (legacy alias; warns on stderr, still runs) | flywheel CLI |
+| Running an ordinary builtin | `workflow run <name> --execute` | — (never a bare `--parts`) | flywheel CLI |
+| In-graph verify evidence | workflow receipt (evidence, never a close) | — | engine `VerifySink` |
+| Bead close verdict | `command-verified` written by the loop's VERIFY | worker `br close` on a loop-owned bead is reopened | loop (`verdict.rs`) |
+| Failure meaning | classified `FailureKind` (rate_limit/timeout retry bounded; auth/billing/blocked/cancelled abort) | work-quality red (a failing test) is NOT a kind — it routes to `repair-until-verified` | engine + loop |
+
+Failing steps never guess: `{ok:false, error, kind, retryable, resumable,
+disposition, retry_after_ms}`. Loop-mail kinds (not-ready / done /
+verifier-family-missing / unverified-close) dispatch through the single
+`send_loop_mail` enum in `src/main.rs` — one send path, per-kind envelopes.
