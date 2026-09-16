@@ -19,6 +19,9 @@ pub(crate) enum MailCmd {
         /// literal `last` (daemon-side crash-proof cursor, read-then-bump)
         #[arg(long)]
         since: Option<String>,
+        /// keep only messages in this thread (thread id or message id)
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
         /// act as this registered agent (adjective+noun or herdr short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
