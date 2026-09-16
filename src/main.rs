@@ -1507,6 +1507,21 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         tier: u32,
     },
+    /// internal: ack-overdue read for one agent (ADR-0001 A6 ack gate; the
+    /// escalation leaf reads its own `health-<name>` thread at SLA 0).
+    /// Prints `{ok,count,messages}`; `ok:false` means the read was
+    /// unavailable — never "nothing overdue".
+    #[command(name = "__ack-overdue", hide = true)]
+    __AckOverdue {
+        project: String,
+        name: String,
+        /// restrict the read to one thread (default: every thread)
+        #[arg(long)]
+        thread: Option<String>,
+        /// age threshold in seconds (default: the toron SLA, 30 min)
+        #[arg(long)]
+        sla_secs: Option<u64>,
+    },
     /// internal: mail the planner that a ready bead is NOT dispatchable
     /// (missing/malformed `## VERIFY` fence — ADR-0019, bd-w1-verify-fence)
     #[command(name = "__mail-not-ready", hide = true)]
@@ -3024,6 +3039,12 @@ fn main() {
             name,
             tier,
         }) => cmd_internal_mail_blocked(&cfg, project, name, *tier),
+        Some(Commands::__AckOverdue {
+            project,
+            name,
+            thread,
+            sla_secs,
+        }) => cmd_internal_ack_overdue(&cfg, project, name, thread.as_deref(), *sla_secs),
         Some(Commands::__MailNotReady {
             project,
             bead_id,
@@ -29496,6 +29517,59 @@ fn cmd_internal_xproj_spawn(
 /// Best-effort by contract: a missing/unreachable agent-mail must NEVER kill
 /// an overnight loop (same standard as the lease-renewal heartbeat) — the
 /// leaf exits 0 with `{"ok": false, "error": ...}` and the next poll retries.
+/// internal: the ack-overdue read behind the blocked-escalation ack gate
+/// (ADR-0001 A6, bd-mail-ack-sla-tracking's `ack_overdue`).
+///
+/// Door contract: `{"ok":true,"count":N,"messages":[…]}` when the read
+/// answered — including a genuine 0 — and `{"ok":false,"error":…}` when it
+/// could not (no index, unregistered agent, remote backend, no mailbox). The
+/// caller must treat `ok:false` as "not acked": an unavailable read may never
+/// silence an escalation. Exit stays 0 so the leaf reads the JSON, not the
+/// status (the argv decoder is `durable::ack_gate_unacked`).
+fn cmd_internal_ack_overdue(
+    cfg: &Config,
+    project: &str,
+    name: &str,
+    thread: Option<&str>,
+    sla_secs: Option<u64>,
+) -> Result<()> {
+    let key = project_dir_str(cfg, project)?;
+    // Same identity resolution the pings used (bd-aseq): the health mail goes
+    // to the REGISTERED identity, so the ack read must be keyed by it too.
+    let agent = resolve_mail_target_registry(project, name);
+    let filter = crate::mail_shim::AckOverdueFilter {
+        sla_secs,
+        thread_id: thread.map(String::from),
+    };
+    let found = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+        .and_then(|m| {
+            m.ok_or_else(|| anyhow!("no mail backend configured (embedded toron unavailable)"))
+        })
+        .and_then(|m| m.ack_overdue(&key, &agent, &filter));
+    match found {
+        Ok(Value::Array(rows)) => print_json(&json!({
+            "ok": true,
+            "project": project,
+            "agent": agent,
+            "thread_id": thread,
+            "sla_secs": sla_secs.unwrap_or(crate::mail_shim::ACK_SLA_DEFAULT_SECS),
+            "count": rows.len(),
+            "messages": rows,
+        })),
+        Ok(other) => print_json(&json!({
+            "ok": false,
+            "agent": agent,
+            "error": format!("unexpected ack-overdue shape: {other}"),
+        })),
+        Err(e) => print_json(&json!({
+            "ok": false,
+            "agent": agent,
+            "error": format!("{e:#}"),
+        })),
+    }
+    Ok(())
+}
+
 fn cmd_internal_mail_blocked(cfg: &Config, project: &str, name: &str, tier: u32) -> Result<()> {
     let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,

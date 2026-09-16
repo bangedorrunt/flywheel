@@ -3325,11 +3325,26 @@ fn now_us_micros() -> i64 {
 /// TIER TRANSITION (`last_ping_tier` marker) — a replay re-execution at the
 /// same tier neither re-mails nor double-counts; at most one ping per
 /// logical tier transition (ADR-0001 §4.4's T0→T1→T2→T3 cadence).
+///
+/// `acked` is the toron ack-SLA handling fact (bd-mail-ack-sla-tracking's
+/// `ack_overdue` read, per-recipient read state — never a wall-clock guess)
+/// for the agent's own health thread. ADR-0001 A6: "an agent that acks or
+/// un-blocks resets the escalation". A reset restarts the budget from now,
+/// drops the ping credit, and records T0 as handled — so an ack never
+/// provokes an immediate re-ping; if the agent goes quiet again the ladder
+/// resumes one window later at T1.
 fn escalation_step(
     st: &mut crate::state::EscalationState,
     now_us: i64,
     interval_secs: u64,
+    acked: bool,
 ) -> (u32, u32, bool) {
+    if acked {
+        st.first_blocked_ts = now_us;
+        st.ping_count = 0;
+        st.last_ping_tier = Some(0);
+        return (0, 0, false);
+    }
     let t = escalation_tier(st.first_blocked_ts, now_us, interval_secs);
     let u = match t {
         EscalationTier::T0 => 0u32,
@@ -3353,12 +3368,18 @@ fn escalation_step(
 /// cannot jump across a crash boundary. Returns (tier, ping_count,
 /// should_mail) — the mail decision comes from the persisted
 /// `last_ping_tier` marker (cg6.3), so a replay at the same tier no-ops.
+///
+/// `gate_acked` is the agent's ack of ITS OWN health thread. It only counts
+/// as a reset once we have actually pinged (`ping_count > 0`): an empty
+/// thread before the first ping is indistinguishable from "nothing sent",
+/// and treating that as an ack would silence the escalation entirely.
 fn escalate_and_persist(
     project: &str,
     name: &str,
     first_blocked_seed: Option<i64>,
     interval_secs: u64,
     params: serde_json::Value,
+    gate_acked: bool,
 ) -> anyhow::Result<(u32, u32, bool)> {
     let now_us = now_us_micros();
     let mut al = crate::state::load_active_loop(project)?.unwrap_or_else(|| {
@@ -3373,9 +3394,69 @@ fn escalate_and_persist(
                 last_ping_tier: None,
                 last_tail: String::new(),
             });
-    let (tier, ping_count, should_mail) = escalation_step(st, now_us, interval_secs);
+    let acked = gate_acked && st.ping_count > 0;
+    let (tier, ping_count, should_mail) = escalation_step(st, now_us, interval_secs, acked);
     crate::state::save_active_loop(project, &al)?;
     Ok((tier, ping_count, should_mail))
+}
+
+/// Pure: argv for the ack gate leaf (`__ack-overdue`). The gate reads the
+/// agent's own `health-<name>` lane at SLA 0 — "is ANY ack-required ping in
+/// this thread still unacked?" — so it is independent of the 30-min default
+/// (the escalation pings on its own 2×interval cadence, which is typically
+/// inside that window; ADR-0001's distinction between the two clocks).
+pub fn ack_gate_argv(project: &str, name: &str) -> Vec<String> {
+    vec![
+        "__ack-overdue".to_string(),
+        project.to_string(),
+        name.to_string(),
+        "--thread".to_string(),
+        format!("health-{name}"),
+        "--sla-secs".to_string(),
+        "0".to_string(),
+    ]
+}
+
+/// Pure: decode the gate's stdout. `Some(n)` = the read answered with `n`
+/// unacked ack-required pings; `None` = the read was UNAVAILABLE (no index,
+/// unregistered agent, remote backend, malformed output). Unavailable is not
+/// acked: the escalation keeps its time-based ladder rather than silently
+/// stopping (fail-open — the pre-gate behavior).
+pub fn ack_gate_unacked(stdout: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    v.get("count").and_then(serde_json::Value::as_u64)
+}
+
+/// Leaf-side I/O for the ack gate: run `__ack-overdue` and decode it.
+/// `true` = every ping in the agent's health thread has been handled.
+/// Any failure answers `false` (not acked) — see [`ack_gate_unacked`].
+///
+/// Short-circuit: with no ping ever recorded for this agent there is nothing
+/// to have been acked, so the first (T0) pass never pays for a subprocess —
+/// the read starts on the pass AFTER the first ping.
+async fn blocked_ack_gate(args: &NotifyArgs) -> bool {
+    let pinged = crate::state::load_active_loop(&args.project)
+        .ok()
+        .flatten()
+        .and_then(|al| al.escalation.get(&args.name).map(|s| s.ping_count))
+        .is_some_and(|n| n > 0);
+    if !pinged {
+        return false;
+    }
+    let Ok(exe) = self_exe() else {
+        return false;
+    };
+    let mut cmd = Command::new(&exe);
+    cmd.args(ack_gate_argv(&args.project, &args.name));
+    match run_leaf_cmd(cmd, "__ack-overdue").await {
+        Ok(out) if out.status.success() => {
+            ack_gate_unacked(&String::from_utf8_lossy(&out.stdout)) == Some(0)
+        }
+        _ => false,
+    }
 }
 
 /// Notify a blocked agent via agent-mail. Checkpointed side effect — and
@@ -3473,12 +3554,17 @@ async fn reply_settled(args: ReplySettledArgs) -> Result<()> {
 
 #[function]
 async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
+    // ADR-0001 A6: the ladder is gated on the observed ack, read off toron's
+    // per-recipient read state (not inferred from elapsed time). The read
+    // happens BEFORE the step so an acked agent is never pinged again.
+    let gate_acked = blocked_ack_gate(&args).await;
     let (tier, ping_count, should_mail) = escalate_and_persist(
         &args.project,
         &args.name,
         args.first_blocked_ts,
         args.interval_secs,
         args.params,
+        gate_acked,
     )
     .map_err(map_err)?;
     if should_mail {
@@ -14377,15 +14463,15 @@ mod resume_dedup_tests {
             last_tail: String::new(),
         };
         // fresh: T0 + count 1 + mail
-        assert_eq!(escalation_step(&mut st, us(30), i), (0, 1, true));
+        assert_eq!(escalation_step(&mut st, us(30), i, false), (0, 1, true));
         // 2x interval: T1 (transition → mail)
-        assert_eq!(escalation_step(&mut st, us(60), i), (1, 2, true));
+        assert_eq!(escalation_step(&mut st, us(60), i, false), (1, 2, true));
         // 4x interval: T2
-        assert_eq!(escalation_step(&mut st, us(120), i), (2, 3, true));
+        assert_eq!(escalation_step(&mut st, us(120), i, false), (2, 3, true));
         // 8x interval: T3, bounded
-        assert_eq!(escalation_step(&mut st, i64::MAX, i), (3, 4, true));
+        assert_eq!(escalation_step(&mut st, i64::MAX, i, false), (3, 4, true));
         // same tier again: NO mail, NO increment (cg6.3 — replay / same-tier tick)
-        assert_eq!(escalation_step(&mut st, i64::MAX, i), (3, 4, false));
+        assert_eq!(escalation_step(&mut st, i64::MAX, i, false), (3, 4, false));
         // overflow-safe: saturating add, never wraps
         let mut st2 = EscalationState {
             first_blocked_ts: 0,
@@ -14393,7 +14479,86 @@ mod resume_dedup_tests {
             last_ping_tier: None,
             last_tail: String::new(),
         };
-        assert_eq!(escalation_step(&mut st2, us(60), i), (1, u32::MAX, true));
+        assert_eq!(
+            escalation_step(&mut st2, us(60), i, false),
+            (1, u32::MAX, true)
+        );
+    }
+
+    /// ADR-0001 A6 acceptance: an agent that ACKS resets the escalation.
+    /// The step restarts the budget from the observed `now`, drops the ping
+    /// credit, records T0 as handled (so no immediate re-ping) and never mails
+    /// on the ack read itself. Once quiet again, the ladder resumes at T1 one
+    /// window later — not at T3 from the pre-ack elapsed clock.
+    #[test]
+    fn escalation_step_ack_resets_the_ladder() {
+        use crate::state::EscalationState;
+        let i = 30u64;
+        let us = |secs: i64| secs * 1_000_000;
+        let mut st = EscalationState {
+            first_blocked_ts: 0,
+            ping_count: 0,
+            last_ping_tier: None,
+            last_tail: "old tail".into(),
+        };
+        // Climb to T2 first (two real pings).
+        assert_eq!(escalation_step(&mut st, us(30), i, false), (0, 1, true));
+        assert_eq!(escalation_step(&mut st, us(120), i, false), (2, 2, true));
+        // Ack observed at 120s: reset, no mail, no ping credit.
+        assert_eq!(escalation_step(&mut st, us(120), i, true), (0, 0, false));
+        assert_eq!(st.ping_count, 0, "ack drops the ping credit");
+        assert_eq!(st.first_blocked_ts, us(120), "budget restarts from the ack");
+        assert_eq!(
+            st.last_ping_tier,
+            Some(0),
+            "T0 is recorded as handled — an ack never re-pings T0"
+        );
+        // Still blocked and quiet: the ladder resumes at T1 a window later,
+        // NOT back at T3 from the pre-ack clock.
+        assert_eq!(escalation_step(&mut st, us(180), i, false), (1, 1, true));
+        assert_eq!(escalation_step(&mut st, us(180), i, false), (1, 1, false));
+        // A second ack at the top tier resets again (idempotent contract).
+        assert_eq!(escalation_step(&mut st, i64::MAX, i, false), (3, 2, true));
+        assert_eq!(escalation_step(&mut st, i64::MAX, i, true), (0, 0, false));
+        // The restart clock is the ACK's `now`, so the reset budget is fully
+        // renewed (elapsed 0 → T0) rather than inheriting the old age.
+        assert_eq!(st.first_blocked_ts, i64::MAX);
+        assert_eq!(
+            escalation_tier(st.first_blocked_ts, i64::MAX, i),
+            EscalationTier::T0
+        );
+    }
+
+    /// Pure: the gate's stdout decoder. Only an available read that reports
+    /// ZERO unacked pings is an ack; every failure mode is "not acked" so the
+    /// time ladder keeps its pre-gate behavior.
+    #[test]
+    fn ack_gate_decodes_unacked_and_fails_open() {
+        assert_eq!(ack_gate_unacked(r#"{"ok":true,"count":0}"#), Some(0));
+        assert_eq!(ack_gate_unacked(r#"{"ok":true,"count":3}"#), Some(3));
+        // unavailable read → None → NOT acked (fail-open to the ladder)
+        assert_eq!(ack_gate_unacked(r#"{"ok":false,"error":"no index"}"#), None);
+        assert_eq!(ack_gate_unacked(""), None);
+        assert_eq!(ack_gate_unacked("not json"), None);
+        assert_eq!(ack_gate_unacked(r#"{"ok":true}"#), None);
+    }
+
+    /// Pure: the gate argv — the agent's own health thread at SLA 0 (any
+    /// unacked ping counts; the escalation has its own 2×interval cadence).
+    #[test]
+    fn ack_gate_argv_targets_own_health_thread_at_sla_zero() {
+        assert_eq!(
+            ack_gate_argv("proj", "agent-a"),
+            vec![
+                "__ack-overdue".to_string(),
+                "proj".to_string(),
+                "agent-a".to_string(),
+                "--thread".to_string(),
+                "health-agent-a".to_string(),
+                "--sla-secs".to_string(),
+                "0".to_string(),
+            ]
+        );
     }
 
     /// Leaf-level (cg6.1): a fresh agent with no persisted entry starts at
@@ -14403,7 +14568,7 @@ mod resume_dedup_tests {
         let _g = cg61_registry_guard();
         let project = cg61_test_project("fresh");
         let (tier, count, mails) =
-            escalate_and_persist(&project, "agent-a", None, 30, json!({})).unwrap();
+            escalate_and_persist(&project, "agent-a", None, 30, json!({}), false).unwrap();
         assert_eq!(
             (tier, count, mails),
             (0, 1, true),
@@ -14436,7 +14601,7 @@ mod resume_dedup_tests {
         );
         crate::state::save_active_loop(&project, &al).unwrap();
         let (tier, count, mails) =
-            escalate_and_persist(&project, "agent-b", None, 30, json!({})).unwrap();
+            escalate_and_persist(&project, "agent-b", None, 30, json!({}), false).unwrap();
         assert_eq!(
             (tier, count, mails),
             (3, 1, true),
@@ -14457,10 +14622,10 @@ mod resume_dedup_tests {
         // seed ~1s ago: both executions land inside the T0 window
         let seed = now_us_micros() - 1_000_000;
         let (t1, c1, m1) =
-            escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({})).unwrap();
+            escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({}), false).unwrap();
         // "crash" — re-execution of the same leaf invocation, later wall-clock
         let (t2, c2, m2) =
-            escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({})).unwrap();
+            escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({}), false).unwrap();
         assert_eq!(t1, t2, "tier must not jump on replay");
         assert_eq!((c1, m1), (1, true));
         assert_eq!(
@@ -14477,6 +14642,55 @@ mod resume_dedup_tests {
         );
         assert_eq!(st.ping_count, 1);
         assert_eq!(st.last_ping_tier, Some(0), "T0 ping marked");
+        cg61_cleanup(&project);
+    }
+
+    /// Leaf-level: the ack gate is honored only AFTER a real ping. A brand-new
+    /// entry with an empty health thread must still ping T0 — an "empty read"
+    /// is not an ack (that inversion would silence the escalation entirely).
+    #[test]
+    fn escalate_and_persist_ignores_ack_before_first_ping() {
+        let _g = cg61_registry_guard();
+        let project = cg61_test_project("ack-prefirst");
+        let (tier, count, mails) =
+            escalate_and_persist(&project, "agent-d", None, 30, json!({}), true).unwrap();
+        assert_eq!(
+            (tier, count, mails),
+            (0, 1, true),
+            "no ping sent yet → the gate cannot claim an ack; T0 still mails"
+        );
+        cg61_cleanup(&project);
+    }
+
+    /// Leaf-level: once a ping is out, an ack resets the ladder and suppresses
+    /// the next tier's mail (the escalation stops pinging an agent that
+    /// answered); a later quiet window resumes at T1.
+    #[test]
+    fn escalate_and_persist_ack_after_ping_resets_and_holds() {
+        let _g = cg61_registry_guard();
+        let project = cg61_test_project("ack-after");
+        // Ping once (T0), then ack, then let the clock run past T3.
+        let (t0, c0, m0) =
+            escalate_and_persist(&project, "agent-e", None, 30, json!({}), false).unwrap();
+        assert_eq!((t0, c0, m0), (0, 1, true));
+        let (t1, c1, m1) = escalate_and_persist(
+            &project,
+            "agent-e",
+            Some(now_us_micros() - 9 * 30 * 1_000_000),
+            30,
+            json!({}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            (t1, c1, m1),
+            (0, 0, false),
+            "acked → reset, no mail (T3 would otherwise have mailed)"
+        );
+        let al = crate::state::load_active_loop(&project).unwrap().unwrap();
+        let st = al.escalation.get("agent-e").unwrap();
+        assert_eq!(st.ping_count, 0);
+        assert_eq!(st.last_ping_tier, Some(0));
         cg61_cleanup(&project);
     }
 

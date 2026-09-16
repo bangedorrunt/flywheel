@@ -24,6 +24,8 @@ Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
 `[mail.toron] url` = daemon. Absent = in-process embed. Legacy `[agent_mail] url` is not a routing source.
 
+Ack-overdue reads (`flywheel __ack-overdue`, `Mail::ack_overdue`) are **in-process only**: they read per-recipient `message_reads` state through the mailbox projection, and the remote daemon exposes no ack-overdue tool, so the call fails loudly instead of answering an empty set. The blocked escalation's ack gate (see [loop.md](loop.md)) treats that as "not acked" and keeps its time ladder.
+
 Mailbox root (bd-t9ey): `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Never per-pid temp. `src/mail_shim.rs` + `src/coalition.rs` share this.
 
 ```bash

@@ -96,7 +96,7 @@ Confirmed by grep across `src/`: **zero use of** `register_agent`, `create_agent
 |---|---|
 | `register_agent` | Orchestrator never registers itself or workers → inbox addressed by a `name` string that may not be a real identity. `send_message` to an unknown recipient **fails fast**. |
 | `reply_message` / `thread_id` | No threaded replies. A debate loop can't preserve context — every turn is a detached subject. |
-| `acknowledge_message` / `mark_message_read` | Loop can't tell "peer saw it" from "peer ignored it". The `__mail-blocked` notification is fire-and-forget. |
+| `acknowledge_message` / `mark_message_read` | Loop can't tell "peer saw it" from "peer ignored it". The `__mail-blocked` notification is fire-and-forget. **(Landed 2026-09-17:** the loop reads ack state off the per-recipient projection — `Mail::ack_overdue` / `ack__overdue_only`, gating the blocked escalation; see A6.) |
 | `renew_file_reservations` | Durable loop runs hours; reservations have TTL. A long-running strategy dies when its lease expires mid-edit — no renew path. |
 | `acquire_build_slot` | Parallel workers race `cargo build`/`cargo test` on shared `target/`. No serialization. |
 | `search_messages` / `summarize_thread` | Loop can't ask "did anyone already solve this?" before re-dispatching duplicate work. |
@@ -119,6 +119,8 @@ The loop treats `unknown` as non-dispatchable (`Wait`, never consumes the queue)
 ### A6. `--on-blocked mail` is one-shot, not a protocol — `src/durable.rs:512`
 
 `notify_blocked` sends one high-importance message and returns. There's no: escalation after N intervals un-acked (the `ack_overdue_only` filter exists in the tool, unused), `set_contact_policy` so blocked agents auto-accept orchestrator pings, or thread continuity so a human/peer sees "still blocked, 3rd ping".
+
+> **Landed (2026-09-17, bd-mail-ack-sla-tracking subtask 4):** the tiered ladder is in the `notify_blocked` leaf (T0/T1/T2/T3 in the agent's `health-<name>` thread, bounded halt per `--on-blocked`), and the ack half is now a real read rather than an assumption: `Mail::ack_overdue` returns the per-recipient ack-overdue set (`message_reads` is per-(message, recipient), migration 0002), the leaf reads its own health lane at SLA 0 through the hidden `__ack-overdue` door, and an ack **resets** the ladder (§11's "an agent that acks or un-blocks resets the escalation"). An unanswerable read is never treated as an ack — the ladder keeps climbing, fail-open to the pre-gate timing.
 
 ---
 
@@ -184,6 +186,8 @@ Bump `HDR_PROTOCOL` 18→19, regenerate wire structs from the bundled schema, ty
 
 ### Phase 4 — Blocked escalation protocol
 Tiered: ping T0 → `ack_overdue_only` re-ping T0+2×interval → `importance=urgent` + `summarize_thread` T0+4×interval. State machine in `durable.rs`.
+
+The ack half landed 2026-09-17: the re-ping tiers are gated on toron's per-recipient read state (`Mail::ack_overdue` → `__ack-overdue` → `durable::ack_gate_unacked`), so "still un-acked" is observed rather than assumed. Two clocks stay distinct by design: the escalation advances on its own 2×interval cadence, while the SLA that `ack_overdue` defaults to (30 min, the `check_ack_sla_expired` default) is the mailbox's — the gate therefore reads at SLA 0, where any unacked ack-required ping counts.
 
 ### Phase 5 — Collaboration pattern recipes
 Four documented, tested recipes (debate / plan-review-implement / peer-triggered / cross-project) implemented as reusable prompt templates + loop configs, each with an e2e test in an isolated herdr test session.
@@ -364,4 +368,5 @@ echo "OK: ADR-0001 verification passed"
 | Date | Change |
 |------|--------|
 | 2026-08-05 | Initial draft (Proposed). Captures the 2026-08-05 audit of herdr 0.8.0-preview + agent-mail 46-tool surface against flywheel's current implementation. |
+| 2026-09-17 | **Ack gate landed (bd-mail-ack-sla-tracking subtask 4).** The escalation's re-ping timing is now read off toron's per-recipient read state (`Mail::ack_overdue`; per-(message, recipient) `message_reads`, migration 0002) instead of assumed from elapsed time: the `notify_blocked` leaf reads its own `health-<name>` lane at SLA 0 (`__ack-overdue`) and an ack resets the ladder (§11). Unavailable reads fail open to the time ladder — never a silent stop, never a fabricated all-clear. `ack_overdue_only` stopped being an "unused filter"/honest `Unsupported`: it is a real post-filter on both mail backends. |
 | 2026-08-05 | **Implementation-review addendum (bd-review-fix-epic-m0b):** post-completion review found the two flagship patterns carried SUBJECT lines instead of reply bodies (debate never passed arguments; plan-review's token parse failed on the subject) and the plan-review gate never actually looped. Fixes: harvest_latest now reads `body_md`→`body`→`subject` with `include_body_md` on the trait-level `SearchFilter` (F1); `cmd_plan_review` is a real phase-driven state machine honoring `--max-change-rounds` (F2); T3 escalation halts the loop (F4); xproj `--to-project` is routing context not a dead flag (F3); default pattern agents resolve to spawned `flywheel-*` names (F7). See the review-fix regression gate `docs/decisions/_scripts/verify-review-fixes.sh`. |
