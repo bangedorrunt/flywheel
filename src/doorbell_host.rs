@@ -288,7 +288,7 @@ impl Host for RtHost {
         // reach Effect::Prompt (nested handle would drop them). Live Snapshot
         // from briefing world facts — never Snapshot::default() invent-green.
         let snap = crate::live_decide_snapshot(&self.cfg, &self.project);
-        let cmds = workspace::expand_reclassify_cmds(&mut self.model, cmds, &|goal| {
+        let cmds = workspace::expand_reclassify_cmds(&mut self.model, cmds, &self.project, &|goal| {
             let d = crate::decide::decide(goal, &snap);
             (
                 d.primitive.to_string(),

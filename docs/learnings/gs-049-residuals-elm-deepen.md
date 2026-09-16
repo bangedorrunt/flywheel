@@ -9,7 +9,7 @@
 3. `live_decide_snapshot.launch_pending` from `snapshot::assemble` (no invent-green 0).
 
 ## Elm deepen (GS-045 P1)
-1. Source-Msg / source-action immutability — docs + same-log / post-effect retry tests (I8a). Tip `Cmd::Reclassify` has no `effect_key` yet; assert goal/reason identity.
+1. Source-Msg / source-action immutability — docs + same-log / post-effect retry tests (I8a). GS-049 asserted goal/reason identity; **GS-050** lands `Cmd::Reclassify.effect_key` (stable journal key).
 2. `workflow evaluate` — evaluate-without-commit.
 3. Phase-bearing failures — `stage` on ClassifiedFailure / journal / run ledger (`classify_with_stage`; Blocked→park).
 4. Sensor→Msg vocabulary in doorbell guide — Presence via Herdr+roles (not a Msg-arm Sensor GenServer).
