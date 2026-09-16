@@ -204,7 +204,9 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                         || s.ends_with('d') =>
                 {
                     let (num, unit) = s.split_at(s.len() - 1);
-                    let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("bad --since {s}"))?;
+                    let n: u64 = num
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad --since {s}"))?;
                     let secs = match unit {
                         "s" => n,
                         "m" => n * 60,

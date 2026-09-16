@@ -202,7 +202,8 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                                     );
                                     eprintln!("{warning}");
                                     println!("lint: {warning}");
-                                    let _ = crate::append_to_receipt(&path, &format!("\n{warning}\n"));
+                                    let _ =
+                                        crate::append_to_receipt(&path, &format!("\n{warning}\n"));
                                     if effective_strict {
                                         bail!(warning);
                                     }
