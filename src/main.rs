@@ -90,7 +90,7 @@ use cmd::{
     CrewCmd, CronCmd, DoorbellCmd, LedgerCmd, LoopCmd, MailCmd, MailContactCmd, MailLockCmd,
     MailProductCmd, MailSlotCmd, ModelCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd,
     SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd,
-    WorktreeCmd, XprojCmd,
+    WorktreeCmd, XprojCmd, cmd_asset, cmd_config, cmd_policy, cmd_principles, cmd_standing_orders,
 };
 use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
@@ -6434,7 +6434,9 @@ mod spawn_boot_reliability_tests {
         // never addresses the daemon (no port, no serve, no daemon stop).
         let src = include_str!("main.rs");
         let kill = crate::tripwire::find_fn(src, "cmd_kill");
-        let kill_end = crate::tripwire::find_fn(src, "cmd_principles");
+        // bd-i9z2: cmd_principles moved to cmd/principles.rs — cmd_ledger
+        // is the next fn after cmd_kill now.
+        let kill_end = crate::tripwire::find_fn(src, "cmd_ledger");
         let kbody = &src[kill..kill_end];
         assert!(
             kbody.contains("doorbell::stop"),
@@ -15930,59 +15932,6 @@ fn cmd_kill(
 
 // ---- work / assign ----
 
-/// ADR-0019 Spec 5/6 `flywheel principles`: the compiled-in 21 leaves.
-/// `list` prints exactly the 21 canonical names; `show <name>` prints the
-/// full when+rule (unknown name -> non-zero exit + a suggestion).
-fn cmd_principles(cmd: &PrinciplesCmd) -> Result<()> {
-    match cmd {
-        PrinciplesCmd::List => {
-            for p in crate::principles::PRINCIPLES {
-                println!("{}", p.name);
-            }
-            Ok(())
-        }
-        PrinciplesCmd::Show { name } => {
-            if let Some(p) = crate::principles::show(name) {
-                println!("{}", p.name);
-                println!("WHEN {}", p.when);
-                println!("RULE {}", p.rule);
-                Ok(())
-            } else {
-                let suggestion = crate::principles::suggest(name)
-                    .map(|s| format!(" — did you mean `{s}`?"))
-                    .unwrap_or_default();
-                anyhow::bail!(
-                    "unknown principle `{name}`{suggestion} (see `flywheel principles list`)"
-                );
-            }
-        }
-    }
-}
-
-/// ADR-0019 Spec 2 `flywheel standing-orders regen`: regenerate the GLOBAL
-/// standing orders (~/.config/flywheel/standing-orders.md) from the
-/// principle registry + the wave-1 criticals (numbered lines, one constraint
-/// each). Writes ONLY the global path — project fences
-/// (<project>/.flywheel/standing-orders.md) are authored and preserved
-/// byte-identical (the layering guarantee, tested in standing_orders.rs).
-fn cmd_standing_orders(cmd: &StandingOrdersCmd) -> Result<()> {
-    match cmd {
-        StandingOrdersCmd::Regen => {
-            let global = crate::config::config_dir().join("standing-orders.md");
-            standing_orders::regen_global(&global)?;
-            let lines = standing_orders::global_standing_orders()
-                .lines()
-                .filter(|l| !l.starts_with('#'))
-                .count();
-            println!(
-                "regenerated {} ({lines} numbered constraints; project fences untouched)",
-                global.display()
-            );
-            Ok(())
-        }
-    }
-}
-
 /// bd-p4oc helpers: non-vacuous VERIFY gate for cargo test filters.
 pub(crate) fn is_cargo_test_verify(verify: &str) -> bool {
     verify.trim_start().starts_with("cargo test")
@@ -19274,53 +19223,6 @@ fn cmd_analytics(project: &str) -> Result<()> {
 }
 
 // ---- recipes / workflows / pipeline / template / ensemble ----
-
-fn cmd_asset(cfg: &Config, kind: &str, cmd: &AssetCmd) -> Result<()> {
-    match cmd {
-        AssetCmd::List => {
-            let names: Vec<String> = match kind {
-                "recipes" | "template" => {
-                    config::Recipes::load()?.recipes.keys().cloned().collect()
-                }
-                "workflows" => config::Workflows::load()?
-                    .workflows
-                    .keys()
-                    .cloned()
-                    .collect(),
-                "pipeline" => config::Pipelines::load()?
-                    .pipelines
-                    .keys()
-                    .cloned()
-                    .collect(),
-                _ => vec![],
-            };
-            if names.is_empty() {
-                println!(
-                    "no {kind} defined (edit {})",
-                    config::config_dir().join(format!("{kind}.toml")).display()
-                );
-            } else {
-                for n in names {
-                    println!("{n}");
-                }
-            }
-            Ok(())
-        }
-        AssetCmd::Run { name, project } => match kind {
-            "recipes" | "template" => cmd_spawn(
-                cfg,
-                project,
-                SpawnOpts {
-                    recipe: Some(name.clone()),
-                    ..Default::default()
-                },
-            ),
-            "workflows" => run_workflow(cfg, project, name),
-            "pipeline" => run_pipeline(cfg, project, name),
-            _ => bail!("unknown asset kind {kind}"),
-        },
-    }
-}
 
 /// `flywheel stage list`: the stage library surface (ADR-0005 P3.3).
 fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
@@ -22669,47 +22571,6 @@ fn cmd_guards(_cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn cmd_policy(_cfg: &Config, cmd: &PolicyCmd) -> Result<()> {
-    let path = config::config_dir().join("policy.toml");
-    let mut policy = config::Policy::load()?;
-    match cmd {
-        PolicyCmd::List => {
-            for (i, p) in policy.deny.iter().enumerate() {
-                println!("[{i}] {p}");
-            }
-            if policy.deny.is_empty() {
-                println!("no deny patterns");
-            }
-        }
-        PolicyCmd::Add { pattern } => {
-            policy.deny.push(pattern.clone());
-            save_policy(&path, &policy)?;
-            println!("guard added: {pattern}");
-        }
-        PolicyCmd::Remove { index } => {
-            if *index >= policy.deny.len() {
-                bail!("no guard at index {index}");
-            }
-            let removed = policy.deny.remove(*index);
-            save_policy(&path, &policy)?;
-            println!("guard removed: {removed}");
-        }
-        PolicyCmd::Path => {
-            println!("{}", path.display());
-        }
-    }
-    Ok(())
-}
-
-fn save_policy(path: &std::path::Path, policy: &config::Policy) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let raw = toml::to_string_pretty(policy)?;
-    std::fs::write(path, raw)?;
-    Ok(())
-}
-
 // ---- deps / config / upgrade / tutorial ----
 pub(crate) fn resonate_health(cfg: &Config) -> Result<()> {
     // 127.0.0.1, NOT localhost: localhost resolves ::1-first while the
@@ -23922,71 +23783,6 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     println!("config: {}", config::config_file().display());
     if !ok {
         bail!("deps check failed");
-    }
-    Ok(())
-}
-
-fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
-    let path = config::config_file();
-    match cmd {
-        ConfigCmd::List => {
-            let raw = if path.exists() {
-                std::fs::read_to_string(&path)?
-            } else {
-                String::new()
-            };
-            println!("{raw}");
-            println!("# effective (flags/env > file):");
-            println!("socket_path = {:?}", cfg.socket_path());
-            println!(
-                "workspace_root = {:?}",
-                cfg.workspace_root().display().to_string()
-            );
-            println!("default_timeout_ms = {}", cfg.timeout_ms());
-        }
-        ConfigCmd::Get { key } => {
-            let raw = if path.exists() {
-                std::fs::read_to_string(&path)?
-            } else {
-                String::new()
-            };
-            let cfg: config::Config = toml::from_str(&raw).unwrap_or_default();
-            let value = match key.as_str() {
-                "socket_path" => cfg.socket_path,
-                "workspace_root" => cfg.workspace_root,
-                "default_timeout_ms" => cfg.default_timeout_ms.map(|v| v.to_string()),
-                _ => bail!("unknown key: {key} (socket_path|workspace_root|default_timeout_ms)"),
-            };
-            println!("{}", value.unwrap_or_default());
-        }
-        ConfigCmd::Set { key, value } => {
-            let raw = if path.exists() {
-                std::fs::read_to_string(&path)?
-            } else {
-                String::new()
-            };
-            let mut cfg: config::Config = toml::from_str(&raw).unwrap_or_default();
-            match key.as_str() {
-                "socket_path" => cfg.socket_path = Some(value.clone()),
-                "workspace_root" => cfg.workspace_root = Some(value.clone()),
-                "default_timeout_ms" => cfg.default_timeout_ms = Some(value.parse()?),
-                "backend.multiplexer" => {
-                    cfg.backend.get_or_insert_with(Default::default).multiplexer = value.clone();
-                }
-                "backend.mail" => {
-                    cfg.backend.get_or_insert_with(Default::default).mail = value.clone();
-                }
-                _ => bail!(
-                    "unknown key: {key} (socket_path|workspace_root|default_timeout_ms|backend.multiplexer|backend.mail)"
-                ),
-            }
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
-            println!("set {key} = {value}");
-        }
-        ConfigCmd::Path => println!("{}", path.display()),
     }
     Ok(())
 }
