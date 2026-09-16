@@ -1681,7 +1681,7 @@ mod tests {
         );
         // A spawned pin with a pane keeps its route.
         assert!(
-            host.reducer.model.unroutable.is_empty() == false
+            !host.reducer.model.unroutable.is_empty()
                 && !host.reducer.model.unroutable.contains("PinA"),
             "a registry pin with a pane stays routable: {:?}",
             host.reducer.model.unroutable

@@ -837,7 +837,8 @@ async fn handle_http(mut stream: tokio::net::TcpStream, app: AppState) {
                 .or_else(|| {
                     req.lines().find_map(|l| {
                         let (k, v) = l.split_once(':')?;
-                        (k.trim().to_ascii_lowercase() == "last-event-id")
+                        k.trim()
+                            .eq_ignore_ascii_case("last-event-id")
                             .then(|| v.trim().parse::<u64>().ok())?
                     })
                 });
@@ -1244,7 +1245,7 @@ fn stats_body(app: &AppState) -> String {
                 && !rest.contains('.')
             {
                 workspaces += 1;
-                journal_rows += store.journal_row_count(&rest.to_string());
+                journal_rows += store.journal_row_count(rest);
             }
         }
     }
@@ -1495,7 +1496,8 @@ mod tests {
             Some("http://127.0.0.1:18999/wake"),
             "w",
         );
-        let (regs, refused) = super::webhook_registrations(&[named.clone()], "w", &allow);
+        let (regs, refused) =
+            super::webhook_registrations(std::slice::from_ref(&named), "w", &allow);
         assert_eq!(
             regs,
             vec![super::WebhookReg {

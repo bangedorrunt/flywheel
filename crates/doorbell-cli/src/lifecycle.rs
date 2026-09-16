@@ -61,10 +61,6 @@ pub fn default_flywheel_state() -> PathBuf {
 }
 
 impl Config {
-    pub fn resolve(state_dir: Option<PathBuf>, port: Option<u16>) -> Result<Self> {
-        Self::resolve_full(state_dir, port, None, Vec::new())
-    }
-
     pub fn resolve_full(
         state_dir: Option<PathBuf>,
         port: Option<u16>,

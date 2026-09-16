@@ -823,10 +823,10 @@ mod tests {
         ));
         let mut saw = false;
         while let Ok(m) = deg_rx.try_recv() {
-            if let BrainMsg::Degraded { source, .. } = m {
-                if source == "sink:webhook" {
-                    saw = true;
-                }
+            if let BrainMsg::Degraded { source, .. } = m
+                && source == "sink:webhook"
+            {
+                saw = true;
             }
         }
         assert!(saw, "endpoint death is Degraded data");
