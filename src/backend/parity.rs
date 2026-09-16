@@ -121,7 +121,6 @@ mod tests {
             terminal_title: None,
             workspace_id: "w1".into(),
         }));
-        let ok = ok.unwrap();
         assert_eq!(ok.status, Some(AgentStatus::Working));
         assert_eq!(ok.code, None);
         // coded error: Err(toron BackendError) → status None, code Some
@@ -130,7 +129,6 @@ mod tests {
                 toron_core::backend::error::BackendErrorCode::AgentPromptStalled,
                 "x",
             )));
-        let err = err.unwrap();
         assert_eq!(err.status, None);
         assert_eq!(err.code.as_deref(), Some("agent_prompt_stalled"));
     }

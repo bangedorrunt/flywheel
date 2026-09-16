@@ -461,7 +461,7 @@ pub fn inspect_lock_generation_with_hash(
 }
 
 /// Kill the dispatcher and drop the pid + generation files (ADR-0005 D1).
-pub fn stop(state_dir: &Path, workspace: &str) -> Result<()> {
+pub fn stop(state_dir: &Path, workspace: &str) {
     let path = pid_file(state_dir, workspace);
     if let Some(pid) = read_pid(&path) {
         kill_pid(pid);
@@ -469,7 +469,6 @@ pub fn stop(state_dir: &Path, workspace: &str) -> Result<()> {
     clear_pid(&path);
     let _ = fs::remove_file(unanswered_file(state_dir, workspace));
     let _ = fs::remove_file(gen_file(state_dir, workspace));
-    Ok(())
 }
 
 /// Cutover registration (bd-asr2.13, Phase 3): spawn records one
@@ -2498,7 +2497,7 @@ mod tests {
         clear_pid(&pid_file(&dir, "w1"));
         assert_eq!(dispatcher_status_line(&dir, "w1"), "dispatcher: down");
         write_pid(&pid_file(&dir, "w1"), 999_998).expect("stale");
-        stop(&dir, "w1").expect("stop");
+        stop(&dir, "w1");
         assert!(!pid_file(&dir, "w1").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2617,7 +2616,7 @@ mod tests {
             text.contains("doorbell: unanswered pin=") && text.contains("PaleHarbor"),
             "{text}"
         );
-        stop(&dir, "w1").expect("stop");
+        stop(&dir, "w1");
         assert!(read_unanswered(&unanswered_file(&dir, "w1")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2800,7 +2799,7 @@ mod tests {
             },
         )
         .expect("gen");
-        stop(&dir, "wst").expect("stop");
+        stop(&dir, "wst");
         assert!(read_gen(&gen_file(&dir, "wst")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

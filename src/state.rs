@@ -806,11 +806,10 @@ pub fn save_captain_alias(project: &str, pin: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn clear_captain_alias_file(project: &str) -> Result<()> {
+pub fn clear_captain_alias_file(project: &str) {
     let path = captain_alias_file(project);
     let _ = std::fs::remove_file(&path);
     // best-effort: also remove empty dir
-    Ok(())
 }
 
 pub fn is_captain_alias_cleared(project: &str) -> bool {

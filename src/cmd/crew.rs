@@ -189,7 +189,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             )?;
             let pane_id = new_pane.pane_id.clone();
             let shell_ready =
-                crate::herdr_shim::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15))?;
+                crate::herdr_shim::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
