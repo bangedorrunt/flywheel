@@ -20521,7 +20521,6 @@ fn cmd_loop(
                     // `## VERIFY` fence are dispatched; not-ready beads are
                     // mailed to the planner once per loop run.
                     let (dispatchable, not_ready) = durable::partition_ready(&ready);
-                    let ok: Vec<durable::ReadyBead> = dispatchable.into_iter().cloned().collect();
                     // bd-gnej wave-gate: hold a wave-N labeled bead while any
                     // earlier wave-M (M<N) is open/in_progress — earlier
                     // waves run first. No wave labels → no gating.
@@ -20554,8 +20553,12 @@ fn cmd_loop(
                                 }
                             }
                         });
-                    let to_assign: Vec<durable::ReadyBead> = ok
+                    // bd-ancp: no intermediate Vec — the ready set streams
+                    // straight into the wave/scope filters (one alloc saved
+                    // per poll on this hot path).
+                    let to_assign: Vec<durable::ReadyBead> = dispatchable
                         .into_iter()
+                        .cloned()
                         .filter(|b| !wave_held.contains(&b.id))
                         .filter(|b| match (&scope_ids, &scope_block) {
                             (Some(ids), _) => ids.contains(&b.id),

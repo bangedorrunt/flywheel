@@ -605,16 +605,14 @@ impl CoalitionStore {
         // The joiner must exist as an agent in THEIR project (same gate as
         // `form`); registration is idempotent (upsert).
         self.register_agent_in(agent, &project)?;
-        let registered: Vec<String> = runtime()?
+        // bd-ancp: membership probe streams — no intermediate Vec alloc.
+        let registered = runtime()?
             .block_on(
                 self.mailbox
                     .list_agents(&project, ListAgentsOptions::default()),
             )
-            .map_err(|e| anyhow!("list agents in project {project}: {e}"))?
-            .into_iter()
-            .map(|a| a.name)
-            .collect();
-        if !registered.contains(&agent.to_string()) {
+            .map_err(|e| anyhow!("list agents in project {project}: {e}"))?;
+        if !registered.iter().any(|a| a.name == *agent) {
             bail!("join: agent {agent} not registered in project {project}");
         }
         manifest.members.push(agent.to_string());
