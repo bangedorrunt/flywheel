@@ -282,8 +282,14 @@ async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
     // bd-enov: a legacy private store means this process used to fork the
     // identity plane. Name it (non-destructively — the file is left in
     // place for the operator); never migrate silently.
+    // bd-d65y: stderr noise trains operators to ignore real warnings —
+    // show only under FLYWHEEL_VERBOSE (documented in .env.example).
     let legacy = db.with_file_name("flywheel-mail.sqlite");
-    if legacy.exists() {
+    if legacy.exists()
+        && !std::env::var("FLYWHEEL_VERBOSE")
+            .unwrap_or_default()
+            .is_empty()
+    {
         eprintln!(
             "flywheel mail: note — the legacy private store {} is superseded by the shared \
              toron index {} (bd-enov). It is left untouched for recovery; nothing reads it.",
