@@ -15613,7 +15613,7 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
 fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
     mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
         anyhow!(
-            "toron mail not configured — set [mail.toron] url in {} (AM fallback: mail=agentmail)",
+            "toron mail not configured — set [mail.toron] url in {}",
             config::config_file().display()
         )
     })
@@ -29921,6 +29921,73 @@ fn send_loop_mail(
         bead: e.bead,
         ..Default::default()
     }))?)
+}
+
+#[cfg(test)]
+mod loop_mail_tests {
+    use super::*;
+
+    /// bd-6tmi review pin: every loop-mail kind builds the envelope the
+    /// pre-unify fns sent — subject, thread, importance, ack, and the
+    /// done-only structural bead tag (ADR-0010 D9: the guard matches the
+    /// TAG, so non-done kinds stay tagless).
+    #[test]
+    fn all_kinds_build_their_documented_envelopes() {
+        let nr = loop_mail_envelope(&LoopMail::NotReady {
+            bead_id: "bd-1",
+            title: "t",
+            planner: "P",
+            reason: Some("nope"),
+        });
+        assert!(nr.subject.contains("[bd-1]") && nr.subject.contains("nope"));
+        assert_eq!(nr.thread, "bd-1");
+        assert_eq!(nr.to, "P");
+        assert_eq!(nr.importance, "high");
+        assert!(nr.ack);
+        assert_eq!(nr.bead, None);
+
+        let nr0 = loop_mail_envelope(&LoopMail::NotReady {
+            bead_id: "bd-1",
+            title: "t",
+            planner: "P",
+            reason: None,
+        });
+        assert!(nr0.body.contains("## VERIFY"));
+
+        let done = loop_mail_envelope(&LoopMail::Done {
+            bead_id: "bd-2",
+            title: "t",
+            report: "r",
+            captain: "C",
+        });
+        assert_eq!(done.subject, "[bd-2] done");
+        assert_eq!(done.importance, "normal");
+        assert_eq!(done.bead.as_deref(), Some("bd-2"));
+
+        let vf = loop_mail_envelope(&LoopMail::VerifierFamilyMissing {
+            bead_id: "bd-3",
+            captain: "C",
+        });
+        assert!(vf.subject.contains("verifier family missing"));
+        assert_eq!(vf.importance, "high");
+        assert_eq!(vf.bead, None);
+
+        let uc = loop_mail_envelope(&LoopMail::UnverifiedClose {
+            bead_id: "bd-4",
+            sha: "abc",
+            planner: "P",
+        });
+        assert!(uc.subject.contains("unverified close reopened"));
+        assert_eq!(uc.importance, "urgent");
+        assert_eq!(uc.bead, None);
+
+        let uc0 = loop_mail_envelope(&LoopMail::UnverifiedClose {
+            bead_id: "bd-4",
+            sha: "",
+            planner: "P",
+        });
+        assert!(uc0.body.contains("ILLEGAL"));
+    }
 }
 
 /// The not-ready mail itself: thread = the bead id, so the planner's reply

@@ -853,8 +853,8 @@ impl Mail {
                 // The remote daemon is toron (`[mail.toron] url`): its
                 // message ids are hex event ids and its `mark_message_read`
                 // tool takes a String — pass the id through verbatim, never
-                // coerce it to a number (se2.2; the AM backend in
-                // agentmail.rs owns the decimal-id edge).
+                // coerce it to a number (se2.2; the deleted AM backend owned
+                // the decimal-id edge).
                 self.call_remote(
                     "mark_message_read",
                     crate::backend::wire::mark_read_args(

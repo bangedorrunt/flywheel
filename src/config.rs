@@ -1144,7 +1144,7 @@ daily = [
     /// Zero-config default build: no sections at all → toron is embedded
     /// in-process.
     #[test]
-    fn zero_config_defaults_agentmail_port_and_embedded_toron() {
+    fn zero_config_defaults_embedded_toron() {
         let cfg = Config::default();
         let toron = cfg.toron_mail_config();
         assert_eq!(toron.url, None, "no url -> embedded in-process toron");
