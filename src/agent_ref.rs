@@ -642,6 +642,209 @@ where
     }
 }
 
+/// One logical mid-session reclassify effect (GS-050 / ADR-0032 I8a).
+/// Stable `effect_key` excludes attempt number — retries attach to the same
+/// journal primary key (Prepared → InFlight → Settled|Unknown|Failed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReclassifyIntent {
+    pub effect_key: String,
+    pub goal: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_topology: Option<String>,
+    pub pin: String,
+    pub state: EffectState,
+    pub attempt: u32,
+}
+
+impl ReclassifyIntent {
+    /// Length-prefixed / tagged encode so field boundaries cannot collide and
+    /// `None` ≠ `Some("")` (raw `\\0` concat invent-green).
+    pub fn derive_effect_key(
+        goal: &str,
+        reason: &str,
+        explicit_topology: Option<&str>,
+        pin: &str,
+    ) -> String {
+        let mut h = Sha256::new();
+        h.update(b"gs050-reclassify-v2");
+        fn put_str(h: &mut Sha256, s: &str) {
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        }
+        put_str(&mut h, goal);
+        put_str(&mut h, reason);
+        match explicit_topology {
+            None => h.update([0u8]),
+            Some(v) => {
+                h.update([1u8]);
+                put_str(&mut h, v);
+            }
+        }
+        put_str(&mut h, pin);
+        format!("reclassify:{}", hex::encode(h.finalize()))
+    }
+
+    pub fn prepare(
+        goal: impl Into<String>,
+        reason: impl Into<String>,
+        explicit_topology: Option<String>,
+        pin: impl Into<String>,
+        attempt: u32,
+    ) -> Self {
+        let goal = goal.into();
+        let reason = reason.into();
+        let pin = pin.into();
+        let effect_key =
+            Self::derive_effect_key(&goal, &reason, explicit_topology.as_deref(), &pin);
+        Self {
+            effect_key,
+            goal,
+            reason,
+            explicit_topology,
+            pin,
+            state: EffectState::Prepared,
+            attempt,
+        }
+    }
+
+    /// Attach to an already-derived journal key (from `Cmd::Reclassify`).
+    pub fn from_cmd_key(
+        effect_key: String,
+        goal: impl Into<String>,
+        reason: impl Into<String>,
+        explicit_topology: Option<String>,
+        pin: impl Into<String>,
+        attempt: u32,
+    ) -> Self {
+        Self {
+            effect_key,
+            goal: goal.into(),
+            reason: reason.into(),
+            explicit_topology,
+            pin: pin.into(),
+            state: EffectState::Prepared,
+            attempt,
+        }
+    }
+}
+
+/// Journal a reclassify effect row (I4). Flywheel event log — not mailbox.
+pub fn journal_reclassify(project: &str, intent: &ReclassifyIntent) -> anyhow::Result<()> {
+    let mut entry = serde_json::to_value(intent)?;
+    if let serde_json::Value::Object(map) = &mut entry {
+        map.insert(
+            "journal".to_string(),
+            serde_json::Value::String("reclassify".to_string()),
+        );
+    }
+    state::log_event(project, EventKind::State, entry)?;
+    eprintln!(
+        "flywheel: reclassify journal effect_key={} state={:?} attempt={} pin={} reason={}",
+        intent.effect_key, intent.state, intent.attempt, intent.pin, intent.reason
+    );
+    Ok(())
+}
+
+/// Newest reclassify journal row for `effect_key`, if any (primary-key load).
+pub fn load_reclassify_by_key(
+    project: &str,
+    effect_key: &str,
+) -> anyhow::Result<Option<ReclassifyIntent>> {
+    let log = state::read_log(project)?;
+    let mut found: Option<ReclassifyIntent> = None;
+    for entry in log {
+        let Some(j) = entry.data.get("journal").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if j != "reclassify" {
+            continue;
+        }
+        let Some(key) = entry.data.get("effect_key").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if key != effect_key {
+            continue;
+        }
+        if let Ok(intent) = serde_json::from_value::<ReclassifyIntent>(entry.data.clone()) {
+            found = Some(intent);
+        }
+    }
+    Ok(found)
+}
+
+/// Insert Prepared if absent; else attach to the same `effect_key` primary key
+/// (bump attempt). Retries resume the same logical effect row identity.
+pub fn insert_or_load_reclassify(
+    project: &str,
+    mut intent: ReclassifyIntent,
+) -> anyhow::Result<ReclassifyIntent> {
+    if let Some(prev) = load_reclassify_by_key(project, &intent.effect_key)? {
+        intent.effect_key = prev.effect_key;
+        intent.attempt = prev.attempt.saturating_add(1);
+    }
+    intent.state = EffectState::Prepared;
+    journal_reclassify(project, &intent)?;
+    Ok(intent)
+}
+
+/// Commit Prepared → InFlight → Settled|Unknown|Failed around a fallible apply.
+/// Caller should [`insert_or_load_reclassify`] first so retries share the PK.
+pub fn commit_reclassify<F, T>(
+    project: &str,
+    mut intent: ReclassifyIntent,
+    apply: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce(&ReclassifyIntent) -> anyhow::Result<T>,
+{
+    // insert_or_load already journaled Prepared; advance to InFlight.
+    intent.state = EffectState::InFlight;
+    journal_reclassify(project, &intent)?;
+    match apply(&intent) {
+        Ok(v) => {
+            intent.state = EffectState::Settled;
+            journal_reclassify(project, &intent)?;
+            Ok(v)
+        }
+        Err(e) => {
+            intent.state = EffectState::Failed;
+            let _ = journal_reclassify(project, &intent);
+            Err(e)
+        }
+    }
+}
+
+/// Like [`commit_reclassify`] but `None` from apply journals Unknown (I5).
+pub fn commit_reclassify_opt<F, T>(
+    project: &str,
+    mut intent: ReclassifyIntent,
+    apply: F,
+) -> anyhow::Result<Option<T>>
+where
+    F: FnOnce(&ReclassifyIntent) -> anyhow::Result<Option<T>>,
+{
+    intent.state = EffectState::InFlight;
+    journal_reclassify(project, &intent)?;
+    match apply(&intent) {
+        Ok(Some(v)) => {
+            intent.state = EffectState::Settled;
+            journal_reclassify(project, &intent)?;
+            Ok(Some(v))
+        }
+        Ok(None) => {
+            intent.state = EffectState::Unknown;
+            journal_reclassify(project, &intent)?;
+            Ok(None)
+        }
+        Err(e) => {
+            intent.state = EffectState::Failed;
+            let _ = journal_reclassify(project, &intent);
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,5 +1077,61 @@ mod tests {
         assert!(!log.contains("sk-live-abcdef"), "{log}");
         assert!(!log.contains("nsec1qqqq"), "{log}");
         assert!(log.contains("[REDACTED]"), "{log}");
+    }
+
+    /// GS-050: length-prefix encode — None ≠ Some("") (no raw NUL concat).
+    #[test]
+    fn reclassify_effect_key_none_ne_some_empty() {
+        let none_k = ReclassifyIntent::derive_effect_key("g", "r", None, "pin");
+        let empty_k = ReclassifyIntent::derive_effect_key("g", "r", Some(""), "pin");
+        assert_ne!(none_k, empty_k, "None must not collide with Some(\"\")");
+        assert!(none_k.starts_with("reclassify:"));
+        assert_eq!(
+            none_k,
+            ReclassifyIntent::derive_effect_key("g", "r", None, "pin")
+        );
+    }
+
+    /// GS-050 I8a: insert-or-load keeps one effect_key primary key across retries.
+    #[test]
+    fn reclassify_insert_or_load_dedups_on_effect_key() {
+        let _home = crate::config::test_state_home();
+        let project = "reclassify-journal-pk";
+        let first = ReclassifyIntent::prepare("ship it", "authoritative-objective", None, "cap", 0);
+        let key = first.effect_key.clone();
+        let loaded = insert_or_load_reclassify(project, first).expect("insert");
+        assert_eq!(loaded.effect_key, key);
+        assert_eq!(loaded.state, EffectState::Prepared);
+        assert_eq!(loaded.attempt, 0);
+
+        let retry = ReclassifyIntent::from_cmd_key(
+            key.clone(),
+            "ship it",
+            "authoritative-objective",
+            None,
+            "cap",
+            0,
+        );
+        let attached = insert_or_load_reclassify(project, retry).expect("load");
+        assert_eq!(attached.effect_key, key, "retries attach to same PK");
+        assert_eq!(attached.attempt, 1, "attempt bumps on resume");
+
+        let settled: () = commit_reclassify(project, attached, |_| Ok(())).expect("settle");
+        let _ = settled;
+        let log = effect_log(project);
+        assert!(log.contains("\"journal\":\"reclassify\""), "{log}");
+        assert!(log.contains(&key), "journal carries effect_key: {log}");
+        for state in ["prepared", "in_flight", "settled"] {
+            assert!(log.contains(&format!("\"state\":\"{state}\"")), "{state}: {log}");
+        }
+        // Every row for this logical effect shares the same primary key.
+        let rows: Vec<_> = log
+            .lines()
+            .filter(|l| l.contains("\"journal\":\"reclassify\""))
+            .collect();
+        assert!(rows.len() >= 3, "prepared+inflight+settled: {rows:?}");
+        for row in &rows {
+            assert!(row.contains(&key), "PK missing in {row}");
+        }
     }
 }

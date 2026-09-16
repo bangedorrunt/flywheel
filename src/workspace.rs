@@ -8,8 +8,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -1282,32 +1280,29 @@ pub fn reclassify_announce_line(
 
 /// GS-050 / ADR-0032 I8a: stable journal identity for one logical
 /// reclassify. Excludes attempt number — same goal/reason/explicit/pin
-/// always yields the same key (retries keep it).
+/// always yields the same key (retries keep it). Length-prefixed / tagged
+/// encode via [`crate::agent_ref::ReclassifyIntent::derive_effect_key`] so
+/// field boundaries cannot collide and `None` ≠ `Some("")`.
 pub fn reclassify_effect_key(
     goal: &str,
     reason: &str,
     explicit_topology: Option<&str>,
     pin: &str,
 ) -> String {
-    let mut h = Sha256::new();
-    h.update(b"gs050-reclassify-v1\0");
-    h.update(goal.as_bytes());
-    h.update(b"\0");
-    h.update(reason.as_bytes());
-    h.update(b"\0");
-    h.update(explicit_topology.unwrap_or("").as_bytes());
-    h.update(b"\0");
-    h.update(pin.as_bytes());
-    format!("reclassify:{}", hex::encode(h.finalize()))
+    crate::agent_ref::ReclassifyIntent::derive_effect_key(goal, reason, explicit_topology, pin)
 }
 
-/// GS-048 effect helper: replace each `Cmd::Reclassify` with the cmds from
-/// folding `Msg::DecisionReady` after a pure `decide` call. Callers in the
-/// effect layer run this **before** mapping Prompt→delivery so the vehicle
-/// announce is not lost inside a nested handle.
+
+/// GS-048 / GS-050 effect helper: replace each `Cmd::Reclassify` with the
+/// cmds from folding `Msg::DecisionReady` after a pure `decide` call.
+/// Journals Prepared → InFlight → Settled|Failed under the Cmd's
+/// `effect_key` (ADR-0032 I8a) via insert-or-load — retries attach to the
+/// same journal primary key. Callers in the effect/host path run this
+/// **before** mapping Prompt→delivery; decide stays outside pure `tick`.
 pub fn expand_reclassify_cmds(
     model: &mut WorkspaceModel,
     cmds: Vec<Cmd>,
+    project: &str,
     decide: &dyn Fn(&str) -> (String, String, Vec<String>, String),
 ) -> Vec<Cmd> {
     let mut out = Vec::with_capacity(cmds.len());
@@ -1315,22 +1310,81 @@ pub fn expand_reclassify_cmds(
         match cmd {
             Cmd::Reclassify {
                 goal,
-                pin: _,
+                pin,
                 explicit_topology,
-                reason: _,
-                effect_key: _,
+                reason,
+                effect_key,
             } => {
-                let (primitive, topology, argv, decide_reason) = decide(&goal);
-                let ready = Msg::DecisionReady {
-                    goal,
-                    primitive,
-                    topology,
-                    argv,
-                    decide_reason,
-                    explicit_topology,
+                // USE the key — never match `_` (Cmd theater without journal).
+                let expected = reclassify_effect_key(
+                    &goal,
+                    &reason,
+                    explicit_topology.as_deref(),
+                    &pin,
+                );
+                if effect_key != expected {
+                    eprintln!(
+                        "flywheel: reclassify effect_key drift cmd={effect_key} derived={expected}"
+                    );
+                }
+                let prepared = crate::agent_ref::ReclassifyIntent::from_cmd_key(
+                    effect_key.clone(),
+                    goal.clone(),
+                    reason.clone(),
+                    explicit_topology.clone(),
+                    pin.clone(),
+                    0,
+                );
+                let intent = match crate::agent_ref::insert_or_load_reclassify(project, prepared) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("flywheel: reclassify journal insert failed: {e:#}");
+                        crate::agent_ref::ReclassifyIntent::from_cmd_key(
+                            effect_key.clone(),
+                            goal.clone(),
+                            reason.clone(),
+                            explicit_topology.clone(),
+                            pin.clone(),
+                            0,
+                        )
+                    }
                 };
-                let (next, more) = tick(model, &ready);
-                *model = next;
+                let more = match crate::agent_ref::commit_reclassify(project, intent, |intent| {
+                    // Apply uses the journaled identity (goal + effect_key).
+                    let _ = &intent.effect_key;
+                    let (primitive, topology, argv, decide_reason) = decide(&intent.goal);
+                    let ready = Msg::DecisionReady {
+                        goal: intent.goal.clone(),
+                        primitive,
+                        topology,
+                        argv,
+                        decide_reason,
+                        explicit_topology: intent.explicit_topology.clone(),
+                    };
+                    let (next, more) = tick(model, &ready);
+                    *model = next;
+                    Ok(more)
+                }) {
+                    Ok(more) => more,
+                    Err(e) => {
+                        eprintln!("flywheel: reclassify commit failed: {e:#}");
+                        // Best-effort: still fold DecisionReady so the session
+                        // is not stuck without an announce (journal already
+                        // recorded Failed).
+                        let (primitive, topology, argv, decide_reason) = decide(&goal);
+                        let ready = Msg::DecisionReady {
+                            goal,
+                            primitive,
+                            topology,
+                            argv,
+                            decide_reason,
+                            explicit_topology,
+                        };
+                        let (next, more) = tick(model, &ready);
+                        *model = next;
+                        more
+                    }
+                };
                 out.extend(more);
             }
             other => out.push(other),
@@ -1338,7 +1392,6 @@ pub fn expand_reclassify_cmds(
     }
     out
 }
-
 
 fn filter_prompts(model: &WorkspaceModel, cmds: Vec<Cmd>) -> Vec<Cmd> {
     // bd-7qg6: the old filter silently dropped every non-Idle Prompt — including
@@ -5920,7 +5973,8 @@ mod gs048_reclassify_tests {
             },
         );
         assert!(cmds.iter().any(|c| matches!(c, Cmd::Reclassify { .. })));
-        let expanded = expand_reclassify_cmds(&mut m, cmds, &|goal| {
+        let _home = crate::config::test_state_home();
+        let expanded = expand_reclassify_cmds(&mut m, cmds, "gs050-expand-test", &|goal| {
             // Pure decide leaf — mirrors effect layer.
             let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
             (
@@ -6169,4 +6223,90 @@ mod gs048_reclassify_tests {
             "derivation is pure / stable"
         );
     }
+
+    /// GS-050: None ≠ Some("") under length-prefixed effect_key encode.
+    #[test]
+    fn reclassify_effect_key_none_ne_some_empty_string() {
+        let a = reclassify_effect_key("g", "r", None, "pin");
+        let b = reclassify_effect_key("g", "r", Some(""), "pin");
+        assert_ne!(a, b);
+        // Length-prefix also prevents boundary collisions (goal||reason).
+        let c = reclassify_effect_key("ab", "c", None, "pin");
+        let d = reclassify_effect_key("a", "bc", None, "pin");
+        assert_ne!(c, d);
+    }
+
+    /// GS-050: expand journals Prepared→InFlight→Settled under Cmd effect_key
+    /// (durable I8a identity — not Cmd/stderr theater). Retries share PK.
+    #[test]
+    fn expand_reclassify_journals_effect_key_primary_key() {
+        let _home = crate::config::test_state_home();
+        let project = "gs050-reclassify-expand-journal";
+        let mut m = idle_captain();
+        let goal = "AUTHORITATIVE: journal the key".to_string();
+        let (_, cmds) = tick(
+            &m,
+            &Msg::MaterialContext {
+                goal: goal.clone(),
+                explicit_topology: None,
+                reason: "authoritative-objective".into(),
+            },
+        );
+        let key = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::Reclassify { effect_key, .. } => Some(effect_key.clone()),
+                _ => None,
+            })
+            .expect("Reclassify carries effect_key");
+        let _ = expand_reclassify_cmds(&mut m, cmds, project, &|g| {
+            (
+                "none".into(),
+                "none".into(),
+                vec![],
+                format!("decided:{g}"),
+            )
+        });
+        let log = std::fs::read_to_string(crate::state::project_log_path(project))
+            .expect("reclassify journal written");
+        assert!(log.contains("\"journal\":\"reclassify\""), "{log}");
+        assert!(log.contains(&key), "journal must carry Cmd effect_key: {log}");
+        for state in ["prepared", "in_flight", "settled"] {
+            assert!(
+                log.contains(&format!("\"state\":\"{state}\"")),
+                "{state} missing: {log}"
+            );
+        }
+        // Retry same MaterialContext — same PK, attempt bumps.
+        let mut m2 = idle_captain();
+        let (_, cmds2) = tick(
+            &m2,
+            &Msg::MaterialContext {
+                goal: goal.clone(),
+                explicit_topology: None,
+                reason: "authoritative-objective".into(),
+            },
+        );
+        let key2 = cmds2
+            .iter()
+            .find_map(|c| match c {
+                Cmd::Reclassify { effect_key, .. } => Some(effect_key.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(key, key2);
+        let _ = expand_reclassify_cmds(&mut m2, cmds2, project, &|_| {
+            ("none".into(), "none".into(), vec![], "retry".into())
+        });
+        let loaded = crate::agent_ref::load_reclassify_by_key(project, &key)
+            .expect("load")
+            .expect("row");
+        assert_eq!(loaded.effect_key, key);
+        assert!(
+            loaded.attempt >= 1,
+            "idempotent resume bumps attempt: {:?}",
+            loaded.attempt
+        );
+    }
+
 }
