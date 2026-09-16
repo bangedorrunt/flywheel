@@ -2318,7 +2318,7 @@ steps:
                 project: None,
             },
         };
-        let mut deep = leaf.clone();
+        let mut deep = leaf;
         for _ in 0..MAX_COMPOSED_NESTING + 2 {
             deep = Step {
                 name: Some("wrap".into()),

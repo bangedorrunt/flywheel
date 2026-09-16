@@ -432,7 +432,7 @@ impl CoalitionStore {
         )?;
 
         let manifest = CoalitionManifest {
-            id: id.clone(),
+            id,
             goal: goal.to_string(),
             run_id,
             captain: captain.to_string(),
@@ -486,7 +486,7 @@ impl CoalitionStore {
             roles,
             status: manifest.status.clone(),
             closed_at: manifest.closed_at.clone(),
-            close_reason: manifest.close_reason.clone(),
+            close_reason: manifest.close_reason,
             run,
             channel,
             intents,
@@ -796,7 +796,7 @@ impl CoalitionStore {
         let project = self.project_of(&manifest, target_agent);
         runtime()?
             .block_on(self.mailbox.request_release(&RequestRelease {
-                project_slug: project.clone(),
+                project_slug: project,
                 sender_name: agent.to_string(),
                 target_agent: target_agent.to_string(),
                 reservation_id: reservation_id.to_string(),
@@ -820,7 +820,7 @@ impl CoalitionStore {
         let project = self.project_of(&manifest, agent);
         runtime()?
             .block_on(self.mailbox.respond_request_release(&ReleaseResponse {
-                project_slug: project.clone(),
+                project_slug: project,
                 sender_name: agent.to_string(),
                 request_message_id: request_message_id.to_string(),
                 decision,

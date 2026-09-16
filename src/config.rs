@@ -1416,7 +1416,7 @@ daily = [
         let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
         let captain_entry = SpawnEntry::with_mail_identity("pane-cap", "cap", captain);
         let unrelated = SpawnEntry::with_mail_identity("pane-other", "other", "UnrelatedPin");
-        let registry = vec![captain_entry.clone(), child.clone(), unrelated.clone()];
+        let registry = vec![captain_entry, child, unrelated];
 
         // continue: captain removed, children + unrelated stay
         let after_continue =
@@ -1446,7 +1446,7 @@ daily = [
         let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
         let captain_entry = SpawnEntry::with_mail_identity("pane-cap", "cap", captain);
         // Unrelated pin lives outside this project's registry (different project / no entry)
-        let registry = vec![captain_entry, child.clone()];
+        let registry = vec![captain_entry, child];
 
         let attributed = captain_attributed_pins(&registry, captain);
         assert_eq!(attributed, vec!["ChildPin".to_string()]);
@@ -1475,7 +1475,7 @@ daily = [
         let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
         let registry = vec![
             SpawnEntry::with_mail_identity("pane-cap", "cap", captain),
-            child.clone(),
+            child,
         ];
         // reap_crews overrides continue → behaves like Stop (children reaped)
         let with_reap = {
@@ -1524,7 +1524,7 @@ daily = [
         let proj = format!("oncap-kill-{}", std::process::id());
         let captain = "BraveCaptain";
         let child = SpawnEntry::with_mail_identity("pane-child", "child1", "ChildPin");
-        st::save_spawn_registry(&proj, &[child.clone()]).unwrap();
+        st::save_spawn_registry(&proj, &[child]).unwrap();
         st::save_captain_alias(&proj, captain).unwrap();
         // simulate kill with continue: crews remain, alias cleared, doorbell would stay (not stopped)
         let registry = st::load_spawn_registry(&proj);

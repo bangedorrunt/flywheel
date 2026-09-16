@@ -620,7 +620,7 @@ mod tests {
     fn artifact_serde_round_trip() {
         let (_f, path) = tmp_file("hello world");
         let rec = ArtifactRecord::new(
-            path.clone(),
+            path,
             ArtifactKind::Finding,
             ExecutionStatus::Completed,
             CriterionStatus::Met,
@@ -845,8 +845,8 @@ mod tests {
         std::fs::write(&file1, "hello").unwrap();
         let sha1 = compute_sha256(&file1).unwrap();
         let rec1 = ArtifactRecord {
-            path: file1.clone(),
-            sha256: sha1.clone(),
+            path: file1,
+            sha256: sha1,
             kind: ArtifactKind::Finding,
             execution_status: ExecutionStatus::Completed,
             criterion_status: CriterionStatus::Met,
@@ -863,8 +863,8 @@ mod tests {
             std::fs::write(&file2, "world").unwrap();
             let sha2 = compute_sha256(&file2).unwrap();
             ArtifactRecord {
-                path: file2.clone(),
-                sha256: sha2.clone(),
+                path: file2,
+                sha256: sha2,
                 kind: ArtifactKind::Patch,
                 execution_status: ExecutionStatus::Completed,
                 criterion_status: CriterionStatus::Met,
@@ -933,7 +933,7 @@ mod tests {
         let file = base.join("payload.txt");
         std::fs::write(&file, "payload").unwrap();
         let rec = ArtifactRecord::new(
-            file.clone(),
+            file,
             ArtifactKind::Finding,
             ExecutionStatus::Completed,
             CriterionStatus::Met,
