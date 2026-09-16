@@ -230,9 +230,23 @@ toward existing behavior). Walk runs only in the about-to-respawn branch.
 | `FLYWHEEL_STALE_ESCALATE_SECS` | **240** | quiet + not-writing + not exact-Busy → inspect |
 | `FLYWHEEL_BUSY_TURN_MAX_SECS` | **3600** | exact-Busy older than this → same inspect path |
 | `FLYWHEEL_WEDGE_INSPECT_COUNT` | **3** | repeats add `demand-deep-inspection` |
+| `FLYWHEEL_PAUSE_RESURFACE_SECS` | **3600** | declared `paused:` resurface window (the `pending_wait` TTL twin) |
 
 Never auto-interrupt. Auto-kill stays `--force-working`. Declared `paused:`
 uses the 3600s resurface (same number as `pending_wait` TTL).
+
+**Landed (declared-pause resurface).** A drained pane that declares
+`paused: <owner>` instead of finishing its fence is no longer a stuck pane: the
+drain leaf records the wait on `DrainState::paused` (`owner`, the paused-since
+clock, the window), Tick **holds grace** for it (no `Respawn`, ever) and calls
+`write_liveness::paused_resurface_due(age, window)` to emit
+`LoopAction::PausedResurface` once per window, re-arming each time so the
+repeats are bounded and observable. The resurface reaches the human channel as
+a captain-relevant `Audit` row (`kind: pause_resurface`) — the AFK digest read —
+plus the loop's log and event journal. The declaration is produced by the
+shell's per-poll tail read of each drained pane (`__read` +
+`parse_paused_declaration`; degrade-to-empty on a failed read), folded before
+the Tick through the reducer, never by writing the model directly.
 
 **Files.** `src/durable.rs` / drain branch, `src/write_liveness.rs` (new).
 

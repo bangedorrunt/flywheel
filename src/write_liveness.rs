@@ -7,6 +7,15 @@
 //! failed/timed-out walk fails toward existing behavior (respawn).
 //! The leaf is the imperative shell; everything here is pure except
 //! [`walk`], which only stats files.
+//!
+//! It also carries the ADR-0010 D4/D12 declared-`paused:` lane: the parse for
+//! an agent's `paused: <owner>` declaration ([`parse_paused_declaration`]), the
+//! resurface-window knob (`FLYWHEEL_PAUSE_RESURFACE_SECS`, default 3600 — the
+//! `pending_wait` TTL twin), and the [`paused_resurface_due`] predicate the
+//! drain leaf's Tick calls. The paused-since clock itself lives on
+//! `durable::DrainState::paused`; the shell stamps the window onto the
+//! declaration, so the reducer reads no environment and a journaled
+//! declaration replays to the same decision.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -17,6 +26,10 @@ pub(crate) const STALE_ESCALATE_DEFAULT_SECS: u64 = 240;
 pub(crate) const BUSY_TURN_MAX_DEFAULT_SECS: u64 = 3600;
 /// Consecutive write-evidence defers that add `demand-deep-inspection`.
 pub(crate) const WEDGE_INSPECT_DEFAULT_COUNT: u32 = 3;
+/// Declared-`paused:` resurface window (secs) — the same 3600s as the
+/// `pending_wait` TTL (ADR-0010 D4/D12): a declared wait names its owner and
+/// gets a bounded re-surface path, never an indefinite silent park.
+pub(crate) const PAUSE_RESURFACE_DEFAULT_SECS: u64 = 3600;
 /// Walk no deeper than this many levels below the project root.
 pub(crate) const WALK_MAXDEPTH_DEFAULT: usize = 8;
 /// Walk budget; breach fails toward respawn, never hangs the leaf.
@@ -32,6 +45,8 @@ pub(crate) const WALK_PRUNE_DEFAULT: &[&str] = &["target", ".git", "node_modules
 /// - `FLYWHEEL_STALE_ESCALATE_SECS` — quiet window, default 240.
 /// - `FLYWHEEL_BUSY_TURN_MAX_SECS` — default 3600.
 /// - `FLYWHEEL_WEDGE_INSPECT_COUNT` — default 3.
+/// - `FLYWHEEL_PAUSE_RESURFACE_SECS` — declared-pause resurface window,
+///   default 3600 (the `pending_wait` TTL twin).
 #[derive(Debug, Clone)]
 pub(crate) struct WalkOpts {
     pub prune: Vec<String>,
@@ -40,6 +55,7 @@ pub(crate) struct WalkOpts {
     pub quiet_secs: u64,
     pub wedge_inspect_count: u32,
     pub busy_turn_max_secs: u64,
+    pub pause_resurface_secs: u64,
 }
 
 impl Default for WalkOpts {
@@ -51,6 +67,7 @@ impl Default for WalkOpts {
             quiet_secs: STALE_ESCALATE_DEFAULT_SECS,
             wedge_inspect_count: WEDGE_INSPECT_DEFAULT_COUNT,
             busy_turn_max_secs: BUSY_TURN_MAX_DEFAULT_SECS,
+            pause_resurface_secs: PAUSE_RESURFACE_DEFAULT_SECS,
         }
     }
 }
@@ -97,6 +114,12 @@ impl WalkOpts {
             .parse()
         {
             o.wedge_inspect_count = v;
+        }
+        if let Ok(v) = std::env::var("FLYWHEEL_PAUSE_RESURFACE_SECS")
+            .unwrap_or_default()
+            .parse()
+        {
+            o.pause_resurface_secs = v;
         }
         o
     }
@@ -294,12 +317,54 @@ pub(crate) fn inspect_due(
 }
 
 /// Declared `paused:` resurface: a pause older than the resurface window
-/// (default 3600s, the pending_wait TTL twin) is due for resurface.
-/// NOTE (bd-8j7m): no paused-since clock exists in the drain leaf yet;
-/// shipped as tested API for the lane that tracks pause declarations.
-#[cfg_attr(not(test), allow(dead_code))]
+/// (default 3600s, the `pending_wait` TTL twin) is due for resurface. Called
+/// by the drain leaf's Tick arm, where the paused-since clock lives
+/// (`durable::DrainState::paused`). A zero window is never "due": an
+/// unset/empty knob must not make every tick a resurface.
 pub(crate) fn paused_resurface_due(paused_age_secs: u64, resurface_secs: u64) -> bool {
-    paused_age_secs >= resurface_secs
+    resurface_secs > 0 && paused_age_secs >= resurface_secs
+}
+
+/// A declared `paused:` wait, parsed from the declaring agent's own text.
+/// `owner` is the human named by the declaration — D12 requires every waiting
+/// state to name its owner, so an unnamed wait is not a declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredPause {
+    pub owner: String,
+}
+
+/// Parse a declared pause out of a pane/agent text tail: a line whose key is
+/// `paused` (case-insensitive), e.g. `paused: CooperSparrow (needs the AC call)`.
+///
+/// The FIRST declaring line wins (a later line is a newer state, not the
+/// declaration being aged). The value is trimmed of list/quote decoration and
+/// split into owner + note: the owner is the first token with any leading `@`
+/// stripped, which is the name the resurface is addressed to. A bare `paused:`
+/// with no owner, or a `paused`-prefixed line with no colon, is NOT a
+/// declaration — the caller keeps the ordinary drain path.
+pub(crate) fn parse_paused_declaration(text: &str) -> Option<DeclaredPause> {
+    for raw in text.lines() {
+        let line = raw.trim().trim_start_matches(['-', '*', '>', '#']).trim();
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("paused") {
+            continue;
+        }
+        let value = value.trim().trim_matches('`').trim();
+        let owner = value
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('@');
+        if owner.is_empty() {
+            continue;
+        }
+        return Some(DeclaredPause {
+            owner: owner.to_string(),
+        });
+    }
+    None
 }
 
 /// Write-evidence digest for the defer path. `defers` counts consecutive
@@ -447,6 +512,42 @@ mod tests {
         // Pause resurface twins the 3600s window.
         assert!(paused_resurface_due(3600, 3600));
         assert!(!paused_resurface_due(3599, 3600));
+        // A zero/unset window must not make every tick a resurface.
+        assert!(!paused_resurface_due(u64::MAX, 0));
+    }
+
+    #[test]
+    fn pause_default_window_twins_the_pending_wait_ttl() {
+        assert_eq!(WalkOpts::default().pause_resurface_secs, 3600);
+        assert_eq!(PAUSE_RESURFACE_DEFAULT_SECS, 3600);
+    }
+
+    #[test]
+    fn parse_paused_declaration_reads_owner_from_the_first_line() {
+        let p = parse_paused_declaration("some work\npaused: CooperSparrow (needs the AC call)\n")
+            .expect("declaration");
+        assert_eq!(p.owner, "CooperSparrow");
+        // Case-insensitive key, list/quote decoration tolerated, `@` stripped.
+        let p = parse_paused_declaration("- PAUSED:   @NavyDog  — waiting on sign-off")
+            .expect("declaration");
+        assert_eq!(p.owner, "NavyDog");
+        // The FIRST declaring line wins: the age must not be re-based by a
+        // later echo of the same wait.
+        let p = parse_paused_declaration("paused: First\npaused: Second").expect("declaration");
+        assert_eq!(p.owner, "First");
+    }
+
+    #[test]
+    fn parse_paused_declaration_refuses_an_unnamed_wait() {
+        // D12: every waiting state names its owner — an unnamed wait has no
+        // re-surface path, so it is not a declaration (ordinary drain path).
+        assert_eq!(parse_paused_declaration("paused:\n"), None);
+        assert_eq!(parse_paused_declaration("paused:   `  `"), None);
+        assert_eq!(parse_paused_declaration("paused :"), None);
+        // A different key, or prose that merely mentions the word.
+        assert_eq!(parse_paused_declaration("blocked: someone"), None);
+        assert_eq!(parse_paused_declaration("I am paused right now"), None);
+        assert_eq!(parse_paused_declaration(""), None);
     }
 
     #[test]
