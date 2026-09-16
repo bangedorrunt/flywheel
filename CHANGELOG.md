@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **GS-052 hybrid `workflow list --brief` (FM-050-STEER → FM-052):** ONE live projection = `name` + `family` + `selection` + `run` + `topology` + `compose_token` (`workflow_list_brief_rows` / `cmd_workflow`). Sticky-open still sees `topology`. Bare `list --json` / `show` keep full description + rest. Docs (AGENTS, catalog-review, workflows, cli-reference, robot-capabilities) aligned to live fields — no invent-green GS-048-only brief docs; no dual `--robot-capabilities` `workflows` key. Rejected: Redis/OTP/new kinds/MCP/GS-046 cuts/GS-051 full packet.
+
 ### Added
 - **GS-050 Reclassify `effect_key` honesty (FM-049-BAR residual) + H1 brief honesty:** `Cmd::Reclassify` carries a durable journal `effect_key` (`reclassify:<sha256>` length-prefixed over goal/reason/explicit/pin — `None` ≠ `Some("")`). Host `expand_reclassify_cmds` insert-or-loads Prepared→InFlight→Settled|Failed under that key (agent_ref `journal_reclassify`, ADR-0032 I8a); retries attach to the same journal primary key. Tests prove journal PK / idempotent resume — not only Cmd field equality. **H1 verdict:** keep GS-048 `--brief` = name/trigger/topology (live `workflow_list_brief_rows` / `cmd_workflow`); family/selection compact stayed mid-work but omitted topology and was early-return shadowed — weak vs sticky-open mid-session pickup; full list retains family/selection/run. Fixed dual `--robot-capabilities` `workflows` key. Docs/guides/AGENTS synced (`.agents/skills/**` unchanged this tip).
 - **GS-049 Elm deepen (GS-045 P1):** `workflow evaluate` — lint + partition candidates without journal dispatch (evaluate-without-commit). Source-Msg / post-effect retry identity tests (I8a; `effect_key` on Reclassify landed in GS-050). Sensor→Msg vocabulary in `docs/guides/doorbell.mdx` (WatchNdjson / Herdr / AckSla / InboxSweep; Presence via Herdr+roles — not a Sensor GenServer arm).
