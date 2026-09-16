@@ -449,10 +449,17 @@ reservations:
   decisions: [ { key, kind: bead|corr, opened_at, waits_on, age, hold_kind } ],
   mail:      { owed, acked, resulted, degraded },
   journal:   { last_seq, last_presented, last_acked, unacked_wakes },
-  drain_pending, afk }
+  drain_pending, afk,
+  loop:      { per_bead_phase, mail_degraded, queue_len, event_cursor } }
 ```
 
 `status` / `view` / `watch` / `steer_brief` consume the snapshot.
+
+The `loop` section is the durable loop's projection (`durable::LoopSnapshot`),
+read from the persisted `ActiveLoop` — per-bead `LoopPhase`, the mail-degraded
+dispatch hold, queue depth, and the event watermark. `loop status` renders the
+same projection, and `helm`'s UNREAD STATUS carries the degraded-hold sentence.
+Nothing derived is persisted twice: the `ActiveLoop` file is the only source.
 
 **`flywheel helm`** is the one session-start drain over that snapshot. Always
 prints OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE even when the wake

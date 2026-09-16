@@ -49,7 +49,6 @@ impl Check {
             status: Status::Fail(msg.into()),
         }
     }
-    #[allow(dead_code)]
     fn skip(name: &'static str, reason: &'static str) -> Self {
         Self {
             name,

@@ -375,11 +375,9 @@ pub struct MailSearchFilter {
     pub sender: Option<String>,
     pub importance: Option<String>,
     pub thread_id: Option<String>,
-    /// Not yet applied by the toron projection (parity surface kept).
-    #[allow(dead_code)]
+    /// Applied to the toron `search_messages` args (see `backend/toron.rs`).
     pub date_start: Option<String>,
-    /// Not yet applied by the toron projection (parity surface kept).
-    #[allow(dead_code)]
+    /// Applied to the toron `search_messages` args (see `backend/toron.rs`).
     pub date_end: Option<String>,
     pub ranking: Option<String>,
     pub include_body_md: bool,
@@ -894,7 +892,12 @@ impl Mail {
     /// Messages past the ack SLA. toron has no ack-overdue projection yet —
     /// returns the inbox (empty after all are acked), so the escalation
     /// protocol's "nothing overdue" branch behaves as before.
-    #[allow(dead_code)] // consumed by the Phase-4 escalation protocol + live test
+    ///
+    /// Blocked on upstream, not on wiring: the Phase-4 escalation protocol is
+    /// the intended consumer, and it cannot distinguish "nothing overdue" from
+    /// "no projection" until toron exposes an ack-overdue read. Kept
+    /// (documented) rather than deleted so the capability is not lost.
+    #[allow(dead_code)]
     pub fn ack_overdue(&self, project_key: &str, agent_name: &str) -> Result<Value> {
         match &self.backend {
             BackendKind::InProcess => {
@@ -1324,28 +1327,9 @@ impl Mail {
         }
     }
 
-    /// Build the `search_messages` args JSON (pure parity surface; kept for
-    /// callers that built args directly).
-    #[allow(dead_code)] // parity surface (the old HTTP client exposed it)
-    pub fn search_args(
-        project_key: &str,
-        query: &str,
-        limit: u32,
-        filter: &MailSearchFilter,
-    ) -> Value {
-        crate::backend::wire::search_args(
-            project_key,
-            query,
-            limit,
-            filter.include_body_md,
-            filter.sender.as_deref(),
-            filter.importance.as_deref(),
-            filter.thread_id.as_deref(),
-            filter.date_start.as_deref(),
-            filter.date_end.as_deref(),
-            filter.ranking.as_deref(),
-        )
-    }
+    // (The former `Mail::search_args` wrapper is gone: the live `search_messages`
+    // arm builds its args through `backend::wire::search_args` directly, and the
+    // wrapper's only other caller was the deleted HTTP client.)
 
     /// `file_reservation_paths`.
     pub fn reserve(

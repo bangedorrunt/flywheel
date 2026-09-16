@@ -15,15 +15,20 @@ use anyhow::{Context, Result};
 // ADR-0012 Phase 0: pure core lives in `doorbell-core`; this module re-exports
 // it (single source) and keeps the effect layer (pid files, supervision,
 // journal, inject). No signature changes in the move.
-pub use doorbell_core::{
-    EventClass, SelfIndex, WakeState, doorbell_line, note_wake, parse_status_pair, should_inject,
-};
+pub use doorbell_core::{SelfIndex, WakeState, note_wake, parse_status_pair};
+// `PinBudget` is consumed live only by the `serve` emit-rate limiter (and by
+// this module's tests), so the re-export is gated to those two builds — the
+// lean backend-only lane would otherwise carry an unused import.
+#[cfg(any(test, feature = "serve"))]
+pub use doorbell_core::PinBudget;
 // The rest of doorbell-core's surface is exercised only by this module's own
-// tests, so the re-export is test-gated — in the bin build it would be unused.
+// tests (plus the `#[cfg(test)]` `fanout_now` reference implementation), so the
+// re-export is test-gated — in the bin build it would be unused.
 #[cfg(test)]
 pub use doorbell_core::{
-    DoorbellQueue, RingInput, UNANSWERED_SECS, classify, inbox_high_water, is_drain_transition,
-    parse_inbox_item, parse_rfc3339_micros, parse_watch_ndjson, watch_pubkey, watch_targets,
+    DoorbellQueue, EventClass, RingInput, UNANSWERED_SECS, classify, doorbell_line,
+    inbox_high_water, is_drain_transition, parse_inbox_item, parse_rfc3339_micros,
+    parse_watch_ndjson, should_inject, watch_pubkey, watch_targets,
 };
 
 /// Pid file: `~/.local/state/flywheel/doorbell/<workspace>.pid`.
@@ -108,61 +113,11 @@ pub fn identity_prime(name: &str, mail_identity: &str) -> String {
     )
 }
 
-/// Per-pin 5/30/3 budget the dispatcher enforces (D1 item 2).
-/// Rolling token bucket: 3 prompts per 30-min window, refilled continuously.
-/// Gap 4 fix: long crews no longer deafen after 30m.
-#[derive(Debug, Clone)]
-pub struct PinBudget {
-    pub budget_minutes: u32,
-    pub max_prompts: u32,
-    /// unix secs of each granted prompt (rolling window)
-    pub prompts: Vec<u64>,
-    #[allow(dead_code)]
-    pub started_unix: u64,
-}
-
-impl PinBudget {
-    #[cfg(test)]
-    pub fn adr_default(started_unix: u64) -> Self {
-        Self::new(30, 3, started_unix)
-    }
-
-    pub fn new(budget_minutes: u32, max_prompts: u32, started_unix: u64) -> Self {
-        Self {
-            budget_minutes,
-            max_prompts,
-            prompts: Vec::new(),
-            started_unix,
-        }
-    }
-
-    fn window_secs(&self) -> u64 {
-        u64::from(self.budget_minutes) * 60
-    }
-
-    pub fn allows(&self, now_unix: u64) -> bool {
-        let window = self.window_secs();
-        let recent = self
-            .prompts
-            .iter()
-            .filter(|t| now_unix.saturating_sub(**t) < window)
-            .count();
-        (recent as u32) < self.max_prompts
-    }
-
-    #[allow(dead_code)]
-    pub fn record(&mut self) {
-        let now = unix_now();
-        self.record_at(now);
-    }
-
-    pub fn record_at(&mut self, now_unix: u64) {
-        let window = self.window_secs();
-        self.prompts
-            .retain(|t| now_unix.saturating_sub(*t) < window);
-        self.prompts.push(now_unix);
-    }
-}
+// `PinBudget` (the per-pin 5/30/3 rolling budget, D1 item 2) is pure core and
+// lives in `doorbell-core` — re-exported above with the rest of the core
+// surface (ADR-0012 Phase 0: ONE implementation). The plane-P copy that lived
+// here carried a never-read `started_unix` and a wall-clock `record()` wrapper;
+// both are gone, and callers pass `now` explicitly per the Tick Law.
 
 pub fn read_pid(path: &Path) -> Option<u32> {
     let raw = fs::read_to_string(path).ok()?;
@@ -379,6 +334,7 @@ pub fn inspect_lock(path: &Path) -> LockAction {
 /// `current_identity`; anything alive otherwise is
 /// [`LockAction::Superseded`]. Hash-aware: when the recorded gen carries a
 /// hash, the on-disk binary hash must match too (same-second rebuild guard).
+#[cfg_attr(not(test), allow(dead_code))] // exe-less callers: mtime+len only (see the hash-aware door)
 pub fn inspect_lock_generation(
     path: &Path,
     gen_path: &Path,
@@ -397,7 +353,7 @@ pub fn inspect_lock_generation(
                     // Need to check hash against current binary; gen_path's workspace
                     // dir is sibling of pid file, but we don't have exe path here.
                     // Fallback: if we have a gen without exe, rely on mtime only.
-                    // Caller that has exe should use inspect_lock_generation_with_hash.
+                    // A caller holding the exe uses the hash-aware door below.
                     true
                 };
                 if mtime_ok && hash_ok {
@@ -411,8 +367,9 @@ pub fn inspect_lock_generation(
     }
 }
 
-/// Hash-aware variant that also checks the binary sha1 when the record carries it.
-#[allow(dead_code)]
+/// Hash-aware variant that also checks the binary sha1 when the record carries
+/// it — the door `ensure_running` uses, since it holds the exe (gap 10 fix: a
+/// same-second rebuild with the same length still supersedes).
 pub fn inspect_lock_generation_with_hash(
     path: &Path,
     gen_path: &Path,
@@ -799,7 +756,15 @@ pub fn ensure_running(
     }
     let path = pid_file(state_dir, workspace);
     let gen_path = gen_file(state_dir, workspace);
-    let action = inspect_lock_generation(&path, &gen_path, binary_identity(exe), pid_alive);
+    // Hash-aware: this caller holds `exe`, so the sha1 short-circuit of gap 10
+    // applies (mtime+len alone cannot tell a same-second rebuild apart).
+    let action = inspect_lock_generation_with_hash(
+        &path,
+        &gen_path,
+        binary_identity(exe),
+        binary_hash(exe),
+        pid_alive,
+    );
     match action {
         LockAction::Attach { .. } => Ok(action),
         LockAction::Superseded { pid } => {
@@ -941,8 +906,10 @@ fn daemon_health_json(url: &str) -> Option<serde_json::Value> {
 }
 /// Fan-out: given classified rings and pane status, produce (pin, line)
 /// pairs that should be prompted now. Working pins are skipped (queued
-/// by the caller).
-#[allow(dead_code)]
+/// by the caller). Plane-P reference implementation — the live path is the
+/// doorbell-rt Brain's `deliver_prompts`; this stays as the tested statement
+/// of the ring/status rule.
+#[cfg(test)]
 pub fn fanout_now(
     rings: &[(String, EventClass, String)],
     status_by_pin: &BTreeMap<String, String>,
