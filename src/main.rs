@@ -9385,13 +9385,6 @@ fn sleep_to_next_second() {
     ));
 }
 
-fn doorbell_persist_hear(workspace: &str, hear: &doorbell::HearTracker) {
-    let _ = doorbell::write_unanswered(
-        &doorbell::unanswered_file(&config::state_dir(), workspace),
-        &hear.unanswered_pins(),
-    );
-}
-
 /// bd-durable-doorbell-lngf: persist the wake state after a delivery pass —
 /// since high-waters + the last-wake stamp survive a crash (at-least-once
 /// redelivery reads this on restart; the `[doorbell]` line is idempotent).
