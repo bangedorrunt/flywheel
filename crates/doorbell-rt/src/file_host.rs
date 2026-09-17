@@ -1104,8 +1104,19 @@ impl Host for FileHost {
                 self.reducer.model = next;
                 self.normalize(actions)
             }
-            BrainMsg::SlaFired { .. }
-            | BrainMsg::Degraded { .. }
+            // bd-w98c residual: same decision as the embedded host — the hit
+            // list audits (LoudMiss-free data audit) + asks for the inbox so
+            // overdue rows can re-enter. Both hosts answer FetchInbox so the
+            // parity assertion on AckSlaTick stays an honest mirror.
+            BrainMsg::SlaFired { posts } => vec![
+                Effect::Audit {
+                    kind: "ack-sla-hit".into(),
+                    pin: String::new(),
+                    detail: serde_json::json!({ "overdue": posts }),
+                },
+                Effect::FetchInbox,
+            ],
+            BrainMsg::Degraded { .. }
             | BrainMsg::Delivered { .. }
             | BrainMsg::Ask { .. }
             | BrainMsg::Shutdown => Vec::new(),

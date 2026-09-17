@@ -159,6 +159,16 @@ The peer-aware handler, on doorbell: `fetch_inbox`, process in rumor order,
 `acknowledge_message` / `mark_message_read` (the **ack**). The dispatcher's wake
 budget is only the re-ring scheduler.
 
+**Registration (2026-09-17, residual closed).** Ladder entries no longer depend
+on a same-process send: the ack-SLA scan's hit list re-enters the reducer as
+`Msg::SlaFired { posts }` (the embedded host maps `BrainMsg::SlaFired`; the
+daemon host mirrors it), which audits the delta and pulls the inbox; the
+`InboxRows` fold then registers/refreshes each unacked ack-overdue corr on the
+ladder — window stamped from the tick clock, keyed by corr, idempotent under
+at-least-once redelivery — and a per-recipient read (`read_ts_us` set) marks
+the entry acked. A corr seen overdue purely on the wire climbs the ladder on
+the next `AckSlaTick` beat without any send-path registration.
+
 **Re-ring ladder (in `workspace::tick`).** An un-acked message older than
 `FLYWHEEL_DOORBELL_GRACE_SECS` (default **90**) is due one ring per grace
 window; after `FLYWHEEL_DOORBELL_RING_MAX` (default **3**) the wake escalates
