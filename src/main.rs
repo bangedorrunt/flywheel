@@ -5504,6 +5504,59 @@ mod gs043_residual_honesty_tests {
             .expect("spawn the parse thread");
         handle.join().expect("the D5 parse assertions must hold");
     }
+
+    /// bd-g5q4: `mail search`'s old `[PROJECT] <QUERY>` order — an optional
+    /// positional before a required one — panicked in clap's debug asserts,
+    /// so the subcommand was unusable in every arg order. The fix makes the
+    /// required QUERY precede the optional PROJECT; this pins the order in
+    /// both spellings and pins that the parse itself never panics.
+    #[test]
+    fn mail_search_query_positional_precedes_project() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                // Required-first positional form.
+                let cli = crate::Cli::try_parse_from([
+                    "flywheel",
+                    "mail",
+                    "search",
+                    "needle",
+                    "proj-a",
+                ])
+                .expect("<QUERY> [PROJECT] must parse");
+                match cli.command {
+                    Some(crate::Commands::Mail {
+                        cmd: crate::cmd::mail::MailCmd::Search { query, project, .. },
+                    }) => {
+                        assert_eq!(query, "needle");
+                        assert_eq!(project.as_deref(), Some("proj-a"));
+                    }
+                    _ => panic!("expected mail search"),
+                }
+                // Flag-first form still binds the query and the project.
+                let cli = crate::Cli::try_parse_from([
+                    "flywheel",
+                    "mail",
+                    "search",
+                    "--project",
+                    "proj-b",
+                    "needle",
+                ])
+                .expect("--project with a bare query must parse");
+                match cli.command {
+                    Some(crate::Commands::Mail {
+                        cmd: crate::cmd::mail::MailCmd::Search { query, project_flag, .. },
+                    }) => {
+                        assert_eq!(query, "needle");
+                        assert_eq!(project_flag.as_deref(), Some("proj-b"));
+                    }
+                    _ => panic!("expected mail search (flag form)"),
+                }
+            })
+            .expect("spawn the parse thread");
+        handle.join().expect("the bd-g5q4 parse assertions must hold");
+    }
 }
 
 #[cfg(test)]

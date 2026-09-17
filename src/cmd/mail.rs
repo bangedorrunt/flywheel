@@ -79,11 +79,15 @@ pub(crate) enum MailCmd {
     },
     /// FTS5 search over the project's indexed messages
     Search {
+        // bd-g5q4: required positionals must precede optional ones — the old
+        // `[PROJECT] <QUERY>` order panicked in clap's debug asserts, making
+        // this subcommand unusable in any arg order. Search is project-scoped
+        // FTS (no identity in the query contract), so there is no --as here.
+        /// FTS5 query (phrase/prefix/boolean; hyphenated ids are quoted)
+        query: String,
         project: Option<String>,
         #[arg(long = "project", value_name = "PROJECT")]
         project_flag: Option<String>,
-        /// FTS5 query (phrase/prefix/boolean; hyphenated ids are quoted)
-        query: String,
         #[arg(long, default_value = "20")]
         limit: u32,
         /// filter by sender (adjective+noun or herdr name)
