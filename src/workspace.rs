@@ -317,8 +317,9 @@ pub struct WorkspaceModel {
     pub pending_wait: std::collections::BTreeMap<String, u64>,
     /// ADR-0010 D1 (bd-w98c): re-ring ladder entries by corr. The
     /// dispatcher owns this cache; swarm never reads it. Entries are
-    /// advanced on the AckSlaTick beat; registration rides the send
-    /// path (residual: cross-process registration, see bead).
+    /// advanced on the AckSlaTick beat; registration rides the InboxRows
+    /// fold (SlaFired hit list → FetchInbox → overdue corr rows) — the
+    /// cross-process residual is closed (2026-09-17).
     pub rering: std::collections::BTreeMap<String, ReringEntry>,
     /// ADR-0010 D2 (bd-8jlv): presented-but-unacked wakes per pin.
     /// Derived deterministically from the Msg log, so crash-resume
@@ -612,6 +613,32 @@ pub fn doorbell_mail_line(unacked: usize, pin: &str, corr: &str) -> String {
     format!("[doorbell] inbox: {unacked} unacked for {pin}; latest corr={corr}; read + ack")
 }
 
+/// ADR-0010 D1 (bd-w98c residual): pure ladder-registration predicate over
+/// one inbox row. Scope is deliberately toron's own SLA scan scope
+/// (`check_ack_sla_expired`): ack required + high/urgent importance. The
+/// read-state check (``read_ts_us`` null) is the caller's job — the SlaFired
+/// hit list only reaches rows that are still unacked, and the InboxRows arm
+/// folds the read fact separately, so this predicate stays the overdue-shape
+/// test. `id`-less rows (no toron message id) are never tracked: the ladder
+/// keys by corr, and an id-less row cannot be honestly deduped.
+fn inbox_row_ack_overdue(row: &serde_json::Value) -> bool {
+    if row.get("ack_required").and_then(serde_json::Value::as_bool) != Some(true) {
+        return false;
+    }
+    if row
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
+        return false;
+    }
+    matches!(
+        row.get("importance").and_then(serde_json::Value::as_str),
+        Some("high" | "urgent")
+    )
+}
+
 /// One tracked delivery: a toron corr awaiting its crew ack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReringEntry {
@@ -714,6 +741,17 @@ pub enum Msg {
     /// Clock payload for the ack-SLA slice. Carries time, never reads it.
     AckSlaTick {
         now: u64,
+    },
+    /// ADR-0010 D1 (bd-w98c residual): the ack-SLA scan's CHANGE hit list
+    /// (overdue corr ids, bd-adms delta fire) re-enters as a Msg. Tick emits
+    /// one captain-relevant audit + FetchInbox — rows re-enter as InboxRows,
+    /// where ack-overdue corr rows register on the re-ring ladder (the
+    /// "registration rides the send path" residual closes here: a corr seen
+    /// overdue on the wire is tracked even without a same-process send).
+    /// Writes: doorbell slice (via the doorbell arm), audit trace. Emits:
+    /// Audit + FetchInbox. Never a direct Prompt (the ladder owns re-rings).
+    SlaFired {
+        posts: Vec<String>,
     },
     /// ADR-0010 D2 (bd-8jlv): crew handler mints this after handling a
     /// wake, citing the generation it handled. Presented wakes with
@@ -1809,6 +1847,39 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     verdict,
                 );
             }
+            // ADR-0010 D1 (bd-w98c residual): ladder registration + ack fold
+            // from the inbox projection itself. An ack-overdue row (the
+            // scan's scope) registers/refreshes its corr on the ladder —
+            // window stamped from the tick clock (bd-bdpx rule), never
+            // wall-clock; a row already per-recipient read is the handling
+            // fact and marks the entry acked. Idempotent by corr.
+            for row in rows {
+                let Some(corr) = row
+                    .get("corr")
+                    .and_then(|v| v.as_str())
+                    .filter(|c| !c.is_empty())
+                    .map(std::string::ToString::to_string)
+                else {
+                    continue;
+                };
+                if row.get("read_ts_us").is_some_and(|v| !v.is_null()) {
+                    // The handling fact wins over the shape test: a read row
+                    // acks its corr (when tracked) and never registers.
+                    if let Some(e) = next.rering.get_mut(&corr) {
+                        e.acked = true;
+                    }
+                } else if inbox_row_ack_overdue(row) {
+                    let e = next.rering.entry(corr).or_insert_with(|| ReringEntry {
+                        pin: pin.clone(),
+                        attempts: 0,
+                        window_start_unix: next.last_now,
+                        acked: false,
+                        fire_and_forget: false,
+                        raw_without_id: false,
+                    });
+                    e.acked = false;
+                }
+            }
             let _ = pin;
         }
         Msg::HerdrStatus { pin, status } => {
@@ -1907,6 +1978,19 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     ReringDecision::Pending | ReringDecision::Skip => {}
                 }
             }
+        }
+        Msg::SlaFired { posts } => {
+            // The scan's hit list is evidence, not a ring: the wake itself
+            // already traveled the watch path (toron emits kind-9
+            // ack-sla-expired per overdue post). Tick audits the delta and
+            // pulls the inbox so overdue corr rows re-enter as InboxRows —
+            // that arm is the ladder's registrar.
+            cmds.push(Cmd::Audit {
+                kind: "ack-sla-hit".into(),
+                pin: "-".into(),
+                detail: format!("overdue corrs: {}", posts.join(",")),
+            });
+            cmds.push(Cmd::FetchInbox);
         }
         Msg::Sweep { now } => {
             cmds.push(Cmd::FetchInbox);
@@ -5039,6 +5123,222 @@ mod adr0010_d1_tests {
             "exhausted Unknown entry must digest naming pin+corr+attempts: {cmds:?}"
         );
         assert!(next.rering.is_empty(), "terminal entries leave the ladder");
+    }
+
+    // ---- bd-w98c residual: SlaFired hit list wires the ladder registrar ----
+
+    fn overdue_row(corr: &str, id: &str, read: Option<i64>) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "corr": corr,
+            "ack_required": true,
+            "importance": "high",
+            "read_ts_us": read,
+            "created_ts_us": 1_000,
+        })
+    }
+
+    #[test]
+    fn adr0010_d1_slafired_audits_and_pulls_the_inbox() {
+        let (next, cmds) = tick(
+            &WorkspaceModel::default(),
+            &Msg::SlaFired {
+                posts: vec!["corr-1".into(), "corr-2".into()],
+            },
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Audit { kind, detail, .. }
+                if kind == "ack-sla-hit" && detail.contains("corr-1") && detail.contains("corr-2"))),
+            "the hit list must be captain-visible as data: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::FetchInbox)),
+            "the registrar pipe must pull the inbox: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "the hit list never rings directly — the ladder owns re-rings: {cmds:?}"
+        );
+        assert!(next.rering.is_empty(), "no row, no registration");
+    }
+
+    #[test]
+    fn adr0010_d1_inbox_rows_register_overdue_corrs_on_the_ladder() {
+        let mut m = WorkspaceModel::default();
+        m.last_now = 5_000;
+        let (next, _) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![
+                    overdue_row("c-over", "id-1", None),
+                    overdue_row("c-read", "id-2", Some(1_100)),
+                    // normal-importance ack-required mail is outside the scan scope
+                    serde_json::json!({
+                        "id": "id-3", "corr": "c-normal", "ack_required": true,
+                        "importance": "normal", "read_ts_us": serde_json::Value::Null,
+                    }),
+                    // no corr = nothing to key on
+                    serde_json::json!({
+                        "id": "id-4", "ack_required": true,
+                        "importance": "urgent", "read_ts_us": serde_json::Value::Null,
+                    }),
+                ],
+                pin: "P".into(),
+            },
+        );
+        assert_eq!(
+            next.rering.get("c-over").map(|e| e.pin.as_str()),
+            Some("P"),
+            "an unacked overdue corr registers: {:?}",
+            next.rering
+        );
+        let e = &next.rering["c-over"];
+        assert_eq!(
+            e.window_start_unix, 5_000,
+            "window stamps from the tick clock (bd-bdpx)"
+        );
+        assert_eq!(e.attempts, 0, "registration is not a ring");
+        assert!(
+            !next.rering.contains_key("c-normal"),
+            "outside the scan scope"
+        );
+        assert_eq!(next.rering.len(), 1, "no corr, no entry");
+        // The read row's corr only acks if it was ALREADY registered (no
+        // ghost entries from plain mail reads).
+        assert!(
+            !next.rering.contains_key("c-read"),
+            "a read never registers"
+        );
+        // Read fact: register first, then see it read -> acked.
+        let (next2, _) = tick(
+            &next,
+            &Msg::InboxRows {
+                rows: vec![overdue_row("c-over", "id-1", Some(5_100))],
+                pin: "P".into(),
+            },
+        );
+        assert!(
+            next2.rering["c-over"].acked,
+            "the per-recipient read is the handling fact"
+        );
+    }
+
+    #[test]
+    fn adr0010_d1_registration_then_ladder_beat_rings_without_a_send() {
+        // The residual closed: an overdue corr seen ONLY on the wire (no
+        // same-process send) climbs the ladder on the next AckSlaTick beat.
+        let mut m = WorkspaceModel::default();
+        m.last_now = 100;
+        let (m, _) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![overdue_row("c-wire", "id-9", None)],
+                pin: "WirePin".into(),
+            },
+        );
+        let (next, cmds) = tick(
+            &m,
+            &Msg::AckSlaTick {
+                now: 100 + doorbell_grace_secs(),
+            },
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::Prompt { pin, line }
+                if pin == "WirePin" && line.contains("c-wire") && line.contains("unacked for"))),
+            "wire-registered corr re-rings through the shrunk doorbell line: {cmds:?}"
+        );
+        assert_eq!(next.rering["c-wire"].attempts, 1);
+    }
+
+    #[test]
+    fn adr0010_d1_registration_is_idempotent_and_refreshes_window() {
+        let mut m = WorkspaceModel::default();
+        m.last_now = 100;
+        let (m, _) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![overdue_row("c-i", "id-i", None)],
+                pin: "P".into(),
+            },
+        );
+        assert_eq!(m.rering["c-i"].attempts, 0);
+        let (m, _) = tick(
+            &m,
+            &Msg::AckSlaTick {
+                now: 100 + doorbell_grace_secs(),
+            },
+        );
+        assert_eq!(m.rering["c-i"].attempts, 1, "one ring");
+        // Same row redelivered (at-least-once): no second ring, no reset of
+        // attempts; the window refreshes only per the ladder's own beat.
+        let (m2, cmds) = tick(
+            &m,
+            &Msg::InboxRows {
+                rows: vec![overdue_row("c-i", "id-i", None)],
+                pin: "P".into(),
+            },
+        );
+        assert_eq!(
+            m2.rering["c-i"].attempts, 1,
+            "redelivery never double-rings"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
+            "redelivery is quiet: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn adr0010_d1_slafired_same_log_same_effects() {
+        // Tick Law: the new arm is a pure fold — same Msg log, same effects.
+        let build = || {
+            let mut m = WorkspaceModel::default();
+            m.last_now = 42;
+            let logs: Vec<Vec<Msg>> = vec![
+                vec![
+                    Msg::SlaFired {
+                        posts: vec!["c-a".into()],
+                    },
+                    Msg::InboxRows {
+                        rows: vec![overdue_row("c-a", "id-a", None)],
+                        pin: "P".into(),
+                    },
+                    Msg::AckSlaTick { now: 1_000 },
+                ],
+                vec![
+                    Msg::SlaFired { posts: vec![] },
+                    Msg::InboxRows {
+                        rows: vec![],
+                        pin: "P".into(),
+                    },
+                    Msg::AckSlaTick { now: 1_000 },
+                ],
+            ];
+            (m, logs)
+        };
+        let (m0, logs) = build();
+        let mut a = m0.clone();
+        let mut a_effects: Vec<Vec<String>> = Vec::new();
+        for log in &logs {
+            for msg in log {
+                let (n, c) = tick(&a, msg);
+                a = n;
+                a_effects.push(c.iter().map(|c| format!("{c:?}")).collect());
+            }
+        }
+        let (m0, logs) = build();
+        let mut b = m0;
+        let mut b_effects: Vec<Vec<String>> = Vec::new();
+        for log in &logs {
+            for msg in log {
+                let (n, c) = tick(&b, msg);
+                b = n;
+                b_effects.push(c.iter().map(|c| format!("{c:?}")).collect());
+            }
+        }
+        assert_eq!(a, b, "same log folds to the same model");
+        assert_eq!(a_effects, b_effects, "same log emits the same effects");
     }
 }
 

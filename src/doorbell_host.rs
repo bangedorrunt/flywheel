@@ -269,11 +269,17 @@ impl Host for RtHost {
                 },
                 false,
             ),
-            // Rings for overdue posts arrive via the watch path (the scan
-            // emits real channel posts, exactly like the old loop) — the
-            // SlaFired tick itself decides nothing.
-            BrainMsg::SlaFired { .. }
-            | BrainMsg::Degraded { .. }
+            // bd-w98c residual: the scan's hit list IS a reducer Msg now —
+            // it audits the delta and asks for the inbox whose rows register
+            // the ladder. The wake itself still arrives via the watch path
+            // (toron emits real channel posts, exactly like the old loop).
+            BrainMsg::SlaFired { posts } => (
+                workspace::Msg::SlaFired {
+                    posts: posts.clone(),
+                },
+                false,
+            ),
+            BrainMsg::Degraded { .. }
             | BrainMsg::Delivered { .. }
             | BrainMsg::Ask { .. }
             | BrainMsg::Shutdown => return Vec::new(),

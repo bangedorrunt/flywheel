@@ -600,7 +600,17 @@ impl<H: Host> Brain<H> {
             serde_json::json!({"stage": "executed"}),
             &self.pins_of(&effects),
         );
+        // bd-w98c residual: the hit list is now a real reducer Msg. When the
+        // tick answers FetchInbox (the ladder-registrar pipe, same shape as
+        // on_ack_sla's live arm), rows re-enter as InboxFetched so the
+        // InboxRows fold can register overdue corrs on the ladder.
+        let fetch = effects.iter().any(|e| matches!(e, Effect::FetchInbox));
         self.deliver(effects, "sla").await;
+        if fetch {
+            for (pin, rows) in self.fetch_all_inbox(self.host.now_unix()) {
+                self.on_inbox_fetched(pin, rows).await;
+            }
+        }
     }
 
     /// Budget gate + sink delivery shared by every arm. Returns delivered pins.
@@ -916,6 +926,58 @@ mod tests {
     /// unchanged backlog re-fired the same wake ~1440x/day (live: `count: 89`
     /// on every beat) — noise that buries a genuine regression. Only a CHANGE
     /// is news.
+    /// bd-w98c residual: the SlaFired hit list is a real reducer Msg. When
+    /// the tick answers FetchInbox, the brain pipes rows back as
+    /// InboxFetched (same shape as the sweep/acksla live arms) — that
+    /// re-entry is what registers overdue corrs on the ladder.
+    #[tokio::test]
+    async fn sla_fired_fetch_answer_pipes_rows_back() {
+        let (mut brain, _rx, _tx) = test_brain(
+            "sla-pipe",
+            // tick 1: SlaFired → Audit + FetchInbox; tick 2: InboxFetched fold.
+            vec![
+                vec![
+                    Effect::Audit {
+                        kind: "ack-sla-hit".into(),
+                        pin: String::new(),
+                        detail: serde_json::json!({ "overdue": ["c-1"] }),
+                    },
+                    Effect::FetchInbox,
+                ],
+                vec![],
+            ],
+        );
+        brain.host.pin_list = vec!["p".into()];
+        // No since_by_pin cursor: fetch_all_inbox backfills from the bounded
+        // redelivery floor (bd-5d0v), so the fixture key IS that floor.
+        let floor = doorbell_core::redelivery_floor_rfc3339(brain.host.now);
+        brain.host.inbox.insert(
+            ("p".into(), floor),
+            vec![serde_json::json!({
+                "id": "m1", "corr": "c-1", "ack_required": true,
+                "importance": "high", "read_ts_us": null, "created_ts": "2026-09-16T23:59:00.000000Z"
+            })],
+        );
+        brain
+            .dispatch(BrainMsg::SlaFired {
+                posts: vec!["c-1".into()],
+            })
+            .await;
+        // The InboxFetched fold ticked through the host: one tick for
+        // SlaFired + one for InboxFetched.
+        assert_eq!(
+            brain.host.tick_log.len(),
+            2,
+            "hit list must pipe the inbox fold, not stop at the audit: {:?}",
+            brain.host.tick_log
+        );
+        assert!(
+            brain.host.tick_log[1].starts_with("InboxFetched"),
+            "rows re-enter as InboxFetched: {:?}",
+            brain.host.tick_log
+        );
+    }
+
     #[tokio::test]
     async fn sla_refire_is_a_delta_not_a_repeat() {
         // `on_sla_fired` ticks again, so one AckSlaTick can consume two
