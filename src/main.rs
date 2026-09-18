@@ -1271,9 +1271,10 @@ enum Commands {
     /// no approval gate — truly autonomous).
     /// Interactive TTY briefing (bd-xe9r/bd-nmzk): `steer` and
     /// `workflow run --execute` prompt before dispatch — crew counts, per-role
-    /// model menus w/ cost/caps, squad/bare-harness shape, stage-chain preview,
-    /// go/no-go. Skipped by `--json`, `--yes`, or explicit `--crew`; non-TTY
-    /// byte-identical (`src/steer_brief.rs`, `source` fork only).
+    /// model menus w/ cost/caps, per-role harness remix (`--role-harness`),
+    /// squad/bare-harness shape, stage-chain preview, go/no-go. Skipped by
+    /// `--json`, `--yes`, or explicit `--crew`; non-TTY byte-identical
+    /// (`src/steer_brief.rs`, `source` fork only).
     Steer {
         /// the objective/target ("implement the auth refactor")
         objective: String,
@@ -4978,6 +4979,7 @@ mod steer_engine_tests {
                 false,
                 false,
                 &[],
+                &[],
             );
             let WorkflowCmd::Run {
                 name,
@@ -5035,6 +5037,7 @@ mod steer_engine_tests {
             false,
             false,
             false,
+            &[],
             &[],
         );
         let WorkflowCmd::Run {
@@ -9470,6 +9473,7 @@ fn handle_workspace_cmds(
                     yes: true,
                     allow_worktree: false,
                     role_model: vec![],
+                    role_harness: vec![],
                 };
                 if let Err(e) = cmd_workflow(cfg, &run) {
                     eprintln!("flywheel: [LoudMiss] invoke {corr} ({workflow}): {e:#}");
@@ -23780,6 +23784,7 @@ fn cmd_steer(
     }
     let mut crew_owned = crew.map(|s| s.to_string());
     let mut role_model_owned: Vec<String> = Vec::new();
+    let mut role_harness_owned: Vec<String> = Vec::new();
     // bd-xe9r: on an INTERACTIVE TTY — skipped by --json, --yes, or an
     // explicit --crew (an agent driver knows its fleet already) — brief the
     // operator before dispatch. Non-TTY output stays byte-identical.
@@ -23807,11 +23812,16 @@ fn cmd_steer(
             steer_brief::BriefingOutcome::Go {
                 budget,
                 role_models,
+                role_harnesses,
             } => {
                 crew_owned = Some(budget.to_string());
                 role_model_owned = role_models
                     .iter()
                     .map(|(role, model)| format!("{role}={model}"))
+                    .collect();
+                role_harness_owned = role_harnesses
+                    .iter()
+                    .map(|(role, kind)| format!("{role}={kind}"))
                     .collect();
             }
         }
@@ -23832,6 +23842,7 @@ fn cmd_steer(
         retire_orphans,
         json,
         &role_model_owned,
+        &role_harness_owned,
     );
     cmd_workflow(cfg, &run)
 }
@@ -23851,6 +23862,7 @@ fn steer_run_cmd(
     retire_orphans: bool,
     json: bool,
     role_model: &[String],
+    role_harness: &[String],
 ) -> WorkflowCmd {
     let wf_name = if direct { "goal-direct" } else { "goal" };
     let inputs = serde_json::json!({ "objective": objective });
@@ -23868,6 +23880,7 @@ fn steer_run_cmd(
         yes: false,
         allow_worktree: false,
         role_model: role_model.to_vec(),
+        role_harness: role_harness.to_vec(),
     }
 }
 
@@ -24037,6 +24050,7 @@ fn profile_workflow_invoke(
         yes: false,
         allow_worktree: false,
         role_model: vec![],
+        role_harness: vec![],
     }
 }
 
@@ -24434,6 +24448,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // cmd_workflow itself needs no opt-out state
             allow_worktree: _,
             role_model,
+            role_harness,
         } => {
             // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
             // alias the run (including --execute journaling + pane spawn)
@@ -24441,6 +24456,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             project_door_opt(project, "workflow run")?;
             let mut crew_sel = crew.clone();
             let mut role_model_sel = role_model.clone();
+            let mut role_harness_sel = role_harness.clone();
             // bd-nmzk: interactive captain briefing for `workflow run --execute`
             // (same skip flags as `steer` — shared prompt module so both stay
             // in lockstep). Arms only on an interactive TTY with --execute.
@@ -24465,12 +24481,19 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     steer_brief::BriefingOutcome::Go {
                         budget,
                         role_models,
+                        role_harnesses,
                     } => {
                         crew_sel = Some(budget.to_string());
                         if role_model_sel.is_empty() {
                             role_model_sel = role_models
                                 .iter()
                                 .map(|(role, model)| format!("{role}={model}"))
+                                .collect();
+                        }
+                        if role_harness_sel.is_empty() {
+                            role_harness_sel = role_harnesses
+                                .iter()
+                                .map(|(role, kind)| format!("{role}={kind}"))
                                 .collect();
                         }
                     }
@@ -24556,6 +24579,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         headless_spawn_gate(&wf)?;
                         let mut catalog = profile::ProfileCatalog::load()?;
                         catalog.apply_role_models(&role_model_sel)?;
+                        catalog.apply_role_harnesses(&role_harness_sel)?;
                         let wf_name = name.clone();
                         let inputs_c = inputs_value.clone();
                         // ADR-0032 Spec 9 tail: stage prompts resolve the
@@ -24577,6 +24601,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         let project = project.as_deref().unwrap_or("flywheel");
                         let mut catalog = profile::ProfileCatalog::load()?;
                         catalog.apply_role_models(&role_model_sel)?;
+                        catalog.apply_role_harnesses(&role_harness_sel)?;
                         let ctx = pane::pre_spawn_crew(
                             cfg,
                             project,
@@ -24872,6 +24897,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             inputs,
             idempotency_key,
             role_model,
+            role_harness,
             harness,
             timeout,
             retire_orphans,
@@ -25174,6 +25200,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             );
             let mut catalog = profile::ProfileCatalog::load()?;
             catalog.apply_role_models(role_model)?;
+            catalog.apply_role_harnesses(role_harness)?;
             // bd-enov (F6): per-run harness override (after role models, so the
             // run's harness is authoritative for every composed role).
             if let Some(kind) = harness.as_deref() {

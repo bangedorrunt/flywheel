@@ -406,6 +406,28 @@ impl ProfileCatalog {
         Ok(())
     }
 
+    /// Overlay `--role-harness ROLE=KIND` onto catalog profiles.
+    /// Aliases (`oc`/`gk`) normalize; unknown role or kind fails loud.
+    pub fn apply_role_harnesses(&mut self, specs: &[String]) -> anyhow::Result<()> {
+        for spec in specs {
+            let (role, kind) = spec
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--role-harness needs ROLE=KIND, got {spec:?}"))?;
+            let canonical = self.canonical_harness(kind).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--role-harness {kind:?} is not spawnable — known: {} (short aliases oc/gk are \
+                     normalized)",
+                    self.known_harnesses().join(", ")
+                )
+            })?;
+            let p = self.profiles.get_mut(role).ok_or_else(|| {
+                anyhow::anyhow!("--role-harness unknown role {role:?} (flywheel profile list)")
+            })?;
+            p.harness = canonical;
+        }
+        Ok(())
+    }
+
     /// Look up a harness spawn recipe.
     pub fn harness(&self, name: &str) -> Option<&HarnessConfig> {
         self.harnesses.get(name)
@@ -1173,6 +1195,42 @@ model = "deepseek-v4-flash"
         assert!(
             cat.apply_harness_override("bogus").is_err(),
             "unknown harness must fail loud, not write a dead profile"
+        );
+    }
+
+    #[test]
+    fn apply_role_harnesses_overlays_one_role_and_rejects_unknown() {
+        let path = tmp_profiles_toml(
+            r#"
+[profiles.coder]
+harness = "pi"
+model = "deepseek-v4-flash"
+[profiles.reviewer]
+harness = "pi"
+model = "deepseek-v4-flash"
+"#,
+        );
+        let mut cat = ProfileCatalog::load_from(Some(&path)).expect("load");
+        cat.apply_role_harnesses(&["coder=oc".into()])
+            .expect("overlay coder");
+        assert_eq!(cat.get("coder").unwrap().harness, "opencode");
+        assert_eq!(
+            cat.get("reviewer").unwrap().harness,
+            "pi",
+            "untouched role keeps its harness"
+        );
+        assert!(
+            cat.apply_role_harnesses(&["coder=bogus".into()]).is_err(),
+            "unknown kind fails loud"
+        );
+        assert!(
+            cat.apply_role_harnesses(&["ghost=opencode".into()])
+                .is_err(),
+            "unknown role fails loud"
+        );
+        assert!(
+            cat.apply_role_harnesses(&["not-a-spec".into()]).is_err(),
+            "missing = fails loud"
         );
     }
 
