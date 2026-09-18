@@ -5517,14 +5517,9 @@ mod gs043_residual_honesty_tests {
             .spawn(|| {
                 use clap::Parser;
                 // Required-first positional form.
-                let cli = crate::Cli::try_parse_from([
-                    "flywheel",
-                    "mail",
-                    "search",
-                    "needle",
-                    "proj-a",
-                ])
-                .expect("<QUERY> [PROJECT] must parse");
+                let cli =
+                    crate::Cli::try_parse_from(["flywheel", "mail", "search", "needle", "proj-a"])
+                        .expect("<QUERY> [PROJECT] must parse");
                 match cli.command {
                     Some(crate::Commands::Mail {
                         cmd: crate::cmd::mail::MailCmd::Search { query, project, .. },
@@ -5546,7 +5541,12 @@ mod gs043_residual_honesty_tests {
                 .expect("--project with a bare query must parse");
                 match cli.command {
                     Some(crate::Commands::Mail {
-                        cmd: crate::cmd::mail::MailCmd::Search { query, project_flag, .. },
+                        cmd:
+                            crate::cmd::mail::MailCmd::Search {
+                                query,
+                                project_flag,
+                                ..
+                            },
                     }) => {
                         assert_eq!(query, "needle");
                         assert_eq!(project_flag.as_deref(), Some("proj-b"));
@@ -5555,7 +5555,54 @@ mod gs043_residual_honesty_tests {
                 }
             })
             .expect("spawn the parse thread");
-        handle.join().expect("the bd-g5q4 parse assertions must hold");
+        handle
+            .join()
+            .expect("the bd-g5q4 parse assertions must hold");
+    }
+
+    /// bd-empty-project-silently-retargets-workspace-bkr3: `--project ""`
+    /// parses (clap takes any string) but the resolver must fail loud — the
+    /// empty spelling used to alias onto the workspace default project and
+    /// silently retarget every mail door. Pins the end-to-end path: the
+    /// parse is fine, the resolution errors with the actionable message.
+    #[test]
+    fn mail_empty_project_spelling_fails_loud_at_resolver() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let cli = crate::Cli::try_parse_from([
+                    "flywheel",
+                    "mail",
+                    "send",
+                    "--project",
+                    "",
+                    "--to",
+                    "TanOtter",
+                    "--subject",
+                    "s",
+                    "--body",
+                    "b",
+                ])
+                .expect("empty --project must still PARSE (rejection lives in the resolver)");
+                match cli.command {
+                    Some(crate::Commands::Mail {
+                        cmd: crate::cmd::mail::MailCmd::Send { project_flag, .. },
+                    }) => {
+                        let none: Option<String> = None;
+                        let err = super::mail_project(&none, &project_flag, "send")
+                            .expect_err("empty --project must fail loud, never alias to workspace");
+                        let msg = format!("{err:#}");
+                        assert!(
+                            msg.contains("requires a project"),
+                            "actionable message, got: {msg}"
+                        );
+                    }
+                    _ => panic!("expected mail send"),
+                }
+            })
+            .expect("spawn the parse thread");
+        handle.join().expect("the bkr3 parse assertions must hold");
     }
 }
 
@@ -6258,6 +6305,42 @@ mod spawn_boot_reliability_tests {
         assert!(
             super::mail_project(&none, &none, "send").is_err(),
             "neither must fail loud, never an empty project"
+        );
+    }
+
+    /// bd-empty-project-silently-retargets-workspace-bkr3: an empty/blank
+    /// project spelling must fail loud exactly like a missing one — it used
+    /// to slip through, and `project_dir(cfg, "")` aliased it onto the
+    /// workspace root (slug "workspace"), silently retargeting every mail
+    /// door to a different project. Flag-wins precedence is unchanged; the
+    /// WINNING spelling must be non-blank.
+    #[test]
+    fn bd_empty_project_spelling_fails_loud_never_retargets() {
+        let none: Option<String> = None;
+        let empty = Some(String::new());
+        let blank = Some("   ".to_string());
+        let real = Some("proj-a".to_string());
+        for spelling in [&empty, &blank] {
+            assert!(
+                super::mail_project(spelling, &none, "send").is_err(),
+                "positional {spelling:?} must fail loud, never alias to workspace"
+            );
+            assert!(
+                super::mail_project(&none, spelling, "send").is_err(),
+                "flag {spelling:?} must fail loud, never alias to workspace"
+            );
+        }
+        // Flag-wins precedence unchanged: a real flag overrides a blank
+        // positional.
+        assert_eq!(
+            super::mail_project(&empty, &real, "send").expect("real flag wins"),
+            "proj-a"
+        );
+        // But a blank FLAG must fail loud too — silently falling back to the
+        // positional would be a second silent correction.
+        assert!(
+            super::mail_project(&real, &empty, "send").is_err(),
+            "a blank winning flag must fail loud, not fall back to the positional"
         );
     }
 
@@ -15943,15 +16026,21 @@ pub fn parse_xproj_request(text: &str) -> Option<XprojRequest> {
 /// bd-3npc: `--project` flag alias for every mail-cli positional PROJECT.
 /// Flag wins when both are given; neither fails loud naming the subcommand.
 /// Total over all four cases — a missing project is never an empty string.
+/// bd-empty-project-silently-retargets-workspace-bkr3: a blank WINNING
+/// spelling ("" or whitespace) fails loud with the same actionable message
+/// — it used to slip through and `project_dir(cfg, "")` aliased it onto the
+/// workspace root, silently retargeting the door to a different project.
+/// No silent fallback to the other spelling either: that would be a second
+/// silent correction of operator-shaped input.
 fn mail_project<'a>(
     positional: &'a Option<String>,
     flag: &'a Option<String>,
     sub: &str,
 ) -> Result<&'a str> {
     match (positional, flag) {
-        (_, Some(f)) => Ok(f.as_str()),
-        (Some(p), None) => Ok(p.as_str()),
-        (None, None) => anyhow::bail!(
+        (_, Some(f)) if !f.trim().is_empty() => Ok(f.as_str()),
+        (Some(p), None) if !p.trim().is_empty() => Ok(p.as_str()),
+        _ => anyhow::bail!(
             "mail {sub} requires a project: pass PROJECT positionally or --project <slug>"
         ),
     }
