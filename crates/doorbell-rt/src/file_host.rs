@@ -31,6 +31,18 @@ pub const PRESENCE_FRESH_SECS: u64 = 30;
 /// Index rebuild cadence — mirrors the embedded 60s TTL + pin-set change.
 pub const INDEX_TTL_SECS: u64 = 60;
 
+/// Split pin-identity failures from fetch-path failures (bd-gpj0.1).
+/// `/health` greps `inbox_error` as "the inbox PATH is down"; a missing
+/// agent key is a pin problem and must not paint the whole daemon.
+fn inbox_fail_kind(stderr: &str) -> &'static str {
+    let s = stderr.to_ascii_lowercase();
+    if s.contains("no local key") || s.contains("register first") {
+        "inbox_pin_miss"
+    } else {
+        "inbox_error"
+    }
+}
+
 /// Registry key + resolution live in core (bd-z5ou single owner).
 use doorbell_core::{PresenceVerdict, registry_key};
 
@@ -1158,11 +1170,12 @@ impl Host for FileHost {
             return Vec::new();
         };
         if !out.status.success() {
+            let error = String::from_utf8_lossy(&out.stderr).to_string();
             self.audit_file(
-                "inbox_error",
+                inbox_fail_kind(&error),
                 serde_json::json!({
                     "pin": pin,
-                    "error": String::from_utf8_lossy(&out.stderr).to_string(),
+                    "error": error,
                 }),
             );
             return Vec::new();
@@ -1976,6 +1989,26 @@ mod tests {
         assert_eq!(host.drain_facts(), vec!["fact one".to_string()]);
         assert!(!dir.join("facts").join("proj-pending.jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inbox_fail_kind_splits_pin_miss_from_path_down() {
+        assert_eq!(
+            super::inbox_fail_kind(
+                "toron: error: tool fetch_inbox returned an error result: agent Buffy has no local key in project . (create_agent_identity or register first)"
+            ),
+            "inbox_pin_miss"
+        );
+        assert_eq!(
+            super::inbox_fail_kind("toron spawn/timeout failed"),
+            "inbox_error"
+        );
+        assert_eq!(
+            super::inbox_fail_kind(
+                "toron: error: daemon connect (is `toron serve --mcp-http` running?)"
+            ),
+            "inbox_error"
+        );
     }
 
     #[test]
