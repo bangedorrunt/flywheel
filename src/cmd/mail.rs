@@ -307,6 +307,11 @@ pub(crate) enum MailCmd {
         /// include ALL registered identities (history), not just active ones
         #[arg(long)]
         all: bool,
+        /// list key.ncryptsec dirs on disk that are not in the registry
+        /// (whois-invisible). stdout becomes
+        /// `{registered, unregistered_on_disk}` instead of a bare array.
+        #[arg(long)]
+        disk: bool,
     },
     /// cross-project contact (request_contact / respond / list)
     Contact {
@@ -918,6 +923,7 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             project,
             project_flag,
             all,
+            disk,
         } => {
             let project = crate::mail_project(project, project_flag, "agents")?;
             let key = crate::project_dir_str(cfg, project)?;
@@ -928,7 +934,29 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             // identities registered for attribution).
             let active_within = if *all { None } else { Some(1) };
             let v = mail.list_agents(&key, active_within)?;
-            print_json(&v);
+            let registered: std::collections::HashSet<String> = v
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let unreg = unregistered_disk_pins(&project_agent_keys_dir(project), &registered);
+            if !unreg.is_empty() {
+                eprintln!(
+                    "flywheel: {} agent key(s) on disk are not in the registry (whois will miss them). `flywheel mail agents {project} --disk` lists names; register with `flywheel mail register` or prune stale dirs.",
+                    unreg.len()
+                );
+            }
+            if *disk {
+                print_json(&json!({
+                    "registered": v,
+                    "unregistered_on_disk": unreg,
+                }));
+            } else {
+                print_json(&v);
+            }
         }
         MailCmd::Contact { cmd } => match cmd {
             MailContactCmd::Request {
@@ -1042,6 +1070,70 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// Mailbox `{data}/projects/<slug>/agents` for a project name or path.
+pub(crate) fn project_agent_keys_dir(project: &str) -> std::path::PathBuf {
+    let slug = std::path::Path::new(project)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(project);
+    crate::mail_shim::mailbox_roots()
+        .0
+        .join(slug)
+        .join("agents")
+}
+
+/// Agent dirs that hold `key.ncryptsec` but are not in the registered roster.
+/// Disk is not whois; this is the loud gap (141 keys vs 2 registry rows).
+pub(crate) fn unregistered_disk_pins(
+    agents_dir: &std::path::Path,
+    registered: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(agents_dir) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || name.starts_with('.') {
+            continue;
+        }
+        if ent.path().join("key.ncryptsec").is_file() && !registered.contains(name) {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::fs;
+
+    #[test]
+    fn unregistered_disk_pins_skips_registered_and_keyless() {
+        let dir = std::env::temp_dir().join(format!(
+            "fw-agent-keys-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("QuietHeron")).unwrap();
+        fs::write(dir.join("QuietHeron").join("key.ncryptsec"), b"k").unwrap();
+        fs::create_dir_all(dir.join("AmberBeacon")).unwrap();
+        fs::write(dir.join("AmberBeacon").join("key.ncryptsec"), b"k").unwrap();
+        fs::create_dir_all(dir.join("no-key")).unwrap();
+        let registered = HashSet::from(["QuietHeron".into()]);
+        let out = unregistered_disk_pins(&dir, &registered);
+        assert_eq!(out, vec!["AmberBeacon".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[derive(Subcommand)]

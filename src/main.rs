@@ -5965,6 +5965,31 @@ fn arrive_records_pin_subscription() {
     assert!(gate < hook, "subscription follows the pin gate");
 }
 
+/// Key on disk is not a whois row. Arrive must upsert `--as` so captain/whois
+/// resolve after the door (QuietHeron-on-disk-but-unknown).
+#[test]
+fn arrive_registers_arriver_pin() {
+    let src = include_str!("main.rs");
+    let start = src
+        .rfind("\nfn cmd_arrive(")
+        .expect("real cmd_arrive (rfind skips quoted copies)");
+    let end = src[start..]
+        .find("\n/// (holder pin, whois.stale)")
+        .map(|i| start + i)
+        .unwrap_or(src.len());
+    let body = &src[start..end];
+    assert!(
+        body.contains("register_agent"),
+        "arrive must upsert the --as pin into the mail registry"
+    );
+    let upsert = body.find("register_agent").expect("upsert");
+    let presence = body.find("presence").expect("presence publish");
+    assert!(
+        upsert < presence,
+        "register before presence so whois sees the pin"
+    );
+}
+
 #[cfg(test)]
 mod tripwire {
     /// Locate a column-0 `fn name(` definition in `src`.
@@ -12791,6 +12816,23 @@ fn cmd_arrive(
         }
     }
     if let Some(agent) = as_agent {
+        // Key on disk is not a whois row. Upsert so captain/whois resolve
+        // after the door. Best-effort: a register miss never fails arrive.
+        match crate::mail_or_die(cfg) {
+            Ok(mail) => {
+                if let Ok(key) = crate::project_dir_str(cfg, project) {
+                    let _ = mail.ensure_project(&key);
+                    if let Err(e) =
+                        mail.register_agent(&key, agent, "flywheel", "flywheel", "session arrive")
+                    {
+                        eprintln!(
+                            "flywheel: arrive register {agent} failed (whois may stay unknown): {e:#}"
+                        );
+                    }
+                }
+            }
+            Err(e) => eprintln!("flywheel: arrive register skipped: {e:#}"),
+        }
         let st = std::process::Command::new("toron")
             .args([
                 "presence",
