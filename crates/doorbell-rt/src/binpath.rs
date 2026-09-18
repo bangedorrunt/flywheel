@@ -12,7 +12,8 @@
 //! `inbox_error` row per pin per second, with `/health` showing no
 //! degradation at all.
 //!
-//! Resolution order (first hit wins): `PATH`, then the standard user
+//! Resolution order (first hit wins): `PATH` (skipping `.../mise/shims`
+//! entries — those are dispatchers, not binaries), then the standard user
 //! install dirs (`~/.cargo/bin`, `~/.local/bin`), then beside our own exe
 //! (dev checkouts / co-install), then mise's shim dir last.
 //!
@@ -29,6 +30,15 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+/// `.../mise/shims` is a dispatcher dir, not a real bin directory.
+fn is_mise_shim_dir(dir: &Path) -> bool {
+    dir.components()
+        .map(|c| c.as_os_str())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0] == "mise" && w[1] == "shims")
+}
 
 /// Resolve `name` to an absolute path using the live process environment.
 /// `None` means "not found anywhere" — callers keep the bare name so
@@ -58,6 +68,13 @@ pub fn resolve_cli_in(
 ) -> Option<PathBuf> {
     if let Some(paths) = path_env {
         for dir in std::env::split_paths(paths) {
+            // Interactive PATH lists mise shims first. A shim is a dispatcher
+            // (symlink to `mise`) that dies under launchd with "No version is
+            // set". Skip it here so the real cargo/local bin still wins; the
+            // shim remains the last-resort search below (bd-gpj0).
+            if is_mise_shim_dir(&dir) {
+                continue;
+            }
             let candidate = dir.join(name);
             if candidate.is_file() {
                 return Some(candidate);
@@ -122,6 +139,25 @@ mod tests {
     fn touch(p: &Path) {
         fs::create_dir_all(p.parent().expect("parent")).expect("mkdir parent");
         fs::write(p, b"#!/bin/sh\n").expect("write stub");
+    }
+
+    /// Interactive-shell PATH lists mise shims first. Those are dispatchers,
+    /// not binaries — skip them so `~/.cargo/bin/toron` still wins (bd-gpj0).
+    #[test]
+    fn path_mise_shim_loses_to_home_cargo_bin() {
+        let root = scratch("path-shim");
+        let home = root.join("home");
+        let shim = home.join(".local/share/mise/shims");
+        touch(&shim.join("toron"));
+        touch(&home.join(".cargo/bin/toron"));
+        let path = OsString::from(format!("{}:/usr/bin:/bin", shim.display()));
+        let got = resolve_cli_in("toron", Some(path.as_os_str()), None, Some(&home));
+        assert_eq!(
+            got,
+            Some(home.join(".cargo/bin/toron")),
+            "a PATH mise shim must not beat the real cargo bin"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

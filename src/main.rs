@@ -6011,6 +6011,32 @@ fn arrive_registers_arriver_pin() {
     );
 }
 
+/// bd-gpj0: open-mode arrive must bind `HERDR_PANE_ID` so doorbell can push,
+/// or say pull-only when the env is absent. A pin with no pane stays
+/// digest-bound (`no_injectable_panes`).
+#[test]
+fn arrive_binds_open_pane_or_says_pull_only() {
+    let src = include_str!("main.rs");
+    let start = src
+        .rfind("\nfn cmd_arrive(")
+        .expect("real cmd_arrive (rfind skips quoted copies)");
+    let end = src[start..]
+        .find("\n/// (holder pin, whois.stale)")
+        .map(|i| start + i)
+        .unwrap_or(src.len());
+    let body = &src[start..end];
+    assert!(
+        body.contains("arrive_maybe_bind_pane"),
+        "arrive must bind the current herdr pane (or announce pull-only)"
+    );
+    let bind = body.find("arrive_maybe_bind_pane").expect("bind helper");
+    let register = body.find("register_agent").expect("register");
+    assert!(
+        register < bind,
+        "bind the pane after the pin is registered so whois/registry agree"
+    );
+}
+
 #[cfg(test)]
 mod tripwire {
     /// Locate a column-0 `fn name(` definition in `src`.
@@ -12836,6 +12862,23 @@ fn arrival_triple(project: &str, pin: &str) {
     }
 }
 
+/// bd-gpj0: open-mode arrive can only be *pushed* if this pane is in the
+/// spawn registry. `HERDR_PANE_ID` is the current herdr pane; bind it to
+/// the arriver pin. Without it, wakes stay digest-bound — say so loudly.
+fn arrive_maybe_bind_pane(cfg: &Config, project: &str, pin: &str) {
+    match std::env::var("HERDR_PANE_ID") {
+        Ok(pane) if !pane.trim().is_empty() => {
+            let pane = pane.trim();
+            bind_pane_mail_identity(cfg, project, pin, pane, Some(pin));
+            eprintln!("arrive bound pane {pane} to {pin} (doorbell can push)");
+        }
+        _ => eprintln!(
+            "flywheel: no HERDR_PANE_ID — this session is pull-only; doorbell \
+             pushes stay digest-bound. Pull with `toron mail inbox --since last`."
+        ),
+    }
+}
+
 fn cmd_arrive(
     cfg: &Config,
     project: &str,
@@ -12914,6 +12957,7 @@ fn cmd_arrive(
             Ok(s) => eprintln!("flywheel: presence publish exited {s}"),
             Err(e) => eprintln!("flywheel: presence publish failed: {e:#}"),
         }
+        arrive_maybe_bind_pane(cfg, project, agent);
     }
     // Arrival triple (bd-asr2.14, D5, flag-gated): presence (above) + role
     // auto-bind from the spawn-registry profile + roster visibility. The
@@ -17379,6 +17423,32 @@ mod wake_identity_tests {
             .expect("registry entry");
         assert_eq!(entry.pane_id, "w9:p1");
         assert_eq!(entry.mail_identity.as_deref(), Some(pin.as_str()));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// bd-gpj0: arrive with HERDR_PANE_ID records the open-mode pane so
+    /// doorbell injection can see it (clears `no_injectable_panes` when
+    /// herdr lists that pane).
+    #[test]
+    fn arrive_maybe_bind_pane_records_current_pane() {
+        let _home = crate::config::test_state_home();
+        let data = std::env::temp_dir().join(format!("fw-arrive-bind-{}", uuid::Uuid::new_v4()));
+        let prev = std::env::var("HERDR_PANE_ID").ok();
+        unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
+        unsafe { std::env::set_var("HERDR_PANE_ID", "wP:p2") };
+        let cfg = Config::default();
+        let project = "fw-arrive-bind-proj";
+        arrive_maybe_bind_pane(&cfg, project, "QuietHeron");
+        let entry = state::load_spawn_registry(project)
+            .into_iter()
+            .find(|e| e.name == "QuietHeron")
+            .expect("open-mode pin lands in registry");
+        assert_eq!(entry.pane_id, "wP:p2");
+        assert_eq!(entry.mail_identity.as_deref(), Some("QuietHeron"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HERDR_PANE_ID", v) },
+            None => unsafe { std::env::remove_var("HERDR_PANE_ID") },
+        }
         let _ = std::fs::remove_dir_all(&data);
     }
 
