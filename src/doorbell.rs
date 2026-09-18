@@ -1298,6 +1298,103 @@ pub fn render_roster(rows: &[RosterRow]) -> Vec<String> {
     out
 }
 
+/// Nearby discovery row (bd-gpj0.2): herdr panes ∪ registry pins ∪
+/// reservation holders. Empty pin means an unbound pane — the thing four
+/// manual queries used to hunt for.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NearbyRow {
+    pub pin: String,
+    pub pane: String,
+    pub name: String,
+    pub state: String,
+    pub held: String,
+}
+
+/// Pure join: registry `(pin, pane, name)`, herdr `(pane, name, status)`,
+/// leases `(holder, path)`. Unbound panes stay in the list.
+pub fn join_nearby(
+    registry: &[(String, String, String)],
+    herdr: &[(String, String, String)],
+    leases: &[(String, String)],
+) -> Vec<NearbyRow> {
+    let mut herdr_by_pane: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    for (pane, name, status) in herdr {
+        herdr_by_pane.insert(pane.clone(), (name.clone(), status.clone()));
+    }
+    let mut seen_panes = std::collections::BTreeSet::new();
+    let mut rows = Vec::new();
+    for (pin, pane, name) in registry {
+        seen_panes.insert(pane.clone());
+        let (hname, status) = herdr_by_pane
+            .get(pane)
+            .cloned()
+            .unwrap_or_else(|| (name.clone(), "missing".to_string()));
+        rows.push(NearbyRow {
+            pin: pin.clone(),
+            pane: pane.clone(),
+            name: if hname.is_empty() {
+                name.clone()
+            } else {
+                hname
+            },
+            state: status,
+            held: lease_paths(leases, pin),
+        });
+    }
+    for (pane, (name, status)) in &herdr_by_pane {
+        if seen_panes.contains(pane) {
+            continue;
+        }
+        rows.push(NearbyRow {
+            pin: String::new(),
+            pane: pane.clone(),
+            name: name.clone(),
+            state: status.clone(),
+            held: lease_paths(leases, name),
+        });
+    }
+    rows.sort_by(|a, b| a.pane.cmp(&b.pane).then(a.pin.cmp(&b.pin)));
+    rows
+}
+
+fn lease_paths(leases: &[(String, String)], holder: &str) -> String {
+    let mut paths: Vec<&str> = leases
+        .iter()
+        .filter(|(h, _)| h == holder)
+        .map(|(_, p)| p.as_str())
+        .collect();
+    paths.sort_unstable();
+    paths.join(",")
+}
+
+/// Human lines for `doorbell roster`. Empty pin/held render as `-`.
+pub fn render_nearby(rows: &[NearbyRow]) -> Vec<String> {
+    let mut out = vec!["NEARBY:".to_string()];
+    for r in rows {
+        let pin = if r.pin.is_empty() {
+            "-"
+        } else {
+            r.pin.as_str()
+        };
+        let pane = if r.pane.is_empty() {
+            "-"
+        } else {
+            r.pane.as_str()
+        };
+        let held = if r.held.is_empty() {
+            "-"
+        } else {
+            r.held.as_str()
+        };
+        out.push(format!(
+            "  pin={pin} pane={pane} name={} state={} held={held}",
+            r.name, r.state
+        ));
+    }
+    out
+}
+
 /// Cross-workspace scopes (bd-asr2.18, D5, flag-gated): widen one pin's
 /// Scope stays explicit (Scope::Many, deduped) — never an implicit
 /// all-workspace watch. Flag off or non-operator actor refuses.
@@ -2978,6 +3075,45 @@ mod tests {
         let rendered = render_roster(&rows);
         assert!(rendered[0].starts_with("ROSTER"));
         assert!(rendered[2].contains('Q') && rendered[2].contains("bd-1"));
+    }
+
+    #[test]
+    fn nearby_join_keeps_unbound_panes_and_holds() {
+        // BoardAgent had no registry pin — nearby must still list the pane.
+        let registry = vec![(
+            "QuietHeron".to_string(),
+            "wP:p2".to_string(),
+            "grok".to_string(),
+        )];
+        let herdr = vec![
+            (
+                "wP:p2".to_string(),
+                "grok".to_string(),
+                "working".to_string(),
+            ),
+            (
+                "w6:p2".to_string(),
+                "BoardAgent".to_string(),
+                "idle".to_string(),
+            ),
+        ];
+        let leases = vec![("QuietHeron".to_string(), "src/main.rs".to_string())];
+        let rows = join_nearby(&registry, &herdr, &leases);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let bound = rows.iter().find(|r| r.pin == "QuietHeron").expect("bound");
+        assert_eq!(bound.pane, "wP:p2");
+        assert_eq!(bound.state, "working");
+        assert_eq!(bound.held, "src/main.rs");
+        let unbound = rows
+            .iter()
+            .find(|r| r.name == "BoardAgent")
+            .expect("unbound");
+        assert!(unbound.pin.is_empty(), "unbound pane has no pin");
+        assert_eq!(unbound.pane, "w6:p2");
+        let rendered = render_nearby(&rows);
+        assert!(rendered[0].starts_with("NEARBY"));
+        assert!(rendered.iter().any(|l| l.contains("BoardAgent")));
+        assert!(rendered.iter().any(|l| l.contains("held=src/main.rs")));
     }
 
     #[test]
