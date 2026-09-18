@@ -1213,19 +1213,17 @@ enum Commands {
         #[arg(long)]
         ensure: bool,
     },
-    /// Generate the beads-agent integration prompts for an agent kind.
-    /// Writes the beads files (beads-{triage,execute,review,commit,create}.md),
-    /// the workflow slash commands (workflow-{...}.md), and the orchestration
-    /// slash commands (open.md, swarm.md, loop.md, peer-aware.md) into the tool's prompts dir.
-    /// Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted); omit to
-    /// list kinds. Re-run after a flywheel rebuild to refresh the generated
-    /// prompts.
+    /// Generate orchestration slash commands for an agent kind.
+    /// Writes {open,swarm,loop,peer-aware}-mode.md into the tool's prompts dir
+    /// and removes leftover /beads-* and /workflow-* files (catalog + br own
+    /// those verbs). Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted);
+    /// omit to list kinds. Re-run after a flywheel rebuild to refresh.
     Integration {
-        /// agent kind: opencode|pi|grok|omp (shorts oc|pi|gk accepted);
+        /// agent kind: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted);
         /// omit to list kinds
         kind: Option<String>,
-        /// write the 5 prompt files into this directory instead of the
-        /// tool's conventional prompts dir
+        /// write the orchestration slash files into this directory instead of
+        /// the tool's conventional prompts dir
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -2461,7 +2459,7 @@ fn main() {
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF (ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify); SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
-            "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate/implement/verify outer SIGNOFF; nests ordinary builtins (phase-plan/beads/ce-plan-review/phase-implement/phase-verify) via call_workflow; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only; after integrate hand off to wave-swarm (until=integrate), never merge (ADR-0008 6.7)",
+            "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
         return;
@@ -4979,6 +4977,7 @@ mod steer_engine_tests {
                 false,
                 false,
                 false,
+                &[],
             );
             let WorkflowCmd::Run {
                 name,
@@ -5036,6 +5035,7 @@ mod steer_engine_tests {
             false,
             false,
             false,
+            &[],
         );
         let WorkflowCmd::Run {
             name,
@@ -9469,6 +9469,7 @@ fn handle_workspace_cmds(
                     json: true,
                     yes: true,
                     allow_worktree: false,
+                    role_model: vec![],
                 };
                 if let Err(e) = cmd_workflow(cfg, &run) {
                     eprintln!("flywheel: [LoudMiss] invoke {corr} ({workflow}): {e:#}");
@@ -12523,11 +12524,17 @@ fn cmd_briefing(
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     let world = briefing::World {
         project: project.to_string(),
-        ready_beads: snap
-            .lanes
-            .iter()
-            .filter(|l| l.status == "open" || l.status == "ready")
-            .count() as u32,
+        // Dispatchable ready only (`br ready`). Open-without-verify must not
+        // trip loop-work; counting jsonl `open` lanes was the session-door hijack.
+        ready_beads: match load_ready_beads(cfg, project) {
+            Ok(v) => v.len() as u32,
+            Err(e) => {
+                eprintln!(
+                    "flywheel: briefing: br ready failed ({e:#}) — ready_beads=0 (fail-open, do not count leftover opens)"
+                );
+                0
+            }
+        },
         dispatcher: snap.dispatcher.clone(),
         joinable: snap.joinable,
         degraded: snap.degraded.clone(),
@@ -12585,8 +12592,14 @@ fn cmd_briefing(
         println!("argv {}", b.proposal.argv.join(" "));
         println!("role {}", b.proposal.role.as_deref().unwrap_or("-"));
         println!(
-            "questions topology={} crew={}",
-            b.questions[0].default, b.questions[1].default
+            "questions topology={} crew={} model={}",
+            b.questions[0].default,
+            b.questions[1].default,
+            b.questions
+                .iter()
+                .find(|q| q.id == "model")
+                .map(|q| q.default.as_str())
+                .unwrap_or("default")
         );
     }
     // bd-enov (F3): a dirt preflight on the session door. An uncommitted ADR
@@ -20861,60 +20874,6 @@ fn cmd_preflight(
     Ok(())
 }
 
-/// Per-kind notes for the beads-agent integration template. Keep terse —
-/// the durable-loop behavior is kind-agnostic; these cover session/rendering
-/// quirks that agents should know about themselves.
-fn kind_notes(kind: &str) -> Option<&'static str> {
-    match kind {
-        "opencode" => Some(
-            "- Config: ~/.config/opencode (sessions in opencode's store, ~/.local/share/opencode).\n- Terminal rendering uses the alternate screen: your context state can leave host\n  scrollback, so the state file is the reliable context channel — write it at ~80%.\n- herdr confirms landings fast (~0.6s).",
-        ),
-        "pi" => Some(
-            "- Config + sessions: ~/.pi (session files under ~/.pi/agent/sessions/).\n- Your agent name is applied automatically at spawn; use it in `--actor` and the\n  state-file path. Landings confirm fast (~0.6s).",
-        ),
-        "grok" => Some(
-            "- Config + sessions: ~/.grok (active sessions in ~/.grok/active_sessions.json).\n- Landing latency can be higher: the orchestrator's confirm wait covers it — you\n  only need to reach working/blocked, not finish, for the send to count as landed.",
-        ),
-        "omp" => Some(
-            "- Config + sessions: ~/.omp (agent sessions under ~/.omp/agent/sessions/).\n- Prompts live in ~/.omp/agent/prompts/beads-*.md (generated — re-run `flywheel\n  integration omp` after a rebuild to refresh; never hand-edit the generated files).\n- omp CLI works standalone. In herdr, omp exits on PTY stdin EOF (bd-ude8 / eign.7):\n  a context-respawn that tears the PTY down kills the agent. Flywheel layers already\n  inject model/effort args and pass a pane id (not a workspace id). Do not flip omp\n  defaults; remaining layer is herdr PTY lifetime.",
-        ),
-        _ => None,
-    }
-}
-
-/// The shared beads-agent BODY — the lifecycle, coordination rules, and
-/// context contract that all agent kinds follow. Every phase prompt embeds
-/// this body (single source of truth); per-phase focus + per-tool frontmatter
-/// live in the phase/frontmatter templates below. Edit the templates in
-/// `integrations/` and rebuild — re-run `flywheel integration <kind>` after
-/// a rebuild to update the installed prompt files.
-const INTEGRATION_BODY: &str = include_str!("../integrations/beads-body.md.tpl");
-
-/// The canonical 5-command set: phase name → description (frontmatter).
-/// Each phase prompt = per-tool frontmatter + phase focus + the shared body.
-const PROMPT_PHASES: &[(&str, &str)] = &[
-    (
-        "triage",
-        "Find ready bead work — triage the tracker for open, unblocked, dependency-ordered tasks.",
-    ),
-    (
-        "execute",
-        "Execute one ready bead end-to-end — claim, reserve, announce, implement, verify, close, sync, handoff.",
-    ),
-    (
-        "review",
-        "Review a bead's work for compliance before closing — does it actually satisfy the acceptance criteria?",
-    ),
-    (
-        "commit",
-        "Close a completed bead and sync the tracker — close with honest reason, export, commit .beads/, hand off.",
-    ),
-    (
-        "create",
-        "Create a new bead from a plan, suggestion, or discovered work — granular, dependency-ordered, self-documenting.",
-    ),
-];
-
 /// Per-tool prompt frontmatter (tool-specific format) + {{PHASE_DESCRIPTION}}.
 fn prompt_frontmatter(kind: &str) -> Option<&'static str> {
     match kind {
@@ -20937,96 +20896,11 @@ fn prompt_frontmatter(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// Per-phase prompt template: `{{TOOL_FRONTMATTER}}` + phase focus +
-/// `{{BODY}}` (the shared body).
-fn prompt_phase_template(phase: &str) -> Option<&'static str> {
-    match phase {
-        "triage" => Some(include_str!("../integrations/prompts/beads-triage.md.tpl")),
-        "execute" => Some(include_str!("../integrations/prompts/beads-execute.md.tpl")),
-        "review" => Some(include_str!("../integrations/prompts/beads-review.md.tpl")),
-        "commit" => Some(include_str!("../integrations/prompts/beads-commit.md.tpl")),
-        "create" => Some(include_str!("../integrations/prompts/beads-create.md.tpl")),
-        _ => None,
-    }
-}
-
-/// The workflow slash-command set (bd-oj9o #3, bd-ucd4): command name →
-/// (target workflow, frontmatter description). The POPULAR user-facing
-/// workflows — debate, plan, plan-review, brainstorm, onboard, triage-deep.
-/// Behind-the-scenes workflows (cron, beads, goal) deliberately get NO
-/// command templates.
-const PROMPT_WORKFLOWS: &[(&str, &str, &str)] = &[
-    (
-        "debate",
-        "debate",
-        "Run the debate workflow — adversarial synthesis: reviewers brief, an oracle decides.",
-    ),
-    (
-        "plan",
-        "ce-plan",
-        "Run the ce-plan workflow — goal → bead-ready plan via the planner.",
-    ),
-    (
-        "plan-review",
-        "ce-plan-review",
-        "Run the ce-plan-review workflow — review a plan bead-by-bead before implementation.",
-    ),
-    (
-        "brainstorm",
-        "ce-brainstorm",
-        "Run the ce-brainstorm workflow — requirements-first ideation: oracles fan out, a planner reduces.",
-    ),
-    (
-        "onboard",
-        "onboard",
-        "Run the onboard workflow — cold-start a newcomer: repo map, seed context, first task.",
-    ),
-    (
-        "triage",
-        "triage-deep",
-        "Run the triage-deep workflow — bv robot-triage, prioritize + assign, spawn the crew.",
-    ),
-    (
-        "captain-audit",
-        "captain-audit",
-        "Run the captain-audit workflow — read-only analysis: scout gathers evidence, oracle synthesizes, reviewer challenges; the report is written to report_path.",
-    ),
-];
-
-/// Per-workflow command template: `{{TOOL_FRONTMATTER}}` + the workflow
-/// focus. Standalone — no beads body (these are workflow commands, not bead
-/// lifecycle commands).
-fn prompt_workflow_template(name: &str) -> Option<&'static str> {
-    match name {
-        "debate" => Some(include_str!(
-            "../integrations/prompts/workflow-debate.md.tpl"
-        )),
-        "plan" => Some(include_str!("../integrations/prompts/workflow-plan.md.tpl")),
-        "plan-review" => Some(include_str!(
-            "../integrations/prompts/workflow-plan-review.md.tpl"
-        )),
-        "brainstorm" => Some(include_str!(
-            "../integrations/prompts/workflow-brainstorm.md.tpl"
-        )),
-        "onboard" => Some(include_str!(
-            "../integrations/prompts/workflow-onboard.md.tpl"
-        )),
-        "triage" => Some(include_str!(
-            "../integrations/prompts/workflow-triage.md.tpl"
-        )),
-        "captain-audit" => Some(include_str!(
-            "../integrations/prompts/workflow-captain-audit.md.tpl"
-        )),
-        _ => None,
-    }
-}
-
 /// The orchestration slash-command set: open-mode, swarm-mode, loop-mode, and peer-aware-mode.
-/// These are agent operating modes/coordination commands, distinct from
-/// PROMPT_WORKFLOWS (reusable procedures) and beads lifecycle commands.
 /// `open-mode` is direct current-pane work; `loop-mode` is durable solo execution;
 /// `swarm-mode` is captain-led multi-crew execution; `peer-aware-mode` installs
-/// wake coordination across either topology.
+/// wake coordination across either topology. Catalog workflows and br own
+/// the retired `/workflow-*` / `/beads-*` slash family — regen deletes leftovers.
 const ORCHESTRATION_COMMANDS: &[(&str, &str, &str)] = &[
     (
         "open-mode",
@@ -21062,6 +20936,27 @@ fn prompt_orchestration_template(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Leftover slash files from the retired `/beads-*` / `/workflow-*` family
+/// (and pre-rename bare `/swarm` `/loop` `/peer-aware`). Regen deletes them
+/// so a harness command dir cannot keep serving frozen copies.
+const RETIRED_SLASH_FILES: &[&str] = &[
+    "beads-triage.md",
+    "beads-execute.md",
+    "beads-review.md",
+    "beads-commit.md",
+    "beads-create.md",
+    "workflow-debate.md",
+    "workflow-plan.md",
+    "workflow-plan-review.md",
+    "workflow-brainstorm.md",
+    "workflow-onboard.md",
+    "workflow-triage.md",
+    "workflow-captain-audit.md",
+    "swarm.md",
+    "loop.md",
+    "peer-aware.md",
+];
+
 /// The prompts directory for one agent kind (the dir the generated
 /// commands are written into). Purely conventional per tool.
 #[must_use]
@@ -21080,61 +20975,6 @@ pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
         "pa" => home.join(".prime/agent/commands"),
         _ => return None,
     })
-}
-
-/// Render one phase prompt for one agent kind. Pure: `version` and
-/// `generated` are injected by the caller (deterministic tests).
-fn render_prompt(kind: &str, phase: &str, version: &str, generated: &str) -> Result<String> {
-    let frontmatter = prompt_frontmatter(kind).ok_or_else(|| {
-        anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)")
-    })?;
-    let phase_tpl = prompt_phase_template(phase).ok_or_else(|| {
-        anyhow!("unknown phase: {phase} (known: triage, execute, review, commit, create)")
-    })?;
-    let (_, description) = PROMPT_PHASES
-        .iter()
-        .find(|(p, _)| *p == phase)
-        .expect("phase in table");
-    let notes = kind_notes(kind).unwrap_or_default();
-    let body = INTEGRATION_BODY
-        .replace("{{KIND_NOTES}}", notes)
-        .replace("{{VERSION}}", version)
-        .replace("{{GENERATED}}", generated);
-    Ok(phase_tpl
-        .replace(
-            "{{TOOL_FRONTMATTER}}",
-            &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
-        )
-        .replace("{{BODY}}", &body)
-        .replace("{{VERSION}}", version)
-        .replace("{{GENERATED}}", generated))
-}
-
-/// Render one workflow command for one agent kind. Pure (deterministic
-/// tests): frontmatter (with the workflow's description) + the workflow
-/// focus template + version/generated stamps.
-fn render_workflow_prompt(
-    kind: &str,
-    name: &str,
-    version: &str,
-    generated: &str,
-) -> Result<String> {
-    let frontmatter = prompt_frontmatter(kind).ok_or_else(|| {
-        anyhow!("unknown agent kind: {kind} (known: opencode, pi, grok, omp, pa)")
-    })?;
-    let tpl = prompt_workflow_template(name)
-        .ok_or_else(|| anyhow!("unknown workflow command: {name} (flywheel integration list)"))?;
-    let (_, _, description) = PROMPT_WORKFLOWS
-        .iter()
-        .find(|(n, _, _)| *n == name)
-        .expect("workflow command in table");
-    Ok(tpl
-        .replace(
-            "{{TOOL_FRONTMATTER}}",
-            &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
-        )
-        .replace("{{VERSION}}", version)
-        .replace("{{GENERATED}}", generated))
 }
 
 /// Render one orchestration command (/open-mode, /swarm-mode, /loop-mode, /peer-aware-mode) for one agent kind.
@@ -21226,32 +21066,16 @@ fn apply_argument_adapter(kind: &str, frontmatter: &str, body: &str) -> (String,
     (fm, body)
 }
 
-/// `flywheel integration [KIND] [--out PATH]` — generate the 5 beads prompt
-/// files (beads-{triage,execute,review,commit,create}.md) for one agent kind
-/// (opencode/pi/grok/omp/pa), each from the shared beads-body, plus the
-/// workflow slash commands (workflow-{...}.md) and the orchestration slash
-/// commands (bd-glup /swarm, bd-ug9z /loop: {name}.md). With no KIND, list
-/// the available kinds. With `--out <dir>`, write the files into that
-/// directory instead of the tool's conventional prompts dir.
-///
-/// The beads SUBAGENT (agents/beads.md) is retired (bd-ra0g.1): the loop
-/// drives panes via its self-contained dispatch prompt, and nothing
-/// load-bearing loads the subagent — prompts are the delivery surface now.
+/// `flywheel integration [KIND] [--out PATH]` — generate the orchestration
+/// slash commands ({open,swarm,loop,peer-aware}-mode.md) for one agent kind.
+/// With no KIND, list kinds. `--out <dir>` writes there instead of the
+/// conventional prompts dir. Also deletes leftover `/beads-*` / `/workflow-*`
+/// (and pre-rename bare swarm/loop/peer-aware) files in that dir.
 fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
     let Some(kind) = kind else {
-        println!("flywheel beads prompts (flywheel {VERSION}):");
-        println!("  5 beads commands per kind: beads-{{triage,execute,review,commit,create}}.md");
+        println!("flywheel orchestration prompts (flywheel {VERSION}):");
         println!(
-            "  + {} workflow slash commands per kind: workflow-{{{}}}.md",
-            PROMPT_WORKFLOWS.len(),
-            PROMPT_WORKFLOWS
-                .iter()
-                .map(|(n, _, _)| *n)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        println!(
-            "  + {} orchestration slash commands per kind: {{{}}}.md",
+            "  {} slash commands per kind: {{{}}}.md",
             ORCHESTRATION_COMMANDS.len(),
             ORCHESTRATION_COMMANDS
                 .iter()
@@ -21269,10 +21093,13 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
             let dir = prompts_dir(k)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<HOME>/.config/...".to_string());
-            println!("  {k:9} flywheel integration {k}   -> {dir}/beads-*.md");
+            println!("  {k:9} flywheel integration {k}   -> {dir}/*-mode.md");
         }
         println!(
-            "templates: integrations/beads-body.md.tpl + integrations/prompts/*.tpl — edit, rebuild, re-run to update"
+            "templates: integrations/prompts/{{open,swarm,loop,peer-aware,frontmatter-*}}.tpl — edit, rebuild, re-run to update"
+        );
+        println!(
+            "retired /workflow-* and /beads-* slash files are removed on regen (catalog + br own those verbs)"
         );
         return Ok(());
     };
@@ -21292,43 +21119,10 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         .with_context(|| format!("create prompts dir {}", dir.display()))?;
     let generated = state::now_iso();
     let mut written = 0usize;
-    for (phase, _) in PROMPT_PHASES {
-        let rendered = render_prompt(kind, phase, VERSION, &generated)?;
-        let path = dir.join(format!("beads-{phase}.md"));
-        std::fs::write(&path, &rendered).with_context(|| format!("write {}", path.display()))?;
-        println!(
-            "wrote {} ({} bytes)",
-            dim(&path.display().to_string()),
-            rendered.len()
-        );
-        written += 1;
-    }
-    // The workflow slash commands (bd-oj9o #3): /workflow-{debate,plan-review,
-    // brainstorm} — the popular user-facing workflows; cron excluded.
-    for (name, _, _) in PROMPT_WORKFLOWS {
-        let rendered = render_workflow_prompt(kind, name, VERSION, &generated)?;
-        let path = dir.join(format!("workflow-{name}.md"));
-        std::fs::write(&path, &rendered).with_context(|| format!("write {}", path.display()))?;
-        println!(
-            "wrote {} ({} bytes)",
-            dim(&path.display().to_string()),
-            rendered.len()
-        );
-        written += 1;
-    }
-    // The orchestration slash commands (/open-mode, /swarm-mode, /loop-mode,
-    // /peer-aware-mode): operating modes and coordination playbooks, rendered
-    // as {name}.md.
+    // /open-mode, /swarm-mode, /loop-mode, /peer-aware-mode as {name}.md.
     for (name, _, _) in ORCHESTRATION_COMMANDS {
         let rendered = render_orchestration_prompt(kind, name, VERSION, &generated)?;
-        let filename = match *name {
-            "open-mode" => "open-mode.md",
-            "swarm-mode" => "swarm-mode.md",
-            "loop-mode" => "loop-mode.md",
-            "peer-aware-mode" => "peer-aware-mode.md",
-            _ => unreachable!("all orchestration commands use the -mode suffix"),
-        };
-        let path = dir.join(filename);
+        let path = dir.join(format!("{name}.md"));
         std::fs::write(&path, &rendered).with_context(|| format!("write {}", path.display()))?;
         println!(
             "wrote {} ({} bytes)",
@@ -21337,18 +21131,12 @@ fn cmd_integration(kind: Option<&str>, out: Option<&Path>) -> Result<()> {
         );
         written += 1;
     }
-    // bd-gs005: remove pre-rename bare-named leftovers (swarm.md / loop.md /
-    // peer-aware.md). Harnesses key slash commands on the file stem, so those
-    // collide with built-in /swarm //loop commands.
-    for legacy in ["swarm.md", "loop.md", "peer-aware.md"] {
-        let p = dir.join(legacy);
+    for retired in RETIRED_SLASH_FILES {
+        let p = dir.join(retired);
         if p.exists() {
             match std::fs::remove_file(&p) {
-                Ok(()) => println!(
-                    "removed stale {} (renamed to -mode)",
-                    dim(&p.display().to_string())
-                ),
-                Err(e) => eprintln!("flywheel: could not remove stale {}: {e}", p.display()),
+                Ok(()) => println!("removed retired {}", dim(&p.display().to_string())),
+                Err(e) => eprintln!("flywheel: could not remove retired {}: {e}", p.display()),
             }
         }
     }
@@ -23991,6 +23779,7 @@ fn cmd_steer(
         );
     }
     let mut crew_owned = crew.map(|s| s.to_string());
+    let mut role_model_owned: Vec<String> = Vec::new();
     // bd-xe9r: on an INTERACTIVE TTY — skipped by --json, --yes, or an
     // explicit --crew (an agent driver knows its fleet already) — brief the
     // operator before dispatch. Non-TTY output stays byte-identical.
@@ -24015,8 +23804,15 @@ fn cmd_steer(
             steer_brief::BriefingOutcome::Abort => {
                 bail!("steer: aborted by the operator at the briefing gate");
             }
-            steer_brief::BriefingOutcome::Go { budget } => {
+            steer_brief::BriefingOutcome::Go {
+                budget,
+                role_models,
+            } => {
                 crew_owned = Some(budget.to_string());
+                role_model_owned = role_models
+                    .iter()
+                    .map(|(role, model)| format!("{role}={model}"))
+                    .collect();
             }
         }
     }
@@ -24035,6 +23831,7 @@ fn cmd_steer(
         retain,
         retire_orphans,
         json,
+        &role_model_owned,
     );
     cmd_workflow(cfg, &run)
 }
@@ -24053,6 +23850,7 @@ fn steer_run_cmd(
     retain: bool,
     retire_orphans: bool,
     json: bool,
+    role_model: &[String],
 ) -> WorkflowCmd {
     let wf_name = if direct { "goal-direct" } else { "goal" };
     let inputs = serde_json::json!({ "objective": objective });
@@ -24069,6 +23867,7 @@ fn steer_run_cmd(
         json,
         yes: false,
         allow_worktree: false,
+        role_model: role_model.to_vec(),
     }
 }
 
@@ -24237,6 +24036,7 @@ fn profile_workflow_invoke(
         json: false,
         yes: false,
         allow_worktree: false,
+        role_model: vec![],
     }
 }
 
@@ -24633,12 +24433,14 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // the preflight gate consumed --allow-worktree (operator-only);
             // cmd_workflow itself needs no opt-out state
             allow_worktree: _,
+            role_model,
         } => {
             // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
             // alias the run (including --execute journaling + pane spawn)
             // onto the workspace root.
             project_door_opt(project, "workflow run")?;
             let mut crew_sel = crew.clone();
+            let mut role_model_sel = role_model.clone();
             // bd-nmzk: interactive captain briefing for `workflow run --execute`
             // (same skip flags as `steer` — shared prompt module so both stay
             // in lockstep). Arms only on an interactive TTY with --execute.
@@ -24660,8 +24462,17 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     steer_brief::BriefingOutcome::Abort => {
                         bail!("workflow run: aborted by the operator at the briefing gate");
                     }
-                    steer_brief::BriefingOutcome::Go { budget } => {
+                    steer_brief::BriefingOutcome::Go {
+                        budget,
+                        role_models,
+                    } => {
                         crew_sel = Some(budget.to_string());
+                        if role_model_sel.is_empty() {
+                            role_model_sel = role_models
+                                .iter()
+                                .map(|(role, model)| format!("{role}={model}"))
+                                .collect();
+                        }
                     }
                 }
             } else if *execute && !json && *yes && crew.is_some() {
@@ -24743,7 +24554,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         // the engine's run_spawn would return ok:true with no
                         // pane — the exact lie this fixes.
                         headless_spawn_gate(&wf)?;
-                        let catalog = profile::ProfileCatalog::load()?;
+                        let mut catalog = profile::ProfileCatalog::load()?;
+                        catalog.apply_role_models(&role_model_sel)?;
                         let wf_name = name.clone();
                         let inputs_c = inputs_value.clone();
                         // ADR-0032 Spec 9 tail: stage prompts resolve the
@@ -24763,7 +24575,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     }
                     "pane" => {
                         let project = project.as_deref().unwrap_or("flywheel");
-                        let catalog = profile::ProfileCatalog::load()?;
+                        let mut catalog = profile::ProfileCatalog::load()?;
+                        catalog.apply_role_models(&role_model_sel)?;
                         let ctx = pane::pre_spawn_crew(
                             cfg,
                             project,
@@ -31867,168 +31680,71 @@ mod wait_output_tests {
 mod integration_tests {
     use super::*;
 
+    /// Regen writes only *-mode.md and deletes leftover /beads-* / /workflow-*.
     #[test]
-    fn render_prompt_has_frontmatter_phase_and_body() {
-        let out = render_prompt("opencode", "execute", "9.9.9", "2026-08-04T00:00:00Z").unwrap();
-        // prompt shape: YAML frontmatter with the phase description
-        assert!(out.starts_with("---\n"));
-        assert!(out.contains("Execute one ready bead end-to-end"));
-        // phase focus section
-        assert!(out.contains("# Beads execute"));
-        assert!(out.contains("## This command's focus"));
-        // version + generated stamps
-        assert!(out.contains("flywheel 9.9.9"));
-        assert!(out.contains("2026-08-04T00:00:00Z"));
-        // the shared body's lifecycle
-        assert!(out.contains("br update bd-<id> --claim"));
-        assert!(out.contains("CONTEXT_LIMIT"));
-        assert!(out.contains(".flywheel/agent-state/<AGENT_NAME>.json"));
-        // per-kind config note
-        assert!(out.contains("~/.config/opencode"));
-        // no leftovers
-        assert!(!out.contains("{{BODY}}"));
-        assert!(!out.contains("{{KIND_NOTES}}"));
-        assert!(!out.contains("{{VERSION}}"));
-        assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
-        assert!(!out.contains("{{PHASE_DESCRIPTION}}"));
-    }
+    fn integration_writes_only_orchestration_and_removes_retired_slash() {
+        let dir = std::env::temp_dir().join(format!(
+            "fw-int-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("beads-execute.md"), "stale").unwrap();
+        std::fs::write(dir.join("workflow-plan.md"), "stale").unwrap();
+        std::fs::write(dir.join("swarm.md"), "stale").unwrap();
 
-    #[test]
-    fn render_all_five_phases_exist_per_kind() {
-        for kind in ["opencode", "pi", "grok", "omp", "pa"] {
-            for phase in ["triage", "execute", "review", "commit", "create"] {
-                let out = render_prompt(kind, phase, "0.1.0", "ts").unwrap();
-                assert!(
-                    out.contains(&format!("# Beads {phase}")),
-                    "{kind}/{phase} heading"
-                );
-                assert!(out.starts_with("---"), "{kind}/{phase} frontmatter");
-            }
-        }
-    }
+        cmd_integration(Some("opencode"), Some(&dir)).expect("integration write");
 
-    #[test]
-    fn render_all_kinds_carry_their_config_dir() {
-        for (kind, cfg) in [
-            ("opencode", "~/.config/opencode"),
-            ("pi", "~/.pi"),
-            ("grok", "~/.grok"),
-            ("omp", "~/.omp"),
-        ] {
-            let out = render_prompt(kind, "execute", "0.1.0", "ts").unwrap();
-            assert!(out.contains(cfg), "{kind} should mention {cfg}");
-            assert!(out.starts_with("---"), "{kind} frontmatter");
-        }
-    }
-
-    #[test]
-    fn render_rejects_unknown_kind() {
-        assert!(render_prompt("claude", "execute", "0.1.0", "ts").is_err());
-        assert!(render_prompt("opencode", "bogus", "0.1.0", "ts").is_err());
-    }
-
-    /// bd-vwsz: the crew templates carry the EXACT MCP arg shapes crews use —
-    /// agents were guessing arg names and failing tool validation (live bug
-    /// 2026-08-16). Each tool name must appear with its REQUIRED set in the
-    /// rendered beads body, and the release note must point crews at
-    /// release_file_reservations (NOT the loop's by_reason hook).
-    #[test]
-    fn rendered_body_carries_exact_mcp_arg_shapes() {
-        let out = render_prompt("omp", "execute", "0.1.0", "ts").unwrap();
-        // send_message: the required set is project_key, sender_name, to,
-        // subject, body_md (+ optional thread_id)
-        let send = out
-            .find("send_message:")
-            .expect("send_message shape present");
-        let send_span = &out[send..send + 200];
-        for needle in [
-            "project_key",
-            "sender_name=YOUR_PIN",
-            "to=[names]",
-            "subject",
-            "body_md",
-            "thread_id",
-        ] {
-            assert!(send_span.contains(needle), "send_message missing {needle}");
-        }
-        // reply_message: same required set + thread_id to stay in-thread
-        let reply = out
-            .find("reply_message:")
-            .expect("reply_message shape present");
-        let reply_span = &out[reply..reply + 200];
-        for needle in [
-            "project_key",
-            "sender_name=YOUR_PIN",
-            "to=[names]",
-            "subject",
-            "body_md",
-            "thread_id",
-        ] {
+        for (name, _, _) in ORCHESTRATION_COMMANDS {
+            let p = dir.join(format!("{name}.md"));
+            assert!(p.is_file(), "must write {name}.md");
+            let body = std::fs::read_to_string(&p).unwrap();
             assert!(
-                reply_span.contains(needle),
-                "reply_message missing {needle}"
+                body.contains(&format!("# Orchestration: {name}")),
+                "{name}.md must be an orchestration playbook"
             );
         }
-        // release: crews use release_file_reservations, NOT the by_reason
-        // loop hook (which needs bead_id)
+        for name in RETIRED_SLASH_FILES {
+            assert!(
+                !dir.join(name).exists(),
+                "retired slash leftover must be gone: {name}"
+            );
+        }
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        for n in &names {
+            assert!(
+                n.ends_with("-mode.md"),
+                "destination must contain only *-mode.md, found {n}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retired_slash_templates_are_gone() {
+        let entries: Vec<_> = std::fs::read_dir("integrations/prompts")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for name in &entries {
+            assert!(
+                !name.starts_with("beads-") && !name.starts_with("workflow-"),
+                "retired template still present: {name}"
+            );
+        }
         assert!(
-            out.contains("release_file_reservations"),
-            "crew release tool named"
-        );
-        assert!(
-            out.contains("release_file_reservations_by_reason"),
-            "loop hook named so crews know the difference"
-        );
-        // the shell fallback line
-        assert!(
-            out.contains("`flywheel mail send` / `toron reserve release`"),
-            "shell fallback one-liner present"
+            !std::path::Path::new("integrations/beads-body.md.tpl").exists(),
+            "beads-body.md.tpl must be deleted"
         );
     }
 
-    /// bd-oj9o #3 + bd-ucd4: the workflow command set is EXACTLY the popular
-    /// user-facing workflows (debate, plan, plan-review, brainstorm, onboard,
-    /// triage) — the same rule as the builtin set. Behind-the-scenes
-    /// workflows (cron, beads, goal) get no command templates.
-    #[test]
-    fn workflow_command_set_is_the_popular_workflows() {
-        assert_eq!(PROMPT_WORKFLOWS.len(), 7, "exactly seven workflow commands");
-        let names: Vec<&str> = PROMPT_WORKFLOWS.iter().map(|(n, _, _)| *n).collect();
-        assert_eq!(
-            names,
-            [
-                "debate",
-                "plan",
-                "plan-review",
-                "brainstorm",
-                "onboard",
-                "triage",
-                "captain-audit"
-            ]
-        );
-        for (name, target, description) in PROMPT_WORKFLOWS {
-            assert!(
-                builtin_workflows::builtin_workflows().contains_key(*target),
-                "/{name} targets a real built-in workflow ({target})"
-            );
-            assert!(!description.is_empty(), "/{name} has a description");
-        }
-        // triage maps to the triage-deep workflow (the command name is the
-        // user-facing short form).
-        assert_eq!(
-            PROMPT_WORKFLOWS
-                .iter()
-                .find(|(n, _, _)| *n == "triage")
-                .map(|(_, t, _)| *t),
-            Some("triage-deep")
-        );
-        for excluded in ["beads", "goal", "cron"] {
-            assert!(
-                !names.contains(&excluded),
-                "/{excluded} must NOT be a workflow command (behind-the-scenes)"
-            );
-        }
-    }
     /// ADR-0009 addon: `workflow list` is the agent-native selection surface
     /// — every compiled-in row carries a non-empty description, a run form,
     /// and the token flag (select from list like a skill catalog).
@@ -32222,61 +31938,19 @@ mod integration_tests {
         );
     }
 
-    /// bd-oj9o #3: a rendered workflow command = frontmatter (with the
-    /// workflow description) + the focus section + stamps; no beads body.
-    #[test]
-    fn render_workflow_prompt_has_frontmatter_and_focus() {
-        let out =
-            render_workflow_prompt("opencode", "debate", "9.9.9", "2026-08-10T00:00:00Z").unwrap();
-        assert!(out.starts_with("---\n"), "frontmatter");
-        assert!(
-            out.contains("Run the debate workflow"),
-            "description in frontmatter"
-        );
-        assert!(out.contains("# Workflow: debate"));
-        assert!(out.contains("## This command's focus"));
-        assert!(
-            out.contains("flywheel workflow run debate"),
-            "the command body tells the agent how to run the workflow"
-        );
-        assert!(out.contains("flywheel 9.9.9"));
-        assert!(out.contains("2026-08-10T00:00:00Z"));
-        assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
-        assert!(
-            !out.contains("{{BODY}}"),
-            "workflow commands are standalone — no beads body"
-        );
-    }
-
-    /// bd-oj9o #3: every kind renders every workflow command.
-    #[test]
-    fn render_all_workflow_commands_per_kind() {
-        for kind in ["opencode", "pi", "grok", "omp", "pa"] {
-            for (name, _, _) in PROMPT_WORKFLOWS {
-                let out = render_workflow_prompt(kind, name, "0.1.0", "ts").unwrap();
-                assert!(out.starts_with("---"), "{kind}/{name} frontmatter");
-                assert!(
-                    out.contains(&format!("# Workflow: {name}")),
-                    "{kind}/{name} heading"
-                );
-            }
-        }
-    }
-
-    /// bd-oj9o #3: unknown kind or command is an actionable error.
-    #[test]
-    fn render_workflow_rejects_unknown() {
-        assert!(render_workflow_prompt("claude", "debate", "0.1.0", "ts").is_err());
-        assert!(render_workflow_prompt("opencode", "beads", "0.1.0", "ts").is_err());
-    }
-
-    /// ORCHESTRATION_COMMANDS holds operating-mode slash commands, distinct
-    /// from reusable workflow commands; PROMPT_WORKFLOWS stays workflow-only.
+    /// ORCHESTRATION_COMMANDS holds operating-mode slash commands. Catalog
+    /// workflows are `workflow list`, not slash twins.
     #[test]
     fn orchestration_command_set_has_swarm() {
         assert!(
-            !PROMPT_WORKFLOWS.iter().any(|(n, _, _)| *n == "swarm"),
-            "swarm must not be a workflow command"
+            ORCHESTRATION_COMMANDS
+                .iter()
+                .any(|(n, _, _)| *n == "swarm-mode"),
+            "swarm-mode is an orchestration command"
+        );
+        assert!(
+            !ORCHESTRATION_COMMANDS.iter().any(|(n, _, _)| *n == "swarm"),
+            "bare /swarm was renamed to /swarm-mode"
         );
         assert_eq!(
             ORCHESTRATION_COMMANDS.len(),
@@ -32622,18 +32296,6 @@ mod integration_tests {
             !out.contains("{{BODY}}"),
             "orchestration commands are standalone — no beads body"
         );
-    }
-
-    #[test]
-    fn render_contains_lifecycle_and_context_contract() {
-        let out = render_prompt("pi", "execute", "0.1.0", "ts").unwrap();
-        assert!(out.contains("br update bd-<id> --claim"));
-        assert!(out.contains("br sync --flush-only"));
-        assert!(out.contains("CONTEXT_LIMIT"));
-        assert!(out.contains(".flywheel/agent-state/<AGENT_NAME>.json"));
-        assert!(out.contains("bv --robot-triage"));
-        assert!(out.contains("file_reservation_paths"));
-        assert!(out.contains("Never use `bd`"));
     }
 
     #[test]

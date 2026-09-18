@@ -107,6 +107,10 @@ pub(crate) enum WorkflowCmd {
         /// Requires the operator key.
         #[arg(long)]
         allow_worktree: bool,
+        /// Per-role model overlay (same pin as compose `--role-model`).
+        /// Bound from TTY captain briefing; agents pass the flag after remix.
+        #[arg(long = "role-model", value_name = "ROLE=PROVIDER/MODEL")]
+        role_model: Vec<String>,
     },
     /// Scaffold a new workflow YAML in the config dir
     New {

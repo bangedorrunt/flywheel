@@ -30,10 +30,9 @@ each lane verifiable.
    tracker. Waves ONE AT A TIME; epics are gates.
 
 3. LANES: single-writer file ownership from bead SCOPE.
-   one-file-at-a-time = handoff chain; disjoint files
-   = parallel. Max 5 crews: 3 coder + read-only scout + verifier
-   (re-runs VERIFY). guard-the-context-window: bulk to subagents,
-   summaries in main thread.
+   one-file-at-a-time = handoff chain; disjoint files = parallel.
+   Default crew planner+coder+reviewer (cap 5). Remix `--crew role:n`.
+   guard-the-context-window: bulk to subagents, summaries in main thread.
 
 4. SPAWN (escape; un-waved ad-hoc lanes only): `flywheel spawn <proj>
    --profile <role> --count N --escape`; kind/count + --model/

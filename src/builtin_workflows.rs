@@ -1159,10 +1159,13 @@ steps:
         "wave-swarm",
         r#"
 name: wave-swarm
-description: "ADR-0006 D3 + ADR-0009: the compounded wave swarm. GATE scopes br ready to one wave label (grounding-reads docs/learnings/), holds on any open lower wave; DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval."
+description: "ADR-0006 D3 + ADR-0009: the compounded wave swarm. GATE scopes br ready to one wave label (grounding-reads docs/learnings/), holds on any open lower wave; DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
 trigger:
   type: webhook
-crew: auto
+crew:
+  planner: 1
+  coder: 1
+  reviewer: 1
 principles:
   - never-block-on-the-human
   - guard-the-context-window
@@ -1208,7 +1211,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec:
-      profile: "@scout"
+      profile: "@reviewer"
       stage: wave-observe
       task: 'Watch {{inputs.steer_channel}}: escalate, never adjudicate. Escalation target = the orchestrator pin {{inputs.captain_pin}} (flywheel mail send --project <slug> --to {{inputs.captain_pin}}) — DM THAT pin, never guess. Objective: {{inputs.objective}}'
     on_error: continue
@@ -1234,7 +1237,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec:
-      profile: "@housekeeper"
+      profile: "@planner"
       phase: compound
       stage: ce-compound
       task: 'Run the compound gate over {{inputs.wave_label}} for {{inputs.objective}}: the wave''s verified solutions + the OBSERVE escalation lessons — capture what qualifies to docs/learnings/, clean_skip the rest. Report written/updated/clean_skip counts.'
@@ -1248,7 +1251,7 @@ steps:
         "repair-until-verified",
         r#"
 name: repair-until-verified
-description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair → evaluate → VERIFY (3 iterations, continue on verify failure so verify-1 can fail and verify-2 can still run; final verify gates the run). Runs --mode pane only. GS-039 P0-3: explicit crew coder:1 reviewer:1 — never auto-balloon to 3+3; multi-crew expand still requires --allow-crew-expand."
+description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair → evaluate → VERIFY (3 iterations, continue on verify failure so verify-1 can fail and verify-2 can still run; final verify gates the run). Runs --mode pane only. GS-039 P0-3: explicit crew coder:1 reviewer:1 — remix with --crew role:n; --allow-crew-expand is a no-op (cap is crew.max)."
 trigger:
   type: webhook
 crew:
@@ -1376,7 +1379,7 @@ graph:
         "beads-lifecycle",
         r#"
 name: beads-lifecycle
-description: "ADR-0008 §6.7: the beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (ADR/goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer ce-plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement runs ce-execute (or hands off to wave-swarm); verify proves with evidence; signoff suspends for captain-only approval. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
+description: "ADR-0008 §6.7: the beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (ADR/goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer ce-plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement hands off to wave-swarm (new graph) or babysit-bead (existing_bead); verify proves with evidence; signoff suspends for captain-only approval. inputs.from=none|session|adr|bead skips grill→integrate when from=bead or existing_bead is set. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
 trigger:
   type: webhook
 crew: auto
@@ -1387,6 +1390,10 @@ inputs:
   - name: objective
   - name: until
     default: "signoff"
+  - name: from
+    default: "none"
+  - name: existing_bead
+    default: ""
   - name: gate_before_implement
     default: false
   - name: project
@@ -1402,18 +1409,19 @@ graph:
       spec:
         profile: "@planner"
         stage: ce-brainstorm
-        task: 'Grill the objective for {{inputs.objective}} (project {{inputs.project}}): sharpen scope, emit ADR/goal JSON to {{inputs.steer_channel}}. Escalate to {{inputs.captain_pin}} on ambiguity.'
+        task: 'Grill the objective for {{inputs.objective}} (project {{inputs.project}}, from={{inputs.from}}): if from is session or adr, start from that artifact rather than a blank page; sharpen scope, emit ADR/goal JSON to {{inputs.steer_channel}}. Escalate to {{inputs.captain_pin}} on ambiguity.'
       on_error: fail_run
+      guard: 'trigger_from != "bead" && trigger_existing_bead == ""'
     create:
       needs: [grill]
-      guard: 'trigger_until != "grill"'
+      guard: 'trigger_until != "grill" && trigger_from != "bead" && trigger_existing_bead == ""'
       action: call_workflow
       workflow: phase-plan
       inputs: { goal: "{{inputs.objective}}" }
       on_error: fail_run
     review1:
       needs: [create]
-      guard: 'trigger_until != "grill" && trigger_until != "create"'
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_from != "bead" && trigger_existing_bead == ""'
       action: dispatch_job
       assignee: x
       spec:
@@ -1423,7 +1431,7 @@ graph:
       on_error: fail_run
     review2:
       needs: [review1]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1"'
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_from != "bead" && trigger_existing_bead == ""'
       action: dispatch_job
       assignee: x
       spec:
@@ -1433,7 +1441,7 @@ graph:
       on_error: fail_run
     integrate:
       needs: [review2]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2"'
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_from != "bead" && trigger_existing_bead == ""'
       action: dispatch_job
       assignee: x
       spec:
@@ -1449,18 +1457,22 @@ graph:
       guard: 'trigger_gate_before_implement == "true" && trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate"'
       action: request_approval
       message: "Beads lifecycle gate (captain-only) for {{inputs.objective}} [{{inputs.project}}]: approve to let implement proceed, reject to stop here."
+    implement-bead:
+      needs: [gate-before-implement]
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_existing_bead != ""'
+      action: call_workflow
+      workflow: babysit-bead
+      inputs: { bead_id: "{{inputs.existing_bead}}" }
+      on_error: fail_run
     implement:
       needs: [gate-before-implement]
-      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate"'
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@coder"
-        stage: ce-execute
-        task: 'Implement the integrated bead set for {{inputs.objective}} from {{steps.integrate}} (project {{inputs.project}}): claim, VERIFY, commit before close, ledger-legal close. For wave execution hand off to wave-swarm instead of merging it.'
+      guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_existing_bead == ""'
+      action: call_workflow
+      workflow: wave-swarm
+      inputs: { objective: "{{inputs.objective}}", captain_pin: "{{inputs.captain_pin}}", steer_channel: "{{inputs.steer_channel}}" }
       on_error: fail_run
     verify:
-      needs: [implement]
+      needs: [implement, implement-bead]
       guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_until != "implement"'
       action: dispatch_job
       assignee: x
@@ -3810,6 +3822,7 @@ mod tests {
             "review1",
             "review2",
             "integrate",
+            "implement-bead",
             "implement",
             "verify",
             "signoff",
@@ -3867,6 +3880,7 @@ mod tests {
             "review2",
             "integrate",
             "gate-before-implement",
+            "implement-bead",
             "implement",
             "verify",
             "signoff",
@@ -3877,23 +3891,19 @@ mod tests {
         want.sort_unstable();
         assert_eq!(seen, want, "graph is exactly the 8 phases + outer gate");
         for (name, node) in &graph.nodes {
-            if name == "grill" {
-                assert!(
-                    node.guard.is_none(),
-                    "grill always runs; until=grill exits by skipping everything AFTER it"
-                );
-                continue;
-            }
             let guard = node
                 .guard
                 .as_deref()
-                .unwrap_or_else(|| panic!("node {name} must carry an exit guard"));
+                .unwrap_or_else(|| panic!("node {name} must carry a guard"));
             assert!(
                 !guard.contains("{{"),
                 "node {name} guard must be a plain expression, not a template: {guard}"
             );
             assert!(
-                guard.contains("trigger_until") || guard.contains("trigger_gate_before_implement"),
+                guard.contains("trigger_until")
+                    || guard.contains("trigger_gate_before_implement")
+                    || guard.contains("trigger_from")
+                    || guard.contains("trigger_existing_bead"),
                 "node {name} guard must reference engine variables: {guard}"
             );
         }
@@ -3949,6 +3959,11 @@ mod tests {
                 "trigger_gate_before_implement".to_string(),
                 evalexpr::Value::from("false"),
             );
+            vars.insert("trigger_from".to_string(), evalexpr::Value::from("none"));
+            vars.insert(
+                "trigger_existing_bead".to_string(),
+                evalexpr::Value::from(""),
+            );
             let mut ran: Vec<&str> = vec![];
             for p in phases {
                 let node = &graph.nodes[p];
@@ -3986,6 +4001,11 @@ mod tests {
             vars.insert(
                 "trigger_gate_before_implement".to_string(),
                 evalexpr::Value::from(gate_in),
+            );
+            vars.insert("trigger_from".to_string(), evalexpr::Value::from("none"));
+            vars.insert(
+                "trigger_existing_bead".to_string(),
+                evalexpr::Value::from(""),
             );
             let outcome = evaluate_guard_default(Some(g), &vars).await;
             assert_eq!(
