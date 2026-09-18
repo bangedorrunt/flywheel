@@ -36,7 +36,12 @@ pub const INDEX_TTL_SECS: u64 = 60;
 /// agent key is a pin problem and must not paint the whole daemon.
 fn inbox_fail_kind(stderr: &str) -> &'static str {
     let s = stderr.to_ascii_lowercase();
-    if s.contains("no local key") || s.contains("register first") {
+    if s.contains("no local key")
+        || s.contains("register first")
+        || s.contains("create_agent_identity")
+        || s.contains("unknown agent")
+        || s.contains("not registered")
+    {
         "inbox_pin_miss"
     } else {
         "inbox_error"
@@ -1997,6 +2002,10 @@ mod tests {
             super::inbox_fail_kind(
                 "toron: error: tool fetch_inbox returned an error result: agent Buffy has no local key in project . (create_agent_identity or register first)"
             ),
+            "inbox_pin_miss"
+        );
+        assert_eq!(
+            super::inbox_fail_kind("unknown agent QuietHeron"),
             "inbox_pin_miss"
         );
         assert_eq!(
