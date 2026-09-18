@@ -49,9 +49,10 @@ Mail wake: idle agents with urgent mail get one MAIL WAKE per message id.
 
 Freshness 15 minutes. Reader threshold `context_pct >= 80`. Writer just reports the number. Verdict = `CONTEXT_LIMIT` marker OR (fresh AND >= 80).
 
-## Beads (slash commands, not a subagent)
+## Beads (br, not a slash family)
 
-`flywheel integration {opencode,pi,grok,omp}` regenerates `prompts/beads-*.md`.
+`br` owns the bead lifecycle. `flywheel integration {opencode,pi,grok,omp,pa}`
+regenerates `*-mode.md` only and deletes leftover `/beads-*` slash files.
 
 ```bash
 br ready --json

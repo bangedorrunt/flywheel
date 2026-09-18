@@ -13,8 +13,10 @@ use crate::decide::{self, Decision};
 
 pub const SCHEMA: &str = "flywheel-briefing.v1";
 
-/// wave-swarm unique inventory when the caller has not yet inferred roles.
-pub const WAVE_SWARM_ROLES: &[&str] = &["coder", "reviewer", "planner", "scout", "housekeeper"];
+/// Default unique inventory when the caller has not yet inferred roles.
+/// Scout/housekeeper are optional (observe/compound already `continue`);
+/// remix via `--crew role:n,role:n`.
+pub const WAVE_SWARM_ROLES: &[&str] = &["planner", "coder", "reviewer"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct World {
@@ -215,8 +217,25 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
             },
             Question {
                 id: "crew".into(),
-                options: vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()],
+                options: vec![
+                    "1".into(),
+                    "2".into(),
+                    "3".into(),
+                    "4".into(),
+                    "5".into(),
+                    "planner:1,coder:1,reviewer:1".into(),
+                ],
                 default: n.to_string(),
+            },
+            Question {
+                id: "model".into(),
+                options: vec![
+                    "default".into(),
+                    "@cheap".into(),
+                    "@standard".into(),
+                    "@premium".into(),
+                ],
+                default: "default".into(),
             },
         ],
     }
@@ -424,8 +443,30 @@ mod tests {
     fn empty_unique_on_swarm_defaults_wave_roles() {
         let b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5);
         assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.crew_total, 5);
+        assert_eq!(b.proposal.crew_total, 3);
         assert!(b.proposal.argv.iter().any(|a| a == "--crew"));
+        assert_eq!(
+            b.proposal.crew.keys().cloned().collect::<Vec<_>>(),
+            vec!["coder", "planner", "reviewer"]
+        );
+    }
+
+    #[test]
+    fn diagnose_with_leftover_ready_count_is_forensics_not_loop() {
+        let world = World {
+            project: "flywheel".into(),
+            ready_beads: 2,
+            dispatcher: "absent".into(),
+            ..World::default()
+        };
+        let b = assemble(
+            "diagnose flywheel x toron x beads friction: workflow use",
+            &world,
+            &[],
+            5,
+        );
+        assert_eq!(b.proposal.workflow, "forensics");
+        assert_eq!(b.proposal.topology, "open");
     }
 
     // ADR-0032 Spec 9 (bd-himk) RED: briefing reads decide's table — the

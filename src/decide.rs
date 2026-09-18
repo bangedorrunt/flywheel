@@ -246,7 +246,14 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         primitive: "forensics",
-        matchers: &["forensic", "leak", "idle cpu", "spindump"],
+        matchers: &[
+            "forensic",
+            "diagnose",
+            "diagnosis",
+            "leak",
+            "idle cpu",
+            "spindump",
+        ],
         topology: "open",
         gate: RouteGate::NoImplement,
         argv: RouteArgv::WorkflowRun { mode: "headless" },
@@ -439,6 +446,16 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "repair-until-verified — compose --parts repair-until-verified --run",
     },
     RouteEntry {
+        primitive: "beads-lifecycle",
+        matchers: &["beads-lifecycle", "beads lifecycle"],
+        topology: "swarm",
+        gate: RouteGate::Always,
+        argv: RouteArgv::ComposeToken {
+            token: "beads-lifecycle",
+        },
+        reason: "beads-lifecycle — compose --parts beads-lifecycle --run",
+    },
+    RouteEntry {
         primitive: "debate",
         matchers: &[
             "argue both sides",
@@ -505,7 +522,9 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         primitive: "loop-work",
-        matchers: &["work", "loop", "beads"],
+        // Phrase needles only. Bare "work" matches "workflow"; bare "beads"
+        // matches "beads-lifecycle" and any diagnosis that names the tracker.
+        matchers: &["work the ready beads", "ready beads", "loop-mode", "loop"],
         topology: "loop",
         gate: RouteGate::ReadyBeadsWork,
         argv: RouteArgv::LoopWork,
@@ -1190,10 +1209,17 @@ mod tests {
         assert_eq!(d.primitive, "steer");
     }
 
-    // Row 2 — ready beads + empty|work|loop|beads → loop-work.
+    // Row 2 — ready beads + empty|work-the-ready|loop → loop-work.
+    // Bare "beads" / "workflow" must NOT trip this (substring hijack).
     #[test]
     fn row2_ready_beads_is_loop_work() {
-        for t in ["", "work the ready beads", "loop", "beads"] {
+        for t in [
+            "",
+            "work the ready beads",
+            "loop",
+            "loop-mode",
+            "ready beads",
+        ] {
             let d = decide(t, &with_beads(3));
             assert_eq!(d.primitive, "loop-work", "target: {t:?}");
             assert!(
@@ -1215,6 +1241,35 @@ mod tests {
     fn row2_no_ready_beads_is_not_loop_work() {
         let d = decide("work", &snap());
         assert_ne!(d.primitive, "loop-work");
+    }
+
+    #[test]
+    fn leftover_ready_beads_do_not_steal_diagnose() {
+        let d = decide(
+            "diagnose flywheel x toron x beads friction: mid-session workflow use",
+            &with_beads(3),
+        );
+        assert_eq!(d.primitive, "forensics", "argv: {:?}", d.argv);
+        assert_eq!(d.topology, "open");
+    }
+
+    #[test]
+    fn leftover_ready_beads_do_not_steal_beads_lifecycle_token() {
+        let d = decide("beads-lifecycle for an existing open bead", &with_beads(3));
+        assert_eq!(d.primitive, "beads-lifecycle", "argv: {:?}", d.argv);
+        assert!(
+            d.argv
+                .windows(2)
+                .any(|w| w == ["--parts", "beads-lifecycle"]),
+            "argv: {:?}",
+            d.argv
+        );
+    }
+
+    #[test]
+    fn workflow_substring_is_not_loop_work() {
+        let d = decide("use a workflow stage in this pane", &with_beads(4));
+        assert_ne!(d.primitive, "loop-work", "argv: {:?}", d.argv);
     }
 
     // Row 3 — implement/fix + beads|tracker|gate → steer.
@@ -1918,6 +1973,10 @@ mod tests {
             decide_trigger_for("repair-until-verified"),
             Some("repair-until-verified")
         );
+        assert_eq!(
+            decide_trigger_for("beads-lifecycle"),
+            Some("beads-lifecycle")
+        );
     }
 
     // Existing rows still win where they should (regression anchors).
@@ -2328,6 +2387,7 @@ mod decide_router_tests {
             ("onboard", "onboard"),
             ("wave-swarm", "wave-swarm"),
             ("repair-until-verified", "repair-until-verified"),
+            ("beads-lifecycle", "beads-lifecycle"),
             ("ce-compound", "compound the learning"),
             ("ce-sweep", "sweep the learnings"),
         ];

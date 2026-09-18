@@ -2051,7 +2051,7 @@ steps:
         );
         assert!(
             matches!(&wf.steps[3].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@scout")
+                if spec.profile.as_deref() == Some("@reviewer")
                     && spec.stage.as_deref() == Some("wave-observe")),
             "OBSERVE fourth"
         );
@@ -2069,10 +2069,10 @@ steps:
         );
         assert!(
             matches!(&wf.steps[6].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@housekeeper")
+                if spec.profile.as_deref() == Some("@planner")
                     && spec.stage.as_deref() == Some("ce-compound")
                     && spec.phase.as_deref() == Some("compound")),
-            "COMPOUND seventh (ADR-0009: phase compound, housekeeper)"
+            "COMPOUND seventh (ADR-0009: phase compound, planner)"
         );
         assert!(
             matches!(&wf.steps[7].action, Action::RequestApproval { message }
@@ -2128,8 +2128,8 @@ steps:
             .expect("graph-form token expands to graph");
         assert_eq!(
             graph.nodes.len(),
-            9,
-            "8 phases + outer implement gate (guards ride ON the nodes): {:?}",
+            10,
+            "8 phases + outer implement gate + existing-bead implement (guards ride ON the nodes): {:?}",
             graph.nodes.keys().collect::<Vec<_>>()
         );
         assert!(
@@ -2257,8 +2257,8 @@ steps:
         assert_eq!(wf.steps.len(), 1, "the plain part lands in steps");
         assert_eq!(
             wf.graph.as_ref().expect("graph").nodes.len(),
-            9,
-            "the token lands in the graph (8 phases + outer gate)"
+            10,
+            "the token lands in the graph (authoring + existing-bead implement + outer gate)"
         );
         let err = compose_workflow_with(
             "bad",

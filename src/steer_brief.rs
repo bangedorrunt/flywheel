@@ -67,8 +67,12 @@ pub struct BriefingContext {
 /// The operator's verdict plus the confirmed plan (post-edit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BriefingOutcome {
-    /// proceed — `budget` is the confirmed total pane count (ADR-0011 D2)
-    Go { budget: u32 },
+    /// proceed — `budget` is the confirmed total pane count (ADR-0011 D2);
+    /// `role_models` is role → chosen registry id (applied via `--role-model`).
+    Go {
+        budget: u32,
+        role_models: BTreeMap<String, String>,
+    },
     /// abort before any dispatch
     Abort,
 }
@@ -139,6 +143,7 @@ pub fn run_briefing(
         accent_lav("[2/4]"),
         ok("per-role models (Enter keeps the default):")
     )?;
+    let mut role_models = BTreeMap::new();
     for m in &ctx.models {
         writeln!(
             out,
@@ -173,10 +178,15 @@ pub fn run_briefing(
         write!(out, "  {} > ", dim("select"))?;
         out.flush()?;
         let line = read_line(input)?;
+        let mut chosen = m.default_model.clone();
         if let Ok(i) = line.trim().parse::<usize>()
             && let Some((id, _, _)) = m.alternatives.get(i)
         {
+            chosen = id.clone();
             writeln!(out, "  {} -> {}", dim(&m.role), accent(id))?;
+        }
+        if !chosen.is_empty() {
+            role_models.insert(m.role.clone(), chosen);
         }
     }
 
@@ -222,7 +232,10 @@ pub fn run_briefing(
         }
         _ => {
             writeln!(out, "{}", ok("dispatching."))?;
-            Ok(BriefingOutcome::Go { budget })
+            Ok(BriefingOutcome::Go {
+                budget,
+                role_models,
+            })
         }
     }
 }
@@ -281,11 +294,21 @@ mod tests {
         (outcome, String::from_utf8(out).expect("utf8"))
     }
 
+    fn go(budget: u32, models: &[(&str, &str)]) -> BriefingOutcome {
+        BriefingOutcome::Go {
+            budget,
+            role_models: models
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
     #[test]
     fn blank_answers_keep_defaults_and_go() {
         // N prompt + 1 model prompt + go/no-go
         let (outcome, rendered) = drive(&["", "", ""]);
-        assert_eq!(outcome, BriefingOutcome::Go { budget: 2 });
+        assert_eq!(outcome, go(2, &[("coder", "deepseek-v4-flash")]));
         // The golden sections all render.
         assert!(rendered.contains("== captain briefing: steer \"goal\""));
         assert!(rendered.contains("crew budget N"));
@@ -310,7 +333,7 @@ mod tests {
     #[test]
     fn edits_apply_budget() {
         let (outcome, rendered) = drive(&["4", "1", "y"]);
-        assert_eq!(outcome, BriefingOutcome::Go { budget: 4 });
+        assert_eq!(outcome, go(4, &[("coder", "zai/glm-5.2")]));
         assert!(rendered.contains("N -> 4"), "{rendered}");
         assert!(rendered.contains("coder -> zai/glm-5.2"), "{rendered}");
     }
@@ -323,7 +346,7 @@ mod tests {
         let outcome = run_briefing(&ctx(), &mut inp, &mut out).expect("eof-safe");
         assert_eq!(
             outcome,
-            BriefingOutcome::Go { budget: 2 },
+            go(2, &[("coder", "deepseek-v4-flash")]),
             "EOF counts as Enter/yes"
         );
     }

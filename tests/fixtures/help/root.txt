@@ -55,7 +55,7 @@ Commands:
   guards           Active policy guards (deny patterns)
   policy           Destructive-command policy management
   deps             Environment + toolchain health check
-  integration      Generate the beads-agent integration prompts for an agent kind. Writes the beads files (beads-{triage,execute,review,commit,create}.md), the workflow slash commands (workflow-{...}.md), and the orchestration slash commands (open.md, swarm.md, loop.md, peer-aware.md) into the tool's prompts dir. Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted); omit to list kinds. Re-run after a flywheel rebuild to refresh the generated prompts
+  integration      Generate orchestration slash commands for an agent kind. Writes {open,swarm,loop,peer-aware}-mode.md into the tool's prompts dir and removes leftover /beads-* and /workflow-* files (catalog + br own those verbs). Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted); omit to list kinds. Re-run after a flywheel rebuild to refresh
   config           Configuration management
   backend          Backend discovery + selection (ADR-0002 pluggable backends)
   profile          Agent profiles (ADR-0005 Spec 1/1b) — catalog + spawn

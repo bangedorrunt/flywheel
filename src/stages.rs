@@ -1090,8 +1090,8 @@ mod tests {
 
     /// bd-close-ceremony-gate-sha-68ms (GS-028 B13-B15+B3): the taught close
     /// contract is gate → commit → sha-carrying close, and the claim assignee
-    /// is a herdr slug, never a pin. Both the wave-dispatch stage and the
-    /// /beads-commit template carry it — ceremony drift fails the build.
+    /// is a herdr slug, never a pin. wave-dispatch is the remaining taught
+    /// surface after /beads-commit was deleted.
     #[test]
     fn close_ceremony_contract_names_gate_sha_and_herdr_assignee() {
         let lib = StageLibrary::compiled_in();
@@ -1113,21 +1113,11 @@ mod tests {
             !dispatch.contains("--assignee <pin>"),
             "wave-dispatch must not teach pin assignees (br takes a herdr slug)"
         );
-
-        let tpl = include_str!("../integrations/prompts/beads-commit.md.tpl");
-        for needle in [
-            "gate report",
-            "--commit-sha",
-            "Commit BEFORE close",
-            "VERIFY tail",
-        ] {
-            assert!(tpl.contains(needle), "/beads-commit must teach {needle:?}");
-        }
-        let commit_pos = tpl.find("Commit BEFORE close").expect("order anchor");
-        let close_pos = tpl.find("br close").expect("close anchor");
+        let commit_pos = dispatch.find("commit BEFORE close").expect("order anchor");
+        let close_pos = dispatch.find("br close").expect("close anchor");
         assert!(
             commit_pos < close_pos,
-            "/beads-commit must order commit before close"
+            "wave-dispatch must order commit before close"
         );
     }
 

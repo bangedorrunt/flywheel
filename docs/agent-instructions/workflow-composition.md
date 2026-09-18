@@ -256,10 +256,9 @@ into `~/.config/opencode/commands/` — plural):
 - `/loop-mode` — start/inspect the durable solo loop
 - `/open-mode` — current-pane work, no lifecycle
 - `/peer-aware-mode` — attach a running pane to the doorbell
-- `/workflow-*` — brainstorm, plan, plan-review, debate, triage, onboard,
-  captain-audit (slash short-forms; the plan/plan-review/brainstorm ones
-  target the renamed `ce-*` builtins — ADR-0009)
-- `/beads-*` — triage, execute, review, commit, create
+- Catalog workflows (`workflow list --brief`) and `br` own bead/workflow verbs;
+  `/workflow-*` and `/beads-*` slash files are gone (`flywheel integration`
+  deletes leftovers)
 
 Mail steering (any harness): crews ack, read, and reply through the toron
 mailbox; replies must land in the thread before you claim a response
