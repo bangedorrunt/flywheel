@@ -784,9 +784,15 @@ enum Commands {
         commit: bool,
         #[arg(long)]
         yes: bool,
-        /// total pane budget (ADR-0011 D2)
+        /// remix topology: swarm|loop|open|join (binds the topology question)
         #[arg(long)]
-        crew: Option<u32>,
+        topology: Option<String>,
+        /// pane budget N or role:n,role:n (binds the crew question)
+        #[arg(long)]
+        crew: Option<String>,
+        /// model slot: default|@cheap|@standard|@premium (binds the model question)
+        #[arg(long)]
+        model: Option<String>,
     },
     /// GS-048: mid-session reclassify — enters Elm plane via
     /// `Msg::MaterialContext` → `Cmd::Reclassify` → `Msg::DecisionReady`
@@ -803,7 +809,11 @@ enum Commands {
         #[arg(long)]
         yes: bool,
         #[arg(long)]
-        crew: Option<u32>,
+        topology: Option<String>,
+        #[arg(long)]
+        crew: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
     },
     /// ADR-0011 D5/D6: arrive on a project — helm, join-loud, doorbell, FCFS captain.
     Arrive {
@@ -2565,7 +2575,9 @@ fn main() {
             json,
             commit,
             yes,
+            topology,
             crew,
+            model,
         }) => cmd_briefing(
             &cfg,
             objective,
@@ -2573,7 +2585,9 @@ fn main() {
             *json,
             *commit,
             *yes,
-            *crew,
+            topology.as_deref(),
+            crew.as_deref(),
+            model.as_deref(),
         ),
         // GS-048: Elm-plane reclassify (MaterialContext → sticky DecisionReady)
         // plus briefing proposal print (same live Snapshot as CLI decide).
@@ -2583,7 +2597,9 @@ fn main() {
             json,
             commit,
             yes,
+            topology,
             crew,
+            model,
         }) => cmd_reclassify(
             &cfg,
             objective,
@@ -2591,7 +2607,9 @@ fn main() {
             *json,
             *commit,
             *yes,
-            *crew,
+            topology.as_deref(),
+            crew.as_deref(),
+            model.as_deref(),
         ),
         Some(Commands::Arrive {
             project,
@@ -5900,13 +5918,16 @@ mod bd2o1v_reset_tests {
             "\nfn cmd_briefing(",
             "\nfn warn_uncommitted_decision_docs(",
         );
+        let bind = body
+            .find("apply_answers")
+            .expect("questions bind into argv");
         let gate = body.find("spawns_crew").expect("gate predicate");
         let refusal = body.find("crew-confirm gate").expect("non-TTY refusal");
         let tty_ask = body.find("spawn this crew?").expect("TTY inline ask");
         let exec = body
             .find("briefing --commit {}")
             .expect("argv exec must exist after the gate");
-        assert!(gate < exec && refusal < exec && tty_ask < exec);
+        assert!(bind < gate && gate < exec && refusal < exec && tty_ask < exec);
         assert!(
             body.contains(r#""open" | "join" | "none""#),
             "zero-pane topologies bypass the gate"
@@ -12474,6 +12495,7 @@ pub(crate) fn live_decide_snapshot(cfg: &Config, project: &str) -> decide::Snaps
 /// (`Msg::MaterialContext` → expand → `DecisionReady` sticky announce), then
 /// prints the briefing proposal with the same live Snapshot. Does **not**
 /// bypass sticky-open via a bare `cmd_briefing` alias.
+#[allow(clippy::too_many_arguments)] // CLI-flag mirror of Briefing/Reclassify
 fn cmd_reclassify(
     cfg: &Config,
     objective: &str,
@@ -12481,32 +12503,34 @@ fn cmd_reclassify(
     json: bool,
     commit: bool,
     yes: bool,
-    crew: Option<u32>,
+    topology: Option<&str>,
+    crew: Option<&str>,
+    model: Option<&str>,
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     let project = project_door(project, "toron", "reclassify")?;
-    // Seed model with sticky topology from prior DecisionReady (if any).
-    let mut model = workspace::WorkspaceModel::default();
+    // Seed workspace with sticky topology from prior DecisionReady (if any).
+    let mut ws_model = workspace::WorkspaceModel::default();
     if let Some(topo) = state::load_session_topology(project) {
-        model.session_topology = Some(topo);
+        ws_model.session_topology = Some(topo);
     }
     // Seed captain role so DecisionReady can Prompt announce.
     if let Some(pin) = state::load_captain_alias(project) {
-        model.roles.insert("captain".into(), pin.clone());
-        model.presence.insert(
+        ws_model.roles.insert("captain".into(), pin.clone());
+        ws_model.presence.insert(
             pin.clone(),
             workspace::Presence::Idle {
                 source: "reclassify".into(),
             },
         );
-        model.doorbell.index.insert_pin(pin, None);
+        ws_model.doorbell.index.insert_pin(pin, None);
     }
     let reason = workspace::material_context_reason(objective).unwrap_or("operator-goal-change");
     let msg = workspace::material_context_msg(objective, reason);
-    let (next, cmds) = workspace::tick(&model, &msg);
-    model = next;
+    let (next, cmds) = workspace::tick(&ws_model, &msg);
+    ws_model = next;
     let snap = live_decide_snapshot(cfg, project);
-    let expanded = workspace::expand_reclassify_cmds(&mut model, cmds, project, &|goal| {
+    let expanded = workspace::expand_reclassify_cmds(&mut ws_model, cmds, project, &|goal| {
         let d = decide::decide(goal, &snap);
         (
             d.primitive.to_string(),
@@ -12515,7 +12539,7 @@ fn cmd_reclassify(
             d.reason.clone(),
         )
     });
-    if let Some(topo) = model.session_topology.as_deref() {
+    if let Some(topo) = ws_model.session_topology.as_deref() {
         let _ = state::save_session_topology(project, topo);
     }
     // Surface announce lines for the CLI user (Elm plane result).
@@ -12533,11 +12557,22 @@ fn cmd_reclassify(
     }
     // Briefing proposal print / optional commit — same leaf as before, but
     // sticky already applied above on the Elm plane.
-    cmd_briefing(cfg, objective, Some(project), json, commit, yes, crew)
+    cmd_briefing(
+        cfg,
+        objective,
+        Some(project),
+        json,
+        commit,
+        yes,
+        topology,
+        crew,
+        model,
+    )
 }
 
 /// ADR-0010 D10 (bd-67qg): the one session-start drain over the snapshot.
 /// Always the three sections, even on an empty queue.
+#[allow(clippy::too_many_arguments)] // CLI-flag mirror of Briefing
 fn cmd_briefing(
     cfg: &Config,
     objective: &str,
@@ -12545,7 +12580,9 @@ fn cmd_briefing(
     json: bool,
     commit: bool,
     yes: bool,
-    crew: Option<u32>,
+    topology: Option<&str>,
+    crew: Option<&str>,
+    model: Option<&str>,
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     let project = project_door(project, "toron", "briefing")?;
@@ -12583,15 +12620,6 @@ fn cmd_briefing(
     }
     let unique: Vec<String> = Vec::new();
     let mut b = briefing::assemble(objective, &world, &unique, cfg.crew_max());
-    if let Some(n) = crew {
-        if let Some(q) = b.questions.iter_mut().find(|q| q.id == "crew") {
-            q.default = n.to_string();
-        }
-        if !b.proposal.argv.iter().any(|a| a == "--crew") && b.proposal.topology != "join" {
-            b.proposal.argv.push("--crew".into());
-            b.proposal.argv.push(n.to_string());
-        }
-    }
     // bd-2o1v P0-5 (a): name the proposed row's profile affinity (read from
     // the workflow's steps, never re-declared) so the crew-confirm gate
     // above and the captain see the same dispatch relation.
@@ -12609,6 +12637,9 @@ fn cmd_briefing(
         );
         briefing::align_with_session_topology(&mut b, &final_topo, held);
     }
+    // Explicit remix flags bind the printed questions into argv (bd-g3li).
+    // `--topology` is an AUTHORITATIVE request — sticky-open may flip.
+    briefing::apply_answers(&mut b, topology, crew, model).map_err(|e| anyhow!(e))?;
     if json {
         print_json(&serde_json::to_value(&b)?);
     } else {
@@ -12637,6 +12668,39 @@ fn cmd_briefing(
     // gate witnesses doc-only changes. Name the files loudly before dispatch.
     warn_uncommitted_decision_docs(cfg, project);
     if commit || yes {
+        if commit && !yes && std::io::stdin().is_terminal() {
+            let mut topo = topology.map(str::to_string);
+            let mut cr = crew.map(str::to_string);
+            let mut mo = model.map(str::to_string);
+            for q in &b.questions {
+                let filled = match q.id.as_str() {
+                    "topology" => topo.is_some(),
+                    "crew" => cr.is_some(),
+                    "model" => mo.is_some(),
+                    _ => true,
+                };
+                if filled {
+                    continue;
+                }
+                eprint!("{} [{}]: ", q.id, q.default);
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                let ans = line.trim();
+                let chosen = if ans.is_empty() {
+                    q.default.clone()
+                } else {
+                    ans.to_string()
+                };
+                match q.id.as_str() {
+                    "topology" => topo = Some(chosen),
+                    "crew" => cr = Some(chosen),
+                    "model" => mo = Some(chosen),
+                    _ => {}
+                }
+            }
+            briefing::apply_answers(&mut b, topo.as_deref(), cr.as_deref(), mo.as_deref())
+                .map_err(|e| anyhow!(e))?;
+        }
         let argv = b.proposal.argv.clone();
         // Crew-confirm gate (bd-2o1v, captain contract 2026-09-13): a crew
         // plan is a PROPOSAL. Spawn-class topologies may not auto-commit
@@ -12926,7 +12990,17 @@ fn cmd_arrive(
     // before a crew is dispatched off stale git history.
     warn_uncommitted_decision_docs(cfg, project);
     if let Some(obj) = objective {
-        cmd_briefing(cfg, obj, Some(project), false, false, false, None)?;
+        cmd_briefing(
+            cfg,
+            obj,
+            Some(project),
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+        )?;
     }
     Ok(())
 }

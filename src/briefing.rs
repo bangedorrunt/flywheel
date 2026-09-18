@@ -347,6 +347,168 @@ fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
     }
 }
 
+/// Operator remix of the printed questions. Explicit topology is an
+/// AUTHORITATIVE request (sticky-open may flip). `crew` is `N` or `role:n`.
+/// `model` is `default` or an `@slot`. Unknown values fail loud.
+pub fn apply_answers(
+    b: &mut Briefing,
+    topology: Option<&str>,
+    crew: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), String> {
+    if let Some(t) = topology {
+        let t = t.trim();
+        if !matches!(t, "swarm" | "loop" | "open" | "join") {
+            return Err(format!(
+                "briefing topology {t:?} is not swarm|loop|open|join"
+            ));
+        }
+        if t != b.proposal.topology {
+            rebuild_argv_for_topology(b, t);
+        }
+        if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
+            q.default = t.to_string();
+        }
+    }
+    if let Some(c) = crew {
+        let c = c.trim();
+        if c.is_empty() {
+            return Err("briefing crew must be N or role:n,role:n".into());
+        }
+        if !b.proposal.argv.is_empty() && b.proposal.topology != "join" {
+            splice_flag(&mut b.proposal.argv, "--crew", c);
+        }
+        if let Some(q) = b.questions.iter_mut().find(|q| q.id == "crew") {
+            q.default = c.to_string();
+        }
+        if let Ok(n) = c.parse::<u32>() {
+            b.proposal.crew_total = n;
+        }
+    }
+    if let Some(m) = model {
+        let m = m.trim();
+        if !matches!(m, "default" | "@cheap" | "@standard" | "@premium") {
+            return Err(format!(
+                "briefing model {m:?} is not default|@cheap|@standard|@premium"
+            ));
+        }
+        if m != "default" && !b.proposal.argv.is_empty() && b.proposal.topology == "swarm" {
+            let roles: Vec<String> = if b.proposal.crew.is_empty() {
+                WAVE_SWARM_ROLES.iter().map(|s| (*s).to_string()).collect()
+            } else {
+                b.proposal.crew.keys().cloned().collect()
+            };
+            let specs: Vec<String> = roles.iter().map(|r| format!("{r}={m}")).collect();
+            splice_role_models(&mut b.proposal.argv, &specs);
+        }
+        if let Some(q) = b.questions.iter_mut().find(|q| q.id == "model") {
+            q.default = m.to_string();
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
+    b.proposal.topology = topology.to_string();
+    match topology {
+        "open" => {
+            b.proposal.workflow = "none".into();
+            b.proposal.token = None;
+            b.proposal.argv.clear();
+            b.proposal.crew.clear();
+            b.proposal.crew_total = 0;
+            b.proposal.add.clear();
+            b.proposal.remove.clear();
+            b.proposal.why = "none: raw (operator topology=open)".into();
+        }
+        "loop" => {
+            b.proposal.workflow = "loop-work".into();
+            b.proposal.token = None;
+            b.proposal.argv = vec![
+                "flywheel".into(),
+                "loop-mode".into(),
+                "run".into(),
+                b.world.project.clone(),
+                "--work".into(),
+            ];
+            b.proposal.crew.clear();
+            b.proposal.crew_total = 0;
+            b.proposal.why = "loop-work (operator topology=loop)".into();
+        }
+        "join" => {
+            b.proposal.workflow = "join".into();
+            b.proposal.token = None;
+            let mut argv = vec!["flywheel".into(), "arrive".into(), b.world.project.clone()];
+            if let Some(id) = &b.world.coalition_id {
+                argv.extend(["--coalition".into(), id.clone()]);
+            }
+            b.proposal.argv = argv;
+            b.proposal.why = "join (operator topology=join)".into();
+        }
+        "swarm" => {
+            b.proposal.workflow = "wave-swarm".into();
+            b.proposal.token = Some("wave-swarm".into());
+            let n = if b.proposal.crew_total > 0 {
+                b.proposal.crew_total
+            } else {
+                WAVE_SWARM_ROLES.len() as u32
+            };
+            b.proposal.crew_total = n;
+            if b.proposal.crew.is_empty() {
+                for role in WAVE_SWARM_ROLES {
+                    b.proposal.crew.insert((*role).into(), 1);
+                }
+            }
+            b.proposal.argv = vec![
+                "flywheel".into(),
+                "workflow".into(),
+                "compose".into(),
+                b.objective.clone(),
+                "--parts".into(),
+                "wave-swarm".into(),
+                "--run".into(),
+                "--project".into(),
+                b.world.project.clone(),
+                "--crew".into(),
+                n.to_string(),
+            ];
+            b.proposal.why = "wave-swarm (operator topology=swarm)".into();
+        }
+        _ => {}
+    }
+}
+
+fn splice_flag(argv: &mut Vec<String>, flag: &str, value: &str) {
+    if let Some(i) = argv.iter().position(|a| a == flag) {
+        if i + 1 < argv.len() && !argv[i + 1].starts_with('-') {
+            argv[i + 1] = value.to_string();
+        } else {
+            argv.insert(i + 1, value.to_string());
+        }
+    } else {
+        argv.push(flag.to_string());
+        argv.push(value.to_string());
+    }
+}
+
+fn splice_role_models(argv: &mut Vec<String>, specs: &[String]) {
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--role-model" {
+            argv.remove(i);
+            if i < argv.len() {
+                argv.remove(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    for spec in specs {
+        argv.push("--role-model".into());
+        argv.push(spec.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +902,81 @@ mod tests {
             !b.proposal.why.contains("wave-swarm"),
             "why must not name invent wave-swarm: {}",
             b.proposal.why
+        );
+    }
+
+    #[test]
+    fn apply_answers_topology_swarm_rebuilds_compose_argv() {
+        let mut b = assemble("diagnose the mailbox", &world_empty(), &[], 5);
+        assert_eq!(b.proposal.topology, "open");
+        apply_answers(&mut b, Some("swarm"), Some("3"), Some("@cheap")).unwrap();
+        assert_eq!(b.proposal.topology, "swarm");
+        assert_eq!(b.proposal.workflow, "wave-swarm");
+        assert!(
+            b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["--parts", "wave-swarm"]),
+            "{:?}",
+            b.proposal.argv
+        );
+        assert!(
+            b.proposal.argv.windows(2).any(|w| w == ["--crew", "3"]),
+            "{:?}",
+            b.proposal.argv
+        );
+        assert!(
+            b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["--role-model", "coder=@cheap"]),
+            "{:?}",
+            b.proposal.argv
+        );
+    }
+
+    #[test]
+    fn apply_answers_topology_open_clears_swarm_argv() {
+        let mut b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5);
+        apply_answers(&mut b, Some("open"), None, None).unwrap();
+        assert_eq!(b.proposal.topology, "open");
+        assert_eq!(b.proposal.workflow, "none");
+        assert!(b.proposal.argv.is_empty(), "{:?}", b.proposal.argv);
+    }
+
+    #[test]
+    fn apply_answers_rejects_unknown() {
+        let mut b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5);
+        assert!(apply_answers(&mut b, Some("banana"), None, None).is_err());
+        assert!(apply_answers(&mut b, None, None, Some("gpt-x")).is_err());
+    }
+
+    #[test]
+    fn apply_answers_same_topology_keeps_beads_lifecycle_token() {
+        let mut b = assemble(
+            "beads-lifecycle for an existing open bead",
+            &world_empty(),
+            &[],
+            5,
+        );
+        assert_eq!(b.proposal.workflow, "beads-lifecycle");
+        apply_answers(&mut b, Some("swarm"), Some("planner:1,coder:1"), None).unwrap();
+        assert_eq!(b.proposal.workflow, "beads-lifecycle");
+        assert!(
+            b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["--parts", "beads-lifecycle"]),
+            "{:?}",
+            b.proposal.argv
+        );
+        assert!(
+            b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["--crew", "planner:1,coder:1"]),
+            "{:?}",
+            b.proposal.argv
         );
     }
 }
