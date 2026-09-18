@@ -100,6 +100,75 @@ pub(crate) fn cmd_toron(cfg: &Config, cmd: &ToronCmd) -> Result<()> {
     {
         return crate::toron_setup_mcp(url.as_deref(), agents, *boot_port, *dry_run, *flywheel);
     }
+    // bd-toron-embed-blank-project-doors-rmg9: a blank project spelling used
+    // to reach the embed — `agents --project ""` answered `[]` (a silently
+    // authoritative-looking empty roster) and send/inbox garbled their
+    // actionable errors with the blank slug ("project  first"). Fail loud
+    // with the house message before any runtime boots.
+    match cmd {
+        ToronCmd::Agents { project } => {
+            crate::check_project_spelling(project, "toron agents")?;
+        }
+        ToronCmd::Mail { cmd } => match cmd {
+            ToronMailCmd::Send { project, .. } | ToronMailCmd::Inbox { project, .. } => {
+                crate::check_project_spelling(project, "toron mail")?;
+            }
+        },
+        ToronCmd::Status | ToronCmd::StartMcp { .. } | ToronCmd::SetupMcp { .. } => {}
+    }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(crate::toron_embed::dispatch(cfg, cmd))
+}
+
+#[cfg(test)]
+mod blank_project_tests {
+    use super::*;
+
+    /// bd-toron-embed-blank-project-doors-rmg9: every project-bearing embed
+    /// door fails loud on a blank spelling BEFORE the embed runtime boots
+    /// (no tokio runtime, no store touch — Config::default() suffices),
+    /// with the actionable house message. Real slugs pass through.
+    #[test]
+    fn embed_doors_reject_blank_project_before_dispatch() {
+        let cfg = Config::default();
+        let doors: Vec<ToronCmd> = vec![
+            ToronCmd::Agents {
+                project: String::new(),
+            },
+            ToronCmd::Mail {
+                cmd: ToronMailCmd::Send {
+                    project: String::new(),
+                    from: "A".into(),
+                    to: "B".into(),
+                    subject: "s".into(),
+                    body: "b".into(),
+                },
+            },
+            ToronCmd::Mail {
+                cmd: ToronMailCmd::Inbox {
+                    project: String::new(),
+                    agent: "A".into(),
+                    limit: None,
+                },
+            },
+        ];
+        for cmd in &doors {
+            let err = crate::cmd_toron(&cfg, cmd)
+                .expect_err("blank project must fail loud, never reach the embed");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("requires a project") && msg.contains("--project <slug>"),
+                "actionable message, got: {msg}"
+            );
+        }
+        // Whitespace spellings are blank too.
+        let err = crate::cmd_toron(
+            &cfg,
+            &ToronCmd::Agents {
+                project: "   ".into(),
+            },
+        )
+        .expect_err("whitespace spelling must fail loud");
+        assert!(format!("{err:#}").contains("requires a project"));
+    }
 }
