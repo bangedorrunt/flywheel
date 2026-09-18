@@ -201,12 +201,23 @@ const REAP_AFTER_SECS: u64 = 7 * 24 * 3600;
 /// The single key builder: auto-host ([`unhosted_subscribed`]) and retire
 /// ([`retire_keys`]) must agree on what a subscription references, or a loop
 /// could be spawned by one rule and retired by another.
+fn hostable_project(project: &str) -> bool {
+    let p = project.trim();
+    !p.is_empty() && p != "." && p != ".."
+}
+
 fn subscribed_keys(subs: &[doorbell_rt::subscribe::Subscription]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for sub in subs {
         let Some(project) = &sub.project else {
             continue;
         };
+        // `.` / `..` / blank are cwd aliases, not slugs. Auto-hosting them
+        // sweeps unregistered pins (Buffy on project `.`) and the resulting
+        // inbox_error paints the whole daemon fetch-path-down (bd-gpj0.1).
+        if !hostable_project(project) {
+            continue;
+        }
         for ws in sub.scope.workspaces() {
             let key = format!("{project}/{ws}");
             if !out.contains(&key) {
@@ -1313,6 +1324,37 @@ mod tests {
         assert!(super::retire_keys(&boot, &boot, &[]).is_empty());
     }
 
+    /// bd-gpj0.1: `flywheel arrive . --as Buffy` wrote project `.` /
+    /// workspace `flywheel-.`. Auto-hosting that pair sweeps a pin with
+    /// no key and paints the WHOLE daemon `inbox_fetch_failing` while
+    /// real CLI inboxes work. Unaddressable projects are not live keys.
+    #[test]
+    fn subscribed_keys_skip_dot_and_empty_projects() {
+        use doorbell_rt::subscribe::*;
+        let mk = |id: &str, project: Option<&str>| Subscription {
+            id: id.into(),
+            identity: Identity::Pin("Buffy".into()),
+            scope: Scope::One("flywheel-.".into()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+            project: project.map(str::to_string),
+            endpoint: None,
+        };
+        let keys = super::subscribed_keys(&[
+            mk("cli-dot", Some(".")),
+            mk("cli-empty", Some("")),
+            mk("cli-dotdot", Some("..")),
+            mk("cli-ok", Some("flywheel")),
+            mk("cli-legacy", None),
+        ]);
+        assert_eq!(
+            keys,
+            vec!["flywheel/flywheel-.".to_string()],
+            "only a real slug auto-hosts, got {keys:?}"
+        );
+    }
+
     /// The key a subscription names is built in ONE place, so the auto-host
     /// rule and the retire rule cannot disagree about what is referenced:
     /// what `subscribed_keys` names is exactly what `retire_keys` treats as
@@ -1619,6 +1661,40 @@ mod tests {
         assert!(
             body.contains("watch_restart_loop"),
             "watch thrash must be named in degraded: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pin with no key is not a fetch-path outage (bd-gpj0.1). Buffy on
+    /// project `.` wrote `inbox_error` every sweep and kept
+    /// `inbox_fetch_failing` on while CLI mail worked.
+    #[test]
+    fn health_does_not_treat_pin_miss_as_fetch_path_down() {
+        use super::{AppState, health_body};
+        let dir = std::env::temp_dir().join(format!("db-health-pinmiss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
+        let ts = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 5, 0)
+            .expect("now in range")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        std::fs::write(
+            dir.join("doorbell/flywheel-..audit.jsonl"),
+            format!(
+                "{{\"ts\":\"{ts}\",\"kind\":\"inbox_pin_miss\",\"workspace\":\"flywheel-.\"}}\n"
+            ),
+        )
+        .expect("write audit");
+        let app = AppState {
+            started: std::time::Instant::now(),
+            fw_state: dir.clone(),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![host_for_test(
+                "./flywheel-.",
+            )])),
+        };
+        let body = health_body(&app);
+        assert!(
+            !body.contains("inbox_fetch_failing"),
+            "pin-miss must not paint the fetch path down: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

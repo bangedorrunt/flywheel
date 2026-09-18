@@ -5595,6 +5595,9 @@ mod gs043_residual_honesty_tests {
         assert!(super::check_project_spelling("   ", "door").is_err());
         assert!(super::check_project_spelling("\t\n", "door").is_err());
         assert!(super::check_project_spelling("proj-a", "door").is_ok());
+        // `.` aliases onto cwd and minted `cli-flywheel-.-Buffy` (bd-gpj0.1).
+        assert!(super::check_project_spelling(".", "arrive").is_err());
+        assert!(super::check_project_spelling("..", "arrive").is_err());
         // The error is actionable (names the door + the two spellings).
         let msg = format!(
             "{:#}",
@@ -12887,6 +12890,7 @@ fn cmd_arrive(
     objective: Option<&str>,
     captain_override: Option<&str>,
 ) -> Result<()> {
+    check_project_spelling(project, "arrive")?;
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     let world = briefing::World {
@@ -16331,8 +16335,13 @@ pub fn parse_xproj_request(text: &str) -> Option<XprojRequest> {
 /// used to alias every door onto the workspace default project. Only the
 /// WINNING spelling is validated; no silent fallback.
 pub(crate) fn check_project_spelling(project: &str, door: &str) -> Result<()> {
-    if project.trim().is_empty() {
+    let p = project.trim();
+    if p.is_empty() {
         anyhow::bail!("{door} requires a project: pass PROJECT positionally or --project <slug>");
+    }
+    // `.` / `..` alias onto cwd and minted `cli-flywheel-.-Buffy` (bd-gpj0.1).
+    if p == "." || p == ".." {
+        anyhow::bail!("{door} requires a project slug, not {p:?} (cwd alias is not a project)");
     }
     Ok(())
 }
