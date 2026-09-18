@@ -111,6 +111,10 @@ pub(crate) enum WorkflowCmd {
         /// Bound from TTY captain briefing; agents pass the flag after remix.
         #[arg(long = "role-model", value_name = "ROLE=PROVIDER/MODEL")]
         role_model: Vec<String>,
+        /// Per-role harness overlay (`coder=pi`). Bound from TTY captain
+        /// briefing; aliases `oc`/`gk` normalize. Unknown kind fails loud.
+        #[arg(long = "role-harness", value_name = "ROLE=KIND")]
+        role_harness: Vec<String>,
     },
     /// Scaffold a new workflow YAML in the config dir
     New {
@@ -171,6 +175,10 @@ pub(crate) enum WorkflowCmd {
         /// registry pin as `spawn --profile`.
         #[arg(long = "role-model", value_name = "ROLE=PROVIDER/MODEL")]
         role_model: Vec<String>,
+        /// Per-role harness overlay (`coder=pi`). Bound from TTY briefing.
+        /// Applied before blanket `--harness` (the blanket still wins).
+        #[arg(long = "role-harness", value_name = "ROLE=KIND")]
+        role_harness: Vec<String>,
         /// bd-enov (F6): per-run harness override for compose --run — every
         /// composed role spawns on KIND (e.g. `opencode`). Removes the need to
         /// mutate `~/.config/flywheel/profiles.toml` for a one-off run.

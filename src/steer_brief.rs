@@ -68,10 +68,12 @@ pub struct BriefingContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BriefingOutcome {
     /// proceed — `budget` is the confirmed total pane count (ADR-0011 D2);
-    /// `role_models` is role → chosen registry id (applied via `--role-model`).
+    /// `role_models` is role → chosen registry id (applied via `--role-model`);
+    /// `role_harnesses` is role → chosen kind (applied via `--role-harness`).
     Go {
         budget: u32,
         role_models: BTreeMap<String, String>,
+        role_harnesses: BTreeMap<String, String>,
     },
     /// abort before any dispatch
     Abort,
@@ -190,7 +192,7 @@ pub fn run_briefing(
         }
     }
 
-    // (3) squad recommendation or explicit bare harness+model.
+    // (3) squad recommendation + per-role harness remix (bound into argv).
     writeln!(out, "\n{} {}", accent_lav("[3/4]"), ok("fleet shape:"))?;
     match &ctx.squad_recommendation {
         Some(squad) => writeln!(out, "  {} {}", dim("recommended squad:"), accent(squad))?,
@@ -207,6 +209,27 @@ pub fn run_briefing(
             "  {}",
             dim("bare harness+model: available via spawn --model/--provider")
         )?,
+    }
+    let mut role_harnesses = BTreeMap::new();
+    for m in &ctx.models {
+        writeln!(
+            out,
+            "  {} default harness {}",
+            accent(&m.role),
+            ok(&m.harness)
+        )?;
+        write!(out, "  {} > ", dim("harness"))?;
+        out.flush()?;
+        let line = read_line(input)?;
+        let mut chosen = m.harness.clone();
+        let typed = line.trim();
+        if !typed.is_empty() {
+            chosen = typed.to_string();
+            writeln!(out, "  {} harness -> {}", dim(&m.role), accent(&chosen))?;
+        }
+        if !chosen.is_empty() {
+            role_harnesses.insert(m.role.clone(), chosen);
+        }
     }
 
     // (4) resolved stage-chain preview.
@@ -235,6 +258,7 @@ pub fn run_briefing(
             Ok(BriefingOutcome::Go {
                 budget,
                 role_models,
+                role_harnesses,
             })
         }
     }
@@ -294,10 +318,14 @@ mod tests {
         (outcome, String::from_utf8(out).expect("utf8"))
     }
 
-    fn go(budget: u32, models: &[(&str, &str)]) -> BriefingOutcome {
+    fn go(budget: u32, models: &[(&str, &str)], harnesses: &[(&str, &str)]) -> BriefingOutcome {
         BriefingOutcome::Go {
             budget,
             role_models: models
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            role_harnesses: harnesses
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
@@ -306,9 +334,12 @@ mod tests {
 
     #[test]
     fn blank_answers_keep_defaults_and_go() {
-        // N prompt + 1 model prompt + go/no-go
-        let (outcome, rendered) = drive(&["", "", ""]);
-        assert_eq!(outcome, go(2, &[("coder", "deepseek-v4-flash")]));
+        // N + 1 model + 1 harness + go/no-go
+        let (outcome, rendered) = drive(&["", "", "", ""]);
+        assert_eq!(
+            outcome,
+            go(2, &[("coder", "deepseek-v4-flash")], &[("coder", "omp")])
+        );
         // The golden sections all render.
         assert!(rendered.contains("== captain briefing: steer \"goal\""));
         assert!(rendered.contains("crew budget N"));
@@ -324,7 +355,7 @@ mod tests {
 
     #[test]
     fn explicit_no_aborts_before_dispatch() {
-        let (outcome, rendered) = drive(&["", "", "n"]);
+        let (outcome, rendered) = drive(&["", "", "", "n"]);
         assert_eq!(outcome, BriefingOutcome::Abort);
         assert!(rendered.contains("aborted."));
         assert!(!rendered.contains("dispatching."));
@@ -332,8 +363,11 @@ mod tests {
 
     #[test]
     fn edits_apply_budget() {
-        let (outcome, rendered) = drive(&["4", "1", "y"]);
-        assert_eq!(outcome, go(4, &[("coder", "zai/glm-5.2")]));
+        let (outcome, rendered) = drive(&["4", "1", "", "y"]);
+        assert_eq!(
+            outcome,
+            go(4, &[("coder", "zai/glm-5.2")], &[("coder", "omp")])
+        );
         assert!(rendered.contains("N -> 4"), "{rendered}");
         assert!(rendered.contains("coder -> zai/glm-5.2"), "{rendered}");
     }
@@ -346,9 +380,19 @@ mod tests {
         let outcome = run_briefing(&ctx(), &mut inp, &mut out).expect("eof-safe");
         assert_eq!(
             outcome,
-            go(2, &[("coder", "deepseek-v4-flash")]),
+            go(2, &[("coder", "deepseek-v4-flash")], &[("coder", "omp")]),
             "EOF counts as Enter/yes"
         );
+    }
+
+    #[test]
+    fn typed_harness_binds_into_outcome() {
+        let (outcome, rendered) = drive(&["", "", "pi", "y"]);
+        assert_eq!(
+            outcome,
+            go(2, &[("coder", "deepseek-v4-flash")], &[("coder", "pi")])
+        );
+        assert!(rendered.contains("coder harness -> pi"), "{rendered}");
     }
 
     #[test]
