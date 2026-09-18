@@ -118,6 +118,14 @@ pub(crate) enum DoorbellCmd {
         #[arg(long)]
         project: Option<String>,
     },
+    /// nearby join: herdr panes ∪ registry pins ∪ reservations (bd-gpj0.2).
+    /// One query instead of pane list + tokens + whois + git log.
+    Roster {
+        project: String,
+        /// structured rows (default is the NEARBY: text view)
+        #[arg(long)]
+        json: bool,
+    },
     /// list subscription store rows.
     Subscriptions {},
     /// drop one subscription row by id.
@@ -125,6 +133,79 @@ pub(crate) enum DoorbellCmd {
         /// subscription id (see `subscriptions`)
         id: String,
     },
+}
+
+pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Result<()> {
+    crate::check_project_spelling(project, "doorbell roster")?;
+    let registry = crate::state::load_spawn_registry(project);
+    let reg: Vec<(String, String, String)> = registry
+        .iter()
+        .filter_map(|e| {
+            let pin = e
+                .mail_identity
+                .clone()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| e.name.clone());
+            if pin.is_empty() {
+                return None;
+            }
+            Some((pin, e.pane_id.clone(), e.name.clone()))
+        })
+        .collect();
+    let herdr = nearby_herdr_agents(cfg);
+    let leases = nearby_leases(project);
+    let rows = crate::doorbell::join_nearby(&reg, &herdr, &leases);
+    if json {
+        crate::output::print_json(&serde_json::to_value(&rows).unwrap_or_default());
+    } else {
+        for line in crate::doorbell::render_nearby(&rows) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+fn nearby_herdr_agents(cfg: &Config) -> Vec<(String, String, String)> {
+    let Ok(mut c) = crate::herdr_shim::Client::connect(Some(&cfg.socket_path())) else {
+        return Vec::new();
+    };
+    let Ok(agents) = c.agent_list() else {
+        return Vec::new();
+    };
+    agents
+        .into_iter()
+        .map(|a| {
+            let name = a
+                .name
+                .filter(|n| !n.is_empty())
+                .or(a.agent)
+                .unwrap_or_default();
+            let state = format!("{:?}", a.agent_status).to_lowercase();
+            (a.pane_id, name, state)
+        })
+        .collect()
+}
+
+fn nearby_leases(project: &str) -> Vec<(String, String)> {
+    let out = std::process::Command::new("toron")
+        .args(["reserve", "list", "--project", project, "--json"])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    v.get("reservations")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.get("holder")?.as_str()?.to_string(),
+                r.get("path")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
 }
 
 pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
