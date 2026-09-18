@@ -172,6 +172,13 @@ fn resolved_bins() -> Bins {
 /// A degradation probe is about NOW, not history: a fetch error older than
 /// this is stale evidence, not a live fault.
 const PROBE_FRESH_SECS: u64 = 120;
+
+/// True only when every hosted workspace has a fresh path-error. Empty
+/// host set is standby, not a fetch outage.
+fn inbox_path_down(ages: &[Option<u64>], fresh_secs: u64) -> bool {
+    !ages.is_empty() && ages.iter().all(|a| a.is_some_and(|age| age <= fresh_secs))
+}
+
 /// Watch-thrash measurement window. A healthy quiet watcher idle-exits at
 /// 90s and is respawned after the retry gate (~109s cadence measured live),
 /// so individual restarts are routine and two workspaces phase them
@@ -1077,13 +1084,20 @@ fn health_body(app: &AppState) -> String {
         .iter()
         .map(|w| workspace_audit_path(&app.fw_state, w))
         .collect();
-    if doorbell_rt::tailprobe::newest_match_age_secs_across(
-        audits.iter().map(std::path::PathBuf::as_path),
-        "\"kind\":\"inbox_error\"",
-        now,
-    )
-    .is_some_and(|age| age <= PROBE_FRESH_SECS)
-    {
+    let ages: Vec<Option<u64>> = audits
+        .iter()
+        .map(|p| {
+            doorbell_rt::tailprobe::newest_match_age_secs(
+                p.as_path(),
+                "\"kind\":\"inbox_error\"",
+                now,
+            )
+        })
+        .collect();
+    // Path-down only when EVERY hosted workspace has a fresh inbox_error.
+    // One pin timeout (or one leftover Buffy host) is a local miss, not a
+    // dead fetch path (bd-gpj0.4). The 2026-09-13 outage was every fetch.
+    if inbox_path_down(&ages, PROBE_FRESH_SECS) {
         degraded.push("inbox_fetch_failing".to_string());
     }
     let journals: Vec<std::path::PathBuf> = ws_names
@@ -1283,7 +1297,33 @@ fn stats_body(app: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::known_journal_workspaces;
-    use super::{REAP_AFTER_SECS, reap_candidates, unhosted_subscribed};
+    use super::{REAP_AFTER_SECS, inbox_path_down, reap_candidates, unhosted_subscribed};
+
+    /// bd-gpj0.4: one workspace with a fresh path-error is a local miss.
+    /// The 2026-09-13 outage was every hosted fetch failing.
+    #[test]
+    fn inbox_path_down_requires_every_hosted_workspace() {
+        assert!(
+            !inbox_path_down(&[], 120),
+            "standby (no hosts) is not a fetch outage"
+        );
+        assert!(
+            inbox_path_down(&[Some(5)], 120),
+            "a single hosted workspace with a fresh error is path-down"
+        );
+        assert!(
+            !inbox_path_down(&[Some(5), None], 120),
+            "a sibling without a path-error keeps the daemon honest"
+        );
+        assert!(
+            inbox_path_down(&[Some(5), Some(8)], 120),
+            "every hosted workspace failing is the original outage"
+        );
+        assert!(
+            !inbox_path_down(&[Some(500)], 120),
+            "a stale error is not live path-down"
+        );
+    }
 
     /// bd-mk60 test seam: a keyed host handle with a real (unused) channel.
     /// `tokio::sync::mpsc::channel` needs no runtime, so this works from a
