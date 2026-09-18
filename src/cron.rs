@@ -323,6 +323,11 @@ pub fn detect_project(cfg: &crate::config::Config, explicit: Option<&str>) -> Op
 /// global > built-in (ADR-0012 Spec 4). A higher tier with the same name
 /// SHADOWS the lower tier entirely — list shows only the winner.
 pub fn load_crons(cfg: &crate::config::Config, project: Option<&str>) -> Result<Vec<CronRow>> {
+    // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to alias
+    // the project tier onto the workspace root.
+    if let Some(p) = project {
+        crate::check_project_spelling(p, "cron")?;
+    }
     let mut out: BTreeMap<String, CronRow> = BTreeMap::new();
     for (name, spec) in builtin_crons() {
         out.insert(

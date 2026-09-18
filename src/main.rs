@@ -3358,6 +3358,9 @@ fn chrono_like_ts() -> String {
     state::now_iso()
 }
 fn cmd_init(cfg: &Config, project: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi: "" would join the
+    // workspace root (which always exists) and init it as a project.
+    check_project_spelling(project, "init")?;
     let dir = project_dir(cfg, project);
     if !dir.exists() {
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -5560,6 +5563,94 @@ mod gs043_residual_honesty_tests {
             .expect("the bd-g5q4 parse assertions must hold");
     }
 
+    /// bd-blank-project-spelling-non-mail-doors-76hi: the non-mail sibling
+    /// of the blank-spelling rejection — `project_dir(cfg, "")` aliases onto
+    /// the workspace root, so every door must fail loud on a blank winning
+    /// spelling. Pins all four shared helpers' contracts.
+    #[test]
+    fn blank_project_helpers_reject_blank_keep_none_defaults() {
+        // check_project_spelling: blank/whitespace fail loud, real passes.
+        assert!(super::check_project_spelling("", "door").is_err());
+        assert!(super::check_project_spelling("   ", "door").is_err());
+        assert!(super::check_project_spelling("\t\n", "door").is_err());
+        assert!(super::check_project_spelling("proj-a", "door").is_ok());
+        // The error is actionable (names the door + the two spellings).
+        let msg = format!(
+            "{:#}",
+            super::check_project_spelling("", "workflow run").unwrap_err()
+        );
+        assert!(
+            msg.contains("workflow run") && msg.contains("--project <slug>"),
+            "actionable message, got: {msg}"
+        );
+
+        // project_door: None keeps the door's default; Some(blank) errors;
+        // Some(real) wins verbatim (no trim-rewrite).
+        assert_eq!(
+            super::project_door(None, "flywheel", "d").expect("none"),
+            "flywheel"
+        );
+        assert!(super::project_door(Some(""), "flywheel", "d").is_err());
+        assert!(super::project_door(Some("  "), "flywheel", "d").is_err());
+        assert_eq!(
+            super::project_door(Some("proj"), "flywheel", "d").expect("real"),
+            "proj"
+        );
+
+        // project_door_opt: None passes through (door default applies
+        // downstream); Some(blank) errors; Some(real) passes verbatim.
+        let none: Option<String> = None;
+        let blank = Some(String::new());
+        let real = Some("proj-b".to_string());
+        assert_eq!(super::project_door_opt(&none, "d").expect("none"), None);
+        assert!(super::project_door_opt(&blank, "d").is_err());
+        assert_eq!(
+            super::project_door_opt(&real, "d").expect("real"),
+            Some("proj-b")
+        );
+
+        // ensure_project_opt: None is meaningful (no filter); Some(blank)
+        // errors; Some(real) ok.
+        assert!(super::ensure_project_opt(None, "d").is_ok());
+        assert!(super::ensure_project_opt(Some(""), "d").is_err());
+        assert!(super::ensure_project_opt(Some("proj"), "d").is_ok());
+    }
+
+    /// bd-blank-project-spelling-non-mail-doors-76hi: the CLI-level pin —
+    /// `--project ""` on a NON-mail door (workflow list) parses (clap takes
+    /// any string) but the door's resolver fails loud with the actionable
+    /// message instead of reading the workspace root's project tier.
+    #[test]
+    fn workflow_list_blank_project_spelling_fails_loud_at_door() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let cli =
+                    crate::Cli::try_parse_from(["flywheel", "workflow", "list", "--project", ""])
+                        .expect("blank --project must still PARSE (rejection lives at the door)");
+                match cli.command {
+                    Some(crate::Commands::Workflow { cmd }) => match &cmd {
+                        crate::cmd::workflow::WorkflowCmd::List { project, .. } => {
+                            // Same shape read_door_workflows applies.
+                            let err = super::project_door_opt(project, "workflow list").expect_err(
+                                "blank spelling must fail loud, never alias to workspace",
+                            );
+                            let msg = format!("{err:#}");
+                            assert!(
+                                msg.contains("requires a project"),
+                                "actionable message, got: {msg}"
+                            );
+                        }
+                        _ => panic!("expected workflow list"),
+                    },
+                    _ => panic!("expected workflow"),
+                }
+            })
+            .expect("spawn the parse thread");
+        handle.join().expect("the 76hi parse assertions must hold");
+    }
+
     /// bd-empty-project-silently-retargets-workspace-bkr3: `--project ""`
     /// parses (clap takes any string) but the resolver must fail loud — the
     /// empty spelling used to alias onto the workspace default project and
@@ -7156,6 +7247,10 @@ fn dead_panes(
 }
 
 fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi: "" defeats the
+    // dir.exists() bail below (the workspace root always exists) — panes
+    // would spawn against the repo root.
+    check_project_spelling(project, "spawn")?;
     let dir = project_dir(cfg, project);
     if !dir.exists() {
         // bd-vik B: fail BEFORE any herdr side effect, and name the valid
@@ -8264,6 +8359,8 @@ fn cmd_doorbell_why(
     seq: Option<u64>,
     subscriber: Option<&str>,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    crate::check_project_spelling(project, "doorbell why")?;
     let _ = cfg;
     // bd-a8ld: fold only the workspaces this project owns (see the helper).
     let scoped = doorbell_scoped_workspaces(project);
@@ -8591,6 +8688,8 @@ fn cmd_doorbell_why(
 /// queue cannot drain (overdue predicate); empty queue is clean, not an
 /// error — AFK with nothing queued means nothing needs the captain.
 fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    crate::check_project_spelling(project, "doorbell afk")?;
     let _ = cfg;
     // bd-z5ut: fold only this project's workspaces. The journal dir holds
     // synthetic fact workspaces (`manual`, `facts-close-*`, `facts-lapsed-*`)
@@ -11826,6 +11925,8 @@ fn cmd_add(
     kinds: &[(String, u32)],
     settle_secs: u64,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "add")?;
     let plan = recipe_counts(None, counts, kinds)?;
     let dir = project_dir(cfg, project);
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
@@ -12072,6 +12173,9 @@ fn cmd_decide(
         contention,
     };
     if let Some(project) = project {
+        // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
+        // load the workspace root's spawn meta.
+        check_project_spelling(project, "decide")?;
         let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
         let live = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
         if snap.ready_bead_count == 0 {
@@ -12309,6 +12413,8 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
 /// JSON. Validates against `snapshot::schema_keys` — a missing key is a
 /// contract break, never an empty section.
 fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "snapshot")?;
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     print_json(&serde_json::to_value(&snap)?);
@@ -12347,7 +12453,8 @@ fn cmd_reclassify(
     yes: bool,
     crew: Option<u32>,
 ) -> Result<()> {
-    let project = project.unwrap_or("toron");
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    let project = project_door(project, "toron", "reclassify")?;
     // Seed model with sticky topology from prior DecisionReady (if any).
     let mut model = workspace::WorkspaceModel::default();
     if let Some(topo) = state::load_session_topology(project) {
@@ -12410,7 +12517,8 @@ fn cmd_briefing(
     yes: bool,
     crew: Option<u32>,
 ) -> Result<()> {
-    let project = project.unwrap_or("toron");
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    let project = project_door(project, "toron", "briefing")?;
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     let world = briefing::World {
@@ -12813,6 +12921,8 @@ fn captain_presence_live(project: &str, pin: &str) -> bool {
 }
 
 fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "helm")?;
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let now = doorbell_now_unix();
     let snap = snapshot::assemble(cfg, project, &ws_label, now);
@@ -12821,6 +12931,8 @@ fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
 }
 
 fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    ensure_project_opt(project, "status")?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let Some(project) = project else {
         return cmd_list(cfg, false);
@@ -13061,6 +13173,8 @@ fn cmd_binding_rebind(
 }
 
 fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "rebind")?;
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
     let entries = state::load_spawn_registry(project);
@@ -13215,6 +13329,8 @@ enum RecoverDecision<'a> {
 /// responsiveness (state_change_seq advancing across a window); a frozen +
 /// idle agent is respawned, not classified healthy.
 fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "recover")?;
     let backend = backend::multiplexer_backend(cfg)?;
     let ws_id = find_workspace_dyn(&*backend, project)?;
     // bd-eign.3 A: registry first; the project-local mirror is the fallback
@@ -14945,6 +15061,8 @@ fn cmd_interrupt(
     keys: &[String],
     force: bool,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "interrupt")?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
@@ -15007,6 +15125,8 @@ fn client_read_with_fallback(
 }
 
 fn cmd_view(cfg: &Config, project: &str, to: &str, lines: Option<u32>, source: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "view")?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings
     // line (pipes stay byte-identical).
@@ -15052,6 +15172,8 @@ fn cmd_output(
     session: Option<&str>,
     limit: u32,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "output")?;
     let dir = project_dir_str(cfg, project)?;
     let log = herdr_shim::read_session_log(&dir, role, session, limit)?;
     print_json(&log);
@@ -15065,6 +15187,8 @@ fn cmd_watch(
     until: Option<&str>,
     timeout_ms: Option<u64>,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    check_project_spelling(project, "watch")?;
     let until_status: Option<AgentStatus> =
         until.map(herdr_shim::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
@@ -16021,6 +16145,61 @@ pub fn parse_xproj_request(text: &str) -> Option<XprojRequest> {
         params: params_parts.join("\n"),
         product,
     })
+}
+
+/// bd-blank-project-spelling-non-mail-doors-76hi: the non-mail sibling of
+/// [`mail_project`]'s blank-spelling rejection. A blank/whitespace project
+/// spelling fails loud with the same actionable message as a missing one —
+/// `project_dir(cfg, "")` joins the workspace root, so the empty spelling
+/// used to alias every door onto the workspace default project. Only the
+/// WINNING spelling is validated; no silent fallback.
+pub(crate) fn check_project_spelling(project: &str, door: &str) -> Result<()> {
+    if project.trim().is_empty() {
+        anyhow::bail!("{door} requires a project: pass PROJECT positionally or --project <slug>");
+    }
+    Ok(())
+}
+
+/// `Option<&str>` door: `None` keeps the door's own default; `Some(blank)`
+/// fails loud. Returns the winning spelling.
+pub(crate) fn project_door<'a>(
+    project: Option<&'a str>,
+    default: &'a str,
+    door: &str,
+) -> Result<&'a str> {
+    match project {
+        Some(p) => {
+            check_project_spelling(p, door)?;
+            Ok(p)
+        }
+        None => Ok(default),
+    }
+}
+
+/// `&Option<String>` arm field: validates the winning spelling and passes
+/// the Option through, so downstream `as_deref().unwrap_or(default)` call
+/// sites stay put (blank already errored by the time they run).
+pub(crate) fn project_door_opt<'a>(
+    project: &'a Option<String>,
+    door: &str,
+) -> Result<Option<&'a str>> {
+    match project {
+        Some(p) => {
+            check_project_spelling(p, door)?;
+            Ok(Some(p.as_str()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Validate-when-present door: `None` is genuinely meaningful (no project
+/// filter), `Some(blank)` fails loud. For doors whose default differs from
+/// every other door — semantics preserved, only the blank spelling fixed.
+pub(crate) fn ensure_project_opt(project: Option<&str>, door: &str) -> Result<()> {
+    if let Some(p) = project {
+        check_project_spelling(p, door)?;
+    }
+    Ok(())
 }
 
 /// bd-3npc: `--project` flag alias for every mail-cli positional PROJECT.
@@ -18193,7 +18372,8 @@ fn cmd_artifacts(
     cmd: &Option<ArtifactsCmd>,
 ) -> Result<()> {
     if let Some(ArtifactsCmd::Stitch { run_id, project }) = cmd {
-        let proj = project.as_deref().unwrap_or("flywheel");
+        // bd-blank-project-spelling-non-mail-doors-76hi
+        let proj = project_door(project.as_deref(), "flywheel", "artifacts stitch")?;
         let path = crate::artifact::stitch_artifacts(proj, run_id)?;
         println!("{}", path.display());
         return Ok(());
@@ -18201,7 +18381,7 @@ fn cmd_artifacts(
     let Some(rid) = run_id else {
         anyhow::bail!("flywheel artifacts: pass <run_id> or `stitch <run_id>`");
     };
-    let proj = project.unwrap_or("flywheel");
+    let proj = project_door(project, "flywheel", "artifacts")?;
     // List mode: read artifacts/<run_id>/*.json and print
     let base = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
@@ -22947,7 +23127,8 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
             let mut spawned: Vec<Value> = Vec::new();
             // Registry key for the spawn entries: the squad's project, else
             // the orchestrator's host project (host-scope, debate convention).
-            let project_key = project.as_deref().unwrap_or("flywheel");
+            // bd-blank-project-spelling-non-mail-doors-76hi
+            let project_key = project_door(project.as_deref(), "flywheel", "squad")?;
             for (profile_name, n) in squad.members() {
                 // bd-brie: project-scope resolve falls back to HOST-scope
                 // (operator npub) with a one-line notice when the profile is
@@ -23792,6 +23973,10 @@ fn cmd_steer(
             "steer: --project is required for AUTHORITATIVE MaterialContext path              (pass --project <slug> or run from a workspace/<project> cwd)"
         )
     })?;
+    // bd-blank-project-spelling-non-mail-doors-76hi: a blank explicit spelling
+    // passes detect_project verbatim and would run AUTHORITATIVE steer against
+    // the workspace root.
+    crate::check_project_spelling(&project_owned, "steer")?;
     if !explicit_project {
         eprintln!("flywheel: steer: inheriting --project={project_owned} from workspace cwd");
     }
@@ -24105,6 +24290,9 @@ fn cmd_workflow_evaluate(
     project: Option<&str>,
     json: bool,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to alias
+    // onto the workspace root.
+    ensure_project_opt(project, "workflow evaluate")?;
     let project_root = project.map(|p| project_dir(cfg, p));
     let all = workflow_catalog::all_workflows_merged(project_root.as_deref())?;
     let (wf, source) = all
@@ -24318,6 +24506,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         cfg: &Config,
         project: &Option<String>,
     ) -> Result<BTreeMap<String, (Workflow, &'static str)>> {
+        // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
+        // alias the read onto the workspace root's project tier.
+        let project = project_door_opt(project, "workflow")?;
         match project {
             Some(p) => all_workflows_layered(Some(&project_dir(cfg, p))),
             None => all_workflows(),
@@ -24443,6 +24634,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // cmd_workflow itself needs no opt-out state
             allow_worktree: _,
         } => {
+            // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
+            // alias the run (including --execute journaling + pane spawn)
+            // onto the workspace root.
+            project_door_opt(project, "workflow run")?;
             let mut crew_sel = crew.clone();
             // bd-nmzk: interactive captain briefing for `workflow run --execute`
             // (same skip flags as `steer` — shared prompt module so both stay
@@ -24907,6 +25102,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // W6: the project tier participates in BOTH the stage library
             // (stage-first affinities) and the workflow catalog (kept entries
             // resolve for call_workflow).
+            // bd-blank-project-spelling-non-mail-doors-76hi: Some("") used to
+            // alias compose (and its --run journaling) onto the workspace root.
+            project_door_opt(project, "workflow compose")?;
             let project_name = project.as_deref().unwrap_or("flywheel");
             let project_root = project_dir(cfg, project_name);
             let project_stages = project_root.join(".flywheel/stages.toml");
