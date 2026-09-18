@@ -53,6 +53,8 @@ Freshness 15 minutes. Reader threshold `context_pct >= 80`. Writer just reports 
 
 `br` owns the bead lifecycle. `flywheel integration {opencode,pi,grok,omp,pa}`
 regenerates `*-mode.md` only and deletes leftover `/beads-*` slash files.
+`flywheel arrive --as <pin>` upserts the pin so whois/captain resolve.
+`flywheel mail agents <p> --disk` lists key dirs that are not in the registry.
 
 ```bash
 br ready --json
