@@ -128,6 +128,9 @@ pub(crate) enum DoorbellCmd {
 }
 
 pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi: a blank positional used
+    // to alias onto the workspace root's workspaces.
+    crate::check_project_spelling(project, "doorbell status")?;
     if crate::proxy_doorbell_verb(cfg, "status", &[])? {
         return Ok(());
     }
@@ -201,6 +204,8 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    crate::check_project_spelling(project, "doorbell start")?;
     let workspaces = crate::doorbell_project_workspaces(project);
     // bd-enov (F17): ARM the plane with this project's workspaces. The old
     // call proxied a bare `doorbell start` (no --host) — which only adopts the
@@ -232,6 +237,8 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_doorbell_stop(cfg: &Config, project: &str, workspace: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    crate::check_project_spelling(project, "doorbell stop")?;
     // Daemon mode owns all wake: any stop targets the daemon (per-workspace
     // dispatchers no longer exist there; Phase 3 removes them everywhere).
     if workspace == "all" && crate::proxy_doorbell_verb(cfg, "stop", &[])? {
@@ -257,6 +264,8 @@ pub(crate) fn cmd_doorbell_inject(
     line: &str,
     workspace: &str,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    crate::check_project_spelling(project, "doorbell inject")?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -293,6 +302,9 @@ pub(crate) fn cmd_doorbell_subscribe(
     extra: &[String],
     project: Option<&str>,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi: None is meaningful here
+    // (workspace-scoped door), Some("") is not.
+    crate::ensure_project_opt(project, "doorbell subscribe")?;
     use doorbell_rt::subscribe::{
         Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
     };
@@ -360,6 +372,8 @@ pub(crate) fn cmd_doorbell_digest(
     since: Option<&str>,
     format: &str,
 ) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    crate::check_project_spelling(project, "doorbell digest")?;
     let _ = cfg;
     let _ = project;
     let entries = crate::doorbell::journal_read_all(&crate::config::state_dir());
@@ -484,6 +498,8 @@ pub(crate) fn cmd_doorbell_digest(
 /// and identity line into EXISTING panes — covers herdr pane-split additions
 /// and post-crash respawns that never got the spawn-time injection.
 pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> {
+    // bd-blank-project-spelling-non-mail-doors-76hi
+    crate::check_project_spelling(project, "doorbell re-inject")?;
     crate::ensure_doorbell_supervisor();
     let registry = crate::state::load_spawn_registry(project);
     let peer_tpl = include_str!("../../integrations/peer-aware.md.tpl");
