@@ -1340,16 +1340,41 @@ pub fn expand_reclassify_cmds(
                     // Apply uses the journaled identity (goal + effect_key).
                     let _ = &intent.effect_key;
                     let (primitive, topology, argv, decide_reason) = decide(&intent.goal);
+                    // W2 (ADR-0014, default off): host-side Jev enrichment. The
+                    // pure table leaf above is untouched; the adapter only
+                    // annotates beside it and journals a JudgmentEffect child
+                    // of this intent. Flag off = byte-identical passthrough.
+                    let sticky = model.session_topology.clone();
+                    let enriched = crate::judgment::enrich_expand(crate::judgment::ExpandArgs {
+                        project: project.to_string(),
+                        goal: intent.goal.clone(),
+                        pin: pin.clone(),
+                        reason: reason.clone(),
+                        explicit_topology: intent.explicit_topology.clone(),
+                        parent_effect_key: intent.effect_key.clone(),
+                        sticky_topology: sticky,
+                        table_primitive: primitive,
+                        table_topology: topology,
+                        table_argv: argv,
+                        table_reason: decide_reason,
+                    });
                     let ready = Msg::DecisionReady {
                         goal: intent.goal.clone(),
-                        primitive,
-                        topology,
-                        argv,
-                        decide_reason,
+                        primitive: enriched.primitive,
+                        topology: enriched.topology,
+                        argv: enriched.argv,
+                        decide_reason: enriched.reason,
                         explicit_topology: intent.explicit_topology.clone(),
                     };
-                    let (next, more) = tick(model, &ready);
+                    let (next, mut more) = tick(model, &ready);
                     *model = next;
+                    if let Some((audit_pin, detail)) = enriched.audit {
+                        more.push(Cmd::Audit {
+                            kind: "judgment".to_string(),
+                            pin: audit_pin,
+                            detail: detail.to_string(),
+                        });
+                    }
                     Ok(more)
                 }) {
                     Ok(more) => more,

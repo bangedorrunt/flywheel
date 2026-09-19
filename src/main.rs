@@ -47,6 +47,7 @@ mod herdr_shim;
 mod ingress;
 mod init_scaffold;
 mod intent;
+mod judgment;
 mod mail_shim;
 mod mcp_http;
 mod models;
@@ -96,11 +97,10 @@ use cmd::{
     WorkflowCmd, WorktreeCmd, XprojCmd, cmd_analytics, cmd_asset, cmd_audit, cmd_backend,
     cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject,
     cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start,
-    cmd_doorbell_status,
-    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_ledger,
-    cmd_mail, cmd_models,
-    cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders,
-    cmd_timeline, cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
+    cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history,
+    cmd_internal_doorbell, cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles,
+    cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron,
+    cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
