@@ -18,9 +18,13 @@ impl HostAuthority {
             .ok();
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let exe =
-            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("flywheel"));
-        Self { agent_name, home, cwd, exe }
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("flywheel"));
+        Self {
+            agent_name,
+            home,
+            cwd,
+            exe,
+        }
     }
 
     #[cfg(test)]

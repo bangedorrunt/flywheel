@@ -30,7 +30,11 @@ pub fn poll_until(mut visible: impl FnMut() -> bool, cap: Duration, step: Durati
 
 /// Default probe: 2s cap, 50ms step.
 pub fn wait_for_visible(path: &Path) -> bool {
-    poll_until(|| path.exists(), Duration::from_secs(2), Duration::from_millis(50))
+    poll_until(
+        || path.exists(),
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+    )
 }
 
 use anyhow::{Context, Result};
@@ -60,6 +64,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("sync temp {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+        // P6: poll-probe the renamed path (2s cap, 50ms step) — a slow
+        // network fs surfaces here instead of as a torn read downstream.
+        let _ = wait_for_visible(path);
         Ok(())
     })();
     if res.is_err() {
@@ -119,7 +126,10 @@ mod tests {
     fn p6_probe_sees_delayed_visibility_without_real_rename() {
         let mut calls = 0;
         let hit = super::poll_until(
-            || { calls += 1; calls >= 3 },
+            || {
+                calls += 1;
+                calls >= 3
+            },
             std::time::Duration::from_secs(2),
             std::time::Duration::from_millis(1),
         );
