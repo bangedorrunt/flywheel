@@ -904,7 +904,8 @@ impl CoalitionStore {
 
         // Subprocess-reuse (Spec A): the __run-headless leaf owns the harness
         // call + run log. --json keeps the outcome machine-readable.
-        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        // P4: exe resolves once in HostAuthority (PATH fallback, never errs).
+        let mut cmd = std::process::Command::new(crate::authority::HostAuthority::resolve().exe);
         cmd.arg("__run-headless")
             .arg(profile_name)
             .arg(&prompt)

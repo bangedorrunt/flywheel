@@ -112,8 +112,8 @@ pub fn apply_opencode_go_api_key_alias(env: &mut std::collections::BTreeMap<Stri
 /// missing (pi/omp/opencode). Create the documented parent dirs before install
 /// so zero-touch spawn works on a cold box.
 pub fn ensure_integration_parent_dirs(kind: &str) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let home = std::path::PathBuf::from(home);
+    // P4: authority injects — one HOME read in HostAuthority, not per site.
+    let home = std::path::PathBuf::from(crate::authority::HostAuthority::resolve().home);
     let dirs: &[&str] = match kind {
         "pi" => &[".pi/agent/extensions"],
         "omp" => &[".omp/agent/extensions"],

@@ -29,7 +29,8 @@ pub(crate) enum WorkCmd {
 }
 
 pub(crate) fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+    // P4: cwd resolves once in HostAuthority (falls back to ".", never errs).
+    let cwd = crate::authority::HostAuthority::resolve().cwd;
     let bv = crate::work::Bv::new(cwd.to_str().unwrap_or("."));
     match cmd {
         WorkCmd::Triage => {
