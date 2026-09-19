@@ -450,10 +450,11 @@ impl UreqTransport {
     }
 }
 
-impl UreqTransport {
-    /// One POST attempt: 5s timeout lives inside (P1: timeout inside retry).
-    /// ponytail: no new transport, one method split for the retry edge.
-    pub fn ask_once(&self, slice: &StateSlice, pack: &QuestionPack) -> Result<Answers, JevError> {
+impl Transport for UreqTransport {
+    /// Single POST attempt: 5s timeout lives inside. Never retried inside —
+    /// retries re-enter as new reclassifies under the same parent effect
+    /// key (ADR-0014 envelope, untouched by ADR-0015).
+    fn ask(&self, slice: &StateSlice, pack: &QuestionPack) -> Result<Answers, JevError> {
         let questions: BTreeMap<String, serde_json::Value> = pack
             .questions
             .iter()
@@ -493,36 +494,6 @@ impl UreqTransport {
             .into_json()
             .map_err(|e| JevError::Malformed(e.to_string()))?;
         parse_systemone_response(&v, pack)
-    }
-
-    /// Retry wrapper (P1): timeout inside `ask_once`, retry outside with
-    /// cap + backoff. Only `Offline` retries; auth/malformed fail fast.
-    pub fn ask_with_retry(
-        &self,
-        slice: &StateSlice,
-        pack: &QuestionPack,
-        policy: crate::retry::RetryPolicy,
-    ) -> Result<Answers, JevError> {
-        let mut attempt = 0u32;
-        loop {
-            match self.ask_once(slice, pack) {
-                Ok(a) => return Ok(a),
-                Err(e) => {
-                    let retryable = matches!(e, JevError::Offline(_));
-                    if !retryable || attempt + 1 >= policy.max_attempts {
-                        return Err(e);
-                    }
-                    std::thread::sleep(policy.delay_for(attempt));
-                    attempt += 1;
-                }
-            }
-        }
-    }
-}
-
-impl Transport for UreqTransport {
-    fn ask(&self, slice: &StateSlice, pack: &QuestionPack) -> Result<Answers, JevError> {
-        self.ask_once(slice, pack)
     }
 }
 
@@ -879,7 +850,6 @@ pub fn active_thresholds() -> Thresholds {
 /// …) — same ancestor-walk discovery as before, generalized (bd-lpn6).
 /// `find_pack` stays the reclassify entry point.
 pub fn find_pack_for(project: &str, id: &str) -> Result<QuestionPack, String> {
-    let prefix = format!("{id}.v");
     let mut bases: Vec<std::path::PathBuf> = Vec::new();
     let p = std::path::PathBuf::from(project);
     if p.is_absolute() {
@@ -890,11 +860,20 @@ pub fn find_pack_for(project: &str, id: &str) -> Result<QuestionPack, String> {
         bases.push(dir.clone());
         cursor = dir.parent().map(|q| q.to_path_buf());
     }
+    // P3: pack loads ride a (dir, id) cache with mtime invalidation —
+    // repeat reclassifies in one process skip re-read + re-parse.
+    static PACK_CACHE: std::sync::OnceLock<std::sync::Mutex<PackCache>> =
+        std::sync::OnceLock::new();
     let mut tried: Vec<std::path::PathBuf> = Vec::new();
     for base in &bases {
         let dir = base.join(PACK_DIR_REL);
         tried.push(dir.clone());
-        if let Some(pack) = newest_pack_in(&dir, &prefix) {
+        let hit = PACK_CACHE
+            .get_or_init(|| std::sync::Mutex::new(PackCache::default()))
+            .lock()
+            .expect("pack cache")
+            .get_or_load(&dir, id);
+        if let Some(pack) = hit {
             return pack;
         }
     }
@@ -916,17 +895,25 @@ pub struct PackCache {
 }
 
 impl PackCache {
-    pub fn get_or_load(&mut self, dir: &std::path::Path, id: &str) -> Option<Result<QuestionPack, String>> {
+    pub fn get_or_load(
+        &mut self,
+        dir: &std::path::Path,
+        id: &str,
+    ) -> Option<Result<QuestionPack, String>> {
         let prefix = format!("{id}.v");
         let path = newest_pack_path(dir, &prefix)?;
-        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs()).unwrap_or(0);
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let key = (dir.to_string_lossy().into_owned(), id.to_string());
         if let Some((cached_mtime, pack)) = self.entries.get(&key)
-            && *cached_mtime == mtime {
-                return Some(Ok(pack.clone()));
-            }
+            && *cached_mtime == mtime
+        {
+            return Some(Ok(pack.clone()));
+        }
         let loaded = QuestionPack::load_from_file(&path);
         if let Ok(pack) = &loaded {
             self.entries.insert(key, (mtime, pack.clone()));
@@ -945,29 +932,12 @@ fn newest_pack_path(dir: &std::path::Path, prefix: &str) -> Option<std::path::Pa
         }
         let mid = &name[prefix.len()..name.len() - PACK_SUFFIX.len()];
         if let Ok(v) = mid.parse::<u32>()
-            && best.as_ref().is_none_or(|(bv, _)| v > *bv) {
-                best = Some((v, entry.path()));
-            }
-    }
-    best.map(|(_, path)| path)
-}
-
-fn newest_pack_in(dir: &std::path::Path, prefix: &str) -> Option<Result<QuestionPack, String>> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut best: Option<(u32, std::path::PathBuf)> = None;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with(prefix) && name.ends_with(PACK_SUFFIX)) {
-            continue;
-        }
-        let mid = &name[prefix.len()..name.len() - PACK_SUFFIX.len()];
-        if let Ok(v) = mid.parse::<u32>()
             && best.as_ref().is_none_or(|(bv, _)| v > *bv)
         {
             best = Some((v, entry.path()));
         }
     }
-    best.map(|(_, path)| QuestionPack::load_from_file(&path))
+    best.map(|(_, path)| path)
 }
 
 /// Arguments for the host expand hook — everything `expand_reclassify_cmds`
