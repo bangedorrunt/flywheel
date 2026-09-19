@@ -2354,6 +2354,29 @@ fn agent_display(a: &AgentInfo) -> String {
     a.pane_id.clone()
 }
 
+/// Bounded settle-retry over fallible live re-reads (bd-qs1c.1): a send
+/// racing a fresh spawn can miss the pin (registry not yet flushed) or the
+/// pane (not yet in herdr's list). Each attempt is a live re-read — never an
+/// invented observation (GS-037) — and exhaustion returns the last error for
+/// the caller to fail loud. `retries` counts RE-tries after the first try.
+fn settle_retry<T, E>(
+    retries: u32,
+    sleep_ms: u64,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut out = attempt();
+    for _ in 0..retries {
+        if out.is_ok() {
+            break;
+        }
+        if sleep_ms > 0 {
+            std::thread::sleep(Duration::from_millis(sleep_ms));
+        }
+        out = attempt();
+    }
+    out
+}
+
 /// bd-a2bw / ADR-0018: herdr omp panes drop names (bd-w17). Fill null
 /// names from the spawn registry so `--to coder3` matches after overlay
 /// even though herdr kind stays `omp`.
@@ -12118,17 +12141,42 @@ fn cmd_add(
                      within 15s — the launch command may be mangled by the booting shell"
                 );
             }
-            let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &add_args)?;
+            let agent = start_agent_with_retry(&mut c, &name, &kind, &prev, &add_args)
+                .with_context(|| {
+                    format!(
+                        "add {name}: pane {prev} left behind — close it with `herdr pane close {prev}`"
+                    )
+                })?;
             // H2: the add path previously had no settle — wait for the TUI to
             // own the foreground (bd-eign.6, same 15s contract as spawn)
             // before the send_text prime, so it is not lost to the shell.
-            let _ = herdr_shim::wait_agent_foreground(
+            // bd-qs1c.2: verify boot — a recipe-launched pane (unsupported
+            // --kind via pane_run) can sit as an undriven shell. Dead process
+            // = fail loud with the corpse + exact close command; unknown kind
+            // (inconclusive probe) or probe error = loud warn with the check
+            // command, never a confident healthy.
+            let foreground = herdr_shim::wait_agent_foreground(
                 &mut c,
                 &prev,
                 &kind,
                 &name,
                 Duration::from_secs(15),
             );
+            if !foreground {
+                match herdr_shim::pane_process_info(&mut c, &prev)
+                    .map(|pi| herdr_shim::pane_agent_alive(&pi, &kind))
+                {
+                    Ok(Some(false)) => bail!(
+                        "add {name}: agent process gone on {prev} — undriven shell left behind; close it with `herdr pane close {prev}`"
+                    ),
+                    Ok(_) => eprintln!(
+                        "flywheel: warn: {name} ({prev}) not foreground within 15s — boot unverified; check with `herdr pane process-info --pane {prev}`"
+                    ),
+                    Err(e) => eprintln!(
+                        "flywheel: warn: {name} ({prev}) liveness probe failed: {e:#} — boot unverified"
+                    ),
+                }
+            }
             // bd-umb3 (bd-eign.6 L2): settle — same as spawn. A TUI can own
             // the foreground while MCP servers still initialize; the prime
             // typed into a half-booted shell is lost, leaving the pane
@@ -13882,7 +13930,16 @@ fn cmd_send(
                 std::thread::sleep(Duration::from_millis(400));
             }
         }
-        targets = resolve_agents(&mut c, &ws_id, project, to);
+        // bd-qs1c.1: a send racing a fresh spawn can miss the pin (registry
+        // not yet flushed) or the pane (not yet in herdr's list) even after
+        // the rebind above. Settle on a short bounded budget — every attempt
+        // is a live re-read, never an invented delivery (GS-037).
+        if targets.is_err() {
+            eprintln!(
+                "flywheel: send --to {to}: unresolvable after rebind — settling for a fresh registration"
+            );
+            targets = settle_retry(3, 2000, || resolve_agents(&mut c, &ws_id, project, to));
+        }
     }
     let targets = targets?;
 
@@ -14774,6 +14831,42 @@ mod bd_4pxy_tests {
             "agent_prompt_stalled".into()
         )));
         assert!(!is_agent_not_ready(&BackendErrorCode::Timeout));
+    }
+
+    /// bd-qs1c.1: settle-retry budget semantics — first-try success costs
+    /// one attempt, transient misses recover within budget, exhaustion
+    /// returns the last error (caller fails loud, never invents).
+    #[test]
+    fn settle_retry_first_try_ok_costs_one_attempt() {
+        let mut tries = 0;
+        let out: Result<&str, &str> = settle_retry(3, 0, || {
+            tries += 1;
+            Ok("hit")
+        });
+        assert_eq!(out, Ok("hit"));
+        assert_eq!(tries, 1);
+    }
+
+    #[test]
+    fn settle_retry_recovers_transient_miss_within_budget() {
+        let mut tries = 0;
+        let out: Result<&str, &str> = settle_retry(3, 0, || {
+            tries += 1;
+            if tries < 3 { Err("miss") } else { Ok("hit") }
+        });
+        assert_eq!(out, Ok("hit"));
+        assert_eq!(tries, 3);
+    }
+
+    #[test]
+    fn settle_retry_exhaustion_returns_last_error() {
+        let mut tries = 0;
+        let out: Result<&str, String> = settle_retry(2, 0, || {
+            tries += 1;
+            Err(format!("miss-{tries}"))
+        });
+        assert_eq!(out, Err("miss-3".to_string()));
+        assert_eq!(tries, 3, "first try + 2 retries");
     }
 
     #[test]
@@ -19217,6 +19310,8 @@ mod verifier_dispatch_tests {
                 "work",
                 "--verify",
                 "cargo test -p flywheel verifier",
+                "--principle",
+                "prove-it-works — fixture carries runnable VERIFY fence, not a self-report",
             ])
             .current_dir(dir)
             .output()
@@ -20238,7 +20333,17 @@ mod loop_tests {
             .expect("br init");
         assert!(init.status.success(), "br init: {init:?}");
         let created = std::process::Command::new("br")
-            .args(["create", "--title", "fixture", "--description", "body"])
+            .args([
+                "create",
+                "--title",
+                "fixture",
+                "--description",
+                "body",
+                "--verify",
+                "br list --json",
+                "--principle",
+                "prove-it-works — fixture carries runnable VERIFY fence, not a self-report",
+            ])
             .current_dir(&dir)
             .output()
             .expect("br create");

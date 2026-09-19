@@ -1289,17 +1289,26 @@ mod tests {
             "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - command-verified\n",
         )
         .unwrap();
-        let mut args: Vec<&str> = vec![
-            "create",
-            "--title",
-            "gate roundtrip",
-            "--slug",
-            "gate-rt-1",
-            "-p",
-            "3",
-            "-d",
-            "work",
-        ];
+        // No VERIFY (triage/dupe shape): fail-closed `br create` refuses
+        // without --verify at every priority, so use the sanctioned
+        // no-verify path `br q` (quick capture, not dispatchable until
+        // verify is added) — NOT -p 4 (verify is still required there)
+        // and NOT a weakened assertion. P3 + empty VERIFY preserved.
+        // (`br q` takes a bare title + -p/-d only: no --title/--slug.)
+        let mut args: Vec<&str> = match verify {
+            Some(_) => vec![
+                "create",
+                "--title",
+                "gate roundtrip",
+                "--slug",
+                "gate-rt-1",
+                "-p",
+                "3",
+                "-d",
+                "work",
+            ],
+            None => vec!["q", "gate roundtrip", "-p", "3", "-d", "work"],
+        };
         if let Some(v) = verify {
             args.extend(["--verify", v]);
         }

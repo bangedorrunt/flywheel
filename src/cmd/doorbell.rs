@@ -157,6 +157,7 @@ pub(crate) enum DoorbellCmd {
     },
 }
 
+#[allow(clippy::too_many_arguments)] // clap leaf: one param per CLI flag, single call site.
 pub(crate) fn cmd_doorbell_introduce(
     cfg: &Config,
     project: &str,
