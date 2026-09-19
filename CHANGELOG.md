@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-19 doorbell vision leftovers
+
+Classifier honesty, HITL bind, and the doorbell wake gaps from live flywheel×toron collab (bd-gpj0).
+
+### Added
+- **Briefing questions bind into argv (bd-g3li).** `briefing --json` topology/crew/model answers, plus CLI `--topology` / `--crew` / `--model` on `briefing` and `reclassify`, now rewrite compose argv. TTY `--commit` prompts unanswered questions. `--topology` is an explicit request (sticky-open may still flip).
+- **HITL remix on steer / workflow run.** `--role-model ROLE=PROVIDER/MODEL`, `--role-harness ROLE=KIND`, `--crew role:n` bind the TTY remix into spawn (bd-pdpe).
+- **`flywheel doorbell roster <project>` (bd-gpj0.2).** Nearby join of herdr panes ∪ registry pins ∪ reservations. Unbound panes stay listed. `--json` for rows.
+- **`flywheel doorbell introduce <project> --pin <peer>` (bd-gpj0.3).** One verb: contact request + channel create (creator joins) + subscribe. `--dry-run` prints the plan. Defaults: channel `intro-<pin-lowercase>`, workspace `flywheel-<project>`.
+- **Open-mode arrive binds `HERDR_PANE_ID` (bd-gpj0).** The current herdr pane is written into the spawn registry so doorbell can push. Without the env, arrive says pull-only.
+- **`flywheel mail agents --disk` (bd-0cqt / bd-yfne).** Lists `key.ncryptsec` dirs not in the registry. Arrive upserts `--as` via `register_agent` before presence.
+- **beads-lifecycle `from=` / `existing_bead`.** Babysit one bead without merging lifecycle into wave-swarm.
+
+### Removed
+- **Retired slash templates.** `flywheel integration` writes only `*-mode.md` (open/swarm/loop/peer-aware) and deletes leftover `beads-*.md` / `workflow-*.md`. Catalog + `br` own those verbs (bd-z9yx).
+
+### Fixed
+- **`inbox_fetch_failing` is a fetch-path outage, not any pin error (bd-gpj0.1 / bd-gpj0.4).** Auto-host skips project `.` / `..` / blank (`cli-flywheel-.-Buffy`). No-key / register-first / unknown-agent audits as `inbox_pin_miss`. Health degrades only when every hosted workspace has a fresh `inbox_error`. Arrive refuses `.` / `..`.
+- **PATH mise shims no longer beat `~/.cargo/bin`.** Interactive PATH lists `.../mise/shims` first; those dispatchers are skipped so the real binary wins under a grok/login PATH.
+- **Introduce does not treat `does not exist` as success (bd-gpj0).** Idempotent only on `already` / `idempotent`.
+- **Classifier honesty.** Decide/briefing no longer invent `wave-swarm` under sticky-open; ready_beads matches `br ready`.
+
+### Changed
+- **Close citation is the full `%B` message (bd-qf99).** A trailing `.` or `:` is punctuation, not glue (`bd-0cqt.` cites; `bd-2qu9.1` does not). Lookup already grepped `%B`; the glue table was the reject. Agents verify with `git show -s --format=%B`.
+
+## [0.6.0] — 2026-09-10 (cut from Unreleased)
+
 ### Added
 - **The ack-SLA hit list is wired: the re-ring ladder registers from the wire, not only from the send path (ADR-0010 D1, bd-w98c residual).** `BrainMsg::SlaFired { posts }` — previously dropped on the floor in both hosts (`RtHost`/`FileHost` folded it to an empty effect list) — is now a real reducer `Msg::SlaFired`: `workspace::tick` emits one captain-relevant `ack-sla-hit` Audit naming the overdue corrs plus a `FetchInbox`, and the brain pipes the fetched rows back as `InboxFetched` (same shape as the sweep live arm). The `InboxRows` fold is the registrar: an unacked ack-overdue row (ack-required + high/urgent — toron's own scan scope) registers/refreshes its corr on the `rering` ladder with the window stamped from the tick clock (bd-bdpx rule), a per-recipient read (`read_ts_us` set) marks the entry acked, and both folds are idempotent under at-least-once redelivery. A corr seen overdue purely on the wire now climbs the ladder on the next `AckSlaTick` beat without any same-process send. The hit list never rings directly — the ladder owns re-rings.
 - **The ack-overdue read is real, and the blocked escalation is gated on it (ADR-0001 A6, bd-mail-ack-sla-tracking subtask 4).** `Mail::ack_overdue(project, agent, AckOverdueFilter{sla_secs, thread_id})` returns the messages an agent owes an ack for — `ack_required` + `importance ∈ {high, urgent}` + **no per-recipient receipt** (`message_reads`, migration 0002, written only by `mark_message_read`/`acknowledge_message`) + past the SLA (`sla_secs`, default 1800 = toron's own `check_ack_sla_expired` default; `0` = "any unacked ack-required mail"). It is a READ: it never calls toron's scan, because that primitive *emits* an `ack-sla-expired` wake and the doorbell's 60s beat already owns the emit — a second emitter would double every ring. An unregistered identity fails loudly instead of answering an empty set that looks like "nothing overdue". `MailInboxFilter.ack_overdue_only` (previously an honest `Unsupported` error) now applies the same predicate as a post-filter on both backends. Consumer: the durable blocked-escalation ladder. `notify_blocked` reads the agent's own `health-<name>` lane at SLA 0 through a new hidden `__ack-overdue` door and an ack **resets** the ladder — budget restarts from the ack, ping credit drops, T0 is recorded as handled (so an ack never provokes an immediate re-ping); a read that cannot answer (no index, unregistered agent, remote backend) is NOT an ack, so the time ladder keeps its pre-gate behavior. The gate is also skipped until the first ping is actually out — an empty thread is not an ack, and treating it as one would silence the escalation entirely. ADR-0001's acceptance ("an agent that acks or un-blocks resets the escalation") is now enforced by the read rather than assumed.
