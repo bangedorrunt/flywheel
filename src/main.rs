@@ -73,6 +73,7 @@ mod upstream_parity;
 mod verdict;
 mod work;
 mod authority;
+mod retry;
 mod workflow_catalog;
 mod workspace;
 mod write_liveness;

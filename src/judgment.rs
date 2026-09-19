@@ -447,8 +447,10 @@ impl UreqTransport {
     }
 }
 
-impl Transport for UreqTransport {
-    fn ask(&self, slice: &StateSlice, pack: &QuestionPack) -> Result<Answers, JevError> {
+impl UreqTransport {
+    /// One POST attempt: 5s timeout lives inside (P1: timeout inside retry).
+    /// ponytail: no new transport, one method split for the retry edge.
+    pub fn ask_once(&self, slice: &StateSlice, pack: &QuestionPack) -> Result<Answers, JevError> {
         let questions: BTreeMap<String, serde_json::Value> = pack
             .questions
             .iter()
@@ -487,6 +489,36 @@ impl Transport for UreqTransport {
             .into_json()
             .map_err(|e| JevError::Malformed(e.to_string()))?;
         parse_systemone_response(&v, pack)
+    }
+
+    /// Retry wrapper (P1): timeout inside `ask_once`, retry outside with
+    /// cap + backoff. Only `Offline` retries; auth/malformed fail fast.
+    pub fn ask_with_retry(
+        &self,
+        slice: &StateSlice,
+        pack: &QuestionPack,
+        policy: crate::retry::RetryPolicy,
+    ) -> Result<Answers, JevError> {
+        let mut attempt = 0u32;
+        loop {
+            match self.ask_once(slice, pack) {
+                Ok(a) => return Ok(a),
+                Err(e) => {
+                    let retryable = matches!(e, JevError::Offline(_));
+                    if !retryable || attempt + 1 >= policy.max_attempts {
+                        return Err(e);
+                    }
+                    std::thread::sleep(policy.delay_for(attempt));
+                    attempt += 1;
+                }
+            }
+        }
+    }
+}
+
+impl Transport for UreqTransport {
+    fn ask(&self, slice: &StateSlice, pack: &QuestionPack) -> Result<Answers, JevError> {
+        self.ask_once(slice, pack)
     }
 }
 
