@@ -908,6 +908,50 @@ pub fn find_pack(project: &str) -> Result<QuestionPack, String> {
     find_pack_for(project, "reclassify")
 }
 
+/// Pack cache keyed by (dir, id) with mtime invalidation (P3).
+/// ponytail: std HashMap, no TTL, mtime is the invalidation.
+#[derive(Debug, Default)]
+pub struct PackCache {
+    entries: std::collections::HashMap<(String, String), (u64, QuestionPack)>,
+}
+
+impl PackCache {
+    pub fn get_or_load(&mut self, dir: &std::path::Path, id: &str) -> Option<Result<QuestionPack, String>> {
+        let prefix = format!("{id}.v");
+        let path = newest_pack_path(dir, &prefix)?;
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let key = (dir.to_string_lossy().into_owned(), id.to_string());
+        if let Some((cached_mtime, pack)) = self.entries.get(&key)
+            && *cached_mtime == mtime {
+                return Some(Ok(pack.clone()));
+            }
+        let loaded = QuestionPack::load_from_file(&path);
+        if let Ok(pack) = &loaded {
+            self.entries.insert(key, (mtime, pack.clone()));
+        }
+        Some(loaded)
+    }
+}
+
+fn newest_pack_path(dir: &std::path::Path, prefix: &str) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(u32, std::path::PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with(prefix) && name.ends_with(PACK_SUFFIX)) {
+            continue;
+        }
+        let mid = &name[prefix.len()..name.len() - PACK_SUFFIX.len()];
+        if let Ok(v) = mid.parse::<u32>()
+            && best.as_ref().is_none_or(|(bv, _)| v > *bv) {
+                best = Some((v, entry.path()));
+            }
+    }
+    best.map(|(_, path)| path)
+}
+
 fn newest_pack_in(dir: &std::path::Path, prefix: &str) -> Option<Result<QuestionPack, String>> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut best: Option<(u32, std::path::PathBuf)> = None;
@@ -2322,6 +2366,20 @@ questions:
         .unwrap();
         let found = find_pack(base.to_str().unwrap()).unwrap();
         assert_eq!(found.version, 2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn p3_pack_cache_hits_then_invalidates_on_mtime() {
+        let base = std::env::temp_dir().join(format!("jev-packcache-{}", std::process::id()));
+        let dir = base.join(".flywheel/judgment-packs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("reclassify.v1.yaml"), PACK_YAML).unwrap();
+        let mut cache = PackCache::default();
+        let first = cache.get_or_load(&dir, "reclassify").unwrap().unwrap();
+        let second = cache.get_or_load(&dir, "reclassify").unwrap().unwrap();
+        assert_eq!(first.version, second.version);
+        assert_eq!(cache.entries.len(), 1, "one cached entry");
         let _ = std::fs::remove_dir_all(&base);
     }
 
