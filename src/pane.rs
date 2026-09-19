@@ -689,11 +689,10 @@ pub fn pane_dispatch(
     // P1+P2: transient dispatch retries ride the shared RetryPolicy (was:
     // fixed 10s x6) behind a host-held consecutive-failure breaker (5/60s).
     // Open breaker = fast escalate, never a hammered pane.
-    let dispatch_policy = crate::retry::RetryPolicy {
-        max_attempts: 6,
-        base: std::time::Duration::from_secs(5),
-        cap: std::time::Duration::from_secs(10),
-    };
+    // Per-site coverage lives with `dispatch_retry_policy` below: the loop
+    // itself needs a live pane, so the fail-twice test pins this config
+    // through the shared driver with an injected no-op sleep.
+    let dispatch_policy = dispatch_retry_policy();
     const MAX_ATTEMPTS: u32 = 6;
     {
         let mut b = dispatch_breaker().lock().expect("dispatch breaker");
@@ -925,6 +924,17 @@ pub fn pane_dispatch(
             out["retryable"] = json!(cf.retryable);
         }
         return Ok(out);
+    }
+}
+
+/// Pane-dispatch retry budget (bd-8pjr): 6 attempts, 5s base, 10s cap —
+/// same envelope as the old fixed 10s x6, now with backoff ramp + headroom.
+/// Named so the per-site fail-twice test pins the config.
+fn dispatch_retry_policy() -> crate::retry::RetryPolicy {
+    crate::retry::RetryPolicy {
+        max_attempts: 6,
+        base: std::time::Duration::from_secs(5),
+        cap: std::time::Duration::from_secs(10),
     }
 }
 
@@ -1759,6 +1769,32 @@ pub fn start_spawn_drainer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-8pjr: per-site fail-twice-then-succeed through the shared driver
+    /// with THIS site's policy (no-op sleep — the loop itself needs a live
+    /// pane, so the config rides the driver here, not the subprocess).
+    #[test]
+    fn dispatch_policy_fail_twice_then_succeeds() {
+        let policy = dispatch_retry_policy();
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let out = policy.retry_with_backoff(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err("agent_not_ready")
+                } else {
+                    Ok("sent")
+                }
+            },
+            |_| true,
+            |_, _| {},
+            |_| sleeps += 1,
+        );
+        assert_eq!(out, Ok("sent"));
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps, 2);
+    }
 
     /// bd-wave-swarm-graduation-fix-98io: both boot-race signatures are
     /// transient (retry), other reasons are not.
