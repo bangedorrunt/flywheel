@@ -1362,6 +1362,7 @@ pub fn expand_reclassify_cmds(
                         slice,
                         pack,
                         transport,
+                        screen: _,
                     } => {
                         let adapter = crate::judgment::JudgmentAdapter {
                             pack: pack.clone(),
@@ -1375,7 +1376,31 @@ pub fn expand_reclassify_cmds(
                     }
                     _ => None,
                 };
-                let enriched = crate::judgment::finish_plan(plan, posted);
+                // Doorbell battery (bd-lpn6): second pack over inbound
+                // material in the same outside-tx window. Detections annotate
+                // routing only via finish_plan; table authority untouched.
+                let screen_posted = match &plan.stage {
+                    crate::judgment::PostStage::Ready {
+                        screen: Some(ask), ..
+                    } => {
+                        let adapter = crate::judgment::JudgmentAdapter {
+                            pack: ask.pack.clone(),
+                            transport: match &plan.stage {
+                                crate::judgment::PostStage::Ready { transport, .. } => {
+                                    transport.clone()
+                                }
+                                _ => unreachable!("screen implies Ready"),
+                            },
+                        };
+                        Some(crate::judgment::run_post(
+                            adapter,
+                            &ask.slice,
+                            crate::judgment::Surface::Honesty,
+                        ))
+                    }
+                    _ => None,
+                };
+                let enriched = crate::judgment::finish_plan(plan, posted, screen_posted);
                 let ready = Msg::DecisionReady {
                     goal: intent.goal.clone(),
                     primitive: enriched.primitive,
@@ -1399,6 +1424,33 @@ pub fn expand_reclassify_cmds(
                             pin: audit_pin,
                             detail: detail.to_string(),
                         });
+                    }
+                    if let Some((audit_pin, detail)) = enriched.screen_audit {
+                        more.push(Cmd::Audit {
+                            kind: "judgment".to_string(),
+                            pin: audit_pin,
+                            detail: detail.to_string(),
+                        });
+                    }
+                    // Miss ledger (bd-lpn6): one row per expand, keyed by the
+                    // parent effect key. Best-effort: a ledger failure warns
+                    // but never fails the dispatch it observes.
+                    if let Err(e) = crate::judgment::miss_append(&crate::judgment::MissRow {
+                        ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        effect_key: intent.effect_key.clone(),
+                        goal: crate::judgment::cap_str(
+                            &intent.goal,
+                            crate::judgment::MISS_GOAL_CAP,
+                        ),
+                        table_primitive: enriched.table_primitive.clone(),
+                        table_topology: enriched.table_topology.clone(),
+                        escalated: enriched.escalated,
+                        screen: enriched.screen.clone(),
+                        resolution: None,
+                        resolved_ts: None,
+                        note: None,
+                    }) {
+                        eprintln!("flywheel: miss ledger append failed: {e}");
                     }
                     Ok(more)
                 }) {
@@ -6364,6 +6416,38 @@ mod gs048_reclassify_tests {
         );
         // Sticky-open: open session without explicit topology stays open.
         assert_eq!(m.session_topology.as_deref(), Some("open"));
+    }
+
+    /// bd-lpn6: every reclassify expand appends one miss-ledger row keyed by
+    /// the effect key — the mining surface for new routing needles.
+    #[test]
+    fn expand_appends_miss_ledger_row() {
+        let mut m = idle_captain();
+        m.session_topology = Some("open".into());
+        let (_, cmds) = tick(
+            &m,
+            &Msg::MaterialContext {
+                goal: "obscure ledger probe xyzzy".into(),
+                explicit_topology: None,
+                reason: "test-ledger".into(),
+            },
+        );
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Reclassify { .. })));
+        let _home = crate::config::test_state_home();
+        let _ = expand_reclassify_cmds(&mut m, cmds, "gs050-ledger-test", &|goal| {
+            let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
+            (
+                d.primitive.to_string(),
+                d.topology.to_string(),
+                d.argv.clone(),
+                d.reason.clone(),
+            )
+        });
+        let rows = crate::judgment::miss_read();
+        assert!(
+            rows.iter().any(|r| r.goal.contains("ledger probe")),
+            "expand appends a row for the goal: {rows:?}"
+        );
     }
 
     /// GS-049 / GS-045 P1-1 (TURN-INV / ADR-0032 I8a): identical source Msg
