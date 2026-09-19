@@ -1395,6 +1395,72 @@ pub fn render_nearby(rows: &[NearbyRow]) -> Vec<String> {
     out
 }
 
+/// One introduce step (bd-gpj0.3): contact request, channel create, or
+/// doorbell subscribe. Pure so the sequence is testable without I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntroduceStep {
+    pub verb: &'static str,
+    pub argv: Vec<String>,
+}
+
+/// Default channel id for introducing `pin`.
+pub fn introduce_channel_id(pin: &str) -> String {
+    format!("intro-{}", pin.to_ascii_lowercase())
+}
+
+/// Ordered introduce plan: contact request → channel create (creator
+/// joins) → subscribe the peer pin. Caller supplies resolved slugs.
+pub fn introduce_steps(
+    project: &str,
+    pin: &str,
+    as_pin: &str,
+    channel: &str,
+    workspace: &str,
+) -> Vec<IntroduceStep> {
+    vec![
+        IntroduceStep {
+            verb: "contact",
+            argv: vec![
+                "contact".into(),
+                "request".into(),
+                "--to".into(),
+                pin.into(),
+                "--as".into(),
+                as_pin.into(),
+                "--project".into(),
+                project.into(),
+                "--reason".into(),
+                "introduce".into(),
+            ],
+        },
+        IntroduceStep {
+            verb: "channel",
+            argv: vec![
+                "channel".into(),
+                "create".into(),
+                channel.into(),
+                "--name".into(),
+                format!("intro {pin}"),
+                "--project".into(),
+                project.into(),
+                "--as".into(),
+                as_pin.into(),
+            ],
+        },
+        IntroduceStep {
+            verb: "subscribe",
+            argv: vec![
+                "--workspace".into(),
+                workspace.into(),
+                "--pin".into(),
+                pin.into(),
+                "--project".into(),
+                project.into(),
+            ],
+        },
+    ]
+}
+
 /// Cross-workspace scopes (bd-asr2.18, D5, flag-gated): widen one pin's
 /// Scope stays explicit (Scope::Many, deduped) — never an implicit
 /// all-workspace watch. Flag off or non-operator actor refuses.
@@ -3114,6 +3180,47 @@ mod tests {
         assert!(rendered[0].starts_with("NEARBY"));
         assert!(rendered.iter().any(|l| l.contains("BoardAgent")));
         assert!(rendered.iter().any(|l| l.contains("held=src/main.rs")));
+    }
+
+    #[test]
+    fn introduce_steps_are_contact_then_channel_then_subscribe() {
+        let steps = introduce_steps(
+            "flywheel",
+            "BoardAgent",
+            "QuietHeron",
+            "intro-boardagent",
+            "flywheel-flywheel",
+        );
+        assert_eq!(
+            steps.iter().map(|s| s.verb).collect::<Vec<_>>(),
+            ["contact", "channel", "subscribe"]
+        );
+        assert!(
+            steps[0]
+                .argv
+                .windows(2)
+                .any(|w| w == ["--to", "BoardAgent"]),
+            "contact requests the peer: {:?}",
+            steps[0].argv
+        );
+        assert!(
+            steps[1].argv.iter().any(|a| a == "intro-boardagent"),
+            "channel create uses the intro id: {:?}",
+            steps[1].argv
+        );
+        assert!(
+            steps[2]
+                .argv
+                .windows(2)
+                .any(|w| w == ["--pin", "BoardAgent"])
+                && steps[2]
+                    .argv
+                    .windows(2)
+                    .any(|w| w == ["--project", "flywheel"]),
+            "subscribe names pin+project: {:?}",
+            steps[2].argv
+        );
+        assert_eq!(introduce_channel_id("BoardAgent"), "intro-boardagent");
     }
 
     #[test]

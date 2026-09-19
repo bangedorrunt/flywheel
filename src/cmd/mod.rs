@@ -42,9 +42,9 @@ pub(crate) use cron::CronCmd;
 #[cfg(feature = "serve")]
 pub(crate) use daemon::DaemonCmd;
 pub(crate) use doorbell::{
-    DoorbellCmd, cmd_doorbell_digest, cmd_doorbell_inject, cmd_doorbell_re_inject,
-    cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop,
-    cmd_doorbell_subscribe, cmd_internal_doorbell,
+    DoorbellCmd, cmd_doorbell_digest, cmd_doorbell_inject, cmd_doorbell_introduce,
+    cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
+    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_internal_doorbell,
 };
 pub(crate) use history::{
     cmd_analytics, cmd_audit, cmd_changes, cmd_history, cmd_resume, cmd_timeline,

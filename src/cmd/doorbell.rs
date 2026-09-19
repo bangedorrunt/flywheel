@@ -126,6 +126,28 @@ pub(crate) enum DoorbellCmd {
         #[arg(long)]
         json: bool,
     },
+    /// one-command introduce: contact request + channel create + subscribe
+    /// (bd-gpj0.3). Idempotent. `--dry-run` prints the plan.
+    Introduce {
+        project: String,
+        /// peer pin to introduce
+        #[arg(long)]
+        pin: String,
+        /// our pin (default: AGENT_NAME / TORON_AGENT / FLYWHEEL_MAIL_AS)
+        #[arg(long = "as")]
+        as_pin: Option<String>,
+        /// channel id (default: intro-<pin-lowercase>)
+        #[arg(long)]
+        channel: Option<String>,
+        /// doorbell workspace (default: flywheel-<project>)
+        #[arg(long)]
+        workspace: Option<String>,
+        /// print the three steps, do not run them
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// list subscription store rows.
     Subscriptions {},
     /// drop one subscription row by id.
@@ -133,6 +155,135 @@ pub(crate) enum DoorbellCmd {
         /// subscription id (see `subscriptions`)
         id: String,
     },
+}
+
+pub(crate) fn cmd_doorbell_introduce(
+    cfg: &Config,
+    project: &str,
+    pin: &str,
+    as_pin: Option<&str>,
+    channel: Option<&str>,
+    workspace: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    crate::check_project_spelling(project, "doorbell introduce")?;
+    let _ = cfg;
+    if pin.trim().is_empty() {
+        anyhow::bail!("doorbell introduce requires --pin <adjectiveNoun>");
+    }
+    let as_pin = as_pin
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("AGENT_NAME").ok())
+        .or_else(|| std::env::var("TORON_AGENT").ok())
+        .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok())
+        .ok_or_else(|| anyhow::anyhow!("doorbell introduce needs --as <pin> (or AGENT_NAME)"))?;
+    let channel = channel
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::doorbell::introduce_channel_id(pin));
+    let workspace = workspace
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::swarm_label(project));
+    let steps = crate::doorbell::introduce_steps(project, pin, &as_pin, &channel, &workspace);
+    if dry_run {
+        if json {
+            let rows: Vec<serde_json::Value> = steps
+                .iter()
+                .map(|s| serde_json::json!({ "verb": s.verb, "argv": s.argv }))
+                .collect();
+            crate::output::print_json(&serde_json::json!({
+                "project": project,
+                "pin": pin,
+                "as": as_pin,
+                "channel": channel,
+                "workspace": workspace,
+                "steps": rows,
+            }));
+        } else {
+            println!(
+                "introduce dry-run pin={pin} as={as_pin} channel={channel} workspace={workspace}"
+            );
+            for s in &steps {
+                println!("  {} {}", s.verb, s.argv.join(" "));
+            }
+        }
+        return Ok(());
+    }
+    let mut results = Vec::new();
+    for step in &steps {
+        let outcome = match step.verb {
+            "subscribe" => run_introduce_subscribe(step, &workspace, pin, project),
+            _ => run_introduce_toron(&step.argv),
+        };
+        match outcome {
+            Ok(msg) => {
+                println!("{}: {msg}", step.verb);
+                results.push((step.verb, true, msg));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if introduce_idempotent(&msg) {
+                    println!("{}: already ({msg})", step.verb);
+                    results.push((step.verb, true, msg));
+                } else {
+                    anyhow::bail!("{} failed: {msg}", step.verb);
+                }
+            }
+        }
+    }
+    if json {
+        let rows: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(v, ok, m)| serde_json::json!({"verb": v, "ok": ok, "detail": m}))
+            .collect();
+        crate::output::print_json(&serde_json::json!({ "ok": true, "steps": rows }));
+    }
+    Ok(())
+}
+
+fn introduce_idempotent(msg: &str) -> bool {
+    let s = msg.to_ascii_lowercase();
+    s.contains("already") || s.contains("idempotent") || s.contains("exists")
+}
+
+fn run_introduce_toron(argv: &[String]) -> Result<String> {
+    let out = std::process::Command::new("toron").args(argv).output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok(if stdout.is_empty() {
+            "ok".into()
+        } else {
+            stdout
+        })
+    } else {
+        anyhow::bail!(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+fn run_introduce_subscribe(
+    step: &crate::doorbell::IntroduceStep,
+    workspace: &str,
+    pin: &str,
+    project: &str,
+) -> Result<String> {
+    let _ = step;
+    cmd_doorbell_subscribe(
+        &Config::default(),
+        workspace,
+        pin,
+        "herdr",
+        None,
+        &[],
+        Some(project),
+    )?;
+    Ok(format!("subscribed {pin} on {workspace}"))
 }
 
 pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Result<()> {
