@@ -394,8 +394,10 @@ pub fn build_state_slice(fields: BTreeMap<String, String>) -> StateSlice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JevError {
-    /// No key, timeout, 429, outage, malformed body — all deny shapes.
+    /// No key, timeout, outage — deny shapes.
     Offline(String),
+    /// HTTP 429: named so callers escalate fast instead of retry-storming.
+    RateLimited(String),
     Unauthorized,
     Malformed(String),
 }
@@ -404,6 +406,7 @@ impl std::fmt::Display for JevError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JevError::Offline(w) => write!(f, "offline/denied: {w}"),
+            JevError::RateLimited(w) => write!(f, "rate-limited (429): {w}"),
             JevError::Unauthorized => write!(f, "unauthorized (key custody)"),
             JevError::Malformed(w) => write!(f, "malformed response: {w}"),
         }
@@ -482,6 +485,7 @@ impl UreqTransport {
             .send_json(body)
             .map_err(|e| match e {
                 ureq::Error::Status(401, _) => JevError::Unauthorized,
+                ureq::Error::Status(429, _) => JevError::RateLimited("http status 429".into()),
                 ureq::Error::Status(code, _) => JevError::Offline(format!("http status {code}")),
                 ureq::Error::Transport(t) => JevError::Offline(t.to_string()),
             })?;
