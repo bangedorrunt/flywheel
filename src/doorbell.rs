@@ -1461,6 +1461,13 @@ pub fn introduce_steps(
     ]
 }
 
+/// True only for a prior successful introduce, never a missing resource.
+/// `"does not exist"` must not count (ce-review finding on bd-gpj0.3).
+pub fn introduce_idempotent(msg: &str) -> bool {
+    let s = msg.to_ascii_lowercase();
+    s.contains("already") || s.contains("idempotent")
+}
+
 /// Cross-workspace scopes (bd-asr2.18, D5, flag-gated): widen one pin's
 /// Scope stays explicit (Scope::Many, deduped) — never an implicit
 /// all-workspace watch. Flag off or non-operator actor refuses.
@@ -3221,6 +3228,18 @@ mod tests {
             steps[2].argv
         );
         assert_eq!(introduce_channel_id("BoardAgent"), "intro-boardagent");
+    }
+
+    #[test]
+    fn introduce_idempotent_does_not_swallow_missing_peer() {
+        assert!(introduce_idempotent("channel already exists"));
+        assert!(introduce_idempotent("already a member"));
+        assert!(introduce_idempotent("idempotent bootstrap"));
+        assert!(
+            !introduce_idempotent("agent BoardAgent does not exist"),
+            "missing peer is a hard fail, not success"
+        );
+        assert!(!introduce_idempotent("project flywheel does not exist"));
     }
 
     #[test]

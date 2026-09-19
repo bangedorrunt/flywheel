@@ -210,7 +210,7 @@ pub(crate) fn cmd_doorbell_introduce(
                 "introduce dry-run pin={pin} as={as_pin} channel={channel} workspace={workspace}"
             );
             for s in &steps {
-                println!("  {} {}", s.verb, s.argv.join(" "));
+                println!("  {}", s.argv.join(" "));
             }
         }
         return Ok(());
@@ -228,7 +228,7 @@ pub(crate) fn cmd_doorbell_introduce(
             }
             Err(e) => {
                 let msg = e.to_string();
-                if introduce_idempotent(&msg) {
+                if crate::doorbell::introduce_idempotent(&msg) {
                     println!("{}: already ({msg})", step.verb);
                     results.push((step.verb, true, msg));
                 } else {
@@ -245,11 +245,6 @@ pub(crate) fn cmd_doorbell_introduce(
         crate::output::print_json(&serde_json::json!({ "ok": true, "steps": rows }));
     }
     Ok(())
-}
-
-fn introduce_idempotent(msg: &str) -> bool {
-    let s = msg.to_ascii_lowercase();
-    s.contains("already") || s.contains("idempotent") || s.contains("exists")
 }
 
 fn run_introduce_toron(argv: &[String]) -> Result<String> {
