@@ -2369,22 +2369,33 @@ fn agent_display(a: &AgentInfo) -> String {
 /// pane (not yet in herdr's list). Each attempt is a live re-read — never an
 /// invented observation (GS-037) — and exhaustion returns the last error for
 /// the caller to fail loud. `retries` counts RE-tries after the first try.
+///
+/// Rides the shared [`crate::retry::RetryPolicy`] (bd-8pjr): every error is
+/// retryable here by design — a re-read miss is always transient-shaped,
+/// so no classified-retryable predicate (a predicate would just say yes).
+/// Timing stays fixed (`cap == base == sleep_ms`, plus the policy's 10%
+/// headroom) to preserve the bd-qs1c.1 budget semantics below.
 fn settle_retry<T, E>(
     retries: u32,
     sleep_ms: u64,
-    mut attempt: impl FnMut() -> Result<T, E>,
+    attempt: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {
-    let mut out = attempt();
-    for _ in 0..retries {
-        if out.is_ok() {
-            break;
-        }
-        if sleep_ms > 0 {
-            std::thread::sleep(Duration::from_millis(sleep_ms));
-        }
-        out = attempt();
-    }
-    out
+    let base = Duration::from_millis(sleep_ms);
+    let policy = crate::retry::RetryPolicy {
+        max_attempts: retries.saturating_add(1).max(1),
+        base,
+        cap: base,
+    };
+    policy.retry_with_backoff(
+        attempt,
+        |_| true,
+        |_, _| {},
+        |d| {
+            if !d.is_zero() {
+                std::thread::sleep(d);
+            }
+        },
+    )
 }
 
 /// bd-a2bw / ADR-0018: herdr omp panes drop names (bd-w17). Fill null
@@ -7021,13 +7032,19 @@ fn prime_via_send_text(c: &mut Client, pane_id: &str) {
 /// launch text must NEVER ride agent.start args — opencode reads a
 /// positional arg as a DIRECTORY ("Failed to change directory to <prompt>");
 /// every prime is typed via pane.send_text after TUI readiness.
-fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) {
-    // P1: boot-prime loop rides the shared RetryPolicy (was: fixed 2s x3).
-    let policy = crate::retry::RetryPolicy {
+/// Boot-prime retry budget (bd-8pjr): 3 attempts, 2s base, 5s cap.
+/// Named so the per-site fail-twice test below pins the config.
+fn boot_prime_policy() -> crate::retry::RetryPolicy {
+    crate::retry::RetryPolicy {
         max_attempts: 3,
         base: Duration::from_secs(2),
         cap: Duration::from_secs(5),
-    };
+    }
+}
+
+fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) {
+    // P1: boot-prime loop rides the shared RetryPolicy (was: fixed 2s x3).
+    let policy = boot_prime_policy();
     let max = policy.max_attempts;
     let res = policy.retry_with_backoff(
         || {
@@ -14865,6 +14882,46 @@ mod bd_4pxy_tests {
 
     #[test]
     fn settle_retry_recovers_transient_miss_within_budget() {
+        let mut tries = 0;
+        let out: Result<&str, &str> = settle_retry(3, 0, || {
+            tries += 1;
+            if tries < 3 { Err("miss") } else { Ok("hit") }
+        });
+        assert_eq!(out, Ok("hit"));
+        assert_eq!(tries, 3);
+    }
+
+    /// bd-8pjr: per-site fail-twice-then-succeed for boot-prime THROUGH the
+    /// site policy (no-op sleep — the real loop needs a herdr Client, so
+    /// the config rides the driver here).
+    #[test]
+    fn boot_prime_policy_fail_twice_then_succeeds() {
+        let policy = boot_prime_policy();
+        assert_eq!(policy.max_attempts, 3);
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let out = policy.retry_with_backoff(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err("prime refused")
+                } else {
+                    Ok(())
+                }
+            },
+            |_| true,
+            |_, _| {},
+            |_| sleeps += 1,
+        );
+        assert!(out.is_ok());
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps, 2);
+    }
+
+    /// bd-8pjr: settle_retry fail-twice-then-succeeds end to end (sleep 0
+    /// keeps it hermetic; the shared driver owns the backoff math).
+    #[test]
+    fn settle_retry_fail_twice_then_succeeds() {
         let mut tries = 0;
         let out: Result<&str, &str> = settle_retry(3, 0, || {
             tries += 1;
