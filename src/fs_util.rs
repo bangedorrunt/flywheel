@@ -10,6 +10,28 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
+
+/// Rename-visibility probe (P6): poll for the renamed path up to `cap` in
+/// `step` increments. Predicate-injected so tests substitute a scripted
+/// sequence instead of sleeping. The documented 30s settle elsewhere stays.
+pub fn poll_until(mut visible: impl FnMut() -> bool, cap: Duration, step: Duration) -> bool {
+    let deadline = std::time::Instant::now() + cap;
+    loop {
+        if visible() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(step);
+    }
+}
+
+/// Default probe: 2s cap, 50ms step.
+pub fn wait_for_visible(path: &Path) -> bool {
+    poll_until(|| path.exists(), Duration::from_secs(2), Duration::from_millis(50))
+}
 
 use anyhow::{Context, Result};
 
@@ -91,5 +113,27 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp cleaned up on failure");
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn p6_probe_sees_delayed_visibility_without_real_rename() {
+        let mut calls = 0;
+        let hit = super::poll_until(
+            || { calls += 1; calls >= 3 },
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(1),
+        );
+        assert!(hit);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn p6_probe_times_out_at_cap() {
+        let hit = super::poll_until(
+            || false,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(1),
+        );
+        assert!(!hit);
     }
 }
