@@ -72,6 +72,7 @@ mod toron_embed;
 mod upstream_parity;
 mod verdict;
 mod work;
+mod authority;
 mod workflow_catalog;
 mod workspace;
 mod write_liveness;

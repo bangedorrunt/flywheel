@@ -177,9 +177,7 @@ pub(crate) fn cmd_doorbell_introduce(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or_else(|| std::env::var("AGENT_NAME").ok())
-        .or_else(|| std::env::var("TORON_AGENT").ok())
-        .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok())
+        .or_else(|| crate::authority::HostAuthority::resolve().agent_name)
         .ok_or_else(|| anyhow::anyhow!("doorbell introduce needs --as <pin> (or AGENT_NAME)"))?;
     let channel = channel
         .map(str::trim)
