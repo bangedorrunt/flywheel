@@ -22,7 +22,9 @@
 mod agent_ref;
 mod agentstate;
 mod artifact;
+mod authority;
 mod backend;
+mod breaker;
 mod briefing;
 mod builtin_workflows;
 mod captain_slot;
@@ -59,6 +61,7 @@ mod plane_route;
 mod preflight;
 mod principles;
 mod profile;
+mod retry;
 mod rot;
 mod run_log;
 mod signoff;
@@ -72,9 +75,6 @@ mod toron_embed;
 mod upstream_parity;
 mod verdict;
 mod work;
-mod authority;
-mod breaker;
-mod retry;
 mod workflow_catalog;
 mod workspace;
 mod write_liveness;
@@ -7022,29 +7022,34 @@ fn prime_via_send_text(c: &mut Client, pane_id: &str) {
 /// positional arg as a DIRECTORY ("Failed to change directory to <prompt>");
 /// every prime is typed via pane.send_text after TUI readiness.
 fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) {
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let res = c
-            .pane_send_text(pane_id, line)
-            .and_then(|_| c.pane_send_input(pane_id, &["Enter"]));
-        match res {
-            Ok(_) => return,
-            Err(e) if attempt < MAX_ATTEMPTS => {
-                eprintln!(
-                    "flywheel: warn: boot-prime attempt {attempt}/{MAX_ATTEMPTS} failed for {pane_id}: {e:#} — retrying"
-                );
-                std::thread::sleep(Duration::from_secs(2));
-            }
-            Err(e) => {
-                eprintln!(
-                    "flywheel: warn: boot-prime via pane.send_text failed for {pane_id} after {MAX_ATTEMPTS} attempts: {e:#}"
-                );
-                eprintln!(
-                    "flywheel:   manual socket prime: herdr pane send-text {pane_id} '{}' then send Enter (or herdr agent prompt {pane_id})",
-                    line
-                );
-            }
-        }
+    // P1: boot-prime loop rides the shared RetryPolicy (was: fixed 2s x3).
+    let policy = crate::retry::RetryPolicy {
+        max_attempts: 3,
+        base: Duration::from_secs(2),
+        cap: Duration::from_secs(5),
+    };
+    let max = policy.max_attempts;
+    let res = policy.retry_with_backoff(
+        || {
+            c.pane_send_text(pane_id, line)
+                .and_then(|_| c.pane_send_input(pane_id, &["Enter"]))
+        },
+        |_| true,
+        |attempt, e| {
+            eprintln!(
+                "flywheel: warn: boot-prime attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying"
+            );
+        },
+        std::thread::sleep,
+    );
+    if let Err(e) = res {
+        eprintln!(
+            "flywheel: warn: boot-prime via pane.send_text failed for {pane_id} after {max} attempts: {e:#}"
+        );
+        eprintln!(
+            "flywheel:   manual socket prime: herdr pane send-text {pane_id} '{}' then send Enter (or herdr agent prompt {pane_id})",
+            line
+        );
     }
 }
 

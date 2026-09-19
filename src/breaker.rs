@@ -20,7 +20,12 @@ pub struct ConsecutiveBreaker {
 
 impl ConsecutiveBreaker {
     pub fn new(threshold: u32, cooldown: Duration) -> Self {
-        Self { threshold, cooldown, failures: 0, opened_at: None }
+        Self {
+            threshold,
+            cooldown,
+            failures: 0,
+            opened_at: None,
+        }
     }
 
     pub fn allows(&mut self) -> bool {

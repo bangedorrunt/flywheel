@@ -686,8 +686,25 @@ pub fn pane_dispatch(
     // the first step fires: `agent_not_ready` is transient — retry with
     // backoff (bounded; a persistent not-ready surfaces as a per-step error,
     // never a hang).
-    let mut attempts = 0;
+    // P1+P2: transient dispatch retries ride the shared RetryPolicy (was:
+    // fixed 10s x6) behind a host-held consecutive-failure breaker (5/60s).
+    // Open breaker = fast escalate, never a hammered pane.
+    let dispatch_policy = crate::retry::RetryPolicy {
+        max_attempts: 6,
+        base: std::time::Duration::from_secs(5),
+        cap: std::time::Duration::from_secs(10),
+    };
     const MAX_ATTEMPTS: u32 = 6;
+    {
+        let mut b = dispatch_breaker().lock().expect("dispatch breaker");
+        if !b.allows() {
+            let st = b.state();
+            bail!(
+                "pane dispatch: consecutive-failure breaker {st:?} — fast escalate, waiting out cooldown instead of hammering the pane"
+            );
+        }
+    }
+    let mut attempts = 0;
     // bd-mukq: 429 reroute state — the CURRENT send target (starts at the
     // resolved entry) plus the attempted profiles (starts at the step's
     // own). A 429 swaps the target to a live fallback-profile pane and
@@ -719,11 +736,13 @@ pub fn pane_dispatch(
                 .map(is_transient_dispatch_reason)
                 .unwrap_or(false);
             if transient && attempts < MAX_ATTEMPTS {
+                let wait = dispatch_policy.delay_for(attempts);
                 attempts += 1;
                 eprintln!(
-                    "flywheel: @{attempt_profile} not ready (attempt {attempts}/{MAX_ATTEMPTS}) — retrying in 10s"
+                    "flywheel: @{attempt_profile} not ready (attempt {attempts}/{MAX_ATTEMPTS}) — retrying in {}s",
+                    wait.as_secs()
                 );
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                std::thread::sleep(wait);
                 continue;
             }
             // bd-lifecycle-occupied-pane-wedge-07tx: bounded-fail-loud. The
@@ -739,6 +758,10 @@ pub fn pane_dispatch(
                     .and_then(Value::as_str)
                     .unwrap_or("transient")
                     .to_string();
+                dispatch_breaker()
+                    .lock()
+                    .expect("dispatch breaker")
+                    .record_failure();
                 return Err(anyhow!(
                     "dispatch @{attempt_profile} ({}) failed after {MAX_ATTEMPTS} transient retries: {reason} — the target pane never became available; fix the pane (occupied/dead) or fail the step",
                     attempt_entry.name
@@ -874,6 +897,10 @@ pub fn pane_dispatch(
             if !reroute_trail.is_empty() {
                 out["reroute_trail"] = json!(reroute_trail);
             }
+            dispatch_breaker()
+                .lock()
+                .expect("dispatch breaker")
+                .record_success();
             return Ok(crate::phase_chain::annotate_dispatch_output(
                 spec, inputs, out,
             ));
@@ -899,6 +926,14 @@ pub fn pane_dispatch(
         }
         return Ok(out);
     }
+}
+
+/// Host-held dispatch breaker (P2): consecutive failures open it for 60s.
+/// ponytail: process-local static, threshold 5 per ADR-0015 §3 P2.
+fn dispatch_breaker() -> &'static std::sync::Mutex<crate::breaker::ConsecutiveBreaker> {
+    static BREAKER: std::sync::OnceLock<std::sync::Mutex<crate::breaker::ConsecutiveBreaker>> =
+        std::sync::OnceLock::new();
+    BREAKER.get_or_init(|| std::sync::Mutex::new(crate::breaker::ConsecutiveBreaker::default()))
 }
 
 /// bd-mukq: select a one-hop 429 reroute target for a pane dispatch — the

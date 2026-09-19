@@ -13,26 +13,35 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { max_attempts: 3, base: Duration::from_millis(200), cap: Duration::from_secs(5) }
+        Self {
+            max_attempts: 3,
+            base: Duration::from_millis(200),
+            cap: Duration::from_secs(5),
+        }
     }
 }
 
 impl RetryPolicy {
     pub fn delay_for(&self, attempt: u32) -> Duration {
-        let exp = self.base.as_millis().saturating_mul(1u128 << attempt.min(10));
+        let exp = self
+            .base
+            .as_millis()
+            .saturating_mul(1u128 << attempt.min(10));
         let capped = exp.min(self.cap.as_millis());
         let jitter = capped / 10;
         Duration::from_millis((capped + jitter) as u64)
     }
 
     /// Run `op` until success, non-retryable error, or cap. `is_retryable`
-    /// classifies the error; `sleep` is injected so tests substitute.
-    pub fn retry_with_backoff<E>(
+    /// classifies the error; `on_retry` observes each wait (warn lines);
+    /// `sleep` is injected so tests substitute.
+    pub fn retry_with_backoff<T, E>(
         &self,
-        mut op: impl FnMut() -> Result<String, E>,
+        mut op: impl FnMut() -> Result<T, E>,
         is_retryable: impl Fn(&E) -> bool,
+        mut on_retry: impl FnMut(u32, &E),
         mut sleep: impl FnMut(Duration),
-    ) -> Result<String, E> {
+    ) -> Result<T, E> {
         let mut attempt = 0u32;
         loop {
             match op() {
@@ -41,6 +50,7 @@ impl RetryPolicy {
                     if !is_retryable(&e) || attempt + 1 >= self.max_attempts {
                         return Err(e);
                     }
+                    on_retry(attempt + 1, &e);
                     sleep(self.delay_for(attempt));
                     attempt += 1;
                 }
@@ -55,27 +65,38 @@ mod tests {
 
     #[test]
     fn fail_twice_then_succeed_stops_at_cap() {
-        let p = RetryPolicy { max_attempts: 3, ..Default::default() };
+        let p = RetryPolicy {
+            max_attempts: 3,
+            ..Default::default()
+        };
         let mut calls = 0;
         let mut sleeps = 0;
+        let mut retries_seen = 0;
         let r = p.retry_with_backoff(
             || {
                 calls += 1;
-                if calls < 3 { Err("boom") } else { Ok("ok".into()) }
+                if calls < 3 {
+                    Err("boom")
+                } else {
+                    Ok("ok".to_string())
+                }
             },
             |_| true,
+            |_, _| retries_seen += 1,
             |_| sleeps += 1,
         );
         assert_eq!(r.unwrap(), "ok");
         assert_eq!(calls, 3);
         assert_eq!(sleeps, 2);
+        assert_eq!(retries_seen, 2);
     }
 
     #[test]
     fn non_retryable_does_not_sleep() {
         let p = RetryPolicy::default();
         let mut sleeps = 0;
-        let r: Result<String, &str> = p.retry_with_backoff(|| Err("nope"), |_| false, |_| sleeps += 1);
+        let r: Result<String, &str> =
+            p.retry_with_backoff(|| Err("nope"), |_| false, |_, _| {}, |_| sleeps += 1);
         assert!(r.is_err());
         assert_eq!(sleeps, 0);
     }
