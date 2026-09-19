@@ -406,6 +406,7 @@ impl Transport for OfflineTransport {
 }
 
 /// Live System One POST over ureq (blocking, 5s timeout).
+#[derive(Debug, Clone)]
 pub struct UreqTransport {
     pub api_key: String,
     pub url: String,
@@ -622,6 +623,10 @@ pub struct JudgmentEffect {
     pub fallback_flag: bool,
     pub escalated: bool,
     pub note: String,
+    /// Measured System One POST latency in ms (bd-n86n, ADR-0014 S8
+    /// measurement duty). 0 = no POST ran (deny before network).
+    #[serde(default)]
+    pub latency_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +677,7 @@ pub fn merge(
     model_id: &str,
     usage: &str,
     fallback_flag: bool,
+    latency_ms: u64,
     deny_note: Option<&str>,
 ) -> MergeResult {
     let mut advisory_parts: Vec<String> = Vec::new();
@@ -730,6 +736,7 @@ pub fn merge(
             fallback_flag,
             escalated: escalate,
             note: cap_str(deny_note.unwrap_or("ok"), AUDIT_NOTE_CAP),
+            latency_ms,
         },
     }
 }
@@ -745,27 +752,6 @@ pub fn jev_enabled() -> bool {
         Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
         Err(_) => false,
     }
-}
-
-/// W2 reclassify enricher input, assembled by the host expand path.
-/// Goal/pin/reason travel inside `slice_fields` (folded by `enrich_expand`);
-/// only merge-relevant context lives here.
-pub struct EnrichInput {
-    pub explicit_topology: Option<String>,
-    pub parent_effect_key: String,
-    pub sticky_topology: Option<String>,
-    pub table: TableDecision,
-    pub slice_fields: BTreeMap<String, String>,
-    pub pack: QuestionPack,
-}
-
-/// W2 output: merged decision + audit detail carrying the JudgmentEffect.
-pub struct EnrichOutput {
-    pub primitive: String,
-    pub topology: String,
-    pub argv: Vec<String>,
-    pub reason: String,
-    pub audit_detail: serde_json::Value,
 }
 
 // W2 host entry point.
@@ -879,52 +865,94 @@ pub struct ExpandOut {
     pub audit: Option<(String, serde_json::Value)>,
 }
 
-/// W2 host hook wrapping the pure table leaf. Flag off → table passes
-/// through untouched and `audit` is None (byte-identical expand). Flag on →
-/// discover pack (missing = deny), slice, ask on the honesty surface, merge
-/// table-wins, and always emit the JudgmentEffect audit row.
-pub fn enrich_expand(a: ExpandArgs) -> ExpandOut {
+/// Split of the enrich path across the journal tx boundary (bd-n86n): the
+/// blocking System One POST must never run inside `commit_reclassify`'s
+/// closure (it holds the journal tx). `prepare_post` (pack discovery, slice
+/// build) and `run_post` (timed network) run OUTSIDE the tx; only
+/// `finish_plan` (merge) runs inside, beside `tick`.
+#[derive(Debug)]
+pub struct PostPlan {
+    pub table: TableDecision,
+    pub pin: String,
+    pub explicit_topology: Option<String>,
+    pub parent_effect_key: String,
+    pub sticky_topology: Option<String>,
+    pub stage: PostStage,
+}
+
+#[derive(Debug)]
+pub enum PostStage {
+    /// Flag off: table passes through untouched, no audit.
+    Off,
+    /// Flag on but undeployable (missing pack / no key): deny merged now,
+    /// no POST ever runs. `latency_ms` records 0 (no network happened).
+    Deny {
+        note: String,
+        pack_id: String,
+        pack_version: u32,
+        model_id: String,
+    },
+    /// Flag on and deployable: POST outside the tx, then finish.
+    Ready {
+        slice: StateSlice,
+        pack: QuestionPack,
+        transport: UreqTransport,
+    },
+}
+
+fn table_of(a: &ExpandArgs) -> TableDecision {
+    TableDecision {
+        primitive: a.table_primitive.clone(),
+        topology: a.table_topology.clone(),
+        argv: a.table_argv.clone(),
+        reason: a.table_reason.clone(),
+    }
+}
+
+fn plan_of(a: ExpandArgs, stage: PostStage) -> PostPlan {
+    PostPlan {
+        table: table_of(&a),
+        pin: a.pin,
+        explicit_topology: a.explicit_topology,
+        parent_effect_key: a.parent_effect_key,
+        sticky_topology: a.sticky_topology,
+        stage,
+    }
+}
+
+/// Phase 1 (no network): flag check, pack discovery, key read, slice build.
+/// Returns `Ready` iff a POST should run; the caller runs `run_post`
+/// outside the journal tx, then `finish_plan` inside.
+pub fn prepare_post(a: ExpandArgs) -> PostPlan {
     if !jev_enabled() {
-        return ExpandOut {
-            primitive: a.table_primitive,
-            topology: a.table_topology,
-            argv: a.table_argv,
-            reason: a.table_reason,
-            audit: None,
-        };
+        return plan_of(a, PostStage::Off);
     }
     let pack = match find_pack(&a.project) {
         Ok(p) => p,
         Err(e) => {
-            let table = TableDecision {
-                primitive: a.table_primitive,
-                topology: a.table_topology,
-                argv: a.table_argv,
-                reason: a.table_reason,
-            };
-            let merged = merge(
-                &table,
-                None,
-                0.0,
-                ActionClass::HonestyGate,
-                &active_thresholds(),
-                a.sticky_topology.as_deref(),
-                a.explicit_topology.as_deref(),
-                &a.parent_effect_key,
-                "reclassify",
-                0,
-                JEV_MODEL_PIN,
-                "{}",
-                false,
-                Some(&e),
+            return plan_of(
+                a,
+                PostStage::Deny {
+                    note: e,
+                    pack_id: "reclassify".into(),
+                    pack_version: 0,
+                    model_id: JEV_MODEL_PIN.into(),
+                },
             );
-            return ExpandOut {
-                primitive: merged.primitive,
-                topology: merged.topology,
-                argv: merged.argv,
-                reason: merged.reason,
-                audit: Some((a.pin, serde_json::json!(&merged.effect))),
-            };
+        }
+    };
+    let transport = match UreqTransport::from_env() {
+        Ok(t) => t,
+        Err(e) => {
+            return plan_of(
+                a,
+                PostStage::Deny {
+                    note: e.to_string(),
+                    pack_id: pack.id.clone(),
+                    pack_version: pack.version,
+                    model_id: pack.model.clone(),
+                },
+            );
         }
     };
     let mut slice_fields = BTreeMap::new();
@@ -933,120 +961,146 @@ pub fn enrich_expand(a: ExpandArgs) -> ExpandOut {
     slice_fields.insert("pin".to_string(), a.pin.clone());
     slice_fields.insert("table_primitive".to_string(), a.table_primitive.clone());
     slice_fields.insert("table_topology".to_string(), a.table_topology.clone());
-    let table = TableDecision {
-        primitive: a.table_primitive,
-        topology: a.table_topology,
-        argv: a.table_argv,
-        reason: a.table_reason,
-    };
-    match maybe_enrich(EnrichInput {
-        explicit_topology: a.explicit_topology,
-        parent_effect_key: a.parent_effect_key,
-        sticky_topology: a.sticky_topology,
-        table,
-        slice_fields,
-        pack,
-    }) {
-        None => unreachable!("flag checked on"),
-        Some(o) => ExpandOut {
-            primitive: o.primitive,
-            topology: o.topology,
-            argv: o.argv,
-            reason: o.reason,
-            audit: Some((a.pin, o.audit_detail)),
+    let slice = build_state_slice(slice_fields);
+    plan_of(
+        a,
+        PostStage::Ready {
+            slice,
+            pack,
+            transport,
         },
-    }
+    )
 }
 
-/// Host expand hook. Flag off (default) → `None`: the caller passes the
-/// table decision through byte-identical (no marker, no audit). Flag on →
-/// `Some` merged decision; deny refuses into escalate + audit (never silent
-/// table fallback on this honesty path).
-pub fn maybe_enrich(input: EnrichInput) -> Option<EnrichOutput> {
-    if !jev_enabled() {
-        return None;
-    }
-    let table = input.table.clone();
-    let transport = match UreqTransport::from_env() {
-        Ok(t) => t,
-        Err(e) => {
+/// Phase 2 (network, timed): run the POST outside the journal tx and
+/// return the outcome + POST latency in ms for the audit row (bd-n86n,
+/// ADR-0014 S8 measurement duty). Takes the adapter by value — one POST
+/// per plan, never retried inside (retries re-enter as new reclassifies
+/// under the same parent effect key).
+pub fn run_post<T: Transport>(
+    adapter: JudgmentAdapter<T>,
+    slice: &StateSlice,
+    surface: Surface,
+) -> (AdapterOutcome, u64) {
+    let start = std::time::Instant::now();
+    let outcome = adapter.ask_on_surface(slice, surface);
+    (outcome, start.elapsed().as_millis() as u64)
+}
+
+/// Phase 3 (merge only, no network): fold the POST outcome beside the table
+/// leaf. `posted=None` on a `Ready` plan is a programming error — deny
+/// loud, never quiet-merge.
+pub fn finish_plan(plan: PostPlan, posted: Option<(AdapterOutcome, u64)>) -> ExpandOut {
+    let PostPlan {
+        table,
+        pin,
+        explicit_topology,
+        parent_effect_key,
+        sticky_topology,
+        stage,
+    } = plan;
+    match stage {
+        PostStage::Off => ExpandOut {
+            primitive: table.primitive,
+            topology: table.topology,
+            argv: table.argv,
+            reason: table.reason,
+            audit: None,
+        },
+        PostStage::Deny {
+            note,
+            pack_id,
+            pack_version,
+            model_id,
+        } => {
             let merged = merge(
                 &table,
                 None,
                 0.0,
                 ActionClass::HonestyGate,
                 &active_thresholds(),
-                input.sticky_topology.as_deref(),
-                input.explicit_topology.as_deref(),
-                &input.parent_effect_key,
-                &input.pack.id,
-                input.pack.version,
-                &input.pack.model,
+                sticky_topology.as_deref(),
+                explicit_topology.as_deref(),
+                &parent_effect_key,
+                &pack_id,
+                pack_version,
+                &model_id,
                 "{}",
                 false,
-                Some(&e.to_string()),
+                0,
+                Some(&note),
             );
-            return Some(EnrichOutput {
+            ExpandOut {
                 primitive: merged.primitive,
                 topology: merged.topology,
                 argv: merged.argv,
                 reason: merged.reason,
-                audit_detail: serde_json::json!(&merged.effect),
-            });
+                audit: Some((pin, serde_json::json!(&merged.effect))),
+            }
         }
-    };
-    let adapter = JudgmentAdapter {
-        pack: input.pack.clone(),
-        transport,
-    };
-    let slice = build_state_slice(input.slice_fields.clone());
-    // (answers, deny, fallback_flag). Honesty never falls back, but the arm
-    // is defensive rather than unreachable: a fallback here still escalates.
-    let (answers_opt, deny_opt, fallback_flag) =
-        match adapter.ask_on_surface(&slice, Surface::Honesty) {
-            AdapterOutcome::Answered(a) => (Some(a), None, false),
-            AdapterOutcome::Refused(e) => (None, Some(e.to_string()), false),
-            AdapterOutcome::FallbackTable(e) => (None, Some(e.to_string()), true),
-        };
-    let (pack_id, pack_version, model_id, usage, conf) = match &answers_opt {
-        Some(a) => (
-            a.pack_id.clone(),
-            a.pack_version,
-            a.model_id.clone(),
-            a.usage.clone(),
-            pack_confidence(a),
-        ),
-        None => (
-            input.pack.id.clone(),
-            input.pack.version,
-            input.pack.model.clone(),
-            "{}".to_string(),
-            0.0,
-        ),
-    };
-    let merged = merge(
-        &table,
-        answers_opt.as_ref(),
-        conf,
-        ActionClass::HonestyGate,
-        &active_thresholds(),
-        input.sticky_topology.as_deref(),
-        input.explicit_topology.as_deref(),
-        &input.parent_effect_key,
-        &pack_id,
-        pack_version,
-        &model_id,
-        &usage,
-        fallback_flag,
-        deny_opt.as_deref(),
-    );
-    Some(EnrichOutput {
-        primitive: merged.primitive,
-        topology: merged.topology,
-        argv: merged.argv,
-        reason: merged.reason,
-        audit_detail: serde_json::json!(&merged.effect),
-    })
+        PostStage::Ready {
+            slice: _,
+            pack,
+            transport: _,
+        } => {
+            // (answers, deny, fallback_flag, latency). Honesty never falls
+            // back, but the arm is defensive rather than unreachable: a
+            // fallback here still escalates.
+            let (answers_opt, deny_opt, fallback_flag, latency_ms) = match posted {
+                Some((AdapterOutcome::Answered(a), ms)) => (Some(a), None, false, ms),
+                Some((AdapterOutcome::Refused(e), ms)) => (None, Some(e.to_string()), false, ms),
+                Some((AdapterOutcome::FallbackTable(e), ms)) => {
+                    (None, Some(e.to_string()), true, ms)
+                }
+                None => (
+                    None,
+                    Some("post skipped: Ready plan finished without a POST".to_string()),
+                    false,
+                    0,
+                ),
+            };
+            let (pack_id, pack_version, model_id, usage, conf) = match &answers_opt {
+                Some(a) => (
+                    a.pack_id.clone(),
+                    a.pack_version,
+                    a.model_id.clone(),
+                    a.usage.clone(),
+                    pack_confidence(a),
+                ),
+                None => (
+                    pack.id.clone(),
+                    pack.version,
+                    pack.model.clone(),
+                    "{}".to_string(),
+                    0.0,
+                ),
+            };
+            let merged = merge(
+                &table,
+                answers_opt.as_ref(),
+                conf,
+                ActionClass::HonestyGate,
+                &active_thresholds(),
+                sticky_topology.as_deref(),
+                explicit_topology.as_deref(),
+                &parent_effect_key,
+                &pack_id,
+                pack_version,
+                &model_id,
+                &usage,
+                fallback_flag,
+                latency_ms,
+                deny_opt.as_deref(),
+            );
+            ExpandOut {
+                primitive: merged.primitive,
+                topology: merged.topology,
+                argv: merged.argv,
+                reason: merged.reason,
+                audit: Some((pin, serde_json::json!(&merged.effect))),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1153,8 +1207,14 @@ questions:
 
     #[test]
     fn shipped_pack_file_parses_and_pins_model() {
+        // .flywheel/ is gitignored (machine state): the pack ships in the
+        // working tree, not in git. Skip gracefully where absent (CI).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".flywheel/judgment-packs/reclassify.v1.yaml");
+        if !path.is_file() {
+            eprintln!("skip: pack file absent (untracked .flywheel)");
+            return;
+        }
         let p = QuestionPack::load_from_file(&path).unwrap();
         assert_eq!(p.id, "reclassify");
         assert!(p.version >= 1);
@@ -1257,6 +1317,7 @@ questions:
             JEV_MODEL_PIN,
             "{}",
             false,
+            0,
             None,
         );
         assert_eq!(m.primitive, "loop-work");
@@ -1284,6 +1345,7 @@ questions:
             JEV_MODEL_PIN,
             "{}",
             false,
+            0,
             None,
         );
         assert!(m.escalate);
@@ -1318,6 +1380,7 @@ questions:
             JEV_MODEL_PIN,
             "{}",
             false,
+            0,
             None,
         );
         assert_eq!(m.primitive, "none");
@@ -1342,6 +1405,7 @@ questions:
             JEV_MODEL_PIN,
             "{}",
             false,
+            0,
             None,
         );
         assert!(m.escalate);
@@ -1366,6 +1430,7 @@ questions:
             JEV_MODEL_PIN,
             "{}",
             false,
+            0,
             None,
         );
         assert!(!m.escalate);
@@ -1402,6 +1467,7 @@ questions:
 
     #[test]
     fn flag_defaults_off() {
+        let _env = crate::config::lock_env();
         // Edition 2024: env mutation is unsafe (single-threaded test, sound).
         unsafe { env::remove_var(FLAG_ENV) };
         assert!(!jev_enabled());
@@ -1520,6 +1586,7 @@ questions:
             JEV_MODEL_PIN,
             &big,
             false,
+            0,
             None,
         );
         assert!(m.effect.usage.len() <= AUDIT_USAGE_CAP + 16);
@@ -1554,18 +1621,151 @@ questions:
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn enrich_returns_none_when_flag_off() {
-        unsafe { env::remove_var(FLAG_ENV) };
-        let pack = QuestionPack::parse_yaml(PACK_YAML).unwrap();
-        let out = maybe_enrich(EnrichInput {
+    // Superseded by prepare_flag_off_is_passthrough_without_audit (bd-n86n
+    // three-phase path); removed with maybe_enrich.
+
+    // --- bd-n86n: POST outside the journal tx ---
+
+    fn expand_args(project: &str) -> ExpandArgs {
+        ExpandArgs {
+            project: project.into(),
+            goal: "g".into(),
+            pin: "p".into(),
+            reason: "r".into(),
             explicit_topology: None,
             parent_effect_key: effect_parent(),
-            sticky_topology: None,
+            sticky_topology: Some("loop".into()),
+            table_primitive: "loop-work".into(),
+            table_topology: "loop".into(),
+            table_argv: vec!["x".into()],
+            table_reason: "table".into(),
+        }
+    }
+
+    struct StubTransport {
+        answers: Answers,
+    }
+
+    impl Transport for StubTransport {
+        fn ask(&self, _slice: &StateSlice, _pack: &QuestionPack) -> Result<Answers, JevError> {
+            Ok(self.answers.clone())
+        }
+    }
+
+    fn stub_answers() -> Answers {
+        Answers {
+            model_id: JEV_MODEL_PIN.into(),
+            pack_id: "reclassify".into(),
+            pack_version: 1,
+            by_question: BTreeMap::from([(
+                "honest".into(),
+                Answer::Noul(NoulAnswer { p_yes: 0.99 }),
+            )]),
+            usage: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn prepare_flag_off_is_passthrough_without_audit() {
+        let _env = crate::config::lock_env();
+        unsafe { env::remove_var(FLAG_ENV) };
+        let plan = prepare_post(expand_args("/nonexistent-probe"));
+        assert!(matches!(plan.stage, PostStage::Off));
+        let out = finish_plan(plan, None);
+        assert_eq!(out.primitive, "loop-work");
+        assert_eq!(out.topology, "loop");
+        assert!(out.audit.is_none(), "flag off = byte-identical, no audit");
+    }
+
+    #[test]
+    fn prepare_missing_pack_is_deny_with_escalate() {
+        let _env = crate::config::lock_env();
+        unsafe { env::set_var(FLAG_ENV, "1") };
+        let base = std::env::temp_dir().join(format!("jev-n86n-nopack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let plan = prepare_post(expand_args(&base.to_string_lossy()));
+        assert!(
+            matches!(plan.stage, PostStage::Deny { .. }),
+            "missing pack = deny, never POST"
+        );
+        let out = finish_plan(plan, None);
+        assert_eq!(out.primitive, "loop-work", "table wins even on deny");
+        let (_, detail) = out.audit.expect("deny always audits");
+        assert!(detail["escalated"].as_bool().unwrap_or(false));
+        assert_eq!(
+            detail["latency_ms"].as_u64(),
+            Some(0),
+            "no POST = zero latency"
+        );
+        unsafe { env::remove_var(FLAG_ENV) };
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_post_stub_answered_and_finish_records_latency() {
+        let pack = QuestionPack::parse_yaml(PACK_YAML).unwrap();
+        let slice = build_state_slice(BTreeMap::from([("goal".into(), "g".into())]));
+        let stub = StubTransport {
+            answers: stub_answers(),
+        };
+        let adapter = JudgmentAdapter {
+            pack: pack.clone(),
+            transport: stub,
+        };
+        let (outcome, _ms) = run_post(adapter, &slice, Surface::Honesty);
+        assert!(matches!(outcome, AdapterOutcome::Answered(_)));
+        let plan = PostPlan {
             table: table("loop-work", "loop"),
-            slice_fields: BTreeMap::from([("goal".into(), "g".into())]),
-            pack,
-        });
-        assert!(out.is_none());
+            pin: "p".into(),
+            explicit_topology: None,
+            parent_effect_key: effect_parent(),
+            sticky_topology: Some("loop".into()),
+            stage: PostStage::Ready {
+                slice,
+                pack,
+                transport: UreqTransport {
+                    api_key: "k".into(),
+                    url: "u".into(),
+                },
+            },
+        };
+        let out = finish_plan(plan, Some((AdapterOutcome::Answered(stub_answers()), 123)));
+        let (_, detail) = out.audit.expect("ready always audits");
+        assert_eq!(
+            detail["latency_ms"].as_u64(),
+            Some(123),
+            "measured POST latency lands in the audit"
+        );
+        assert!(
+            !detail["escalated"].as_bool().unwrap_or(true),
+            "high-conf stub must not escalate"
+        );
+    }
+
+    #[test]
+    fn finish_ready_without_post_is_loud_deny() {
+        let pack = QuestionPack::parse_yaml(PACK_YAML).unwrap();
+        let slice = build_state_slice(BTreeMap::from([("goal".into(), "g".into())]));
+        let plan = PostPlan {
+            table: table("loop-work", "loop"),
+            pin: "p".into(),
+            explicit_topology: None,
+            parent_effect_key: effect_parent(),
+            sticky_topology: Some("loop".into()),
+            stage: PostStage::Ready {
+                slice,
+                pack,
+                transport: UreqTransport {
+                    api_key: "k".into(),
+                    url: "u".into(),
+                },
+            },
+        };
+        // Programming error (POST skipped): fail-closed deny, never quiet merge.
+        let out = finish_plan(plan, None);
+        assert!(out.audit.is_some());
+        let reason = out.reason;
+        assert!(reason.contains("jev"), "deny attaches advisory: {reason}");
     }
 }
