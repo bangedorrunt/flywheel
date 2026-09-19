@@ -105,6 +105,10 @@ flowchart TB
 
 **Invariant:** HTTP / API keys / Jev calls never enter `workspace::tick`. Adapter lives in the host expand path (doorbell_host / live_decide_snapshot expand), same honesty plane as other effects.
 
+**Expand boundary (I7, normative):** `Cmd::Reclassify` prepares pack intent (insert-or-load under the `ReclassifyIntent` effect key) → the effect layer awaits the System One POST off-tick → answers re-enter as a `DecisionReady` extended field. The diagram's `HOST → AD` edge is never an inline blocking call inside expand; tick never performs I/O.
+
+**Merge authority (I3, normative):** the table `decide` wins on primitive and topology. Jev may only annotate (urgency / confidence) and resolve explicit-`none` ambiguity as advisory text attached to the escalate Prompt — never auto-adopt. After merge, code asserts `out.topology == sticky(in)` unless `explicit_topology` was set on the incoming `MaterialContext`; violation escalates to muse-spark / human and journals a `LoudMiss`. Forbidden zone: never call the adapter from `decide.rs` `classify` / `pick` / `build_decision` — those stay pure.
+
 ---
 
 ## 5. Decision details
@@ -114,11 +118,17 @@ flowchart TB
 ```text
 JudgmentAdapter.ask(state_slice, pack_id) -> Answers
   1. Load versioned QuestionPack (pure data — ADR-0013 / toron ADR-0032 profile rhyme)
-  2. POST systemone OR offline fallback (table decide / refuse) — always loud in journal
+  2. POST systemone OR offline refuse (honesty path) / table fallback (announce-only, `fallback_flag=true`) — always loud in journal
   3. Return Choice|Score|Noul map + model id + usage
   4. If honesty_required: EffectJournal.append(JudgmentEffect{pack, answers, conf, model})
 Caller code: weights, thresholds, Cmd construction — NEVER the model.
 ```
+
+**Pack contract (I5, normative):** packs are versioned YAML pure data in-repo at `.flywheel/judgment-packs/<id>.vN.yaml` (schema: pack id, version, model pin, questions with typed Choice/Score/Noul definitions). Model pin is `jev-1.13.0` — never `jev-latest` — until pack re-validation CI exists, so static packs cannot drift silently under a moving alias.
+
+**State-slice builder (I5, normative):** the slice is built in code with a byte cap (8 KiB default) and a PII denylist (credentials, tokens, private keys, full mail bodies); truncation is head-cut with a `truncated=true` marker. This is the code-side filter the jev-1.13 jaggedness row mandates.
+
+**Offline / deny policy (I4, normative):** on the honesty path the default is hard escalate (refuse, never silent table fallback). Table-decide fallback is allowed only on announce-only surfaces, and then only with `fallback_flag=true` journaled. This closes §7.2.
 
 ### 5.2 Allowed enrichment surfaces (flywheel)
 
@@ -135,10 +145,13 @@ Caller code: weights, thresholds, Cmd construction — NEVER the model.
 2. **sticky-open stays deterministic** — open stays open unless explicit loop/swarm/join/none; Jev cannot silently rewrite topology.
 3. **`decide` remains pure** — table leaf stays; Jev is host enricher beside it, not a replacement inside pure tick.
 4. **Effect journal** — every production Jev call on honesty path is journaled as a judgment effect (or loud UNJOURNALED).
+   **JudgmentEffect shape (I2, normative):** a *child* of the `ReclassifyIntent` effect key (never a peer intent — one logical reclassify, one parent intent): `{parent_effect_key, pack_id, pack_version, model_id, answers, conf, usage, fallback_flag}`. Honesty path runs `Enforced` (no runner → refuse, never dispatch unjournaled); off-honesty surfaces keep the `bypassed-no-effect-runner` marker. This closes §7.7.
 5. **Confidence escalate** — low confidence → muse-spark / human Prompt path; confidence is peakedness, not permission to act.
+   **Confidence definition (I1, normative):** Choice confidence = top1−top2 probability margin. Score/Noul map to margin-from-midpoint in code (never model-side Noul↔Choice arithmetic, per jev-1.13 jaggedness). **Provisional thresholds** (initial defaults, captain-tunable, re-validation duty): topology-adjacent < 0.85 escalate; honesty-gate < 0.80 escalate; announce-only < 0.60 fallback-allowed. This closes §7.3.
 6. **Profiles stay pure data** — QuestionPacks may live as data; do not store profiles or bindings in TypeSafe.
 7. **Beads sole close** — no Noul → `br close` (see beads ADR-0006).
-8. **Offline / deny** — 429/outage: escalate or table-decide fallback; either way journal loudly. Captain locks thresholds later.
+8. **Offline / deny** — 429/outage.
+   **Locked (I4):** honesty path = hard escalate (refuse); announce-only = table fallback with `fallback_flag=true`. Thresholds locked as provisional per rule 5 above (I1).
 
 ### 5.4 Folded GS-054 REJECT list (flywheel-facing)
 
@@ -147,6 +160,7 @@ Caller code: weights, thresholds, Cmd construction — NEVER the model.
 3. **Dual SoT** — TypeSafe-hosted session/wiki as authority beside Nostr+SQLite / disk wiki.
 4. **Redis / OTP / AgentServer** "because classifier needs a cluster".
 5. **New MCP** `jev_*` tools without Tick Msg feed / effect journal.
+   Catalog reads for workflow-family selection enter as `state_slice` via the host (I7) — never via a new tool.
 6. **Casual new Nostr kinds** for judgment events without ADR + Tick Msg mapping.
 7. **Invent-Settled** from timeout, mail ack, process exit, or Jev confidence alone.
 8. **Invent-green** offline emulator claiming calibration without measurement.
@@ -159,24 +173,24 @@ Caller code: weights, thresholds, Cmd construction — NEVER the model.
 
 | Plane | Role of Jev |
 |-------|-------------|
-| **Tick Law** | Leaf judgment only; Msg/Cmd shape unchanged; host expand may call adapter |
-| **Effect journal** | JudgmentEffect (or extension of ReclassifyIntent) records pack, answers, model, confidence |
+| **Tick Law** | Leaf judgment only; Msg/Cmd shape unchanged; host expand may call adapter via prepared-intent → await → re-entry (I7); `decide.rs` classify/pick/build_decision is a forbidden zone (I3/L6) |
+| **Effect journal** | JudgmentEffect child of `ReclassifyIntent` effect key: `{parent_effect_key, pack_id, pack_version, model_id, answers, conf, usage, fallback_flag}` (I2) |
 | **beads close** | Never; advisory readiness only (beads ADR-0006) |
 | **Profiles (ADR-0013)** | Remain pure data; Score "profile fit" optional later — never move SoT into model weights |
 | **toron ADR-0032 / 0033** | Honesty Spec 7 applies; System One is optional judgment in host/effects plane, not a peer path |
 
 ---
 
-## 7. Open questions (need captain lock before W1–W2)
+## 7. Open questions → locked defaults (debate agreement 2026-09-19, PearlTern + BrightCoast)
 
-1. API key custody (`TYPESAFE_API_KEY`) — mikasa only? eren? box never? monthly spend ceiling?
-2. Offline / deny policy — hard-fail escalate vs loud table-decide fallback?
-3. Confidence thresholds per action class (topology-adjacent vs announce-only)?
-4. Data egress — which MaterialContext slices may leave Tailnet (redact PII first)?
-5. Model pin — `jev-latest` vs pin `jev-1.13.0` until packs re-validated?
-6. Pack ownership — packs in flywheel vs shared `judgment-packs` vs chie repo?
-7. Honesty schema — extend `ReclassifyIntent` vs new `JudgmentEffect` kind?
-8. Interaction with GS-053 — any eren consumer Jev only after Serve MCP, or builder-only forever?
+1. API key custody (`TYPESAFE_API_KEY`) — **locked (I6):** mikasa-only; no eren/box egress until Serve MCP; monthly spend ceiling still TBD captain (sole remaining open item).
+2. Offline / deny policy — **locked (I4):** hard-fail escalate on honesty path; loud table-decide fallback announce-only with `fallback_flag=true`.
+3. Confidence thresholds per action class — **locked provisional (I1):** 0.85 / 0.80 / 0.60 with re-validation duty; captain-tunable.
+4. Data egress — **locked (I5/I6):** code-side filter with byte cap + PII denylist before any POST; mikasa-only until Serve MCP.
+5. Model pin — **locked (I5):** pin `jev-1.13.0`; never `jev-latest` until pack re-validation CI exists.
+6. Pack ownership — **locked (I5):** packs in-repo at `.flywheel/judgment-packs/<id>.vN.yaml` (pure data); shared vs chie split deferred to Shipwright's chie ADR.
+7. Honesty schema — **locked (I2):** new `JudgmentEffect` kind as child of `ReclassifyIntent` effect key (not an extension of the intent row).
+8. Interaction with GS-053 — **locked (I6):** builder-only until Serve MCP; any eren consumer Jev only after.
 
 ---
 
@@ -187,6 +201,7 @@ Caller code: weights, thresholds, Cmd construction — NEVER the model.
 - Calibrated uncertainty on DecisionReady without agent-loop fashion.
 - Shared vocabulary with toron ADR-0033 and Shipwright's chiebukuro ADR (compile vs gate).
 - Cost/latency friendly: parallel question packs (~100 ms class path; batch >> serial).
+  Measurement duty (L8): the ~100 ms figure is vendor-claimed, not measured in-repo; W2 ships with a latency/cost budget (timeout + batch policy) and observes real distributions before any per-message surface (e.g. mail guardrails) is enabled.
 
 ### Negative / costs
 
@@ -213,9 +228,17 @@ This ADR takes effect when the Captain marks it **Accepted**. Until then:
 
 ## 10. Sources
 
-- GS-054: `/home/box/agent-data/grok-ship/reports/GS-054.md`
-- GS-055: `/home/box/agent-data/grok-ship/reports/GS-055.md`
+- GS-054: `/home/box/agent-data/grok-ship/reports/GS-054.md` (box-local path; canonical content folded into §§1–5 above)
+- GS-055: `/home/box/agent-data/grok-ship/reports/GS-055.md` (box-local path; tip baselines in §2 — rebase policy: refresh SHAs on rebase, never treat pinned SHAs as live)
 - https://docs.typesafe.ai/llms.txt
 - https://docs.typesafe.ai/concepts/how-to-build-with-system-one.md
 - https://docs.typesafe.ai/model-jaggedness/jev-1.13.md
 - Cookbooks: rerank, classifying_rag_passages, citation_check, skill_suggestion, llm_guardrails, parallel_questions, entity_alignment, hierarchical_classification
+
+---
+
+## 11. Debate agreement + implementation record (2026-09-19)
+
+- **Debate:** 1-pi crew (PearlTern) adversarial review, 13-part critique (G1–G7 gaps, L1–L8 logic, I1–I7 improvements), Round 2 reply, **AGREE stated by both**. Full thread: toron channel `test-channel`, project `flywheel`.
+- **Outcome:** I1–I7 landed as normative text above (§§4.2, 5.1, 5.3–5.4, 6, 7); sole remaining open item is the monthly spend ceiling (captain).
+- **Implementation:** W1 (`src/judgment.rs` adapter + `.flywheel/judgment-packs/`) and W2 (reclassify enricher behind `FLYWHEEL_JEV`, default off) built under bead `bd-h3nj` per operator override (see bead comment `BYPASS gate=ADR-0014-HOLD-merge`). Status stays **Proposed** until the captain's explicit accept word.
