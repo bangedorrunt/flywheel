@@ -97,7 +97,11 @@ pub fn pick_workflow(
     if let Some(found) = merged.get(name) {
         return Ok(found.clone());
     }
-    let mut hits: Vec<String> = merged.keys().filter(|k| k.starts_with(name)).cloned().collect();
+    let mut hits: Vec<String> = merged
+        .keys()
+        .filter(|k| k.starts_with(name))
+        .cloned()
+        .collect();
     hits.sort();
     match hits.len() {
         0 => Err(CatalogError::Unknown(name.into())),
@@ -815,15 +819,22 @@ msg = "legacy triage"
 
     #[test]
     fn p5_pick_unknown_ambiguous_and_prefix() {
-        use super::{pick_workflow, CatalogError};
+        use super::{CatalogError, pick_workflow};
         let mut merged: super::BTreeMap<String, super::ResolvedWorkflow> = super::BTreeMap::new();
         for n in ["ship", "ship-chain", "debate"] {
-            let wf = toron_workflow::schema::parse_workflow(&format!("name: {n}\nsteps: []\n")).unwrap();
+            let wf =
+                toron_workflow::schema::parse_workflow(&format!("name: {n}\nsteps: []\n")).unwrap();
             merged.insert(n.into(), (wf, "builtin"));
         }
         assert!(pick_workflow(&merged, "ship").is_ok());
-        assert_eq!(pick_workflow(&merged, "deb" ).unwrap().0.name, "debate");
-        assert!(matches!(pick_workflow(&merged, "nope"), Err(CatalogError::Unknown(_))));
-        assert!(matches!(pick_workflow(&merged, "sh"), Err(CatalogError::Ambiguous(..))));
+        assert_eq!(pick_workflow(&merged, "deb").unwrap().0.name, "debate");
+        assert!(matches!(
+            pick_workflow(&merged, "nope"),
+            Err(CatalogError::Unknown(_))
+        ));
+        assert!(matches!(
+            pick_workflow(&merged, "sh"),
+            Err(CatalogError::Ambiguous(..))
+        ));
     }
 }

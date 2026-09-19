@@ -54,10 +54,11 @@ pub(crate) fn cmd_crew(cfg: &Config, cmd: &CrewCmd) -> Result<()> {
             // in crew preview like every other resolution path.
             let project_root = crate::project_dir(cfg, "flywheel");
             let all = crate::workflow_catalog::all_workflows_merged(Some(&project_root))?;
-            let wf = all
-                .get(name.as_str())
-                .map(|(wf, _)| wf)
-                .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))?;
+            // P5: typed pick — exact, then unique prefix; unknown/ambiguous
+            // fail loud (nonzero exit), never a silent default.
+            let picked = crate::workflow_catalog::pick_workflow(&all, name.as_str())
+                .map_err(|e| anyhow!("{e}"))?;
+            let wf = &picked.0;
             let resolve = |sub: &str| all.get(sub).map(|(w, _)| w.clone());
             let packed = crate::packed_from_flag(cfg, wf, &resolve, None, None)?;
             let members: Vec<Value> = packed
