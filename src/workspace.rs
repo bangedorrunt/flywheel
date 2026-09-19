@@ -1336,36 +1336,61 @@ pub fn expand_reclassify_cmds(
                         )
                     }
                 };
+                // bd-n86n: W2 (ADR-0014, default off) host-side Jev enrichment.
+                // The pure table leaf is untouched; the adapter only annotates
+                // beside it and journals a JudgmentEffect child of this intent.
+                // Decide + prepare + POST run here, OUTSIDE the journal tx:
+                // commit holds the tx across its closure, so a blocking 5s
+                // POST inside would stall every concurrent journal writer.
+                // Flag off = byte-identical passthrough (no audit).
+                let (primitive, topology, argv, decide_reason) = decide(&intent.goal);
+                let plan = crate::judgment::prepare_post(crate::judgment::ExpandArgs {
+                    project: project.to_string(),
+                    goal: intent.goal.clone(),
+                    pin: pin.clone(),
+                    reason: reason.clone(),
+                    explicit_topology: intent.explicit_topology.clone(),
+                    parent_effect_key: intent.effect_key.clone(),
+                    sticky_topology: model.session_topology.clone(),
+                    table_primitive: primitive,
+                    table_topology: topology,
+                    table_argv: argv,
+                    table_reason: decide_reason,
+                });
+                let posted = match &plan.stage {
+                    crate::judgment::PostStage::Ready {
+                        slice,
+                        pack,
+                        transport,
+                    } => {
+                        let adapter = crate::judgment::JudgmentAdapter {
+                            pack: pack.clone(),
+                            transport: transport.clone(),
+                        };
+                        Some(crate::judgment::run_post(
+                            adapter,
+                            slice,
+                            crate::judgment::Surface::Honesty,
+                        ))
+                    }
+                    _ => None,
+                };
+                let enriched = crate::judgment::finish_plan(plan, posted);
+                let ready = Msg::DecisionReady {
+                    goal: intent.goal.clone(),
+                    primitive: enriched.primitive,
+                    topology: enriched.topology,
+                    argv: enriched.argv,
+                    decide_reason: enriched.reason,
+                    explicit_topology: intent.explicit_topology.clone(),
+                };
                 let more = match crate::agent_ref::commit_reclassify(project, intent, |intent| {
                     // Apply uses the journaled identity (goal + effect_key).
                     let _ = &intent.effect_key;
-                    let (primitive, topology, argv, decide_reason) = decide(&intent.goal);
-                    // W2 (ADR-0014, default off): host-side Jev enrichment. The
-                    // pure table leaf above is untouched; the adapter only
-                    // annotates beside it and journals a JudgmentEffect child
-                    // of this intent. Flag off = byte-identical passthrough.
-                    let sticky = model.session_topology.clone();
-                    let enriched = crate::judgment::enrich_expand(crate::judgment::ExpandArgs {
-                        project: project.to_string(),
-                        goal: intent.goal.clone(),
-                        pin: pin.clone(),
-                        reason: reason.clone(),
-                        explicit_topology: intent.explicit_topology.clone(),
-                        parent_effect_key: intent.effect_key.clone(),
-                        sticky_topology: sticky,
-                        table_primitive: primitive,
-                        table_topology: topology,
-                        table_argv: argv,
-                        table_reason: decide_reason,
-                    });
-                    let ready = Msg::DecisionReady {
-                        goal: intent.goal.clone(),
-                        primitive: enriched.primitive,
-                        topology: enriched.topology,
-                        argv: enriched.argv,
-                        decide_reason: enriched.reason,
-                        explicit_topology: intent.explicit_topology.clone(),
-                    };
+                    // bd-n86n: decide + prepare + POST all ran OUTSIDE the tx
+                    // (below, before commit) — the closure holds the journal
+                    // tx, so it must never wait on network. Only merge+tick
+                    // run here: pure folds, no I/O. `enriched`/`ready` move in.
                     let (next, mut more) = tick(model, &ready);
                     *model = next;
                     if let Some((audit_pin, detail)) = enriched.audit {

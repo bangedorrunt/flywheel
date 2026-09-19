@@ -1,0 +1,54 @@
+---
+title: Jev W2 enable procedure
+description: Arming checklist for the reclassify enricher behind FLYWHEEL_JEV. Key custody, spend ceiling, pack re-validation CI, latency mining, rollback.
+---
+
+Default state is **off**: `FLYWHEEL_JEV` unset (or anything but `1`/`true`/`yes`)
+means the expand path is byte-identical to the table leaf — no POST, no audit.
+Do not enable until the captain gives the word; this page is the procedure for
+that day, not the word itself.
+
+## Key custody (mikasa-only)
+
+- `TYPESAFE_API_KEY` lives in mikasa's environment only. Never committed,
+  never in eren/box envs, never in pack YAML.
+- Missing/empty key is a loud deny (escalate + audit), never a silent skip.
+- Rotation: replace the env value, no code change; in-flight reclassifies
+  fail over to deny on the next tick.
+
+## Spend ceiling (TBD captain)
+
+No ceiling is set. Before arming, the captain locks: monthly cap, per-tick
+POST budget (one POST per MaterialContext today — no batching), and who gets
+paged on 429 streaks. Until then the flag stays off.
+
+## Pack re-validation CI
+
+Model pin is `jev-1.13.0` — never `jev-latest`. On any pin bump or pack edit:
+
+1. `QuestionPack::parse_yaml` rejects `jev-latest`, empty ids, Choice with
+   fewer than 2 options, Score with fewer than 2 levels.
+2. Re-run `test --bin flywheel judgment` (pack + confidence + merge suite).
+3. Re-validate thresholds against fresh traffic before keeping them
+   (`FLYWHEEL_JEV_THRESHOLDS` is provisional, captain-tunable).
+4. Highest `reclassify.vN.yaml` in `.flywheel/judgment-packs/` wins; old
+   versions stay on disk for audit.
+
+## Latency mining (S8 duty)
+
+Every `JudgmentEffect` audit row carries `latency_ms` (measured POST time;
+`0` means no POST ran). Before enabling per-message surfaces (mail
+guardrails), mine the distribution from a shadow period and set the timeout
+(5s today) and batch policy from data, not vendor claims.
+
+## Arming checklist
+
+1. Judgment suite green: `test --bin flywheel judgment`.
+2. Reclassify path green: `test --bin flywheel workspace`.
+3. Clippy gate clean: `scripts/verify-clippy.sh`.
+4. Thresholds reviewed (`FLYWHEEL_JEV_THRESHOLDS` or provisional defaults).
+5. Key present on mikasa only; spend ceiling locked.
+6. Flip: `FLYWHEEL_JEV=1` on the host. Observe `kind=judgment` audit rows
+   (parent effect key, pack version, confidence, `latency_ms`, escalated).
+7. Rollback: unset the flag. The path returns to byte-identical passthrough;
+   no journal migration, no cleanup.
