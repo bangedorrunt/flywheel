@@ -845,6 +845,12 @@ pub fn spawn_failure_bead(bundle: &toron_workflow::FailureBundle) -> Result<Stri
             "1",
             "--description",
             &description,
+            // Fail-closed br: P1 needs a runnable VERIFY + a principle.
+            // Re-observe the failing surface: green history = fixed.
+            "--verify",
+            &format!("flywheel cron history {}", bundle.workflow),
+            "--principle",
+            "fix-root-causes — bundle carries error+step so the fixer repairs the failure, not a symptom",
             "--json",
         ])
         .output()
@@ -986,6 +992,12 @@ pub fn spawn_review_bead(output: &serde_json::Value, tick_ts: i64) -> Result<Opt
             "2",
             "--description",
             &description,
+            // Fail-closed br: P2 needs a runnable VERIFY + a principle.
+            // Re-observe the originating surface on triage.
+            "--verify",
+            "flywheel cron history weekly-review",
+            "--principle",
+            "outcome-oriented-execution — proposal carries acceptance+EV so the captain decides implement-or-close on evidence",
             "--labels",
             &format!("weekly-review,{date}"),
             "--json",
@@ -1551,11 +1563,19 @@ owner = "housekeeper"
         use toron_workflow::schema::Action;
         // Hermetic XDG: no catalog, no spawn registry → the dispatch path
         // must fail fast (the recording runner would return Ok).
+        // state_dir() honors XDG_STATE_HOME, so the live spawn registry
+        // (state dir, not config dir) must be redirected too — otherwise
+        // the test reads the operator's live panes and dispatches for real.
         let _g = crate::config::lock_env();
         let dir = tmp_path("pane-dispatch-xdg");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+        // The project-local mirror (.flywheel/agent-names.json) resolves
+        // via the registry root, not XDG — without this the test reads the
+        // operator's live bindings and dispatches for real.
+        let _reg = crate::state::set_registry_root_override(dir.clone());
         let mut e = sample("weekly-x");
         e.mode = CronMode::Pane;
         let runner = cron_runner(&e);
@@ -1573,6 +1593,7 @@ owner = "housekeeper"
             "dispatch path failed fast, not recorded: {err}"
         );
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
