@@ -2313,6 +2313,9 @@ mod tests {
         // The departed member's intent auto-expires via NIP-40 (TTL) — no
         // manual cleanup: wait out the 1s TTL, then the intent is gone from
         // the project-wide board (the auto-expire mechanism clears it).
+        // P7 documented exception: TTL-bound 1.5s sleep on a hermetic store
+        // (no daemon, no network). True live tests stay behind #[ignore]
+        // (`cargo test -- --ignored`); default suite stays hermetic.
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let board = store.board().expect("board");
         assert!(
