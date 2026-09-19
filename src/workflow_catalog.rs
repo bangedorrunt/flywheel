@@ -69,6 +69,43 @@ pub fn all_workflows_merged(
     Ok(out)
 }
 
+/// Typed catalog failures (P5). New fallible pick paths return this;
+/// entrypoints map it to LoudMiss + nonzero exit instead of panicking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogError {
+    Unknown(String),
+    Ambiguous(String, Vec<String>),
+}
+
+impl std::fmt::Display for CatalogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(n) => write!(f, "unknown workflow '{n}'; see `workflow list`"),
+            Self::Ambiguous(n, hits) => write!(f, "ambiguous workflow prefix '{n}': {hits:?}"),
+        }
+    }
+}
+
+impl std::error::Error for CatalogError {}
+
+/// Exact-then-unique-prefix pick over the merged catalog (P5).
+/// ponytail: prefix convenience only, exact names always win.
+pub fn pick_workflow(
+    merged: &BTreeMap<String, ResolvedWorkflow>,
+    name: &str,
+) -> Result<ResolvedWorkflow, CatalogError> {
+    if let Some(found) = merged.get(name) {
+        return Ok(found.clone());
+    }
+    let mut hits: Vec<String> = merged.keys().filter(|k| k.starts_with(name)).cloned().collect();
+    hits.sort();
+    match hits.len() {
+        0 => Err(CatalogError::Unknown(name.into())),
+        1 => Ok(merged.get(&hits[0]).cloned().expect("prefix hit resolves")),
+        _ => Err(CatalogError::Ambiguous(name.into(), hits)),
+    }
+}
+
 /// [`all_workflows_merged`] without the source tag — the plain name →
 /// workflow map most resolvers want.
 pub fn all_workflows_plain(project_root: Option<&Path>) -> Result<BTreeMap<String, Workflow>> {
@@ -774,5 +811,19 @@ msg = "legacy triage"
         assert_eq!(first_run, "2026-08-21T12:00:00Z");
         assert_eq!(author, "TealDune");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p5_pick_unknown_ambiguous_and_prefix() {
+        use super::{pick_workflow, CatalogError};
+        let mut merged: super::BTreeMap<String, super::ResolvedWorkflow> = super::BTreeMap::new();
+        for n in ["ship", "ship-chain", "debate"] {
+            let wf = toron_workflow::schema::parse_workflow(&format!("name: {n}\nsteps: []\n")).unwrap();
+            merged.insert(n.into(), (wf, "builtin"));
+        }
+        assert!(pick_workflow(&merged, "ship").is_ok());
+        assert_eq!(pick_workflow(&merged, "deb" ).unwrap().0.name, "debate");
+        assert!(matches!(pick_workflow(&merged, "nope"), Err(CatalogError::Unknown(_))));
+        assert!(matches!(pick_workflow(&merged, "sh"), Err(CatalogError::Ambiguous(..))));
     }
 }
