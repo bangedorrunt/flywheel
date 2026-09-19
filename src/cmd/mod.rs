@@ -13,6 +13,7 @@ pub(crate) mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doorbell;
 pub(crate) mod history;
+pub(crate) mod judgment;
 pub(crate) mod ledger;
 pub(crate) mod loop_mode;
 pub(crate) mod mail;
@@ -49,6 +50,7 @@ pub(crate) use doorbell::{
 pub(crate) use history::{
     cmd_analytics, cmd_audit, cmd_changes, cmd_history, cmd_resume, cmd_timeline,
 };
+pub(crate) use judgment::{JudgmentCmd, cmd_judgment};
 pub(crate) use ledger::{LedgerCmd, cmd_ledger};
 pub(crate) use loop_mode::LoopCmd;
 pub(crate) use mail::{MailCmd, cmd_mail};

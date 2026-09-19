@@ -153,7 +153,10 @@ pub fn escalate_required(conf: f64, class: ActionClass, t: &Thresholds) -> bool 
 // Question packs (pure data)
 // ---------------------------------------------------------------------------
 
-/// One typed question inside a pack.
+/// One typed question inside a pack. `criteria` defines the possible
+/// answers (per-option descriptions for Choice/Score, guidance lines for
+/// Noul) — the model cannot choose an omitted value, and Score levels must
+/// stand on their own as concrete situations (typesafe-ai skill shaping).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct QuestionDef {
     pub id: String,
@@ -161,6 +164,8 @@ pub struct QuestionDef {
     pub instructions: String,
     #[serde(default)]
     pub options: Vec<String>,
+    #[serde(default)]
+    pub criteria: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -211,6 +216,22 @@ impl QuestionPack {
             }
             if q.kind == QuestionKind::Choice && q.options.len() < 2 {
                 return Err(format!("choice question {} needs >= 2 options", q.id));
+            }
+            if q.kind == QuestionKind::Score && q.options.len() < 2 {
+                return Err(format!("score question {} needs >= 2 levels", q.id));
+            }
+            // Criteria, when present, define each option 1:1 (Choice/Score).
+            // Noul carries free guidance lines instead (no options to align).
+            if !q.criteria.is_empty()
+                && matches!(q.kind, QuestionKind::Choice | QuestionKind::Score)
+                && q.criteria.len() != q.options.len()
+            {
+                return Err(format!(
+                    "question {} criteria ({} lines) must define each option 1:1 ({} options)",
+                    q.id,
+                    q.criteria.len(),
+                    q.options.len()
+                ));
             }
             if q.kind == QuestionKind::Score && q.options.len() < 2 {
                 return Err(format!("score question {} needs >= 2 levels", q.id));
@@ -443,6 +464,7 @@ impl Transport for UreqTransport {
                         "type": kind,
                         "instructions": q.instructions,
                         "options": q.options,
+                        "criteria": q.criteria,
                     }),
                 )
             })
@@ -758,7 +780,6 @@ pub fn jev_enabled() -> bool {
 // ---------------------------------------------------------------------------
 
 const PACK_DIR_REL: &str = ".flywheel/judgment-packs";
-const PACK_PREFIX: &str = "reclassify.v";
 const PACK_SUFFIX: &str = ".yaml";
 
 /// Env knob for the provisional thresholds (I1): `FLYWHEEL_JEV_THRESHOLDS`
@@ -795,10 +816,14 @@ pub fn active_thresholds() -> Thresholds {
 
 /// Best-effort pack discovery (B5): absolute project path first, then the cwd
 /// and its ancestors (flag-on outside a repo root no longer denies every
-/// reclassify). Picks the highest `reclassify.vN.yaml` version in the first
+/// reclassify). Picks the highest `<id>.vN.yaml` version in the first
 /// directory that holds any. Missing everywhere with the flag on is a loud
 /// deny (escalate + audit), never a silent skip.
-pub fn find_pack(project: &str) -> Result<QuestionPack, String> {
+/// Newest `<id>.vN.yaml` pack for one id (`reclassify`, `doorbell-screen`,
+/// …) — same ancestor-walk discovery as before, generalized (bd-lpn6).
+/// `find_pack` stays the reclassify entry point.
+pub fn find_pack_for(project: &str, id: &str) -> Result<QuestionPack, String> {
+    let prefix = format!("{id}.v");
     let mut bases: Vec<std::path::PathBuf> = Vec::new();
     let p = std::path::PathBuf::from(project);
     if p.is_absolute() {
@@ -813,24 +838,29 @@ pub fn find_pack(project: &str) -> Result<QuestionPack, String> {
     for base in &bases {
         let dir = base.join(PACK_DIR_REL);
         tried.push(dir.clone());
-        if let Some(pack) = newest_pack_in(&dir) {
+        if let Some(pack) = newest_pack_in(&dir, &prefix) {
             return pack;
         }
     }
     Err(format!(
-        "reclassify pack not found (tried {tried:?}); add {PACK_DIR_REL}/reclassify.vN.yaml or unset {FLAG_ENV}"
+        "{id} pack not found (tried {tried:?}); add {PACK_DIR_REL}/{id}.vN.yaml or unset {FLAG_ENV}"
     ))
 }
 
-fn newest_pack_in(dir: &std::path::Path) -> Option<Result<QuestionPack, String>> {
+/// Reclassify entry point (bd-n86n path). Passes the pack id through.
+pub fn find_pack(project: &str) -> Result<QuestionPack, String> {
+    find_pack_for(project, "reclassify")
+}
+
+fn newest_pack_in(dir: &std::path::Path, prefix: &str) -> Option<Result<QuestionPack, String>> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut best: Option<(u32, std::path::PathBuf)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with(PACK_PREFIX) && name.ends_with(PACK_SUFFIX)) {
+        if !(name.starts_with(prefix) && name.ends_with(PACK_SUFFIX)) {
             continue;
         }
-        let mid = &name[PACK_PREFIX.len()..name.len() - PACK_SUFFIX.len()];
+        let mid = &name[prefix.len()..name.len() - PACK_SUFFIX.len()];
         if let Ok(v) = mid.parse::<u32>()
             && best.as_ref().is_none_or(|(bv, _)| v > *bv)
         {
@@ -861,8 +891,19 @@ pub struct ExpandOut {
     pub topology: String,
     pub argv: Vec<String>,
     pub reason: String,
+    /// Table-leaf primitive/topology entering the merge (bd-lpn6 ledger).
+    /// `primitive`/`topology` above always equal these (Jev never flips).
+    pub table_primitive: String,
+    pub table_topology: String,
+    /// Whether the merge escalated (low conf, deny, sticky-violation, screen).
+    pub escalated: bool,
     /// Some(pin, detail) → caller pushes `Cmd::Audit kind=judgment`.
     pub audit: Option<(String, serde_json::Value)>,
+    /// Battery row (bd-lpn6): second `Cmd::Audit kind=judgment` when the
+    /// doorbell screen ran. None when skipped or flag off.
+    pub screen_audit: Option<(String, serde_json::Value)>,
+    /// Battery summary for the miss-ledger row. None when skipped.
+    pub screen: Option<ScreenSummary>,
 }
 
 /// Split of the enrich path across the journal tx boundary (bd-n86n): the
@@ -893,11 +934,23 @@ pub enum PostStage {
         model_id: String,
     },
     /// Flag on and deployable: POST outside the tx, then finish.
+    /// `screen` is the doorbell battery (bd-lpn6): a second pack asked over
+    /// inbound material in the same outside-tx window; detections annotate
+    /// routing only, never flip the table leaf.
     Ready {
         slice: StateSlice,
         pack: QuestionPack,
         transport: UreqTransport,
+        screen: Option<ScreenAsk>,
     },
+}
+
+/// One doorbell-screen battery ask: pack + redacted inbound-material slice.
+/// Built in prepare (no network); asked beside the reclassify POST.
+#[derive(Debug, Clone)]
+pub struct ScreenAsk {
+    pub slice: StateSlice,
+    pub pack: QuestionPack,
 }
 
 fn table_of(a: &ExpandArgs) -> TableDecision {
@@ -962,12 +1015,32 @@ pub fn prepare_post(a: ExpandArgs) -> PostPlan {
     slice_fields.insert("table_primitive".to_string(), a.table_primitive.clone());
     slice_fields.insert("table_topology".to_string(), a.table_topology.clone());
     let slice = build_state_slice(slice_fields);
+    // Doorbell battery (bd-lpn6): screen inbound material with a second
+    // pack in the same outside-tx window. A missing screen pack skips the
+    // battery loudly without touching the reclassify verdict (auxiliary).
+    let screen = match find_pack_for(&a.project, "doorbell-screen") {
+        Ok(screen_pack) => {
+            let mut screen_fields = BTreeMap::new();
+            screen_fields.insert("material.text".to_string(), a.goal.clone());
+            screen_fields.insert("material.reason".to_string(), a.reason.clone());
+            screen_fields.insert("table_primitive".to_string(), a.table_primitive.clone());
+            Some(ScreenAsk {
+                slice: build_state_slice(screen_fields),
+                pack: screen_pack,
+            })
+        }
+        Err(e) => {
+            eprintln!("flywheel: doorbell-screen pack absent ({e}) — battery skipped");
+            None
+        }
+    };
     plan_of(
         a,
         PostStage::Ready {
             slice,
             pack,
             transport,
+            screen,
         },
     )
 }
@@ -989,8 +1062,14 @@ pub fn run_post<T: Transport>(
 
 /// Phase 3 (merge only, no network): fold the POST outcome beside the table
 /// leaf. `posted=None` on a `Ready` plan is a programming error — deny
-/// loud, never quiet-merge.
-pub fn finish_plan(plan: PostPlan, posted: Option<(AdapterOutcome, u64)>) -> ExpandOut {
+/// loud, never quiet-merge. `screen_posted` carries the doorbell-battery
+/// outcome (None = battery skipped in prepare); detections annotate routing
+/// only — the table leaf still wins on primitive and topology.
+pub fn finish_plan(
+    plan: PostPlan,
+    posted: Option<(AdapterOutcome, u64)>,
+    screen_posted: Option<(AdapterOutcome, u64)>,
+) -> ExpandOut {
     let PostPlan {
         table,
         pin,
@@ -1001,11 +1080,16 @@ pub fn finish_plan(plan: PostPlan, posted: Option<(AdapterOutcome, u64)>) -> Exp
     } = plan;
     match stage {
         PostStage::Off => ExpandOut {
-            primitive: table.primitive,
-            topology: table.topology,
-            argv: table.argv,
-            reason: table.reason,
+            primitive: table.primitive.clone(),
+            topology: table.topology.clone(),
+            argv: table.argv.clone(),
+            reason: table.reason.clone(),
+            table_primitive: table.primitive,
+            table_topology: table.topology,
+            escalated: false,
             audit: None,
+            screen_audit: None,
+            screen: None,
         },
         PostStage::Deny {
             note,
@@ -1035,13 +1119,19 @@ pub fn finish_plan(plan: PostPlan, posted: Option<(AdapterOutcome, u64)>) -> Exp
                 topology: merged.topology,
                 argv: merged.argv,
                 reason: merged.reason,
+                table_primitive: table.primitive,
+                table_topology: table.topology,
+                escalated: merged.escalate,
                 audit: Some((pin, serde_json::json!(&merged.effect))),
+                screen_audit: None,
+                screen: None,
             }
         }
         PostStage::Ready {
             slice: _,
             pack,
             transport: _,
+            screen,
         } => {
             // (answers, deny, fallback_flag, latency). Honesty never falls
             // back, but the arm is defensive rather than unreachable: a
@@ -1075,7 +1165,7 @@ pub fn finish_plan(plan: PostPlan, posted: Option<(AdapterOutcome, u64)>) -> Exp
                     0.0,
                 ),
             };
-            let merged = merge(
+            let mut merged = merge(
                 &table,
                 answers_opt.as_ref(),
                 conf,
@@ -1092,14 +1182,463 @@ pub fn finish_plan(plan: PostPlan, posted: Option<(AdapterOutcome, u64)>) -> Exp
                 latency_ms,
                 deny_opt.as_deref(),
             );
+            // Doorbell battery fold (bd-lpn6): detections ride the reason +
+            // escalate flag (routing only); the table primitive/topology above
+            // are untouched. The battery gets its own audit row.
+            let (screen_parts, screen_escalate, screen_summary, screen_effect) =
+                fold_screen(screen.as_ref(), screen_posted, &parent_effect_key);
+            if !screen_parts.is_empty() {
+                let extra = screen_parts.join("; ");
+                merged.reason = format!("{} [screen: {extra}]", merged.reason);
+                merged.advisory = Some(match merged.advisory {
+                    Some(a) => format!("{a}; {extra}"),
+                    None => extra,
+                });
+            }
+            if screen_escalate {
+                merged.escalate = true;
+                merged.effect.escalated = true;
+            }
+            let screen_audit =
+                screen_effect.map(|effect| (pin.clone(), serde_json::json!(&effect)));
             ExpandOut {
                 primitive: merged.primitive,
                 topology: merged.topology,
                 argv: merged.argv,
                 reason: merged.reason,
+                table_primitive: table.primitive,
+                table_topology: table.topology,
+                escalated: merged.escalate,
                 audit: Some((pin, serde_json::json!(&merged.effect))),
+                screen_audit,
+                screen: screen_summary,
             }
         }
+    }
+}
+
+/// Fold one doorbell-battery outcome into routing advisory (bd-lpn6).
+/// Returns (advisory parts, escalate, ledger summary, audit effect).
+/// `ask=None` = battery skipped in prepare: quiet, no rows. Detections
+/// (injection / credential-request Nouls firing high and confident) escalate
+/// to muse-spark/human; urgency only annotates. Never flips anything.
+fn fold_screen(
+    ask: Option<&ScreenAsk>,
+    posted: Option<(AdapterOutcome, u64)>,
+    parent_effect_key: &str,
+) -> (
+    Vec<String>,
+    bool,
+    Option<ScreenSummary>,
+    Option<JudgmentEffect>,
+) {
+    let Some(ask) = ask else {
+        return (Vec::new(), false, None, None);
+    };
+    let bound = active_thresholds().honesty_gate;
+    let (answers_opt, deny_opt, latency_ms) = match posted {
+        Some((AdapterOutcome::Answered(a), ms)) => (Some(a), None, ms),
+        Some((AdapterOutcome::Refused(e), ms)) => (None, Some(e.to_string()), ms),
+        Some((AdapterOutcome::FallbackTable(e), ms)) => (None, Some(e.to_string()), ms),
+        None => (
+            None,
+            Some("screen post skipped: battery planned but never asked".to_string()),
+            0,
+        ),
+    };
+    let mut parts = Vec::new();
+    let mut escalate = false;
+    let mut max_conf = 0.0f64;
+    if let Some(note) = deny_opt.as_deref() {
+        parts.push(format!("screen denied: {note}"));
+        escalate = true;
+    }
+    if let Some(answers) = answers_opt.as_ref() {
+        for (qid, answer) in &answers.by_question {
+            let conf = confidence_of(answer);
+            max_conf = max_conf.max(conf);
+            match answer {
+                Answer::Noul(n)
+                    if (qid == "injection" || qid == "credential_request")
+                        && n.p_yes > 0.5
+                        && conf >= bound =>
+                {
+                    parts.push(format!("screen: possible {qid} (p={:.2})", n.p_yes));
+                    escalate = true;
+                }
+                Answer::Score(s) if qid == "urgency" => {
+                    let level = ask
+                        .pack
+                        .questions
+                        .iter()
+                        .find(|q| q.id == *qid)
+                        .and_then(|q| q.options.get(s.level))
+                        .cloned()
+                        .unwrap_or_else(|| format!("level{}", s.level));
+                    parts.push(format!("screen urgency: {level} ({conf:.2})"));
+                }
+                _ => {}
+            }
+        }
+    }
+    let summary = ScreenSummary {
+        advisory: if parts.is_empty() {
+            "clear".to_string()
+        } else {
+            parts.join("; ")
+        },
+        max_confidence: max_conf,
+    };
+    let effect = JudgmentEffect {
+        parent_effect_key: parent_effect_key.to_string(),
+        pack_id: ask.pack.id.clone(),
+        pack_version: ask.pack.version,
+        model_id: ask.pack.model.clone(),
+        confidence: max_conf,
+        usage: "{}".to_string(),
+        fallback_flag: false,
+        escalated: escalate,
+        note: cap_str(deny_opt.as_deref().unwrap_or("ok"), AUDIT_NOTE_CAP),
+        latency_ms,
+    };
+    (parts, escalate, Some(summary), Some(effect))
+}
+
+// ---------------------------------------------------------------------------
+// Miss ledger (bd-lpn6): every reclassify expand appends one row keyed by
+// the parent effect key; resolutions land later via `miss_resolve`
+// (none-path advisory confirm/deny, raw, compose). `miss needle mining`
+// reads the unresolved none-rows grouped by normalized goal — new routing
+// needles come from recurring misses, never from guesses.
+// ---------------------------------------------------------------------------
+
+/// Screen-battery outcome summary for the ledger row (bd-lpn6). Scores live
+/// in the kind=judgment audit; the row keeps the advisory + peak detection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ScreenSummary {
+    pub advisory: String,
+    pub max_confidence: f64,
+}
+
+/// One miss-ledger row. `resolution` starts None; a later `miss_resolve`
+/// appends a second row with the same key carrying the verdict.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct MissRow {
+    pub ts: String,
+    pub effect_key: String,
+    pub goal: String,
+    pub table_primitive: String,
+    pub table_topology: String,
+    pub escalated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<ScreenSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ts: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Resolutions the ledger accepts. confirm/deny close a none-path advisory;
+/// raw/compose record how an undecided goal was actually dispatched.
+pub const MISS_RESOLUTIONS: &[&str] = &["confirm", "deny", "raw", "compose"];
+
+/// Max goal chars kept per row (goals can be whole briefs).
+pub const MISS_GOAL_CAP: usize = 512;
+
+pub fn miss_ledger_path() -> std::path::PathBuf {
+    crate::config::state_dir().join("miss-ledger.jsonl")
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Append one row (JSON line). The caller owns durability policy: the
+/// expand path treats failure as a loud warn, never a dispatch failure.
+pub fn miss_append(row: &MissRow) -> Result<(), String> {
+    use std::io::Write;
+    let path = miss_ledger_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("miss ledger mkdir: {e}"))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("miss ledger open: {e}"))?;
+    let line = serde_json::to_string(row).map_err(|e| format!("miss ledger encode: {e}"))?;
+    writeln!(f, "{line}").map_err(|e| format!("miss ledger write: {e}"))?;
+    Ok(())
+}
+
+/// Read all valid rows, oldest first. Corrupt lines are skipped with one
+/// loud line on stderr (a torn tail must never poison mining).
+pub fn miss_read() -> Vec<MissRow> {
+    let path = miss_ledger_path();
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut rows = Vec::new();
+    let mut skipped = 0;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<MissRow>(line) {
+            Ok(r) => rows.push(r),
+            Err(_) => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        eprintln!(
+            "flywheel: miss ledger skipped {skipped} corrupt line(s) in {}",
+            path.display()
+        );
+    }
+    rows
+}
+
+/// Fold rows to latest-per-key (a resolution row supersedes its expand row).
+fn miss_fold_latest(rows: Vec<MissRow>) -> Vec<MissRow> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: BTreeMap<String, MissRow> = BTreeMap::new();
+    for r in rows {
+        if !by_key.contains_key(&r.effect_key) {
+            order.push(r.effect_key.clone());
+        }
+        by_key.insert(r.effect_key.clone(), r);
+    }
+    order
+        .into_iter()
+        .filter_map(|k| by_key.remove(&k))
+        .collect()
+}
+
+/// Record a resolution for a known effect key. Fails loud on an unknown key
+/// or a bad verdict (never invents ledger history).
+pub fn miss_resolve(
+    effect_key: &str,
+    resolution: &str,
+    note: Option<&str>,
+) -> Result<MissRow, String> {
+    if !MISS_RESOLUTIONS.contains(&resolution) {
+        return Err(format!(
+            "bad resolution {resolution:?}; want one of {}",
+            MISS_RESOLUTIONS.join(",")
+        ));
+    }
+    let mut base = miss_read()
+        .into_iter()
+        .rfind(|r| r.effect_key == effect_key)
+        .ok_or_else(|| format!("unknown effect key {effect_key:?} (no expand row)"))?;
+    base.resolution = Some(resolution.to_string());
+    base.resolved_ts = Some(now_rfc3339());
+    base.note = note.map(str::to_string);
+    miss_append(&base)?;
+    Ok(base)
+}
+
+/// Latest-per-key rows still awaiting a resolution.
+pub fn miss_unresolved() -> Vec<MissRow> {
+    miss_fold_latest(miss_read())
+        .into_iter()
+        .filter(|r| r.resolution.is_none())
+        .collect()
+}
+
+/// Normalize a goal for grouping: lowercase, collapse whitespace, cap.
+fn miss_norm_goal(goal: &str) -> String {
+    let mut out = String::with_capacity(goal.len().min(120));
+    let mut prev_space = true;
+    for c in goal.to_lowercase().chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+        if out.len() >= 120 {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Needle candidates: unresolved `none`-primitive rows grouped by normalized
+/// goal, most-recurring first. Recurring misses are routing-table gaps.
+pub fn miss_needle_candidates() -> Vec<(String, usize)> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for r in miss_unresolved() {
+        if r.table_primitive == "none" {
+            *counts.entry(miss_norm_goal(&r.goal)).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
+}
+
+/// Verify prescreen fold (bd-lpn6): advisory input to ce-evaluate, never a
+/// verdict. Returns (advisory, destructive_flag): the shape Choice value +
+/// the destructive Noul, plainly stated for a human to judge.
+pub fn fold_prescreen(answers: &Answers) -> (String, bool) {
+    let shape = answers
+        .by_question
+        .get("safe_shape")
+        .and_then(|a| match a {
+            Answer::Choice(c) => Some(c.choice.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let destructive_p = answers
+        .by_question
+        .get("destructive_risk")
+        .and_then(|a| match a {
+            Answer::Noul(n) => Some(n.p_yes),
+            _ => None,
+        })
+        .unwrap_or(0.5);
+    let conf = pack_confidence(answers);
+    (
+        format!("prescreen: shape={shape} destructive_p={destructive_p:.2} conf={conf:.2}"),
+        destructive_p > 0.5 && conf >= active_thresholds().honesty_gate,
+    )
+}
+
+/// Verify prescreen ask (bd-lpn6): runs the verify-prescreen pack over
+/// {verify.cmd} outside any tx. Deny (no pack/key) errors loud — the caller
+/// renders it into the advisory channel, never into a verdict field.
+pub fn prescreen_verify(project: &str, cmd_text: &str) -> Result<(String, bool, f64, u64), String> {
+    let pack = find_pack_for(project, "verify-prescreen")?;
+    let transport = UreqTransport::from_env().map_err(|e| e.to_string())?;
+    let mut fields = BTreeMap::new();
+    fields.insert("verify.cmd".to_string(), cmd_text.to_string());
+    let slice = build_state_slice(fields);
+    let adapter = JudgmentAdapter { pack, transport };
+    let (outcome, latency_ms) = run_post(adapter, &slice, Surface::Honesty);
+    match outcome {
+        AdapterOutcome::Answered(a) => {
+            let conf = pack_confidence(&a);
+            let (advisory, destructive) = fold_prescreen(&a);
+            Ok((advisory, destructive, conf, latency_ms))
+        }
+        AdapterOutcome::Refused(e) | AdapterOutcome::FallbackTable(e) => Err(e.to_string()),
+    }
+}
+
+/// Coordination-annotator surfaces (bd-lpn6). Each maps to one pack; every
+/// result is advisory text for the captain — annotators never dispatch,
+/// hold, assign, or close anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotateSurface {
+    CoalitionIntent,
+    WaveReadiness,
+    ReviewerRank,
+}
+
+impl AnnotateSurface {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "coalition-intent" => Some(Self::CoalitionIntent),
+            "wave-readiness" => Some(Self::WaveReadiness),
+            "reviewer-rank" => Some(Self::ReviewerRank),
+            _ => None,
+        }
+    }
+
+    fn pack_id(self) -> &'static str {
+        match self {
+            Self::CoalitionIntent => "coalition-intent",
+            Self::WaveReadiness => "wave-readiness",
+            Self::ReviewerRank => "reviewer-rank",
+        }
+    }
+}
+
+/// Annotator fold (bd-lpn6): answers → advisory line. Pure; network lives in
+/// `annotate`. Coalition unclear and wave unreadiness stay advisory text —
+/// the captain (or code gate) acts, never this fold.
+pub fn fold_annotate(surface: AnnotateSurface, answers: &Answers, pack: &QuestionPack) -> String {
+    let conf = pack_confidence(answers);
+    match surface {
+        AnnotateSurface::CoalitionIntent => {
+            let intent = answers
+                .by_question
+                .get("intent")
+                .and_then(|a| match a {
+                    Answer::Choice(c) => Some(c.choice.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("unclear");
+            if intent == "unclear" {
+                format!("annotate coalition: unclear ({conf:.2}) — ask before forming")
+            } else {
+                format!("annotate coalition: intent={intent} ({conf:.2})")
+            }
+        }
+        AnnotateSurface::WaveReadiness => {
+            let p = answers
+                .by_question
+                .get("ready_to_release")
+                .and_then(|a| match a {
+                    Answer::Noul(n) => Some(n.p_yes),
+                    _ => None,
+                })
+                .unwrap_or(0.5);
+            format!("annotate wave: ready_p={p:.2} ({conf:.2})")
+        }
+        AnnotateSurface::ReviewerRank => {
+            let (level, lv_conf) = answers
+                .by_question
+                .get("reviewer_fit")
+                .and_then(|a| match a {
+                    Answer::Score(s) => pack
+                        .questions
+                        .iter()
+                        .find(|q| q.id == "reviewer_fit")
+                        .and_then(|q| q.options.get(s.level))
+                        .map(|name| (name.clone(), confidence_of(a))),
+                    _ => None,
+                })
+                .unwrap_or(("unknown".to_string(), 0.0));
+            format!("annotate reviewer: fit={level} ({lv_conf:.2})")
+        }
+    }
+}
+
+/// Coordination annotator ask (bd-lpn6): loads the surface pack, asks over
+/// {goal.text + extra state}, folds to advisory text + confidence + latency.
+/// Deny errors loud. One candidate per call for reviewer-rank; the caller
+/// ranks repeated calls in code.
+pub fn annotate(
+    project: &str,
+    surface: AnnotateSurface,
+    goal: &str,
+    extra: &BTreeMap<String, String>,
+) -> Result<(String, f64, u64), String> {
+    let pack = find_pack_for(project, surface.pack_id())?;
+    let transport = UreqTransport::from_env().map_err(|e| e.to_string())?;
+    let mut fields = BTreeMap::new();
+    fields.insert("goal.text".to_string(), goal.to_string());
+    for (k, v) in extra {
+        fields.insert(k.clone(), v.clone());
+    }
+    let slice = build_state_slice(fields);
+    let adapter = JudgmentAdapter {
+        pack: pack.clone(),
+        transport,
+    };
+    let (outcome, latency_ms) = run_post(adapter, &slice, Surface::Honesty);
+    match outcome {
+        AdapterOutcome::Answered(a) => {
+            let conf = pack_confidence(&a);
+            Ok((fold_annotate(surface, &a, &pack), conf, latency_ms))
+        }
+        AdapterOutcome::Refused(e) | AdapterOutcome::FallbackTable(e) => Err(e.to_string()),
     }
 }
 
@@ -1225,6 +1764,77 @@ questions:
     fn pack_rejects_jev_latest() {
         let bad = PACK_YAML.replace("jev-1.13.0", "jev-latest");
         assert!(QuestionPack::parse_yaml(&bad).is_err());
+    }
+
+    /// bd-lpn6: every LIVE pack (highest version per id) parses, pins the
+    /// model, and carries criteria defining each Choice/Score option 1:1
+    /// (typesafe-ai shaping). Older versions stay on disk for audit and are
+    /// not held to the current shaping bar. .flywheel/ is untracked machine
+    /// state — skip gracefully where absent.
+    #[test]
+    fn shipped_packs_parse_pin_and_define_options() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".flywheel/judgment-packs");
+        if !dir.is_dir() {
+            eprintln!("skip: packs dir absent (untracked .flywheel)");
+            return;
+        }
+        // <id>.vN.yaml — test the highest N per id (the loader's live pick;
+        // older versions stay on disk for audit).
+        let mut best: std::collections::BTreeMap<String, (u32, std::path::PathBuf)> =
+            std::collections::BTreeMap::new();
+        let mut entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".yaml") {
+                continue;
+            }
+            let stem = name.trim_end_matches(".yaml");
+            let (id, ver) = match stem.rsplit_once(".v") {
+                Some((id, v)) => (id.to_string(), v.parse::<u32>().unwrap_or(0)),
+                None => continue,
+            };
+            best.entry(id)
+                .and_modify(|e| {
+                    if ver > e.0 {
+                        *e = (ver, entry.path());
+                    }
+                })
+                .or_insert((ver, entry.path()));
+        }
+        let mut seen = 0;
+        for (id, (ver, path)) in &best {
+            let name = format!("{id}.v{ver}");
+            let p = QuestionPack::load_from_file(path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(p.model, JEV_MODEL_PIN, "{name} pins the model");
+            for q in &p.questions {
+                if matches!(q.kind, QuestionKind::Choice | QuestionKind::Score) {
+                    assert!(
+                        !q.criteria.is_empty() && q.criteria.len() == q.options.len(),
+                        "{name}/{qid}: criteria must define each option 1:1",
+                        qid = q.id
+                    );
+                }
+            }
+            seen += 1;
+        }
+        assert!(seen >= 5, "reclassify + 4 lpn6 packs, got {seen}");
+    }
+
+    #[test]
+    fn pack_rejects_misaligned_criteria() {
+        let bad = r#"
+id: x
+version: 1
+model: jev-1.13.0
+questions:
+  - id: q
+    kind: choice
+    instructions: "?"
+    options: [a, b]
+    criteria: ["only one"]
+"#;
+        assert!(QuestionPack::parse_yaml(bad).is_err());
     }
 
     #[test]
@@ -1624,6 +2234,265 @@ questions:
     // Superseded by prepare_flag_off_is_passthrough_without_audit (bd-n86n
     // three-phase path); removed with maybe_enrich.
 
+    // --- bd-lpn6: miss ledger ---
+
+    fn miss_row(key: &str, goal: &str, prim: &str) -> MissRow {
+        MissRow {
+            ts: "2026-09-19T00:00:00Z".into(),
+            effect_key: key.into(),
+            goal: goal.into(),
+            table_primitive: prim.into(),
+            table_topology: "none".into(),
+            escalated: true,
+            screen: None,
+            resolution: None,
+            resolved_ts: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn miss_append_read_roundtrip() {
+        let _home = crate::config::test_state_home();
+        miss_append(&miss_row("k1", "Ship the onboarding", "none")).unwrap();
+        let rows = miss_read();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].effect_key, "k1");
+        assert_eq!(rows[0].resolution, None);
+    }
+
+    #[test]
+    fn miss_resolve_records_and_clears_unresolved() {
+        let _home = crate::config::test_state_home();
+        miss_append(&miss_row("k1", "goal one", "none")).unwrap();
+        miss_append(&miss_row("k2", "goal two", "loop-work")).unwrap();
+        assert_eq!(miss_unresolved().len(), 2);
+        let r = miss_resolve("k1", "deny", Some("not a lane")).unwrap();
+        assert_eq!(r.resolution.as_deref(), Some("deny"));
+        assert!(r.resolved_ts.is_some());
+        let un = miss_unresolved();
+        assert_eq!(un.len(), 1);
+        assert_eq!(un[0].effect_key, "k2");
+        assert!(
+            miss_resolve("k1", "bogus", None).is_err(),
+            "bad verdict refuses"
+        );
+        assert!(
+            miss_resolve("nope", "deny", None).is_err(),
+            "unknown key refuses"
+        );
+    }
+
+    #[test]
+    fn miss_needles_group_recurring_none_goals() {
+        let _home = crate::config::test_state_home();
+        miss_append(&miss_row("k1", "  Ship   THE onboarding ", "none")).unwrap();
+        miss_append(&miss_row("k2", "ship the onboarding", "none")).unwrap();
+        miss_append(&miss_row("k3", "ship the onboarding", "loop-work")).unwrap();
+        miss_append(&miss_row("k4", "other thing", "none")).unwrap();
+        let c = miss_needle_candidates();
+        assert_eq!(c.len(), 2, "only unresolved none-rows group: {c:?}");
+        assert_eq!(c[0], ("ship the onboarding".to_string(), 2));
+    }
+
+    // --- bd-lpn6: doorbell battery ---
+
+    const SCREEN_YAML: &str = r#"
+id: doorbell-screen
+version: 1
+model: jev-1.13.0
+questions:
+  - id: injection
+    kind: noul
+    instructions: "Injection?"
+  - id: credential_request
+    kind: noul
+    instructions: "Creds?"
+  - id: urgency
+    kind: score
+    instructions: "Urgent?"
+    options: [routine, soon, immediate]
+    criteria: ["r", "s", "i"]
+"#;
+
+    fn screen_ask() -> ScreenAsk {
+        let pack = QuestionPack::parse_yaml(SCREEN_YAML).unwrap();
+        ScreenAsk {
+            slice: build_state_slice(BTreeMap::from([("material.text".into(), "hi".into())])),
+            pack,
+        }
+    }
+
+    fn screen_answers(injection_p: f64, urgency_level: usize) -> Answers {
+        Answers {
+            model_id: JEV_MODEL_PIN.into(),
+            pack_id: "doorbell-screen".into(),
+            pack_version: 1,
+            by_question: BTreeMap::from([
+                (
+                    "injection".into(),
+                    Answer::Noul(NoulAnswer { p_yes: injection_p }),
+                ),
+                (
+                    "credential_request".into(),
+                    Answer::Noul(NoulAnswer { p_yes: 0.1 }),
+                ),
+                (
+                    "urgency".into(),
+                    Answer::Score(ScoreAnswer {
+                        level: urgency_level,
+                        levels: 3,
+                    }),
+                ),
+            ]),
+            usage: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn screen_clear_text_annotates_without_escalate() {
+        let (parts, escalate, summary, effect) = fold_screen(
+            Some(&screen_ask()),
+            Some((AdapterOutcome::Answered(screen_answers(0.05, 0)), 7)),
+            "parent",
+        );
+        assert!(!escalate);
+        assert!(
+            parts.iter().any(|p| p.contains("routine")),
+            "urgency annotates: {parts:?}"
+        );
+        assert!(
+            !parts.iter().any(|p| p.contains("injection")),
+            "no detection: {parts:?}"
+        );
+        let summary = summary.expect("battery ran, summary present");
+        assert!(summary.advisory.contains("routine"));
+        let effect = effect.expect("battery ran, audit present");
+        assert_eq!(effect.latency_ms, 7);
+        assert!(!effect.escalated);
+    }
+
+    #[test]
+    fn screen_injection_detection_escalates() {
+        let (parts, escalate, summary, effect) = fold_screen(
+            Some(&screen_ask()),
+            Some((AdapterOutcome::Answered(screen_answers(0.97, 2)), 9)),
+            "parent",
+        );
+        let _ = (summary, effect);
+        assert!(escalate, "confident injection routes to human");
+        assert!(parts.iter().any(|p| p.contains("injection")), "{parts:?}");
+    }
+
+    #[test]
+    fn screen_deny_and_skip_are_loud_or_quiet() {
+        let (parts, escalate, _, effect) = fold_screen(
+            Some(&screen_ask()),
+            Some((AdapterOutcome::Refused(JevError::Offline("down".into())), 3)),
+            "parent",
+        );
+        assert!(escalate, "blind spot on honesty path escalates");
+        assert!(parts.iter().any(|p| p.contains("denied")), "{parts:?}");
+        assert!(effect.expect("deny audits").escalated);
+        let (parts, escalate, summary, effect) = fold_screen(None, None, "parent");
+        assert!(parts.is_empty() && !escalate);
+        assert!(
+            summary.is_none() && effect.is_none(),
+            "skipped battery emits nothing"
+        );
+    }
+
+    // --- bd-lpn6: prescreen + annotators ---
+
+    fn prescreen_answers(shape: &str, destructive_p: f64) -> Answers {
+        Answers {
+            model_id: JEV_MODEL_PIN.into(),
+            pack_id: "verify-prescreen".into(),
+            pack_version: 1,
+            by_question: BTreeMap::from([
+                (
+                    "safe_shape".into(),
+                    Answer::Choice(ChoiceAnswer {
+                        choice: shape.into(),
+                        probs: BTreeMap::from([
+                            ("single-command".into(), 0.9),
+                            (shape.into(), 0.05),
+                        ]),
+                    }),
+                ),
+                (
+                    "destructive_risk".into(),
+                    Answer::Noul(NoulAnswer {
+                        p_yes: destructive_p,
+                    }),
+                ),
+            ]),
+            usage: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn prescreen_fold_states_shape_plainly() {
+        let (advisory, destructive) = fold_prescreen(&prescreen_answers("single-command", 0.02));
+        assert!(advisory.contains("shape=single-command"), "{advisory}");
+        assert!(!destructive);
+        let (advisory, destructive) = fold_prescreen(&prescreen_answers("destructive", 0.99));
+        assert!(destructive, "confident destructive flags: {advisory}");
+    }
+
+    #[test]
+    fn prescreen_and_annotate_deny_without_key() {
+        let _env = crate::config::lock_env();
+        unsafe { env::remove_var(API_KEY_ENV) };
+        // Packs resolve via ancestor walk from the repo; the failure under
+        // test is the missing key, not discovery.
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            prescreen_verify(&repo, "cargo test").is_err(),
+            "no key = loud deny"
+        );
+        assert!(
+            annotate(
+                &repo,
+                AnnotateSurface::CoalitionIntent,
+                "goal",
+                &BTreeMap::new()
+            )
+            .is_err(),
+            "no key = loud deny"
+        );
+    }
+
+    #[test]
+    fn annotate_folds_state_intent_plainly() {
+        let pack = QuestionPack::parse_yaml(
+            "id: coalition-intent\nversion: 1\nmodel: jev-1.13.0\nquestions:\n  - id: intent\n    kind: choice\n    instructions: \"?\"\n    options: [joint-ownership, review-handoff, no-coalition, unclear]\n    criteria: [\"a\", \"b\", \"c\", \"d\"]\n",
+        )
+        .unwrap();
+        let answers = Answers {
+            model_id: JEV_MODEL_PIN.into(),
+            pack_id: "coalition-intent".into(),
+            pack_version: 1,
+            by_question: BTreeMap::from([(
+                "intent".into(),
+                Answer::Choice(ChoiceAnswer {
+                    choice: "review-handoff".into(),
+                    probs: BTreeMap::from([
+                        ("review-handoff".into(), 0.8),
+                        ("unclear".into(), 0.1),
+                    ]),
+                }),
+            )]),
+            usage: "{}".into(),
+        };
+        let line = fold_annotate(AnnotateSurface::CoalitionIntent, &answers, &pack);
+        assert!(line.contains("intent=review-handoff"), "{line}");
+        assert!(AnnotateSurface::parse("wave-readiness") == Some(AnnotateSurface::WaveReadiness));
+        assert!(AnnotateSurface::parse("bogus").is_none());
+    }
+
     // --- bd-n86n: POST outside the journal tx ---
 
     fn expand_args(project: &str) -> ExpandArgs {
@@ -1671,7 +2540,7 @@ questions:
         unsafe { env::remove_var(FLAG_ENV) };
         let plan = prepare_post(expand_args("/nonexistent-probe"));
         assert!(matches!(plan.stage, PostStage::Off));
-        let out = finish_plan(plan, None);
+        let out = finish_plan(plan, None, None);
         assert_eq!(out.primitive, "loop-work");
         assert_eq!(out.topology, "loop");
         assert!(out.audit.is_none(), "flag off = byte-identical, no audit");
@@ -1689,7 +2558,7 @@ questions:
             matches!(plan.stage, PostStage::Deny { .. }),
             "missing pack = deny, never POST"
         );
-        let out = finish_plan(plan, None);
+        let out = finish_plan(plan, None, None);
         assert_eq!(out.primitive, "loop-work", "table wins even on deny");
         let (_, detail) = out.audit.expect("deny always audits");
         assert!(detail["escalated"].as_bool().unwrap_or(false));
@@ -1728,9 +2597,14 @@ questions:
                     api_key: "k".into(),
                     url: "u".into(),
                 },
+                screen: None,
             },
         };
-        let out = finish_plan(plan, Some((AdapterOutcome::Answered(stub_answers()), 123)));
+        let out = finish_plan(
+            plan,
+            Some((AdapterOutcome::Answered(stub_answers()), 123)),
+            None,
+        );
         let (_, detail) = out.audit.expect("ready always audits");
         assert_eq!(
             detail["latency_ms"].as_u64(),
@@ -1760,10 +2634,11 @@ questions:
                     api_key: "k".into(),
                     url: "u".into(),
                 },
+                screen: None,
             },
         };
         // Programming error (POST skipped): fail-closed deny, never quiet merge.
-        let out = finish_plan(plan, None);
+        let out = finish_plan(plan, None, None);
         assert!(out.audit.is_some());
         let reason = out.reason;
         assert!(reason.contains("jev"), "deny attaches advisory: {reason}");

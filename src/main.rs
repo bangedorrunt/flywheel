@@ -92,15 +92,15 @@ use serde_json::{Value, json};
 use cmd::DaemonCmd;
 use cmd::{
     ArtifactsCmd, AssetCmd, BackendCmd, CheckpointCmd, CoalitionCmd, ConfigCmd, CrewCmd, CronCmd,
-    DoorbellCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd, PrinciplesCmd, ProfileCmd,
-    RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd, ToronMailCmd, WorkCmd,
-    WorkflowCmd, WorktreeCmd, XprojCmd, cmd_analytics, cmd_asset, cmd_audit, cmd_backend,
+    DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd, PrinciplesCmd,
+    ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd, ToronMailCmd,
+    WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_analytics, cmd_asset, cmd_audit, cmd_backend,
     cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject,
     cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start,
     cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history,
-    cmd_internal_doorbell, cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles,
-    cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron,
-    cmd_work, cmd_worktree, cmd_xproj,
+    cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_models, cmd_policy,
+    cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline,
+    cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
@@ -1082,6 +1082,13 @@ enum Commands {
     Ledger {
         #[command(subcommand)]
         cmd: LedgerCmd,
+    },
+    /// host-side judgment surfaces (ADR-0014, bd-lpn6): miss ledger
+    /// (resolve/list/needles), on-demand annotators, verify prescreen.
+    /// Annotate-only — nothing here dispatches, holds, or closes.
+    Judgment {
+        #[command(subcommand)]
+        cmd: JudgmentCmd,
     },
     /// engineering principle registry (ADR-0019 Spec 5/6): list the 21
     /// canonical names, or show a leaf's full when+rule (unknown name ->
@@ -2469,7 +2476,7 @@ fn main() {
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
-            "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts",
+            "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
@@ -2900,6 +2907,7 @@ fn main() {
             reap_crews,
         }) => cmd_kill(&cfg, project, *force, *force_working, *drain, *reap_crews),
         Some(Commands::Ledger { cmd }) => cmd_ledger(&cfg, cmd),
+        Some(Commands::Judgment { cmd }) => cmd_judgment(cmd),
         Some(Commands::Principles { cmd }) => cmd_principles(cmd),
         Some(Commands::StandingOrders { cmd }) => cmd_standing_orders(cmd),
         Some(Commands::Work { cmd }) => cmd_work(&cfg, cmd),
