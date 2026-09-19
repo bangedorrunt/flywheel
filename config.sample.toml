@@ -1,0 +1,68 @@
+# flywheel user config sample — copy to ~/.config/flywheel/config.toml and uncomment.
+# Every key below is optional; absent keys take compiled-in defaults.
+# Validation: unknown keys are IGNORED (serde default, no deny-unknown-fields),
+# so typos fail silent — `flywheel config list` shows the effective config.
+# Layer ladder: compiled-in < config.toml < .env (dotenvy) < env < CLI flags.
+# Companion surfaces: models.toml, profiles.toml, workflows/*.yaml, crons/*.yaml,
+# stages.toml (see docs/configuration.md). Judgment env: .env.example.
+
+# herdr socket path (default ~/.config/herdr/herdr.sock)
+# socket_path = "~/.config/herdr/herdr.sock"
+
+# default project root (default ~/workspace)
+# workspace_root = "~/workspace"
+
+# default --wait timeout in ms for send/watch (default 1800000 = 30m)
+# default_timeout_ms = 1800000
+
+# Resonate server URL for the durable loop (default http://localhost:8001)
+# resonate_url = "http://localhost:8001"
+
+# short name -> herdr agent kind (defaults: oc=opencode, pi=pi, gk=grok;
+# unknown shorts pass through verbatim and fail loud at agent.start)
+# [kinds]
+# claude = "claude"
+
+# backend selection (defaults: multiplexer=herdr, mail=toron).
+# Env overrides: FLYWHEEL_BACKEND / FLYWHEEL_MAIL.
+# [backend]
+# multiplexer = "herdr"
+# mail = "toron"
+
+# mail transport (single-backend toron since bd-euav).
+# [mail.toron] url set = remote daemon; absent = embedded in-process.
+# Env overrides: FLYWHEEL_TORON_URL / FLYWHEEL_TORON_TOKEN / FLYWHEEL_MAIL_NAME.
+# [mail.toron]
+# url = "http://127.0.0.1:18080"
+# token = ""
+# [agent_mail]
+# name = "DustySparrow"   # shared orchestrator identity (legacy section)
+
+# doorbell plane-D daemon (ADR-0012 D2). Section present (even empty) selects
+# the daemon host; absent section = embedded in-process host.
+# [doorbell]
+# url = "http://127.0.0.1:18980"
+# arrival_triple = false  # presence + role auto-bind + join ring (default false)
+# beads_poller = false    # read-only br WAL poll (default false; never writes)
+# cron_doorbell_sink = false  # cron tick journals Fact rows (default false)
+# cross_workspace = false # N-workspace subscriptions (default false)
+# external_projects = {}  # slug -> repo dir for foreign re-ring (same host only)
+# [doorbell.services]     # name -> token hash + scope + rate; empty disables
+# deploy = { token_sha256 = "<hex>", channels = ["*"], rate_per_min = 6 }
+
+# durable-loop self-heal knobs (defaults shown).
+# [loop]
+# unknown_diagnose_threshold = 3
+# respawn_budget = 2
+# unknown_detect_grace_polls = 6
+# drain_grace_polls = 1
+# claim_nudge_after_polls = 2
+# verifier_family_override = ""  # absent = strict different-family rule
+
+# parent-death policy (default stop): stop | continue | adopt (recover = adopt).
+# on_captain_death = "stop"
+
+# operator-owned pane cap (default 5; repo .flywheel/ must not raise it).
+# Env override: FLYWHEEL_CREW_MAX.
+# [crew]
+# max = 5

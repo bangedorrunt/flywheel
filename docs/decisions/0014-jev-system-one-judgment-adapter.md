@@ -128,13 +128,13 @@ Caller code: weights, thresholds, Cmd construction — NEVER the model.
 
 **State-slice builder (I5, normative):** the slice is built in code with a byte cap (8 KiB default) and a PII denylist (credentials, tokens, private keys, full mail bodies); truncation is head-cut with a `truncated=true` marker. This is the code-side filter the jev-1.13 jaggedness row mandates.
 
-**Offline / deny policy (I4, normative):** on the honesty path the default is hard escalate (refuse, never silent table fallback). Table-decide fallback is allowed only on announce-only surfaces, and then only with `fallback_flag=true` journaled. This closes §7.2.
+**Offline / deny policy (I4, normative, revised bd-0glq P7 default-on):** the gate is three-way. Key ABSENT (flag unset) = unconfigured lane: table passthrough with a loud `jev: unconfigured` reason marker, never escalate, never audit (no escalate spam). Key PRESENT + 429/outage on the honesty path = hard escalate (refuse, never silent table fallback). Table-decide fallback is allowed only on announce-only surfaces, and then only with `fallback_flag=true` journaled. Explicit `FLYWHEEL_JEV=1` is a configured lane (deny escalates even keyless); explicit `0/false/no` is operator override (byte-identical passthrough). Never silent-skip a configured lane. This closes §7.2.
 
 ### 5.2 Allowed enrichment surfaces (flywheel)
 
 | Surface | Shape | Notes |
 |---------|-------|-------|
-| **Reclassify enricher** | On MaterialContext: intent Choice, urgency Score, honesty Nouls → merge with table `decide` | Highest leverage; default off behind future `FLYWHEEL_JEV` |
+| **Reclassify enricher** | On MaterialContext: intent Choice, urgency Score, honesty Nouls → merge with table `decide` | Highest leverage; on by default when `TYPESAFE_API_KEY` is present (bd-0glq P7), loud unconfigured-skip otherwise |
 | **Workflow family / selection** | Choice over families when brief catalog ambiguous (skill_suggestion shape) | After adapter exists; does not replace hybrid `--brief` |
 | **Inbound mail guardrails** | Noul/Score battery on doorbell material (injection / credentials) | Compose in host; still Tick Msg; later wave |
 | **Honesty gates** | Confidence thresholds escalate; never invent Settled from Jev alone | Aligns ADR-0032 Spec 7 |
@@ -151,7 +151,7 @@ Caller code: weights, thresholds, Cmd construction — NEVER the model.
 6. **Profiles stay pure data** — QuestionPacks may live as data; do not store profiles or bindings in TypeSafe.
 7. **Beads sole close** — no Noul → `br close` (see beads ADR-0006).
 8. **Offline / deny** — 429/outage.
-   **Locked (I4):** honesty path = hard escalate (refuse); announce-only = table fallback with `fallback_flag=true`. Thresholds locked as provisional per rule 5 above (I1).
+   **Locked (I4, revised bd-0glq):** key-absent default = unconfigured loud-skip (marker, no escalate, no audit); key-present failure on honesty path = hard escalate (refuse); announce-only = table fallback with `fallback_flag=true`. Thresholds locked as provisional per rule 5 above (I1).
 
 ### 5.4 Folded GS-054 REJECT list (flywheel-facing)
 
@@ -184,7 +184,7 @@ Caller code: weights, thresholds, Cmd construction — NEVER the model.
 ## 7. Open questions → locked defaults (debate agreement 2026-09-19, PearlTern + BrightCoast)
 
 1. API key custody (`TYPESAFE_API_KEY`) — **locked (I6):** mikasa-only; no eren/box egress until Serve MCP; monthly spend ceiling still TBD captain (sole remaining open item).
-2. Offline / deny policy — **locked (I4):** hard-fail escalate on honesty path; loud table-decide fallback announce-only with `fallback_flag=true`.
+2. Offline / deny policy — **locked (I4, revised bd-0glq P7 default-on):** key-absent = unconfigured loud-skip; key-present failure = hard-fail escalate on honesty path; loud table-decide fallback announce-only with `fallback_flag=true`.
 3. Confidence thresholds per action class — **locked provisional (I1):** 0.85 / 0.80 / 0.60 with re-validation duty; captain-tunable.
 4. Data egress — **locked (I5/I6):** code-side filter with byte cap + PII denylist before any POST; mikasa-only until Serve MCP.
 5. Model pin — **locked (I5):** pin `jev-1.13.0`; never `jev-latest` until pack re-validation CI exists.

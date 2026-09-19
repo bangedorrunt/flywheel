@@ -767,12 +767,32 @@ pub fn merge(
 // Flag + W2 host entry point
 // ---------------------------------------------------------------------------
 
-/// True only for explicit opt-in values. Everything else (including unset)
-/// is off: the expand path behaves exactly as before.
-pub fn jev_enabled() -> bool {
+/// Gate for the W2 enricher (bd-0glq; P7 operator order: Jev on by default).
+/// - Explicit `0`/`false`/`no` (or any other set non-truthy value) → `Off`:
+///   operator override, byte-identical passthrough, no marker.
+/// - Explicit `1`/`true`/`yes` → `On`: configured lane; deny escalates,
+///   even keyless (never silent-skip a configured lane).
+/// - Unset → `On` iff `TYPESAFE_API_KEY` is present non-empty, else
+///   `Unconfigured`: table passthrough with a loud `jev: unconfigured`
+///   reason marker, never escalate, never audit (no escalate spam).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JevGate {
+    Off,
+    Unconfigured,
+    On,
+}
+
+/// Resolve the gate from env. Pure read, no I/O beyond env.
+pub fn jev_gate() -> JevGate {
     match env::var(FLAG_ENV) {
-        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
-        Err(_) => false,
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => JevGate::On,
+            _ => JevGate::Off,
+        },
+        Err(_) => match env::var(API_KEY_ENV) {
+            Ok(k) if !k.trim().is_empty() => JevGate::On,
+            _ => JevGate::Unconfigured,
+        },
     }
 }
 
@@ -975,10 +995,29 @@ fn plan_of(a: ExpandArgs, stage: PostStage) -> PostPlan {
 
 /// Phase 1 (no network): flag check, pack discovery, key read, slice build.
 /// Returns `Ready` iff a POST should run; the caller runs `run_post`
-/// outside the journal tx, then `finish_plan` inside.
+/// outside the journal tx, then `finish_plan` inside. `Unconfigured`
+/// (keyless default) skips loud with a reason marker — table passthrough,
+/// no escalate, no audit.
 pub fn prepare_post(a: ExpandArgs) -> PostPlan {
-    if !jev_enabled() {
-        return plan_of(a, PostStage::Off);
+    match jev_gate() {
+        JevGate::Off => return plan_of(a, PostStage::Off),
+        JevGate::Unconfigured => {
+            let mut table = table_of(&a);
+            table.reason = format!(
+                "{} [jev: unconfigured — set TYPESAFE_API_KEY to enable judgment]",
+                table.reason
+            );
+            let plan = PostPlan {
+                table,
+                pin: a.pin,
+                explicit_topology: a.explicit_topology,
+                parent_effect_key: a.parent_effect_key,
+                sticky_topology: a.sticky_topology,
+                stage: PostStage::Off,
+            };
+            return plan;
+        }
+        JevGate::On => {}
     }
     let pack = match find_pack(&a.project) {
         Ok(p) => p,
@@ -2080,7 +2119,26 @@ questions:
         let _env = crate::config::lock_env();
         // Edition 2024: env mutation is unsafe (single-threaded test, sound).
         unsafe { env::remove_var(FLAG_ENV) };
-        assert!(!jev_enabled());
+        unsafe { env::remove_var(API_KEY_ENV) };
+        assert_eq!(jev_gate(), JevGate::Unconfigured);
+    }
+
+    /// bd-0glq: P7 default-on — unset flag enriches iff the key is present;
+    /// keyless default skips loud (marker, never escalate); explicit values
+    /// keep the old contract (truthy = configured lane, else off).
+    #[test]
+    fn gate_default_on_with_key_unconfigured_without() {
+        let _env = crate::config::lock_env();
+        unsafe { env::remove_var(FLAG_ENV) };
+        unsafe { env::set_var(API_KEY_ENV, "k") };
+        assert_eq!(jev_gate(), JevGate::On);
+        unsafe { env::remove_var(API_KEY_ENV) };
+        assert_eq!(jev_gate(), JevGate::Unconfigured);
+        unsafe { env::set_var(FLAG_ENV, "1") };
+        assert_eq!(jev_gate(), JevGate::On);
+        unsafe { env::set_var(FLAG_ENV, "0") };
+        assert_eq!(jev_gate(), JevGate::Off);
+        unsafe { env::remove_var(FLAG_ENV) };
     }
 
     // --- review blockers (PearlTern fresh-eyes) ---
@@ -2537,13 +2595,38 @@ questions:
     #[test]
     fn prepare_flag_off_is_passthrough_without_audit() {
         let _env = crate::config::lock_env();
-        unsafe { env::remove_var(FLAG_ENV) };
+        unsafe { env::set_var(FLAG_ENV, "0") };
         let plan = prepare_post(expand_args("/nonexistent-probe"));
         assert!(matches!(plan.stage, PostStage::Off));
         let out = finish_plan(plan, None, None);
         assert_eq!(out.primitive, "loop-work");
         assert_eq!(out.topology, "loop");
         assert!(out.audit.is_none(), "flag off = byte-identical, no audit");
+        assert!(
+            !out.reason.contains("jev:"),
+            "explicit off carries no marker"
+        );
+        unsafe { env::remove_var(FLAG_ENV) };
+    }
+
+    /// bd-0glq: keyless default is a LOUD skip — table passthrough with the
+    /// unconfigured marker, no audit, no escalate (never escalate spam).
+    #[test]
+    fn prepare_unconfigured_marks_passthrough_without_escalate() {
+        let _env = crate::config::lock_env();
+        unsafe { env::remove_var(FLAG_ENV) };
+        unsafe { env::remove_var(API_KEY_ENV) };
+        let plan = prepare_post(expand_args("/nonexistent-probe"));
+        assert!(matches!(plan.stage, PostStage::Off));
+        let out = finish_plan(plan, None, None);
+        assert_eq!(out.primitive, "loop-work", "table wins");
+        assert!(out.audit.is_none(), "no POST = no audit");
+        assert!(!out.escalated, "unconfigured never escalates");
+        assert!(
+            out.reason.contains("jev: unconfigured"),
+            "loud skip marker: {}",
+            out.reason
+        );
     }
 
     #[test]

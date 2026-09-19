@@ -3,16 +3,21 @@ title: Jev W2 enable procedure
 description: Arming checklist for the reclassify enricher behind FLYWHEEL_JEV. Key custody, spend ceiling, pack re-validation CI, latency mining, rollback.
 ---
 
-Default state is **off**: `FLYWHEEL_JEV` unset (or anything but `1`/`true`/`yes`)
-means the expand path is byte-identical to the table leaf — no POST, no audit.
-Do not enable until the captain gives the word; this page is the procedure for
-that day, not the word itself.
+Default state is **on when `TYPESAFE_API_KEY` is present** (bd-0glq P7
+operator order: Jev on by default). Key absent (flag unset) = unconfigured
+lane: table passthrough with a loud `jev: unconfigured` reason marker,
+never escalate, never audit. Explicit `FLYWHEEL_JEV=1` forces on (deny
+escalates even keyless); explicit `0/false/no` forces off (byte-identical
+passthrough). Do not "enable" anything else — there is no other switch;
+the arming work below is custody, ceiling, packs, and thresholds.
 
 ## Key custody (mikasa-only)
 
 - `TYPESAFE_API_KEY` lives in mikasa's environment only. Never committed,
   never in eren/box envs, never in pack YAML.
-- Missing/empty key is a loud deny (escalate + audit), never a silent skip.
+- Unset flag + missing/empty key = unconfigured lane (loud marker, no
+  escalate). Explicit `FLYWHEEL_JEV=1` + missing key = configured lane
+  failing: loud deny (escalate + audit), never a silent skip.
 - Rotation: replace the env value, no code change; in-flight reclassifies
   fail over to deny on the next tick.
 
@@ -20,7 +25,7 @@ that day, not the word itself.
 
 No ceiling is set. Before arming, the captain locks: monthly cap, per-tick
 POST budget (one POST per MaterialContext today — no batching), and who gets
-paged on 429 streaks. Until then the flag stays off.
+paged on 429 streaks.
 
 ## Pack re-validation CI
 
@@ -53,7 +58,8 @@ It doubles per-expand POST cost — include it in the spend math.
 3. Clippy gate clean: `scripts/verify-clippy.sh`.
 4. Thresholds reviewed (`FLYWHEEL_JEV_THRESHOLDS` or provisional defaults).
 5. Key present on mikasa only; spend ceiling locked.
-6. Flip: `FLYWHEEL_JEV=1` on the host. Observe `kind=judgment` audit rows
-   (parent effect key, pack version, confidence, `latency_ms`, escalated).
-7. Rollback: unset the flag. The path returns to byte-identical passthrough;
-   no journal migration, no cleanup.
+6. Enrichment runs by default (no flag flip needed). Observe `kind=judgment`
+   audit rows (parent effect key, pack version, confidence, `latency_ms`,
+   escalated); unconfigured hosts show the `jev: unconfigured` marker.
+7. Rollback: set `FLYWHEEL_JEV=0`. The path returns to byte-identical
+   passthrough; no journal migration, no cleanup.

@@ -49,7 +49,12 @@ Also supported: `[mail.toron]` url+token, `[backend]` multiplexer/mail,
 `[backend]` multiplexer/mail, `[crew] max` (default 5), `[loop]`
 thresholds (unknown_diagnose, respawn_budget, detect_grace, drain_grace,
 claim_nudge), `socket_path`, `workspace_root`, `resonate_url`,
-`on_captain_death` (stop | continue | adopt).
+`on_captain_death` (stop | continue | adopt), `kinds`, `verifier_family_override`. Full annotated
+inventory with every default and validation rule: `config.sample.toml`
+at the repo root (unknown keys are ignored — typos fail silent, check
+with `flywheel config list`). Judgment has no `config.toml` keys (env
+only: `FLYWHEEL_JEV`, `TYPESAFE_API_KEY`, `FLYWHEEL_JEV_THRESHOLDS` —
+see §3 and the [Jev enable guide](./guides/jev-w2-enable.mdx)).
 
 ### `~/.config/flywheel/models.toml` — registry overlay
 
@@ -124,6 +129,9 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 | `RESONATE_URL` | durable-loop server (default `http://localhost:8001`) |
 | `HERDR_SOCKET_PATH` | multiplexer socket |
 | `AGENT_NAME` / `TORON_AGENT` / `FLYWHEEL_MAIL_AS` | your pin (attributed commits; unattributed fail closed) |
+| `FLYWHEEL_JEV` | judgment gate (bd-0glq P7: on by default). Unset = auto (enrich iff `TYPESAFE_API_KEY` is set, else loud `jev: unconfigured` passthrough, never escalate); `1/true/yes` = force on (deny escalates even keyless); `0/false/no` = force off (byte-identical) |
+| `TYPESAFE_API_KEY` | System One key, mikasa-only custody. Absent = unconfigured lane (marker, no escalate); present + failure = I4 hard escalate. Never commit a real key |
+| `FLYWHEEL_JEV_THRESHOLDS` | provisional `topology,honesty,announce` floats (default `0.85,0.80,0.60`, captain-tunable, re-validation duty) |
 
 ## 4. The daemons (who runs what, who touches whom)
 
