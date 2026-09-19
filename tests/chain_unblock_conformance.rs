@@ -76,6 +76,8 @@ fn closing_blocker_unblocks_dependent() {
     // b1 is the blocker; b2 depends on b1. Both carry a TYPED verify field —
     // schema-18 br's ready predicate refuses verify-less beads (bd-3566,
     // beads_rust-wave5-flywheel-parser-strip-dkpvi).
+    // Fail-closed create (bd-h8d6): title alone refuses — a description is
+    // required. Same titles, priority, and verify as before.
     let b1 = br_stdout(
         &dir,
         &[
@@ -83,6 +85,8 @@ fn closing_blocker_unblocks_dependent() {
             "blocker task",
             "-p",
             "3",
+            "-d",
+            "conformance fixture: blocks the dependent bead",
             "--verify",
             "test -f README.md",
             "--json",
@@ -95,6 +99,8 @@ fn closing_blocker_unblocks_dependent() {
             "dependent task",
             "-p",
             "3",
+            "-d",
+            "conformance fixture: unblocked when the blocker closes",
             "--verify",
             "test -f README.md",
             "--json",
