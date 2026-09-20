@@ -531,6 +531,17 @@ pub(crate) fn cmd_doorbell_subscribe(
     // bd-blank-project-spelling-non-mail-doors-76hi: None is meaningful here
     // (workspace-scoped door), Some("") is not.
     crate::ensure_project_opt(project, "doorbell subscribe")?;
+    // bd-zawk G8: a missing --project stores a legacy row that is never
+    // auto-hosted — the operator reads "subscribed" while nothing can ring.
+    // Refuse the silent store LOUDLY instead of minting a dead row.
+    // governed-by: bd-zawk
+    let project = match project {
+        Some(p) => p,
+        None => {
+            eprintln!("doorbell subscribe: --project is required (no silent store: a project-less row is never auto-hosted, so the wake would never ring). Pass --project <slug>.");
+            anyhow::bail!("doorbell subscribe requires --project <slug>");
+        }
+    };
     use doorbell_rt::subscribe::{
         Actor, Budget, Filter, Identity, Scope, SinkKind, Subscription, SubscriptionStore,
     };
@@ -576,7 +587,7 @@ pub(crate) fn cmd_doorbell_subscribe(
         },
         sink: kind,
         budget: Budget::default_530(),
-        project: project.map(|s| s.to_string()),
+        project: Some(project.to_string()),
         endpoint,
     };
     let mut store = SubscriptionStore::open(&crate::config::state_dir());

@@ -988,19 +988,22 @@ impl FileHost {
         effects
             .into_iter()
             .flat_map(|e| match e {
-                Effect::Prompt { pin, line } => match self.presence.get(&pin) {
-                    Some(PresenceVerdict::Idle) => vec![Effect::Prompt { pin, line }],
-                    Some(PresenceVerdict::Busy) if doorbell_core::is_urgent_line(&line) => {
-                        vec![Effect::Prompt { pin, line }]
+                // governed-by: bd-zawk — same typed InjectGate as the herdr
+                // path: Busy+urgent breaks through, everything else digests.
+                Effect::Prompt { pin, line } => {
+                    let verdict = self.presence.get(&pin).copied().unwrap_or(PresenceVerdict::Unknown);
+                    let urgent = doorbell_core::is_urgent_line(&line);
+                    match doorbell_core::inject_gate(verdict, urgent) {
+                        doorbell_core::InjectGate::Inject => vec![Effect::Prompt { pin, line }],
+                        doorbell_core::InjectGate::Digest(_) => vec![Effect::Audit {
+                            kind: "prompt_filtered".into(),
+                            pin,
+                            detail: serde_json::json!(format!(
+                                "non-injectable presence held wake for digest: {line}"
+                            )),
+                        }],
                     }
-                    _ => vec![Effect::Audit {
-                        kind: "prompt_filtered".into(),
-                        pin,
-                        detail: serde_json::json!(format!(
-                            "non-injectable presence held wake for digest: {line}"
-                        )),
-                    }],
-                },
+                }
                 other => vec![other],
             })
             .collect()

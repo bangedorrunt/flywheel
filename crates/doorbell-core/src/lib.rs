@@ -66,14 +66,43 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
     None
 }
 
-/// Inject only when the pane is idle, done, or blocked (blocked is await-signal,
-/// not "don't disturb" — a peer's fix must break through, ADR-0005 gap 5).
-/// NOTE (bd-s8bo / bd-7qg6): this is the LEGACY DoorbellModel gate over raw
-/// herdr-status strings. The live workspace path re-gates every Prompt through
-/// `workspace::prompt_allowed` (exact Idle verdict) + `filter_prompts`
-/// (Busy+urgent breakthrough, rest → digest-visible Audit). Blocked parses to
-/// Busy there, so a blocked pin's wake lands in the captain digest, not as a
-/// prompt — keep both gates in sync when touching either.
+/// One typed inject gate (bd-zawk G6): the single owner of the
+/// inject-vs-digest decision for BOTH the herdr-string path
+/// (`route_or_queue`, `is_drain_transition` inputs) and the presence-verdict
+/// path (`apply_presence_filter`). blocked parses to Busy, so blocked+urgent
+/// injects while blocked+routine digests with a reason — never a silent drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectGate {
+    Inject,
+    Digest(&'static str),
+}
+
+/// Verdict + urgency -> decision. Idle always injects; Busy breaks through
+/// only for urgent lines; Dead/Unknown always digest with a reason.
+// governed-by: bd-zawk
+pub fn inject_gate(verdict: PresenceVerdict, urgent: bool) -> InjectGate {
+    match (verdict, urgent) {
+        (PresenceVerdict::Idle, _) => InjectGate::Inject,
+        (PresenceVerdict::Busy, true) => InjectGate::Inject,
+        (PresenceVerdict::Busy, false) => InjectGate::Digest("non-injectable presence held wake for digest"),
+        (PresenceVerdict::Dead, _) => InjectGate::Digest("dead presence held wake for digest"),
+        (PresenceVerdict::Unknown, _) => InjectGate::Digest("unknown presence held wake for digest"),
+    }
+}
+
+/// Herdr-status string + line urgency -> decision. Parses through
+/// `parse_presence_word` so blocked->Busy and done->Idle agree with the
+/// presence path by construction.
+// governed-by: bd-zawk
+pub fn inject_gate_for_herdr(herdr_status: &str, urgent: bool) -> InjectGate {
+    inject_gate(parse_presence_word(herdr_status), urgent)
+}
+
+/// State-level injectability (queue drain transitions only). Kept
+/// urgency-agnostic on purpose: drain is about leaving working for an
+/// await-signal state, not about one line's urgency. Per-wake decisions
+/// MUST use `inject_gate` / `inject_gate_for_herdr` instead.
+// governed-by: bd-zawk
 pub fn should_inject(herdr_status: &str) -> bool {
     matches!(herdr_status, "idle" | "done" | "blocked")
 }
@@ -825,8 +854,9 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
     (next, actions)
 }
 
-/// Idle/done/blocked panes get a Prompt now; working panes queue (drained on
-/// the next working -> idle|done|blocked HerdrStatus).
+/// Idle/done panes get a Prompt now; blocked+urgent prompts while
+/// blocked+routine digests with a reason (bd-zawk G6); working panes queue
+/// (drained on the next working -> idle|done|blocked HerdrStatus).
 fn route_or_queue(
     next: &mut DoorbellModel,
     actions: &mut Vec<DoorbellAction>,
@@ -838,11 +868,25 @@ fn route_or_queue(
         .get(pin)
         .map(String::as_str)
         .unwrap_or("unknown");
+    // governed-by: bd-zawk — per-wake verdict via the typed InjectGate so the
+    // herdr-string path agrees with the presence-verdict path by construction.
+    // blocked+urgent prompts; blocked+routine digests with a reason.
     if should_inject(status) {
-        actions.push(DoorbellAction::Prompt {
-            pin: pin.to_string(),
-            line,
-        });
+        match inject_gate_for_herdr(status, is_urgent_line(&line)) {
+            InjectGate::Inject => {
+                actions.push(DoorbellAction::Prompt {
+                    pin: pin.to_string(),
+                    line,
+                });
+            }
+            InjectGate::Digest(reason) => {
+                actions.push(DoorbellAction::Digest {
+                    pin: pin.to_string(),
+                    line: format!("{line} [{reason}]"),
+                    why: reason.to_string(),
+                });
+            }
+        }
     } else if next.unroutable.contains(pin) {
         // bd-bk9t: no pane means no drain is possible, ever. Queueing here
         // would be a memory leak wearing a delivery intent — the RAM-only
@@ -917,6 +961,39 @@ mod tests {
         for w in ["", "mystery", "null"] {
             assert_eq!(parse_presence_word(w), PresenceVerdict::Unknown);
         }
+    }
+
+    #[test]
+    fn inject_gate_blocked_urgent_injects_routine_digests() {
+        // bd-zawk G6: one typed gate for both paths — blocked+urgent injects,
+        // blocked+routine digests with a reason, never a silent drop.
+        assert_eq!(
+            inject_gate_for_herdr("blocked", true),
+            InjectGate::Inject
+        );
+        assert!(matches!(
+            inject_gate_for_herdr("blocked", false),
+            InjectGate::Digest(_)
+        ));
+        assert_eq!(inject_gate_for_herdr("idle", false), InjectGate::Inject);
+        assert_eq!(inject_gate_for_herdr("done", false), InjectGate::Inject);
+        assert!(matches!(
+            inject_gate_for_herdr("working", false),
+            InjectGate::Digest(_)
+        ));
+        assert!(matches!(
+            inject_gate_for_herdr("unknown", true),
+            InjectGate::Digest(_)
+        ));
+        // Verdict path agrees with the herdr-string path by construction.
+        assert_eq!(
+            inject_gate(PresenceVerdict::Busy, true),
+            InjectGate::Inject
+        );
+        assert!(matches!(
+            inject_gate(PresenceVerdict::Busy, false),
+            InjectGate::Digest(_)
+        ));
     }
 
     #[test]
