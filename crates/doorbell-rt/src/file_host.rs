@@ -418,7 +418,8 @@ const STALE_PANE_GRACE_SECS: u64 = 120;
 /// impossible.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InjectionPicture {
-    /// registry pins (non-empty `mail_identity`)
+    /// sweep-set pins (non-empty `mail_identity`, pane still listed by
+    /// herdr) — what the sweep actually fetches, never the raw registry
     pub pins: usize,
     /// pins whose pane appears in `herdr agent list`, any status
     pub panes_seen: usize,
@@ -438,8 +439,19 @@ pub fn injection_picture(
 ) -> InjectionPicture {
     let (rows, _) = read_registry_rows(flywheel_state, project, override_path);
     let statuses = herdr_agent_statuses(herdr_bin);
+    // bd-2i96 G4: `pins` tracks the sweep set, not the raw registry.
+    // Reaped/stale pins (pane absent from `herdr pane list`) leave the
+    // sweep via reap_stale_registry_pins; counting them here reported a
+    // fleet that costs no fetches and can land no wake. The fault stays
+    // visible in `panes_missing`. Empty pane set = herdr did not answer
+    // (same guard as the reaper): no evidence, keep all rows.
+    let panes = herdr_pane_ids(herdr_bin);
     let mut picture = InjectionPicture::default();
     for (_, pane, _) in &rows {
+        if !panes.is_empty() && (pane.is_empty() || !panes.contains(pane)) {
+            picture.panes_missing += 1;
+            continue;
+        }
         picture.pins += 1;
         match statuses.get(pane) {
             Some(status) => {
@@ -670,9 +682,9 @@ impl FileHost {
     ///
     /// Guards: an EMPTY pane list means herdr did not answer, so nothing is
     /// reaped on a transient failure, and a pin whose pane reappears is
-    /// un-reaped. `/health.injection` still counts reaped pins (it reads the
-    /// raw registry), so the fault stays visible after it stops costing a
-    /// fetch per tick.
+    /// un-reaped. `/health.injection` pins track the same sweep set, so a
+    /// reaped pin leaves `pins` and the fault stays visible in
+    /// `panes_missing` after it stops costing a fetch per tick.
     fn reap_stale_registry_pins(&mut self, rows: &[RegistryRow], now: u64) -> StaleReap {
         let known = herdr_pane_ids(&self.cfg.herdr_bin);
         if known.is_empty() {
@@ -1563,6 +1575,44 @@ mod tests {
         assert_eq!(
             (pic.pins, pic.panes_seen, pic.injectable, pic.panes_missing),
             (2, 2, 1, 0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-2i96 G4: `pins` tracks the sweep set, not the raw registry. A
+    /// pin whose pane herdr no longer lists is reaped from the sweep, so
+    /// /health must stop counting it in pins. The fault stays visible in
+    /// `panes_missing`, never in `pins`.
+    #[test]
+    fn injection_picture_excludes_stale_panes_from_pin_count() {
+        let dir = tmp_state("inj-stale");
+        std::fs::write(
+            dir.join("agents").join("proj.json"),
+            serde_json::to_string(&entries()).unwrap(),
+        )
+        .unwrap();
+        // pane-b is dead: absent from both the pane list and the agents.
+        let script = dir.join("herdr-stale");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"pane\" ]; then echo '{\"result\":{\"panes\":[{\"pane_id\":\"pane-a\"}]}}'; else echo '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"idle\"}]}}'; fi\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        let pic = injection_picture(
+            &dir,
+            "proj",
+            Some(&dir.join("agents").join("proj.json")),
+            &script.to_string_lossy(),
+        );
+        assert_eq!(
+            (pic.pins, pic.panes_seen, pic.injectable, pic.panes_missing),
+            (1, 1, 1, 1),
+            "stale pane-b leaves pins, fault stays in panes_missing"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

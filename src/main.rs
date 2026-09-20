@@ -8711,6 +8711,17 @@ fn cmd_doorbell_why(
         let pin_match = if corr.is_some() || seq.is_some() {
             true
         } else {
+            // bd-2i96 G1: journal attribution for daemon rows that fold
+            // to no workspace::Msg (InboxFetched/Digest carry rt_kind).
+            let entry_pins: Vec<String> = entry
+                .get("pins")
+                .and_then(|p| p.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
             let effective: Vec<workspace::Cmd> = actual
                 .iter()
                 .filter(|c| match c {
@@ -8719,7 +8730,7 @@ fn cmd_doorbell_why(
                 })
                 .cloned()
                 .collect();
-            why_entry_mentions_pin(pin, replay_msg.as_ref(), &effective)
+            why_entry_mentions_pin(pin, replay_msg.as_ref(), &effective, &entry_pins)
         };
         if !corr_match || !seq_match || !pin_match {
             continue;
@@ -9222,6 +9233,7 @@ fn why_entry_mentions_pin(
     pin: &str,
     msg: Option<&workspace::Msg>,
     cmds: &[workspace::Cmd],
+    entry_pins: &[String],
 ) -> bool {
     let cmd_hit = cmds.iter().any(|c| match c {
         workspace::Cmd::Prompt { pin: p, .. } => p == pin,
@@ -9231,9 +9243,13 @@ fn why_entry_mentions_pin(
     if cmd_hit {
         return true;
     }
-    // bd-c9jw: a daemon row has no workspace::Msg counterpart, so there is
-    // nothing left to match on beyond the journaled actions above. Say no
-    // rather than pretend.
+    // bd-2i96 G1: daemon rows (InboxFetched/Digest) journal no
+    // workspace::Msg — rt_kind shape, rows never journaled — so a quiet
+    // fetch yields no Prompt/Audit cmd either. The journal `pins`
+    // attribution is the delivery fact; honor it (still [journaled]).
+    if entry_pins.iter().any(|p| p == pin) {
+        return true;
+    }
     let Some(msg) = msg else { return false };
     match msg {
         workspace::Msg::InboxItems { pin: p, .. }
@@ -9960,6 +9976,27 @@ mod s_proof_tests {
                 "why must carry a {needle} filter bound, not pin-substring grep"
             );
         }
+    }
+
+    #[test]
+    fn why_shows_daemon_inbox_wake() {
+        // bd-2i96 G1: daemon InboxFetched rows journal no workspace::Msg
+        // (rt_kind shape, rows never journaled), so a quiet fetch yields
+        // no Prompt/Audit cmd either. The journal `pins` attribution is
+        // the only link to the pin — why must honor it (still [journaled]).
+        let entry_pins = vec!["PearlTern".to_string()];
+        assert!(
+            super::why_entry_mentions_pin("PearlTern", None, &[], &entry_pins),
+            "daemon inbox row attributed via journal pins must match"
+        );
+        assert!(
+            !super::why_entry_mentions_pin("BrightCoast", None, &[], &entry_pins),
+            "other pins must not match"
+        );
+        assert!(
+            !super::why_entry_mentions_pin("PearlTern", None, &[], &[]),
+            "legacy rows without pins stay invisible, never invented"
+        );
     }
 }
 
