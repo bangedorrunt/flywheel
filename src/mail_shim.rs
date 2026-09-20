@@ -761,6 +761,7 @@ impl Mail {
                     urgent_only,
                     since_ts: None,
                     thread_id: None,
+                    ack_overdue_only: false,
                 }))?;
                 Ok(Value::Array(msgs.iter().map(ToJson::to_json).collect()))
             }
@@ -823,6 +824,7 @@ impl Mail {
                     urgent_only: filter.urgent_only,
                     since_ts: filter.since_ts.clone(),
                     thread_id: filter.thread_id.clone(),
+                    ack_overdue_only: false,
                 }))?;
                 let rows = msgs
                     .iter()
@@ -1008,6 +1010,7 @@ impl Mail {
                     urgent_only: true,
                     since_ts: None,
                     thread_id: filter.thread_id.clone(),
+                    ack_overdue_only: false,
                 }))?;
                 msgs.iter()
                     .map(ToJson::to_json)
