@@ -14,6 +14,17 @@ agreement (1 pi), implement via 2 pi lanes. Beads bd-cr8h / bd-2i96 / bd-zawk.
 - Lane B (6ea530c): one typed InjectGate both paths; subscribe without
   --project refuses silent store. Both closed LEGAL, doorbell fence green.
 
+## Live e2e outcome (bd-46qy, 2026-09-21)
+
+Proven live: G8 subscribe refusal, G1 why-shows-daemon-rows, XDG cutover
+(pid 80758 via launchd respawn, hosted, seq advancing), urgent ring now
+reaches a real digest (bd-v8vi fix, digest line 04:59:44Z). New bugs filed
+from probing: bd-v8vi (urgent audit-blackhole, fixed 63d311c), toron
+channel-plane incident bd-pwja (open). Process scars: reinstall the binary
+after landing (stale CLI lies); old daemon ignored SIGTERM, kill -9 +
+launchd respawn recovered; `doorbell restart` adopts instead of restarting,
+use stop --force or kill + start.
+
 ## Gotchas (do not repeat)
 
 1. **`send --stage` dispatched:true landed:false is UNVERIFIED delivery.**
