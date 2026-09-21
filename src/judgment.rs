@@ -12,6 +12,8 @@
 use std::collections::BTreeMap;
 use std::env;
 
+use crate::authority::RuntimeAuthority;
+
 /// Pinned model id. Never `jev-latest` until pack re-validation CI exists
 /// (ADR-0014 §5.1 I5): a moving alias under static packs is silent drift.
 pub const JEV_MODEL_PIN: &str = "jev-1.13.0";
@@ -402,6 +404,20 @@ pub enum JevError {
     Malformed(String),
 }
 
+impl JevError {
+    /// Map judgment transport failures into the shared host taxonomy so Jev
+    /// participates in the same retry, audit, and escalation policy as every
+    /// other provider. The adapter still preserves its richer error variant.
+    pub fn classified(&self) -> crate::failure::ClassifiedFailure {
+        let text = match self {
+            Self::RateLimited(e) => format!("429 {e}"),
+            Self::Unauthorized => "401 unauthorized".to_string(),
+            other => other.to_string(),
+        };
+        crate::failure::classify(&text, None, None)
+    }
+}
+
 impl std::fmt::Display for JevError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -437,16 +453,25 @@ pub struct UreqTransport {
 }
 
 impl UreqTransport {
-    pub fn from_env() -> Result<Self, JevError> {
-        let api_key =
-            env::var(API_KEY_ENV).map_err(|_| JevError::Offline(format!("{API_KEY_ENV} unset")))?;
-        if api_key.trim().is_empty() {
-            return Err(JevError::Offline(format!("{API_KEY_ENV} empty")));
-        }
+    /// Construct from already-resolved host authority. Network effects must
+    /// not re-read process environment after the entrypoint boundary.
+    pub fn from_authority(authority: &RuntimeAuthority) -> Result<Self, JevError> {
+        let api_key = authority
+            .host
+            .typesafe_api_key
+            .clone()
+            .ok_or_else(|| JevError::Offline(format!("{API_KEY_ENV} unset")))?;
         Ok(Self {
             api_key,
             url: SYSTEMONE_URL.to_string(),
         })
+    }
+
+    /// Compatibility boundary for callers that have not yet adopted the
+    /// runtime authority. Production host paths use `from_authority`.
+    pub fn from_env() -> Result<Self, JevError> {
+        let authority = RuntimeAuthority::resolve();
+        Self::from_authority(&authority)
     }
 }
 
@@ -1048,8 +1073,16 @@ fn plan_of(a: ExpandArgs, stage: PostStage) -> PostPlan {
 /// outside the journal tx, then `finish_plan` inside. `Unconfigured`
 /// (keyless default) skips loud with a reason marker — table passthrough,
 /// no escalate, no audit.
-pub fn prepare_post(a: ExpandArgs) -> PostPlan {
-    match jev_gate() {
+pub fn prepare_post_with_authority(a: ExpandArgs, authority: &RuntimeAuthority) -> PostPlan {
+    prepare_post_with_authority_and_gate(a, authority, jev_gate())
+}
+
+fn prepare_post_with_authority_and_gate(
+    a: ExpandArgs,
+    authority: &RuntimeAuthority,
+    gate: JevGate,
+) -> PostPlan {
+    match gate {
         JevGate::Off => return plan_of(a, PostStage::Off),
         JevGate::Unconfigured => {
             let mut table = table_of(&a);
@@ -1083,7 +1116,7 @@ pub fn prepare_post(a: ExpandArgs) -> PostPlan {
             );
         }
     };
-    let transport = match UreqTransport::from_env() {
+    let transport = match UreqTransport::from_authority(authority) {
         Ok(t) => t,
         Err(e) => {
             return plan_of(
@@ -1132,6 +1165,14 @@ pub fn prepare_post(a: ExpandArgs) -> PostPlan {
             screen,
         },
     )
+}
+
+/// Compatibility boundary for tests and legacy callers. New host code passes
+/// the resolved authority explicitly through `prepare_post_with_authority`.
+#[allow(dead_code)]
+pub fn prepare_post(a: ExpandArgs) -> PostPlan {
+    let authority = RuntimeAuthority::resolve();
+    prepare_post_with_authority(a, &authority)
 }
 
 /// Phase 2 (network, timed): run the POST outside the journal tx and
@@ -1227,10 +1268,18 @@ pub fn finish_plan(
             // fallback here still escalates.
             let (answers_opt, deny_opt, fallback_flag, latency_ms) = match posted {
                 Some((AdapterOutcome::Answered(a), ms)) => (Some(a), None, false, ms),
-                Some((AdapterOutcome::Refused(e), ms)) => (None, Some(e.to_string()), false, ms),
-                Some((AdapterOutcome::FallbackTable(e), ms)) => {
-                    (None, Some(e.to_string()), true, ms)
-                }
+                Some((AdapterOutcome::Refused(e), ms)) => (
+                    None,
+                    Some(format!("{} [{}]", e, e.classified().kind)),
+                    false,
+                    ms,
+                ),
+                Some((AdapterOutcome::FallbackTable(e), ms)) => (
+                    None,
+                    Some(format!("{} [{}]", e, e.classified().kind)),
+                    true,
+                    ms,
+                ),
                 None => (
                     None,
                     Some("post skipped: Ready plan finished without a POST".to_string()),
@@ -1327,8 +1376,12 @@ fn fold_screen(
     let bound = active_thresholds().honesty_gate;
     let (answers_opt, deny_opt, latency_ms) = match posted {
         Some((AdapterOutcome::Answered(a), ms)) => (Some(a), None, ms),
-        Some((AdapterOutcome::Refused(e), ms)) => (None, Some(e.to_string()), ms),
-        Some((AdapterOutcome::FallbackTable(e), ms)) => (None, Some(e.to_string()), ms),
+        Some((AdapterOutcome::Refused(e), ms)) => {
+            (None, Some(format!("{} [{}]", e, e.classified().kind)), ms)
+        }
+        Some((AdapterOutcome::FallbackTable(e), ms)) => {
+            (None, Some(format!("{} [{}]", e, e.classified().kind)), ms)
+        }
         None => (
             None,
             Some("screen post skipped: battery planned but never asked".to_string()),
@@ -2658,9 +2711,11 @@ questions:
 
     #[test]
     fn prepare_flag_off_is_passthrough_without_audit() {
-        let _env = crate::config::lock_env();
-        unsafe { env::set_var(FLAG_ENV, "0") };
-        let plan = prepare_post(expand_args("/nonexistent-probe"));
+        let plan = prepare_post_with_authority_and_gate(
+            expand_args("/nonexistent-probe"),
+            &RuntimeAuthority::for_test("/tmp/jev-home", 0),
+            JevGate::Off,
+        );
         assert!(matches!(plan.stage, PostStage::Off));
         let out = finish_plan(plan, None, None);
         assert_eq!(out.primitive, "loop-work");
@@ -2670,17 +2725,17 @@ questions:
             !out.reason.contains("jev:"),
             "explicit off carries no marker"
         );
-        unsafe { env::remove_var(FLAG_ENV) };
     }
 
     /// bd-0glq: keyless default is a LOUD skip — table passthrough with the
     /// unconfigured marker, no audit, no escalate (never escalate spam).
     #[test]
     fn prepare_unconfigured_marks_passthrough_without_escalate() {
-        let _env = crate::config::lock_env();
-        unsafe { env::remove_var(FLAG_ENV) };
-        unsafe { env::remove_var(API_KEY_ENV) };
-        let plan = prepare_post(expand_args("/nonexistent-probe"));
+        let plan = prepare_post_with_authority_and_gate(
+            expand_args("/nonexistent-probe"),
+            &RuntimeAuthority::for_test("/tmp/jev-home", 0),
+            JevGate::Unconfigured,
+        );
         assert!(matches!(plan.stage, PostStage::Off));
         let out = finish_plan(plan, None, None);
         assert_eq!(out.primitive, "loop-work", "table wins");
@@ -2695,12 +2750,14 @@ questions:
 
     #[test]
     fn prepare_missing_pack_is_deny_with_escalate() {
-        let _env = crate::config::lock_env();
-        unsafe { env::set_var(FLAG_ENV, "1") };
         let base = std::env::temp_dir().join(format!("jev-n86n-nopack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let plan = prepare_post(expand_args(&base.to_string_lossy()));
+        let plan = prepare_post_with_authority_and_gate(
+            expand_args(&base.to_string_lossy()),
+            &RuntimeAuthority::for_test("/tmp/jev-home", 0),
+            JevGate::On,
+        );
         assert!(
             matches!(plan.stage, PostStage::Deny { .. }),
             "missing pack = deny, never POST"

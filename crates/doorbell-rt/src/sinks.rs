@@ -10,7 +10,7 @@
 use crate::error::RtError;
 use crate::msg::BrainMsg;
 use crate::policy::RestartPolicy;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, mpsc};
 
@@ -71,7 +71,9 @@ struct Sink {
 
 /// Per-subscription sink actors with shed-to-digest and supervision.
 pub struct SinkManager {
-    sinks: HashMap<String, Sink>,
+    // Ordered by sink name so shutdown, status, and audit traversal are
+    // deterministic across replays and process restarts.
+    sinks: BTreeMap<String, Sink>,
     degraded_tx: mpsc::Sender<BrainMsg>,
     cap: usize,
 }
@@ -83,7 +85,7 @@ impl SinkManager {
 
     pub fn with_cap(degraded_tx: mpsc::Sender<BrainMsg>, cap: usize) -> Self {
         Self {
-            sinks: HashMap::new(),
+            sinks: BTreeMap::new(),
             degraded_tx,
             cap,
         }

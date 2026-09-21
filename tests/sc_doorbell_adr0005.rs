@@ -100,7 +100,7 @@ fn sc_d1_kind9_live_npub_p_tag_urgent_rings() {
     let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     let presence = r#"{"kind":20001,"tags":[["p","BlueRidge"]],"content":"idle"}"#;
     let kind9 = format!(
-        r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["toron-kind","mail-delivered"],["h","steer-x"]],"content":"@BlueRidge hi"}}"#
+        r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["toron-kind","ack-sla-expired"],["h","steer-x"]],"content":"@BlueRidge hi"}}"#
     );
     let stdin = format!("{presence}\n{kind9}");
     let stdout = run_doorbell_once(&stdin, &["BlueRidge=idle", "LilacChapel=idle"]);

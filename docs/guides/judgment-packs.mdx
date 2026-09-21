@@ -5,7 +5,10 @@ description: Authoring versioned question packs for the host-side judgment adapt
 
 Packs are pure data at `.flywheel/judgment-packs/<id>.vN.yaml`. Code owns
 control flow; packs only supply calibrated judgments. The loader picks the
-highest `vN` per id; older versions stay on disk for audit.
+highest `vN` per id; older versions stay on disk for audit. A judgment is an
+ADR-0016 effect: it is requested by an interpreter and returns evidence as a
+message; it never runs inside a reducer or becomes a routing, delivery, close,
+or verification authority.
 
 ## Shaping (from the typesafe-ai skill)
 
@@ -52,4 +55,8 @@ resolution}` to `miss-ledger.jsonl`, keyed by the parent effect key:
   undecided goal was actually dispatched (raw/compose).
 
 Annotators never dispatch, hold, assign, or close. Confidence is peakedness,
-not permission — low confidence escalates to muse-spark/human.
+not permission — low confidence escalates to muse-spark/human. Preserve the
+parent effect key across retries and keep malformed, timeout, unavailable, and
+unknown provider results visible; do not convert them to a green judgment.
+
+See [Functional effect kernel](./effect-kernel) and [effect-kernel discipline](../agent-instructions/effect-kernel).

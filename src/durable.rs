@@ -247,83 +247,12 @@ pub struct IllegalTransition {
     pub reason: &'static str,
 }
 
+/// Compatibility wrapper for the pure durable phase-transition seam.
 pub fn transition(
     from: &LoopPhase,
     event: &LoopEvent,
 ) -> std::result::Result<LoopPhase, IllegalTransition> {
-    match (from, event) {
-        (LoopPhase::ClaimWatch, LoopEvent::Verify) => Err(IllegalTransition {
-            from: from.clone(),
-            event: event.clone(),
-            reason: "Verify without close",
-        }),
-        (
-            LoopPhase::Verify,
-            LoopEvent::Complete {
-                wave_gate: true, ..
-            },
-        ) => Err(IllegalTransition {
-            from: from.clone(),
-            event: event.clone(),
-            reason: "Complete while WaveGate",
-        }),
-        (
-            LoopPhase::Verify,
-            LoopEvent::Complete {
-                has_command_verified: false,
-                wave_gate: false,
-            },
-        ) => Err(IllegalTransition {
-            from: from.clone(),
-            event: event.clone(),
-            reason: "Complete without CommandVerified",
-        }),
-        (
-            LoopPhase::Idle,
-            LoopEvent::Dispatch {
-                agent_status,
-                force: false,
-            },
-        ) if agent_status == "working" => Err(IllegalTransition {
-            from: from.clone(),
-            event: event.clone(),
-            reason: "Dispatch to working without force",
-        }),
-        (
-            LoopPhase::Reclaim,
-            LoopEvent::Reclaim {
-                holder_pin,
-                claimant_pin,
-                is_live: true,
-            },
-        ) if holder_pin != claimant_pin => Err(IllegalTransition {
-            from: from.clone(),
-            event: event.clone(),
-            reason: "Reclaim foreign reservation",
-        }),
-        // Legal transitions
-        (LoopPhase::Idle, LoopEvent::Dispatch { .. }) => Ok(LoopPhase::Dispatched),
-        (LoopPhase::Dispatched, LoopEvent::ClaimSeen) => Ok(LoopPhase::ClaimWatch),
-        (LoopPhase::Dispatched, LoopEvent::PaneExited) => Ok(LoopPhase::Reclaim),
-        (LoopPhase::ClaimWatch, LoopEvent::PaneExited) => Ok(LoopPhase::Reclaim),
-        (LoopPhase::Reclaim, LoopEvent::Reclaim { .. }) => Ok(LoopPhase::Idle),
-        (LoopPhase::ClaimWatch, LoopEvent::BrClose) => Ok(LoopPhase::Verify),
-        (
-            LoopPhase::Verify,
-            LoopEvent::Complete {
-                has_command_verified: true,
-                wave_gate: false,
-            },
-        ) => Ok(LoopPhase::Complete),
-        (LoopPhase::Verify, LoopEvent::WaveGate { .. }) => Ok(LoopPhase::WaveHeld),
-        (LoopPhase::WaveHeld, LoopEvent::BrClose) => Ok(LoopPhase::Idle),
-        (LoopPhase::Idle, LoopEvent::Blocked) => Ok(LoopPhase::Blocked),
-        _ => Err(IllegalTransition {
-            from: from.clone(),
-            event: event.clone(),
-            reason: "illegal transition",
-        }),
-    }
+    crate::durable_transition::transition(from, event)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -373,45 +302,14 @@ pub struct LoopModel {
 /// done-mail dedup carries verbatim, drains restart with fresh grace (a
 /// crash must never force-kill immediately; the prompt re-sends and send
 /// dedup protects).
+/// Compatibility wrapper for the pure recovery projection seam.
 pub fn seed_swarm_resume(
     model: &mut LoopModel,
     heal_states: &std::collections::BTreeMap<String, crate::state::HealState>,
     done_mailed: &std::collections::HashSet<String>,
     drain_pending: &std::collections::BTreeMap<String, String>,
 ) {
-    for (k, v) in heal_states {
-        model.heal_states.insert(
-            k.clone(),
-            HealState {
-                unknown_count: v.unknown_count,
-                diagnose_count: v.diagnose_count,
-                respawn_count: v.respawn_count,
-                awaiting_clear: false,
-            },
-        );
-    }
-    // bd-55nx.8: done-mail dedup is crash-safe Model state, not a per-poll wipe.
-    model.done_mailed = done_mailed.clone();
-    // bd-zfnx.10: open drains resume with fresh grace (never force-kill
-    // immediately after a crash); the prompt re-sends via DrainRequest
-    // replay and send dedup protects against doubles.
-    model.drain_pending = drain_pending
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                DrainState {
-                    bead_id: v.clone(),
-                    grace_polls: DRAIN_GRACE_POLLS,
-                    defers: 0,
-                    // A crash deliberately drops a declared pause: the pane
-                    // re-declares on the next poll's tail read, and a stale
-                    // clock must never resurrect a wait nobody is holding.
-                    paused: None,
-                },
-            )
-        })
-        .collect();
+    crate::durable_resume::seed_swarm_resume(model, heal_states, done_mailed, drain_pending);
 }
 
 /// GS-033 (NEW-L2 / B1): seed the one WorkspaceModel's swarm slice from

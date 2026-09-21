@@ -18,6 +18,7 @@ This directory contains records of the major architectural decisions made for th
 | [0012](0012-doorbell-plane-independent-runtime.md) | Spin doorbell out as an independent plane (always-on wake runtime) | **Accepted** (2026-09-10; bd-asr2 Phase 0: doorbell-core extracted, `verify-0012.sh` green; Phases 1–4 in bd-asr2.1–.19) |
 | [0013](0013-agent-profile-lifecycle-journaled-rebind.md) | Agent-profile lifecycle and journaled fallback rebind | **Accepted** (2026-09-12; GS-044; ADR-0032 Spec 7 honesty; Wave A + Wave B landed, Wave C open) |
 | [0014](0014-jev-system-one-judgment-adapter.md) | Jev / System One as host-side judgment adapter | **Proposed** (2026-09-19; GS-055; HOLD merge; W1–W3 HOLD implement; companion toron ADR-0033 / beads ADR-0006) |
+| [0016](0016-functional-effect-kernel-redesign.md) | Adopt one typed functional effect kernel across flywheel | **Accepted** (2026-09-21; bd-6si7; sequential implementation Phases 0–7) |
 
 ## Related toron ADRs
 

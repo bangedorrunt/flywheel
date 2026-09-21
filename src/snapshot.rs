@@ -415,30 +415,21 @@ fn read_held_paths(cfg: &crate::config::Config, project: &str) -> (Vec<String>, 
 }
 
 /// herdr pane ids look like `wP:p1` / `w6:p2`. A lone current pane is not a fleet.
+/// Compatibility wrappers for pure snapshot reporting predicates.
+#[allow(dead_code)]
 pub fn looks_like_pane_id(pin: &str) -> bool {
-    let Some((ws, pane)) = pin.split_once(':') else {
-        return false;
-    };
-    !ws.is_empty() && pane.starts_with('p')
+    crate::snapshot_reporting::looks_like_pane_id(pin)
 }
 
-/// Live fleet: doorbell up, or at least one named pin (not just this pane id).
-/// Month-old coalition JSON is not a fleet (ADR-0011 D5).
 pub fn fleet_joinable(dispatcher: &str, pins: &[PinRow]) -> bool {
-    dispatcher == "up"
-        || pins
-            .iter()
-            .any(|p| !looks_like_pane_id(&p.pin) && !p.pin.is_empty())
+    crate::snapshot_reporting::fleet_joinable(dispatcher, pins)
 }
 
-/// Month-old "active" JSON is not a live fleet (ADR-0011 D5).
-pub const COALITION_LIVE_SECS: u64 = 48 * 3600;
+#[allow(dead_code)]
+pub const COALITION_LIVE_SECS: u64 = crate::snapshot_reporting::COALITION_LIVE_SECS;
 
 pub fn coalition_is_live(created_at: &str, now_unix: u64) -> bool {
-    let Ok(t) = chrono::DateTime::parse_from_rfc3339(created_at) else {
-        return false;
-    };
-    now_unix.saturating_sub(t.timestamp() as u64) < COALITION_LIVE_SECS
+    crate::snapshot_reporting::coalition_is_live(created_at, now_unix)
 }
 
 fn list_active_coalitions(_project: &str, now_unix: u64) -> Vec<String> {
@@ -472,22 +463,9 @@ fn list_active_coalitions(_project: &str, now_unix: u64) -> Vec<String> {
     ids
 }
 
-/// Captain bearings: one-line fleet summary for TTY surfaces.
+/// Compatibility wrapper for the pure snapshot reporting seam.
 pub fn bearings_line(snap: &Snapshot) -> String {
-    let join = if snap.joinable { " JOINABLE" } else { "" };
-    format!(
-        "fleet: {} pins, {} open decisions, {} afk queued, {} unacked wakes dispatcher={}{join}{}",
-        snap.pins.len(),
-        snap.decisions.len(),
-        snap.afk,
-        snap.journal.unacked_wakes,
-        snap.dispatcher,
-        if snap.degraded.is_empty() {
-            String::new()
-        } else {
-            format!(" (degraded: {})", snap.degraded.join(","))
-        }
-    )
+    crate::snapshot_reporting::bearings_line(snap)
 }
 
 /// Helm drain: always the three sections, empty-state sentences allowed.

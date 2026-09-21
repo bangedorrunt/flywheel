@@ -735,7 +735,9 @@ mod tests {
         let base = tmp_lifecycle("mig-noold");
         let new = base.join("new");
         assert!(
-            maybe_migrate_to_default(&new, &base.join("nope")).unwrap().is_none(),
+            maybe_migrate_to_default(&new, &base.join("nope"))
+                .unwrap()
+                .is_none(),
             "absent old dir is a clean no-op"
         );
         assert!(!new.exists(), "no-op must not create the new dir");
