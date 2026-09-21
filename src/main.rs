@@ -29,6 +29,7 @@ mod briefing;
 mod builtin_workflows;
 mod captain_slot;
 mod catalog_tui;
+mod cli_args;
 mod cmd;
 mod coalition;
 mod config;
@@ -41,6 +42,8 @@ mod doorbell;
 mod doorbell_host;
 mod doorbell_tick;
 mod durable;
+mod durable_resume;
+mod durable_transition;
 mod effect_journal;
 mod failure;
 mod fs_util;
@@ -50,6 +53,10 @@ mod ingress;
 mod init_scaffold;
 mod intent;
 mod judgment;
+// Kernel contracts are introduced incrementally; unused variants remain
+// intentionally available for the next interpreter migrations.
+#[allow(dead_code)]
+mod kernel;
 mod mail_shim;
 mod mcp_http;
 mod models;
@@ -67,6 +74,7 @@ mod run_log;
 mod signoff;
 mod smart_cron;
 mod snapshot;
+mod snapshot_reporting;
 mod stages;
 mod standing_orders;
 mod state;
@@ -77,6 +85,7 @@ mod verdict;
 mod work;
 mod workflow_catalog;
 mod workspace;
+mod workspace_reporting;
 mod write_liveness;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -85,6 +94,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+
+use cli_args::rewrite_legacy_loop_args;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
@@ -2451,28 +2462,6 @@ fn log(project: &str, kind: EventKind, data: Value) {
 }
 
 // ---- main dispatch ----
-
-/// Rewrite the legacy bare form `flywheel loop <project> [flags]` into the
-/// canonical `flywheel loop run <project> [flags]` before clap parsing.
-/// `run` is the default subcommand; any first token after `loop`/`loop-mode`
-/// that is not a known subcommand name is treated as the project. Pure +
-/// unit-tested.
-fn rewrite_legacy_loop_args(args: &[String]) -> Vec<String> {
-    const SUBCOMMANDS: [&str; 7] = ["run", "status", "list", "prune", "doctor", "replay", "why"];
-    if args.len() >= 2
-        && matches!(args[1].as_str(), "loop" | "loop-mode")
-        // A flag (--help, -h, global options) keeps the parent context;
-        // anything else is the legacy positional project → default `run`.
-        && let Some(next) = args.get(2)
-        && !SUBCOMMANDS.contains(&next.as_str())
-        && !next.starts_with('-')
-    {
-        let mut out = args.to_vec();
-        out.insert(2, "run".to_string());
-        return out;
-    }
-    args.to_vec()
-}
 
 fn main() {
     // clap parses from the raw argv; rewrite legacy `loop <project>` first.

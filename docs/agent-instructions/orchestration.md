@@ -17,6 +17,10 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 | swarm mode | `/swarm-mode`: captain-led multi-crew execution with parallel lanes; loop supervision is optional |
 | doorbell | workspace `__doorbell` (ADR-0005 Layer 0). Spawn starts it. `flywheel kill` stops it. `/peer-aware-mode` attaches. Shared by loop-mode and swarm-mode when enabled. |
 
+## Functional effect-kernel discipline (ADR-0016)
+
+All orchestration paths still obey one Elm boundary: external observations become `Msg`, `tick` returns `Cmd`, interpreters perform effects, and results re-enter as `Msg`. Do not add policy to a runtime brain, CLI helper, or persistence projection. Time and environment are sampled at effect boundaries and injected; `Unknown` never becomes success; queue acceptance never becomes provider delivery; Jev remains advisory. The full review checklist is [effect-kernel discipline](./effect-kernel.md).
+
 ## Session door (ADR-0011)
 
 `flywheel arrive <project> --as <pin>` then `flywheel briefing "<target>" --project <p> --json`. `--commit` runs argv. `decide` is the classifier leaf (emits `topology`; `"2 crews"` becomes `--crew 2`). A live fleet proposes join, not a second compose.

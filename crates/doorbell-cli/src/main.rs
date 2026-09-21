@@ -84,9 +84,7 @@ async fn main() -> anyhow::Result<()> {
     // bd-fpd5: migrate-once off the legacy platform dir into the XDG
     // default. Explicit --state-dir / DOORBELL_STATE_DIR means
     // user-managed: never touch, migrate manually instead.
-    if using_default_dir
-        && let Some(old) = lifecycle::legacy_platform_state_dir()
-    {
+    if using_default_dir && let Some(old) = lifecycle::legacy_platform_state_dir() {
         match lifecycle::maybe_migrate_to_default(&cfg.state_dir, &old) {
             Ok(Some(copied)) => eprintln!(
                 "doorbell: migrated {} file(s) from {} (one-time XDG move)",

@@ -30,6 +30,7 @@ Commands:
   attach           Attach to an agent's terminal (interactive; execs `herdr attach`)
   kill             Close (kill) a swarm workspace
   ledger           bead-verdict ledger (ADR-0019): br gate wrappers + receipt helper. `check` exits 0 only on a legal verdict for the current SHA; `receipt` writes only the receipt file (workers never write verdicts)
+  judgment         host-side judgment surfaces (ADR-0014, bd-lpn6): miss ledger (resolve/list/needles), on-demand annotators, verify prescreen. Annotate-only — nothing here dispatches, holds, or closes
   principles       engineering principle registry (ADR-0019 Spec 5/6): list the 21 canonical names, or show a leaf's full when+rule (unknown name -> non-zero + suggestion)
   standing-orders  standing orders (ADR-0019 Spec 2): regen the GENERATED global file (~/.config/flywheel/standing-orders.md) from the registry + wave-1 criticals; project fences (<project>/.flywheel/standing-orders.md) are authored and preserved byte-identical
   work             Work-graph surfaces (bv/br pass-through)

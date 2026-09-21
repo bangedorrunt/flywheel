@@ -538,7 +538,9 @@ pub(crate) fn cmd_doorbell_subscribe(
     let project = match project {
         Some(p) => p,
         None => {
-            eprintln!("doorbell subscribe: --project is required (no silent store: a project-less row is never auto-hosted, so the wake would never ring). Pass --project <slug>.");
+            eprintln!(
+                "doorbell subscribe: --project is required (no silent store: a project-less row is never auto-hosted, so the wake would never ring). Pass --project <slug>."
+            );
             anyhow::bail!("doorbell subscribe requires --project <slug>");
         }
     };

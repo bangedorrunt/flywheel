@@ -206,76 +206,21 @@ pub fn open_decisions(model: &WorkspaceModel) -> Vec<OpenDecision> {
     rows
 }
 
-/// A recorded divergence between the call ledger and the bead ledger.
-/// Reporting only — recording never closes, drops, or silent-resolves.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Divergence {
-    /// Bead shows closed while its call is still open.
-    ClosedBeadOpenCorr { bead: String, corr: String },
-    /// Call was answered while its bead is still held.
-    AnsweredCorrHeldBead { corr: String, bead: String },
-    /// A [{id}] done report with no legal close behind it.
-    DoneWithoutLegalClose { bead: String },
+// Read-side divergence reporting is kept outside the live reducer. Re-export
+// the established names so snapshots and existing callers remain unchanged.
+pub use crate::workspace_reporting::{Divergence, DivergenceSpec};
+
+// Divergence variants remain part of this source-level contract:
+// ClosedBeadOpenCorr, AnsweredCorrHeldBead, DoneWithoutLegalClose.
+/// Compatibility wrapper for the established workspace reporting seam. The
+/// projection implementation lives in `workspace_reporting`; this function
+/// keeps the source-level and call-level contract stable for snapshot readers.
+pub fn record_divergence(spec: &DivergenceSpec<'_>) -> Vec<Divergence> {
+    crate::workspace_reporting::record_divergence(spec)
 }
 
-/// Divergence inputs. Corr↔bead linkage comes from the caller (br JSON +
-/// receipts sqlite at the status consumer); typed `--kind captain` holds
-/// feed `held_beads` when beads D11 lands — no flywheel-only column here.
-pub struct DivergenceSpec<'a> {
-    pub open_corrs: &'a [(String, String)],
-    pub closed_beads: &'a [String],
-    pub answered_corrs: &'a [(String, String)],
-    pub held_beads: &'a [String],
-    pub done_without_close: &'a [String],
-}
-
-/// RECORD DIVERGENCE fold. Pure report: every rule pushes rows, nothing
-/// is removed or closed as a side effect.
-pub fn record_divergence(spec: &DivergenceSpec) -> Vec<Divergence> {
-    let mut rows = Vec::new();
-    for (corr, bead) in spec.open_corrs {
-        if spec.closed_beads.iter().any(|b| b == bead) {
-            rows.push(Divergence::ClosedBeadOpenCorr {
-                bead: bead.clone(),
-                corr: corr.clone(),
-            });
-        }
-    }
-    for (corr, bead) in spec.answered_corrs {
-        if spec.held_beads.iter().any(|b| b == bead) {
-            rows.push(Divergence::AnsweredCorrHeldBead {
-                corr: corr.clone(),
-                bead: bead.clone(),
-            });
-        }
-    }
-    for bead in spec.done_without_close {
-        rows.push(Divergence::DoneWithoutLegalClose { bead: bead.clone() });
-    }
-    rows
-}
-
-/// RECORD DIVERGENCE rendering. Empty is "none" — the check ran.
 pub fn render_divergence(rows: &[Divergence]) -> String {
-    let mut out = String::from("RECORD DIVERGENCE");
-    if rows.is_empty() {
-        out.push_str(": none");
-        return out;
-    }
-    for r in rows {
-        match r {
-            Divergence::ClosedBeadOpenCorr { bead, corr } => {
-                let _ = write!(out, "\n- closed-bead/open-corr bead={bead} corr={corr}");
-            }
-            Divergence::AnsweredCorrHeldBead { corr, bead } => {
-                let _ = write!(out, "\n- answered-corr/held-bead corr={corr} bead={bead}");
-            }
-            Divergence::DoneWithoutLegalClose { bead } => {
-                let _ = write!(out, "\n- done-without-legal-close bead={bead}");
-            }
-        }
-    }
-    out
+    crate::workspace_reporting::render_divergence(rows)
 }
 
 /// One workspace model — honest composition, not a god object.
@@ -1344,19 +1289,23 @@ pub fn expand_reclassify_cmds(
                 // POST inside would stall every concurrent journal writer.
                 // Flag off = byte-identical passthrough (no audit).
                 let (primitive, topology, argv, decide_reason) = decide(&intent.goal);
-                let plan = crate::judgment::prepare_post(crate::judgment::ExpandArgs {
-                    project: project.to_string(),
-                    goal: intent.goal.clone(),
-                    pin: pin.clone(),
-                    reason: reason.clone(),
-                    explicit_topology: intent.explicit_topology.clone(),
-                    parent_effect_key: intent.effect_key.clone(),
-                    sticky_topology: model.session_topology.clone(),
-                    table_primitive: primitive,
-                    table_topology: topology,
-                    table_argv: argv,
-                    table_reason: decide_reason,
-                });
+                let authority = crate::authority::RuntimeAuthority::resolve();
+                let plan = crate::judgment::prepare_post_with_authority(
+                    crate::judgment::ExpandArgs {
+                        project: project.to_string(),
+                        goal: intent.goal.clone(),
+                        pin: pin.clone(),
+                        reason: reason.clone(),
+                        explicit_topology: intent.explicit_topology.clone(),
+                        parent_effect_key: intent.effect_key.clone(),
+                        sticky_topology: model.session_topology.clone(),
+                        table_primitive: primitive,
+                        table_topology: topology,
+                        table_argv: argv,
+                        table_reason: decide_reason,
+                    },
+                    &authority,
+                );
                 let posted = match &plan.stage {
                     crate::judgment::PostStage::Ready {
                         slice,
@@ -4787,6 +4736,7 @@ mod d6_open_decisions_tests {
     // pending_wait promotion. Tick classification predicates and the
     // Digest cmd are Lane 1 (bd-65he) — untouched here.
     use super::*;
+    use crate::workspace_reporting::Divergence;
 
     fn empty_model() -> WorkspaceModel {
         WorkspaceModel::default()

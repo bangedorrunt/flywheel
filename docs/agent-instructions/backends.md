@@ -36,6 +36,10 @@ flywheel backend default <multiplexer|mail> <name>
 
 herdr protocol v20. Socket: `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
 
+## Effect-kernel authority
+
+Runtime adapters are the effect boundary described by ADR-0016. Resolve host identity, paths, configuration, clocks, process paths, and network clients once, then pass them into interpreters. Reducers never read these sources directly. A daemon or remote backend returning no proof yields `unknown` or a loud degraded result, never an invented success. See [effect-kernel discipline](effect-kernel.md).
+
 ## Runtime
 
 - Resonate: `http://localhost:8001`, sqlite `~/.local/state/flywheel/resonate.db`; `flywheel deps --ensure` or `flywheel daemon start` starts it when down (loopback urls only)

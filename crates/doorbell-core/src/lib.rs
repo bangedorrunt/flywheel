@@ -96,9 +96,13 @@ pub fn inject_gate(verdict: PresenceVerdict, urgent: bool) -> InjectGate {
     match (verdict, urgent) {
         (PresenceVerdict::Idle, _) => InjectGate::Inject,
         (PresenceVerdict::Busy, true) => InjectGate::Inject,
-        (PresenceVerdict::Busy, false) => InjectGate::Digest("non-injectable presence held wake for digest"),
+        (PresenceVerdict::Busy, false) => {
+            InjectGate::Digest("non-injectable presence held wake for digest")
+        }
         (PresenceVerdict::Dead, _) => InjectGate::Digest("dead presence held wake for digest"),
-        (PresenceVerdict::Unknown, _) => InjectGate::Digest("unknown presence held wake for digest"),
+        (PresenceVerdict::Unknown, _) => {
+            InjectGate::Digest("unknown presence held wake for digest")
+        }
     }
 }
 
@@ -451,7 +455,7 @@ fn pull_hint(class: EventClass, channel: Option<&str>) -> String {
         EventClass::Job => "toron job list".into(),
         EventClass::RequestRelease | EventClass::PlanePUrgent | EventClass::PlanePMail => {
             "toron mail inbox --since".into()
-        },
+        }
         EventClass::ReservationConflict => "toron reserve list".into(),
     }
 }
@@ -987,10 +991,7 @@ mod tests {
     fn inject_gate_blocked_urgent_injects_routine_digests() {
         // bd-zawk G6: one typed gate for both paths — blocked+urgent injects,
         // blocked+routine digests with a reason, never a silent drop.
-        assert_eq!(
-            inject_gate_for_herdr("blocked", true),
-            InjectGate::Inject
-        );
+        assert_eq!(inject_gate_for_herdr("blocked", true), InjectGate::Inject);
         assert!(matches!(
             inject_gate_for_herdr("blocked", false),
             InjectGate::Digest(_)
@@ -1006,10 +1007,7 @@ mod tests {
             InjectGate::Digest(_)
         ));
         // Verdict path agrees with the herdr-string path by construction.
-        assert_eq!(
-            inject_gate(PresenceVerdict::Busy, true),
-            InjectGate::Inject
-        );
+        assert_eq!(inject_gate(PresenceVerdict::Busy, true), InjectGate::Inject);
         assert!(matches!(
             inject_gate(PresenceVerdict::Busy, false),
             InjectGate::Digest(_)
@@ -1195,11 +1193,13 @@ mod tests {
         // a routine inbox-pull; urgency comes from the inbox fold.
         let index = SelfIndex::from_pins(["BlueRidge"]);
         let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
-        let (class, hint) =
-            parse_watch_ndjson(line, &index).expect("mail-delivered must ring");
+        let (class, hint) = parse_watch_ndjson(line, &index).expect("mail-delivered must ring");
         assert_eq!(class, EventClass::PlanePMail);
         assert_ne!(class, EventClass::Channel);
-        assert!(hint.contains("toron mail inbox"), "hint must pull inbox: {hint}");
+        assert!(
+            hint.contains("toron mail inbox"),
+            "hint must pull inbox: {hint}"
+        );
         let rendered = doorbell_line(class, &hint);
         assert!(
             !is_urgent_line(&rendered),
@@ -1213,8 +1213,7 @@ mod tests {
         // only routine deliveries downgrade, never the SLA ring.
         let index = SelfIndex::from_pins(["BlueRidge"]);
         let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["toron-kind","ack-sla-expired"]],"content":"sealed"}"#;
-        let (class, _) =
-            parse_watch_ndjson(line, &index).expect("ack-sla-expired must ring");
+        let (class, _) = parse_watch_ndjson(line, &index).expect("ack-sla-expired must ring");
         assert_eq!(class, EventClass::PlanePUrgent);
     }
 
