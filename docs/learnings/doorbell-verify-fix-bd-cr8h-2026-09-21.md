@@ -25,6 +25,18 @@ after landing (stale CLI lies); old daemon ignored SIGTERM, kill -9 +
 launchd respawn recovered; `doorbell restart` adopts instead of restarting,
 use stop --force or kill + start.
 
+## Cross-repo closeout record (bd-pwja)
+
+Toron channel-plane incident, fixed toron-side, recorded here so the
+flywheel ledger binds to a real local commit. Root cause: bus cap-prune
+evicted 39000/39002 room-state under kind-9 flood. Fix: toron@a54f953
+(bd-fxzv closed LEGAL toron-side, 22/22 event_store green, clippy clean).
+Live verified: channel list + read show steer-bd-cr8h with 8 posts.
+Ceremony repair: prior gate rows cited a phantom sha (b702b8b, in neither
+repo); superseded by the gate bound to THIS commit. ack_overdue_only was
+already shipped (toron@e708aa8, branch at messaging.rs:258); my duplicate
+bd-pt4a was a bad grep, closed as invalid.
+
 ## Gotchas (do not repeat)
 
 1. **`send --stage` dispatched:true landed:false is UNVERIFIED delivery.**
