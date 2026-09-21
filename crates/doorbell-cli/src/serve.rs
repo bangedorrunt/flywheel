@@ -118,7 +118,24 @@ struct AppState {
     /// bd-2o1v: hosting is dynamic (auto-host on subscribe), so the table
     /// is shared mutably; handlers snapshot the keys under the lock.
     hosted: Hosts,
+    /// bd-o86s: the served /health snapshot. `health_body` shells herdr and
+    /// greps hundreds of journal/audit files per call (seconds at fleet
+    /// scale), so handlers serve this cache and a background tick refreshes
+    /// it — never compute per request.
+    health: Shared<CachedHealth>,
 }
+
+/// One served /health snapshot: the body as computed plus when. Empty body
+/// means uncomputed (cold start serves one inline compute, then the tick).
+struct CachedHealth {
+    body: String,
+    computed_at: std::time::Instant,
+}
+
+/// Freshness bound on the served snapshot (bd-o86s): sweep ages read in
+/// whole seconds, so a snapshot up to this old never lies about liveness,
+/// while every served request stays far under the probe budget.
+const HEALTH_CACHE_TTL_SECS: u64 = 15;
 
 /// bd-2o1v: shared mutable state handle (parking_lot — no poisoning).
 type Shared<T> = std::sync::Arc<parking_lot::Mutex<T>>;
@@ -505,7 +522,35 @@ pub async fn run(cfg: &Config) -> Result<()> {
         started,
         fw_state: cfg.flywheel_state.clone(),
         hosted: hosted.clone(),
+        health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+            body: String::new(),
+            computed_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(3600))
+                .unwrap_or(std::time::Instant::now()),
+        })),
     };
+    // bd-o86s: the /health snapshot tick. Recomputes the body on its own
+    // cadence so request handlers never pay the shells-and-greps cost.
+    // Initial compute happens inline once (cold start), then every TTL.
+    {
+        let app = app.clone();
+        refresh_health_snapshot(&app);
+    }
+    let health_tick = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(HEALTH_CACHE_TTL_SECS));
+            loop {
+                tick.tick().await;
+                // Compute off the request path; a slow compute only delays
+                // the NEXT snapshot, never a served request.
+                let app = app.clone();
+                tokio::task::spawn_blocking(move || refresh_health_snapshot(&app)).await.ok();
+            }
+        })
+    };
+    let _ = health_tick;
     let serve_tcp = async {
         loop {
             let (stream, _) = tcp.accept().await?;
@@ -833,6 +878,36 @@ fn copy_truncate_over(path: &std::path::Path, cap: u64) {
     }
 }
 
+/// Recompute the served snapshot now (bd-o86s): the ONLY place
+/// `health_body` runs in the daemon — the tick and cold start call this,
+/// request handlers never do.
+fn refresh_health_snapshot(app: &AppState) {
+    let body = health_body(app);
+    *app.health.lock() = CachedHealth {
+        body,
+        computed_at: std::time::Instant::now(),
+    };
+}
+
+/// Serve /health from the snapshot (bd-o86s): a fresh cache returns
+/// instantly (no shells, no greps); a stale/cold cache recomputes inline
+/// once so the response is never older than TTL plus one compute.
+fn cached_health_body(app: &AppState) -> String {
+    let fresh = app
+        .health
+        .lock()
+        .computed_at
+        .elapsed()
+        .as_secs()
+        < HEALTH_CACHE_TTL_SECS;
+    let body = app.health.lock().body.clone();
+    if fresh && !body.is_empty() {
+        return body;
+    }
+    refresh_health_snapshot(app);
+    app.health.lock().body.clone()
+}
+
 async fn handle_http(mut stream: tokio::net::TcpStream, app: AppState) {
     let mut buf = vec![0u8; 4096];
     let Ok(n) = stream.read(&mut buf).await else {
@@ -845,7 +920,7 @@ async fn handle_http(mut stream: tokio::net::TcpStream, app: AppState) {
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
     let (code, content_type, body) = match path.split('?').next().unwrap_or("/") {
-        "/health" => ("200 OK", "application/json", health_body(&app)),
+        "/health" => ("200 OK", "application/json", cached_health_body(&app)),
         "/stats" => ("200 OK", "application/json", stats_body(&app)),
         "/events" => {
             let since = path
@@ -1654,7 +1729,7 @@ mod tests {
     /// the ground-truth surfaces and named.
     #[test]
     fn health_names_fetch_failure_and_watch_thrash() {
-        use super::{AppState, health_body};
+        use super::{AppState, CachedHealth, health_body};
         let dir = std::env::temp_dir().join(format!("db-health-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
@@ -1692,6 +1767,10 @@ mod tests {
             hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![host_for_test(
                 "flywheel/flywheel-flywheel",
             )])),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: std::time::Instant::now(),
+            })),
         };
         let body = health_body(&app);
         assert!(
@@ -1710,7 +1789,7 @@ mod tests {
     /// `inbox_fetch_failing` on while CLI mail worked.
     #[test]
     fn health_does_not_treat_pin_miss_as_fetch_path_down() {
-        use super::{AppState, health_body};
+        use super::{AppState, CachedHealth, health_body};
         let dir = std::env::temp_dir().join(format!("db-health-pinmiss-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
@@ -1730,6 +1809,10 @@ mod tests {
             hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![host_for_test(
                 "./flywheel-.",
             )])),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: std::time::Instant::now(),
+            })),
         };
         let body = health_body(&app);
         assert!(
@@ -1737,5 +1820,28 @@ mod tests {
             "pin-miss must not paint the fetch path down: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-o86s RED: /health serves a cached snapshot — a fresh cache
+    /// returns its body without recomputing (no shells, no greps).
+    #[test]
+    fn health_cache_serves_snapshot_without_recompute() {
+        use super::{AppState, CachedHealth, HEALTH_CACHE_TTL_SECS, cached_health_body};
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join(format!("db-healthcache-{}", std::process::id()));
+        let app = AppState {
+            started: Instant::now(),
+            fw_state: dir,
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: "CANNED".to_string(),
+                computed_at: Instant::now(),
+            })),
+        };
+        assert_eq!(cached_health_body(&app), "CANNED");
+        assert!(
+            HEALTH_CACHE_TTL_SECS <= 30,
+            "a health snapshot older than a sweep era lies: {HEALTH_CACHE_TTL_SECS}"
+        );
     }
 }

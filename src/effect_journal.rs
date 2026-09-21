@@ -19,7 +19,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::Value;
 
 use anyhow::bail;
@@ -35,29 +35,86 @@ use toron_workflow::engine::{
 use toron_workflow::identity::{action_digest_of, redact_value};
 use toron_workflow::stamp_workflow_emitted;
 
-/// Drive one async journal call from the sync [`EffectRunner`] without a
-/// nested-runtime panic (the toron-mcp house pattern, ADR-0007 F8).
+/// The shared journal executor (bd-k0iq, ADR-0035 Spec 2.7).
 ///
-/// The runner is a sync closure by engine contract, but the journal is async
-/// (SQLite). Blocking the caller's runtime would panic whenever a run is
-/// invoked from inside one — which the cron daemon and the durable loop both
-/// do. A dedicated OS thread with its own current-thread runtime is the only
-/// correct isolation; it is joined immediately, so at most one extra thread
-/// exists per effectful leaf.
-fn block_on_journal<F, T>(fut: F) -> Result<T>
+/// ONE bounded worker pool drains a FIFO queue of journal futures. Every
+/// former per-leaf thread+runtime spawn submits here instead: under
+/// wave-swarm fanout this is a fixed 4 workers instead of one thread AND one
+/// runtime build per effectful leaf, and the bounded queue applies
+/// backpressure (loud saturation error) instead of spawning unbounded threads.
+///
+/// ponytail: fixed 4-worker pool — nesting deeper than 4 simultaneous
+/// submits-per-worker (today: max 1, a provider probe inside a dispatch)
+/// would starve; raise workers if a deeper nesting ever lands.
+///
+/// The submitter blocks on the reply until its future completes. That block
+/// is the sync-seam price the engine contract charges (runners are sync
+/// closures); it never nests runtimes — the future runs on the pool, never
+/// the caller's — so the historical nested-panic class stays closed. A full
+/// no-block migration (async runner seams) is wave-6 work.
+type ExecutorTask = std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Bound on the executor queue (Spec 2.5: every queue a bound): past this
+/// many parked submits, new submits fail loud instead of growing memory.
+const EXECUTOR_QUEUE_BOUND: usize = 4096;
+
+fn journal_executor() -> &'static tokio::sync::mpsc::Sender<ExecutorTask> {
+    static QUEUE: std::sync::OnceLock<tokio::sync::mpsc::Sender<ExecutorTask>> =
+        std::sync::OnceLock::new();
+    QUEUE.get_or_init(|| {
+        // Bounded: saturation is a loud error at submit, never silent growth.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ExecutorTask>(EXECUTOR_QUEUE_BOUND);
+        std::thread::Builder::new()
+            .name("flywheel-journal-exec".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_name("flywheel-journal-worker")
+                    .enable_all()
+                    .build()
+                    .expect("journal executor runtime");
+                // The pool driver: pool workers pump the queue, so a submit
+                // nested inside a running task (provider probe) lands on a
+                // sibling worker instead of deadlocking one thread.
+                rt.block_on(async move {
+                    while let Some(task) = rx.recv().await {
+                        tokio::spawn(task);
+                    }
+                });
+            })
+            .expect("spawn journal executor");
+        tx
+    })
+}
+
+/// Submit one journal future to the single executor and wait for its result.
+/// Replaces every per-leaf thread+runtime spawn: FIFO order, one thread,
+/// one runtime. A saturated queue or a dead executor fails loud — a journal
+/// write that cannot run must never read as success.
+fn submit_journal_wait<F, T>(fut: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build effect-journal runtime")?;
-        rt.block_on(fut)
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("effect-journal thread panicked"))?
+    let (reply, wait) = tokio::sync::oneshot::channel();
+    let task: ExecutorTask = Box::pin(async move {
+        let _ = reply.send(fut.await);
+    });
+    journal_executor().try_send(task).map_err(|_| {
+        anyhow::anyhow!("journal executor saturated (>{EXECUTOR_QUEUE_BOUND} parked submits)")
+    })?;
+    // The wait must never park an async worker: inside a runtime it hops to
+    // a plain thread for the block (the old per-leaf spawn did the same by
+    // accident of design); outside one it blocks inline with no spawn.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || wait.blocking_recv())
+            .join()
+            .map_err(|_| anyhow::anyhow!("journal wait thread panicked"))?
+            .map_err(|_| anyhow::anyhow!("journal executor died before settling the submit"))?
+    } else {
+        wait.blocking_recv()
+            .map_err(|_| anyhow::anyhow!("journal executor died before settling the submit"))?
+    }
 }
 
 /// The journal store for this process, or `None` when the toron index cannot
@@ -91,7 +148,7 @@ pub fn journal_store() -> Option<WorkflowEffectStore> {
     }
     let db_path = db.clone();
     let db = db.to_string_lossy().into_owned();
-    match block_on_journal(async move {
+    match submit_journal_wait(async move {
         let pool = toron_core::index::schema::connect(&db).await?;
         toron_core::index::schema::migrate(&pool).await?;
         Ok(WorkflowEffectStore::new(pool))
@@ -142,13 +199,14 @@ pub fn effect_runner(
             }
             // The mailbox is its own provider (flywheel's leaf runners record
             // mailbox actions rather than dispatching them), so without a
-            // sender there is no effect to journal.
+            // sender there is no effect to journal — and bd-v9em fails
+            // closed instead of running unjournaled: a remote/absent plane
+            // cannot carry `corr == effect_key` (Spec 5.4), so the send is
+            // refused, never performed without its journal row.
             SINK_MAILBOX => {
                 let Some(plane) = plane.clone() else {
-                    return Ok(uncovered_sink(
-                        &inner,
-                        inv,
-                        sink,
+                    return Ok(refuse_unjournaled(
+                        "mailbox",
                         "no in-process toron mailbox is available for a fenced send \
                          (Spec 5.4 needs `corr == effect_key`, which the remote wire cannot carry)",
                     ));
@@ -175,10 +233,10 @@ pub fn effect_runner(
             // observed effect to journal and the row would be a lie.
             SINK_VERIFY => {
                 let Some(result) = inv.run.provider_result.clone() else {
-                    return Ok(uncovered_sink(
-                        &inner,
-                        inv,
-                        sink,
+                    // bd-v9em: no observed effect, no row, no run — refuse
+                    // loud instead of journaling a lie or performing blind.
+                    return Ok(refuse_unjournaled(
+                        "verify",
                         "no engine-observed verify result on this invocation — the VerifySink \
                          never ran, so there is no effect to journal",
                     ));
@@ -197,13 +255,27 @@ pub fn effect_runner(
                     Box::new(move || provider_outcome(Ok(result))),
                 )))
             }
-            other => Ok(uncovered_sink(
-                &inner,
-                inv,
-                other,
-                "no provider performs this sink",
-            )),
+            // A sink this runner does not cover is refused loud (fail-closed):
+            // journaling it would settle work nobody did, and running it
+            // unjournaled is the bypass Spec 6 forbids.
+            other => Ok(refuse_unjournaled(other, "no provider performs this sink")),
         }
+    })
+}
+
+/// Refuse an effectful leaf with no journaled provider (bd-v9em, ADR-0035
+/// Spec 2.8): loud `{ok:false}` naming the real cause. Nothing is performed
+/// and no row is written — a settlement without an effect would be a lie,
+/// and an effect without a row would be the silent bypass.
+fn refuse_unjournaled(sink: &str, why: &str) -> Value {
+    eprintln!(
+        "flywheel: effectful '{sink}' action REFUSED — no journaled provider: {why} \
+         (fail-closed, ADR-0035 Spec 2.8)"
+    );
+    serde_json::json!({
+        "ok": false,
+        "error": format!("refused: no journaled provider for '{sink}': {why}"),
+        "kind": "effect_journal_unavailable",
     })
 }
 
@@ -235,35 +307,6 @@ pub struct MailPlane {
     pub send: MailSender,
 }
 
-/// A host sink no provider performs.
-///
-/// It is NOT journaled: a `settled` row would claim an effect nobody performed.
-/// The leaf still runs through its runner and carries the engine's own
-/// uncovered-sink marker, so the gap stays visible in the ledger instead of
-/// looking journaled — and it is reported once per occurrence, loudly, with the
-/// reason.
-fn uncovered_sink(
-    inner: &ActionRunner,
-    inv: &ActionInvocation,
-    sink: &'static str,
-    why: &str,
-) -> Value {
-    eprintln!(
-        "flywheel: effectful '{sink}' action '{}' wrote NO effect-journal row \
-         ({}): {why} — journaling it would settle work nobody did (ADR-0032 Spec 6)",
-        inv.action.type_name(),
-        toron_workflow::engine::EFFECT_JOURNAL_SINK_UNCOVERED
-    );
-    let mut value = leaf_value((inner)(&inv.action));
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "effect_journal".into(),
-            Value::String(toron_workflow::engine::EFFECT_JOURNAL_SINK_UNCOVERED.to_string()),
-        );
-    }
-    value
-}
-
 /// Run one effectful leaf through the fenced journal: commit prepared intent,
 /// claim the attempt, invoke the provider EXACTLY once, settle (or fail, or
 /// record `unknown`). The journal observes a real effect; it never invents one.
@@ -274,7 +317,7 @@ fn dispatch_once(
 ) -> Result<toron_mcp::workflow_host::DispatchResult> {
     let req = dispatch_request(inv);
     let dispatcher = dispatcher.clone();
-    block_on_journal(async move { dispatcher.dispatch(&req, move |_req| provider()).await })
+    submit_journal_wait(async move { dispatcher.dispatch(&req, move |_req| provider()).await })
 }
 
 /// The leaf's delivery data, before any identity is attached: what a
@@ -441,7 +484,7 @@ pub fn run_journal(store: WorkflowEffectStore) -> RunJournal {
         let workflow = t.workflow.clone();
         let workflow_digest = t.workflow_digest.clone();
         let label = run_id.clone();
-        if let Err(e) = block_on_journal(async move {
+        if let Err(e) = submit_journal_wait(async move {
             let current = match store.get_run(&run_id).await? {
                 Some(row) => row.status,
                 None => {
@@ -476,14 +519,14 @@ pub fn run_journal(store: WorkflowEffectStore) -> RunJournal {
 /// GS-048 residual honesty: expand journal coverage **only** when a real
 /// provider exists (job / in-process mailbox / engine-observed verify).
 /// Remote mail stays UNJOURNALED — never invent-green a settled row for a
-/// wire that cannot carry `corr == effect_key`. Uncovered sinks keep the
-/// loud `EFFECT_JOURNAL_SINK_UNCOVERED` marker.
+/// wire that cannot carry `corr == effect_key`. Sinks with no provider fail
+/// closed in the runner (bd-v9em) instead of running unjournaled.
 ///
 /// A remote `[mail.toron] url` is refused deliberately: the daemon's wire
 /// surface cannot carry the `corr` tag the journal needs (Spec 5.4, and
 /// `mail_shim` refuses that same send), and the journal's index is the LOCAL
 /// one — sending here would land a message the daemon's mailbox never reads.
-/// The leaves then keep the honest uncovered-sink marker instead.
+/// Mailbox leaves with no plane fail closed in the runner (bd-v9em) instead.
 fn mail_plane(cfg: &crate::config::Config) -> Option<MailPlane> {
     let url = cfg.toron_mail_config().url.clone().unwrap_or_default();
     if !url.trim().is_empty() {
@@ -501,7 +544,9 @@ fn mail_plane(cfg: &crate::config::Config) -> Option<MailPlane> {
         let mailbox = mailbox.clone();
         Arc::new(move |message: SendMessage| {
             let mailbox = mailbox.clone();
-            block_on_journal(async move { mailbox.send_message(&message).await.map(|r| r.count) })
+            submit_journal_wait(
+                async move { mailbox.send_message(&message).await.map(|r| r.count) },
+            )
         })
     };
     // The sender is the ONE actor ladder (explicit `--as` cannot exist in a
@@ -513,7 +558,7 @@ fn mail_plane(cfg: &crate::config::Config) -> Option<MailPlane> {
         Arc::new(move |project: &str| {
             let mailbox = mailbox.clone();
             let project = project.to_string();
-            block_on_journal(async move {
+            submit_journal_wait(async move {
                 let roster: Vec<String> = mailbox
                     .list_agents(&project, toron_core::mailbox::ListAgentsOptions::default())
                     .await
@@ -753,6 +798,42 @@ mod tests {
         )
     }
 
+    /// bd-k0iq: the shared journal executor runs every submitted future on
+    /// its bounded worker pool — 16 concurrent submits complete on at most
+    /// 4 distinct threads (never one thread+runtime per submit).
+    #[tokio::test]
+    async fn journal_executor_is_single_threaded() {
+        use std::collections::HashSet;
+        let seen = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let seen = seen.clone();
+            handles.push(tokio::spawn(async move {
+                // `submit_journal_wait` from async contexts would block the
+                // worker, so drive it from a plain thread like the sync
+                // runner paths do.
+                std::thread::spawn(move || {
+                    super::submit_journal_wait(async move {
+                        seen.lock().unwrap().insert(std::thread::current().id());
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .expect("executor runs the task");
+                })
+                .join()
+                .expect("driver thread");
+            }));
+        }
+        for h in handles {
+            h.await.expect("task");
+        }
+        let distinct = seen.lock().unwrap().len();
+        assert!(
+            distinct <= 4,
+            "a bounded pool serves every submit, never one thread per submit (saw {distinct})"
+        );
+        assert!(!seen.lock().unwrap().is_empty(), "submits actually ran");
+    }
+
     /// The journal is keyed by the ONE derivation the engine owns (Spec 3) —
     /// an embedding must not mint a second identity scheme.
     #[tokio::test]
@@ -791,7 +872,7 @@ mod tests {
         let inner: ActionRunner = Arc::new(move |_a: &Action| {
             let store = probe_store.clone();
             let k = probe_key.clone();
-            let row = block_on_journal(async move { store.get_effect(&k).await })
+            let row = submit_journal_wait(async move { store.get_effect(&k).await })
                 .expect("probe read")
                 .expect("the intent row exists before the provider runs");
             *seen_c.lock().unwrap() = Some(row.state);
@@ -971,11 +1052,11 @@ mod tests {
             "no journal row for engine-owned control flow"
         );
     }
-    /// A mailbox action whose leaf cannot be journaled (no sender) is marked,
-    /// never silently clean — the same uncovered-sink semantics the engine uses
-    /// for a sink an injected runner does not cover.
+    /// A mailbox action whose leaf cannot be journaled (no sender) is
+    /// REFUSED loud (bd-v9em, Spec 2.8) — never silently clean, never
+    /// performed without its journal row.
     #[tokio::test]
-    async fn mailbox_sink_without_a_sender_is_marked_not_settled() {
+    async fn mailbox_sink_without_a_sender_is_refused_not_performed() {
         let (_dir, store) = test_store().await;
         let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
         let fx = effect_runner(inner, store.clone(), None);
@@ -984,11 +1065,15 @@ mod tests {
         let out = fx(&inv).expect("runner returns a value");
 
         assert_eq!(
-            out["effect_journal"],
-            json!(toron_workflow::engine::EFFECT_JOURNAL_SINK_UNCOVERED),
-            "the unperformed sink is marked, never silently clean: {out}"
+            out["ok"],
+            json!(false),
+            "the unjournaled send is refused, never silently clean: {out}"
         );
-        assert_eq!(out["action"], json!("send_message"), "the leaf still ran");
+        assert!(
+            out["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "the refusal names the cause: {out}"
+        );
+        assert!(out.get("action").is_none(), "the leaf never ran: {out}");
         assert!(
             store
                 .get_effect(&effect_key_for(&inv))
@@ -1120,7 +1205,7 @@ mod tests {
         let mailbox = crate::mail_shim::mailbox().clone();
         // The recipient must exist in the project before the mailbox will route
         // to it — the same precondition any workflow send has in production.
-        block_on_journal({
+        submit_journal_wait({
             let mailbox = mailbox.clone();
             let profile = toron_core::nostr::identity::AgentProfile {
                 name: "pi".to_string(),
@@ -1209,10 +1294,10 @@ mod tests {
     }
 
     /// A verify invocation with NO observed result (outside the engine's
-    /// verify path) is marked uncovered — journaling it would settle a
-    /// command nobody ran.
+    /// verify path) is REFUSED loud (bd-v9em) — journaling it would settle a
+    /// command nobody ran, running it would perform blind.
     #[tokio::test]
-    async fn verify_without_an_observed_result_is_marked_not_settled() {
+    async fn verify_without_an_observed_result_is_refused_not_settled() {
         let (_dir, store) = test_store().await;
         let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
         let fx = effect_runner(inner, store.clone(), None);
@@ -1221,9 +1306,9 @@ mod tests {
         let out = fx(&inv).expect("runner returns a value");
 
         assert_eq!(
-            out["effect_journal"],
-            json!(toron_workflow::engine::EFFECT_JOURNAL_SINK_UNCOVERED),
-            "no observed effect, no journal row: {out}"
+            out["ok"],
+            json!(false),
+            "no observed effect, no journal row, no blind run: {out}"
         );
         assert!(
             store
