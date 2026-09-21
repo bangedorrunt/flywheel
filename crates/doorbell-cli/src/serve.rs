@@ -546,11 +546,16 @@ pub async fn run(cfg: &Config) -> Result<()> {
                 // Compute off the request path; a slow compute only delays
                 // the NEXT snapshot, never a served request.
                 let app = app.clone();
-                tokio::task::spawn_blocking(move || refresh_health_snapshot(&app)).await.ok();
+                tokio::task::spawn_blocking(move || refresh_health_snapshot(&app))
+                    .await
+                    .ok();
             }
         })
     };
-    let _ = health_tick;
+    // Detached supervision: the tick aborts with the serve task group; the
+    // handle is dropped (not awaited) on purpose — awaiting it here would
+    // block the accept loop.
+    drop(health_tick);
     let serve_tcp = async {
         loop {
             let (stream, _) = tcp.accept().await?;
@@ -893,13 +898,7 @@ fn refresh_health_snapshot(app: &AppState) {
 /// instantly (no shells, no greps); a stale/cold cache recomputes inline
 /// once so the response is never older than TTL plus one compute.
 fn cached_health_body(app: &AppState) -> String {
-    let fresh = app
-        .health
-        .lock()
-        .computed_at
-        .elapsed()
-        .as_secs()
-        < HEALTH_CACHE_TTL_SECS;
+    let fresh = app.health.lock().computed_at.elapsed().as_secs() < HEALTH_CACHE_TTL_SECS;
     let body = app.health.lock().body.clone();
     if fresh && !body.is_empty() {
         return body;
@@ -1839,9 +1838,11 @@ mod tests {
             })),
         };
         assert_eq!(cached_health_body(&app), "CANNED");
-        assert!(
-            HEALTH_CACHE_TTL_SECS <= 30,
-            "a health snapshot older than a sweep era lies: {HEALTH_CACHE_TTL_SECS}"
-        );
+        const {
+            assert!(
+                HEALTH_CACHE_TTL_SECS <= 30,
+                "a health snapshot older than a sweep era lies"
+            );
+        }
     }
 }

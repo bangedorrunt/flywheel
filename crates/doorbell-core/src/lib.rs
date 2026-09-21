@@ -1075,7 +1075,9 @@ pub mod wake_table {
     pub fn why_flood(decision: &GateDecision, total: usize, unseen: usize) -> String {
         match decision {
             GateDecision::Proceed => {
-                format!("flood gate proceed: {unseen}/{total} unseen (threshold {FLOOD_NEW_THRESHOLD})")
+                format!(
+                    "flood gate proceed: {unseen}/{total} unseen (threshold {FLOOD_NEW_THRESHOLD})"
+                )
             }
             GateDecision::Pause { .. } => {
                 format!(

@@ -52,11 +52,7 @@ use toron_core::mailbox::overlaps;
 use crate::config::Config;
 use crate::ingress::{IngressEvent, LedgerEvent};
 
-fn mail_health_n() -> u32 {
-    crate::state::mail_health_escalate_at()
-}
-
-fn update_mail_health(project: &str, success: bool, leaf: &str, evidence: &str) {
+fn update_mail_health(project: &str, success: bool, leaf: &str, evidence: &str, escalate_at: u32) {
     let now_ts = {
         let (secs, _) = crate::state::utc_now();
         secs as i64
@@ -67,7 +63,7 @@ fn update_mail_health(project: &str, success: bool, leaf: &str, evidence: &str) 
             al.mail_degraded = false;
         } else {
             al.mail_health.record_failure(now_ts);
-            let n = mail_health_n();
+            let n = escalate_at;
             if al.mail_health.should_escalate(n) && !al.mail_degraded {
                 al.mail_degraded = true;
                 let msg = format!(
@@ -174,10 +170,47 @@ pub struct LoopParams {
     /// default (1800s, bd-cy0s).
     #[serde(default = "default_pane_stall_secs")]
     pub pane_stall_secs: u64,
+    /// ADR-0016: dispatch-guard freshness TTL (µs), resolved once at loop
+    /// start and serialized like `reclaim` — the guard leaf never reads env
+    /// mid-tick. `#[serde(default)]` keeps pre-field saved params at the
+    /// crate default (90 min, bd-dispatch-dedupe-2zlz).
+    #[serde(default = "default_dispatch_guard_ttl_us")]
+    pub dispatch_guard_ttl_us: i64,
+    /// ADR-0016/ADR-0026: mail-health escalation threshold (0 disables),
+    /// resolved once at loop start and serialized — the tick and the
+    /// health-recording leaves read params, never env.
+    #[serde(default = "default_mail_health_escalate_at")]
+    pub mail_health_escalate_at: u32,
+    /// ADR-0016: declared-pause resurface window (secs), resolved once at
+    /// loop start — the drain path reads params, never env per pane.
+    /// `#[serde(default)]` keeps pre-field params at the 3600s crate default
+    /// (the declared-wait TTL twin on the doorbell path).
+    #[serde(default = "default_pause_resurface_secs")]
+    pub pause_resurface_secs: u64,
+    /// ADR-0016: write-liveness walk budget (secs), resolved once at loop
+    /// start; the drain-defer walk reads params, never env per bead.
+    #[serde(default = "default_walk_timeout_secs")]
+    pub walk_timeout_secs: u64,
 }
 
 fn default_pane_stall_secs() -> u64 {
     1800
+}
+
+fn default_dispatch_guard_ttl_us() -> i64 {
+    DISPATCH_GUARD_TTL_US
+}
+
+fn default_mail_health_escalate_at() -> u32 {
+    3
+}
+
+fn default_pause_resurface_secs() -> u64 {
+    crate::write_liveness::PAUSE_RESURFACE_DEFAULT_SECS
+}
+
+fn default_walk_timeout_secs() -> u64 {
+    crate::write_liveness::WALK_TIMEOUT_DEFAULT_SECS
 }
 
 fn default_unknown_diagnose_threshold() -> u32 {
@@ -1534,10 +1567,9 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
             (None, None)
         };
         let is_vacuous = is_cargo && passed == Some(0);
-        let effective_strict = args.strict
-            || std::env::var("FLYWHEEL_VERIFY_STRICT")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+        // ADR-0016: strictness is loop-params data (resolved once at loop
+        // start), never a mid-leaf env read.
+        let effective_strict = args.strict;
         if is_vacuous {
             let warning = format!(
                 "WARNING: vacuous VERIFY — filter `{verify_cmd}` matched 0 tests (evidence proves nothing)"
@@ -1988,6 +2020,9 @@ pub struct MailDigest {
 pub struct DispatchGuardArgs {
     pub project: String,
     pub bead: String,
+    /// ADR-0016: freshness TTL (µs) resolved at loop start — the leaf never
+    /// reads env mid-tick.
+    pub dispatch_ttl_us: i64,
 }
 
 /// Args for the xproj-spawn leaf (cross-project swarm receive, full branch).
@@ -2587,7 +2622,8 @@ fn queue_brief(
 // a live peer signal says the work is taken.
 
 /// Freshness window for peer claim/announce signals. Mirrors the ~90-minute
-/// TIMEBOX in the dispatch brief; `FLYWHEEL_DISPATCH_TTL_SECS` overrides.
+/// TIMEBOX in the dispatch brief; `FLYWHEEL_DISPATCH_TTL_SECS` overrides
+/// (resolved once at loop start into `LoopParams.dispatch_guard_ttl_us`).
 pub const DISPATCH_GUARD_TTL_US: i64 = 90 * 60 * 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3661,12 +3697,7 @@ async fn dispatch_guard_scan(args: DispatchGuardArgs) -> Result<Value> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
-    let ttl_us = std::env::var("FLYWHEEL_DISPATCH_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .map(|secs| secs * 1_000_000)
-        .unwrap_or(DISPATCH_GUARD_TTL_US);
-    match eval_dispatch_guard(&facts, now_us, ttl_us) {
+    match eval_dispatch_guard(&facts, now_us, args.dispatch_ttl_us) {
         Ok(()) => Ok(json!({ "bead": args.bead, "dispatch": true, "reason": null })),
         Err(reason) => Ok(json!({ "bead": args.bead, "dispatch": false, "reason": reason })),
     }
@@ -6635,8 +6666,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // paused batch counts once and then dispatches, while a runaway
             // minting NEW ids keeps pausing — across crash-resume, not just
             // this invocation.
-            let candidate_ids: Vec<String> =
-                to_assign.iter().map(|b| b.id.clone()).collect();
+            let candidate_ids: Vec<String> = to_assign.iter().map(|b| b.id.clone()).collect();
             let total = candidate_ids.len();
             let (next_table, gate) =
                 doorbell_core::wake_table::flood_decide(wake_table, &candidate_ids);
@@ -6709,6 +6739,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     let g_args = DispatchGuardArgs {
                         project: params.project.clone(),
                         bead: bead.id.clone(),
+                        dispatch_ttl_us: params.dispatch_guard_ttl_us,
                     };
                     match ctx.run(dispatch_guard_scan, g_args).await {
                         Ok(v) => {
@@ -6803,6 +6834,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         let g_args = DispatchGuardArgs {
                             project: params.project.clone(),
                             bead: bead_id.clone(),
+                            dispatch_ttl_us: params.dispatch_guard_ttl_us,
                         };
                         match ctx.run(dispatch_guard_scan, g_args).await {
                             Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
@@ -6841,6 +6873,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         let g_args = DispatchGuardArgs {
                             project: params.project.clone(),
                             bead: bead_id.clone(),
+                            dispatch_ttl_us: params.dispatch_guard_ttl_us,
                         };
                         match ctx.run(dispatch_guard_scan, g_args).await {
                             Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
@@ -6954,12 +6987,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             bead_id: bead_id.clone(),
                                             sha: Some(sha.clone()),
                                             timeout_secs: None,
-                                            strict: params.strict
-                                                || std::env::var("FLYWHEEL_VERIFY_STRICT")
-                                                    .map(|v| {
-                                                        v == "1" || v.eq_ignore_ascii_case("true")
-                                                    })
-                                                    .unwrap_or(false),
+                                            strict: params.strict,
                                         };
                                         match ctx.run(loop_run_verify, lr_args).await {
                                             Ok(v) => {
@@ -7167,6 +7195,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             true,
                             "renew_leases",
                             &format!("renewed {renewed}"),
+                            params.mail_health_escalate_at,
                         );
                     }
                     Err(e) => {
@@ -7178,7 +7207,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         for (path, bead_id) in &to_renew {
                             emit_lease_lapsed(&params.project, path, Some(bead_id));
                         }
-                        update_mail_health(&params.project, false, "renew_leases", &err_str);
+                        update_mail_health(
+                            &params.project,
+                            false,
+                            "renew_leases",
+                            &err_str,
+                            params.mail_health_escalate_at,
+                        );
                     }
                 }
             }
@@ -7206,8 +7241,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 emit_fact(&params.project, ev);
             }
         }
-        // ADR-0026 Spec 4: mail-health dispatch-hold at N
-        let n = mail_health_n();
+        // ADR-0026 Spec 4: mail-health dispatch-hold at N. ADR-0016: the
+        // threshold is loop-params data resolved at loop start.
+        let n = params.mail_health_escalate_at;
         let mail_hold = if n == 0 {
             false
         } else if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
@@ -7303,7 +7339,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // a declared wait holds grace instead of being force-stopped. Folded
         // through `tick_from_loop_msg` + journalled exactly like `fold` above —
         // the shell never writes the model directly.
-        let pause_secs = crate::write_liveness::WalkOpts::from_env().pause_resurface_secs;
+        // pause_resurface_secs is loop-params data (ADR-0016: resolved once
+        // at loop start), not an env read per poll.
+        let pause_secs = params.pause_resurface_secs;
         let drained: Vec<String> = swarm.drain_pending.keys().cloned().collect();
         for name in drained {
             if swarm
@@ -8080,7 +8118,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 .map(|(p, _)| p)
                                 .collect();
                             if !globs.is_empty() {
-                                let opts = crate::write_liveness::WalkOpts::from_env();
+                                // ADR-0016: the walk budget is loop-params
+                                // data; the rest are deterministic crate
+                                // defaults (Default is env-free).
+                                let opts = crate::write_liveness::WalkOpts {
+                                    timeout_secs: params.walk_timeout_secs,
+                                    ..Default::default()
+                                };
                                 let root =
                                     crate::write_liveness::resolve_project_root(&params.project);
                                 match crate::write_liveness::walk(&root, &globs, &opts) {
@@ -12557,6 +12601,10 @@ mod tests {
             strict: false,
             reclaim: crate::durable_policy::ReclaimPolicy::new(10, 20),
             pane_stall_secs: 1800,
+            dispatch_guard_ttl_us: 90 * 60 * 1_000_000,
+            mail_health_escalate_at: 3,
+            pause_resurface_secs: 3600,
+            walk_timeout_secs: 10,
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();
@@ -12594,6 +12642,10 @@ mod tests {
         // ADR-0016: pre-field saved params load at the crate default — the
         // tick reads params.pane_stall_secs, never process state.
         assert_eq!(back.pane_stall_secs, PANE_STALL_DEFAULT_SECS);
+        // ADR-0016: same honesty for the dispatch-guard TTL — pre-field
+        // params load at the crate default, and the guard leaf consumes the
+        // serialized value.
+        assert_eq!(back.dispatch_guard_ttl_us, DISPATCH_GUARD_TTL_US);
     }
 
     #[test]
@@ -15551,15 +15603,16 @@ mod mail_health_tests {
             false,
             "renew_leases",
             "evidence: lease renew failed",
+            3,
         );
         let al2 = crate::state::load_active_loop(&project).unwrap().unwrap();
         assert_eq!(al2.mail_health.consecutive_failures, 3);
         // Next failure should set degraded
-        super::update_mail_health(&project, false, "renew_leases", "evidence2");
+        super::update_mail_health(&project, false, "renew_leases", "evidence2", 3);
         let al3 = crate::state::load_active_loop(&project).unwrap().unwrap();
         assert!(al3.mail_degraded);
         // Success should reset
-        super::update_mail_health(&project, true, "renew_leases", "ok");
+        super::update_mail_health(&project, true, "renew_leases", "ok", 3);
         let al4 = crate::state::load_active_loop(&project).unwrap().unwrap();
         assert_eq!(al4.mail_health.consecutive_failures, 0);
         assert!(!al4.mail_degraded);

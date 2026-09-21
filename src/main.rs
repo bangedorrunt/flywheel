@@ -18867,6 +18867,13 @@ fn cmd_loop(
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
     }
+    // ADR-0016: strictness is resolved ONCE at loop start — CLI flag OR env
+    // FLYWHEEL_VERIFY_STRICT — and serialized into LoopParams; leaves never
+    // re-read the env mid-tick.
+    let strict = strict
+        || std::env::var("FLYWHEEL_VERIFY_STRICT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     // single-instance guard (bd-fw-stale-loop-processes-gac): refuse while a
     // live loop process owns this project; --force takes over deliberately.
     // The pid entry is unregistered on exit via LoopPidGuard (Drop), so a
@@ -18936,6 +18943,15 @@ fn cmd_loop(
             respawn_budget: cfg.respawn_budget(),
             reclaim: crate::durable_policy::ReclaimPolicy::from_environment(),
             pane_stall_secs: durable::pane_stall_threshold_from_environment(),
+            dispatch_guard_ttl_us: std::env::var("FLYWHEEL_DISPATCH_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|secs| *secs > 0)
+                .map(|secs| secs * 1_000_000)
+                .unwrap_or(durable::DISPATCH_GUARD_TTL_US),
+            mail_health_escalate_at: crate::state::mail_health_escalate_at(),
+            pause_resurface_secs: crate::write_liveness::PAUSE_RESURFACE_DEFAULT_SECS,
+            walk_timeout_secs: crate::write_liveness::WALK_TIMEOUT_DEFAULT_SECS,
             unknown_detect_grace_polls: cfg.unknown_detect_grace_polls(),
             drain_grace_polls: cfg.drain_grace_polls(),
             claim_nudge_after_polls: cfg.claim_nudge_after_polls(),

@@ -194,7 +194,10 @@ pub struct ActiveLoop {
     /// ActiveLoop file (bd-0cet; replaces the per-invocation seen-set that
     /// forgot paused batches on every restart and re-tripped).
     /// Daemon-side pin routing reads the same rows (wave-5 follow-up).
-    #[serde(default, skip_serializing_if = "doorbell_core::wake_table::WakeTable::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "doorbell_core::wake_table::WakeTable::is_empty"
+    )]
     pub wake: doorbell_core::wake_table::WakeTable,
     /// Heal state per agent persists across polls in model' (bd-gs8b #14, crash-safe via ActiveLoop file, was loop-local).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

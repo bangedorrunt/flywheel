@@ -29,11 +29,11 @@ pub(crate) const WEDGE_INSPECT_DEFAULT_COUNT: u32 = 3;
 /// Declared-`paused:` resurface window (secs) — the same 3600s as the
 /// `pending_wait` TTL (ADR-0010 D4/D12): a declared wait names its owner and
 /// gets a bounded re-surface path, never an indefinite silent park.
-pub(crate) const PAUSE_RESURFACE_DEFAULT_SECS: u64 = 3600;
+pub const PAUSE_RESURFACE_DEFAULT_SECS: u64 = 3600;
 /// Walk no deeper than this many levels below the project root.
 pub(crate) const WALK_MAXDEPTH_DEFAULT: usize = 8;
 /// Walk budget; breach fails toward respawn, never hangs the leaf.
-pub(crate) const WALK_TIMEOUT_DEFAULT_SECS: u64 = 10;
+pub const WALK_TIMEOUT_DEFAULT_SECS: u64 = 10;
 /// Directory names never descended into.
 pub(crate) const WALK_PRUNE_DEFAULT: &[&str] = &["target", ".git", "node_modules", ".hg", ".svn"];
 
@@ -45,8 +45,9 @@ pub(crate) const WALK_PRUNE_DEFAULT: &[&str] = &["target", ".git", "node_modules
 /// - `FLYWHEEL_STALE_ESCALATE_SECS` — quiet window, default 240.
 /// - `FLYWHEEL_BUSY_TURN_MAX_SECS` — default 3600.
 /// - `FLYWHEEL_WEDGE_INSPECT_COUNT` — default 3.
-/// - `FLYWHEEL_PAUSE_RESURFACE_SECS` — declared-pause resurface window,
-///   default 3600 (the `pending_wait` TTL twin).
+///
+/// The declared-pause resurface window is loop-params data now
+/// (`LoopParams.pause_resurface_secs`, ADR-0016) — env no longer tunes it.
 #[derive(Debug, Clone)]
 pub(crate) struct WalkOpts {
     pub prune: Vec<String>,
@@ -55,6 +56,8 @@ pub(crate) struct WalkOpts {
     pub quiet_secs: u64,
     pub wedge_inspect_count: u32,
     pub busy_turn_max_secs: u64,
+    /// Kept for API symmetry with the declaration stamp; `walk` never reads it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub pause_resurface_secs: u64,
 }
 
@@ -73,6 +76,10 @@ impl Default for WalkOpts {
 }
 
 impl WalkOpts {
+    /// Env override seam — currently unused by the loop (ADR-0016: walk
+    /// knobs resolve into `LoopParams` at loop start); kept for operator
+    /// tooling that wants the full env-tuned config in one call.
+    #[allow(dead_code)]
     pub(crate) fn from_env() -> Self {
         let mut o = Self::default();
         if let Ok(v) = std::env::var("FLYWHEEL_WRITE_WALK_PRUNE") {
@@ -115,12 +122,8 @@ impl WalkOpts {
         {
             o.wedge_inspect_count = v;
         }
-        if let Ok(v) = std::env::var("FLYWHEEL_PAUSE_RESURFACE_SECS")
-            .unwrap_or_default()
-            .parse()
-        {
-            o.pause_resurface_secs = v;
-        }
+        // The declared-pause window is resolved once at loop start
+        // (LoopParams.pause_resurface_secs) — env no longer tunes it here.
         o
     }
 }
