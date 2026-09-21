@@ -24,7 +24,7 @@ wire / CLI / timer / process observation
 
 **2. Time enters as data.** An interpreter samples wall or monotonic time and sends it in a message. A reducer never calls `SystemTime::now` or `Instant::now`.
 
-**2a. Policy enters as data.** Host configuration is resolved once into `WorkspacePolicy` (workspace) and `LoopParams` fields `reclaim`/`pane_stall_secs` (durable loop) before the live model or workflow starts. Reducers read policy fields from the model/params; they never read environment variables through convenience helpers. The env resolver runs exactly once, at the construction site in `main.rs` — a reducer or tick helper reading `FLYWHEEL_*` directly is a review reject.
+**2a. Policy enters as data.** Host configuration is resolved once into `WorkspacePolicy` (workspace) and `LoopParams` fields `reclaim`, `pane_stall_secs`, `dispatch_guard_ttl_us`, `mail_health_escalate_at`, `pause_resurface_secs`, `walk_timeout_secs`, plus `strict` (durable loop) before the live model or workflow starts. Reducers and leaves read policy fields from the model/params; they never read environment variables through convenience helpers, and leaves receive policy on their args structs. The env resolver runs exactly once, at the construction site in `main.rs` — a reducer, tick helper, or checkpointed leaf reading `FLYWHEEL_*` directly is a review reject.
 
 **3. Effects are values first.** A reducer emits a command; it does not perform the command. Each command has exactly one named interpreter. Unknown commands fail loudly rather than being ignored.
 
