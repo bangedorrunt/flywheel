@@ -89,12 +89,12 @@ Read it with `flywheel doorbell digest <project> --identity <pin>` — the verb
 prints the wake line for a `Digest` row, which is the only place it is
 rendered (the wake is otherwise readable only by grepping the journal).
 
-`flywheel doorbell why <project> <pin>` does **not** yet replay these rows:
-`why` rebuilds each entry by folding the embedded `workspace::tick`, and the
-daemon journals its inbox wakes as `InboxFetched`, which has no `workspace::Msg`
-counterpart — so the fold skips the row and `why` reports that nothing mentions
-the pin. That blindness predates this change and covers the daemon's whole
-inbox path, not just pane-less pins; it is filed separately.
+`flywheel doorbell why <project> <pin>` replays these rows: `why` honors
+the journal's `pins` attribution for daemon `InboxFetched`/digest rows (which
+carry no `workspace::Msg`), so a daemon inbox wake shows with a `[journaled]`
+label instead of reporting that nothing mentions the pin (bd-2i96; live-proven
+2026-09-21). The label is honesty, not a fold: the row is journal evidence,
+not a refolded reducer pass.
 
 To get an actual **prompt** for such a pin you need a real pane to route to
 (bind a subscription to a spawned pin) — or a webhook subscription (below),
@@ -197,8 +197,9 @@ is absent from `herdr pane list` now drops out of the sweep after a 120s
 grace, with ONE `registry_pin_stale` audit row naming pin, pane, and grace.
 A pane that reappears un-reaps it; an **empty** pane list means herdr did not
 answer, so nothing is reaped on a transient failure. `/health.injection`
-still counts reaped pins (it reads the raw registry), so the fault stays
-visible after it stops costing a fetch per tick.
+counts sweep-set pins only (reaped pins are excluded, bd-2i96), so the count
+matches the pins actually costing a fetch per tick; the reap itself stays
+visible as its `registry_pin_stale` audit row.
 - **The ack-SLA beat.** `toron ack-sla` re-reports every corr still past SLA,
 so a stale backlog re-fired the same wake every 60s (live: `count: 89`, 1440×
 per day). The beat now fires on a **change** only: new overdue ids audit
@@ -207,9 +208,11 @@ backlog is one fact, not one row per minute.
 
 ### The prompt hop's precondition (`/health.injection`)
 
-A wake reaching a pane needs an *injectable* pane: `should_inject` accepts
-only `idle|done|blocked`, and statuses come from `herdr agent list` mapped
-through the spawn registry. When herdr knows no agent, no wake can ever be
+A wake reaching a pane needs an *injectable* pane: one typed `InjectGate`
+(bd-zawk) unifies the herdr-status gate with the presence parse, so `blocked`
+means exactly one thing everywhere — `blocked` + urgent injects, `blocked` +
+routine digests with its reason, never a silent drop. Statuses come from
+`herdr agent list` mapped through the spawn registry. When herdr knows no agent, no wake can ever be
 injected — a property of the environment, not a doorbell bug — and it used
 to be invisible: `mode: hosted, degraded: []` while nothing landed. `/health`
 now counts it:
@@ -245,8 +248,8 @@ serve/migrate/ping).
 | Why | `flywheel doorbell why <project> <pin> --seq <n> --corr <id>` |
 | History | `flywheel doorbell digest` |
 | Direct ring | `flywheel doorbell inject <project> <pin> "<line>"` (ratcheted, budgeted, digest-visible) |
-| Subscriptions | `flywheel doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair; omitted = never auto-hosted) |
-| Cross-workspace | `flywheel doorbell subscribe --workspace wA --pin P --extra wB` (scope printed, never implicit) |
+| Subscriptions | `flywheel doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair and is required: a project-less row is refused loud, bd-zawk — it would never ring) |
+| Cross-workspace | `flywheel doorbell subscribe --workspace wA --pin P --extra wB --project <slug>` (scope printed, never implicit; `--project` required) |
 | Human wake (no pane) | `flywheel doorbell subscribe --sink webhook --url http://host:port/path` + `DOORBELL_WEBHOOK_ALLOWLIST=host` on the daemon (see above) |
 | Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded` |
 
