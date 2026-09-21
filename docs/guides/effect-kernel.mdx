@@ -47,6 +47,10 @@ The deterministic routing table and code-owned thresholds remain authoritative. 
 
 See [Judgment packs](./judgment-packs) for pack validation and confidence rules.
 
+## Typed boundary use
+
+The kernel is an active boundary, not a marker module. Correlation IDs and agent pins are validated before workspace mutation, workflow names are validated before catalog lookup, project paths are validated before process adapters, and known failure phases use `kernel::ActionStage` rather than unchecked stage literals. Stable wire output may remain string-shaped, but conversion belongs at the edge.
+
 ## Replay discipline
 
 When adding a reducer arm:

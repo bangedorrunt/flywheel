@@ -29,9 +29,11 @@ pub(crate) enum WorkCmd {
 }
 
 pub(crate) fn cmd_work(cfg: &Config, cmd: &WorkCmd) -> Result<()> {
-    // P4: cwd resolves once in HostAuthority (falls back to ".", never errs).
-    let cwd = crate::authority::HostAuthority::resolve().cwd;
-    let bv = crate::work::Bv::new(cwd.to_str().unwrap_or("."));
+    // P4 / ADR-0016: cwd resolves once in HostAuthority and is validated
+    // before entering the process effect adapter.
+    let cwd = crate::kernel::ProjectPath::parse(crate::authority::HostAuthority::resolve().cwd)
+        .map_err(|error| anyhow::anyhow!("invalid project path: {error}"))?;
+    let bv = crate::work::Bv::new(cwd.as_path().to_str().unwrap_or("."));
     match cmd {
         WorkCmd::Triage => {
             let v = bv.robot("triage")?;

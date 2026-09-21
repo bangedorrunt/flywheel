@@ -1859,7 +1859,7 @@ impl Mail {
                 let id = block_on(mailbox().set_contact_policy(
                     project_key,
                     agent_name,
-                    ContactPolicy::parse(policy),
+                    ContactPolicy::parse(policy)?,
                 ))?;
                 Ok(json!({ "policy": policy, "event_id": id }))
             }

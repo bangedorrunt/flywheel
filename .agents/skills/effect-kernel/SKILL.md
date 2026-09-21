@@ -22,9 +22,10 @@ Reducers must not perform I/O, read time or environment, use randomness or locks
 3. Add a command/result message instead of calling an effect from a reducer.
 4. Give every real effect one journal identity and bounded retry/timeout behavior.
 5. Preserve `Unknown`; never infer success from missing evidence.
-6. Keep queue acceptance distinct from provider delivery.
-7. Keep Jev advisory. It cannot choose topology, settle an effect, close a bead, or verify a run.
-8. Add same-log/same-effects replay coverage and boundary tests for malformed, timeout, retry, and unknown results.
+6. Use typed kernel values actively: validate `Corr`, `AgentPin`, `WorkflowName`, and `ProjectPath` before mutation or process effects; use `ActionStage` at typed failure call sites.
+7. Keep queue acceptance distinct from provider delivery.
+8. Keep Jev advisory. It cannot choose topology, settle an effect, close a bead, or verify a run.
+9. Add same-log/same-effects replay coverage and boundary tests for malformed, timeout, retry, and unknown results.
 
 Read `docs/agent-instructions/effect-kernel.md` before editing and `docs/decisions/0016-functional-effect-kernel-redesign.md` for rationale and phase status.
 

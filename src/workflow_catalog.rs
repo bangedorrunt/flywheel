@@ -94,6 +94,11 @@ pub fn pick_workflow(
     merged: &BTreeMap<String, ResolvedWorkflow>,
     name: &str,
 ) -> Result<ResolvedWorkflow, CatalogError> {
+    // ADR-0016: catalog identifiers are validated at the boundary while
+    // preserving prefix lookup semantics and the original error text.
+    if crate::kernel::WorkflowName::parse(name.to_string()).is_err() {
+        return Err(CatalogError::Unknown(name.into()));
+    }
     if let Some(found) = merged.get(name) {
         return Ok(found.clone());
     }

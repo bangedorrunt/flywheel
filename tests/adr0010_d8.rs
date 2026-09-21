@@ -8,10 +8,12 @@
 //!
 //! Test names: adr0010_d8_* — filtered by `mbx +nightly-aarch64-apple-darwin test adr0010_d8`.
 
+use std::str::FromStr;
+
 use toron_core::index::schema;
-use toron_core::mailbox::Receipt;
 use toron_core::mailbox::receipts::{DEGRADED_NOTE, ReceiptState, ReceiptStore, resend_guidance};
 use toron_core::mailbox::send_tags::Wake;
+use toron_core::mailbox::{Corr, Receipt};
 
 const MESSAGING: &str = include_str!("../../toron/crates/toron-core/src/mailbox/messaging.rs");
 const MAIN: &str = include_str!("../src/main.rs");
@@ -70,7 +72,11 @@ async fn adr0010_d8_degraded_state_roundtrip_and_guards() {
 
     // Resulted still wins over degraded (recovery path).
     store
-        .set_resulted("C-8", Some("/tmp/out.json".to_string()))
+        .set_resulted(
+            &Corr::from_str("C-8").expect("corr"),
+            Some("/tmp/out.json".to_string()),
+            3,
+        )
         .await
         .expect("resulted");
     assert_eq!(
@@ -279,7 +285,10 @@ async fn adr0010_d8_corr_send_duplicate_is_noop_and_receipt_survives() {
     );
 
     // Resulted is terminal even against a re-send's owed upsert.
-    store.set_resulted("FM-D8", None).await.expect("resulted");
+    store
+        .set_resulted(&Corr::from_str("FM-D8").expect("corr"), None, i64::MAX)
+        .await
+        .expect("resulted");
     let _ = mailbox
         .send_message(&msg())
         .await

@@ -218,6 +218,23 @@ pub fn classify_with_stage(
     }
 }
 
+/// Typed ActionStage adapter for callers that already crossed the kernel
+/// boundary. The wire-facing classifier keeps its stable string field, while
+/// production callers no longer spell stage names as unchecked literals.
+pub fn classify_with_action_stage(
+    stderr_tail: &str,
+    exit_code: Option<i32>,
+    body: Option<&str>,
+    stage: Option<crate::kernel::ActionStage>,
+) -> ClassifiedFailure {
+    classify_with_stage(
+        stderr_tail,
+        exit_code,
+        body,
+        stage.map(|value| value.as_str()),
+    )
+}
+
 fn truncate_evidence(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()

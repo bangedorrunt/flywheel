@@ -104,6 +104,19 @@ pub(crate) enum ActionStage {
     Park,
 }
 
+impl ActionStage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normalize => "normalize",
+            Self::Input => "input",
+            Self::Execute => "execute",
+            Self::Output => "output",
+            Self::Effect => "effect",
+            Self::Park => "park",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStatus {
     Planned,
@@ -239,6 +252,7 @@ mod tests {
         assert!(!RunStatus::Running.is_terminal());
         assert!(DeliveryState::Unknown.is_terminal());
         assert!(!DeliveryState::Accepted.is_terminal());
+        assert_eq!(ActionStage::Effect.as_str(), "effect");
     }
 
     #[test]
