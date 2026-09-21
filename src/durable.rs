@@ -2744,35 +2744,6 @@ pub fn eval_dispatch_guard(
     Ok(())
 }
 
-/// Bead-creation flood verdict (bd-eign.2): more than 3 previously-unassigned
-/// ready beads arriving in ONE poll is the runaway-create signature (the
-/// 40-junk-beads-in-4-min incident, RC2). The loop derives `new_ready` from
-/// checkpointed poll results (`ready` minus `assigned`), so the verdict is
-/// deterministic across replays. PURE + unit-tested.
-pub fn bead_flood_verdict(new_ready: usize) -> bool {
-    // Hotfix 2026-08-21: legitimate ADR-0022 wave is 5-6 beads at once;
-    // the durable replay resets flood_seen each poll, so the same 5 kept
-    // tripping the >3 guard and starving dispatch. Allow up to 6;
-    // real runaway mints 10+ with NEW ids and still trips. Proper fix:
-    // persist flood_seen via ctx (bead bd-eign.2 follow-up).
-    new_ready > 6
-}
-
-/// bd-eign.2.1: count ready beads the flood guard has NOT yet seen this
-/// invocation. The guard's pause feeds `seen`; a legitimate pre-created
-/// batch (>3 beads opened at once) is counted once and then dispatches,
-/// while a runaway minting NEW ids keeps tripping the verdict. PURE +
-/// unit-tested.
-pub fn flood_new_count<'a>(
-    to_assign: impl IntoIterator<Item = &'a ReadyBead>,
-    seen: &std::collections::HashSet<String>,
-) -> usize {
-    to_assign
-        .into_iter()
-        .filter(|b| !seen.contains(&b.id))
-        .count()
-}
-
 /// Exhaustion verdict from the two context channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextVerdict {
@@ -6077,13 +6048,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // replay, so the correctness floor is never skipped.
     let mut states: Vec<AgentState> = Vec::new();
     let mut since_snapshot: u64 = 0;
-    // bd-7qg6: flood_seen lives OUTSIDE the poll loop — declared per-poll it
-    // reset every iteration, so a legit 7+ batch counted as "new" forever and
-    // never dispatched. Hoisted: paused ids are known next poll (one pause,
-    // then dispatch); ever-new runaway ids still trip every poll. Resets only
-    // on crash-resume (one extra pause, bounded — full ctx persistence is the
-    // bd-eign.2 follow-up).
-    let mut flood_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // bd-0cet: the flood guard's memory is the persisted Spec-5 Wake table
+    // (crash-safe via ActiveLoop, seeded below like dispatch_pending) —
+    // a restart no longer re-trips on the batch it already paused.
+    let mut wake_table: doorbell_core::wake_table::WakeTable = {
+        if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
+            al.wake.clone()
+        } else {
+            doorbell_core::wake_table::WakeTable::default()
+        }
+    };
 
     loop {
         iteration += 1;
@@ -6407,8 +6381,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // bd-gnej wave-gate: ready beads held this poll (earlier wave open).
         // Hoisted so the completion gate below can require them empty.
         let mut wave_held: Vec<String> = Vec::new();
-        // bd-eign.2.1 (2026-08-17) + bd-7qg6: beads the flood guard PAUSED this
-        // invocation persist in `flood_seen` (hoisted above the poll loop) —
+        // bd-eign.2.1 (2026-08-17) + bd-0cet: beads the flood guard PAUSED
+        // enter the Wake table's memory (persisted via ActiveLoop) —
         // without this, the same beads count as "new" every poll (they never
         // enter `assigned` while paused) and dispatch locks forever. The guard
         // still fires for EVER-NEW bead ids (the runaway signature).
@@ -6584,7 +6558,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     }
                 }
                 let now_secs = chrono::Utc::now().timestamp();
-                let stale = plan_reclaim(now_secs, &inprog, &states, &board);
+                // ADR-0025 / ADR-0016: thresholds ride the loop params
+                // (serialized with the invocation) so a replay reclaims by
+                // the same policy the original run used.
+                let stale =
+                    plan_reclaim_with_policy(now_secs, &inprog, &states, &board, &params.reclaim);
                 for act in stale {
                     reclaim_actions.push(act);
                 }
@@ -6594,23 +6572,21 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // ~4 min, RC2). CRITICAL warn + PAUSE dispatch this poll: feeding
             // the flood (each dispatch prompts "claim a bead") doubles the
             // creates. Deterministic: to_assign derives from checkpointed
-            // poll results, so replays reach the same verdict.
-            // bd-eign.2.1: paused beads enter flood_seen — the NEXT poll
-            // counts them as known and dispatches (legit pre-created batch
-            // of 4+ unblocks after one pause); a runaway keeps minting NEW
-            // ids, which flood_seen cannot absorb, so the guard still fires.
-            let flood_new: Vec<String> = to_assign
-                .iter()
-                .filter(|b| !flood_seen.contains(&b.id))
-                .map(|b| b.id.clone())
-                .collect();
-            if bead_flood_verdict(flood_new_count(to_assign.iter().copied(), &flood_seen)) {
-                for id in &flood_new {
-                    flood_seen.insert(id.clone());
-                }
+            // poll results, so replays reach the same verdict. The verdict
+            // and its memory live in the Spec-5 Wake table (bd-0cet): a
+            // paused batch counts once and then dispatches, while a runaway
+            // minting NEW ids keeps pausing — across crash-resume, not just
+            // this invocation.
+            let candidate_ids: Vec<String> =
+                to_assign.iter().map(|b| b.id.clone()).collect();
+            let total = candidate_ids.len();
+            let (next_table, gate) =
+                doorbell_core::wake_table::flood_decide(wake_table, &candidate_ids);
+            wake_table = next_table;
+            if let doorbell_core::wake_table::GateDecision::Pause { unseen } = &gate {
                 eprintln!(
-                    "flywheel: CRITICAL: {} new ready beads this poll — runaway bead creation suspected (bd-eign.2). Pausing dispatch this poll; queue not fed.",
-                    flood_new.len()
+                    "flywheel: CRITICAL: {}",
+                    doorbell_core::wake_table::why_flood(&gate, total, unseen.len())
                 );
             } else if serialize_all {
                 eprintln!(
@@ -7434,6 +7410,9 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .map(|(k, v)| (k.clone(), format!("{v:?}")))
                 .collect();
             al.dispatch_pending = dispatch_pending.clone();
+            // bd-0cet: the wake table persists per poll (flood-guard and
+            // AckSLA memory survive crash-resume via the ActiveLoop file).
+            al.wake = wake_table.clone();
             // bd-55nx.8: done-mail dedup is crash-safe Model state.
             al.done_mailed = swarm.done_mailed.clone();
             // bd-zfnx.10: open drains are crash-safe Model state (name →
@@ -10958,23 +10937,31 @@ mod tests {
         }
     }
 
-    /// bd-eign.2: >6 new ready beads in one poll = runaway create flood;
+    /// bd-0cet: >6 new ready beads in one poll = runaway create flood;
     /// 0-6 is normal dispatch volume (ADR-0022 waves are 5-6 beads).
+    /// Decided by the persisted Wake table now (was free fns + loop set).
     #[test]
     fn bead_flood_verdict_threshold() {
-        assert!(!bead_flood_verdict(0));
-        assert!(!bead_flood_verdict(3));
-        assert!(!bead_flood_verdict(6));
-        assert!(bead_flood_verdict(7));
-        assert!(bead_flood_verdict(40));
+        use doorbell_core::wake_table::{GateDecision, WakeTable, flood_decide};
+        let ids = |n: usize| (0..n).map(|i| format!("bd-t{i}")).collect::<Vec<_>>();
+        for n in [0, 3, 6] {
+            let (_, d) = flood_decide(WakeTable::default(), &ids(n));
+            assert!(matches!(d, GateDecision::Proceed), "{n} proceeds");
+        }
+        for n in [7, 40] {
+            let (_, d) = flood_decide(WakeTable::default(), &ids(n));
+            assert!(matches!(d, GateDecision::Pause { .. }), "{n} pauses");
+        }
     }
 
-    /// bd-eign.2.1: the flood guard's paused beads enter the seen-set, so a
-    /// pre-created flood-sized batch is counted ONCE and then dispatches; a
-    /// runaway minting new ids keeps tripping. Batch is 7 to clear the
-    /// hotfix-472e4ca threshold (verdict trips at >6; bd-e7ev).
+    /// bd-0cet: the flood guard's paused beads enter the Wake table, so a
+    /// pre-created flood-sized batch is paused ONCE and then dispatches; a
+    /// runaway minting new ids keeps pausing. Batch is 7 to clear the
+    /// threshold (verdict trips at >6; bd-e7ev). Table persists via
+    /// ActiveLoop, so crash-resume inherits the absorption.
     #[test]
     fn flood_new_count_absorbs_paused_batch_and_catches_runaway() {
+        use doorbell_core::wake_table::{GateDecision, WakeTable, flood_decide};
         let rb = |id: &str| ReadyBead {
             id: id.into(),
             title: String::new(),
@@ -10995,23 +10982,29 @@ mod tests {
             rb("bd-f"),
             rb("bd-g"),
         ];
-        let mut seen = std::collections::HashSet::new();
-        let first = flood_new_count(batch.iter(), &seen);
-        assert_eq!(first, 7, "fresh batch counts fully");
-        assert!(bead_flood_verdict(first), "batch trips the pause");
-        for b in &batch {
-            seen.insert(b.id.clone());
-        }
-        assert_eq!(
-            flood_new_count(batch.iter(), &seen),
-            0,
+        let ids: Vec<String> = batch.iter().map(|b| b.id.clone()).collect();
+        let (t, first) = flood_decide(WakeTable::default(), &ids);
+        assert!(
+            matches!(first, GateDecision::Pause { .. }),
+            "fresh flood-sized batch trips the pause"
+        );
+        let (t, second) = flood_decide(t, &ids);
+        assert!(
+            matches!(second, GateDecision::Proceed),
             "paused batch dispatches on the next poll (no repeat pause)"
         );
-        let runaway = rb("bd-runaway");
-        assert_eq!(
-            flood_new_count(std::iter::once(&runaway), &seen),
-            1,
-            "a NEW id still trips the verdict"
+        // One NEW id alone is below threshold and proceeds; a fresh
+        // flood-sized wave pauses again (the runaway signature).
+        let (_, single) = flood_decide(t.clone(), &[rb("bd-runaway").id]);
+        assert!(
+            matches!(single, GateDecision::Proceed),
+            "a lone new id proceeds"
+        );
+        let fresh: Vec<String> = (0..7).map(|i| format!("bd-fresh{i}")).collect();
+        let (_, runaway_flood) = flood_decide(t, &fresh);
+        assert!(
+            matches!(runaway_flood, GateDecision::Pause { .. }),
+            "a fresh flood-sized wave still trips"
         );
     }
 
