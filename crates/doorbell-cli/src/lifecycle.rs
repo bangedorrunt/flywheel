@@ -40,6 +40,99 @@ pub fn parse_host(s: &str) -> anyhow::Result<(String, String)> {
     }
 }
 
+/// Default daemon state dir (bd-fpd5): `DOORBELL_STATE_DIR` >
+/// `XDG_STATE_HOME/doorbell` > `~/.local/state/doorbell`. Same ladder
+/// shape as [`default_flywheel_state`], except the last rung is the
+/// portable home fallback, never the platform data dir — the daemon
+/// state converges to XDG on every platform.
+///
+/// The pure ladder lives in [`resolve_state_dir_default`] (no env reads)
+/// so unit tests exercise it hermetically; this wrapper only reads env.
+pub fn default_state_dir() -> PathBuf {
+    resolve_state_dir_default(
+        std::env::var_os("DOORBELL_STATE_DIR").map(PathBuf::from),
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+pub fn resolve_state_dir_default(
+    env_doorbell: Option<PathBuf>,
+    env_xdg: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    env_doorbell
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            env_xdg
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|d| d.join("doorbell"))
+        })
+        .unwrap_or_else(|| {
+            home.unwrap_or_else(|| PathBuf::from("~"))
+                .join(".local/state/doorbell")
+        })
+}
+
+/// Pre-XDG default we migrate away from (`dirs::data_dir/doorbell`, i.e.
+/// `~/Library/Application Support/doorbell` on macOS). `None` when the
+/// platform has no data dir at all.
+pub fn legacy_platform_state_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("doorbell"))
+}
+
+/// Migrate-once from the legacy platform dir into the default state dir
+/// (bd-fpd5). Copies via [`crate::migrate::migrate`] (byte-identical,
+/// refuse-overwrite) when the old dir exists and the new one carries no
+/// inventory yet; every other shape is a clean `None` no-op (same dir,
+/// absent old dir, already-migrated or user-managed new dir). Returns
+/// the copied relative paths when a migration ran.
+pub fn maybe_migrate_to_default(
+    new: &std::path::Path,
+    old: &std::path::Path,
+) -> Result<Option<Vec<String>>> {
+    if new == old {
+        return Ok(None);
+    }
+    if !old.is_dir() {
+        return Ok(None);
+    }
+    if dir_has_inventory(new) {
+        return Ok(None);
+    }
+    let copied = crate::migrate::migrate(old, new)?;
+    Ok(Some(copied))
+}
+
+fn dir_has_inventory(dir: &std::path::Path) -> bool {
+    for sub in ["doorbell", "journals", ""] {
+        let d = if sub.is_empty() {
+            dir.to_path_buf()
+        } else {
+            dir.join(sub)
+        };
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(true) {
+                continue;
+            }
+            if crate::migrate::inventory_match(sub, &name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when the env var is unset or empty (an explicit override must be
+/// non-empty to count).
+pub fn env_is_unset_or_empty(name: &str) -> bool {
+    std::env::var_os(name).map(|v| v.is_empty()).unwrap_or(true)
+}
+
 pub fn default_flywheel_state() -> PathBuf {
     std::env::var_os("DOORBELL_FLYWHEEL_STATE_DIR")
         .map(PathBuf::from)
@@ -67,10 +160,10 @@ impl Config {
         flywheel_state: Option<PathBuf>,
         hosts: Vec<(String, String)>,
     ) -> Result<Self> {
+        // bd-fpd5: XDG-first default; explicit flag wins, then env.
         let state_dir = state_dir
-            .or_else(|| std::env::var_os("DOORBELL_STATE_DIR").map(PathBuf::from))
-            .or_else(|| dirs::data_dir().map(|d| d.join("doorbell")))
-            .unwrap_or_else(|| PathBuf::from("/tmp/doorbell-state"));
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(default_state_dir);
         let port = port
             .or_else(|| {
                 std::env::var("DOORBELL_PORT")
@@ -534,6 +627,120 @@ fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_state_ladder_prefers_explicit_env_then_xdg_then_home() {
+        // bd-fpd5: DOORBELL_STATE_DIR > XDG_STATE_HOME/doorbell >
+        // ~/.local/state/doorbell. Pure ladder (no env reads) so tests
+        // stay hermetic under parallel execution.
+        let home = PathBuf::from("/home/u");
+        assert_eq!(
+            resolve_state_dir_default(
+                Some(PathBuf::from("/env/doorbell")),
+                Some(PathBuf::from("/xdg")),
+                Some(home.clone())
+            ),
+            PathBuf::from("/env/doorbell")
+        );
+        assert_eq!(
+            resolve_state_dir_default(None, Some(PathBuf::from("/xdg")), Some(home.clone())),
+            PathBuf::from("/xdg/doorbell")
+        );
+        assert_eq!(
+            resolve_state_dir_default(None, None, Some(home)),
+            PathBuf::from("/home/u/.local/state/doorbell")
+        );
+    }
+
+    #[test]
+    fn default_state_ladder_ignores_empty_env() {
+        // Empty DOORBELL_STATE_DIR / XDG_STATE_HOME are unset, never "".
+        assert_eq!(
+            resolve_state_dir_default(
+                Some(PathBuf::from("")),
+                Some(PathBuf::from("")),
+                Some(PathBuf::from("/home/u"))
+            ),
+            PathBuf::from("/home/u/.local/state/doorbell")
+        );
+    }
+
+    #[test]
+    fn legacy_platform_dir_is_data_dir_doorbell() {
+        // The pre-XDG default we migrate away from, when it exists.
+        assert_eq!(
+            legacy_platform_state_dir(),
+            dirs::data_dir().map(|d| d.join("doorbell"))
+        );
+    }
+
+    fn tmp_lifecycle(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dbcl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn migrate_once_copies_when_new_missing() {
+        let base = tmp_lifecycle("mig-new");
+        let old = base.join("old");
+        std::fs::create_dir_all(old.join("journals")).unwrap();
+        std::fs::write(old.join("doorbell-wake-w.json"), r#"{"w":1}"#).unwrap();
+        std::fs::write(
+            old.join("journals").join("doorbell-journal-w.jsonl"),
+            "{\"v\":1}\n",
+        )
+        .unwrap();
+        let new = base.join("new");
+        let copied = maybe_migrate_to_default(&new, &old)
+            .unwrap()
+            .expect("missing new dir must migrate");
+        assert_eq!(copied.len(), 2);
+        assert_eq!(
+            std::fs::read(new.join("doorbell-wake-w.json")).unwrap(),
+            std::fs::read(old.join("doorbell-wake-w.json")).unwrap()
+        );
+        // Second run is a no-op (migrate-once): new is populated now.
+        assert!(
+            maybe_migrate_to_default(&new, &old).unwrap().is_none(),
+            "populated new dir must not re-migrate"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrate_once_skips_when_new_populated() {
+        // Refuse-overwrite is never even attempted: populated new wins.
+        let base = tmp_lifecycle("mig-skip");
+        let old = base.join("old");
+        let new = base.join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("doorbell-wake-w.json"), r#"{"new":1}"#).unwrap();
+        std::fs::write(old.join("doorbell-wake-w.json"), r#"{"old":1}"#).unwrap();
+        assert!(
+            maybe_migrate_to_default(&new, &old).unwrap().is_none(),
+            "populated new dir must be left alone"
+        );
+        assert_eq!(
+            std::fs::read(new.join("doorbell-wake-w.json")).unwrap(),
+            br#"{"new":1}"#.to_vec()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrate_once_skips_when_old_missing() {
+        let base = tmp_lifecycle("mig-noold");
+        let new = base.join("new");
+        assert!(
+            maybe_migrate_to_default(&new, &base.join("nope")).unwrap().is_none(),
+            "absent old dir is a clean no-op"
+        );
+        assert!(!new.exists(), "no-op must not create the new dir");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn parse_host_accepts_absolute_project_paths() {

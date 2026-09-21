@@ -13,7 +13,8 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-    /// State dir override (default: platform data dir / doorbell).
+    /// State dir override (default: $DOORBELL_STATE_DIR, else
+    /// $XDG_STATE_HOME/doorbell, else ~/.local/state/doorbell).
     #[arg(long, global = true)]
     state_dir: Option<std::path::PathBuf>,
     /// TCP port override, mostly for tests (default 18980).
@@ -49,6 +50,8 @@ enum Cmd {
     /// Run the serve loop (spawned by `start`; humans rarely run this).
     Serve,
     /// Adopt a dispatcher's state dir byte-identically (bd-asr2.6).
+    /// Also runs automatically once at startup when the default state dir
+    /// is in effect and the legacy platform dir still holds content.
     Migrate {
         /// Source state dir to adopt from.
         #[arg(long)]
@@ -74,8 +77,26 @@ async fn main() -> anyhow::Result<()> {
     for h in &cli.host {
         hosts.push(lifecycle::parse_host(h)?);
     }
+    let using_default_dir =
+        cli.state_dir.is_none() && lifecycle::env_is_unset_or_empty("DOORBELL_STATE_DIR");
     let cfg =
         lifecycle::Config::resolve_full(cli.state_dir, cli.port, cli.flywheel_state_dir, hosts)?;
+    // bd-fpd5: migrate-once off the legacy platform dir into the XDG
+    // default. Explicit --state-dir / DOORBELL_STATE_DIR means
+    // user-managed: never touch, migrate manually instead.
+    if using_default_dir
+        && let Some(old) = lifecycle::legacy_platform_state_dir()
+    {
+        match lifecycle::maybe_migrate_to_default(&cfg.state_dir, &old) {
+            Ok(Some(copied)) => eprintln!(
+                "doorbell: migrated {} file(s) from {} (one-time XDG move)",
+                copied.len(),
+                old.display()
+            ),
+            Ok(None) => {}
+            Err(e) => anyhow::bail!("doorbell: state migration failed: {e:#}"),
+        }
+    }
     match cli.cmd {
         Cmd::Start => lifecycle::start(&cfg),
         Cmd::Stop { force } => lifecycle::stop(&cfg, force),
