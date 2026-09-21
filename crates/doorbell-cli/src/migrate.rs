@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Inventory filename predicates: (dir, matches).
-fn inventory_match(dir: &str, name: &str) -> bool {
+pub(crate) fn inventory_match(dir: &str, name: &str) -> bool {
     match dir {
         "doorbell" => {
             (name.ends_with(".pid")
