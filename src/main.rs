@@ -42,6 +42,7 @@ mod doorbell;
 mod doorbell_host;
 mod doorbell_tick;
 mod durable;
+mod durable_policy;
 mod durable_resume;
 mod durable_transition;
 mod effect_journal;
@@ -85,6 +86,7 @@ mod verdict;
 mod work;
 mod workflow_catalog;
 mod workspace;
+mod workspace_policy;
 mod workspace_reporting;
 mod write_liveness;
 
@@ -8655,7 +8657,7 @@ fn cmd_doorbell_why(
                     // durable caches the live dispatcher reloads at start (receipts sqlite
                     // → assignment; presence.jsonl snapshot → presence). Journal Msgs fold
                     // on top. Never the live dispatcher's RAM, never a second store.
-                    let mut m = workspace::WorkspaceModel::default();
+                    let mut m = workspace::WorkspaceModel::from_environment();
                     rebuild_assignment_from_receipts(&mut m);
                     seed_why_presence(&mut m, presence_rows.clone());
                     m
@@ -8886,7 +8888,7 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
         let msg_val = entry.get("msg").cloned().unwrap_or(serde_json::Value::Null);
         if let Some(msg) = snapshot::replay_msg(&msg_val) {
             let model = models.entry(ws.clone()).or_insert_with(|| {
-                let mut m = workspace::WorkspaceModel::default();
+                let mut m = workspace::WorkspaceModel::from_environment();
                 rebuild_assignment_from_receipts(&mut m);
                 m
             });
@@ -12667,7 +12669,7 @@ fn cmd_reclassify(
     // bd-blank-project-spelling-non-mail-doors-76hi
     let project = project_door(project, "toron", "reclassify")?;
     // Seed workspace with sticky topology from prior DecisionReady (if any).
-    let mut ws_model = workspace::WorkspaceModel::default();
+    let mut ws_model = workspace::WorkspaceModel::from_environment();
     if let Some(topo) = state::load_session_topology(project) {
         ws_model.session_topology = Some(topo);
     }
@@ -18932,6 +18934,8 @@ fn cmd_loop(
             invocation: String::new(),
             unknown_diagnose_threshold: cfg.unknown_diagnose_threshold(),
             respawn_budget: cfg.respawn_budget(),
+            reclaim: crate::durable_policy::ReclaimPolicy::from_environment(),
+            pane_stall_secs: durable::pane_stall_threshold_from_environment(),
             unknown_detect_grace_polls: cfg.unknown_detect_grace_polls(),
             drain_grace_polls: cfg.drain_grace_polls(),
             claim_nudge_after_polls: cfg.claim_nudge_after_polls(),
@@ -33096,13 +33100,13 @@ mod plan_review_tests {
     fn newest_in_thread_matches_exact_thread_and_newest() {
         let mk =
             |id: &str, sender: &str, thread: Option<&str>, ts: i64, body: &str| backend::MailItem {
-                id: backend::MessageId::from(id),
+                id: id.parse().expect("valid message id"),
                 sender: sender.to_string(),
                 subject: format!("Re: [debate] prop {id}"),
                 body_md: body.to_string(),
                 importance: "high".to_string(),
                 ack_required: true,
-                thread_id: thread.map(backend::MessageId::from),
+                thread_id: thread.map(|value| value.parse().expect("valid thread id")),
                 bead: None,
                 created_ts_us: ts,
                 duplicate_of: None,
@@ -33136,13 +33140,13 @@ mod plan_review_tests {
     #[test]
     fn newest_in_thread_matches_name_or_npub() {
         let mk = |id: &str, sender: &str, ts: i64| backend::MailItem {
-            id: backend::MessageId::from(id),
+            id: id.parse().expect("valid message id"),
             sender: sender.to_string(),
             subject: "Re: [debate] prop".to_string(),
             body_md: "arg".to_string(),
             importance: "high".to_string(),
             ack_required: true,
-            thread_id: Some(backend::MessageId::from("debate-20260806T130548")),
+            thread_id: Some("debate-20260806T130548".parse().expect("valid thread id")),
             bead: None,
             created_ts_us: ts,
             duplicate_of: None,
@@ -35288,8 +35292,8 @@ mod single_writer_tests {
             "Option A / B8: doorbell must seed roles from the RoleBound snapshot"
         );
         assert!(
-            host.contains("WorkspaceModel::default()"),
-            "doorbell remains the one live WorkspaceModel::default()"
+            host.contains("WorkspaceModel::from_environment()"),
+            "doorbell remains the one live WorkspaceModel with host-resolved policy"
         );
     }
 

@@ -13,7 +13,7 @@ Use this skill for any change that crosses `workspace`, `durable`, `doorbell-cor
 Msg -> pure tick(Model, Msg) -> Cmd -> interpreter -> result Msg
 ```
 
-Reducers must not perform I/O, read time or environment, use randomness or locks, mutate external state, or silently drop a command. Time is an input message. Runtime authority is injected into interpreters.
+Reducers must not perform I/O, read time or environment, use randomness or locks, mutate external state, or silently drop a command. Time is an input message, and host wake policy is model data resolved before the live model is built and reused by replay folds. Runtime authority is injected into interpreters.
 
 ## Required checks
 

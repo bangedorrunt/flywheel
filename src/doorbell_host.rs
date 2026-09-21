@@ -96,7 +96,7 @@ impl RtHost {
         workspace: &str,
         brain_tx: mpsc::Sender<BrainMsg>,
     ) -> anyhow::Result<Self> {
-        let mut model = workspace::WorkspaceModel::default();
+        let mut model = workspace::WorkspaceModel::from_environment();
         if let Some(pin) = state::load_captain_alias(project) {
             model.roles.insert("captain".into(), pin);
         }

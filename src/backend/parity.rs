@@ -474,7 +474,7 @@ mod tests {
                 subject: "Re: parity subject".into(),
                 body_md: "parity reply body".into(),
                 ack_required: false,
-                thread_id: crate::backend::MessageId::from(id.to_string()),
+                thread_id: id.parse().expect("valid message id"),
             }))
             .unwrap_or_else(|e| panic!("{} reply: {e}", kind.name()));
         }
@@ -596,13 +596,13 @@ mod tests {
         run_mail(b.acknowledge(&crate::backend::ReceiptOp {
             project: project.to_string(),
             agent: agent.to_string(),
-            message_id: crate::backend::MessageId::from(id.clone()),
+            message_id: id.parse().expect("valid message id"),
         }))
         .expect("ack(hex) succeeds");
         run_mail(b.mark_read(&crate::backend::ReceiptOp {
             project: project.to_string(),
             agent: agent.to_string(),
-            message_id: crate::backend::MessageId::from(id),
+            message_id: id.parse().expect("valid message id"),
         }))
         .expect("mark_read(hex) succeeds");
     }
