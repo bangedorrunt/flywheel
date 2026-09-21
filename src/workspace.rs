@@ -2197,15 +2197,25 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             cmds.extend(c);
         }
         Msg::Receipt { corr, receipt } => {
-            next.assignment.insert(corr.clone(), receipt.clone());
-            // bd-bpj1 (F1): the wait-list removal is owned here, not by the
-            // effect-layer drain — the full receipt transition (insert +
-            // unpark + upsert) reproduces from this one Msg on replay.
-            next.pending_wait.remove(corr);
-            cmds.push(Cmd::SqliteUpsert {
-                corr: corr.clone(),
-                receipt: receipt.clone(),
-            });
+            // ADR-0016: receipt correlation is a validated boundary value.
+            // Preserve the wire string unchanged on success; reject malformed
+            // input before it can create an unaddressable assignment or unpark
+            // the wrong waiter.
+            if let Err(error) = crate::kernel::Corr::parse(corr.clone()) {
+                cmds.push(Cmd::LoudMiss {
+                    why: format!("receipt corr invalid: {error}"),
+                });
+            } else {
+                next.assignment.insert(corr.clone(), receipt.clone());
+                // bd-bpj1 (F1): the wait-list removal is owned here, not by the
+                // effect-layer drain — the full receipt transition (insert +
+                // unpark + upsert) reproduces from this one Msg on replay.
+                next.pending_wait.remove(corr);
+                cmds.push(Cmd::SqliteUpsert {
+                    corr: corr.clone(),
+                    receipt: receipt.clone(),
+                });
+            }
         }
         Msg::RoleBound { role, pin } => {
             // E4 open-corr inheritance is LATE BINDING: assignment receipts
@@ -2216,8 +2226,16 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         }
         Msg::Presence { pin, state } => {
             // Trusted internal edge (dispatcher jsonl timeout path):
-            // no author check — the dispatcher is the trust root here.
-            next.presence.insert(pin.clone(), Presence::from_str(state));
+            // no author check — the dispatcher is the trust root here. The
+            // identity itself is still validated before it can become a map
+            // key or prompt target.
+            if let Err(error) = crate::kernel::AgentPin::parse(pin.clone()) {
+                cmds.push(Cmd::LoudMiss {
+                    why: format!("presence pin invalid: {error}"),
+                });
+            } else {
+                next.presence.insert(pin.clone(), Presence::from_str(state));
+            }
         }
         Msg::HumanDecision { corr, verdict } => {
             apply_human_decision(&mut next, &mut cmds, corr, verdict);
@@ -3871,6 +3889,34 @@ mod assignment_tick_tests {
     }
 
     #[test]
+    fn assignment_tick_rejects_malformed_receipt_corr_without_writing() {
+        let m = empty_model();
+        let receipt = Receipt {
+            state: "owed".into(),
+            wake: "tasked".into(),
+            due_at: None,
+            result_path: None,
+        };
+        let (next, cmds) = tick(
+            &m,
+            &Msg::Receipt {
+                corr: "bad\ncorrelation".into(),
+                receipt,
+            },
+        );
+        assert!(next.assignment.is_empty());
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::LoudMiss { why } if why.contains("receipt corr invalid")
+        )));
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::SqliteUpsert { .. }))
+        );
+    }
+
+    #[test]
     fn assignment_tick_wait_corr_wired() {
         let m = empty_model();
         let row = inbox_row("C4", "tasked", "work", "agents", None, None);
@@ -4192,6 +4238,23 @@ mod presence_model_tests {
             src.contains("Msg::Presence"),
             "presence update via Msg::Presence"
         );
+    }
+
+    #[test]
+    fn presence_model_rejects_malformed_pin_without_map_write() {
+        let m = empty_model();
+        let (next, cmds) = tick(
+            &m,
+            &Msg::Presence {
+                pin: "bad\npin".into(),
+                state: "idle".into(),
+            },
+        );
+        assert!(next.presence.is_empty());
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::LoudMiss { why } if why.contains("presence pin invalid")
+        )));
     }
 
     #[test]

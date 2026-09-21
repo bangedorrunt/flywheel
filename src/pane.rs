@@ -405,11 +405,11 @@ fn spawn_crew_into(
                 ) {
                     Ok(a) => a,
                     Err(e) => {
-                        let cf = crate::failure::classify_with_stage(
+                        let cf = crate::failure::classify_with_action_stage(
                             &e.to_string(),
                             None,
                             None,
-                            Some("input"),
+                            Some(crate::kernel::ActionStage::Input),
                         );
                         if cf.kind == crate::failure::FailureKind::RateLimit {
                             if let Ok(registry) = ModelRegistry::load_routing() {
@@ -1223,8 +1223,12 @@ pub fn launch_spawn_job(
         ) {
             Ok(a) => a,
             Err(e) => {
-                let cf =
-                    crate::failure::classify_with_stage(&e.to_string(), None, None, Some("input"));
+                let cf = crate::failure::classify_with_action_stage(
+                    &e.to_string(),
+                    None,
+                    None,
+                    Some(crate::kernel::ActionStage::Input),
+                );
                 if cf.kind == crate::failure::FailureKind::RateLimit {
                     if let Ok(registry) = ModelRegistry::load_routing() {
                         if let Ok(catalog) = crate::profile::ProfileCatalog::load() {

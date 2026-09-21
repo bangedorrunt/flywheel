@@ -40,7 +40,7 @@ wire / CLI / timer / process observation
 
 **10. Bound all work.** Network, subprocess, retry, queue, digest, and recursion paths have explicit limits. A fallback is a typed transition, not an unbounded loop.
 
-**11. Parse at the edge.** External strings and JSON become validated kernel values at the boundary. Internal code should not repeatedly re-interpret raw identifiers or invent defaults for malformed values.
+**11. Parse at the edge.** External strings and JSON become validated kernel values at the boundary. Internal code should not repeatedly re-interpret raw identifiers or invent defaults for malformed values. Use `kernel::ActionStage` at typed call sites; retain string conversion only at stable wire/reporting fields.
 
 **12. Close authority is singular.** Beads close beads. Toron owns mailbox and reservation truth. The host owns run/effect journaling. A worker, Jev result, or report cannot self-admit completion.
 
