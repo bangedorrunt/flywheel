@@ -1658,6 +1658,7 @@ mod tests {
             addressed_to_self: false,
             toron_kind_request_release: false,
             toron_kind_mail_delivered: false,
+            toron_kind_ack_sla: false,
             importance_high_or_urgent: false,
             reservation_conflicts_self: false,
             is_presence: false,
@@ -2409,11 +2410,13 @@ mod tests {
     #[test]
     fn sc_d1_kind9_npub_p_tag_rings_pin() {
         // bd-l72k: plain kind-9 no longer delivers, so npub resolution is
-        // proven through an urgent (mail-delivered) line — the resolution
-        // mechanism (SelfIndex npub lookup) is identical.
+        // proven through an urgent (ack-sla-expired) line — the resolution
+        // mechanism (SelfIndex npub lookup) is identical. (bd-v8vi:
+        // mail-delivered now rings routine, so it can no longer serve as
+        // the urgent vehicle here.)
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let line = format!(
-            r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["toron-kind","mail-delivered"],["h","steer-x"]],"content":"sealed"}}"#
+            r#"{{"kind":9,"id":"ab","tags":[["p","{npub}"],["toron-kind","ack-sla-expired"],["h","steer-x"]],"content":"sealed"}}"#
         );
         let mut index = SelfIndex::default();
         index.insert_pin("BlueRidge".into(), Some(npub.into()));
@@ -3023,8 +3026,8 @@ mod tests {
         );
         assert_eq!(
             class,
-            EventClass::PlanePUrgent,
-            "mail-delivered should reuse PlanePUrgent mail pull"
+            EventClass::PlanePMail,
+            "mail-delivered is routine inbox-pull, urgency comes from the fold"
         );
         assert!(
             hint.contains("toron mail inbox"),
@@ -3044,6 +3047,7 @@ mod tests {
                 EventClass::Channel
                     | EventClass::Job
                     | EventClass::PlanePUrgent
+                    | EventClass::PlanePMail
                     | EventClass::RequestRelease
                     | EventClass::ReservationConflict
             ),
