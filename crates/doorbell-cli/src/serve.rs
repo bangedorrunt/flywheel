@@ -659,6 +659,12 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
 }
 
+/// Pure boot-gate predicate (bd-fuql): hosting needs BOTH CLIs resolvable.
+/// Tested without spawning anything; `spawn_host_loop` enforces it.
+fn bins_allow_hosting(toron_resolved: bool, herdr_resolved: bool) -> bool {
+    toron_resolved && herdr_resolved
+}
+
 /// Spawn one hosted loop (bd-2o1v: shared by boot-time `--host` config and
 /// dynamic auto-host) and record it on the shared tables.
 fn spawn_host_loop(
@@ -673,6 +679,35 @@ fn spawn_host_loop(
     // before pushing anything, so an early return leaves no orphan tx.
     let key = format!("{project}/{workspace}");
     if hosted.lock().iter().any(|h| h.key == key) {
+        return;
+    }
+    // bd-fuql: fail-closed boot gate — hosting with an unresolvable toron
+    // or herdr CLI is a deaf plane (/health would merely decorate it with
+    // cli_unresolved while no wake can land). Refuse here: both boot config
+    // and reconcile auto-host funnel through this fn. The operator pins
+    // real bins via DOORBELL_TORON_BIN / DOORBELL_HERDR_BIN.
+    let early_bins = resolved_bins();
+    if !bins_allow_hosting(early_bins.toron_resolved, early_bins.herdr_resolved) {
+        let mut missing = Vec::new();
+        if !early_bins.toron_resolved {
+            missing.push("toron");
+        }
+        if !early_bins.herdr_resolved {
+            missing.push("herdr");
+        }
+        eprintln!(
+            "doorbell serve: REFUSING to host {key} — unresolvable CLI bins ({}) — set {} to absolute binary paths",
+            missing.join(", "),
+            missing
+                .iter()
+                .map(|b| if *b == "toron" {
+                    doorbell_rt::binpath::TORON_BIN_ENV
+                } else {
+                    doorbell_rt::binpath::HERDR_BIN_ENV
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         return;
     }
     // bd-ba8t: say out loud whether this workspace's wakes have anywhere to
@@ -1371,7 +1406,19 @@ fn stats_body(app: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::known_journal_workspaces;
-    use super::{REAP_AFTER_SECS, inbox_path_down, reap_candidates, unhosted_subscribed};
+    use super::{
+        REAP_AFTER_SECS, bins_allow_hosting, inbox_path_down, reap_candidates, unhosted_subscribed,
+    };
+
+    /// bd-fuql: hosting with either CLI unresolvable is refused — a deaf
+    /// plane must never read as hosted.
+    #[test]
+    fn boot_gate_refuses_unresolved_bins() {
+        assert!(bins_allow_hosting(true, true));
+        assert!(!bins_allow_hosting(false, true), "toron missing refuses");
+        assert!(!bins_allow_hosting(true, false), "herdr missing refuses");
+        assert!(!bins_allow_hosting(false, false));
+    }
 
     /// bd-gpj0.4: one workspace with a fresh path-error is a local miss.
     /// The 2026-09-13 outage was every hosted fetch failing.

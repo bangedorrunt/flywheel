@@ -990,6 +990,9 @@ pub mod wake_table {
 
     /// The persisted table: live rows plus the two seen-sets that must
     /// survive crash-resume (flood guard continuity + AckSLA continuity).
+    /// Dispatcher working sets (pending/rering/presented/digest) stay in
+    /// the tick Model until the absorption lands — the table takes them
+    /// when their folds move (bd-fuql remainder, mapped on the bead).
     #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct WakeTable {
         /// Bead ids the flood guard already counted (pause absorbs them).
@@ -1037,10 +1040,13 @@ pub mod wake_table {
         }
     }
 
-    /// The flood guard's verdict (Spec-5 `GateDecision` for the dispatch
-    /// plane: proceed with this poll's dispatch, or pause it).
+    /// The flood guard's verdict (bd-0cet plane: dispatch Proceed vs Pause).
+    /// Named `FloodGate` (not `GateDecision`) on purpose: the Spec-5
+    /// `GateDecision` vocabulary (Inject/Digest/Queue/Drop, below) governs
+    /// wake ROUTING; this one governs bead-DISPATCH pausing. Two planes,
+    /// two names, no conflation.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum GateDecision {
+    pub enum FloodGate {
         /// At or below threshold (or nothing unseen) — dispatch proceeds.
         Proceed,
         /// Over threshold — pause dispatch this poll; the listed ids are
@@ -1052,10 +1058,7 @@ pub mod wake_table {
     /// Pure flood gate (bd-0cet): unseen candidates join the table's memory
     /// and the verdict follows the shared threshold. Deterministic in the
     /// candidate list — same ids, same verdict, every replay.
-    pub fn flood_decide(
-        mut table: WakeTable,
-        candidate_ids: &[String],
-    ) -> (WakeTable, GateDecision) {
+    pub fn flood_decide(mut table: WakeTable, candidate_ids: &[String]) -> (WakeTable, FloodGate) {
         let mut unseen = Vec::new();
         for id in candidate_ids {
             if table.flood_seen.insert(id.clone()) {
@@ -1063,27 +1066,93 @@ pub mod wake_table {
             }
         }
         if unseen.len() > FLOOD_NEW_THRESHOLD {
-            (table, GateDecision::Pause { unseen })
+            (table, FloodGate::Pause { unseen })
         } else {
-            (table, GateDecision::Proceed)
+            (table, FloodGate::Proceed)
         }
     }
 
     /// The one `why` projection (Spec 5): the verdict plus its evidence in
     /// a single line — the loop's CRITICAL log and any operator `why` read
     /// the same string.
-    pub fn why_flood(decision: &GateDecision, total: usize, unseen: usize) -> String {
+    pub fn why_flood(decision: &FloodGate, total: usize, unseen: usize) -> String {
         match decision {
-            GateDecision::Proceed => {
+            FloodGate::Proceed => {
                 format!(
                     "flood gate proceed: {unseen}/{total} unseen (threshold {FLOOD_NEW_THRESHOLD})"
                 )
             }
-            GateDecision::Pause { .. } => {
+            FloodGate::Pause { .. } => {
                 format!(
                     "flood gate PAUSE: {unseen}/{total} unseen over threshold {FLOOD_NEW_THRESHOLD} — runaway bead creation suspected (bd-eign.2); pausing dispatch this poll"
                 )
             }
+        }
+    }
+
+    /// Spec-5 routing verdict (bd-fuql): exactly one of these per wake.
+    /// Distinct from [`FloodGate`] (dispatch pausing) — this governs where
+    /// one wake GOES.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum GateDecision {
+        /// Prompt the pin now with this line.
+        Inject { pin: String, line: String },
+        /// Hold for the pin's digest batch with the reason recorded.
+        Digest { pin: String, reason: String },
+        /// Hold for a later poll (budget spent, transition pending).
+        Queue { wake: String },
+        /// Never deliver (superseded, expired, duplicate).
+        Drop { reason: String },
+    }
+
+    /// What `route_wake` decides on (all inputs are already-resolved facts:
+    /// presence word, route existence, budget state — never lookups).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RouteInput {
+        pub pin: String,
+        pub line: String,
+        pub urgent: bool,
+        pub presence: super::PresenceVerdict,
+        pub has_route: bool,
+        pub budget_allows: bool,
+    }
+
+    /// ONE pure routing decide (bd-fuql): composes the existing gates in
+    /// Spec order — route existence (bd-bk9t), budget (Queue on spent),
+    /// then presence × urgency (`inject_gate`, bd-zawk). Deterministic in
+    /// its inputs; the caller owns persistence and delivery.
+    pub fn route_wake(input: &RouteInput) -> GateDecision {
+        if !input.has_route {
+            return GateDecision::Digest {
+                pin: input.pin.clone(),
+                reason: "no route: unroutable pin digests (bd-bk9t)".to_string(),
+            };
+        }
+        if !input.budget_allows {
+            return GateDecision::Queue {
+                wake: input.line.clone(),
+            };
+        }
+        match super::inject_gate(input.presence, input.urgent) {
+            super::InjectGate::Inject => GateDecision::Inject {
+                pin: input.pin.clone(),
+                line: input.line.clone(),
+            },
+            super::InjectGate::Digest(reason) => GateDecision::Digest {
+                pin: input.pin.clone(),
+                reason: reason.to_string(),
+            },
+        }
+    }
+
+    /// The routing `why`: one line per decision, same string for logs and
+    /// operator reads.
+    pub fn why_route(decision: &GateDecision) -> String {
+        match decision {
+            GateDecision::Inject { pin, line } => format!("inject {pin}: {line}"),
+            GateDecision::Digest { pin, reason } => format!("digest {pin}: {reason}"),
+            GateDecision::Queue { wake } => format!("queue (budget spent): {wake}"),
+            GateDecision::Drop { reason } => format!("drop: {reason}"),
         }
     }
 }
@@ -1448,7 +1517,7 @@ mod tests {
 
 #[cfg(test)]
 mod wake_table_tests_bd_0cet {
-    use super::wake_table::{GateDecision, WakeTable, flood_decide, why_flood};
+    use super::wake_table::{FloodGate, WakeTable, flood_decide, why_flood};
 
     #[test]
     fn red_table_starts_empty_and_roundtrips() {
@@ -1463,11 +1532,11 @@ mod wake_table_tests_bd_0cet {
     fn red_seven_new_ids_pause_then_proceed() {
         let ids: Vec<String> = (0..7).map(|i| format!("bd-n{i}")).collect();
         let (t, d) = flood_decide(WakeTable::default(), &ids);
-        assert!(matches!(d, GateDecision::Pause { .. }), "7 new trips");
+        assert!(matches!(d, FloodGate::Pause { .. }), "7 new trips");
         assert_eq!(t.flood_seen_len(), 7);
         let (t2, d2) = flood_decide(t, &ids);
         assert!(
-            matches!(d2, GateDecision::Proceed),
+            matches!(d2, FloodGate::Proceed),
             "known batch dispatches next poll"
         );
         assert_eq!(t2.flood_seen_len(), 7);
@@ -1477,10 +1546,10 @@ mod wake_table_tests_bd_0cet {
     fn red_runaway_fresh_ids_keep_pausing() {
         let fresh: Vec<String> = (0..7).map(|i| format!("bd-r{i}")).collect();
         let (_, d) = flood_decide(WakeTable::default(), &fresh);
-        assert!(matches!(d, GateDecision::Pause { .. }));
+        assert!(matches!(d, FloodGate::Pause { .. }));
         let one = ["bd-only".to_string()];
         let (_, d2) = flood_decide(WakeTable::default(), &one);
-        assert!(matches!(d2, GateDecision::Proceed), "1 new proceeds");
+        assert!(matches!(d2, FloodGate::Proceed), "1 new proceeds");
     }
 
     #[test]
@@ -1493,12 +1562,63 @@ mod wake_table_tests_bd_0cet {
         t.digest("bd-y");
         assert!(t.is_empty(), "digested rows leave the table");
         let w = why_flood(
-            &GateDecision::Pause {
+            &FloodGate::Pause {
                 unseen: vec!["a".to_string()],
             },
             7,
             1,
         );
         assert!(w.contains('7') && w.contains('1'), "why names counts: {w}");
+    }
+}
+
+#[cfg(test)]
+mod route_tests_bd_fuql {
+    use super::PresenceVerdict;
+    use super::wake_table::{GateDecision, RouteInput, route_wake, why_route};
+
+    fn input(urgent: bool, presence: PresenceVerdict, route: bool, budget: bool) -> RouteInput {
+        RouteInput {
+            pin: "TestPin".to_string(),
+            line: "wake line".to_string(),
+            urgent,
+            presence,
+            has_route: route,
+            budget_allows: budget,
+        }
+    }
+
+    #[test]
+    fn red_no_route_digests() {
+        let d = route_wake(&input(true, PresenceVerdict::Idle, false, true));
+        assert!(
+            matches!(d, GateDecision::Digest { .. }),
+            "unroutable wake digests, never prompts: {d:?}"
+        );
+    }
+
+    #[test]
+    fn red_budget_spent_queues() {
+        let d = route_wake(&input(true, PresenceVerdict::Idle, true, false));
+        assert!(
+            matches!(d, GateDecision::Queue { .. }),
+            "spent budget holds the wake: {d:?}"
+        );
+    }
+
+    #[test]
+    fn red_idle_injects_and_dead_digests() {
+        let d = route_wake(&input(false, PresenceVerdict::Idle, true, true));
+        assert!(matches!(d, GateDecision::Inject { .. }));
+        let d2 = route_wake(&input(true, PresenceVerdict::Dead, true, true));
+        assert!(matches!(d2, GateDecision::Digest { .. }));
+    }
+
+    #[test]
+    fn red_why_names_decision() {
+        let w = why_route(&GateDecision::Drop {
+            reason: "superseded".to_string(),
+        });
+        assert!(w.contains("drop") && w.contains("superseded"), "{w}");
     }
 }
