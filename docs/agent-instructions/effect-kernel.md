@@ -90,6 +90,10 @@ bash scripts/verify-clippy.sh
 
 A green compile is not enough. The ADR phase is complete only when its behavior witness, replay/parity evidence, and required gate are green.
 
+## Current audit status
+
+As of 2026-09-22, the reducer/Tick Law and serialized-policy boundaries pass fresh audit and the full workspace gates are green. The broader ADR remains **conditionally compliant** until legacy Jev authority helpers are fully threaded from the entrypoint and durable effect leaves receive injected wall/monotonic clocks instead of sampling them directly. Those reads are outside reducers and do not invalidate replay witnesses, but they are still migration work under the strict authority contract.
+
 ## Related sources
 
 - [ADR-0016](../decisions/0016-functional-effect-kernel-redesign.md)

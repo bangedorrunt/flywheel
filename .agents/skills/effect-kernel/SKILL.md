@@ -38,3 +38,7 @@ bash scripts/verify-clippy.sh
 ```
 
 Do not mark a phase complete from compilation alone. Record the behavior witness and parity evidence in the ADR implementation record.
+
+## Audit status (2026-09-22)
+
+The reducer/Tick Law and serialized-policy boundaries are green under a fresh full workspace run. Treat ADR-0016 as **conditionally compliant** until the remaining legacy Jev helpers stop resolving `RuntimeAuthority` internally and durable effect leaves receive injected wall/monotonic clocks rather than sampling them directly. Those are effect-edge migrations, not reducer violations, but they remain required for strict end-to-end authority injection.
