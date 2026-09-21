@@ -134,7 +134,7 @@ pub fn fold_model_for(
     entries: &[(String, serde_json::Value)],
     ws_label: &str,
 ) -> crate::workspace::WorkspaceModel {
-    let mut model = crate::workspace::WorkspaceModel::default();
+    let mut model = crate::workspace::WorkspaceModel::from_environment();
     for (ws, entry) in entries {
         if ws != ws_label {
             continue;

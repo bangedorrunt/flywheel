@@ -39,7 +39,7 @@ Prepared -> Claimed -> Running -> Delivered
 
 ## Authority injection
 
-Host authority is resolved once at the process boundary. Effects receive paths, identity, configuration, clocks, process handles, and transports explicitly. Reducers receive time only through message payloads. This makes breaker, timeout, retry, and replay tests deterministic without sleeping or mutating process-global environment variables.
+Host authority is resolved once at the process boundary. Effects receive paths, identity, configuration, clocks, process handles, and transports explicitly. Reducers receive time only through message payloads and wake policy through `WorkspacePolicy` model data. This makes breaker, timeout, retry, policy, and replay tests deterministic without sleeping or mutating process-global environment variables.
 
 ## Jev is not the controller
 
@@ -49,7 +49,7 @@ See [Judgment packs](./judgment-packs) for pack validation and confidence rules.
 
 ## Typed boundary use
 
-The kernel is an active boundary, not a marker module. Correlation IDs and agent pins are validated before workspace mutation, workflow names are validated before catalog lookup, project paths are validated before process adapters, and known failure phases use `kernel::ActionStage` rather than unchecked stage literals. Stable wire output may remain string-shaped, but conversion belongs at the edge.
+The kernel is an active boundary, not a marker module. Correlation IDs and agent pins are validated before workspace mutation, workflow names are validated before catalog lookup, project paths are validated before process adapters, and known failure phases use `kernel::ActionStage` rather than unchecked stage literals. `WorkspacePolicy` is loaded for both live models and replay folds, so configured thresholds cannot create a live/replay split. Stable wire output may remain string-shaped, but conversion belongs at the edge.
 
 ## Replay discipline
 

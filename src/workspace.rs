@@ -246,6 +246,8 @@ pub fn render_divergence(rows: &[Divergence]) -> String {
 /// `seq` is a per-process diagnostic counter, not shared truth.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceModel {
+    /// Host-resolved policy carried as model data so tick remains pure.
+    pub policy: crate::workspace_policy::WorkspacePolicy,
     pub doorbell: crate::doorbell_tick::DoorbellModel,
     pub swarm: crate::durable::LoopModel,
     pub assignment: BTreeMap<String, Receipt>,
@@ -291,6 +293,17 @@ pub struct WorkspaceModel {
     pub last_vehicle: Option<String>,
 }
 
+impl WorkspaceModel {
+    /// Construct the live model at the host boundary. After this point policy
+    /// is ordinary model data and reducers never read process environment.
+    pub fn from_environment() -> Self {
+        Self {
+            policy: crate::workspace_policy::WorkspacePolicy::from_environment(),
+            ..Self::default()
+        }
+    }
+}
+
 /// ADR-0010 D2 (bd-8jlv): one presented wake — the line as prompted,
 /// bound to the tick generation that presented it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,22 +330,18 @@ pub const DIGEST_INTERVAL_DEFAULT_SECS: u64 = 300;
 /// FLYWHEEL_DIGEST_THRESHOLD.
 pub const DIGEST_THRESHOLD_DEFAULT: usize = 10;
 
-/// Digest batching interval secs (env override, default 300).
-pub fn digest_interval_secs() -> u64 {
-    std::env::var("FLYWHEEL_DIGEST_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DIGEST_INTERVAL_DEFAULT_SECS)
+/// Deterministic default digest interval. Host overrides live in
+/// `WorkspacePolicy::from_environment`, never in reducer helpers.
+#[allow(dead_code)]
+pub const fn digest_interval_secs() -> u64 {
+    DIGEST_INTERVAL_DEFAULT_SECS
 }
 
-/// Digest queue depth that forces a batch (env override, default 10).
-pub fn digest_threshold() -> usize {
-    std::env::var("FLYWHEEL_DIGEST_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DIGEST_THRESHOLD_DEFAULT)
+/// Deterministic default digest threshold. Host overrides live in
+/// `WorkspacePolicy::from_environment`, never in reducer helpers.
+#[allow(dead_code)]
+pub const fn digest_threshold() -> usize {
+    DIGEST_THRESHOLD_DEFAULT
 }
 
 /// Wake severity, lowest to highest. Tick class is the max over its cmds;
@@ -462,7 +471,21 @@ pub fn render_digest(entries: &[DigestEntry], now: u64) -> String {
 /// Wedge alarm: a non-empty queue older than two batch intervals means
 /// the digest path cannot deliver — fail loud, never silently batch.
 pub fn digest_overdue(queue_len: usize, last_digest_unix: u64, now: u64) -> bool {
-    queue_len > 0 && now.saturating_sub(last_digest_unix) > 2 * digest_interval_secs()
+    digest_overdue_with_policy(
+        queue_len,
+        last_digest_unix,
+        now,
+        &crate::workspace_policy::WorkspacePolicy::default(),
+    )
+}
+
+pub fn digest_overdue_with_policy(
+    queue_len: usize,
+    last_digest_unix: u64,
+    now: u64,
+    policy: &crate::workspace_policy::WorkspacePolicy,
+) -> bool {
+    queue_len > 0 && now.saturating_sub(last_digest_unix) > 2 * policy.digest_interval_secs
 }
 
 /// bd-2fxx: deadline-attached holds. The pending_wait value IS the
@@ -534,22 +557,18 @@ pub const DOORBELL_GRACE_DEFAULT_SECS: u64 = 90;
 /// FLYWHEEL_DOORBELL_RING_MAX.
 pub const DOORBELL_RING_MAX_DEFAULT: u32 = 3;
 
-/// Grace window secs for the re-ring ladder (env override, default 90).
-pub fn doorbell_grace_secs() -> u64 {
-    std::env::var("FLYWHEEL_DOORBELL_GRACE_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DOORBELL_GRACE_DEFAULT_SECS)
+/// Deterministic default grace window. Host overrides live in
+/// `WorkspacePolicy::from_environment`, never in reducer helpers.
+#[allow(dead_code)]
+pub const fn doorbell_grace_secs() -> u64 {
+    DOORBELL_GRACE_DEFAULT_SECS
 }
 
-/// Max rings before escalation (env override, default 3).
-pub fn doorbell_ring_max() -> u32 {
-    std::env::var("FLYWHEEL_DOORBELL_RING_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DOORBELL_RING_MAX_DEFAULT)
+/// Deterministic default ring cap. Host overrides live in
+/// `WorkspacePolicy::from_environment`, never in reducer helpers.
+#[allow(dead_code)]
+pub const fn doorbell_ring_max() -> u32 {
+    DOORBELL_RING_MAX_DEFAULT
 }
 
 /// D1 shrunk prompt: the payload rides the toron message, herdr gets
@@ -618,7 +637,22 @@ pub enum ReringDecision {
 /// Pure ladder step. `verdict` is the pin's current presence verdict
 /// ("Dead" / "Unknown" / other) — read by the tick arm, never
 /// constructed here, so the Presence enum stays Lane-2 owned.
+#[allow(dead_code)]
 pub fn rering_due(entry: &ReringEntry, now: u64, verdict: &str) -> ReringDecision {
+    rering_due_with_policy(
+        entry,
+        now,
+        verdict,
+        &crate::workspace_policy::WorkspacePolicy::default(),
+    )
+}
+
+pub fn rering_due_with_policy(
+    entry: &ReringEntry,
+    now: u64,
+    verdict: &str,
+    policy: &crate::workspace_policy::WorkspacePolicy,
+) -> ReringDecision {
     if entry.acked || entry.fire_and_forget {
         return ReringDecision::Skip;
     }
@@ -628,8 +662,8 @@ pub fn rering_due(entry: &ReringEntry, now: u64, verdict: &str) -> ReringDecisio
         }
         return ReringDecision::Skip;
     }
-    let grace = doorbell_grace_secs();
-    let max = doorbell_ring_max();
+    let grace = policy.doorbell_grace_secs;
+    let max = policy.doorbell_ring_max;
     if entry.attempts >= max {
         return match verdict {
             "Dead" => ReringDecision::RecoverDead,
@@ -1991,7 +2025,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     Some(Presence::Unknown) => "Unknown",
                     _ => "other",
                 };
-                match rering_due(&entry, *now, verdict) {
+                match rering_due_with_policy(&entry, *now, verdict, &next.policy) {
                     ReringDecision::Ring { attempt } => {
                         cmds.push(Cmd::Prompt {
                             pin: entry.pin.clone(),
@@ -2492,8 +2526,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
         _ => None,
     } && !next.digest_queue.is_empty()
-        && (next.digest_queue.len() >= digest_threshold()
-            || now.saturating_sub(next.last_digest_unix) >= digest_interval_secs())
+        && (next.digest_queue.len() >= next.policy.digest_threshold
+            || now.saturating_sub(next.last_digest_unix) >= next.policy.digest_interval_secs)
     {
         let entries = std::mem::take(&mut next.digest_queue);
         next.last_digest_unix = now;

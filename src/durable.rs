@@ -163,6 +163,21 @@ pub struct LoopParams {
     /// bd-p4oc strict vacuous gate: refuse 0-test VERIFY (also FLYWHEEL_VERIFY_STRICT=1)
     #[serde(default)]
     pub strict: bool,
+    /// ADR-0025 reclaim thresholds resolved at loop start (bd-0rzv:
+    /// serialized for replay determinism). `#[serde(default)]` keeps
+    /// pre-field saved params loadable at the crate defaults.
+    #[serde(default)]
+    pub reclaim: crate::durable_policy::ReclaimPolicy,
+    /// ADR-0016: pane-stall detection threshold, resolved once at loop
+    /// start and serialized like `reclaim` — the tick never reads env.
+    /// `#[serde(default)]` keeps pre-field saved params at the crate
+    /// default (1800s, bd-cy0s).
+    #[serde(default = "default_pane_stall_secs")]
+    pub pane_stall_secs: u64,
+}
+
+fn default_pane_stall_secs() -> u64 {
+    1800
 }
 
 fn default_unknown_diagnose_threshold() -> u32 {
@@ -3922,13 +3937,16 @@ pub fn leases_to_renew_simple(
     leases_to_renew(&with_none, in_progress, live_names, 0, 0)
 }
 
-/// bd-cy0s: pane stall threshold — env FLYWHEEL_PANE_STALL_SECS, default 1800s.
-/// Reuses herdr status facts the tick already polls.
-pub fn pane_stall_threshold_secs() -> u64 {
+/// bd-cy0s: pane stall threshold. The threshold is a LoopParams field
+/// (resolved once at loop start, serialized for replay); this resolver is
+/// used only by the CLI construction site in main.rs. Default 1800s.
+pub const PANE_STALL_DEFAULT_SECS: u64 = 1800;
+pub fn pane_stall_threshold_from_environment() -> u64 {
     std::env::var("FLYWHEEL_PANE_STALL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1800)
+        .filter(|v| *v > 0)
+        .unwrap_or(PANE_STALL_DEFAULT_SECS)
 }
 
 /// Pane-stall evidence + classification (extends bd-cy0s).
@@ -5283,21 +5301,19 @@ fn blind_completion_count(complete_now: bool, leaf_failed: bool, consecutive: u3
 /// working agent to `br update --claim` it.
 pub const DEFAULT_CLAIM_NUDGE_AFTER_POLLS: u32 = 2;
 
-/// ADR-0025 reclaim: stale thresholds (swarm vs human), env overridable.
+/// ADR-0025 reclaim: stale thresholds (swarm vs human). Defaults live in
+/// `crate::durable_policy::ReclaimPolicy`; the env adapter is called once
+/// at loop start, never inside the pure reclaim predicates.
 pub const FLYWHEEL_RECLAIM_SWARM_SECS: u64 = 7200;
 pub const FLYWHEEL_RECLAIM_HUMAN_SECS: u64 = 86400;
 
+#[allow(dead_code)]
 pub fn reclaim_swarm_secs() -> u64 {
-    std::env::var("FLYWHEEL_RECLAIM_SWARM_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(FLYWHEEL_RECLAIM_SWARM_SECS)
+    crate::durable_policy::ReclaimPolicy::from_environment().swarm_secs
 }
+#[allow(dead_code)]
 pub fn reclaim_human_secs() -> u64 {
-    std::env::var("FLYWHEEL_RECLAIM_HUMAN_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(FLYWHEEL_RECLAIM_HUMAN_SECS)
+    crate::durable_policy::ReclaimPolicy::from_environment().human_secs
 }
 pub fn is_swarm_assignee(assignee: &str) -> bool {
     if assignee.contains('-') {
@@ -5320,6 +5336,29 @@ pub fn stale_reclaim_due(
     last_comment_body: Option<&str>,
     dirty_files: &[String],
 ) -> bool {
+    stale_reclaim_due_with_policy(
+        bead,
+        now_secs,
+        panes,
+        reservations,
+        last_comment_ts,
+        last_comment_body,
+        dirty_files,
+        &crate::durable_policy::ReclaimPolicy::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // leaf predicate over the full reclaim observation surface (bead, now, panes, reservations, comments, dirty files, policy)
+pub fn stale_reclaim_due_with_policy(
+    bead: &ReadyBead,
+    now_secs: i64,
+    panes: &[AgentState],
+    reservations: &[(String, String, String)],
+    last_comment_ts: Option<i64>,
+    last_comment_body: Option<&str>,
+    dirty_files: &[String],
+    policy: &crate::durable_policy::ReclaimPolicy,
+) -> bool {
     let assignee = match &bead.assignee {
         Some(a) => a,
         None => return false,
@@ -5330,9 +5369,9 @@ pub fn stale_reclaim_due(
     };
     let age = now_secs.saturating_sub(updated);
     let threshold = if is_swarm_assignee(assignee) {
-        reclaim_swarm_secs() as i64
+        policy.swarm_secs as i64
     } else {
-        reclaim_human_secs() as i64
+        policy.human_secs as i64
     };
     if age <= threshold {
         return false;
@@ -5360,11 +5399,30 @@ pub fn stale_reclaim_due(
     }
     true
 }
+// ADR-0016: the live loop calls plan_reclaim_with_policy with the injected
+// ReclaimPolicy; this default-threshold wrapper is test-only.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn plan_reclaim(
     now_secs: i64,
     beads: &[ReadyBead],
     panes: &[AgentState],
     reservations: &[(String, String)],
+) -> Vec<LoopAction> {
+    plan_reclaim_with_policy(
+        now_secs,
+        beads,
+        panes,
+        reservations,
+        &crate::durable_policy::ReclaimPolicy::default(),
+    )
+}
+
+pub fn plan_reclaim_with_policy(
+    now_secs: i64,
+    beads: &[ReadyBead],
+    panes: &[AgentState],
+    reservations: &[(String, String)],
+    policy: &crate::durable_policy::ReclaimPolicy,
 ) -> Vec<LoopAction> {
     let ext_res: Vec<(String, String, String)> = reservations
         .iter()
@@ -5372,7 +5430,7 @@ pub fn plan_reclaim(
         .collect();
     let mut out = Vec::new();
     for b in beads {
-        if stale_reclaim_due(b, now_secs, panes, &ext_res, None, None, &[]) {
+        if stale_reclaim_due_with_policy(b, now_secs, panes, &ext_res, None, None, &[], policy) {
             let pin = b.assignee.clone().unwrap_or_default();
             let herdr_name = panes
                 .iter()
@@ -7128,7 +7186,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // bd-cy0s: tick stall detection — bead in_progress + pane listed + idle past threshold
         {
             let now_secs = chrono::Utc::now().timestamp();
-            let threshold = pane_stall_threshold_secs();
+            let threshold = params.pane_stall_secs;
             let inprog_for_stall: Vec<ReadyBead> = if params.work {
                 // reuse already-fetched inprog_for_renew if available, else fetch
                 ctx.run(
@@ -12497,6 +12555,8 @@ mod tests {
             resonate_url: String::new(),
             force: false,
             strict: false,
+            reclaim: crate::durable_policy::ReclaimPolicy::new(10, 20),
+            pane_stall_secs: 1800,
         };
         let v = serde_json::to_value(&p).unwrap();
         let back: LoopParams = serde_json::from_value(v).unwrap();
@@ -12531,6 +12591,9 @@ mod tests {
         });
         let back: LoopParams = serde_json::from_value(v).unwrap();
         assert_eq!(back.active_interval_secs, 30);
+        // ADR-0016: pre-field saved params load at the crate default — the
+        // tick reads params.pane_stall_secs, never process state.
+        assert_eq!(back.pane_stall_secs, PANE_STALL_DEFAULT_SECS);
     }
 
     #[test]
@@ -15392,24 +15455,34 @@ mod reclaim_tests {
         assert!(snippet.contains("reclaim: previous in_progress claim appears abandoned"));
     }
     #[test]
-    fn reclaim_env_override() {
-        // bd-0rzv follow-up: the crate-wide env lock, not a module-local
-        // one — these vars are read by reclaim threshold fns in OTHER
-        // tests running concurrently (observed: reclaim_human_86400
-        // reclaiming at HUMAN_SECS=20).
-        let _guard = crate::config::lock_env();
-        unsafe {
-            std::env::set_var("FLYWHEEL_RECLAIM_SWARM_SECS", "10");
-            std::env::set_var("FLYWHEEL_RECLAIM_HUMAN_SECS", "20");
-        }
-        assert_eq!(reclaim_swarm_secs(), 10);
-        assert_eq!(reclaim_human_secs(), 20);
-        unsafe {
-            std::env::remove_var("FLYWHEEL_RECLAIM_SWARM_SECS");
-            std::env::remove_var("FLYWHEEL_RECLAIM_HUMAN_SECS");
-        }
-        assert_eq!(reclaim_swarm_secs(), 7200);
-        assert_eq!(reclaim_human_secs(), 86400);
+    fn reclaim_thresholds_come_from_the_injected_policy_not_process_state() {
+        // bd-0rzv follow-up, ADR-0016: thresholds are loop params. The old
+        // env-mutating test raced every concurrently-running reader of the
+        // same vars; substitution proves the same behavior with zero
+        // process-global mutation.
+        let bead = ReadyBead {
+            id: "bd-policy".into(),
+            title: "policy witness".into(),
+            assignee: Some("swarm-agent".into()),
+            updated_at: None,
+            ..ReadyBead::default()
+        };
+        let mut with_updated = bead.clone();
+        with_updated.updated_at = Some(
+            chrono::DateTime::from_timestamp(1_000, 0)
+                .expect("epoch")
+                .to_rfc3339(),
+        );
+        let tight = crate::durable_policy::ReclaimPolicy::new(10, 20);
+        assert!(
+            stale_reclaim_due_with_policy(&with_updated, 2_000, &[], &[], None, None, &[], &tight,),
+            "a 1000s-old swarm claim past a 10s threshold is reclaimable"
+        );
+        let loose = crate::durable_policy::ReclaimPolicy::new(7_200, 86_400);
+        assert!(
+            !stale_reclaim_due_with_policy(&with_updated, 2_000, &[], &[], None, None, &[], &loose,),
+            "the same claim under default thresholds is not reclaimable"
+        );
     }
 }
 

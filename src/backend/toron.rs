@@ -93,18 +93,24 @@ struct DeliveryPayloadEnvelope {
 fn send_receipt_from(v: Value) -> Result<SendReceipt, MailError> {
     let env: SendEnvelope = serde_json::from_value(v)
         .map_err(|e| MailError::other(format!("send receipt shape mismatch: {e}")))?;
-    let deliveries: Vec<DeliveryLine> = env
-        .deliveries
-        .into_iter()
-        .map(|d| DeliveryLine {
-            recipient: d.payload.recipient,
-            event_id: MessageId::from(d.payload.event_id),
-        })
-        .collect();
+    let deliveries: Vec<DeliveryLine> =
+        env.deliveries
+            .into_iter()
+            .map(|d| {
+                let event_id =
+                    d.payload.event_id.parse::<MessageId>().map_err(|e| {
+                        MailError::other(format!("send receipt event_id invalid: {e}"))
+                    })?;
+                Ok(DeliveryLine {
+                    recipient: d.payload.recipient,
+                    event_id,
+                })
+            })
+            .collect::<Result<Vec<_>, MailError>>()?;
     let id = deliveries
         .first()
         .map(|d| d.event_id.clone())
-        .unwrap_or_else(|| MessageId::from(String::new()));
+        .ok_or_else(|| MailError::other("send receipt contains no deliveries"))?;
     Ok(SendReceipt {
         id,
         deliveries,

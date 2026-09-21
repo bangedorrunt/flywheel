@@ -24,6 +24,8 @@ wire / CLI / timer / process observation
 
 **2. Time enters as data.** An interpreter samples wall or monotonic time and sends it in a message. A reducer never calls `SystemTime::now` or `Instant::now`.
 
+**2a. Policy enters as data.** Host configuration is resolved once into `WorkspacePolicy` (workspace) and `LoopParams` fields `reclaim`/`pane_stall_secs` (durable loop) before the live model or workflow starts. Reducers read policy fields from the model/params; they never read environment variables through convenience helpers. The env resolver runs exactly once, at the construction site in `main.rs` — a reducer or tick helper reading `FLYWHEEL_*` directly is a review reject.
+
 **3. Effects are values first.** A reducer emits a command; it does not perform the command. Each command has exactly one named interpreter. Unknown commands fail loudly rather than being ignored.
 
 **4. Facts precede judgments.** Presence, delivery, run status, and provider results are observations. Jev may annotate or rank an already-filtered question, but cannot create a command, settle an effect, close a bead, or change sticky topology.
