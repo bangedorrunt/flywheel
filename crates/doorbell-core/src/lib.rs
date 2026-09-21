@@ -958,6 +958,134 @@ impl DoorbellAction {
     }
 }
 
+/// Spec-5 wake unity (ADR-0035, bd-0cet): ONE persisted wake table plus a
+/// pure gate decision plus one `why` projection. It absorbs the durable
+/// loop's per-invocation `flood_seen` set (per-poll amnesia on crash-resume
+/// — the same batch re-tripped every restart) and the AckSLA seen-sets:
+/// the table rides the ActiveLoop file, so a resume inherits it.
+///
+/// Scope note: the gate below decides the bead-dispatch flood guard
+/// (`Proceed` vs `Pause`). Pin-level Inject/Digest/Queue routing consumes
+/// table rows in the doorbell daemon (separate workspace); the daemon-side
+/// fold is the wave-5 follow-up, not this bead.
+pub mod wake_table {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// More than this many previously-unseen ready beads in ONE poll is the
+    /// runaway-create signature (bd-eign.2: 40 junk beads in ~4 min; legit
+    /// ADR-0022 waves are 5-6). Matches the retired `bead_flood_verdict`.
+    pub const FLOOD_NEW_THRESHOLD: usize = 6;
+
+    /// One wake's lifecycle (Spec 5: queued → presented → acked | digested
+    /// | expired). Terminal rows leave the table; the flood/sla seen-sets
+    /// below are the cross-resume memory.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum WakeStatus {
+        Queued,
+        Presented,
+        Acked,
+        Digested,
+        Expired,
+    }
+
+    /// The persisted table: live rows plus the two seen-sets that must
+    /// survive crash-resume (flood guard continuity + AckSLA continuity).
+    #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct WakeTable {
+        /// Bead ids the flood guard already counted (pause absorbs them).
+        pub flood_seen: BTreeSet<String>,
+        /// Corrs the AckSLA ladder already pinged (no re-ping on resume).
+        pub sla_seen: BTreeSet<String>,
+        /// Live wake rows by id (terminal transitions remove the row).
+        pub wakes: BTreeMap<String, WakeStatus>,
+    }
+
+    impl WakeTable {
+        /// True when nothing is tracked (serde skip guard for ActiveLoop).
+        pub fn is_empty(&self) -> bool {
+            self.flood_seen.is_empty() && self.sla_seen.is_empty() && self.wakes.is_empty()
+        }
+
+        /// Flood-guard memory depth (test observable).
+        pub fn flood_seen_len(&self) -> usize {
+            self.flood_seen.len()
+        }
+
+        /// Mark one wake presented (idempotent on unknown ids — never
+        /// invents a row for a stranger).
+        pub fn present(&mut self, id: &str) {
+            self.wakes.insert(id.to_string(), WakeStatus::Presented);
+        }
+
+        /// Terminal transitions remove the row (the seen-sets keep history).
+        pub fn ack(&mut self, id: &str) {
+            if self.wakes.get(id) == Some(&WakeStatus::Presented) {
+                self.wakes.remove(id);
+            }
+        }
+
+        /// Digest is terminal like ack (stays visible in digest history
+        /// elsewhere; the table only tracks live routing).
+        pub fn digest(&mut self, id: &str) {
+            self.wakes.remove(id);
+        }
+
+        /// Expiry is terminal (a re-ring re-queues explicitly, never via
+        /// the stale row).
+        pub fn expire(&mut self, id: &str) {
+            self.wakes.remove(id);
+        }
+    }
+
+    /// The flood guard's verdict (Spec-5 `GateDecision` for the dispatch
+    /// plane: proceed with this poll's dispatch, or pause it).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum GateDecision {
+        /// At or below threshold (or nothing unseen) — dispatch proceeds.
+        Proceed,
+        /// Over threshold — pause dispatch this poll; the listed ids are
+        /// now absorbed, so a legit batch dispatches next poll while a
+        /// runaway minting fresh ids keeps pausing.
+        Pause { unseen: Vec<String> },
+    }
+
+    /// Pure flood gate (bd-0cet): unseen candidates join the table's memory
+    /// and the verdict follows the shared threshold. Deterministic in the
+    /// candidate list — same ids, same verdict, every replay.
+    pub fn flood_decide(
+        mut table: WakeTable,
+        candidate_ids: &[String],
+    ) -> (WakeTable, GateDecision) {
+        let mut unseen = Vec::new();
+        for id in candidate_ids {
+            if table.flood_seen.insert(id.clone()) {
+                unseen.push(id.clone());
+            }
+        }
+        if unseen.len() > FLOOD_NEW_THRESHOLD {
+            (table, GateDecision::Pause { unseen })
+        } else {
+            (table, GateDecision::Proceed)
+        }
+    }
+
+    /// The one `why` projection (Spec 5): the verdict plus its evidence in
+    /// a single line — the loop's CRITICAL log and any operator `why` read
+    /// the same string.
+    pub fn why_flood(decision: &GateDecision, total: usize, unseen: usize) -> String {
+        match decision {
+            GateDecision::Proceed => {
+                format!("flood gate proceed: {unseen}/{total} unseen (threshold {FLOOD_NEW_THRESHOLD})")
+            }
+            GateDecision::Pause { .. } => {
+                format!(
+                    "flood gate PAUSE: {unseen}/{total} unseen over threshold {FLOOD_NEW_THRESHOLD} — runaway bead creation suspected (bd-eign.2); pausing dispatch this poll"
+                )
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,5 +1441,62 @@ mod tests {
         assert_eq!(super::take_allowed(one("q"), &mut m, 1001).len(), 1);
         // Window slides: 30 min later the pin passes again.
         assert_eq!(super::take_allowed(one("p"), &mut m, 1000 + 1800).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod wake_table_tests_bd_0cet {
+    use super::wake_table::{GateDecision, WakeTable, flood_decide, why_flood};
+
+    #[test]
+    fn red_table_starts_empty_and_roundtrips() {
+        let t = WakeTable::default();
+        assert!(t.is_empty());
+        let v = serde_json::to_value(&t).expect("serializes");
+        let back: WakeTable = serde_json::from_value(v).expect("parses");
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn red_seven_new_ids_pause_then_proceed() {
+        let ids: Vec<String> = (0..7).map(|i| format!("bd-n{i}")).collect();
+        let (t, d) = flood_decide(WakeTable::default(), &ids);
+        assert!(matches!(d, GateDecision::Pause { .. }), "7 new trips");
+        assert_eq!(t.flood_seen_len(), 7);
+        let (t2, d2) = flood_decide(t, &ids);
+        assert!(
+            matches!(d2, GateDecision::Proceed),
+            "known batch dispatches next poll"
+        );
+        assert_eq!(t2.flood_seen_len(), 7);
+    }
+
+    #[test]
+    fn red_runaway_fresh_ids_keep_pausing() {
+        let fresh: Vec<String> = (0..7).map(|i| format!("bd-r{i}")).collect();
+        let (_, d) = flood_decide(WakeTable::default(), &fresh);
+        assert!(matches!(d, GateDecision::Pause { .. }));
+        let one = ["bd-only".to_string()];
+        let (_, d2) = flood_decide(WakeTable::default(), &one);
+        assert!(matches!(d2, GateDecision::Proceed), "1 new proceeds");
+    }
+
+    #[test]
+    fn red_rows_transition_and_why_names_counts() {
+        let mut t = WakeTable::default();
+        t.present("bd-x");
+        t.ack("bd-x");
+        assert!(t.is_empty(), "acked rows leave the table");
+        t.present("bd-y");
+        t.digest("bd-y");
+        assert!(t.is_empty(), "digested rows leave the table");
+        let w = why_flood(
+            &GateDecision::Pause {
+                unseen: vec!["a".to_string()],
+            },
+            7,
+            1,
+        );
+        assert!(w.contains('7') && w.contains('1'), "why names counts: {w}");
     }
 }

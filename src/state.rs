@@ -190,6 +190,12 @@ pub struct ActiveLoop {
     /// Double-dispatch guard persists across polls (bd-5fbv).
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub dispatch_pending: std::collections::HashSet<String>,
+    /// Spec-5 wake table persists across polls AND crash-resume via the
+    /// ActiveLoop file (bd-0cet; replaces the per-invocation seen-set that
+    /// forgot paused batches on every restart and re-tripped).
+    /// Daemon-side pin routing reads the same rows (wave-5 follow-up).
+    #[serde(default, skip_serializing_if = "doorbell_core::wake_table::WakeTable::is_empty")]
+    pub wake: doorbell_core::wake_table::WakeTable,
     /// Heal state per agent persists across polls in model' (bd-gs8b #14, crash-safe via ActiveLoop file, was loop-local).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub heal_states: std::collections::BTreeMap<String, HealState>,
@@ -225,6 +231,7 @@ impl ActiveLoop {
             heal_states: BTreeMap::new(),
             done_mailed: std::collections::HashSet::new(),
             drain_pending: BTreeMap::new(),
+            wake: doorbell_core::wake_table::WakeTable::default(),
         }
     }
 }
@@ -1847,6 +1854,7 @@ mod loops_schema_v2_tests {
             heal_states: Default::default(),
             done_mailed: Default::default(),
             drain_pending: Default::default(),
+            wake: Default::default(),
         };
         let mut map = BTreeMap::new();
         map.insert("/tmp/p".into(), al.clone());
