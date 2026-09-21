@@ -995,13 +995,24 @@ impl FileHost {
                     let urgent = doorbell_core::is_urgent_line(&line);
                     match doorbell_core::inject_gate(verdict, urgent) {
                         doorbell_core::InjectGate::Inject => vec![Effect::Prompt { pin, line }],
-                        doorbell_core::InjectGate::Digest(_) => vec![Effect::Audit {
-                            kind: "prompt_filtered".into(),
-                            pin,
-                            detail: serde_json::json!(format!(
-                                "non-injectable presence held wake for digest: {line}"
-                            )),
-                        }],
+                        // bd-v8vi: a held-for-digest wake must actually
+                        // digest — the Audit alone left BrightDog urgents
+                        // visible nowhere (no Digest, no last_wake). Both
+                        // rows journal; absorb_digests delivers the Digest.
+                        doorbell_core::InjectGate::Digest(reason) => vec![
+                            Effect::Audit {
+                                kind: "prompt_filtered".into(),
+                                pin: pin.clone(),
+                                detail: serde_json::json!(format!(
+                                    "non-injectable presence held wake for digest: {line}"
+                                )),
+                            },
+                            Effect::Digest {
+                                pin,
+                                line,
+                                why: reason.to_string(),
+                            },
+                        ],
                     }
                 }
                 other => vec![other],
@@ -1896,6 +1907,37 @@ mod tests {
                 .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "prompt_filtered")),
             "busy presence holds routine wake: {fx:?}"
         );
+    }
+
+    #[test]
+    fn unknown_presence_urgent_actually_digests() {
+        // bd-v8vi (BrightDog): idle-in-herdr but presence-Unknown — the
+        // filter held the urgent "for digest" and digested nothing
+        // (audit only). The Digest intent must be emitted, not just audited.
+        let (mut host, _dir) = host_with_registry("t-unk", entries());
+        host.refresh_index();
+        host.tick(&BrainMsg::HerdrStatus {
+            pin: "PinA".into(),
+            status: "idle".into(),
+        });
+        // No Presence tick: verdict stays Unknown.
+        let rows = vec![serde_json::json!({"importance": "urgent", "body": "x"})];
+        let fx = host.tick(&BrainMsg::InboxFetched {
+            pin: "PinA".into(),
+            rows,
+        });
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "prompt_filtered")),
+            "held wake stays audited: {fx:?}"
+        );
+        assert!(
+            fx.iter().any(
+                |e| matches!(e, Effect::Digest { pin, why, .. } if pin == "PinA" && !why.is_empty())
+            ),
+            "held wake must actually digest: {fx:?}"
+        );
+        let _ = std::fs::remove_dir_all(_dir);
     }
 
     #[test]

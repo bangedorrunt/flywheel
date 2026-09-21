@@ -16,6 +16,10 @@ pub enum EventClass {
     RequestRelease,
     ReservationConflict,
     PlanePUrgent,
+    /// Sealed-mail delivery notice (bd-v8vi): urgency unknowable on the
+    /// watch path, so it rings a routine inbox-pull. True urgency comes
+    /// from the inbox fold (`parse_inbox_item` reads importance).
+    PlanePMail,
 }
 
 /// A watch/inbox edge the dispatcher might ring on.
@@ -26,6 +30,9 @@ pub struct RingInput {
     pub addressed_to_self: bool,
     pub toron_kind_request_release: bool,
     pub toron_kind_mail_delivered: bool,
+    /// Kind-9 `ack-sla-expired`: the ack never came — urgent by nature,
+    /// unlike a routine delivery (bd-v8vi split).
+    pub toron_kind_ack_sla: bool,
     pub importance_high_or_urgent: bool,
     pub reservation_conflicts_self: bool,
     /// Room chatter: kind 9 with no self address.
@@ -48,9 +55,14 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
         return Some(EventClass::Job);
     }
     // GS-006 bug 1: kind 9 mail-delivered (NIP-17 gift-wrap wake) must pull mail, not channel.
-    // Tagged `toron-kind=mail-delivered` on kind 9; reuse PlanePUrgent (inbox pull) path.
-    if ev.addressed_to_self && ev.kind == 9 && ev.toron_kind_mail_delivered {
+    // bd-v8vi: delivery is routine (urgency unknowable sealed); only the
+    // ack-sla-expiry ring stays urgent. Phantom urgents otherwise.
+    if ev.addressed_to_self && ev.kind == 9 && ev.toron_kind_ack_sla {
         return Some(EventClass::PlanePUrgent);
+    }
+    // Tagged `toron-kind=mail-delivered` on kind 9; routine inbox pull.
+    if ev.addressed_to_self && ev.kind == 9 && ev.toron_kind_mail_delivered {
+        return Some(EventClass::PlanePMail);
     }
     if ev.addressed_to_self && ev.kind == 9 {
         return Some(EventClass::Channel);
@@ -393,22 +405,26 @@ pub fn parse_watch_ndjson(line: &str, index: &SelfIndex) -> Option<(EventClass, 
     // mail-delivered AND ack-sla-expired are mailbox wakes (kind 9 metadata
     // rings for sealed NIP-17 mail) — both must pull the inbox, never
     // `channel read` on a thread id.
-    let toron_kind_mail_delivered = tags.iter().any(|t| {
-        t.as_array()
-            .map(|a| {
-                a.first().and_then(|x| x.as_str()) == Some("toron-kind")
-                    && matches!(
-                        a.get(1).and_then(|x| x.as_str()),
-                        Some("mail-delivered" | "ack-sla-expired")
-                    )
-            })
-            .unwrap_or(false)
-    });
+    let toron_kind_is = |want: &str| {
+        tags.iter().any(|t| {
+            t.as_array()
+                .map(|a| {
+                    a.first().and_then(|x| x.as_str()) == Some("toron-kind")
+                        && a.get(1).and_then(|x| x.as_str()) == Some(want)
+                })
+                .unwrap_or(false)
+        })
+    };
+    // bd-v8vi: delivery notice vs expiry are different urgencies — a
+    // sealed delivery is routine until the inbox fold says otherwise.
+    let toron_kind_mail_delivered = toron_kind_is("mail-delivered");
+    let toron_kind_ack_sla = toron_kind_is("ack-sla-expired");
     let class = classify(&RingInput {
         kind,
         addressed_to_self,
         toron_kind_request_release,
         toron_kind_mail_delivered,
+        toron_kind_ack_sla,
         importance_high_or_urgent: false,
         reservation_conflicts_self: kind == 30031 && addressed_to_self,
         is_presence: kind == 20001,
@@ -433,7 +449,9 @@ fn pull_hint(class: EventClass, channel: Option<&str>) -> String {
             None => "toron channel read".into(),
         },
         EventClass::Job => "toron job list".into(),
-        EventClass::RequestRelease | EventClass::PlanePUrgent => "toron mail inbox --since".into(),
+        EventClass::RequestRelease | EventClass::PlanePUrgent | EventClass::PlanePMail => {
+            "toron mail inbox --since".into()
+        },
         EventClass::ReservationConflict => "toron reserve list".into(),
     }
 }
@@ -552,6 +570,7 @@ pub fn doorbell_line(class: EventClass, hint: &str) -> String {
         EventClass::RequestRelease => "request-release",
         EventClass::ReservationConflict => "kind 30031",
         EventClass::PlanePUrgent => "plane-P urgent",
+        EventClass::PlanePMail => "plane-P mail",
     };
     format!("[doorbell] {kind}. Pull: {hint}")
 }
@@ -567,6 +586,7 @@ pub fn doorbell_line_with_event(class: EventClass, hint: &str, event_id: &str) -
             EventClass::RequestRelease => "request-release",
             EventClass::ReservationConflict => "kind 30031",
             EventClass::PlanePUrgent => "plane-P urgent",
+            EventClass::PlanePMail => "plane-P mail",
         };
         format!("[doorbell] {kind} event={event_id}. Pull: {hint}")
     }
@@ -1165,6 +1185,37 @@ mod tests {
             actions[0]
         );
         assert_eq!(next.queues.get("BlueRidge").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn mail_delivered_is_routine_mail_not_urgent() {
+        // bd-v8vi: a sealed envelope's urgency is unknowable on the watch
+        // path — every delivery labeled urgent manufactured phantom
+        // urgents (5 QuietHeron digests, zero urgent mail). Delivery rings
+        // a routine inbox-pull; urgency comes from the inbox fold.
+        let index = SelfIndex::from_pins(["BlueRidge"]);
+        let line = r#"{"kind":9,"id":"aa","tags":[["p","BlueRidge"],["toron-kind","mail-delivered"],["h","t-1"]],"content":"sealed"}"#;
+        let (class, hint) =
+            parse_watch_ndjson(line, &index).expect("mail-delivered must ring");
+        assert_eq!(class, EventClass::PlanePMail);
+        assert_ne!(class, EventClass::Channel);
+        assert!(hint.contains("toron mail inbox"), "hint must pull inbox: {hint}");
+        let rendered = doorbell_line(class, &hint);
+        assert!(
+            !is_urgent_line(&rendered),
+            "delivery ring must not read urgent: {rendered}"
+        );
+    }
+
+    #[test]
+    fn ack_sla_expired_stays_urgent() {
+        // Unacked-corr expiry IS urgent by nature (the ack never came) —
+        // only routine deliveries downgrade, never the SLA ring.
+        let index = SelfIndex::from_pins(["BlueRidge"]);
+        let line = r#"{"kind":9,"id":"ab","tags":[["p","BlueRidge"],["toron-kind","ack-sla-expired"]],"content":"sealed"}"#;
+        let (class, _) =
+            parse_watch_ndjson(line, &index).expect("ack-sla-expired must ring");
+        assert_eq!(class, EventClass::PlanePUrgent);
     }
 
     #[test]
