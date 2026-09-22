@@ -40,7 +40,7 @@ wire / CLI / timer / process observation
 
 **9. Determinism is observable.** Same model plus same message produces the same next model and command sequence. Output-affecting maps are ordered. New reducer paths require same-log/same-effects coverage.
 
-**10. Bound all work.** Network, subprocess, retry, queue, digest, and recursion paths have explicit limits. A fallback is a typed transition, not an unbounded loop.
+**10. Bound all work.** Network, subprocess, retry, queue, digest, and recursion paths have explicit limits. A fallback is a typed transition, not an unbounded loop. The order on a remote command is ADR-0016 §5: fallback outside, budget timeout around the retry, breaker inside the retry, attempt timeout on the call. Interruption is not `Unknown` and not a typed provider failure.
 
 **11. Parse at the edge.** External strings and JSON become validated kernel values at the boundary. Internal code should not repeatedly re-interpret raw identifiers or invent defaults for malformed values. Use `kernel::ActionStage` at typed call sites; retain string conversion only at stable wire/reporting fields.
 

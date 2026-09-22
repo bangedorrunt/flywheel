@@ -508,11 +508,11 @@ mod tests {
                 .cloned()
         });
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        let engine = crate::pane::local_engine(
-            &rt,
-            report_runner(),
+        let _enter = rt.enter();
+        let engine = toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
             crate::profile::ProfileCatalog::catalog_profile_resolver(),
             resolver.clone(),
+            Some(report_runner()),
         )
         .expect("local engine");
         let tmp = std::env::temp_dir();

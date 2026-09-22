@@ -1744,6 +1744,8 @@ pub struct PollEventsBatch {
 pub struct ReadArgs {
     pub project: String,
     pub name: String,
+    /// Wall-clock observation captured by the workflow host before the leaf.
+    pub now_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1932,6 +1934,8 @@ pub fn reply_settled_argv(args: &ReplySettledArgs) -> Vec<String> {
 pub struct NotifyArgs {
     pub project: String,
     pub name: String,
+    /// Wall-clock observation captured by the workflow host before the leaf.
+    pub now_us: i64,
     /// Seed for a FIRST escalation entry (None → the leaf stamps `now`).
     /// The leaf loads the persisted entry when one exists — replay never
     /// re-seeds, so the tier sequence is deterministic (cg6.1).
@@ -2023,6 +2027,8 @@ pub struct DispatchGuardArgs {
     /// ADR-0016: freshness TTL (µs) resolved at loop start — the leaf never
     /// reads env mid-tick.
     pub dispatch_ttl_us: i64,
+    /// Wall-clock observation captured by the workflow host before the leaf.
+    pub now_us: i64,
 }
 
 /// Args for the xproj-spawn leaf (cross-project swarm receive, full branch).
@@ -3107,13 +3113,13 @@ async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
     let v: serde_json::Value = serde_json::from_str(raw.trim())
         .map_err(|e| map_err(anyhow::anyhow!("__read bad JSON: {e}: {raw}")))?;
     let ro = parse_read_output(&v);
-    // freshness evaluated HERE at run time so the verdict is checkpointed
-    // with the leaf result — a replay cannot re-judge a stale file later
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Ok(context_verdict(&ro.terminal, ro.state.as_ref(), now_unix))
+    // The host captured this observation in the serializable leaf args, so
+    // the checkpointed result and replay use the same freshness instant.
+    Ok(context_verdict(
+        &ro.terminal,
+        ro.state.as_ref(),
+        args.now_unix,
+    ))
 }
 
 /// Replace an exhausted agent with a fresh instance in a new pane.
@@ -3168,6 +3174,10 @@ async fn respawn_agent(args: RespawnArgs) -> Result<()> {
 pub struct SendOutcome {
     pub ok: bool,
     pub name: String,
+    /// The provider or operator interrupted this attempt. This is distinct
+    /// from a failed or ambiguous delivery and never triggers respawn.
+    #[serde(default)]
+    pub cancelled: bool,
     #[serde(default)]
     pub landed: Option<bool>,
     #[serde(default)]
@@ -3232,6 +3242,7 @@ async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
 /// leaves (cg6.1): leaf-side effects are checkpointed by Resonate, so a
 /// completed leaf's result is replayed as-is — the body must never read
 /// wall-clock directly (that was the replay-determinism bug).
+#[cfg(test)]
 fn now_us_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3300,8 +3311,8 @@ fn escalate_and_persist(
     interval_secs: u64,
     params: serde_json::Value,
     gate_acked: bool,
+    now_us: i64,
 ) -> anyhow::Result<(u32, u32, bool)> {
-    let now_us = now_us_micros();
     let mut al = crate::state::load_active_loop(project)?.unwrap_or_else(|| {
         crate::state::ActiveLoop::new("swarm-loop", params, crate::state::now_iso())
     });
@@ -3485,6 +3496,7 @@ async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
         args.interval_secs,
         args.params,
         gate_acked,
+        args.now_us,
     )
     .map_err(map_err)?;
     if should_mail {
@@ -3693,11 +3705,7 @@ async fn dispatch_guard_scan(args: DispatchGuardArgs) -> Result<Value> {
         signals,
         receipts_fresh_us: facts.get("receipts_fresh_us").and_then(Value::as_i64),
     };
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    match eval_dispatch_guard(&facts, now_us, args.dispatch_ttl_us) {
+    match eval_dispatch_guard(&facts, args.now_us, args.dispatch_ttl_us) {
         Ok(()) => Ok(json!({ "bead": args.bead, "dispatch": true, "reason": null })),
         Err(reason) => Ok(json!({ "bead": args.bead, "dispatch": false, "reason": reason })),
     }
@@ -5143,6 +5151,9 @@ pub enum Escalation {
     /// clears the agent's failure history; a timeout leaves it untouched and
     /// is verified by the next poll.
     Accept,
+    /// Cancellation is distinct from provider failure: do not respawn or
+    /// increment the pane-health counter.
+    Cancelled,
     /// 4 consecutive non-landing sends on the same agent (3 respawns, then
     /// the 4th fails): hard stop the loop. A genuinely broken environment
     /// must not burn the swarm forever. (cg6.4: threshold is FOUR — the
@@ -5171,6 +5182,9 @@ pub fn failstop_message(name: &str, reason: Option<&str>) -> String {
 /// Deterministic: derives from the checkpointed
 /// leaf result and the (also deterministic) counter.
 pub fn escalate(outcome: &SendOutcome, failures: u64) -> Escalation {
+    if outcome.cancelled {
+        return Escalation::Cancelled;
+    }
     match outcome.landed {
         Some(true) | None => Escalation::Accept,
         Some(false) => match outcome.reason.as_deref() {
@@ -5209,6 +5223,7 @@ pub fn handle_send_result(
             *failures.entry(name.to_string()).or_insert(0) += 1;
             Escalation::RespawnAndRequeue
         }
+        Escalation::Cancelled => Escalation::Cancelled,
         fail_stop => fail_stop,
     }
 }
@@ -5992,6 +6007,7 @@ pub fn spawn_graph_vehicle(
 
 #[function]
 async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
+    let authority = crate::authority::RuntimeAuthority::resolve();
     // bd-bpd9: beads whose graph vehicle was already spawned this process.
     let mut graph_invoked: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ADR-0026 W2: loop-identity fail-loud — hard-error at start if no usable key
@@ -6755,6 +6771,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         project: params.project.clone(),
                         bead: bead.id.clone(),
                         dispatch_ttl_us: params.dispatch_guard_ttl_us,
+                        now_us: authority.now_unix() as i64 * 1_000_000,
                     };
                     match ctx.run(dispatch_guard_scan, g_args).await {
                         Ok(v) => {
@@ -6850,6 +6867,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             project: params.project.clone(),
                             bead: bead_id.clone(),
                             dispatch_ttl_us: params.dispatch_guard_ttl_us,
+                            now_us: authority.now_unix() as i64 * 1_000_000,
                         };
                         match ctx.run(dispatch_guard_scan, g_args).await {
                             Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
@@ -6889,6 +6907,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             project: params.project.clone(),
                             bead: bead_id.clone(),
                             dispatch_ttl_us: params.dispatch_guard_ttl_us,
+                            now_us: authority.now_unix() as i64 * 1_000_000,
                         };
                         match ctx.run(dispatch_guard_scan, g_args).await {
                             Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
@@ -7779,6 +7798,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             ReadArgs {
                                 project: params.project.clone(),
                                 name: name.clone(),
+                                now_unix: authority.now_unix(),
                             },
                         )
                         .await
@@ -7846,6 +7866,8 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             status: None,
                             reason: Some(format!("error:{e}")),
                             deduped: false,
+                            cancelled: crate::failure::classify(&format!("{e}"), None, None).kind
+                                == crate::failure::FailureKind::Cancelled,
                         },
                     };
                     clear_dispatch_pending(&mut dispatch_pending, name, outcome.landed);
@@ -7878,6 +7900,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 "{}",
                                 failstop_message(name, outcome.reason.as_deref())
                             )));
+                        }
+                        Escalation::Cancelled => {
+                            eprintln!(
+                                "flywheel: send to {name} cancelled; preserving cancellation without respawn"
+                            );
                         }
                         Escalation::RespawnAndRequeue => {
                             let attempts = send_failures.get(name).copied().unwrap_or(0);
@@ -7916,6 +7943,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 NotifyArgs {
                                     project: params.project.clone(),
                                     name: name.clone(),
+                                    now_us: authority.now_unix() as i64 * 1_000_000,
                                     first_blocked_ts: None,
                                     interval_secs: params.interval_secs,
                                     params: serde_json::to_value(&params)
@@ -8041,11 +8069,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 status: None,
                                 reason: Some(format!("error:{e}")),
                                 deduped: false,
+                                cancelled: crate::failure::classify(&format!("{e}"), None, None)
+                                    .kind
+                                    == crate::failure::FailureKind::Cancelled,
                             },
                         };
                         any_work = true;
                         match handle_send_result(&mut send_failures, name, &outcome) {
                             Escalation::Accept => {}
+                            Escalation::Cancelled => {
+                                eprintln!(
+                                    "flywheel: send to {name} cancelled; preserving cancellation without respawn"
+                                );
+                            }
                             Escalation::FailStop => {
                                 return Err(map_err(anyhow::anyhow!(
                                     "{}",
@@ -10389,11 +10425,27 @@ mod tests {
         SendOutcome {
             deduped: false,
             ok: true,
+            cancelled: false,
             name: "a".to_string(),
             landed,
             status: None,
             reason: reason.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn cancelled_send_is_not_a_health_failure() {
+        let mut outcome = so(Some(false), Some("cancelled"));
+        outcome.cancelled = true;
+        let mut failures = std::collections::HashMap::new();
+        assert_eq!(
+            handle_send_result(&mut failures, "a", &outcome),
+            Escalation::Cancelled
+        );
+        assert!(
+            failures.is_empty(),
+            "cancellation must not trigger respawn state"
+        );
     }
 
     #[test]
@@ -13548,10 +13600,7 @@ mod tests {
     /// release fails here instead of silently reinstating the doc's gap.
     #[test]
     fn close_path_releases_the_beads_reservations() {
-        let loop_path = include_str!("durable.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("non-test source");
+        let loop_path = include_str!("durable.rs");
         // Slice the CLOSED-bead arm: from its match arm to the next top-level
         // fn, so the assertion cannot be satisfied by the leaf definition or
         // the executor registration seen earlier in the file.
@@ -14589,7 +14638,8 @@ mod resume_dedup_tests {
         let _g = cg61_registry_guard();
         let project = cg61_test_project("fresh");
         let (tier, count, mails) =
-            escalate_and_persist(&project, "agent-a", None, 30, json!({}), false).unwrap();
+            escalate_and_persist(&project, "agent-a", None, 30, json!({}), false, 1_000_000)
+                .unwrap();
         assert_eq!(
             (tier, count, mails),
             (0, 1, true),
@@ -14621,8 +14671,16 @@ mod resume_dedup_tests {
             },
         );
         crate::state::save_active_loop(&project, &al).unwrap();
-        let (tier, count, mails) =
-            escalate_and_persist(&project, "agent-b", None, 30, json!({}), false).unwrap();
+        let (tier, count, mails) = escalate_and_persist(
+            &project,
+            "agent-b",
+            None,
+            30,
+            json!({}),
+            false,
+            now_us_micros(),
+        )
+        .unwrap();
         assert_eq!(
             (tier, count, mails),
             (3, 1, true),
@@ -14642,11 +14700,27 @@ mod resume_dedup_tests {
         let project = cg61_test_project("replay");
         // seed ~1s ago: both executions land inside the T0 window
         let seed = now_us_micros() - 1_000_000;
-        let (t1, c1, m1) =
-            escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({}), false).unwrap();
+        let (t1, c1, m1) = escalate_and_persist(
+            &project,
+            "agent-c",
+            Some(seed),
+            30,
+            json!({}),
+            false,
+            1_000_000,
+        )
+        .unwrap();
         // "crash" — re-execution of the same leaf invocation, later wall-clock
-        let (t2, c2, m2) =
-            escalate_and_persist(&project, "agent-c", Some(seed), 30, json!({}), false).unwrap();
+        let (t2, c2, m2) = escalate_and_persist(
+            &project,
+            "agent-c",
+            Some(seed),
+            30,
+            json!({}),
+            false,
+            1_000_000,
+        )
+        .unwrap();
         assert_eq!(t1, t2, "tier must not jump on replay");
         assert_eq!((c1, m1), (1, true));
         assert_eq!(
@@ -14674,7 +14748,8 @@ mod resume_dedup_tests {
         let _g = cg61_registry_guard();
         let project = cg61_test_project("ack-prefirst");
         let (tier, count, mails) =
-            escalate_and_persist(&project, "agent-d", None, 30, json!({}), true).unwrap();
+            escalate_and_persist(&project, "agent-d", None, 30, json!({}), true, 1_000_000)
+                .unwrap();
         assert_eq!(
             (tier, count, mails),
             (0, 1, true),
@@ -14692,7 +14767,8 @@ mod resume_dedup_tests {
         let project = cg61_test_project("ack-after");
         // Ping once (T0), then ack, then let the clock run past T3.
         let (t0, c0, m0) =
-            escalate_and_persist(&project, "agent-e", None, 30, json!({}), false).unwrap();
+            escalate_and_persist(&project, "agent-e", None, 30, json!({}), false, 1_000_000)
+                .unwrap();
         assert_eq!((t0, c0, m0), (0, 1, true));
         let (t1, c1, m1) = escalate_and_persist(
             &project,
@@ -14701,6 +14777,7 @@ mod resume_dedup_tests {
             30,
             json!({}),
             true,
+            1_000_000,
         )
         .unwrap();
         assert_eq!(

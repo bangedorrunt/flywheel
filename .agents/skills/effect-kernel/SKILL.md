@@ -15,6 +15,8 @@ Msg -> pure tick(Model, Msg) -> Cmd -> interpreter -> result Msg
 
 Reducers must not perform I/O, read time or environment, use randomness or locks, mutate external state, or silently drop a command. Time is an input message, and host wake policy is model data resolved before the live model is built and reused by replay folds. Runtime authority is injected into interpreters.
 
+A command is an effect value. Interpret it with the effect-oriented stack: fallback outside, budget timeout around the retry chain, breaker inside the retry, attempt timeout on the call alone. ADR-0016 §5 binds that stack to a journaled command. Interruption is not success, not a typed provider failure, and not `Unknown`.
+
 ## Required checks
 
 1. Identify the single model that owns the fact.

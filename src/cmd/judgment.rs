@@ -168,9 +168,14 @@ pub(crate) fn cmd_judgment(cmd: &JudgmentCmd) -> Result<()> {
                 }
             }
             let project = project.as_deref().unwrap_or(".");
-            let (advisory, conf, latency_ms) =
-                judgment::annotate(project, surface, goal, &extra)
-                    .map_err(|e| anyhow::anyhow!("annotate denied: {e}"))?;
+            let (advisory, conf, latency_ms) = judgment::annotate(
+                project,
+                surface,
+                goal,
+                &extra,
+                &crate::authority::RuntimeAuthority::resolve(),
+            )
+            .map_err(|e| anyhow::anyhow!("annotate denied: {e}"))?;
             if *json {
                 crate::output::print_json(&serde_json::json!({
                     "surface": format!("{surface:?}"),
@@ -185,9 +190,12 @@ pub(crate) fn cmd_judgment(cmd: &JudgmentCmd) -> Result<()> {
         }
         JudgmentCmd::Prescreen { cmd, project, json } => {
             let project = project.as_deref().unwrap_or(".");
-            let (advisory, destructive, conf, latency_ms) =
-                judgment::prescreen_verify(project, cmd)
-                    .map_err(|e| anyhow::anyhow!("prescreen denied: {e}"))?;
+            let (advisory, destructive, conf, latency_ms) = judgment::prescreen_verify(
+                project,
+                cmd,
+                &crate::authority::RuntimeAuthority::resolve(),
+            )
+            .map_err(|e| anyhow::anyhow!("prescreen denied: {e}"))?;
             if *json {
                 crate::output::print_json(&serde_json::json!({
                     "advisory": advisory,

@@ -3,7 +3,7 @@ title: Functional effect kernel
 description: How flywheel keeps reducers pure, effects honest, runtime authority explicit, and Jev advisory.
 ---
 
-ADR-0016 makes the Elm/Redux boundary the project’s semantic spine. The important rule is simple: observations enter as messages, reducers return commands, interpreters perform effects, and results come back as messages.
+ADR-0016 makes the Elm/Redux boundary the project’s semantic spine. The important rule is simple: observations enter as messages, reducers return commands, interpreters perform effects, and results come back as messages. A command is interpreted with the stack in ADR-0016 §5. Fallback wraps the chain. The attempt timeout wraps only the call. An open breaker sits inside the retry so it can fail fast. Interruption is not a successful delivery and not `Unknown`.
 
 ```mermaid
 flowchart LR
