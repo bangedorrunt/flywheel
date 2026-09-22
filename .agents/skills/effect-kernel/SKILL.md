@@ -1,6 +1,6 @@
 ---
 name: effect-kernel
-description: Enforce flywheel ADR-0016 while changing reducers, runtime effects, journaling, doorbell, durable loops, or Jev integration.
+description: Enforce the flywheel effect-kernel laws while changing reducers, runtime effects, journaling, doorbell, durable loops, or Jev integration. Pure tick, journal before the provider, remote-command stack.
 ---
 
 # Effect kernel
@@ -15,7 +15,7 @@ Msg -> pure tick(Model, Msg) -> Cmd -> interpreter -> result Msg
 
 Reducers must not perform I/O, read time or environment, use randomness or locks, mutate external state, or silently drop a command. Time is an input message, and host wake policy is model data resolved before the live model is built and reused by replay folds. Runtime authority is injected into interpreters.
 
-A command is an effect value. Interpret it with the effect-oriented stack: fallback outside, budget timeout around the retry chain, breaker inside the retry, attempt timeout on the call alone. ADR-0016 §5 binds that stack to a journaled command. Interruption is not success, not a typed provider failure, and not `Unknown`.
+A command is an effect value. Interpret it with the effect-oriented stack: fallback outside, breaker inside the retry, budget timeout around the chain, attempt timeout on the call alone. Journal that command before the provider runs. Interruption is not success, not a typed provider failure, and not `Unknown`.
 
 ## Required checks
 
@@ -29,7 +29,7 @@ A command is an effect value. Interpret it with the effect-oriented stack: fallb
 8. Keep Jev advisory. It cannot choose topology, settle an effect, close a bead, or verify a run.
 9. Add same-log/same-effects replay coverage and boundary tests for malformed, timeout, retry, and unknown results.
 
-Read `docs/agent-instructions/effect-kernel.md` before editing and `docs/decisions/0016-functional-effect-kernel-redesign.md` for rationale and phase status.
+Read `docs/agent-instructions/effect-kernel.md` before editing. Rationale and phase status are in `docs/decisions/0016-functional-effect-kernel-redesign.md`.
 
 ## Verification
 
@@ -39,8 +39,8 @@ mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
 ```
 
-Do not mark a phase complete from compilation alone. Record the behavior witness and parity evidence in the ADR implementation record.
+A phase is complete when its behavior witness and parity evidence are recorded, not when the code compiles. Write that witness in `docs/decisions/0016-functional-effect-kernel-redesign.md`.
 
 ## Audit status (2026-09-22)
 
-The reducer/Tick Law and serialized-policy boundaries are green under a fresh full workspace run. Treat ADR-0016 as **conditionally compliant** until the remaining legacy Jev helpers stop resolving `RuntimeAuthority` internally and durable effect leaves receive injected wall/monotonic clocks rather than sampling them directly. Those are effect-edge migrations, not reducer violations, but they remain required for strict end-to-end authority injection.
+The reducer/Tick Law and serialized-policy boundaries are green under a fresh full workspace run. Treat the kernel as **conditionally compliant** until the remaining legacy Jev helpers stop resolving `RuntimeAuthority` internally and durable effect leaves receive injected wall/monotonic clocks rather than sampling them directly. Those are effect-edge migrations, not reducer violations, but they remain required for strict end-to-end authority injection.

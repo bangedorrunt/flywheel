@@ -7,7 +7,7 @@ each lane verifiable.
 
 ## Playbook
 
-0. ARRIVE then BRIEF (ADR-0011). `flywheel arrive <project> --as <pin>`
+0. ARRIVE then BRIEF. `flywheel arrive <project> --as <pin>`
    (helm, JOINING banner if a live fleet, FCFS captain, doorbell
    `--live`; `arrival_triple` presence-publishes, role-binds, roster
    row). Then `flywheel briefing "<objective>" --project <p> --json`;
@@ -69,7 +69,7 @@ each lane verifiable.
 
 Once pinned, do not casually re-run decide -- **until** a material event (AUTHORITATIVE objective change, explicit topology switch, new work-unit class, classifier miss, stage-chain exhaustion). Then: `decide --json` + `workflow list --brief` + `stage list`, announce vehicle / `none: raw`. Sticky-open still applies if the session was open.
 
-## NO HARNESS-NATIVE DELEGATION (ADR-0010 D13)
+## NO HARNESS-NATIVE DELEGATION 
 
 No harness-native delegation tools (agent/subagent/task/spawn/
 dispatch/worktree/delegate-shaped -- e.g. Claude's Task): they bypass
