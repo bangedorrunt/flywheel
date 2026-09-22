@@ -50,9 +50,9 @@ pub trait Host: Send {
     /// &mut; pipe worker in .5 calls this off-loop, immediate here).
     fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value>;
     fn scan_ack_sla(&mut self) -> Vec<String>;
-    /// Restart the watch child with backoff (GS-007 never-deaf rule).
+    /// Restart the wake consumer with backoff (GS-007 never-deaf rule).
     /// The brain calls this on `Died`; results re-enter as watch Msgs.
-    fn restart_watch(&mut self);
+    fn restart_wake(&mut self);
     /// Binary-generation gate (.5: `WatcherGen`; default allows).
     fn inject_allowed(&self, _pin: &str) -> bool {
         true
@@ -177,7 +177,7 @@ impl Host for MockHost {
         std::mem::take(&mut self.sla)
     }
 
-    fn restart_watch(&mut self) {
+    fn restart_wake(&mut self) {
         self.restarts += 1;
     }
 

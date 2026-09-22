@@ -424,7 +424,7 @@ impl<H: Host> Brain<H> {
             serde_json::json!({"stage": "executed", "restarted": true}),
             &[],
         );
-        self.host.restart_watch();
+        self.host.restart_wake();
         let _ = self
             .hear
             .expire(self.host.now_unix(), doorbell_core::UNANSWERED_SECS);

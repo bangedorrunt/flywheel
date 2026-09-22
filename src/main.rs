@@ -94,7 +94,7 @@ mod write_liveness;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9363,59 +9363,38 @@ fn timeout_presence_rows(body: &str, now: u64) -> Vec<(String, String)> {
 /// Kinds MUST match the in-process filter (presence 20001 + profile 30013).
 const DOORBELL_WATCH_KINDS: &str = "9,14,20001,30013,43001,30031,39002";
 
-/// A `toron watch` child that is killed + reaped on drop. Wrapping is the
-/// point: dropping a bare `std::process::Child` does NOT terminate it, so
-/// every `Died`-driven restart leaked another long-lived watcher holding a
-/// live bus subscription (observed live as PPID-1 orphans).
-pub struct WatchChild(pub std::process::Child);
+/// Wake-bus socket consumer (bd-qe1r wave 2) — replaces the `toron watch`
+/// child: subscribes the daemon `wake.sock`, outcomes map onto `BrainMsg`
+/// at the call site (mapping byte-identical by the doorbell-rt golden test).
 
-impl Drop for WatchChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn spawn_watch_child<F>(
+fn spawn_wake_consumer<F>(
     project: &str,
     workspace: &str,
     state_dir: &std::path::Path,
     on_event: F,
-) -> Option<WatchChild>
+) -> tokio::task::AbortHandle
 where
-    F: Fn(Option<String>) + Send + 'static,
+    F: Fn(doorbell_rt::wake_sock::WakeOutcome) + Send + 'static,
 {
-    let kinds = DOORBELL_WATCH_KINDS;
-    let mut child = Command::new("toron")
-        .args(["watch", "--live", "--project", project, "--kinds", kinds])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
+    use doorbell_rt::wake_sock::{self, WakeOpts};
+    let opts = WakeOpts::new(
+        wake_sock::wake_sock_path(),
+        wake_sock::parse_kinds(DOORBELL_WATCH_KINDS),
+        Some(project.to_string()),
+    );
     let state_dir = state_dir.to_path_buf();
     let workspace = workspace.to_string();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        // Heartbeat (throttled 1s) so `/health` can tell a quiet bus from a
-        // deaf watcher — the one signal that would have caught a daemon
-        // watching a different mailbox immediately instead of by inference.
-        let mut stamped: Option<std::time::Instant> = None;
-        for line in std::io::BufReader::new(stdout).lines() {
-            match line {
-                Ok(l) => {
-                    if stamped.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
-                        doorbell_rt::watchbeat::touch(&state_dir, &workspace);
-                        stamped = Some(std::time::Instant::now());
-                    }
-                    on_event(Some(l));
-                }
-                Err(_) => break,
-            }
-        }
-        on_event(None); // Died
-    });
-    Some(WatchChild(child))
+    wake_sock::spawn_wake_task(
+        opts,
+        move |kind, detail| {
+            doorbell::audit_append(
+                &state_dir,
+                &workspace,
+                serde_json::json!({"kind": kind, "detail": detail}),
+            );
+        },
+        on_event,
+    )
 }
 
 /// Pins plus npubs so live kind-9 `p` tags (hex) resolve to the pin.
