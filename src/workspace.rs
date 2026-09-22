@@ -262,7 +262,7 @@ pub struct WorkspaceModel {
     pub open_human: BTreeMap<String, Question>,
     pub seq: u64,
     /// ONE wake home (bd-fuql): WaitCorr waits, ladder entries, shown
-    /// wakes, and pending digests live in this
+    /// presented wakes, `digest_queue`, and pending digests live in this
     /// table (`doorbell_core::wake_core`) — D1/D2/D5 contracts unchanged,
     /// single persistence, single decision, single why.
     pub wake: doorbell_core::wake_core::WakeModel,
@@ -1117,6 +1117,7 @@ pub fn expand_reclassify_cmds(
     model: &mut WorkspaceModel,
     cmds: Vec<Cmd>,
     project: &str,
+    authority: &crate::authority::RuntimeAuthority,
     decide: &dyn Fn(&str) -> ReclassifyDecision,
 ) -> Vec<Cmd> {
     let mut out = Vec::with_capacity(cmds.len());
@@ -1133,9 +1134,12 @@ pub fn expand_reclassify_cmds(
                 let expected =
                     reclassify_effect_key(&goal, &reason, explicit_topology.as_deref(), &pin);
                 if effect_key != expected {
-                    eprintln!(
-                        "flywheel: reclassify effect_key drift cmd={effect_key} derived={expected}"
-                    );
+                    out.push(Cmd::LoudMiss {
+                        why: format!(
+                            "reclassify effect_key drift: supplied={effect_key} derived={expected}"
+                        ),
+                    });
+                    continue;
                 }
                 let prepared = crate::agent_ref::ReclassifyIntent::from_cmd_key(
                     effect_key.clone(),
@@ -1148,15 +1152,12 @@ pub fn expand_reclassify_cmds(
                 let intent = match crate::agent_ref::insert_or_load_reclassify(project, prepared) {
                     Ok(i) => i,
                     Err(e) => {
-                        eprintln!("flywheel: reclassify journal insert failed: {e:#}");
-                        crate::agent_ref::ReclassifyIntent::from_cmd_key(
-                            effect_key.clone(),
-                            goal.clone(),
-                            reason.clone(),
-                            explicit_topology.clone(),
-                            pin.clone(),
-                            0,
-                        )
+                        out.push(Cmd::LoudMiss {
+                            why: format!(
+                                "reclassify journal insert failed; refusing provider effect: {e:#}"
+                            ),
+                        });
+                        continue;
                     }
                 };
                 // bd-n86n: W2 (ADR-0014, default off) host-side Jev enrichment.
@@ -1167,7 +1168,6 @@ pub fn expand_reclassify_cmds(
                 // POST inside would stall every concurrent journal writer.
                 // Flag off = byte-identical passthrough (no audit).
                 let (primitive, topology, argv, decide_reason) = decide(&intent.goal);
-                let authority = crate::authority::RuntimeAuthority::resolve();
                 let plan = crate::judgment::prepare_post_with_authority(
                     crate::judgment::ExpandArgs {
                         project: project.to_string(),
@@ -1182,7 +1182,7 @@ pub fn expand_reclassify_cmds(
                         table_argv: argv,
                         table_reason: decide_reason,
                     },
-                    &authority,
+                    authority,
                 );
                 let posted = match &plan.stage {
                     crate::judgment::PostStage::Ready {
@@ -1283,22 +1283,9 @@ pub fn expand_reclassify_cmds(
                 }) {
                     Ok(more) => more,
                     Err(e) => {
-                        eprintln!("flywheel: reclassify commit failed: {e:#}");
-                        // Best-effort: still fold DecisionReady so the session
-                        // is not stuck without an announce (journal already
-                        // recorded Failed).
-                        let (primitive, topology, argv, decide_reason) = decide(&goal);
-                        let ready = Msg::DecisionReady {
-                            goal,
-                            primitive,
-                            topology,
-                            argv,
-                            decide_reason,
-                            explicit_topology,
-                        };
-                        let (next, more) = tick(model, &ready);
-                        *model = next;
-                        more
+                        vec![Cmd::LoudMiss {
+                            why: format!("reclassify commit failed; refusing DecisionReady: {e:#}"),
+                        }]
                     }
                 };
                 out.extend(more);
@@ -1858,7 +1845,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             // ring per grace window; past max rings Dead→respawn and
             // Unknown→digest. Acked / fire-and-forget entries leave
             // without a sound. Presence is read-only here; the enum
-            // itself stays Lane-2 (bd-s8bo) owned.
+            // itself stays Lane-2 (bd-s8bo) owned. The ladder is the
+            // `next.rering`-equivalent state carried by `next.wake`.
             let corrs: Vec<String> = next.wake.ladders.keys().cloned().collect();
             for corr in corrs {
                 let Some(entry) = next.wake.ladders.get(&corr).cloned() else {
@@ -6314,16 +6302,22 @@ mod gs048_reclassify_tests {
         );
         assert!(cmds.iter().any(|c| matches!(c, Cmd::Reclassify { .. })));
         let _home = crate::config::test_state_home();
-        let expanded = expand_reclassify_cmds(&mut m, cmds, "gs050-expand-test", &|goal| {
-            // Pure decide leaf — mirrors effect layer.
-            let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
-            (
-                d.primitive.to_string(),
-                d.topology.to_string(),
-                d.argv.clone(),
-                d.reason.clone(),
-            )
-        });
+        let expanded = expand_reclassify_cmds(
+            &mut m,
+            cmds,
+            "gs050-expand-test",
+            &crate::authority::RuntimeAuthority::resolve(),
+            &|goal| {
+                // Pure decide leaf — mirrors effect layer.
+                let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
+                (
+                    d.primitive.to_string(),
+                    d.topology.to_string(),
+                    d.argv.clone(),
+                    d.reason.clone(),
+                )
+            },
+        );
         assert!(
             !expanded.iter().any(|c| matches!(c, Cmd::Reclassify { .. })),
             "expand must consume Reclassify: {expanded:?}"
@@ -6354,15 +6348,21 @@ mod gs048_reclassify_tests {
         );
         assert!(cmds.iter().any(|c| matches!(c, Cmd::Reclassify { .. })));
         let _home = crate::config::test_state_home();
-        let _ = expand_reclassify_cmds(&mut m, cmds, "gs050-ledger-test", &|goal| {
-            let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
-            (
-                d.primitive.to_string(),
-                d.topology.to_string(),
-                d.argv.clone(),
-                d.reason.clone(),
-            )
-        });
+        let _ = expand_reclassify_cmds(
+            &mut m,
+            cmds,
+            "gs050-ledger-test",
+            &crate::authority::RuntimeAuthority::resolve(),
+            &|goal| {
+                let d = crate::decide::decide(goal, &crate::decide::Snapshot::default());
+                (
+                    d.primitive.to_string(),
+                    d.topology.to_string(),
+                    d.argv.clone(),
+                    d.reason.clone(),
+                )
+            },
+        );
         let rows = crate::judgment::miss_read();
         assert!(
             rows.iter().any(|r| r.goal.contains("ledger probe")),
@@ -6624,9 +6624,13 @@ mod gs048_reclassify_tests {
                 _ => None,
             })
             .expect("Reclassify carries effect_key");
-        let _ = expand_reclassify_cmds(&mut m, cmds, project, &|g| {
-            ("none".into(), "none".into(), vec![], format!("decided:{g}"))
-        });
+        let _ = expand_reclassify_cmds(
+            &mut m,
+            cmds,
+            project,
+            &crate::authority::RuntimeAuthority::resolve(),
+            &|g| ("none".into(), "none".into(), vec![], format!("decided:{g}")),
+        );
         let log = std::fs::read_to_string(crate::state::project_log_path(project))
             .expect("reclassify journal written");
         assert!(log.contains("\"journal\":\"reclassify\""), "{log}");
@@ -6658,9 +6662,13 @@ mod gs048_reclassify_tests {
             })
             .unwrap();
         assert_eq!(key, key2);
-        let _ = expand_reclassify_cmds(&mut m2, cmds2, project, &|_| {
-            ("none".into(), "none".into(), vec![], "retry".into())
-        });
+        let _ = expand_reclassify_cmds(
+            &mut m2,
+            cmds2,
+            project,
+            &crate::authority::RuntimeAuthority::resolve(),
+            &|_| ("none".into(), "none".into(), vec![], "retry".into()),
+        );
         let loaded = crate::agent_ref::load_reclassify_by_key(project, &key)
             .expect("load")
             .expect("row");

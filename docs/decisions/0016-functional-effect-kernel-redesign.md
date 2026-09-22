@@ -191,13 +191,26 @@ The existing `src/effect_journal.rs` and toron workflow journal remain the imple
 
 ### 5. Effect-oriented resilience
 
-Resilience belongs at effect edges:
+Resilience belongs on the command the interpreter runs. The reducer chooses the command. It does not sleep, retry, or read a clock.
 
-```text
-operation timeout -> bounded retry -> breaker/fallback -> typed result
-```
+Outermost to innermost for one remote command:
 
-Retry policies must be injected and bounded. Retryability comes from the shared failure taxonomy. Breakers must use injected monotonic time and be represented as state transitions rather than reading clocks internally. Every subprocess, HTTP request, sink, queue, and retry loop has an explicit bound.
+1. A skip filter, when the command should not run at all. A skip does not fall back.
+2. Fallback. Another strategy, only after the protected command is exhausted.
+3. Cache, only when a cache exists. It sits inside fallback and outside retry. It stores a primary success. It does not store a fallback answer as that success.
+4. Budget timeout. Bounds the whole chain, retries included.
+5. Retry. A bounded schedule, only for typed retryable failures, under the same effect key. The retried region is this command, not the reducer and not a wider workflow.
+6. Circuit breaker, inside the retry, so an open breaker fails the attempt without calling through. Do not retry breaker-open, and do not count it as another trip. Size the threshold against the retry cap so one caller cannot open the circuit for the process by exhausting its own attempts.
+7. Rate limit, when the provider contract is a count per interval. The wait is not an attempt failure and does not hold an in-flight slot.
+8. Bulkhead, when the provider dies under concurrency. The queue is bounded. The slot covers the call, not the backoff.
+9. Attempt timeout. Bounds and cancels that one call. It does not cover the rate-limit wait or the bulkhead queue.
+10. The call.
+
+Interruption is its own outcome. It is not `Failed`, not `Unknown`, and not a typed provider error. Cancelling a call still releases what the call acquired. A compensating action runs on failure or interruption, and it does not run after success.
+
+`ConsecutiveBreaker` today is a cooldown reset: when the cooldown elapses it returns to `Closed` and clears the failure count before the next call is observed. That is not a half-open probe. The target shape is one probe that re-opens on failure. Until that lands, do not describe the current breaker as half-open.
+
+Retry policies and clocks are injected. Retryability comes from the shared failure taxonomy. Every subprocess, HTTP request, sink, queue, and retry loop has an explicit bound.
 
 ### 6. Doorbell runtime as interpreter
 
@@ -587,3 +600,15 @@ Two residual gaps remain and are explicitly tracked rather than hidden by the gr
 2. **Some durable effect leaves sample time directly.** `read_output`, `dispatch_guard_scan`, `now_us_micros`, and the subprocess watchdog use `SystemTime`/`Instant` at effect boundaries. They are not reducer reads and their results are checkpointed, but the strict authority contract calls for injected wall and monotonic clocks. This is a migration gap, not evidence of nondeterministic reducer behavior.
 
 Until those two edges are migrated and substitution witnesses cover injected clocks and authority threading, reviewers must describe ADR-0016 as **core-kernel compliant with residual authority-edge work**, not “fully complete.”
+
+### Effect-oriented review: 2026-09-22
+
+Section 5 now states the effect-oriented stack. The previous one-line order (`operation timeout -> bounded retry -> breaker/fallback`) mixed the budget timeout with the attempt timeout and put fallback on the inside. Interpreters follow the numbered list in §5.
+
+Checked against the tree on this date:
+
+- The fold is real. `workspace::tick`, `durable::tick`, and `doorbell-core::tick` are `(model, message) -> (model, commands)`. `doorbell-rt` host `tick` takes `&mut self` because it is the interpreter edge, not a second policy reducer.
+- The two gaps in the 2026-09-22 audit are still present. `expand_reclassify_cmds` in `src/workspace.rs` calls `RuntimeAuthority::resolve()` on the host path. `UreqTransport::from_env` still resolves authority for leftover callers. `read_output` and `now_us_micros` in `src/durable.rs` still sample `SystemTime` inside checkpointed leaves. `ConsecutiveBreaker::allows` and `record_failure` still sample `SystemClock` for callers that have not moved to `*_at`. `src/pane.rs` still calls `record_failure()`. That dispatch path also retries with `std::thread::sleep` up to a fixed cap. That is a handwritten retry, not the §5 stack, and the sleep blocks the caller.
+- The breaker is not half-open. After cooldown, `allows_at` clears `opened_at` and the failure count, and `state()` is `Closed` before the next call returns. The unit test that claimed a half-open probe was renamed to describe that reset. A failing first call after cooldown must reach the threshold again before the breaker re-opens.
+- A journal insert failure in `expand_reclassify_cmds` logs and then continues with an in-memory intent, including the Jev post. That is louder than a silent drop, and it is not a refusal. Enforced mode is supposed to refuse an effect that has no journal row.
+- Cancellation is not yet a first-class interpreter outcome next to `Failed` and `Unknown`. Timeouts today fold into the failure taxonomy. A dropped attempt must still release, and it must not be reported as provider success.

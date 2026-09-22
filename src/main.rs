@@ -5218,12 +5218,14 @@ mod steer_engine_tests {
                 Ok(json!({ "action": inv.action.type_name() }))
             });
         let rt = tokio::runtime::Runtime::new()?;
-        let engine = std::sync::Arc::new(pane::local_engine(
-            &rt,
-            runner,
-            profile::ProfileCatalog::catalog_profile_resolver(),
-            workflow_resolver,
-        )?);
+        let _enter = rt.enter();
+        let engine = std::sync::Arc::new(
+            toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
+                profile::ProfileCatalog::catalog_profile_resolver(),
+                workflow_resolver,
+                Some(runner),
+            )?,
+        );
         Ok((rt, engine, invoke_wf))
     }
 
@@ -9726,6 +9728,7 @@ fn handle_workspace_cmds(
                         effect_key: effect_key.clone(),
                     }],
                     project,
+                    &crate::authority::RuntimeAuthority::resolve(),
                     &|g| {
                         let d = crate::decide::decide(g, &snap);
                         (
@@ -12692,15 +12695,21 @@ fn cmd_reclassify(
     let (next, cmds) = workspace::tick(&ws_model, &msg);
     ws_model = next;
     let snap = live_decide_snapshot(cfg, project);
-    let expanded = workspace::expand_reclassify_cmds(&mut ws_model, cmds, project, &|goal| {
-        let d = decide::decide(goal, &snap);
-        (
-            d.primitive.to_string(),
-            d.topology.to_string(),
-            d.argv.clone(),
-            d.reason.clone(),
-        )
-    });
+    let expanded = workspace::expand_reclassify_cmds(
+        &mut ws_model,
+        cmds,
+        project,
+        &crate::authority::RuntimeAuthority::resolve(),
+        &|goal| {
+            let d = decide::decide(goal, &snap);
+            (
+                d.primitive.to_string(),
+                d.topology.to_string(),
+                d.argv.clone(),
+                d.reason.clone(),
+            )
+        },
+    );
     if let Some(topo) = ws_model.session_topology.as_deref() {
         let _ = state::save_session_topology(project, topo);
     }

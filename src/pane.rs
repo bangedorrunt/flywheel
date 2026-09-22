@@ -33,6 +33,8 @@ use serde_json::{Value, json};
 
 use toron_workflow::schema::Action;
 
+use crate::authority::Clock;
+
 use crate::config::Config;
 use crate::crew::CrewPlan;
 use crate::herdr_shim::{AgentStatus, Client};
@@ -696,7 +698,7 @@ pub fn pane_dispatch(
     const MAX_ATTEMPTS: u32 = 6;
     {
         let mut b = dispatch_breaker().lock().expect("dispatch breaker");
-        if !b.allows() {
+        if !b.allows_at(crate::authority::SystemClock.now_unix()) {
             let st = b.state();
             bail!(
                 "pane dispatch: consecutive-failure breaker {st:?} — fast escalate, waiting out cooldown instead of hammering the pane"
@@ -760,7 +762,7 @@ pub fn pane_dispatch(
                 dispatch_breaker()
                     .lock()
                     .expect("dispatch breaker")
-                    .record_failure();
+                    .record_failure_at(crate::authority::SystemClock.now_unix());
                 return Err(anyhow!(
                     "dispatch @{attempt_profile} ({}) failed after {MAX_ATTEMPTS} transient retries: {reason} — the target pane never became available; fix the pane (occupied/dead) or fail the step",
                     attempt_entry.name
@@ -896,10 +898,12 @@ pub fn pane_dispatch(
             if !reroute_trail.is_empty() {
                 out["reroute_trail"] = json!(reroute_trail);
             }
-            dispatch_breaker()
-                .lock()
-                .expect("dispatch breaker")
-                .record_success();
+            let mut breaker = dispatch_breaker().lock().expect("dispatch breaker");
+            if out.get("ok").and_then(Value::as_bool) == Some(true) {
+                breaker.record_success_at();
+            } else {
+                breaker.record_failure_at(crate::authority::SystemClock.now_unix());
+            }
             return Ok(crate::phase_chain::annotate_dispatch_output(
                 spec, inputs, out,
             ));
@@ -923,6 +927,10 @@ pub fn pane_dispatch(
             out["kind"] = json!(cf.kind.to_string());
             out["retryable"] = json!(cf.retryable);
         }
+        dispatch_breaker()
+            .lock()
+            .expect("dispatch breaker")
+            .record_failure_at(crate::authority::SystemClock.now_unix());
         return Ok(out);
     }
 }
@@ -1390,19 +1398,41 @@ pub fn local_engine(
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let server_url = cli_engine_store_url();
+    // Dry runs still need a recording seam so control-flow output contains
+    // every dispatch node. The adapter records the action shape only; it
+    // never calls the real host runner, so no external effect is performed.
+    let recording_runner: toron_workflow::engine::EffectRunner =
+        std::sync::Arc::new(|inv| Ok(json!({ "action": inv.action.type_name() })));
     local_engine_with_journal(
         rt,
         server_url,
         runner,
         profile,
         workflow,
-        None,
+        Some(recording_runner),
         toron_workflow::engine::EffectJournalMode::Recording,
         // Dry engine: no effect journal, so no run rows either — the engine
         // performs nothing, and a row claiming otherwise is the lie the
         // journal exists to prevent (bd-mi9n).
         None,
     )
+}
+
+/// Lift a blocking effect runner onto the workflow engine's async seam.
+/// Blocking pane/process work runs on Tokio's blocking pool, so retry delays
+/// cannot stall the engine executor or unrelated workflow tasks.
+pub fn asyncify_runner(
+    runner: toron_workflow::engine::EffectRunner,
+) -> toron_workflow::engine::AsyncEffectRunner {
+    std::sync::Arc::new(move |inv| {
+        let runner = runner.clone();
+        let inv = inv.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || runner(&inv))
+                .await
+                .map_err(|e| anyhow!("pane effect task failed: {e}"))?
+        })
+    })
 }
 
 /// [`local_engine`] with the host-owned effect journal attached
@@ -1507,7 +1537,7 @@ fn local_engine_with(
 fn local_engine_with_journal(
     rt: &tokio::runtime::Runtime,
     server_url: Option<String>,
-    runner: toron_workflow::engine::EffectRunner,
+    _runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
     effect: Option<toron_workflow::engine::EffectRunner>,
@@ -1519,24 +1549,38 @@ fn local_engine_with_journal(
     // wins when present, else this runner executes leaves directly through
     // the supported context-bearing seam (same preference the old engine
     // applied to its two-runner inputs).
-    let effect = effect.or(Some(runner));
+    let effect = effect;
+    // Pane dispatch owns subprocesses and retry waits. Lift both host-owned
+    // synchronous seams onto the engine's async surface so the workflow
+    // executor never sleeps or waits for a child on its Tokio worker thread.
+    // The blocking work is isolated in Tokio's blocking pool until the pane
+    // dispatcher is fully async, while cancellation of the engine future can
+    // still propagate at the async boundary.
+    let async_effect = effect.map(asyncify_runner);
+    let async_run_journal = run_journal.map(|journal| {
+        std::sync::Arc::new(move |transition: toron_workflow::engine::RunTransition| {
+            let journal = journal.clone();
+            Box::pin(async move { journal(&transition) })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        }) as toron_workflow::engine::AsyncRunJournal
+    });
     match server_url {
         Some(url) => {
-            toron_workflow::WorkflowEngine::remote_with_resolvers_effect_mode_and_run_journal(
+            toron_workflow::WorkflowEngine::remote_with_resolvers_async_effect_mode_and_journal(
                 url,
                 profile,
                 workflow,
-                effect,
+                async_effect,
                 mode,
-                run_journal,
+                async_run_journal,
             )
         }
-        None => toron_workflow::WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
+        None => toron_workflow::WorkflowEngine::local_with_resolvers_async_effect_mode_and_journal(
             profile,
             workflow,
-            effect,
+            async_effect,
             mode,
-            run_journal,
+            async_run_journal,
         ),
     }
 }

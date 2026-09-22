@@ -79,6 +79,7 @@ pub struct RtHost {
     brain_tx: mpsc::Sender<BrainMsg>,
     covered_panes: HashSet<String>,
     retry: doorbell_rt::WatchRetry,
+    authority: crate::authority::RuntimeAuthority,
     // F7: cache the whois-backed index — rebuild at most every 60s or when
     // the registry pin set changes (was every 1s sweep: N whois RPCs/sec).
     index_refreshed_at: u64,
@@ -127,6 +128,7 @@ impl RtHost {
             brain_tx,
             covered_panes: HashSet::new(),
             retry: doorbell_rt::WatchRetry::default(),
+            authority: crate::authority::RuntimeAuthority::resolve(),
             index_refreshed_at: now,
             index_pins,
             watch_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -291,8 +293,12 @@ impl Host for RtHost {
         // reach Effect::Prompt (nested handle would drop them). Live Snapshot
         // from briefing world facts — never Snapshot::default() invent-green.
         let snap = crate::live_decide_snapshot(&self.cfg, &self.project);
-        let cmds =
-            workspace::expand_reclassify_cmds(&mut self.model, cmds, &self.project, &|goal| {
+        let cmds = workspace::expand_reclassify_cmds(
+            &mut self.model,
+            cmds,
+            &self.project,
+            &self.authority,
+            &|goal| {
                 let d = crate::decide::decide(goal, &snap);
                 (
                     d.primitive.to_string(),
@@ -300,7 +306,8 @@ impl Host for RtHost {
                     d.argv,
                     d.reason,
                 )
-            });
+            },
+        );
         if let Some(topo) = self.model.session_topology.as_deref() {
             let _ = crate::state::save_session_topology(&self.project, topo);
         }

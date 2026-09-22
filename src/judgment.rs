@@ -466,13 +466,6 @@ impl UreqTransport {
             url: SYSTEMONE_URL.to_string(),
         })
     }
-
-    /// Compatibility boundary for callers that have not yet adopted the
-    /// runtime authority. Production host paths use `from_authority`.
-    pub fn from_env() -> Result<Self, JevError> {
-        let authority = RuntimeAuthority::resolve();
-        Self::from_authority(&authority)
-    }
 }
 
 impl Transport for UreqTransport {
@@ -1167,14 +1160,6 @@ fn prepare_post_with_authority_and_gate(
     )
 }
 
-/// Compatibility boundary for tests and legacy callers. New host code passes
-/// the resolved authority explicitly through `prepare_post_with_authority`.
-#[allow(dead_code)]
-pub fn prepare_post(a: ExpandArgs) -> PostPlan {
-    let authority = RuntimeAuthority::resolve();
-    prepare_post_with_authority(a, &authority)
-}
-
 /// Phase 2 (network, timed): run the POST outside the journal tx and
 /// return the outcome + POST latency in ms for the audit row (bd-n86n,
 /// ADR-0014 S8 measurement duty). Takes the adapter by value — one POST
@@ -1654,9 +1639,13 @@ pub fn fold_prescreen(answers: &Answers) -> (String, bool) {
 /// Verify prescreen ask (bd-lpn6): runs the verify-prescreen pack over
 /// {verify.cmd} outside any tx. Deny (no pack/key) errors loud — the caller
 /// renders it into the advisory channel, never into a verdict field.
-pub fn prescreen_verify(project: &str, cmd_text: &str) -> Result<(String, bool, f64, u64), String> {
+pub fn prescreen_verify(
+    project: &str,
+    cmd_text: &str,
+    authority: &RuntimeAuthority,
+) -> Result<(String, bool, f64, u64), String> {
     let pack = find_pack_for(project, "verify-prescreen")?;
-    let transport = UreqTransport::from_env().map_err(|e| e.to_string())?;
+    let transport = UreqTransport::from_authority(authority).map_err(|e| e.to_string())?;
     let mut fields = BTreeMap::new();
     fields.insert("verify.cmd".to_string(), cmd_text.to_string());
     let slice = build_state_slice(fields);
@@ -1761,9 +1750,10 @@ pub fn annotate(
     surface: AnnotateSurface,
     goal: &str,
     extra: &BTreeMap<String, String>,
+    authority: &RuntimeAuthority,
 ) -> Result<(String, f64, u64), String> {
     let pack = find_pack_for(project, surface.pack_id())?;
-    let transport = UreqTransport::from_env().map_err(|e| e.to_string())?;
+    let transport = UreqTransport::from_authority(authority).map_err(|e| e.to_string())?;
     let mut fields = BTreeMap::new();
     fields.insert("goal.text".to_string(), goal.to_string());
     for (k, v) in extra {
@@ -2624,8 +2614,9 @@ questions:
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .to_string_lossy()
             .into_owned();
+        let authority = RuntimeAuthority::for_test("/tmp/jev-home", 0);
         assert!(
-            prescreen_verify(&repo, "cargo test").is_err(),
+            prescreen_verify(&repo, "cargo test", &authority).is_err(),
             "no key = loud deny"
         );
         assert!(
@@ -2633,7 +2624,8 @@ questions:
                 &repo,
                 AnnotateSurface::CoalitionIntent,
                 "goal",
-                &BTreeMap::new()
+                &BTreeMap::new(),
+                &authority,
             )
             .is_err(),
             "no key = loud deny"

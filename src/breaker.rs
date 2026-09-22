@@ -14,6 +14,7 @@ use crate::authority::{Clock, SystemClock};
 pub enum BreakerState {
     Closed,
     Open,
+    HalfOpen,
 }
 
 #[derive(Debug)]
@@ -22,6 +23,7 @@ pub struct ConsecutiveBreaker {
     pub cooldown: Duration,
     failures: u32,
     opened_at: Option<u64>,
+    half_open: bool,
 }
 
 impl ConsecutiveBreaker {
@@ -31,41 +33,54 @@ impl ConsecutiveBreaker {
             cooldown,
             failures: 0,
             opened_at: None,
+            half_open: false,
         }
     }
 
     /// Compatibility boundary for callers not yet migrated to authority.
+    #[allow(dead_code)]
     pub fn allows(&mut self) -> bool {
         self.allows_at(SystemClock.now_unix())
     }
 
     pub fn allows_at(&mut self, now_unix: u64) -> bool {
+        if self.half_open {
+            return false;
+        }
         let Some(opened_at) = self.opened_at else {
             return true;
         };
         if now_unix.saturating_sub(opened_at) >= self.cooldown.as_secs() {
-            self.opened_at = None;
-            self.failures = 0;
+            self.half_open = true;
             return true;
         }
         false
     }
 
     /// Compatibility boundary for callers not yet migrated to authority.
+    #[allow(dead_code)]
     pub fn record_success(&mut self) {
         self.record_success_at();
     }
 
     pub fn record_success_at(&mut self) {
         self.failures = 0;
+        self.opened_at = None;
+        self.half_open = false;
     }
 
     /// Compatibility boundary for callers not yet migrated to authority.
+    #[allow(dead_code)]
     pub fn record_failure(&mut self) {
         self.record_failure_at(SystemClock.now_unix());
     }
 
     pub fn record_failure_at(&mut self, now_unix: u64) {
+        if self.half_open {
+            self.opened_at = Some(now_unix);
+            self.half_open = false;
+            return;
+        }
         self.failures = self.failures.saturating_add(1);
         if self.failures >= self.threshold {
             self.opened_at = Some(now_unix);
@@ -73,7 +88,9 @@ impl ConsecutiveBreaker {
     }
 
     pub fn state(&self) -> BreakerState {
-        if self.opened_at.is_some() {
+        if self.half_open {
+            BreakerState::HalfOpen
+        } else if self.opened_at.is_some() {
             BreakerState::Open
         } else {
             BreakerState::Closed
@@ -92,7 +109,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn opens_at_threshold_then_half_open_probe_without_sleep() {
+    fn opens_at_threshold_then_allows_one_half_open_probe() {
         let mut b = ConsecutiveBreaker::new(3, Duration::from_secs(50));
         b.record_failure_at(100);
         b.record_failure_at(101);
@@ -101,6 +118,13 @@ mod tests {
         assert_eq!(b.state(), BreakerState::Open);
         assert!(!b.allows_at(151));
         assert!(b.allows_at(152));
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        assert!(!b.allows_at(153));
+        b.record_failure_at(153);
+        assert_eq!(b.state(), BreakerState::Open);
+        assert!(!b.allows_at(154));
+        assert!(b.allows_at(203));
+        b.record_success_at();
         assert_eq!(b.state(), BreakerState::Closed);
     }
 

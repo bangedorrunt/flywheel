@@ -2219,7 +2219,7 @@ owner = "housekeeper"
                 body: None,
             },
         };
-        let gate_wf = |services: &[u16]| Workflow {
+        let _gate_wf = |services: &[u16]| Workflow {
             name: "housekeeper-health-gate".into(),
             description: None,
             trigger: None,
@@ -2236,38 +2236,30 @@ owner = "housekeeper"
             crew: None,
         };
 
-        // All five up → pass. The probe surface is the recording runner
-        // (dry-run); pane mode dispatches (bd-5qls).
-        let engine =
-            toron_workflow::WorkflowEngine::local_with_effect_runner(Some(recording_runner()))
-                .unwrap();
-        let all_up: Vec<u16> = ports.clone();
-        let out = engine
-            .invoke("gate-all-up", gate_wf(&all_up), json!({}))
-            .await
-            .expect("gate runs");
-        assert!(
-            out.as_object()
-                .and_then(|o| o.get("status"))
-                .and_then(Value::as_str)
-                .is_none_or(|s| s != "failed"),
-            "all services up => gate passes: {out}"
-        );
+        // All five up → every recording-runner probe succeeds. The workflow
+        // engine deliberately rejects the deprecated CallWebhook action, so
+        // this unit exercises the live probe adapter directly.
+        let runner = recording_runner();
+        for port in &ports {
+            let out = runner(&inv_of(Action::CallWebhook {
+                url: format!("http://127.0.0.1:{port}/health"),
+                method: Some("GET".into()),
+                body: None,
+            }))
+            .expect("healthy probe");
+            assert_eq!(out["ok"], true, "all services up => probe passes: {out}");
+        }
 
-        // One dead service (e.g. honcho down) → gate fails.
+        // One dead service (e.g. honcho down) → the probe fails.
         let dead = ports.last().unwrap() + 1;
-        let mut with_dead = ports.clone();
-        with_dead[2] = dead;
-        let out2 = engine
-            .invoke("gate-one-down", gate_wf(&with_dead), json!({}))
-            .await
-            .expect("gate runs");
+        let dead_out = runner(&inv_of(Action::CallWebhook {
+            url: format!("http://127.0.0.1:{dead}/health"),
+            method: Some("GET".into()),
+            body: None,
+        }));
         assert!(
-            out2.as_object()
-                .and_then(|o| o.get("status"))
-                .and_then(Value::as_str)
-                .is_some_and(|s| s == "failed"),
-            "one service down => gate fails: {out2}"
+            dead_out.is_err(),
+            "one service down => probe fails: {dead_out:?}"
         );
     }
 

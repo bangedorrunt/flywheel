@@ -2958,8 +2958,16 @@ steps:
         });
         // Runner succeeds on dispatch; verify outcome comes from the sink.
         let runner: toron_workflow::engine::EffectRunner =
-            Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
-                Ok(serde_json::json!({ "ok": true }))
+            Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
+                if matches!(inv.action, Action::Verify { .. }) {
+                    Ok(inv
+                        .run
+                        .provider_result
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({ "ok": false })))
+                } else {
+                    Ok(serde_json::json!({ "ok": true }))
+                }
             });
         let engine =
             toron_workflow::WorkflowEngine::local_with_effect_runner(Some(runner)).expect("engine");
@@ -2981,14 +2989,7 @@ steps:
         ));
         *engine.verify_sink().0.lock().unwrap() = sink.0.lock().unwrap().clone();
         let out = engine
-            .run(
-                "compose-verify-red-1",
-                toron_workflow::RunInput {
-                    run_id: None,
-                    workflow: wf.clone(),
-                    trigger: serde_json::json!({}),
-                },
-            )
+            .invoke("compose-verify-red-1", wf.clone(), serde_json::json!({}))
             .await
             .expect("run red");
         assert_eq!(seen.lock().unwrap().len(), 1, "verify must have executed");
@@ -3042,14 +3043,7 @@ steps:
             },
         });
         let out2 = engine2
-            .run(
-                "compose-verify-green-1",
-                toron_workflow::RunInput {
-                    run_id: None,
-                    workflow: wf_green,
-                    trigger: serde_json::json!({}),
-                },
-            )
+            .invoke("compose-verify-green-1", wf_green, serde_json::json!({}))
             .await
             .expect("run green");
         assert!(
