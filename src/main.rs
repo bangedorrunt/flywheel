@@ -8911,7 +8911,7 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
     let last_digest_unix: u64 = u64::MAX;
     let mut counters: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
     for m in models.values() {
-        queue.extend(m.digest_queue.iter().cloned());
+        queue.extend(m.wake.digests.iter().cloned());
         for k in ["benign", "routine", "captain", "urgent"] {
             *counters.entry(k).or_insert(0) += m.wake_counters.get(k).copied().unwrap_or(0);
         }
@@ -9750,10 +9750,10 @@ fn handle_workspace_cmds(
 }
 
 fn drain_pending_wait_corrs(workspace_model: &mut workspace::WorkspaceModel) {
-    let pending: Vec<String> = workspace_model.pending_wait.keys().cloned().collect();
+    let pending: Vec<String> = workspace_model.wake.waits.keys().cloned().collect();
     for corr in pending {
         if try_tick_receipt(workspace_model, &corr) {
-            workspace_model.pending_wait.remove(&corr);
+            workspace_model.wake.waits.remove(&corr);
         }
     }
 }

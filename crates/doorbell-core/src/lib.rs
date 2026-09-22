@@ -970,6 +970,7 @@ impl DoorbellAction {
 /// fold is the wave-5 follow-up, not this bead.
 pub mod wake_table {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write as _;
 
     /// More than this many previously-unseen ready beads in ONE poll is the
     /// runaway-create signature (bd-eign.2: 40 junk beads in ~4 min; legit
@@ -1001,17 +1002,48 @@ pub mod wake_table {
         pub sla_seen: BTreeSet<String>,
         /// Live wake rows by id (terminal transitions remove the row).
         pub wakes: BTreeMap<String, WakeStatus>,
+        /// WaitCorr holds: corr -> needed-by unix secs.
+        pub waits: BTreeMap<String, u64>,
+        /// Re-ring ladder entries by corr.
+        pub ladders: BTreeMap<String, ReringEntry>,
+        /// Shown-but-unacked wakes per pin.
+        pub shown: BTreeMap<String, Vec<PresentedWake>>,
+        /// Captain-relevant wakes awaiting the afk digest batch.
+        pub digests: Vec<DigestEntry>,
     }
 
     impl WakeTable {
         /// True when nothing is tracked (serde skip guard for ActiveLoop).
         pub fn is_empty(&self) -> bool {
-            self.flood_seen.is_empty() && self.sla_seen.is_empty() && self.wakes.is_empty()
+            self.flood_seen.is_empty()
+                && self.sla_seen.is_empty()
+                && self.wakes.is_empty()
+                && self.waits.is_empty()
+                && self.ladders.is_empty()
+                && self.shown.is_empty()
+                && self.digests.is_empty()
         }
 
         /// Flood-guard memory depth (test observable).
         pub fn flood_seen_len(&self) -> usize {
             self.flood_seen.len()
+        }
+
+        /// Ladder step through the table (bd-fuql): folds the pure verdict
+        /// for a tracked corr. Unknown corrs read Pending — never invent
+        /// tracking for a stranger.
+        pub fn ladder_step(
+            &mut self,
+            corr: &str,
+            now: u64,
+            verdict: &str,
+            grace_secs: u64,
+            ring_max: u32,
+        ) -> ReringDecision {
+            match self.ladders.get(corr) {
+                Some(entry) => rering_due_with_policy(entry, now, verdict, grace_secs, ring_max),
+                None => ReringDecision::Pending,
+            }
         }
 
         /// Mark one wake presented (idempotent on unknown ids — never
@@ -1145,6 +1177,141 @@ pub mod wake_table {
         }
     }
 
+    /// ADR-0010 D2 (bd-8jlv): one presented wake — the line as prompted,
+    /// bound to the tick generation that presented it.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PresentedWake {
+        pub seq: u64,
+        pub line: String,
+    }
+
+    /// One captain-relevant wake awaiting the digest batch.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DigestEntry {
+        pub seq: u64,
+        /// Last wall-clock seen when recorded (0 = before any clock Msg).
+        pub at_unix: u64,
+        pub kind: String,
+        pub pin: String,
+        pub detail: String,
+    }
+
+    /// Digest detail is bounded: prompt lines can be long, the queue is not
+    /// a log. Truncation is marked.
+    pub fn digest_detail_truncate(detail: &str) -> String {
+        const MAX: usize = 200;
+        if detail.len() <= MAX {
+            return detail.to_string();
+        }
+        format!("{}…[{} chars]", &detail[..MAX], detail.len())
+    }
+
+    /// Extract bead ids (`bd-…` tokens) from digest details, sorted dedup.
+    pub fn digest_bead_ids(entries: &[DigestEntry]) -> Vec<String> {
+        let mut ids: Vec<String> = entries
+            .iter()
+            .flat_map(|e| e.detail.split(|c: char| !c.is_alphanumeric() && c != '-'))
+            .filter(|t| t.starts_with("bd-") && t.len() > 3)
+            .map(str::to_string)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Render the afk digest: outcomes first with ages, bead ids kept,
+    /// exact commands last. Pure — the afk CLI and the Digest effect share it.
+    pub fn render_digest(entries: &[DigestEntry], now: u64) -> String {
+        let mut out = format!("doorbell afk digest ({} items)\n", entries.len());
+        for e in entries {
+            // bd-z5ut: `at_unix == 0` means "recorded before any clock Msg in this
+            // fold", NOT "56 years ago". Subtracting it printed a raw epoch value
+            // dressed as a duration, which is worse than admitting the unknown.
+            let age = match e.at_unix {
+                0 => "age unknown".to_string(),
+                t => format!("{}s ago", now.saturating_sub(t)),
+            };
+            let _ = writeln!(out, "- [{age}] {} {}: {}", e.kind, e.pin, e.detail);
+        }
+        let beads = digest_bead_ids(entries);
+        if beads.is_empty() {
+            out.push_str("beads: none in this digest\n");
+        } else {
+            let _ = writeln!(out, "beads: {}", beads.join(", "));
+        }
+        out.push_str("commands:\n");
+        for b in &beads {
+            let _ = writeln!(out, "  br show {b}");
+        }
+        if beads.is_empty() {
+            out.push_str("  (no bead commands)\n");
+        }
+        out
+    }
+
+    /// One tracked delivery: a toron corr awaiting its crew ack.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ReringEntry {
+        pub pin: String,
+        /// Rings already emitted for this corr.
+        pub attempts: u32,
+        /// Unix secs of the current grace window start.
+        pub window_start_unix: u64,
+        /// Acked corrs skip the ladder (handling fact already observed).
+        pub acked: bool,
+        /// --fire-and-forget deliveries never climb the ladder.
+        pub fire_and_forget: bool,
+        /// --raw without an id rings once and never escalates.
+        pub raw_without_id: bool,
+    }
+
+    /// Ladder outcome for one corr at one tick.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ReringDecision {
+        /// Emit ring number `attempt` (0-based) now; caller bumps the entry.
+        Ring { attempt: u32 },
+        /// Past max rings and the pane is Dead → respawn path.
+        RecoverDead,
+        /// Past max rings and the pane is Unknown → digest (no prompt).
+        DigestUnknown,
+        /// Inside a grace window: nothing due yet.
+        Pending,
+        /// Opt-out: acked, fire-and-forget, or raw already rang once.
+        Skip,
+    }
+
+    pub fn rering_due_with_policy(
+        entry: &ReringEntry,
+        now: u64,
+        verdict: &str,
+        grace_secs: u64,
+        ring_max: u32,
+    ) -> ReringDecision {
+        if entry.acked || entry.fire_and_forget {
+            return ReringDecision::Skip;
+        }
+        if entry.raw_without_id {
+            if entry.attempts == 0 {
+                return ReringDecision::Ring { attempt: 0 };
+            }
+            return ReringDecision::Skip;
+        }
+        let grace = grace_secs;
+        let max = ring_max;
+        if entry.attempts >= max {
+            return match verdict {
+                "Dead" => ReringDecision::RecoverDead,
+                "Unknown" => ReringDecision::DigestUnknown,
+                _ => ReringDecision::Ring { attempt: max },
+            };
+        }
+        if now.saturating_sub(entry.window_start_unix) >= grace {
+            return ReringDecision::Ring {
+                attempt: entry.attempts,
+            };
+        }
+        ReringDecision::Pending
+    }
     /// The routing `why`: one line per decision, same string for logs and
     /// operator reads.
     pub fn why_route(decision: &GateDecision) -> String {

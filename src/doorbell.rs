@@ -1853,7 +1853,7 @@ mod tests {
             next.wake_counters
         );
         assert!(
-            next.digest_queue.is_empty(),
+            next.wake.digests.is_empty(),
             "routine never enters the digest"
         );
     }
@@ -2097,7 +2097,8 @@ mod tests {
             model = next;
         }
         let prompts: Vec<_> = model
-            .digest_queue
+            .wake
+            .digests
             .iter()
             .filter(|e| e.kind == "urgent-prompt")
             .collect();
@@ -2105,7 +2106,7 @@ mod tests {
             prompts.len(),
             1,
             "urgent row recorded once: {:?}",
-            model.digest_queue
+            model.wake.digests
         );
         // Refold from Default: every recorded Cmd sequence reproduces.
         let entries = journal_read_all(&dir);
@@ -2132,10 +2133,10 @@ mod tests {
         }
         assert_eq!(live_prompts, 1, "only the urgent row injects on refold");
         assert_eq!(
-            folded.digest_queue.len(),
+            folded.wake.digests.len(),
             2,
             "captain entry plus urgent record: {:?}",
-            folded.digest_queue
+            folded.wake.digests
         );
         assert!(
             folded.wake_counters.get("routine").copied().unwrap_or(0) >= 1
@@ -2149,7 +2150,7 @@ mod tests {
             cmds.iter().any(|c| matches!(c, Cmd::Digest { .. })),
             "digest batch emits: {cmds:?}"
         );
-        assert!(drained.digest_queue.is_empty());
+        assert!(drained.wake.digests.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
