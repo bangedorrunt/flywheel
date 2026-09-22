@@ -28,9 +28,9 @@ use toron_core::mailbox::SendMessage;
 use toron_core::nostr::Tag;
 use toron_mcp::workflow_host::{DispatchRequest, EffectDispatcher};
 use toron_workflow::engine::{
-    ActionInvocation, ActionPartition, ActionRunner, EffectRunner, ProviderErrorClass,
-    ProviderOutcome, RunJournal, RunPhase, RunTransition, capability_for_action_type,
-    classify_provider_error_msg, derive_effect_key, partition,
+    ActionInvocation, ActionPartition, EffectRunner, ProviderErrorClass, ProviderOutcome,
+    RunJournal, RunPhase, RunTransition, capability_for_action_type, classify_provider_error_msg,
+    derive_effect_key, partition,
 };
 use toron_workflow::identity::{action_digest_of, redact_value};
 use toron_workflow::stamp_workflow_emitted;
@@ -172,7 +172,7 @@ pub fn journal_store() -> Option<WorkflowEffectStore> {
 /// effect — a sink the inner runner does not perform is still reported by the
 /// engine's own bypass marker, not settled here.
 pub fn effect_runner(
-    inner: ActionRunner,
+    inner: EffectRunner,
     store: WorkflowEffectStore,
     plane: Option<MailPlane>,
 ) -> EffectRunner {
@@ -183,18 +183,20 @@ pub fn effect_runner(
             // that journaled it would claim an external effect nobody
             // performed, so it stays a pass-through (the engine's boundary
             // rejects a real misdispatch on its own).
-            return Ok(leaf_value((inner)(&inv.action)));
+            return Ok(leaf_value((inner)(inv)));
         };
         match sink {
             // The leaf runner is the provider: a real pane or a real
             // `__run-headless` subprocess performs the effect.
             SINK_JOB => {
-                let action = inv.action.clone();
                 let provider = inner.clone();
+                // Owned clone: the deferred box is 'static, so the
+                // provider cannot borrow the caller's invocation.
+                let owned = inv.clone();
                 Ok(fenced_outcome(dispatch_once(
                     &dispatcher,
                     inv,
-                    Box::new(move || provider_outcome((provider)(&action))),
+                    Box::new(move || provider_outcome((provider)(&owned))),
                 )))
             }
             // The mailbox is its own provider (flywheel's leaf runners record
@@ -435,7 +437,7 @@ pub struct Journals {
 /// plane, or `None` when no toron index is open — the engine then keeps its
 /// loud `bypassed-no-effect-runner` marker rather than a run that only looks
 /// journaled.
-pub fn journals(cfg: &crate::config::Config, inner: ActionRunner) -> Option<Journals> {
+pub fn journals(cfg: &crate::config::Config, inner: EffectRunner) -> Option<Journals> {
     // Mail first: when it is in-process it also builds the pool the journal
     // borrows, so the two share one connection instead of opening two.
     let plane = mail_plane(cfg);
@@ -839,7 +841,7 @@ mod tests {
     #[tokio::test]
     async fn journal_key_is_the_engine_boundary_derivation() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|_a: &Action| Ok(json!({ "ok": true })));
+        let inner: EffectRunner = Arc::new(|_inv: &ActionInvocation| Ok(json!({ "ok": true })));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(dispatch_job(), "run-key", "ship");
 
@@ -869,7 +871,7 @@ mod tests {
         let seen_c = seen.clone();
         let probe_store = store.clone();
         let probe_key = key.clone();
-        let inner: ActionRunner = Arc::new(move |_a: &Action| {
+        let inner: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
             let store = probe_store.clone();
             let k = probe_key.clone();
             let row = submit_journal_wait(async move { store.get_effect(&k).await })
@@ -894,7 +896,8 @@ mod tests {
     #[tokio::test]
     async fn settled_effect_journals_the_claim_and_settle_attempts() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|_a: &Action| Ok(json!({ "ok": true, "pane": "p1" })));
+        let inner: EffectRunner =
+            Arc::new(|_inv: &ActionInvocation| Ok(json!({ "ok": true, "pane": "p1" })));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(dispatch_job(), "run-settle", "ship");
 
@@ -921,8 +924,8 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_provider_error_journals_unknown_not_failed() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner =
-            Arc::new(|_a: &Action| Err(anyhow::anyhow!("connection reset by peer")));
+        let inner: EffectRunner =
+            Arc::new(|_inv: &ActionInvocation| Err(anyhow::anyhow!("connection reset by peer")));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(dispatch_job(), "run-amb", "ship");
 
@@ -951,8 +954,8 @@ mod tests {
     #[tokio::test]
     async fn proven_provider_error_journals_failed() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner =
-            Arc::new(|_a: &Action| Err(anyhow::anyhow!("unknown agent 'nobody'")));
+        let inner: EffectRunner =
+            Arc::new(|_inv: &ActionInvocation| Err(anyhow::anyhow!("unknown agent 'nobody'")));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(dispatch_job(), "run-fail", "ship");
 
@@ -974,7 +977,7 @@ mod tests {
         let (_dir, store) = test_store().await;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_c = calls.clone();
-        let inner: ActionRunner = Arc::new(move |_a: &Action| {
+        let inner: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
             calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({ "ok": true, "count": 7 }))
         });
@@ -1001,7 +1004,7 @@ mod tests {
     #[tokio::test]
     async fn runs_scope_effect_keys_so_identical_payloads_do_not_collide() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|_a: &Action| Ok(json!({ "ok": true })));
+        let inner: EffectRunner = Arc::new(|_inv: &ActionInvocation| Ok(json!({ "ok": true })));
         let fx = effect_runner(inner, store.clone(), None);
         let a = invocation(dispatch_job(), "run-a", "ship");
         let b = invocation(dispatch_job(), "run-b", "ship");
@@ -1036,7 +1039,8 @@ mod tests {
     #[tokio::test]
     async fn engine_control_actions_are_not_journaled() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|_a: &Action| Ok(json!({ "action": "delay" })));
+        let inner: EffectRunner =
+            Arc::new(|_inv: &ActionInvocation| Ok(json!({ "action": "delay" })));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(Action::Delay { secs: 0 }, "run-control", "wait");
 
@@ -1058,7 +1062,8 @@ mod tests {
     #[tokio::test]
     async fn mailbox_sink_without_a_sender_is_refused_not_performed() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(send_message(), "run-mail", "notify");
 
@@ -1091,7 +1096,8 @@ mod tests {
     async fn mailbox_sink_journals_intent_claim_settle_around_a_delivery() {
         let (_dir, store) = test_store().await;
         let seen: Arc<std::sync::Mutex<Vec<SendMessage>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), Some(recording_plane(seen.clone())));
         let inv = invocation(send_message(), "run-mail", "notify");
 
@@ -1151,7 +1157,8 @@ mod tests {
     async fn terminal_mailbox_effect_replays_without_resending() {
         let (_dir, store) = test_store().await;
         let seen: Arc<std::sync::Mutex<Vec<SendMessage>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), Some(recording_plane(seen.clone())));
         let inv = invocation(send_message(), "run-mail-replay", "notify");
 
@@ -1175,7 +1182,8 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_delivery_error_journals_unknown() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let plane = MailPlane {
             actor: Arc::new(|_p: &str| Ok("workflow-demo".to_string())),
             send: Arc::new(|_m: SendMessage| Err(anyhow::anyhow!("timeout waiting for relay"))),
@@ -1220,7 +1228,8 @@ mod tests {
         drop(mailbox);
         let plane = mail_plane(&crate::config::Config::default())
             .expect("the default config is the in-process plane");
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), Some(plane));
         let inv = invocation(send_message(), "run-mail-live", "notify");
 
@@ -1248,7 +1257,8 @@ mod tests {
     #[tokio::test]
     async fn verify_sink_journals_around_the_engine_observed_result() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), None);
         let mut inv = invocation(verify(), "run-verify", "gate");
         inv.run.provider_result = Some(json!({
@@ -1276,7 +1286,8 @@ mod tests {
     #[tokio::test]
     async fn failed_verify_journals_failed_not_unknown() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), None);
         let mut inv = invocation(verify(), "run-verify-red", "gate");
         inv.run.provider_result =
@@ -1299,7 +1310,8 @@ mod tests {
     #[tokio::test]
     async fn verify_without_an_observed_result_is_refused_not_settled() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(verify(), "run-verify-nores", "gate");
 
@@ -1325,7 +1337,8 @@ mod tests {
     #[tokio::test]
     async fn terminal_verify_effect_replays_without_rerunning() {
         let (_dir, store) = test_store().await;
-        let inner: ActionRunner = Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), None);
         let mut inv = invocation(verify(), "run-verify-replay", "gate");
         inv.run.provider_result = Some(json!({ "ok": true, "exit": 0 }));
@@ -1450,7 +1463,7 @@ mod tests {
             journal(&transition("run-life-2", "ship", phase));
         }
         // An effect row for the SAME run, through the same store.
-        let inner: ActionRunner = Arc::new(|_a: &Action| Ok(json!({ "ok": true })));
+        let inner: EffectRunner = Arc::new(|_inv: &ActionInvocation| Ok(json!({ "ok": true })));
         let fx = effect_runner(inner, store.clone(), None);
         let inv = invocation(dispatch_job(), "run-life-2", "ship");
         fx(&inv).expect("runner returns a value");

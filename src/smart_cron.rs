@@ -152,14 +152,9 @@ steps:
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Arc;
 
-    use toron_workflow::engine::{ActionRunner, WorkflowEngine};
+    use toron_workflow::engine::WorkflowEngine;
     use toron_workflow::schema::{Action, parse_workflow};
-
-    fn noop_runner() -> ActionRunner {
-        Arc::new(|_a: &Action| Ok(serde_json::Value::Null))
-    }
 
     fn collect_profiles(wf: &toron_workflow::schema::Workflow, cb: &mut dyn FnMut(&str)) {
         use toron_workflow::schema::Step;
@@ -294,7 +289,7 @@ mod tests {
     /// framework can RUN the sagas once P4.3 lands).
     #[tokio::test]
     async fn design_workflows_are_invocable() {
-        let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+        let engine = WorkflowEngine::local().expect("engine");
         for (name, yaml) in DESIGN_WORKFLOWS {
             let wf = parse_workflow(yaml).unwrap();
             let inputs = if name == &"housekeeper-diagnose" {

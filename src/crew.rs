@@ -1438,11 +1438,13 @@ mod tests {
     /// invoked with no time bound at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn bounded_invoke_enforces_wall_clock_cap() {
-        let runner: toron_workflow::ActionRunner = std::sync::Arc::new(|_a: &Action| {
-            std::thread::sleep(std::time::Duration::from_millis(700));
-            Ok(serde_json::json!({ "ok": true }))
-        });
-        let engine = toron_workflow::WorkflowEngine::local(runner).expect("local engine");
+        let runner: toron_workflow::engine::EffectRunner =
+            std::sync::Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                Ok(serde_json::json!({ "ok": true }))
+            });
+        let engine = toron_workflow::WorkflowEngine::local_with_effect_runner(Some(runner))
+            .expect("local engine");
         let wf = parse_workflow(
             "name: t\nsteps:\n  - name: a\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n  - name: b\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n",
         )
@@ -1456,9 +1458,12 @@ mod tests {
         );
         // Control: the same helper under a generous cap completes normally —
         // the bound is a budget, not a blanket failure.
-        let fast: toron_workflow::ActionRunner =
-            std::sync::Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-        let engine2 = toron_workflow::WorkflowEngine::local(fast).expect("local engine 2");
+        let fast: toron_workflow::engine::EffectRunner =
+            std::sync::Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
+                Ok(serde_json::json!({ "ok": true }))
+            });
+        let engine2 = toron_workflow::WorkflowEngine::local_with_effect_runner(Some(fast))
+            .expect("local engine 2");
         let wf2 = parse_workflow(
             "name: t\nsteps:\n  - name: a\n    action: send_message\n    to: [x]\n    subject: s\n    body: b\n",
         )
@@ -1709,7 +1714,7 @@ steps:
     /// Bare parts default FailRun (bd-gs005 — red fails the run, not silent green).
     #[test]
     fn compose_workflow_assembles_parts_and_lints_clean() {
-        use toron_workflow::schema::{Action, StepOnError};
+        use toron_workflow::schema::StepOnError;
         let parts = vec![
             ComposePart::Dispatch {
                 role: "scout".into(),
@@ -1888,7 +1893,7 @@ steps:
     /// not by silently downgrading FailRun at compose.
     #[test]
     fn t1_compose_grammar_parts_assemble_actions() {
-        use toron_workflow::schema::{Action, StepOnError};
+        use toron_workflow::schema::StepOnError;
         let lib = crate::stages::StageLibrary::compiled_in();
         let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
         let parts: Vec<ComposePart> = [
@@ -2856,7 +2861,7 @@ steps:
     /// part fails the run (R-E1/R-E3 downgrade handles retry-on-blocked at lint).
     #[tokio::test]
     async fn bare_dispatch_red_fails_composed_workflow_not_silent_green() {
-        use toron_workflow::schema::{Action, StepOnError};
+        use toron_workflow::schema::StepOnError;
         // Single bare dispatch part via compose.
         let part = parse_compose_part("coder:systematic-execute").unwrap();
         let wf = compose_workflow("composed-bare-red", "fix the bug", None, &[part]).unwrap();
@@ -2867,14 +2872,22 @@ steps:
             "bare dispatch is FailRun"
         );
         // Runner that fails the dispatch step (red).
-        let runner: toron_workflow::ActionRunner = std::sync::Arc::new(|a: &Action| {
-            if matches!(a, Action::DispatchJob { .. }) {
-                Ok(serde_json::json!({ "ok": false, "error": "simulated red", "kind": "unknown" }))
-            } else {
-                Ok(serde_json::json!({ "ok": true }))
-            }
-        });
-        let engine = toron_workflow::WorkflowEngine::local(runner).expect("engine");
+        let runner: toron_workflow::engine::EffectRunner = std::sync::Arc::new(
+            |inv: &toron_workflow::engine::ActionInvocation| {
+                if matches!(
+                    &inv.action,
+                    toron_workflow::schema::Action::DispatchJob { .. }
+                ) {
+                    Ok(
+                        serde_json::json!({ "ok": false, "error": "simulated red", "kind": "unknown" }),
+                    )
+                } else {
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+            },
+        );
+        let engine =
+            toron_workflow::WorkflowEngine::local_with_effect_runner(Some(runner)).expect("engine");
         let out = engine
             .run(
                 "bare-red-1",
@@ -2895,9 +2908,12 @@ steps:
             "{out}"
         );
         // Green control: same workflow with ok runner succeeds.
-        let ok_runner: toron_workflow::ActionRunner =
-            std::sync::Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-        let engine2 = toron_workflow::WorkflowEngine::local(ok_runner).expect("engine2");
+        let ok_runner: toron_workflow::engine::EffectRunner =
+            std::sync::Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
+                Ok(serde_json::json!({ "ok": true }))
+            });
+        let engine2 = toron_workflow::WorkflowEngine::local_with_effect_runner(Some(ok_runner))
+            .expect("engine2");
         let part2 = parse_compose_part("coder:systematic-execute").unwrap();
         let wf2 = compose_workflow("composed-bare-green", "fix the bug", None, &[part2]).unwrap();
         let out2 = engine2
@@ -2924,7 +2940,7 @@ steps:
     #[tokio::test]
     async fn compose_dispatch_plus_verify_red_fails_and_sink_not_missing() {
         use std::sync::{Arc, Mutex};
-        use toron_workflow::schema::{Action, StepOnError};
+        use toron_workflow::schema::StepOnError;
         // Compose one bare dispatch, then append a verify step (the pattern
         // `compose --run` produces when a verify stage is included).
         let part = parse_compose_part("coder:systematic-execute").unwrap();
@@ -2941,9 +2957,12 @@ steps:
             },
         });
         // Runner succeeds on dispatch; verify outcome comes from the sink.
-        let runner: toron_workflow::ActionRunner =
-            Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-        let engine = toron_workflow::WorkflowEngine::local(runner).expect("engine");
+        let runner: toron_workflow::engine::EffectRunner =
+            Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
+                Ok(serde_json::json!({ "ok": true }))
+            });
+        let engine =
+            toron_workflow::WorkflowEngine::local_with_effect_runner(Some(runner)).expect("engine");
         // Attach a RED verify sink (simulates `cargo test` failing).
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_c = seen.clone();
@@ -2986,9 +3005,12 @@ steps:
                 .contains("verify sink missing"),
             "sink must be attached, not missing: {out}"
         );
-        let runner2: toron_workflow::ActionRunner =
-            Arc::new(|_a: &Action| Ok(serde_json::json!({ "ok": true })));
-        let engine2 = toron_workflow::WorkflowEngine::local(runner2).expect("engine2");
+        let runner2: toron_workflow::engine::EffectRunner =
+            Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
+                Ok(serde_json::json!({ "ok": true }))
+            });
+        let engine2 = toron_workflow::WorkflowEngine::local_with_effect_runner(Some(runner2))
+            .expect("engine2");
         let sink2 = toron_workflow::engine::VerifySink::default();
         *sink2.0.lock().unwrap() =
             Some(Arc::new(|_req: &toron_workflow::engine::VerifyRequest| {

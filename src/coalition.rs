@@ -389,10 +389,7 @@ impl CoalitionStore {
         // execution of goal steps is `workflow run <goal> --execute`).
         let rt = runtime()?;
         let run_output = rt.block_on(async {
-            let runner: toron_workflow::ActionRunner =
-                Arc::new(|a: &toron_workflow::Action| Ok(json!({ "action": a.type_name() })));
             let engine = toron_workflow::WorkflowEngine::local_with(
-                runner,
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
             )?;
             engine.invoke(&run_id, wf.clone(), json!({})).await
