@@ -892,6 +892,18 @@ fn build_decision(entry: &RouteEntry, target: &str, snap: &Snapshot) -> Decision
 /// `decide` is the classifier leaf: it resolves the one routing table and
 /// applies the crew budget. Briefing consumes its output directly.
 pub fn decide(target: &str, snap: &Snapshot) -> Decision {
+    // bd-0bf8: beadless profile-only goals never ride wave-swarm — its gate
+    // and verify assume beads by construction. A lone --profile with no
+    // ready beads is one-pane work, so short-circuit to the spawn-send row
+    // before earliest-match can let an incidental "wave-swarm" claim it.
+    // With beads the declared trigger still routes via the table below.
+    if snap.ready_bead_count == 0 && target.to_ascii_lowercase().contains("--profile") {
+        if let Some(entry) = ROUTING_TABLE.iter().find(|e| e.primitive == "spawn-send") {
+            let mut d = build_decision(entry, target, snap);
+            apply_crew_budget(&mut d, target);
+            return d;
+        }
+    }
     let mut d = classify(target, snap);
     apply_crew_budget(&mut d, target);
     d
@@ -1319,6 +1331,29 @@ mod tests {
         assert!(
             d.argv.windows(2).any(|w| w == ["--crew", "3"]),
             "{:?}",
+            d.argv
+        );
+    }
+
+    // bd-0bf8: beadless profile-only goals never ride wave-swarm (its gate
+    // and verify assume beads by construction). A lone --profile with no
+    // ready beads is one-pane work -> spawn-send, even when the goal
+    // mentions wave-swarm. With beads, the declared trigger still routes.
+    #[test]
+    fn beadless_profile_only_is_not_wave_swarm() {
+        for t in ["spawn --profile coder", "wave-swarm --profile coder"] {
+            let d = decide(t, &with_beads(0));
+            assert_eq!(
+                d.primitive, "spawn-send",
+                "target: {t} argv: {:?}",
+                d.argv
+            );
+            assert_eq!(d.topology, "open", "target: {t}");
+        }
+        let d = decide("wave-swarm --profile coder", &with_beads(3));
+        assert_eq!(
+            d.primitive, "wave-swarm",
+            "declared trigger with beads still routes: {:?}",
             d.argv
         );
     }
