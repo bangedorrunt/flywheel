@@ -1,6 +1,6 @@
 # Functional effect-kernel discipline
 
-This guide is the operational contract for ADR-0016. It is intentionally shorter than the ADR: use the ADR for rationale and migration history, and this page while editing code.
+This page is the contract for reducers, journals, and interpreters. Use it while editing code. Rationale and migration history live in `docs/decisions/0016-functional-effect-kernel-redesign.md`.
 
 ## The boundary
 
@@ -40,7 +40,7 @@ wire / CLI / timer / process observation
 
 **9. Determinism is observable.** Same model plus same message produces the same next model and command sequence. Output-affecting maps are ordered. New reducer paths require same-log/same-effects coverage.
 
-**10. Bound all work.** Network, subprocess, retry, queue, digest, and recursion paths have explicit limits. A fallback is a typed transition, not an unbounded loop. The order on a remote command is ADR-0016 §5: fallback outside, budget timeout around the retry, breaker inside the retry, attempt timeout on the call. Interruption is not `Unknown` and not a typed provider failure.
+**10. Bound all work.** Network, subprocess, retry, queue, digest, and recursion paths have explicit limits. A fallback is a typed transition, not an unbounded loop. The order on a remote command is fallback outside, breaker inside the retry, budget timeout around the chain, attempt timeout on the call. Interruption is not `Unknown` and not a typed provider failure.
 
 **11. Parse at the edge.** External strings and JSON become validated kernel values at the boundary. Internal code should not repeatedly re-interpret raw identifiers or invent defaults for malformed values. Use `kernel::ActionStage` at typed call sites; retain string conversion only at stable wire/reporting fields.
 
@@ -88,15 +88,15 @@ mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
 ```
 
-A green compile is not enough. The ADR phase is complete only when its behavior witness, replay/parity evidence, and required gate are green.
+A green compile is not enough. A phase is complete only when its behavior witness, replay/parity evidence, and required gate are green.
 
 ## Current audit status
 
-As of 2026-09-22, the reducer/Tick Law and serialized-policy boundaries pass fresh audit and the full workspace gates are green. The broader ADR remains **conditionally compliant** until legacy Jev authority helpers are fully threaded from the entrypoint and durable effect leaves receive injected wall/monotonic clocks instead of sampling them directly. Those reads are outside reducers and do not invalidate replay witnesses, but they are still migration work under the strict authority contract.
+As of 2026-09-22, the reducer/Tick Law and serialized-policy boundaries pass fresh audit and the full workspace gates are green. The kernel remains **conditionally compliant** until legacy Jev authority helpers are fully threaded from the entrypoint and durable effect leaves receive injected wall/monotonic clocks instead of sampling them directly. Those reads are outside reducers and do not invalidate replay witnesses, but they are still migration work under the strict authority contract.
 
 ## Related sources
 
-- [ADR-0016](../decisions/0016-functional-effect-kernel-redesign.md)
+- [Effect kernel decision record](../decisions/0016-functional-effect-kernel-redesign.md)
 - [Doorbell guide](../guides/doorbell.mdx)
 - [Session door](../guides/session-door.mdx)
 - [Judgment packs](../guides/judgment-packs.mdx)

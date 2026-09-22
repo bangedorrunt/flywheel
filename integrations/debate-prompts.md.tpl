@@ -1,4 +1,4 @@
-# Debate-loop prompt templates (bd-pattern-debate-loop)
+# Debate-loop prompt templates 
 
 Templates for the N-round A/B debate + judge recipe. Each prompt is delivered
 via `send_message` on thread `debate-<ts>` (thread continuity) with
@@ -44,5 +44,5 @@ why it is stronger. Reply in thread {thread} and acknowledge when done.
 
 - Every prompt carries `ack_required=true`; turn advancement is ack-gated.
 - The proposition appears ONLY in the opening + judge prompts (counters
-  reference the prior reply, per ADR-0001 s9.1, since long prompts degrade quality).
+  reference the prior reply, since long prompts degrade quality).
 - The judge uses `summarize_thread`, not raw message scrolling.

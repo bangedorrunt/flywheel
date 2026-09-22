@@ -16,7 +16,7 @@ On material mid-session triggers (new AUTHORITATIVE objective, explicit topology
 
 ## The loop
 
-0. ARRIVE then BRIEF (ADR-0011): `flywheel arrive <project> --as <pin>`
+0. ARRIVE then BRIEF: `flywheel arrive <project> --as <pin>`
    then `flywheel briefing "<objective>" --project <p> --json`. Join
    topology -> do not start a second loop; loop -> continue. `decide`
    is the leaf inside briefing. Before each managed run, confirm
@@ -69,7 +69,7 @@ On material mid-session triggers (new AUTHORITATIVE objective, explicit topology
 7. PROMOTE (optional): /swarm-mode only on operator choice; solo stays
    one harness + reviewer.
 
-## NO HARNESS-NATIVE DELEGATION (ADR-0010 D13)
+## NO HARNESS-NATIVE DELEGATION 
 
 The loop pane owns the dispatcher: no harness-native delegation
 tools (agent/subagent/task/spawn/dispatch/worktree/delegate-shaped).

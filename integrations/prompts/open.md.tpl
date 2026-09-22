@@ -33,7 +33,7 @@ unless the operator overrides. Do not invent model ids or bypass registry
 compatibility. For direct in-pane work, keep using the current harness/model
 unless the operator requests a change.
 
-## Arrive then brief (ADR-0011)
+## Arrive then brief 
 
 Session start is `flywheel arrive <project> --as <pin>` then
 `flywheel briefing "<objective>" --project <p> --json`. Open-mode
@@ -117,7 +117,7 @@ Continue the supplied task. Report what you changed and what you verified;
 do not claim bead closure or swarm completion unless those actions were
 explicitly performed.
 
-## NO HARNESS-NATIVE DELEGATION (ADR-0010 D13)
+## NO HARNESS-NATIVE DELEGATION 
 
 Open-mode panes can own a dispatcher (peer-aware). Do not spawn work through
 harness-native delegation tools (agent/subagent/task/workflow/spawn/dispatch/
