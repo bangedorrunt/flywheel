@@ -6140,11 +6140,11 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     // bd-0cet: the flood guard's memory is the persisted Spec-5 Wake table
     // (crash-safe via ActiveLoop, seeded below like dispatch_pending) —
     // a restart no longer re-trips on the batch it already paused.
-    let mut wake_table: doorbell_core::wake_table::WakeTable = {
+    let mut wake: doorbell_core::wake_core::WakeModel = {
         if let Ok(Some(al)) = crate::state::load_active_loop(&params.project) {
             al.wake.clone()
         } else {
-            doorbell_core::wake_table::WakeTable::default()
+            doorbell_core::wake_core::WakeModel::default()
         }
     };
 
@@ -6668,14 +6668,29 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // this invocation.
             let candidate_ids: Vec<String> = to_assign.iter().map(|b| b.id.clone()).collect();
             let total = candidate_ids.len();
-            let (next_table, gate) =
-                doorbell_core::wake_table::flood_decide(wake_table, &candidate_ids);
-            wake_table = next_table;
-            if let doorbell_core::wake_table::GateDecision::Pause { unseen } = &gate {
+            // bd-0nem: single fold through the fenced kernel (was a direct
+            // free-fn call; same verdict, journal-shaped effects).
+            let (next_table, effects) = doorbell_core::wake_core::tick(
+                &wake,
+                &doorbell_core::wake_core::WakeMsg::FloodCheck { ids: candidate_ids },
+            );
+            wake = next_table;
+            let gate = effects.into_iter().find_map(|e| match e {
+                doorbell_core::wake_core::WakeEffect::FloodVerdict { gate } => Some(gate),
+                _ => None,
+            });
+            let mut paused = false;
+            if let Some(gate) = gate.as_ref()
+                && let doorbell_core::wake_core::FloodGate::Pause { unseen } = gate
+            {
                 eprintln!(
                     "flywheel: CRITICAL: {}",
-                    doorbell_core::wake_table::why_flood(&gate, total, unseen.len())
+                    doorbell_core::wake_core::why_flood(gate, total, unseen.len())
                 );
+                paused = true;
+            }
+            if paused {
+                // Pause: nothing dispatched this poll (logged above).
             } else if serialize_all {
                 eprintln!(
                     "flywheel: always-serialize path held ({}) — no new ready-bead dispatch this poll (ADR-0019 Spec 3.5; serialized until the holder releases)",
@@ -7508,7 +7523,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             al.dispatch_pending = dispatch_pending.clone();
             // bd-0cet: the wake table persists per poll (flood-guard and
             // AckSLA memory survive crash-resume via the ActiveLoop file).
-            al.wake = wake_table.clone();
+            al.wake = wake.clone();
             // bd-55nx.8: done-mail dedup is crash-safe Model state.
             al.done_mailed = swarm.done_mailed.clone();
             // bd-zfnx.10: open drains are crash-safe Model state (name →
@@ -11044,15 +11059,15 @@ mod tests {
     /// Decided by the persisted Wake table now (was free fns + loop set).
     #[test]
     fn bead_flood_verdict_threshold() {
-        use doorbell_core::wake_table::{GateDecision, WakeTable, flood_decide};
+        use doorbell_core::wake_core::{FloodGate, WakeModel, flood_decide};
         let ids = |n: usize| (0..n).map(|i| format!("bd-t{i}")).collect::<Vec<_>>();
         for n in [0, 3, 6] {
-            let (_, d) = flood_decide(WakeTable::default(), &ids(n));
-            assert!(matches!(d, GateDecision::Proceed), "{n} proceeds");
+            let (_, d) = flood_decide(WakeModel::default(), &ids(n));
+            assert!(matches!(d, FloodGate::Proceed), "{n} proceeds");
         }
         for n in [7, 40] {
-            let (_, d) = flood_decide(WakeTable::default(), &ids(n));
-            assert!(matches!(d, GateDecision::Pause { .. }), "{n} pauses");
+            let (_, d) = flood_decide(WakeModel::default(), &ids(n));
+            assert!(matches!(d, FloodGate::Pause { .. }), "{n} pauses");
         }
     }
 
@@ -11063,7 +11078,7 @@ mod tests {
     /// ActiveLoop, so crash-resume inherits the absorption.
     #[test]
     fn flood_new_count_absorbs_paused_batch_and_catches_runaway() {
-        use doorbell_core::wake_table::{GateDecision, WakeTable, flood_decide};
+        use doorbell_core::wake_core::{FloodGate, WakeModel, flood_decide};
         let rb = |id: &str| ReadyBead {
             id: id.into(),
             title: String::new(),
@@ -11085,27 +11100,27 @@ mod tests {
             rb("bd-g"),
         ];
         let ids: Vec<String> = batch.iter().map(|b| b.id.clone()).collect();
-        let (t, first) = flood_decide(WakeTable::default(), &ids);
+        let (t, first) = flood_decide(WakeModel::default(), &ids);
         assert!(
-            matches!(first, GateDecision::Pause { .. }),
+            matches!(first, FloodGate::Pause { .. }),
             "fresh flood-sized batch trips the pause"
         );
         let (t, second) = flood_decide(t, &ids);
         assert!(
-            matches!(second, GateDecision::Proceed),
+            matches!(second, FloodGate::Proceed),
             "paused batch dispatches on the next poll (no repeat pause)"
         );
         // One NEW id alone is below threshold and proceeds; a fresh
         // flood-sized wave pauses again (the runaway signature).
         let (_, single) = flood_decide(t.clone(), &[rb("bd-runaway").id]);
         assert!(
-            matches!(single, GateDecision::Proceed),
+            matches!(single, FloodGate::Proceed),
             "a lone new id proceeds"
         );
         let fresh: Vec<String> = (0..7).map(|i| format!("bd-fresh{i}")).collect();
         let (_, runaway_flood) = flood_decide(t, &fresh);
         assert!(
-            matches!(runaway_flood, GateDecision::Pause { .. }),
+            matches!(runaway_flood, FloodGate::Pause { .. }),
             "a fresh flood-sized wave still trips"
         );
     }

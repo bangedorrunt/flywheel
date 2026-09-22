@@ -210,11 +210,10 @@ pub fn open_decisions(model: &WorkspaceModel) -> Vec<OpenDecision> {
 // the established names so snapshots and existing callers remain unchanged.
 pub use crate::workspace_reporting::{Divergence, DivergenceSpec};
 /// Single-home re-exports (bd-fuql): wake-state types + pure folds live in
-/// `doorbell_core::wake_table`; the tick borrows them through these names
+/// `doorbell_core::wake_core`; the tick borrows them through these names
 /// so external users (`main.rs` digest rendering) keep resolving.
-pub use doorbell_core::wake_table::{
-    DigestEntry, PresentedWake, ReringDecision, ReringEntry, digest_detail_truncate,
-    render_digest,
+pub use doorbell_core::wake_core::{
+    DigestEntry, PresentedWake, ReringDecision, ReringEntry, digest_detail_truncate, render_digest,
 };
 
 // Divergence variants remain part of this source-level contract:
@@ -264,9 +263,9 @@ pub struct WorkspaceModel {
     pub seq: u64,
     /// ONE wake home (bd-fuql): WaitCorr waits, ladder entries, shown
     /// wakes, and pending digests live in this
-    /// table (`doorbell_core::wake_table`) — D1/D2/D5 contracts unchanged,
+    /// table (`doorbell_core::wake_core`) — D1/D2/D5 contracts unchanged,
     /// single persistence, single decision, single why.
-    pub wake: doorbell_core::wake_table::WakeTable,
+    pub wake: doorbell_core::wake_core::WakeModel,
     /// ADR-0010 D2 (bd-8jlv): ack watermark per pin — highest handled
     /// presentation seq. Entries with seq <= watermark are handled fact.
     pub wake_acked: std::collections::BTreeMap<String, u64>,
@@ -4975,7 +4974,7 @@ mod adr0010_d1_tests {
     /// scratch table with the file defaults (production goes through
     /// `model.wake.ladder_step` with live policy values).
     fn ladder_due(e: &ReringEntry, now: u64, verdict: &str) -> ReringDecision {
-        let mut wake = doorbell_core::wake_table::WakeTable::default();
+        let mut wake = doorbell_core::wake_core::WakeModel::default();
         wake.ladders.insert("t".to_string(), e.clone());
         wake.ladder_step(
             "t",
