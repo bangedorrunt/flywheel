@@ -262,9 +262,10 @@ pub struct WorkspaceModel {
     pub open_human: BTreeMap<String, Question>,
     pub seq: u64,
     /// ONE wake home (bd-fuql): WaitCorr waits, ladder entries, shown
-    /// presented wakes, `digest_queue`, and pending digests live in this
-    /// table (`doorbell_core::wake_core`) — D1/D2/D5 contracts unchanged,
-    /// single persistence, single decision, single why.
+    /// wakes, and pending digests live in this table
+    /// (`doorbell_core::wake_core`: `waits`/`ladders`/`shown`/`digests`) —
+    /// D1/D2/D5 contracts unchanged, single persistence, single decision,
+    /// single why.
     pub wake: doorbell_core::wake_core::WakeModel,
     /// ADR-0010 D2 (bd-8jlv): ack watermark per pin — highest handled
     /// presentation seq. Entries with seq <= watermark are handled fact.
@@ -1845,8 +1846,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             // ring per grace window; past max rings Dead→respawn and
             // Unknown→digest. Acked / fire-and-forget entries leave
             // without a sound. Presence is read-only here; the enum
-            // itself stays Lane-2 (bd-s8bo) owned. The ladder is the
-            // `next.rering`-equivalent state carried by `next.wake`.
+            // itself stays Lane-2 (bd-s8bo) owned. The ladder entries live
+            // in `next.wake.ladders`.
             let corrs: Vec<String> = next.wake.ladders.keys().cloned().collect();
             for corr in corrs {
                 let Some(entry) = next.wake.ladders.get(&corr).cloned() else {
