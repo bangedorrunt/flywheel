@@ -177,7 +177,7 @@ pub struct Question {
 // open_human IS the captain-hold cache (single store — no second table).
 // The fold below renders every open decision until an answer/--verdict
 // clears it (apply_human_decision is the only remover). Teardown, kill,
-// corr TTL, and pending_wait expiry never close a call: expiry PROMOTES
+// corr TTL, and wait expiry never closes a call: expiry PROMOTES
 // into open_human (re-surface, never drop). Divergence rows only report.
 // ---------------------------------------------------------------------------
 
@@ -209,6 +209,13 @@ pub fn open_decisions(model: &WorkspaceModel) -> Vec<OpenDecision> {
 // Read-side divergence reporting is kept outside the live reducer. Re-export
 // the established names so snapshots and existing callers remain unchanged.
 pub use crate::workspace_reporting::{Divergence, DivergenceSpec};
+/// Single-home re-exports (bd-fuql): wake-state types + pure folds live in
+/// `doorbell_core::wake_table`; the tick borrows them through these names
+/// so external users (`main.rs` digest rendering) keep resolving.
+pub use doorbell_core::wake_table::{
+    DigestEntry, PresentedWake, ReringDecision, ReringEntry, digest_detail_truncate,
+    render_digest,
+};
 
 // Divergence variants remain part of this source-level contract:
 // ClosedBeadOpenCorr, AnsweredCorrHeldBead, DoneWithoutLegalClose.
@@ -255,29 +262,14 @@ pub struct WorkspaceModel {
     pub presence: BTreeMap<String, Presence>,
     pub open_human: BTreeMap<String, Question>,
     pub seq: u64,
-    /// WaitCorr corrs whose receipt has not landed yet (fast-path re-peek
-    /// on WATCH batches only, GS-016: never the 1s sweep), with deadline
-    /// unix secs (bd-zfnx.6: bounded — TTL + cap, never an
-    /// unbounded set). The doorbell dispatcher owns this cache; swarm
-    /// never reads it. Expiry/cap-eviction happens in the Sweep arm and
-    /// always records Cmd::Audit wait-timeout (never silent drop).
-    pub pending_wait: std::collections::BTreeMap<String, u64>,
-    /// ADR-0010 D1 (bd-w98c): re-ring ladder entries by corr. The
-    /// dispatcher owns this cache; swarm never reads it. Entries are
-    /// advanced on the AckSlaTick beat; registration rides the InboxRows
-    /// fold (SlaFired hit list → FetchInbox → overdue corr rows) — the
-    /// cross-process residual is closed (2026-09-17).
-    pub rering: std::collections::BTreeMap<String, ReringEntry>,
-    /// ADR-0010 D2 (bd-8jlv): presented-but-unacked wakes per pin.
-    /// Derived deterministically from the Msg log, so crash-resume
-    /// refold reproduces it exactly (replay drops nothing, dups nothing).
-    pub presented: std::collections::BTreeMap<String, Vec<PresentedWake>>,
+    /// ONE wake home (bd-fuql): WaitCorr waits, ladder entries, shown
+    /// wakes, and pending digests live in this
+    /// table (`doorbell_core::wake_table`) — D1/D2/D5 contracts unchanged,
+    /// single persistence, single decision, single why.
+    pub wake: doorbell_core::wake_table::WakeTable,
     /// ADR-0010 D2 (bd-8jlv): ack watermark per pin — highest handled
     /// presentation seq. Entries with seq <= watermark are handled fact.
     pub wake_acked: std::collections::BTreeMap<String, u64>,
-    /// ADR-0010 D5 (bd-65he): captain-relevant wakes awaiting the afk
-    /// digest batch. Drained into Cmd::Digest on interval/threshold.
-    pub digest_queue: Vec<DigestEntry>,
     /// ADR-0010 D5 (bd-65he): per-class tick counts (journal+counter
     /// for routine; proves benign/routine classes spend zero prompts).
     pub wake_counters: std::collections::BTreeMap<String, u64>,
@@ -302,14 +294,6 @@ impl WorkspaceModel {
             ..Self::default()
         }
     }
-}
-
-/// ADR-0010 D2 (bd-8jlv): one presented wake — the line as prompted,
-/// bound to the tick generation that presented it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PresentedWake {
-    pub seq: u64,
-    pub line: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -404,70 +388,6 @@ pub fn classify_cmd(cmd: &Cmd) -> WakeClass {
     }
 }
 
-/// One captain-relevant wake awaiting the digest batch.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DigestEntry {
-    pub seq: u64,
-    /// Last wall-clock seen when recorded (0 = before any clock Msg).
-    pub at_unix: u64,
-    pub kind: String,
-    pub pin: String,
-    pub detail: String,
-}
-
-/// Digest detail is bounded: prompt lines can be long, the queue is not
-/// a log. Truncation is marked.
-pub fn digest_detail_truncate(detail: &str) -> String {
-    const MAX: usize = 200;
-    if detail.len() <= MAX {
-        return detail.to_string();
-    }
-    format!("{}…[{} chars]", &detail[..MAX], detail.len())
-}
-
-/// Extract bead ids (`bd-…` tokens) from digest details, sorted dedup.
-pub fn digest_bead_ids(entries: &[DigestEntry]) -> Vec<String> {
-    let mut ids: Vec<String> = entries
-        .iter()
-        .flat_map(|e| e.detail.split(|c: char| !c.is_alphanumeric() && c != '-'))
-        .filter(|t| t.starts_with("bd-") && t.len() > 3)
-        .map(str::to_string)
-        .collect();
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
-/// Render the afk digest: outcomes first with ages, bead ids kept,
-/// exact commands last. Pure — the afk CLI and the Digest effect share it.
-pub fn render_digest(entries: &[DigestEntry], now: u64) -> String {
-    let mut out = format!("doorbell afk digest ({} items)\n", entries.len());
-    for e in entries {
-        // bd-z5ut: `at_unix == 0` means "recorded before any clock Msg in this
-        // fold", NOT "56 years ago". Subtracting it printed a raw epoch value
-        // dressed as a duration, which is worse than admitting the unknown.
-        let age = match e.at_unix {
-            0 => "age unknown".to_string(),
-            t => format!("{}s ago", now.saturating_sub(t)),
-        };
-        let _ = writeln!(out, "- [{age}] {} {}: {}", e.kind, e.pin, e.detail);
-    }
-    let beads = digest_bead_ids(entries);
-    if beads.is_empty() {
-        out.push_str("beads: none in this digest\n");
-    } else {
-        let _ = writeln!(out, "beads: {}", beads.join(", "));
-    }
-    out.push_str("commands:\n");
-    for b in &beads {
-        let _ = writeln!(out, "  br show {b}");
-    }
-    if beads.is_empty() {
-        out.push_str("  (no bead commands)\n");
-    }
-    out
-}
-
 /// Wedge alarm: a non-empty queue older than two batch intervals means
 /// the digest path cannot deliver — fail loud, never silently batch.
 pub fn digest_overdue(queue_len: usize, last_digest_unix: u64, now: u64) -> bool {
@@ -488,12 +408,13 @@ pub fn digest_overdue_with_policy(
     queue_len > 0 && now.saturating_sub(last_digest_unix) > 2 * policy.digest_interval_secs
 }
 
-/// bd-2fxx: deadline-attached holds. The pending_wait value IS the
+/// bd-2fxx: deadline-attached holds. The wait value IS the
 /// needed-by unix secs (stamped now+TTL at the WaitCorr effect site,
 /// decided in the Sweep arm). No new store: these folds read it.
 pub fn sorted_holds(model: &WorkspaceModel) -> Vec<(String, u64)> {
     let mut holds: Vec<(String, u64)> = model
-        .pending_wait
+        .wake
+        .waits
         .iter()
         .map(|(c, d)| (c.clone(), *d))
         .collect();
@@ -603,82 +524,6 @@ fn inbox_row_ack_overdue(row: &serde_json::Value) -> bool {
     )
 }
 
-/// One tracked delivery: a toron corr awaiting its crew ack.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReringEntry {
-    pub pin: String,
-    /// Rings already emitted for this corr.
-    pub attempts: u32,
-    /// Unix secs of the current grace window start.
-    pub window_start_unix: u64,
-    /// Acked corrs skip the ladder (handling fact already observed).
-    pub acked: bool,
-    /// --fire-and-forget deliveries never climb the ladder.
-    pub fire_and_forget: bool,
-    /// --raw without an id rings once and never escalates.
-    pub raw_without_id: bool,
-}
-
-/// Ladder outcome for one corr at one tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReringDecision {
-    /// Emit ring number `attempt` (0-based) now; caller bumps the entry.
-    Ring { attempt: u32 },
-    /// Past max rings and the pane is Dead → respawn path.
-    RecoverDead,
-    /// Past max rings and the pane is Unknown → digest (no prompt).
-    DigestUnknown,
-    /// Inside a grace window: nothing due yet.
-    Pending,
-    /// Opt-out: acked, fire-and-forget, or raw already rang once.
-    Skip,
-}
-
-/// Pure ladder step. `verdict` is the pin's current presence verdict
-/// ("Dead" / "Unknown" / other) — read by the tick arm, never
-/// constructed here, so the Presence enum stays Lane-2 owned.
-#[allow(dead_code)]
-pub fn rering_due(entry: &ReringEntry, now: u64, verdict: &str) -> ReringDecision {
-    rering_due_with_policy(
-        entry,
-        now,
-        verdict,
-        &crate::workspace_policy::WorkspacePolicy::default(),
-    )
-}
-
-pub fn rering_due_with_policy(
-    entry: &ReringEntry,
-    now: u64,
-    verdict: &str,
-    policy: &crate::workspace_policy::WorkspacePolicy,
-) -> ReringDecision {
-    if entry.acked || entry.fire_and_forget {
-        return ReringDecision::Skip;
-    }
-    if entry.raw_without_id {
-        if entry.attempts == 0 {
-            return ReringDecision::Ring { attempt: 0 };
-        }
-        return ReringDecision::Skip;
-    }
-    let grace = policy.doorbell_grace_secs;
-    let max = policy.doorbell_ring_max;
-    if entry.attempts >= max {
-        return match verdict {
-            "Dead" => ReringDecision::RecoverDead,
-            "Unknown" => ReringDecision::DigestUnknown,
-            _ => ReringDecision::Ring { attempt: max },
-        };
-    }
-    if now.saturating_sub(entry.window_start_unix) >= grace {
-        return ReringDecision::Ring {
-            attempt: entry.attempts,
-        };
-    }
-    ReringDecision::Pending
-}
-
 // ---------------------------------------------------------------------------
 // Msg — one union covering mail / watch / status / heal / reclaim / receipt / role / human / presence
 //
@@ -734,7 +579,7 @@ pub enum Msg {
     },
     /// ADR-0010 D2 (bd-8jlv): crew handler mints this after handling a
     /// wake, citing the generation it handled. Presented wakes with
-    /// seq <= through_seq leave the presented set (handling fact);
+    /// seq <= through_seq leave the shown set (handling fact);
     /// anything newer re-presents at the next prompt. Idempotent:
     /// duplicate or stale acks fold into the watermark via max.
     WakeAck {
@@ -1605,7 +1450,7 @@ fn apply_assignment(
     // there. Sweep-arm expiry + cap-eviction stay the deciders, each with an
     // Audit wait-timeout record. Never silent drop.
     if next.last_now > 0 {
-        next.pending_wait.insert(
+        next.wake.waits.insert(
             corr.clone(),
             next.last_now.saturating_add(PENDING_WAIT_TTL_SECS),
         );
@@ -1950,18 +1795,22 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 if row.get("read_ts_us").is_some_and(|v| !v.is_null()) {
                     // The handling fact wins over the shape test: a read row
                     // acks its corr (when tracked) and never registers.
-                    if let Some(e) = next.rering.get_mut(&corr) {
+                    if let Some(e) = next.wake.ladders.get_mut(&corr) {
                         e.acked = true;
                     }
                 } else if inbox_row_ack_overdue(row) {
-                    let e = next.rering.entry(corr).or_insert_with(|| ReringEntry {
-                        pin: pin.clone(),
-                        attempts: 0,
-                        window_start_unix: next.last_now,
-                        acked: false,
-                        fire_and_forget: false,
-                        raw_without_id: false,
-                    });
+                    let e = next
+                        .wake
+                        .ladders
+                        .entry(corr)
+                        .or_insert_with(|| ReringEntry {
+                            pin: pin.clone(),
+                            attempts: 0,
+                            window_start_unix: next.last_now,
+                            acked: false,
+                            fire_and_forget: false,
+                            raw_without_id: false,
+                        });
                     e.acked = false;
                 }
             }
@@ -2011,13 +1860,13 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             // Unknown→digest. Acked / fire-and-forget entries leave
             // without a sound. Presence is read-only here; the enum
             // itself stays Lane-2 (bd-s8bo) owned.
-            let corrs: Vec<String> = next.rering.keys().cloned().collect();
+            let corrs: Vec<String> = next.wake.ladders.keys().cloned().collect();
             for corr in corrs {
-                let Some(entry) = next.rering.get(&corr).cloned() else {
+                let Some(entry) = next.wake.ladders.get(&corr).cloned() else {
                     continue;
                 };
                 if entry.acked || entry.fire_and_forget {
-                    next.rering.remove(&corr);
+                    next.wake.ladders.remove(&corr);
                     continue;
                 }
                 let verdict = match next.presence.get(&entry.pin) {
@@ -2025,17 +1874,21 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                     Some(Presence::Unknown) => "Unknown",
                     _ => "other",
                 };
-                match rering_due_with_policy(&entry, *now, verdict, &next.policy) {
+                let (grace, max) = (
+                    next.policy.doorbell_grace_secs,
+                    next.policy.doorbell_ring_max,
+                );
+                match next.wake.ladder_step(&corr, *now, verdict, grace, max) {
                     ReringDecision::Ring { attempt } => {
                         cmds.push(Cmd::Prompt {
                             pin: entry.pin.clone(),
                             line: doorbell_mail_line(1, &entry.pin, &corr),
                         });
-                        if let Some(e) = next.rering.get_mut(&corr) {
+                        if let Some(e) = next.wake.ladders.get_mut(&corr) {
                             e.attempts = attempt + 1;
                             e.window_start_unix = *now;
                             if e.raw_without_id {
-                                next.rering.remove(&corr);
+                                next.wake.ladders.remove(&corr);
                             }
                         }
                     }
@@ -2047,7 +1900,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                                 entry.pin, entry.attempts
                             ),
                         });
-                        next.rering.remove(&corr);
+                        next.wake.ladders.remove(&corr);
                     }
                     ReringDecision::DigestUnknown => {
                         cmds.push(Cmd::Audit {
@@ -2058,7 +1911,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                                 entry.pin, entry.attempts
                             ),
                         });
-                        next.rering.remove(&corr);
+                        next.wake.ladders.remove(&corr);
                     }
                     ReringDecision::Pending | ReringDecision::Skip => {}
                 }
@@ -2085,22 +1938,23 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             // silent drop. Receipt arrival still wins via try_tick_receipt
             // (effect side) before the next sweep.
             let mut gone: Vec<(String, &'static str)> = Vec::new();
-            for (corr, deadline) in &next.pending_wait {
+            for (corr, deadline) in &next.wake.waits {
                 if *deadline <= *now {
                     gone.push((corr.clone(), "expired"));
                 }
             }
             for (corr, _) in &gone {
-                next.pending_wait.remove(corr);
+                next.wake.waits.remove(corr);
             }
-            while next.pending_wait.len() > PENDING_WAIT_CAP {
+            while next.wake.waits.len() > PENDING_WAIT_CAP {
                 if let Some((corr, ())) = next
-                    .pending_wait
+                    .wake
+                    .waits
                     .iter()
                     .min_by_key(|(_, d)| *d)
                     .map(|(c, _)| (c.clone(), ()))
                 {
-                    next.pending_wait.remove(&corr);
+                    next.wake.waits.remove(&corr);
                     gone.push((corr, "over-cap"));
                 } else {
                     break;
@@ -2126,7 +1980,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 cmds.push(Cmd::Audit {
                     kind: "wait-timeout".into(),
                     pin: corr,
-                    detail: format!("pending_wait {why}"),
+                    detail: format!("waitcorr {why}"),
                 });
             }
         }
@@ -2149,10 +2003,10 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 next.wake_acked.insert(pin.clone(), *through_seq);
             }
             let watermark = next.wake_acked.get(pin).copied().unwrap_or(0);
-            if let Some(entries) = next.presented.get_mut(pin) {
+            if let Some(entries) = next.wake.shown.get_mut(pin) {
                 entries.retain(|e| e.seq > watermark);
                 if entries.is_empty() {
-                    next.presented.remove(pin);
+                    next.wake.shown.remove(pin);
                 }
             }
         }
@@ -2244,7 +2098,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 // bd-bpj1 (F1): the wait-list removal is owned here, not by the
                 // effect-layer drain — the full receipt transition (insert +
                 // unpark + upsert) reproduces from this one Msg on replay.
-                next.pending_wait.remove(corr);
+                next.wake.waits.remove(corr);
                 cmds.push(Cmd::SqliteUpsert {
                     corr: corr.clone(),
                     receipt: receipt.clone(),
@@ -2374,10 +2228,10 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
 
     // ADR-0010 D2 (bd-8jlv): generation-bound wake ledger, one central
     // post-pass so every Prompt site shares the semantics. (1) Re-present:
-    // pins prompted this tick re-emit their presented-but-unacked lines
+    // pins prompted this tick re-emit their shown-but-unacked lines
     // first (same bytes — a duplicate ring is never second work), gated
     // by prompt_allowed like any wake. (2) Record: every emitted Prompt
-    // upserts presented[pin] by line at this generation. Fresh models
+    // upserts shown[pin] by line at this generation. Fresh models
     // carry no unacked entries, so silent ticks stay silent.
     let mut replays: Vec<Cmd> = Vec::new();
     for cmd in &cmds {
@@ -2389,7 +2243,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
                 continue;
             }
             let watermark = next.wake_acked.get(pin).copied().unwrap_or(0);
-            if let Some(entries) = next.presented.get(pin) {
+            if let Some(entries) = next.wake.shown.get(pin) {
                 for e in entries {
                     if e.seq > watermark
                         && e.line != *line
@@ -2413,11 +2267,11 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
         if let Cmd::Prompt { pin, line } = cmd {
             // bd-l72k: the ledger records deliveries only. Non-urgent
             // prompts are stripped below — recording them would grow
-            // `presented` with lines that never deliver and re-ring forever.
+            // shown lines that never deliver and re-ring forever.
             if !is_urgent_line(line) {
                 continue;
             }
-            let slot = next.presented.entry(pin.clone()).or_default();
+            let slot = next.wake.shown.entry(pin.clone()).or_default();
             if let Some(found) = slot.iter_mut().find(|e| e.line == *line) {
                 found.seq = next.seq;
             } else {
@@ -2458,7 +2312,8 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             Cmd::Prompt { pin, line } => {
                 let short = digest_detail_truncate(line);
                 let queued = next
-                    .digest_queue
+                    .wake
+                    .digests
                     .iter()
                     .any(|e| e.pin == *pin && e.detail == short);
                 if queued {
@@ -2511,7 +2366,7 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             _ => None,
         };
         if let Some(e) = entry {
-            next.digest_queue.push(e);
+            next.wake.digests.push(e);
         }
     }
     *next
@@ -2525,11 +2380,11 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
     if let Some(now) = match msg {
         Msg::AckSlaTick { now } | Msg::Sweep { now, .. } | Msg::Tick { now } => Some(*now),
         _ => None,
-    } && !next.digest_queue.is_empty()
-        && (next.digest_queue.len() >= next.policy.digest_threshold
+    } && !next.wake.digests.is_empty()
+        && (next.wake.digests.len() >= next.policy.digest_threshold
             || now.saturating_sub(next.last_digest_unix) >= next.policy.digest_interval_secs)
     {
-        let entries = std::mem::take(&mut next.digest_queue);
+        let entries = std::mem::take(&mut next.wake.digests);
         next.last_digest_unix = now;
         cmds.push(Cmd::Digest { entries });
     }
@@ -2819,7 +2674,7 @@ mod tests {
         // bd-bpj1 (F1): the receipt transition owns the wait-list removal —
         // the effect-layer drain must have nothing left to do.
         let mut m = empty_model();
-        m.pending_wait.insert("c".into(), 999);
+        m.wake.waits.insert("c".into(), 999);
         let (next, _) = tick(
             &m,
             &Msg::Receipt {
@@ -2827,7 +2682,7 @@ mod tests {
                 receipt: Receipt::default(),
             },
         );
-        assert!(!next.pending_wait.contains_key("c"));
+        assert!(!next.wake.waits.contains_key("c"));
         assert!(next.assignment.contains_key("c"));
     }
 
@@ -3144,7 +2999,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_wait_deadline_stamped_from_tick_clock_not_wall_clock() {
+    fn wait_deadline_stamped_from_tick_clock_not_wall_clock() {
         // bd-bdpx: the park deadline stamps from last_now inside tick, so
         // replay reproduces it from the Msg log (the effect handler no longer
         // reads wall-clock). With no clock folded yet the Cmd still emits
@@ -3169,7 +3024,7 @@ mod tests {
             },
         );
         assert_eq!(
-            next.pending_wait.get("C-W"),
+            next.wake.waits.get("C-W"),
             Some(&(1_000_000 + PENDING_WAIT_TTL_SECS)),
             "deadline = tick clock + TTL"
         );
@@ -3186,7 +3041,7 @@ mod tests {
             },
         );
         assert!(
-            !bare.pending_wait.contains_key("C-W"),
+            !bare.wake.waits.contains_key("C-W"),
             "pre-clock model registers nothing"
         );
         assert!(
@@ -3198,30 +3053,31 @@ mod tests {
     }
 
     #[test]
-    fn pending_wait_sweep_expires_and_caps_with_timeout_record() {
-        // bd-zfnx.6 RED: pending_wait is bounded (TTL + cap). Expiry and
+    fn wait_sweep_expires_and_caps_with_timeout_record() {
+        // bd-zfnx.6 RED: waits are bounded (TTL + cap). Expiry and
         // cap-eviction REMOVE entries and record a timeout — never silent.
         let mut m = empty_model();
         let now = 1_000_000u64;
-        m.pending_wait.insert("expired".into(), now - 1);
-        m.pending_wait.insert("live".into(), now + 100_000);
+        m.wake.waits.insert("expired".into(), now - 1);
+        m.wake.waits.insert("live".into(), now + 100_000);
         for i in 0..PENDING_WAIT_CAP + 2 {
-            m.pending_wait
+            m.wake
+                .waits
                 .insert(format!("filler-{i:04}"), now + 20_000 + i as u64);
         }
         let (next, cmds) = tick(&m, &Msg::Sweep { now });
         assert!(
-            !next.pending_wait.contains_key("expired"),
+            !next.wake.waits.contains_key("expired"),
             "expired waits drain on Sweep"
         );
         assert!(
-            next.pending_wait.contains_key("live"),
+            next.wake.waits.contains_key("live"),
             "live waits survive Sweep"
         );
         assert!(
-            next.pending_wait.len() <= PENDING_WAIT_CAP,
+            next.wake.waits.len() <= PENDING_WAIT_CAP,
             "cap holds: {}",
-            next.pending_wait.len()
+            next.wake.waits.len()
         );
         let timeouts: Vec<&str> = cmds
             .iter()
@@ -3249,12 +3105,12 @@ mod tests {
     fn deadline_holds_sorted_digest_and_overdue_escalation() {
         // bd-2fxx RED: holds carry needed-by; digest renders
         // earliest-deadline first; overdue auto-escalates on the wedge
-        // pattern (no new store: pending_wait + digest + wedge alarm).
+        // pattern (no new store: waits + digest + wedge alarm).
         let now = 1_000_000u64;
         let mut m = empty_model();
-        m.pending_wait.insert("late".into(), now - 1);
-        m.pending_wait.insert("soon".into(), now + 10);
-        m.pending_wait.insert("later".into(), now + 100);
+        m.wake.waits.insert("late".into(), now - 1);
+        m.wake.waits.insert("soon".into(), now + 10);
+        m.wake.waits.insert("later".into(), now + 100);
         // Future-dated holds sort earliest-deadline first.
         let order: Vec<String> = sorted_holds(&m).iter().map(|(c, _)| c.clone()).collect();
         assert_eq!(
@@ -3552,7 +3408,7 @@ mod bell_fold_tests {
         assert!(
             src.contains("fn try_tick_receipt")
                 && src.contains("Msg::Receipt")
-                && src.contains("pending_wait"),
+                && src.contains("wake.waits"),
             "WaitCorr must re-enter Receipt through tick (pending re-peek), not discard the store row"
         );
         assert!(
@@ -4830,7 +4686,7 @@ mod human_decision_tests {
 #[cfg(test)]
 mod d6_open_decisions_tests {
     // ADR-0010 D6 (bd-f14d): OPEN DECISIONS fold + RECORD DIVERGENCE +
-    // pending_wait promotion. Tick classification predicates and the
+    // waitcorr promotion. Tick classification predicates and the
     // Digest cmd are Lane 1 (bd-65he) — untouched here.
     use super::*;
     use crate::workspace_reporting::Divergence;
@@ -4875,12 +4731,12 @@ mod d6_open_decisions_tests {
     }
 
     #[test]
-    fn d6_pending_wait_expiry_promotes_never_drops() {
+    fn d6_wait_expiry_promotes_never_drops() {
         let mut m = empty_model();
-        m.pending_wait.insert("FM-W".into(), 100);
+        m.wake.waits.insert("FM-W".into(), 100);
         let (next, cmds) = tick(&m, &Msg::Sweep { now: 200 });
         assert!(
-            !next.pending_wait.contains_key("FM-W"),
+            !next.wake.waits.contains_key("FM-W"),
             "expired entry leaves the wait cache"
         );
         let q = next
@@ -5115,6 +4971,21 @@ mod adr0010_d1_tests {
         }
     }
 
+    /// Test-local ladder shorthand (bd-fuql): folds one entry through a
+    /// scratch table with the file defaults (production goes through
+    /// `model.wake.ladder_step` with live policy values).
+    fn ladder_due(e: &ReringEntry, now: u64, verdict: &str) -> ReringDecision {
+        let mut wake = doorbell_core::wake_table::WakeTable::default();
+        wake.ladders.insert("t".to_string(), e.clone());
+        wake.ladder_step(
+            "t",
+            now,
+            verdict,
+            DOORBELL_GRACE_DEFAULT_SECS,
+            DOORBELL_RING_MAX_DEFAULT,
+        )
+    }
+
     #[test]
     fn adr0010_d1_line_shape_is_shrunk_doorbell() {
         assert_eq!(
@@ -5126,8 +4997,8 @@ mod adr0010_d1_tests {
     #[test]
     fn adr0010_d1_duplicate_ring_is_zero_duplicate_work() {
         let e = entry("P");
-        let a = rering_due(&e, DOORBELL_GRACE_DEFAULT_SECS + 1, "other");
-        let b = rering_due(&e, DOORBELL_GRACE_DEFAULT_SECS + 1, "other");
+        let a = ladder_due(&e, DOORBELL_GRACE_DEFAULT_SECS + 1, "other");
+        let b = ladder_due(&e, DOORBELL_GRACE_DEFAULT_SECS + 1, "other");
         assert_eq!(a, b, "same state + same beat must decide identically");
         assert_eq!(
             doorbell_mail_line(1, "P", "c"),
@@ -5144,24 +5015,24 @@ mod adr0010_d1_tests {
         for attempt in 0..max {
             // Inside the window: nothing due.
             assert_eq!(
-                rering_due(&e, e.window_start_unix + grace - 1, "other"),
+                ladder_due(&e, e.window_start_unix + grace - 1, "other"),
                 ReringDecision::Pending
             );
             // Window elapsed: ring once.
             assert_eq!(
-                rering_due(&e, e.window_start_unix + grace, "other"),
+                ladder_due(&e, e.window_start_unix + grace, "other"),
                 ReringDecision::Ring { attempt }
             );
             e.attempts = attempt + 1;
             e.window_start_unix += grace;
         }
         assert_eq!(
-            rering_due(&e, e.window_start_unix + grace, "Dead"),
+            ladder_due(&e, e.window_start_unix + grace, "Dead"),
             ReringDecision::RecoverDead,
             "past max rings a Dead pane takes the respawn path"
         );
         assert_eq!(
-            rering_due(&e, e.window_start_unix + grace, "Unknown"),
+            ladder_due(&e, e.window_start_unix + grace, "Unknown"),
             ReringDecision::DigestUnknown,
             "past max rings an Unknown pane takes the digest path"
         );
@@ -5171,10 +5042,10 @@ mod adr0010_d1_tests {
     fn adr0010_d1_skips_never_climb() {
         let mut acked = entry("P");
         acked.acked = true;
-        assert_eq!(rering_due(&acked, u64::MAX, "Dead"), ReringDecision::Skip);
+        assert_eq!(ladder_due(&acked, u64::MAX, "Dead"), ReringDecision::Skip);
         let mut faf = entry("P");
         faf.fire_and_forget = true;
-        assert_eq!(rering_due(&faf, u64::MAX, "Dead"), ReringDecision::Skip);
+        assert_eq!(ladder_due(&faf, u64::MAX, "Dead"), ReringDecision::Skip);
     }
 
     #[test]
@@ -5182,12 +5053,12 @@ mod adr0010_d1_tests {
         let mut e = entry("P");
         e.raw_without_id = true;
         assert_eq!(
-            rering_due(&e, 0, "other"),
+            ladder_due(&e, 0, "other"),
             ReringDecision::Ring { attempt: 0 }
         );
         e.attempts = 1;
         assert_eq!(
-            rering_due(&e, u64::MAX, "Dead"),
+            ladder_due(&e, u64::MAX, "Dead"),
             ReringDecision::Skip,
             "raw without id must never escalate, even past max on a Dead pane"
         );
@@ -5202,7 +5073,7 @@ mod adr0010_d1_tests {
                 source: "test".into(),
             },
         );
-        m.rering.insert("c-1".into(), entry("P"));
+        m.wake.ladders.insert("c-1".into(), entry("P"));
         // Fresh entry: inside grace window, no re-ring (other beat
         // cmds like CheckAckSla may still appear).
         let (_, cmds) = tick(&m, &Msg::AckSlaTick { now: 1 });
@@ -5231,7 +5102,7 @@ mod adr0010_d1_tests {
                     && line == "[doorbell] inbox: 1 unacked for P; latest corr=c-1; read + ack")),
             "re-ring must prompt the shrunk doorbell line, not the payload: {cmds:?}"
         );
-        assert_eq!(next.rering["c-1"].attempts, 1);
+        assert_eq!(next.wake.ladders["c-1"].attempts, 1);
     }
 
     #[test]
@@ -5251,8 +5122,8 @@ mod adr0010_d1_tests {
         let mut eu = entry("U");
         eu.attempts = max;
         eu.window_start_unix = 0;
-        m.rering.insert("c-d".into(), ed);
-        m.rering.insert("c-u".into(), eu);
+        m.wake.ladders.insert("c-d".into(), ed);
+        m.wake.ladders.insert("c-u".into(), eu);
         let (next, cmds) = tick(
             &m,
             &Msg::AckSlaTick {
@@ -5271,7 +5142,10 @@ mod adr0010_d1_tests {
                 if kind == "doorbell-unanswered-digest" && pin == "U" && detail.contains("c-u"))),
             "exhausted Unknown entry must digest naming pin+corr+attempts: {cmds:?}"
         );
-        assert!(next.rering.is_empty(), "terminal entries leave the ladder");
+        assert!(
+            next.wake.ladders.is_empty(),
+            "terminal entries leave the ladder"
+        );
     }
 
     // ---- bd-w98c residual: SlaFired hit list wires the ladder registrar ----
@@ -5309,7 +5183,7 @@ mod adr0010_d1_tests {
             !cmds.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
             "the hit list never rings directly — the ladder owns re-rings: {cmds:?}"
         );
-        assert!(next.rering.is_empty(), "no row, no registration");
+        assert!(next.wake.ladders.is_empty(), "no row, no registration");
     }
 
     #[test]
@@ -5337,26 +5211,26 @@ mod adr0010_d1_tests {
             },
         );
         assert_eq!(
-            next.rering.get("c-over").map(|e| e.pin.as_str()),
+            next.wake.ladders.get("c-over").map(|e| e.pin.as_str()),
             Some("P"),
             "an unacked overdue corr registers: {:?}",
-            next.rering
+            next.wake.ladders
         );
-        let e = &next.rering["c-over"];
+        let e = &next.wake.ladders["c-over"];
         assert_eq!(
             e.window_start_unix, 5_000,
             "window stamps from the tick clock (bd-bdpx)"
         );
         assert_eq!(e.attempts, 0, "registration is not a ring");
         assert!(
-            !next.rering.contains_key("c-normal"),
+            !next.wake.ladders.contains_key("c-normal"),
             "outside the scan scope"
         );
-        assert_eq!(next.rering.len(), 1, "no corr, no entry");
+        assert_eq!(next.wake.ladders.len(), 1, "no corr, no entry");
         // The read row's corr only acks if it was ALREADY registered (no
         // ghost entries from plain mail reads).
         assert!(
-            !next.rering.contains_key("c-read"),
+            !next.wake.ladders.contains_key("c-read"),
             "a read never registers"
         );
         // Read fact: register first, then see it read -> acked.
@@ -5368,7 +5242,7 @@ mod adr0010_d1_tests {
             },
         );
         assert!(
-            next2.rering["c-over"].acked,
+            next2.wake.ladders["c-over"].acked,
             "the per-recipient read is the handling fact"
         );
     }
@@ -5397,7 +5271,7 @@ mod adr0010_d1_tests {
                 if pin == "WirePin" && line.contains("c-wire") && line.contains("unacked for"))),
             "wire-registered corr re-rings through the shrunk doorbell line: {cmds:?}"
         );
-        assert_eq!(next.rering["c-wire"].attempts, 1);
+        assert_eq!(next.wake.ladders["c-wire"].attempts, 1);
     }
 
     #[test]
@@ -5411,14 +5285,14 @@ mod adr0010_d1_tests {
                 pin: "P".into(),
             },
         );
-        assert_eq!(m.rering["c-i"].attempts, 0);
+        assert_eq!(m.wake.ladders["c-i"].attempts, 0);
         let (m, _) = tick(
             &m,
             &Msg::AckSlaTick {
                 now: 100 + doorbell_grace_secs(),
             },
         );
-        assert_eq!(m.rering["c-i"].attempts, 1, "one ring");
+        assert_eq!(m.wake.ladders["c-i"].attempts, 1, "one ring");
         // Same row redelivered (at-least-once): no second ring, no reset of
         // attempts; the window refreshes only per the ladder's own beat.
         let (m2, cmds) = tick(
@@ -5429,7 +5303,7 @@ mod adr0010_d1_tests {
             },
         );
         assert_eq!(
-            m2.rering["c-i"].attempts, 1,
+            m2.wake.ladders["c-i"].attempts, 1,
             "redelivery never double-rings"
         );
         assert!(
@@ -5533,7 +5407,7 @@ mod adr0010_d2_tests {
         let l1 = "[doorbell] plane-P urgent w1".to_string();
         assert_eq!(prompts(&cmds1), vec![l1.clone()]);
         assert_eq!(
-            a.presented.get("P"),
+            a.wake.shown.get("P"),
             Some(&vec![PresentedWake {
                 seq: 1,
                 line: l1.clone(),
@@ -5569,8 +5443,8 @@ mod adr0010_d2_tests {
         assert!(ack_cmds.is_empty(), "an ack emits nothing");
         assert_eq!(c.wake_acked.get("P"), Some(&b.seq));
         assert!(
-            !c.presented.contains_key("P"),
-            "acked generations leave the presented set"
+            !c.wake.shown.contains_key("P"),
+            "acked generations leave the shown set"
         );
         // After ack, the next prompt carries only the new wake.
         let (_, cmds3) = tick(&c, &fact("w3"));
@@ -5591,7 +5465,7 @@ mod adr0010_d2_tests {
                 through_seq: w1.seq,
             },
         );
-        assert!(!w1ack.presented.contains_key("P"));
+        assert!(!w1ack.wake.shown.contains_key("P"));
         // Duplicate ack: same watermark, same empty ledger.
         let (dup, cmds) = tick(
             &w1ack,
@@ -5602,7 +5476,7 @@ mod adr0010_d2_tests {
         );
         assert!(cmds.is_empty());
         assert_eq!(
-            dup.presented, w1ack.presented,
+            dup.wake.shown, w1ack.wake.shown,
             "duplicate ack changes nothing"
         );
         assert_eq!(
@@ -5619,7 +5493,7 @@ mod adr0010_d2_tests {
             },
         );
         assert_eq!(
-            stale.presented.get("P").map(Vec::len),
+            stale.wake.shown.get("P").map(Vec::len),
             Some(2),
             "stale ack must not clear newer presentations"
         );
@@ -5638,7 +5512,7 @@ mod adr0010_d2_tests {
         );
         assert!(cmds.is_empty());
         assert_eq!(next.wake_acked.get("Ghost"), Some(&7));
-        assert!(!next.presented.contains_key("Ghost"));
+        assert!(!next.wake.shown.contains_key("Ghost"));
     }
 
     #[test]
@@ -5653,7 +5527,7 @@ mod adr0010_d2_tests {
             },
         );
         m.roles.insert("captain".into(), "Q".into());
-        m.presented.insert(
+        m.wake.shown.insert(
             "Q".into(),
             vec![PresentedWake {
                 seq: 1,
@@ -5736,8 +5610,8 @@ mod adr0010_d5_tests {
             !c4.iter().any(|c| matches!(c, Cmd::Prompt { .. })),
             "misses spend zero prompts: {c4:?}"
         );
-        assert_eq!(m4.digest_queue.len(), 1, "miss queues for digest");
-        assert_eq!(m4.digest_queue[0].kind, "fact-miss");
+        assert_eq!(m4.wake.digests.len(), 1, "miss queues for digest");
+        assert_eq!(m4.wake.digests[0].kind, "fact-miss");
         // Urgent inbox pull prompts immediately (bypasses batching).
         let (m5, c5) = tick(
             &m,
@@ -5771,7 +5645,7 @@ mod adr0010_d5_tests {
             );
             m = next;
         }
-        assert_eq!(m.digest_queue.len(), 2);
+        assert_eq!(m.wake.digests.len(), 2);
         // Interval lapse flushes exactly the queued set with ages.
         let (next, cmds) = tick(
             &m,
@@ -5792,7 +5666,7 @@ mod adr0010_d5_tests {
             digests[0].iter().all(|e| e.seq > 0 && e.at_unix == 0),
             "entries carry generation + clock (0 = pre-clock fixture)"
         );
-        assert!(next.digest_queue.is_empty(), "batch drains the queue");
+        assert!(next.wake.digests.is_empty(), "batch drains the queue");
         assert_eq!(next.last_digest_unix, digest_interval_secs() + 1);
     }
 
@@ -5995,26 +5869,26 @@ mod adr0010_d5_tests {
             prompts[0].1
         );
         assert_eq!(
-            m.digest_queue.len(),
+            m.wake.digests.len(),
             2,
             "digest holds the captain set plus the urgent record (urgent prompts AND queues), got {:?}",
-            m.digest_queue
+            m.wake.digests
         );
-        let kinds: Vec<&str> = m.digest_queue.iter().map(|e| e.kind.as_str()).collect();
+        let kinds: Vec<&str> = m.wake.digests.iter().map(|e| e.kind.as_str()).collect();
         assert!(
             kinds.contains(&"prompt") && kinds.contains(&"urgent-prompt"),
             "one captain entry plus one urgent record, got {:?}",
-            m.digest_queue
+            m.wake.digests
         );
         assert!(
-            m.digest_queue.iter().all(|e| e.pin == "BlueRidge"),
+            m.wake.digests.iter().all(|e| e.pin == "BlueRidge"),
             "no routine/benign entry may enter the digest: {:?}",
-            m.digest_queue
+            m.wake.digests
         );
         assert!(
-            m.digest_queue[0].detail.contains("43001"),
+            m.wake.digests[0].detail.contains("43001"),
             "digest entry is the job wake, got {}",
-            m.digest_queue[0].detail
+            m.wake.digests[0].detail
         );
         assert!(
             m.wake_counters.get("routine").copied().unwrap_or(0) >= 1,
@@ -6043,9 +5917,9 @@ mod adr0010_d5_tests {
             "routine wakes spend zero prompts: {cmds:?}"
         );
         assert!(
-            next.digest_queue.is_empty(),
+            next.wake.digests.is_empty(),
             "routine never enters the digest: {:?}",
-            next.digest_queue
+            next.wake.digests
         );
         assert_eq!(
             next.wake_counters.get("routine"),
@@ -6066,12 +5940,12 @@ mod adr0010_d5_tests {
             "captain-relevant queues, never injects immediately: {cmds:?}"
         );
         assert_eq!(
-            m1.digest_queue.len(),
+            m1.wake.digests.len(),
             1,
             "job wake queued for digest: {:?}",
-            m1.digest_queue
+            m1.wake.digests
         );
-        assert_eq!(m1.digest_queue[0].pin, "BlueRidge");
+        assert_eq!(m1.wake.digests[0].pin, "BlueRidge");
         // Batch emits on a now-bearing beat past the interval; the queue drains.
         let (m2, cmds2) = tick(&m1, &Msg::Tick { now: 1_000_000 });
         assert!(
@@ -6080,11 +5954,11 @@ mod adr0010_d5_tests {
                 .any(|c| matches!(c, Cmd::Digest { entries } if entries.len() == 1)),
             "digest batch must emit the captain entry: {cmds2:?}"
         );
-        assert!(m2.digest_queue.is_empty(), "batch drains the queue");
+        assert!(m2.wake.digests.is_empty(), "batch drains the queue");
     }
 
     #[test]
-    fn edge_triage_rering_line_is_urgent_and_injects() {
+    fn edge_triage_ladder_line_is_urgent_and_injects() {
         let line = doorbell_mail_line(1, "BlueRidge", "c-1");
         assert!(
             is_urgent_line(&line),

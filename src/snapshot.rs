@@ -256,7 +256,8 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         })
         .collect();
     let last_presented = model
-        .presented
+        .wake
+        .shown
         .values()
         .flatten()
         .map(|e| e.seq)
@@ -264,7 +265,8 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         .unwrap_or(0);
     let last_acked = model.wake_acked.values().copied().max().unwrap_or(0);
     let unacked_wakes = model
-        .presented
+        .wake
+        .shown
         .iter()
         .map(|(pin, es)| {
             let wm = model.wake_acked.get(pin).copied().unwrap_or(0);
@@ -277,8 +279,8 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
         last_acked,
         unacked_wakes,
     };
-    let drain_pending = model.pending_wait.len();
-    let afk = model.digest_queue.len();
+    let drain_pending = model.wake.waits.len();
+    let afk = model.wake.digests.len();
 
     // ADR-0011 D6: attempt live mail/reservation reads; degrade only on miss.
     let (mail, mail_degraded) = read_mail_counts(project);
