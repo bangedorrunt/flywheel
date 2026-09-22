@@ -784,19 +784,19 @@ pub fn pane_dispatch(
             });
             // ADR-0024 W1a: classify pane dispatch failures (rate_limit/timeout/auth)
             if v.get("ok").and_then(Value::as_bool) == Some(false) {
-                let err_str = v
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&raw)
-                    .to_string();
+                // bd-5yzp: every failure payload carries ok:false + a
+                // non-empty error + kind (unknown included) — an
+                // error-less or kind-less ok:false misroutes as bare
+                // {error: step failed} downstream (bd-nyrn).
+                let leaf_err = v.get("error").and_then(Value::as_str).unwrap_or("");
+                let err_str =
+                    dispatch_failure_error(&attempt_profile, &attempt_entry.name, &raw, leaf_err);
                 let cf = crate::failure::classify(&err_str, None, None);
                 out["stage"] = json!(cf.stage);
-                if cf.kind != crate::failure::FailureKind::Unknown {
-                    out["ok"] = json!(false);
-                    out["error"] = json!(err_str.clone());
-                    out["kind"] = json!(cf.kind.to_string());
-                    out["retryable"] = json!(cf.retryable);
-                }
+                out["ok"] = json!(false);
+                out["error"] = json!(err_str.clone());
+                out["kind"] = json!(cf.kind.to_string());
+                out["retryable"] = json!(cf.retryable);
                 // bd-mukq: 429 reroute — ONE hop to a live fallback-profile
                 // pane (ADR-0026 shared chain; the running agent keeps its
                 // model and session, the self-contained prompt reroutes).
@@ -909,30 +909,37 @@ pub fn pane_dispatch(
             ));
         }
         let err = String::from_utf8_lossy(&output.stderr).to_string();
-        let err_str = if err.trim().is_empty() {
-            raw.clone()
-        } else {
-            err.clone()
-        };
+        // bd-5yzp: never error:'' — stderr, stdout, then scoped fallback.
+        let err_str = dispatch_failure_error(profile_name, &entry.name, &raw, &err);
         let cf = crate::failure::classify(&err_str, None, None);
         let mut out = json!({
             "ok": false,
-            "error": if err.trim().is_empty() { raw } else { err },
+            "error": err_str,
             "profile": profile_name,
             "agent": entry.name,
             // GS-049 P1-3: phase-bearing failure (ActionStage)
             "stage": cf.stage,
+            "kind": cf.kind.to_string(),
+            "retryable": cf.retryable,
         });
-        if cf.kind != crate::failure::FailureKind::Unknown {
-            out["kind"] = json!(cf.kind.to_string());
-            out["retryable"] = json!(cf.retryable);
-        }
         dispatch_breaker()
             .lock()
             .expect("dispatch breaker")
             .record_failure_at(crate::authority::SystemClock.now_unix());
         return Ok(out);
     }
+}
+
+/// bd-5yzp: non-empty failure error for pane dispatch — stderr/leaf error
+/// wins, then stdout, then a profile/agent-scoped fallback (never '').
+fn dispatch_failure_error(profile: &str, agent: &str, raw_stdout: &str, err: &str) -> String {
+    if !err.trim().is_empty() {
+        return err.to_string();
+    }
+    if !raw_stdout.trim().is_empty() {
+        return raw_stdout.to_string();
+    }
+    format!("pane dispatch: @{profile} ({agent}) __send returned empty stdout+stderr — no payload")
 }
 
 /// Pane-dispatch retry budget (bd-8pjr): 6 attempts, 5s base, 10s cap —
@@ -2746,5 +2753,30 @@ mod kind_classify_tests {
         let cf = failure::classify("429 quota exceeded", None, None);
         assert_eq!(cf.kind, failure::FailureKind::RateLimit);
         assert!(cf.retryable);
+    }
+}
+
+#[cfg(test)]
+mod bd_5yzp_tests {
+    use super::dispatch_failure_error;
+
+    #[test]
+    fn empty_stdout_stderr_yields_scoped_nonempty_error() {
+        let e = dispatch_failure_error("coder", "WittyAnt", "", "");
+        assert!(!e.trim().is_empty(), "error must never be empty");
+        assert!(e.contains("@coder"), "carries profile: {e}");
+        assert!(e.contains("WittyAnt"), "carries agent: {e}");
+    }
+
+    #[test]
+    fn stderr_wins_over_stdout() {
+        let e = dispatch_failure_error("coder", "WittyAnt", "some stdout", "boom stderr");
+        assert_eq!(e, "boom stderr");
+    }
+
+    #[test]
+    fn stdout_used_when_stderr_empty() {
+        let e = dispatch_failure_error("coder", "WittyAnt", "some stdout", "  \n ");
+        assert_eq!(e, "some stdout");
     }
 }
