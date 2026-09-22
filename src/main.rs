@@ -5029,7 +5029,6 @@ mod steer_safety_tests {
 #[cfg(test)]
 mod steer_engine_tests {
     use super::*;
-    use toron_workflow::schema::Action;
 
     // bd-adr22-local-resonate-tx8q: engine runs now execute against the
     // persistent server, where first task delivery can miss the SSE window
@@ -5210,10 +5209,14 @@ mod steer_engine_tests {
         });
         let crew_plan = crew::plan_crew_with(&wf, &|sub| workflow_resolver(sub));
         let invoke_wf = crew::resolve_crew_fanouts(&wf, &crew_plan);
-        let runner: toron_workflow::ActionRunner = Arc::new(move |a: &Action| {
-            calls.lock().unwrap().push(a.type_name().to_string());
-            Ok(json!({ "action": a.type_name() }))
-        });
+        let runner: toron_workflow::engine::EffectRunner =
+            Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push(inv.action.type_name().to_string());
+                Ok(json!({ "action": inv.action.type_name() }))
+            });
         let rt = tokio::runtime::Runtime::new()?;
         let engine = std::sync::Arc::new(pane::local_engine(
             &rt,
@@ -25008,7 +25011,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // a real herdr crew from the crew plan and dispatches each step
             // via the loop's `__send` leaf (P10.3, bd-ghcj.1).
             let mut pane_ctx: Option<pane::PaneRunCtx> = None;
-            let runner: toron_workflow::ActionRunner = if *execute {
+            let runner: toron_workflow::engine::EffectRunner = if *execute {
                 match mode.as_str() {
                     "headless" => {
                         // bd-omwg: fail closed — a spawn step cannot run
@@ -25026,13 +25029,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         // project tier on headless runs.
                         let dispatch_project_dir =
                             project_dir(cfg, project.as_deref().unwrap_or("flywheel"));
-                        Arc::new(move |a: &Action| {
+                        Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
                             headless_dispatch(
                                 &catalog,
                                 &wf_name,
                                 &inputs_c,
                                 None,
-                                a,
+                                &inv.action,
                                 Some(&dispatch_project_dir),
                             )
                         })
@@ -25057,16 +25060,23 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         let entries = ctx.entries.clone();
                         let project_c = project.to_string();
                         pane_ctx = Some(ctx);
-                        Arc::new(move |a: &Action| {
+                        Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
                             pane::pane_dispatch(
-                                &catalog, &project_c, &wf_name, &inputs_c, &entries, a,
+                                &catalog,
+                                &project_c,
+                                &wf_name,
+                                &inputs_c,
+                                &entries,
+                                &inv.action,
                             )
                         })
                     }
                     other => bail!("unknown --mode {other:?} (headless | pane)"),
                 }
             } else {
-                Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })))
+                Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
+                    Ok(json!({ "action": inv.action.type_name() }))
+                })
             };
             let rt = tokio::runtime::Runtime::new()?;
             let run_id = format!("fw-cli-{}", state::now_iso());
@@ -25661,11 +25671,18 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let entries = ctx.entries.clone();
             let project_c = project_name.to_string();
             let wf_name_c = wf_name.clone();
-            let runner: toron_workflow::ActionRunner = {
+            let runner: toron_workflow::engine::EffectRunner = {
                 let entries = entries.clone();
                 let inputs_c = inputs_c.clone();
-                Arc::new(move |a: &Action| {
-                    pane::pane_dispatch(&catalog, &project_c, &wf_name_c, &inputs_c, &entries, a)
+                Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
+                    pane::pane_dispatch(
+                        &catalog,
+                        &project_c,
+                        &wf_name_c,
+                        &inputs_c,
+                        &entries,
+                        &inv.action,
+                    )
                 })
             };
             let rt = tokio::runtime::Runtime::new()?;
@@ -26342,10 +26359,10 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
                 // recording runner cannot resolve. 25s cap → explicit timeout
                 // error, never a silent never-returning command.
                 let output = rt.block_on(async {
-                    let engine = toron_workflow::WorkflowEngine::local_with_resolvers(
-                        runner,
+                    let engine = toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
                         profile_resolver,
                         workflow_resolver,
+                        Some(runner),
                     )?;
                     tokio::time::timeout(
                         std::time::Duration::from_secs(25),
@@ -34527,10 +34544,7 @@ mod verify_sink_tests {
 
     #[tokio::test]
     async fn verify_sink_missing_returns_error() {
-        let engine = toron_workflow::WorkflowEngine::local(std::sync::Arc::new(
-            |_: &toron_workflow::schema::Action| Ok(serde_json::json!({ "ok": true })),
-        ))
-        .expect("engine");
+        let engine = toron_workflow::WorkflowEngine::local().expect("engine");
         let wf = toron_workflow::schema::parse_workflow(
             r#"name: t
 graph:
@@ -34747,10 +34761,7 @@ steps:
 
     #[tokio::test]
     async fn approval_drain_approve_resumes() {
-        let engine = toron_workflow::WorkflowEngine::local(std::sync::Arc::new(
-            |_: &toron_workflow::schema::Action| Ok(serde_json::json!({ "ok": true })),
-        ))
-        .expect("engine");
+        let engine = toron_workflow::WorkflowEngine::local().expect("engine");
         let wf = approval_workflow();
         let run_id = format!("approval-approve-{}", uuid::Uuid::new_v4());
         let input = RunInput {
@@ -34789,10 +34800,7 @@ steps:
 
     #[tokio::test]
     async fn approval_drain_reject_records_rejected() {
-        let engine = toron_workflow::WorkflowEngine::local(std::sync::Arc::new(
-            |_: &toron_workflow::schema::Action| Ok(serde_json::json!({ "ok": true })),
-        ))
-        .expect("engine");
+        let engine = toron_workflow::WorkflowEngine::local().expect("engine");
         let wf = approval_workflow();
         let run_id = format!("approval-reject-{}", uuid::Uuid::new_v4());
         let input = RunInput {

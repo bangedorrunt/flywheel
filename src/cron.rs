@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use toron_workflow::engine::ActionInvocation;
 use toron_workflow::schema::{CronScope, CronSpec, Workflow};
 
 /// One registered cron: a schedule bound to a workflow template.
@@ -728,11 +729,11 @@ impl RegistryCronManager {
 ///   the step errors, never records.
 ///
 /// The runner closes over the cron entry because the engine's
-/// [`toron_workflow::ActionRunner`] receives only the action — cron context
+/// [`toron_workflow::engine::EffectRunner`] receives only the action — cron context
 /// cannot flow through the engine. `start_loops` therefore builds one engine
 /// per cron.
-pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
-    use toron_workflow::schema::Action;
+pub fn cron_runner(entry: &CronEntry) -> toron_workflow::engine::EffectRunner {
+    use toron_workflow::engine::ActionInvocation;
     match entry.mode {
         CronMode::Pane => {
             let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
@@ -740,8 +741,8 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
             let entries = crate::state::load_spawn_registry(project);
             let name = entry.name.clone();
             let inputs = Value::Null;
-            std::sync::Arc::new(move |a: &Action| {
-                crate::pane::pane_dispatch(&catalog, project, &name, &inputs, &entries, a)
+            std::sync::Arc::new(move |inv: &ActionInvocation| {
+                crate::pane::pane_dispatch(&catalog, project, &name, &inputs, &entries, &inv.action)
             })
         }
         CronMode::Headless => {
@@ -749,8 +750,15 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
             let name = entry.name.clone();
             let template = entry.template.clone();
             let inputs = Value::Null;
-            std::sync::Arc::new(move |a: &Action| {
-                crate::headless_dispatch(&catalog, &template, &inputs, Some(&name), a, None)
+            std::sync::Arc::new(move |inv: &ActionInvocation| {
+                crate::headless_dispatch(
+                    &catalog,
+                    &template,
+                    &inputs,
+                    Some(&name),
+                    &inv.action,
+                    None,
+                )
             })
         }
     }
@@ -761,9 +769,10 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::ActionRunner {
 /// (bd-8wvz): an on-demand run is a structural test of the body, never a
 /// live agent dispatch — so it records every step instead of shelling out.
 /// Pane crons no longer use this runner (bd-5qls — they dispatch).
-pub fn recording_runner() -> toron_workflow::ActionRunner {
+pub fn recording_runner() -> toron_workflow::engine::EffectRunner {
+    use toron_workflow::engine::ActionInvocation;
     use toron_workflow::schema::Action;
-    std::sync::Arc::new(|a: &Action| match a {
+    std::sync::Arc::new(|inv: &ActionInvocation| match &inv.action {
         Action::CallWebhook { url, method, body } => {
             let method = method.as_deref().unwrap_or("GET").to_ascii_uppercase();
             let agent = ureq::AgentBuilder::new()
@@ -803,15 +812,15 @@ pub fn recording_runner() -> toron_workflow::ActionRunner {
 /// input types): headless = real `__run-headless` dispatch (the default);
 /// pane = the P10.3 pane dispatch (bd-5qls) — crew panes from the cron
 /// project's spawn registry, empty registry fail-fast.
-pub fn spec_runner(spec: &CronSpec) -> toron_workflow::ActionRunner {
-    use toron_workflow::schema::{Action, CronMode as SpecMode};
+pub fn spec_runner(spec: &CronSpec) -> toron_workflow::engine::EffectRunner {
+    use toron_workflow::schema::CronMode as SpecMode;
     match spec.mode {
         SpecMode::Headless => {
             let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
             let name = spec.name.clone();
             let inputs = Value::Null;
-            std::sync::Arc::new(move |a: &Action| {
-                crate::headless_dispatch(&catalog, &name, &inputs, Some(&name), a, None)
+            std::sync::Arc::new(move |inv: &ActionInvocation| {
+                crate::headless_dispatch(&catalog, &name, &inputs, Some(&name), &inv.action, None)
             })
         }
         SpecMode::Pane => {
@@ -820,8 +829,8 @@ pub fn spec_runner(spec: &CronSpec) -> toron_workflow::ActionRunner {
             let entries = crate::state::load_spawn_registry(project);
             let name = spec.name.clone();
             let inputs = Value::Null;
-            std::sync::Arc::new(move |a: &Action| {
-                crate::pane::pane_dispatch(&catalog, project, &name, &inputs, &entries, a)
+            std::sync::Arc::new(move |inv: &ActionInvocation| {
+                crate::pane::pane_dispatch(&catalog, project, &name, &inputs, &entries, &inv.action)
             })
         }
     }
@@ -1100,7 +1109,6 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         };
         let engine = std::sync::Arc::new(
             toron_workflow::WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
-                spec_run.clone(),
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
                 toron_workflow::WorkflowEngine::default_workflow_resolver(),
                 effect,
@@ -1152,7 +1160,6 @@ pub async fn start_loops(cfg: &crate::config::Config, project: Option<&str>) -> 
         };
         let engine = std::sync::Arc::new(
             toron_workflow::WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
-                cron_run.clone(),
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
                 toron_workflow::WorkflowEngine::default_workflow_resolver(),
                 effect,
@@ -1419,6 +1426,27 @@ pub fn cron_history(name: &str) -> Vec<CronRun> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test invocation wrapper (bd-fuql flag-day): runners take
+    /// `&ActionInvocation`, not `&Action`.
+    fn inv_of(action: toron_workflow::schema::Action) -> toron_workflow::engine::ActionInvocation {
+        toron_workflow::engine::ActionInvocation {
+            action,
+            run: toron_workflow::engine::RunContext {
+                run_id: "test".into(),
+                workflow_digest: "test".into(),
+                node_path: "test".into(),
+                iteration_key: None,
+                effect_key: None,
+                attempt: 1,
+                provider_result: None,
+            },
+            execution: toron_workflow::engine::ExecutionPolicy {
+                max_attempts: 1,
+                timeout_secs: None,
+            },
+        }
+    }
     use chrono::{Datelike, Timelike};
 
     fn tmp_path(tag: &str) -> PathBuf {
@@ -1579,14 +1607,14 @@ owner = "housekeeper"
         let mut e = sample("weekly-x");
         e.mode = CronMode::Pane;
         let runner = cron_runner(&e);
-        let err = runner(&Action::DispatchJob {
+        let err = runner(&inv_of(Action::DispatchJob {
             assignee: "x".into(),
             spec: toron_workflow::schema::DispatchSpec {
                 profile: Some("@planner".into()),
                 ..Default::default()
             },
             channel: None,
-        })
+        }))
         .unwrap_err();
         assert!(
             err.to_string().contains("pane dispatch"),
@@ -1632,7 +1660,7 @@ owner = "housekeeper"
                 inputs: serde_json::Value::Null,
             },
         ] {
-            let out = runner(&a)
+            let out = runner(&inv_of(a))
                 .unwrap_or_else(|e| serde_json::json!({ "ok": false, "error": e.to_string() }));
             assert!(
                 out.get("ok").is_some(),
@@ -2096,29 +2124,29 @@ owner = "housekeeper"
         // surface) — pane mode dispatches (bd-5qls), headless shells out to
         // __run-headless.
         let runner = recording_runner();
-        let ok = runner(&Action::CallWebhook {
+        let ok = runner(&inv_of(Action::CallWebhook {
             url: format!("http://127.0.0.1:{port}/health"),
             method: Some("GET".into()),
             body: None,
-        })
+        }))
         .unwrap();
         assert_eq!(ok["ok"], true, "live probe succeeds: {ok}");
 
         // closed port → probe errors (a step with on_error: fail_run fails)
         let dead_port = 1; // port 1 is not listening
-        let dead = runner(&Action::CallWebhook {
+        let dead = runner(&inv_of(Action::CallWebhook {
             url: format!("http://127.0.0.1:{dead_port}/health"),
             method: Some("GET".into()),
             body: None,
-        });
+        }));
         assert!(dead.is_err(), "dead probe errors: {dead:?}");
 
         // non-webhook actions are recorded, not dispatched
-        let rec = runner(&Action::SendDm {
+        let rec = runner(&inv_of(Action::SendDm {
             to: "housekeeper".into(),
             body: "x".into(),
             project: None,
-        })
+        }))
         .unwrap();
         assert_eq!(rec["action"], "send_dm");
         assert_eq!(rec["ok"], true);
@@ -2210,7 +2238,9 @@ owner = "housekeeper"
 
         // All five up → pass. The probe surface is the recording runner
         // (dry-run); pane mode dispatches (bd-5qls).
-        let engine = toron_workflow::WorkflowEngine::local(recording_runner()).unwrap();
+        let engine =
+            toron_workflow::WorkflowEngine::local_with_effect_runner(Some(recording_runner()))
+                .unwrap();
         let all_up: Vec<u16> = ports.clone();
         let out = engine
             .invoke("gate-all-up", gate_wf(&all_up), json!({}))

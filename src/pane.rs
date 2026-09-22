@@ -1385,7 +1385,7 @@ pub fn launch_spawn_job(
 /// in-memory runtime (previous behavior; in-process replay only).
 pub fn local_engine(
     rt: &tokio::runtime::Runtime,
-    runner: toron_workflow::ActionRunner,
+    runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
@@ -1421,7 +1421,7 @@ pub fn local_engine(
 pub fn local_engine_journaled(
     cfg: &crate::config::Config,
     rt: &tokio::runtime::Runtime,
-    runner: toron_workflow::ActionRunner,
+    runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
@@ -1461,7 +1461,7 @@ fn local_engine_with(
     cfg: &crate::config::Config,
     rt: &tokio::runtime::Runtime,
     server_url: Option<String>,
-    runner: toron_workflow::ActionRunner,
+    runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
     journal: bool,
@@ -1507,7 +1507,7 @@ fn local_engine_with(
 fn local_engine_with_journal(
     rt: &tokio::runtime::Runtime,
     server_url: Option<String>,
-    runner: toron_workflow::ActionRunner,
+    runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
     effect: Option<toron_workflow::engine::EffectRunner>,
@@ -1515,11 +1515,15 @@ fn local_engine_with_journal(
     run_journal: Option<toron_workflow::engine::RunJournal>,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let _enter = rt.enter();
+    // Flag-day (bd-fuql): the legacy runner is gone — the journaled effect
+    // wins when present, else this runner executes leaves directly through
+    // the supported context-bearing seam (same preference the old engine
+    // applied to its two-runner inputs).
+    let effect = effect.or(Some(runner));
     match server_url {
         Some(url) => {
             toron_workflow::WorkflowEngine::remote_with_resolvers_effect_mode_and_run_journal(
                 url,
-                runner,
                 profile,
                 workflow,
                 effect,
@@ -1528,7 +1532,6 @@ fn local_engine_with_journal(
             )
         }
         None => toron_workflow::WorkflowEngine::local_with_resolvers_effect_mode_and_run_journal(
-            runner,
             profile,
             workflow,
             effect,
@@ -2343,10 +2346,8 @@ steps:
     /// the engine's ok:true no longer lies about a pane.
     #[tokio::test(flavor = "multi_thread")]
     async fn drain_spawn_sink_launches_every_promise_after_invoke() {
-        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
         let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local_with(runner, housekeeper_resolver())
-                .expect("engine"),
+            toron_workflow::WorkflowEngine::local_with(housekeeper_resolver()).expect("engine"),
         );
         let invoke = tokio::spawn({
             let engine = engine.clone();
@@ -2437,10 +2438,8 @@ steps:
     /// kind-43004).
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_await_true_resumes_on_drainer_resolve() {
-        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
         let engine = std::sync::Arc::new(
-            toron_workflow::WorkflowEngine::local_with(runner, housekeeper_resolver())
-                .expect("engine"),
+            toron_workflow::WorkflowEngine::local_with(housekeeper_resolver()).expect("engine"),
         );
         let invoke = tokio::spawn({
             let engine = engine.clone();
@@ -2504,7 +2503,9 @@ steps:
         // persistent store when one answers (host runs `resonate serve
         // --storage-type sqlite` on :8001), not the in-memory LocalNetwork.
         // Construction must stay lazy (dead port must not dial at build).
-        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let runner = std::sync::Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
+            Ok(json!({ "action": inv.action.type_name() }))
+        });
         let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
         let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -2551,8 +2552,10 @@ steps:
     /// that this path claims no journal coverage.
     #[test]
     fn recording_engine_keeps_the_bypass_marker() {
-        let runner: toron_workflow::ActionRunner =
-            std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let runner: toron_workflow::engine::EffectRunner =
+            std::sync::Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
+                Ok(json!({ "action": inv.action.type_name() }))
+            });
         let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
         let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -2587,7 +2590,9 @@ steps:
 
     #[test]
     fn local_engine_constructs_under_entered_runtime() {
-        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
+        let runner = std::sync::Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
+            Ok(json!({ "action": inv.action.type_name() }))
+        });
         let profile: toron_workflow::ProfileResolver = std::sync::Arc::new(|_| None);
         let workflow: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_| None);
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -2599,9 +2604,8 @@ steps:
 
     #[test]
     fn local_engine_without_runtime_panics() {
-        let runner = std::sync::Arc::new(|a: &Action| Ok(json!({ "action": a.type_name() })));
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = toron_workflow::WorkflowEngine::local(runner);
+            let _ = toron_workflow::WorkflowEngine::local();
         }))
         .is_err();
         assert!(

@@ -21,15 +21,10 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use toron_workflow::engine::{ActionRunner, WorkflowEngine};
+use toron_workflow::engine::WorkflowEngine;
 use toron_workflow::schema::{Action, Workflow, parse_workflow};
 
-/// A no-op runner (returns Null for every action — the embedding's real
-/// runner is injected; this test exercises the engine, not the mailbox).
-fn noop_runner() -> ActionRunner {
-    Arc::new(|_a: &Action| Ok(serde_json::Value::Null))
-}
-
+/// Flag-day (bd-fuql): pure no-op leaves need no runner — `local()` takes none.
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
@@ -202,7 +197,7 @@ fn flywheel_cargo_toml_lists_toron_workflow() {
 /// and `{{inputs.*}}` / `{{trigger.*}}` resolve end-to-end.
 #[tokio::test]
 async fn sc_fw_flywheel_invokes_workflow_through_engine() {
-    let engine = WorkflowEngine::local(noop_runner()).expect("engine");
+    let engine = WorkflowEngine::local().expect("engine");
     let wf = parse_workflow(
         r#"
 name: sc-fw-demo
@@ -253,16 +248,17 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
     let dispatches: Arc<Mutex<Vec<(String, toron_workflow::schema::DispatchSpec)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let captured = dispatches.clone();
-    let runner: ActionRunner = Arc::new(move |a: &Action| {
-        if let Action::DispatchJob { assignee, spec, .. } = a {
-            captured
-                .lock()
-                .unwrap()
-                .push((assignee.clone(), spec.clone()));
-            return Ok(serde_json::json!({ "ok": true, "assignee": assignee }));
-        }
-        Ok(serde_json::Value::Null)
-    });
+    let runner: toron_workflow::engine::EffectRunner =
+        Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
+            if let Action::DispatchJob { assignee, spec, .. } = &inv.action {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((assignee.clone(), spec.clone()));
+                return Ok(serde_json::json!({ "ok": true, "assignee": assignee }));
+            }
+            Ok(serde_json::Value::Null)
+        });
 
     // The absorbed-legacy workflow shape (mirrors absorb_workflow_steps):
     // send-0 -> DispatchJob{to,spec:{to,stage,msg}}, wait-0 -> Delay.
@@ -307,7 +303,7 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
         inputs: vec![],
     };
 
-    let engine = WorkflowEngine::local(runner).expect("engine");
+    let engine = WorkflowEngine::local_with_effect_runner(Some(runner)).expect("engine");
     let output = engine
         .invoke("legacy-send-wait-1", wf, serde_json::json!({}))
         .await

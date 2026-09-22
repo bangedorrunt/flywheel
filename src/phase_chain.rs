@@ -468,9 +468,9 @@ mod tests {
     /// Contract-passing reports per phase — the fake leaf every linked
     /// built-in dispatch lands on. The plan report PRE-injects dep_cycles=0
     /// so the test does not depend on a live `br` tracker.
-    fn report_runner() -> toron_workflow::ActionRunner {
-        Arc::new(|a: &Action| {
-            let phase = match a {
+    fn report_runner() -> toron_workflow::engine::EffectRunner {
+        Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
+            let phase = match &inv.action {
                 Action::DispatchJob { spec, .. } => spec.phase.clone().unwrap_or_default(),
                 _ => String::new(),
             };
