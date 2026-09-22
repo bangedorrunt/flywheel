@@ -196,9 +196,9 @@ pub struct ActiveLoop {
     /// Daemon-side pin routing reads the same rows (wave-5 follow-up).
     #[serde(
         default,
-        skip_serializing_if = "doorbell_core::wake_table::WakeTable::is_empty"
+        skip_serializing_if = "doorbell_core::wake_core::WakeModel::is_empty"
     )]
-    pub wake: doorbell_core::wake_table::WakeTable,
+    pub wake: doorbell_core::wake_core::WakeModel,
     /// Heal state per agent persists across polls in model' (bd-gs8b #14, crash-safe via ActiveLoop file, was loop-local).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub heal_states: std::collections::BTreeMap<String, HealState>,
@@ -234,7 +234,7 @@ impl ActiveLoop {
             heal_states: BTreeMap::new(),
             done_mailed: std::collections::HashSet::new(),
             drain_pending: BTreeMap::new(),
-            wake: doorbell_core::wake_table::WakeTable::default(),
+            wake: doorbell_core::wake_core::WakeModel::default(),
         }
     }
 }

@@ -996,7 +996,7 @@ impl FileHost {
                 // behavior drift (parity tests prove it). Threading the
                 // real budget signal (Queue) is the follow-up.
                 Effect::Prompt { pin, line } => {
-                    let input = doorbell_core::wake_table::RouteInput {
+                    let input = doorbell_core::wake_core::RouteInput {
                         pin: pin.clone(),
                         line: line.clone(),
                         urgent: doorbell_core::is_urgent_line(&line),
@@ -1008,56 +1008,72 @@ impl FileHost {
                         has_route: true,
                         budget_allows: true,
                     };
+                    // governed-by: bd-0nem — single fold through the fenced
+                    // kernel (was a direct free-fn call; same decision,
+                    // journal-shaped effects).
+                    let (_, effects) = doorbell_core::wake_core::tick(
+                        &doorbell_core::wake_core::WakeModel::default(),
+                        &doorbell_core::wake_core::WakeMsg::Route { input },
+                    );
+                    let decision = effects.into_iter().find_map(|e| match e {
+                        doorbell_core::wake_core::WakeEffect::Routed { decision } => Some(decision),
+                        _ => None,
+                    });
                     // governed-by: bd-zawk — same typed gate as the herdr
                     // path: Busy+urgent breaks through, everything else digests.
-                    match doorbell_core::wake_table::route_wake(&input) {
-                        doorbell_core::wake_table::GateDecision::Inject { pin, line } => {
-                            vec![Effect::Prompt { pin, line }]
-                        }
-                        // bd-v8vi: a held-for-digest wake must actually
-                        // digest — the Audit alone left BrightDog urgents
-                        // visible nowhere (no Digest, no last_wake). Both
-                        // rows journal; absorb_digests delivers the Digest.
-                        doorbell_core::wake_table::GateDecision::Digest { pin, reason } => vec![
-                            Effect::Audit {
-                                kind: "prompt_filtered".into(),
-                                pin: pin.clone(),
-                                detail: serde_json::json!(format!(
-                                    "non-injectable presence held wake for digest: {line}"
-                                )),
-                            },
-                            Effect::Digest {
-                                pin,
-                                line,
-                                why: reason,
-                            },
-                        ],
-                        // Unreachable at this seam (budget/route read true
-                        // above): degrade LOUD to digest, never silent drop
-                        // and never an unbudgeted prompt.
-                        doorbell_core::wake_table::GateDecision::Queue { wake } => vec![
-                            Effect::Audit {
-                                kind: "prompt_filtered".into(),
-                                pin: pin.clone(),
-                                detail: serde_json::json!(format!(
-                                    "budget-held wake queued for digest: {wake}"
-                                )),
-                            },
-                            Effect::Digest {
-                                pin,
-                                line: wake,
-                                why: "budget spent: queued wake surfaces in digest".to_string(),
-                            },
-                        ],
-                        doorbell_core::wake_table::GateDecision::Drop { reason } => {
-                            vec![Effect::Audit {
-                                kind: "prompt_filtered".into(),
-                                pin,
-                                detail: serde_json::json!(format!(
-                                    "wake dropped at routing: {reason}"
-                                )),
-                            }]
-                        }
+                    match decision {
+                        Some(decision) => match decision {
+                            doorbell_core::wake_core::GateDecision::Inject { pin, line } => {
+                                vec![Effect::Prompt { pin, line }]
+                            }
+                            // bd-v8vi: a held-for-digest wake must actually
+                            // digest — the Audit alone left BrightDog urgents
+                            // visible nowhere (no Digest, no last_wake). Both
+                            // rows journal; absorb_digests delivers the Digest.
+                            doorbell_core::wake_core::GateDecision::Digest { pin, reason } => {
+                                vec![
+                                    Effect::Audit {
+                                        kind: "prompt_filtered".into(),
+                                        pin: pin.clone(),
+                                        detail: serde_json::json!(format!(
+                                            "non-injectable presence held wake for digest: {line}"
+                                        )),
+                                    },
+                                    Effect::Digest {
+                                        pin,
+                                        line,
+                                        why: reason,
+                                    },
+                                ]
+                            }
+                            // Unreachable at this seam (budget/route read true
+                            // above): degrade LOUD to digest, never silent drop
+                            // and never an unbudgeted prompt.
+                            doorbell_core::wake_core::GateDecision::Queue { wake } => vec![
+                                Effect::Audit {
+                                    kind: "prompt_filtered".into(),
+                                    pin: pin.clone(),
+                                    detail: serde_json::json!(format!(
+                                        "budget-held wake queued for digest: {wake}"
+                                    )),
+                                },
+                                Effect::Digest {
+                                    pin,
+                                    line: wake,
+                                    why: "budget spent: queued wake surfaces in digest".to_string(),
+                                },
+                            ],
+                            doorbell_core::wake_core::GateDecision::Drop { reason } => {
+                                vec![Effect::Audit {
+                                    kind: "prompt_filtered".into(),
+                                    pin,
+                                    detail: serde_json::json!(format!(
+                                        "wake dropped at routing: {reason}"
+                                    )),
+                                }]
+                            }
+                        },
+                        None => vec![],
                     }
                 }
                 other => vec![other],
