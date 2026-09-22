@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 doorbell-core = { path = "../doorbell-core" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # bd-qrmw: typed library errors (thiserror) — anyhow is gone from this crate.

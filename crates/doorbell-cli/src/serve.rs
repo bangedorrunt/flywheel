@@ -81,9 +81,9 @@ async fn host_workspace(
         }
     }
     let store = FileStore::new(fw_state);
-    // Watch child (CLI; the in-process bus needs toron-core, which the
+    // Wake-sock consumer (the in-process bus needs toron-core, which the
     // lean daemon never links). Backoff + retry gate live in the host.
-    host.restart_watch();
+    host.restart_wake();
     // Beats: 1s sweep, 60s ack-SLA (same cadences as embedded).
     let sweep_ticker = doorbell_rt::interval_ticker(
         "sweep",

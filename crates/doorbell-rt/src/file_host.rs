@@ -3,9 +3,10 @@
 //!
 //! Same [`Brain`], file/CLI inputs: flywheel state files (spawn registry,
 //! role binds, pending role-bounds/facts, pid/gen) plus the `toron` /
-//! `herdr` CLIs (watch, inbox, whois, prompt, agent list). Zero new crates:
-//! `std::process` only. No flywheel types — this is what lets the
-//! `doorbell` daemon host the loop without linking the orchestrator.
+//! `herdr` CLIs (inbox, whois, prompt, agent list) and the daemon
+//! `wake.sock` subscription (no `toron watch` child). No flywheel types —
+//! this is what lets the `doorbell` daemon host the loop without linking
+//! the orchestrator.
 //!
 //! Parity contract (bd-ene2 verify): the same [`BrainMsg`] sequence with
 //! the same registry/presence/inbox inputs yields the same [`Effect`]
@@ -466,17 +467,8 @@ pub fn injection_picture(
     picture
 }
 
-/// A `toron watch` child that is killed + reaped when dropped. Wrapping is
-/// the point: a bare `std::process::Child` drop leaves the process running,
-/// which is how `Died`-driven restarts littered long-lived watchers.
-struct WatchChild(std::process::Child);
-
-impl Drop for WatchChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+/// Wake-socket subscription kinds live in [`WATCH_KINDS`]; the consumer in
+/// [`crate::wake_sock`] maps frames onto [`BrainMsg`](crate::msg::BrainMsg).
 
 pub struct FileHost {
     cfg: FileHostConfig,
@@ -524,17 +516,20 @@ pub struct FileHost {
     /// through this channel (forwarder topology over a poll transport).
     tx: Option<tokio::sync::mpsc::Sender<BrainMsg>>,
     pending_audit: Option<(String, serde_json::Value)>,
-    /// The single live `toron watch` child (shared with the respawn task so
-    /// a replacement reaps its predecessor). [`WatchChild`] kills on drop.
-    watch_child: std::sync::Arc<std::sync::Mutex<Option<WatchChild>>>,
+    /// The single live wake-socket consumer (shared with the restart task so
+    /// a replacement aborts its predecessor). [`tokio::task::AbortHandle`]
+    /// aborts on drop-scope, mirroring the old child reap.
+    wake_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl Drop for FileHost {
-    /// Never outlive a live watcher: dropping the host (shutdown, or a
-    /// retired generation) reaps the child instead of orphaning it.
+    /// Never outlive a live consumer: dropping the host (shutdown, or a
+    /// retired generation) aborts the socket task instead of orphaning it.
     fn drop(&mut self) {
-        if let Ok(mut g) = self.watch_child.lock() {
-            let _ = g.take();
+        if let Ok(mut g) = self.wake_task.lock() {
+            if let Some(h) = g.take() {
+                h.abort();
+            }
         }
     }
 }
@@ -569,7 +564,7 @@ impl FileHost {
             generation,
             tx: None,
             pending_audit: None,
-            watch_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            wake_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -954,17 +949,26 @@ impl FileHost {
     /// (`ts/workspace/kind` + detail) for CLI failures on the `&self`
     /// paths, where no journal row can be emitted inline.
     fn audit_file(&self, kind: &str, detail: serde_json::Value) {
-        let path = self
-            .cfg
-            .flywheel_state
+        Self::append_audit_row(&self.cfg.flywheel_state, &self.cfg.workspace, kind, detail);
+    }
+
+    /// Append one audit row. Single owner for the audit shape, shared by
+    /// [`FileHost::audit_file`] and the wake-sock task (which owns no `&self`).
+    pub(crate) fn append_audit_row(
+        state_dir: &Path,
+        workspace: &str,
+        kind: &str,
+        detail: serde_json::Value,
+    ) {
+        let path = state_dir
             .join("doorbell")
-            .join(format!("{}.audit.jsonl", self.cfg.workspace));
+            .join(format!("{workspace}.audit.jsonl"));
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut entry = serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "workspace": self.cfg.workspace,
+            "workspace": workspace,
             "kind": kind,
         });
         if let (Some(obj), serde_json::Value::Object(map)) = (entry.as_object_mut(), detail) {
@@ -1325,88 +1329,56 @@ impl Host for FileHost {
             .unwrap_or_default()
     }
 
-    fn restart_watch(&mut self) {
+    fn restart_wake(&mut self) {
         let backoff = self.retry.record_fail();
         let tx = self.tx.clone();
         let project = self.cfg.project.clone();
-        let toron = self.cfg.toron_bin.clone();
         let fw_state = self.cfg.flywheel_state.clone();
         let workspace = self.cfg.workspace.clone();
-        // One live watcher per host, never a litter. The slot's `Drop`
-        // kills+reaps the previous child before the replacement spawns:
-        // dropping a bare `Child` does NOT terminate it, so every Died
-        // burst used to leak another long-lived `toron watch` holding a bus
-        // subscription (observed live as PPID-1 orphans after restarts).
-        let slot = self.watch_child.clone();
+        // One live consumer per host, never a litter. The slot aborts the
+        // previous task before the replacement subscribes.
+        let slot = self.wake_task.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
             let Some(tx) = tx else { return };
-            if let Ok(mut g) = slot.lock() {
-                let _ = g.take();
-            }
-            let kinds = WATCH_KINDS;
-            // --idle-exit bounds silence: a half-open bus subscription
-            // delivers nothing AND never errors (observed live as a zombie
-            // child whose heartbeat went 14 minutes stale while the process
-            // sat alive). Exit 4 = idle exit; the reader thread's EOF on the
-            // next line feeds Died, and this spawn site's backoff respawns.
-            // The plane-S cursor (gap 1) dedupes the respawn's replay.
-            const WATCH_IDLE_EXIT_SECS: u64 = 90;
-            let mut child = match std::process::Command::new(&toron)
-                .args([
-                    "watch",
-                    "--live",
-                    "--project",
-                    &project,
-                    "--kinds",
-                    kinds,
-                    "--idle-exit",
-                    &WATCH_IDLE_EXIT_SECS.to_string(),
-                ])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
+            if let Ok(mut g) = slot.lock()
+                && let Some(h) = g.take()
             {
-                Ok(c) => c,
-                Err(_) => {
-                    let _ = tx.send(BrainMsg::Died).await;
-                    return;
-                }
-            };
-            let stdout = match child.stdout.take() {
-                Some(s) => s,
-                None => {
-                    let _ = tx.send(BrainMsg::Died).await;
-                    return;
-                }
-            };
-            if let Ok(mut g) = slot.lock() {
-                *g = Some(WatchChild(child));
+                h.abort();
             }
-            std::thread::spawn(move || {
-                use std::io::BufRead;
-                // Heartbeat, throttled to 1s: `/health` reads this mtime so
-                // a watcher on the wrong bus (or a dead child) is visible
-                // instead of indistinguishable from a quiet workspace.
-                let mut stamped: Option<std::time::Instant> = None;
-                for line in std::io::BufReader::new(stdout).lines() {
-                    match line {
-                        Ok(l) => {
-                            if stamped
-                                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
-                            {
-                                crate::watchbeat::touch(&fw_state, &workspace);
-                                stamped = Some(std::time::Instant::now());
-                            }
-                            if tx.blocking_send(BrainMsg::Watch(l)).is_err() {
-                                break;
-                            }
+            let opts = crate::wake_sock::WakeOpts::new(
+                crate::wake_sock::wake_sock_path(),
+                crate::wake_sock::parse_kinds(WATCH_KINDS),
+                Some(project),
+            );
+            let audit_state = fw_state.clone();
+            let audit_workspace = workspace.clone();
+            let beat_state = fw_state.clone();
+            let beat_workspace = workspace.clone();
+            let handle = crate::wake_sock::spawn_wake_task(
+                opts,
+                move |kind, detail| {
+                    FileHost::append_audit_row(&audit_state, &audit_workspace, kind, detail);
+                },
+                move |out| {
+                    use crate::wake_sock::WakeOutcome;
+                    match out {
+                        WakeOutcome::Watch(l) => {
+                            crate::watchbeat::touch(&beat_state, &beat_workspace);
+                            let _ = tx.blocking_send(BrainMsg::Watch(l));
                         }
-                        Err(_) => break,
+                        WakeOutcome::Heartbeat => {
+                            crate::watchbeat::touch(&beat_state, &beat_workspace);
+                        }
+                        WakeOutcome::Died => {
+                            let _ = tx.blocking_send(BrainMsg::Died);
+                        }
                     }
-                }
-                let _ = tx.blocking_send(BrainMsg::Died);
-            });
+                },
+            );
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(handle);
+            }
         });
     }
 

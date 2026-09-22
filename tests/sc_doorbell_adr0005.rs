@@ -199,10 +199,10 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         host.contains("doorbell_prompt"),
         "live inject must go through the herdr prompt delivery path"
     );
-    // One watch source: in-process bus watch with the CLI child fallback.
+    // One watch source: in-process bus watch with the wake-sock fallback.
     assert!(
-        host.contains("subscribe_trusted") && host.contains("spawn_watch_child"),
-        "in-process watch first, CLI child fallback"
+        host.contains("subscribe_trusted") && host.contains("spawn_wake_consumer"),
+        "in-process watch first, wake-sock fallback"
     );
     assert!(
         !host.contains("9,7,43001"),

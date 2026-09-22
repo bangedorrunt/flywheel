@@ -84,10 +84,32 @@ pub struct RtHost {
     // the registry pin set changes (was every 1s sweep: N whois RPCs/sec).
     index_refreshed_at: u64,
     index_pins: Vec<String>,
-    /// The one live `toron watch` child. Shared with the respawn task so a
-    /// replacement reaps its predecessor ([`crate::WatchChild`] kills on
-    /// drop) instead of littering PPID-1 watchers.
-    watch_child: std::sync::Arc<std::sync::Mutex<Option<crate::WatchChild>>>,
+    /// The one live wake-socket consumer. Shared with the restart task so a
+    /// replacement aborts its predecessor instead of littering watchers.
+    wake_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+}
+
+/// Map one wake-sock outcome onto `BrainMsg`. Single owner for the twin
+/// sites (restart + initial fallback): Watch lines and heartbeats stamp the
+/// watchbeat, transport death re-enters as `Died`.
+fn wake_outcome_to_brain(
+    out: doorbell_rt::wake_sock::WakeOutcome,
+    tx: &mpsc::Sender<BrainMsg>,
+    workspace: &str,
+) {
+    use doorbell_rt::wake_sock::WakeOutcome;
+    match out {
+        WakeOutcome::Watch(l) => {
+            doorbell_rt::watchbeat::touch(&config::state_dir(), workspace);
+            let _ = tx.blocking_send(BrainMsg::Watch(l));
+        }
+        WakeOutcome::Heartbeat => {
+            doorbell_rt::watchbeat::touch(&config::state_dir(), workspace);
+        }
+        WakeOutcome::Died => {
+            let _ = tx.blocking_send(BrainMsg::Died);
+        }
+    }
 }
 
 impl RtHost {
@@ -131,7 +153,7 @@ impl RtHost {
             authority: crate::authority::RuntimeAuthority::resolve(),
             index_refreshed_at: now,
             index_pins,
-            watch_child: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            wake_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -457,42 +479,39 @@ impl Host for RtHost {
         crate::drain_pending_facts(&self.project)
     }
 
-    fn restart_watch(&mut self) {
+    fn restart_wake(&mut self) {
         // GS-007 never-deaf rule: burst in a task, gate across calls.
         let backoff = self.retry.record_fail();
         let tx = self.brain_tx.clone();
         let project = self.project.clone();
         let workspace = self.workspace.clone();
-        let slot = self.watch_child.clone();
+        let slot = self.wake_task.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(backoff)).await;
-            // Reap the predecessor first: one live watcher per host.
-            if let Ok(mut g) = slot.lock() {
-                let _ = g.take();
+            // Abort the predecessor first: one live consumer per host.
+            if let Ok(mut g) = slot.lock()
+                && let Some(h) = g.take()
+            {
+                h.abort();
             }
             let tx_g = tx.clone();
-            let spawned =
-                crate::spawn_watch_child(&project, &workspace, &config::state_dir(), move |ev| {
-                    let _ = match ev {
-                        Some(l) => tx_g.blocking_send(BrainMsg::Watch(l)),
-                        None => tx_g.blocking_send(BrainMsg::Died),
-                    };
-                });
-            match spawned {
-                Some(child) => {
-                    if let Ok(mut g) = slot.lock() {
-                        *g = Some(child);
-                    }
-                    doorbell::audit_append(
-                        &config::state_dir(),
-                        "",
-                        serde_json::json!({ "kind": "watch_restart" }),
-                    );
-                }
-                None => {
-                    let _ = tx.blocking_send(BrainMsg::Died);
-                }
+            let beat_workspace = workspace.clone();
+            let handle = crate::spawn_wake_consumer(
+                &project,
+                &workspace,
+                &config::state_dir(),
+                move |out| {
+                    wake_outcome_to_brain(out, &tx_g, &beat_workspace);
+                },
+            );
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(handle);
             }
+            doorbell::audit_append(
+                &config::state_dir(),
+                "",
+                serde_json::json!({ "kind": "watch_restart" }),
+            );
         });
     }
 }
@@ -634,22 +653,20 @@ async fn run_embedded_async(
         },
     );
     let store = FileStore::new(config::state_dir());
-    // Watch source: in-process bus watch first (zero fork), CLI child fallback.
-    // Both stamp the watch heartbeat, and the child goes through the host's
-    // slot so the respawn path reaps its predecessor.
-    let watch_slot = host.watch_child.clone();
+    // Watch source: in-process bus watch first (zero fork), wake-sock fallback.
+    // Both stamp the watch heartbeat, and the socket task goes through the
+    // host's slot so the restart path aborts its predecessor.
+    let watch_slot = host.wake_task.clone();
     if !spawn_bus_watch(&cfg, project, workspace, tx.clone()) {
         let tx_w = tx.clone();
         let project = project.to_string();
-        let spawned =
-            crate::spawn_watch_child(&project, workspace, &config::state_dir(), move |ev| {
-                let _ = match ev {
-                    Some(l) => tx_w.blocking_send(BrainMsg::Watch(l)),
-                    None => tx_w.blocking_send(BrainMsg::Died),
-                };
+        let beat_workspace = workspace.to_string();
+        let handle =
+            crate::spawn_wake_consumer(&project, workspace, &config::state_dir(), move |out| {
+                wake_outcome_to_brain(out, &tx_w, &beat_workspace);
             });
         if let Ok(mut g) = watch_slot.lock() {
-            *g = spawned;
+            *g = Some(handle);
         }
     }
     host.cover_new_panes();
