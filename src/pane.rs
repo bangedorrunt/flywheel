@@ -229,6 +229,29 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
         }
     }
 }
+/// bd-nwnb: the dead-row gauge core — rows whose pane is gone, as
+/// (pane_id, name) pairs. Pure; [`dead_registry_rows`] supplies the live
+/// set and reads the file.
+pub fn find_dead_rows(
+    entries: &[SpawnEntry],
+    live_pane_ids: &std::collections::HashSet<String>,
+) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .filter(|e| !live_pane_ids.contains(&e.pane_id))
+        .map(|e| (e.pane_id.clone(), e.name.clone()))
+        .collect()
+}
+
+/// bd-nwnb: dead registry rows for status output. Fail-open: an
+/// unlistable backend reports none (never error the status render).
+pub fn dead_registry_rows(project: &str, c: &mut Client) -> Vec<(String, String)> {
+    let Ok(panes) = c.pane_list(None) else {
+        return Vec::new();
+    };
+    let live: std::collections::HashSet<String> = panes.into_iter().map(|p| p.pane_id).collect();
+    find_dead_rows(&state::load_spawn_registry(project), &live)
+}
 /// bd-lvyi: resolve a per-step harness override to a crew pane running THAT
 /// harness. The pane's `harness` column is authoritative; a legacy entry
 /// without one (pre-bd-lvyi registry) falls back to its profile's harness
@@ -2412,6 +2435,44 @@ mod tests {
         assert_eq!(pruned, 1);
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|e| e.pane_id != "wDead:p1"));
+    }
+
+    /// bd-nwnb (red first): the gauge — rows whose pane is gone,
+    /// reported as (pane_id, name) pairs for status output. Live rows
+    /// never appear, even when they sort after dead ones.
+    #[test]
+    fn dead_rows_gauge_names_only_gone_panes() {
+        use std::collections::HashSet;
+        let mk = |pane: &str, name: &str| SpawnEntry {
+            pane_id: pane.into(),
+            name: name.into(),
+            profile: Some("planner".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        };
+        let entries = vec![
+            mk("wDead:p1", "crew-old-planner"),
+            mk("wLive:p1", "crew-new-planner"),
+        ];
+        let live: HashSet<String> = ["wLive:p1".to_string()].into_iter().collect();
+        let dead = find_dead_rows(&entries, &live);
+        assert_eq!(
+            dead,
+            vec![("wDead:p1".to_string(), "crew-old-planner".to_string())]
+        );
+        let none = find_dead_rows(
+            &entries,
+            &["wDead:p1", "wLive:p1"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        assert!(none.is_empty());
     }
 
     /// bd-lvyi: a per-step harness override resolves to a crew pane OF THAT
