@@ -1669,6 +1669,9 @@ pub enum AnnotateSurface {
     CoalitionIntent,
     WaveReadiness,
     ReviewerRank,
+    /// bd-adv4: smart profile pickup — one coder-family candidate per
+    /// call, the caller ranks repeated calls; the user decides.
+    ProfilePick,
 }
 
 impl AnnotateSurface {
@@ -1677,6 +1680,7 @@ impl AnnotateSurface {
             "coalition-intent" => Some(Self::CoalitionIntent),
             "wave-readiness" => Some(Self::WaveReadiness),
             "reviewer-rank" => Some(Self::ReviewerRank),
+            "profile-pick" => Some(Self::ProfilePick),
             _ => None,
         }
     }
@@ -1686,6 +1690,7 @@ impl AnnotateSurface {
             Self::CoalitionIntent => "coalition-intent",
             Self::WaveReadiness => "wave-readiness",
             Self::ReviewerRank => "reviewer-rank",
+            Self::ProfilePick => "profile-pick",
         }
     }
 }
@@ -1738,7 +1743,64 @@ pub fn fold_annotate(surface: AnnotateSurface, answers: &Answers, pack: &Questio
                 .unwrap_or(("unknown".to_string(), 0.0));
             format!("annotate reviewer: fit={level} ({lv_conf:.2})")
         }
+        AnnotateSurface::ProfilePick => {
+            let (level, lv_conf) = answers
+                .by_question
+                .get("profile_fit")
+                .and_then(|a| match a {
+                    Answer::Score(s) => pack
+                        .questions
+                        .iter()
+                        .find(|q| q.id == "profile_fit")
+                        .and_then(|q| q.options.get(s.level))
+                        .map(|name| (name.clone(), confidence_of(a))),
+                    _ => None,
+                })
+                .unwrap_or(("unknown".to_string(), 0.0));
+            format!("annotate profile: fit={level} ({lv_conf:.2})")
+        }
     }
+}
+
+/// bd-adv4: offline FallbackTable for the profile-pick pack — deterministic
+/// language cues over the objective text. The live path is
+/// `annotate(project, AnnotateSurface::ProfilePick, goal, extra, authority)`
+/// once per coder-family candidate (the caller ranks by fit level, then
+/// confidence); this table is what the steer briefing shows when Jev is
+/// unreachable, and `@coder` is the default the compose tokens ship. The
+/// user always decides — a suggestion never dispatches, holds, or closes.
+pub fn suggest_profile_pick(objective: &str) -> &'static str {
+    let lower = objective.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = |w: &str| tokens.contains(&w);
+    if has("rust")
+        || has("cargo")
+        || has("rustc")
+        || lower.contains(".rs")
+        || lower.contains("borrow check")
+        || lower.contains("lifetime")
+    {
+        return "@rust-coder";
+    }
+    if has("typescript")
+        || has("javascript")
+        || has("node")
+        || has("npm")
+        || has("deno")
+        || has("tsx")
+        || has("tsconfig")
+        || lower.contains(".ts")
+        || lower.contains("jsx")
+    {
+        return "@ts-coder";
+    }
+    if has("zig") || lower.contains(".zig") || lower.contains("comptime") {
+        return "@zig-coder";
+    }
+    "@coder"
 }
 
 /// Coordination annotator ask (bd-lpn6): loads the surface pack, asks over
@@ -2658,6 +2720,69 @@ questions:
         assert!(line.contains("intent=review-handoff"), "{line}");
         assert!(AnnotateSurface::parse("wave-readiness") == Some(AnnotateSurface::WaveReadiness));
         assert!(AnnotateSurface::parse("bogus").is_none());
+    }
+
+    /// bd-adv4: the profile-pick fold maps the Score level to its option
+    /// name, mirroring the reviewer-rank arm.
+    #[test]
+    fn profile_pick_fold_reports_fit_level() {
+        let pack = QuestionPack::parse_yaml(
+            r#"
+id: profile-pick
+version: 1
+model: jev-1.13.0
+questions:
+  - id: profile_fit
+    kind: score
+    instructions: "fit?"
+    options: [poor, adequate, strong]
+    criteria: ["p", "a", "s"]
+"#,
+        )
+        .expect("profile-pick test pack parses");
+        let answers = Answers {
+            model_id: JEV_MODEL_PIN.into(),
+            pack_id: "profile-pick".into(),
+            pack_version: 1,
+            by_question: BTreeMap::from([(
+                "profile_fit".into(),
+                Answer::Score(ScoreAnswer {
+                    level: 2,
+                    levels: 3,
+                }),
+            )]),
+            usage: "{}".into(),
+        };
+        let line = fold_annotate(AnnotateSurface::ProfilePick, &answers, &pack);
+        assert!(line.contains("fit=strong"), "{line}");
+        assert!(AnnotateSurface::parse("profile-pick") == Some(AnnotateSurface::ProfilePick));
+    }
+
+    /// bd-adv4: the offline profile-pick table routes by language cue and
+    /// defaults to the generic coder.
+    #[test]
+    fn profile_pick_suggest_falls_back_by_language() {
+        assert_eq!(
+            suggest_profile_pick("fix the borrow checker error in cargo build"),
+            "@rust-coder"
+        );
+        assert_eq!(
+            suggest_profile_pick("migrate the tsconfig build to npm workspaces"),
+            "@ts-coder"
+        );
+        assert_eq!(
+            suggest_profile_pick("rewrite the allocator with comptime"),
+            "@zig-coder"
+        );
+        assert_eq!(
+            suggest_profile_pick("sharpen the objective into beads"),
+            "@coder"
+        );
+        // Substring caution: bare "nodes"/"assets" must not cue ts-coder.
+        assert_eq!(
+            suggest_profile_pick("drain the nodes and rotate assets"),
+            "@coder"
+        );
     }
 
     // --- bd-n86n: POST outside the journal tx ---

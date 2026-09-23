@@ -1293,6 +1293,12 @@ fn infer_auto(
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();
 
     fn bump_role(role: &str, counts: &mut BTreeMap<String, u32>) {
+        // bd-adv4: the profile-pick input template names the implement
+        // profile decided at invoke time — it always seats a coder.
+        if role.trim() == "{{inputs.coder_profile}}" {
+            counts.entry("coder".to_string()).or_insert(1);
+            return;
+        }
         if let Some(role) = role.strip_prefix('@') {
             counts.entry(role.to_string()).or_insert(1);
         }
@@ -1504,6 +1510,29 @@ steps:
         assert_eq!(plan.members.get("reviewer"), Some(&1), "{:?}", plan.members);
         assert_eq!(plan.members.get("oracle"), Some(&1), "{:?}", plan.members);
         assert_eq!(plan.total(), 2, "unique roles, not occurrence count");
+    }
+
+    /// bd-adv4: a `crew: auto` step riding the profile-pick input template
+    /// still seats a coder — the implement profile is decided at invoke
+    /// time, the seat is known at plan time.
+    #[test]
+    fn profile_pick_template_ref_seats_coder() {
+        let wf = parse_workflow(
+            r#"
+name: impl-token
+trigger:
+  type: webhook
+crew: auto
+steps:
+  - name: execute
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "{{inputs.coder_profile}}" }
+"#,
+        )
+        .expect("parse");
+        let plan = plan_crew(&wf);
+        assert_eq!(plan.members.get("coder"), Some(&1), "{:?}", plan.members);
     }
 
     /// bd-t86p: crew:auto on a COMPOSED workflow (call_workflow steps) must
@@ -2050,9 +2079,9 @@ steps:
         );
         assert!(
             matches!(&wf.steps[2].action, Action::DispatchJob { spec, .. }
-                if spec.profile.as_deref() == Some("@coder")
+                if spec.profile.as_deref() == Some("{{inputs.coder_profile}}")
                     && spec.stage.as_deref() == Some("ce-execute")),
-            "EXECUTE third (bd-wave-swarm-graduation-fix-98io: the crew needs an executor)"
+            "EXECUTE third (bd-wave-swarm-graduation-fix-98io: the crew needs an executor; bd-adv4: the executor profile rides the coder_profile input, default @coder)"
         );
         assert!(
             matches!(&wf.steps[3].action, Action::DispatchJob { spec, .. }

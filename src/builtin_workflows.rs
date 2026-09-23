@@ -1179,6 +1179,8 @@ inputs:
     default: "adr0006-steer"
   - name: captain_pin
     default: ""
+  - name: coder_profile
+    default: "@coder"
 steps:
   - name: gate
     action: dispatch_job
@@ -1202,7 +1204,7 @@ steps:
     action: dispatch_job
     assignee: x
     spec:
-      profile: "@coder"
+      profile: "{{inputs.coder_profile}}"
       stage: ce-execute
       task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). Objective: {{inputs.objective}}'
     on_error: fail_run
@@ -1264,13 +1266,15 @@ inputs:
     default: 3
   - name: run_id
   - name: ledger_path
+  - name: coder_profile
+    default: "@coder"
 graph:
   nodes:
     repair-1:
       action: dispatch_job
       assignee: x
       spec:
-        profile: "@coder"
+        profile: "{{inputs.coder_profile}}"
         context: fresh
         task: "Repair iteration 1 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}} (read the file, do not trust prompt). VERIFY: {{inputs.verify}}"
       on_error: fail_run
@@ -1297,7 +1301,7 @@ graph:
       action: dispatch_job
       assignee: x
       spec:
-        profile: "@coder"
+        profile: "{{inputs.coder_profile}}"
         context: fresh
         task: "Repair iteration 2 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}}."
       on_error: fail_run
@@ -1324,7 +1328,7 @@ graph:
       action: dispatch_job
       assignee: x
       spec:
-        profile: "@coder"
+        profile: "{{inputs.coder_profile}}"
         context: fresh
         task: "Repair iteration 3 for {{inputs.bead_id}}."
       on_error: fail_run
@@ -1401,6 +1405,8 @@ inputs:
     default: ""
   - name: steer_channel
     default: "adr0008-steer"
+  - name: coder_profile
+    default: "@coder"
 graph:
   nodes:
     grill:
@@ -1469,7 +1475,7 @@ graph:
       guard: 'trigger_until != "grill" && trigger_until != "create" && trigger_until != "review1" && trigger_until != "review2" && trigger_until != "integrate" && trigger_existing_bead == ""'
       action: call_workflow
       workflow: wave-swarm
-      inputs: { objective: "{{inputs.objective}}", captain_pin: "{{inputs.captain_pin}}", steer_channel: "{{inputs.steer_channel}}" }
+      inputs: { objective: "{{inputs.objective}}", captain_pin: "{{inputs.captain_pin}}", steer_channel: "{{inputs.steer_channel}}", coder_profile: "{{inputs.coder_profile}}" }
       on_error: fail_run
     verify:
       needs: [implement, implement-bead]
@@ -3096,6 +3102,80 @@ mod tests {
                 .1
                 .contains("workflow: triage"),
             "goal.ship must not call triage (invoke-path templates would render empty)"
+        );
+    }
+
+    /// bd-adv4: compose tokens route the implement profile through the
+    /// `coder_profile` input (default @coder) so the profile-pick
+    /// suggestion applies without editing YAML; beads-lifecycle forwards
+    /// it to wave-swarm.
+    #[test]
+    fn profile_pick_compose_tokens_wire_coder_profile() {
+        use toron_workflow::schema::Action;
+        let wfs = builtin_workflows();
+        let wave = &wfs["wave-swarm"];
+        let decl = wave
+            .inputs
+            .iter()
+            .find(|d| d.name == "coder_profile")
+            .expect("wave-swarm coder_profile input");
+        assert_eq!(
+            decl.default.as_ref().and_then(|v| v.as_str()),
+            Some("@coder"),
+            "default keeps the old hardcoded seat"
+        );
+        let exec = wave
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("execute"))
+            .expect("wave-swarm execute");
+        let Action::DispatchJob { spec, .. } = &exec.action else {
+            panic!("execute is a dispatch_job");
+        };
+        assert_eq!(
+            spec.profile.as_deref(),
+            Some("{{inputs.coder_profile}}"),
+            "execute rides the input, not a hardcoded @coder"
+        );
+        let rep = &wfs["repair-until-verified"];
+        let decl = rep
+            .inputs
+            .iter()
+            .find(|d| d.name == "coder_profile")
+            .expect("repair coder_profile input");
+        assert_eq!(
+            decl.default.as_ref().and_then(|v| v.as_str()),
+            Some("@coder")
+        );
+        let graph = rep.graph.as_ref().expect("repair graph");
+        for name in ["repair-1", "repair-2", "repair-3"] {
+            let node = graph
+                .nodes
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} present"));
+            let Action::DispatchJob { spec, .. } = &node.action else {
+                panic!("{name} is a dispatch_job");
+            };
+            assert_eq!(
+                spec.profile.as_deref(),
+                Some("{{inputs.coder_profile}}"),
+                "{name}"
+            );
+        }
+        let bl = &wfs["beads-lifecycle"];
+        assert!(
+            bl.inputs.iter().any(|d| d.name == "coder_profile"),
+            "beads-lifecycle declares coder_profile"
+        );
+        let bl_graph = bl.graph.as_ref().expect("beads-lifecycle graph");
+        let imp = bl_graph.nodes.get("implement").expect("implement present");
+        let Action::CallWorkflow { inputs, .. } = &imp.action else {
+            panic!("implement calls wave-swarm");
+        };
+        assert_eq!(
+            inputs.get("coder_profile").and_then(|v| v.as_str()),
+            Some("{{inputs.coder_profile}}"),
+            "implement forwards the input to wave-swarm"
         );
     }
 
