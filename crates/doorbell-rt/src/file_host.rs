@@ -469,7 +469,6 @@ pub fn injection_picture(
 
 /// Wake-socket subscription kinds live in [`WATCH_KINDS`]; the consumer in
 /// [`crate::wake_sock`] maps frames onto [`BrainMsg`](crate::msg::BrainMsg).
-
 pub struct FileHost {
     cfg: FileHostConfig,
     reducer: CoreReducer,
@@ -526,10 +525,10 @@ impl Drop for FileHost {
     /// Never outlive a live consumer: dropping the host (shutdown, or a
     /// retired generation) aborts the socket task instead of orphaning it.
     fn drop(&mut self) {
-        if let Ok(mut g) = self.wake_task.lock() {
-            if let Some(h) = g.take() {
-                h.abort();
-            }
+        if let Ok(mut g) = self.wake_task.lock()
+            && let Some(h) = g.take()
+        {
+            h.abort();
         }
     }
 }

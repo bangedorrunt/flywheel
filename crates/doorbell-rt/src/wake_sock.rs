@@ -37,6 +37,10 @@ pub enum WakeOutcome {
 /// Loud-degradation audit kinds (never silent).
 pub const AUDIT_SOCK_ABSENT: &str = "wake_sock_absent";
 pub const AUDIT_SOCK_FRAME: &str = "wake_sock_frame";
+/// bd-gdfe: a consumer that ended without its terminal outcome (worker
+/// panic or abort) journals this instead of dying silently — the gap that
+/// left hosted workspaces wake-blind with no backoff explanation.
+pub const AUDIT_WAKE_DROPPED: &str = "wake_consumer_dropped";
 
 /// Pure discovery core: explicit override wins, else the daemon state dir.
 /// (Mirrors toron-cli `discover_from`: `XDG_STATE_HOME/toron`, else
@@ -194,14 +198,41 @@ pub fn spawn_wake_task(
 ) -> tokio::task::AbortHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WakeOutcome>();
     let audit = std::sync::Arc::new(on_audit);
+    let worker_audit = audit.clone();
     let worker = tokio::spawn(async move {
-        run_wake_loop(opts, &tx, &audit).await;
+        run_wake_loop(opts, &tx, &worker_audit).await;
     });
     let handle = worker.abort_handle();
     std::thread::spawn(move || {
         let mut rx = rx;
+        let mut terminal = false;
         while let Some(out) = rx.blocking_recv() {
-            on_event(out);
+            if matches!(out, WakeOutcome::Died) {
+                terminal = true;
+            }
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_event(out))).is_err() {
+                // bd-gdfe: a panicking forwarder must not strand the chain —
+                // fall through to the inferred terminal below.
+                eprintln!("doorbell: wake outcome forwarder panicked; inferring Died (bd-gdfe)");
+                break;
+            }
+        }
+        if !terminal {
+            // bd-gdfe: the worker ended (panic, abort, unwind) with NO
+            // terminal outcome. Journal the loss, then forward exactly one
+            // Died so the brain re-arms — a consumer may never vanish
+            // silently: that was the permanent wake-blind gap.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                audit(
+                    AUDIT_WAKE_DROPPED,
+                    serde_json::json!({
+                        "reason": "wake worker ended without a terminal outcome; inferred Died"
+                    }),
+                );
+            }));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                on_event(WakeOutcome::Died)
+            }));
         }
     });
     handle
@@ -404,6 +435,59 @@ mod tests {
         assert!(matches!(got[1], WakeOutcome::Heartbeat));
         assert!(matches!(got[2], WakeOutcome::Died));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-gdfe: the silent wake gap. When the worker task dies WITHOUT a
+    /// terminal outcome (here: a scripted panic in the audit callback — the
+    /// same path a real defect takes), the forwarding thread must still
+    /// deliver exactly one `Died` and journal why. Before this contract the
+    /// thread exited silently: no outcome, no audit row, no backoff — the
+    /// permanent per-workspace silence observed live.
+    #[test]
+    fn wake_respawn_lost_worker_still_forwards_one_died() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let opts = WakeOpts {
+            sock_path: std::env::temp_dir()
+                .join(format!("wake-respawn-absent-{}.sock", std::process::id())),
+            kinds: vec![9],
+            project: None,
+            handshake_timeout: Duration::from_millis(100),
+            idle_timeout: Duration::from_millis(100),
+        };
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<WakeOutcome>(8);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let audit_calls = calls.clone();
+        let audit_rows = rows.clone();
+        let audit = move |kind: &str, _v: serde_json::Value| {
+            // The FIRST audit runs inside the worker: defect it like reality.
+            if audit_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("scripted worker defect");
+            }
+            audit_rows.lock().unwrap().push(kind.to_string());
+        };
+        let _handle = rt.block_on(async move {
+            spawn_wake_task(opts, audit, move |out| {
+                let _ = out_tx.send(out);
+            })
+        });
+        let got = out_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a lost worker must still forward one Died (bd-gdfe)");
+        assert!(matches!(got, WakeOutcome::Died));
+        assert!(
+            out_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "exactly one Died, never a duplicate"
+        );
+        let rows = rows.lock().unwrap();
+        assert!(
+            rows.iter().any(|k| k == AUDIT_WAKE_DROPPED),
+            "the inferred terminal journals itself, never silently: {rows:?}"
+        );
     }
 
     #[tokio::test]
