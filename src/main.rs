@@ -19244,7 +19244,12 @@ fn cmd_loop(
                         .and_then(|v| v.get("ok").and_then(Value::as_bool))
                         .unwrap_or(false);
                     if !ok {
-                        eprintln!("flywheel: send to {name} failed: {raw}");
+                        let err_bytes = String::from_utf8_lossy(&out.stderr).to_string();
+                        let code = out.status.code().unwrap_or(-1);
+                        eprintln!(
+                            "{}",
+                            format_send_failure(name, raw.trim(), err_bytes.trim(), out.status.success(), code)
+                        );
                         // the item was already popped by plan_actions — put it
                         // back at the FRONT so the next poll retries it (a
                         // dead agent never silently consumes a prompt)
@@ -27991,6 +27996,19 @@ fn cmd_internal_send(
     Ok(())
 }
 
+/// bd-n9hy: one-line failure record for a __send subprocess dispatch — keeps
+/// the raw stdout+stderr bytes plus exit status so a bare `{ok:false}` on a
+/// fresh pane stays diagnosable. Log-only shape, never parsed.
+fn format_send_failure(name: &str, stdout: &str, stderr: &str, status_ok: bool, code: i32) -> String {
+    let out = if stdout.is_empty() { "<empty>" } else { stdout };
+    let err = if stderr.is_empty() { "<empty>" } else { stderr };
+    format!(
+        "flywheel: send to {name} failed: status={code} ok={status_ok} stdout_len={} stderr_len={} stdout={out:?} stderr={err:?}",
+        stdout.len(),
+        stderr.len(),
+    )
+}
+
 /// The confirmed-send leaf JSON for ONE classified landing. Honesty contract
 /// (bd-adr0006-cosmetic-sweep-q0g0): a timeout is AMBIGUOUS — the prompt may
 /// have started — so it emits `landed: null` + `ambiguous: true`, never a
@@ -34025,6 +34043,26 @@ mod send_result_row_tests {
             interrupt_guard_working(AgentStatus::Idle, false).is_ok(),
             "idle needs no force"
         );
+    }
+}
+
+#[cfg(test)]
+mod send_failure_log_tests {
+    use super::*;
+
+    /// bd-n9hy T1 (red first): every __send dispatch failure must keep the
+    /// raw stdout+stderr bytes plus exit status — the loop leaf at ~19237
+    /// today formats stdout only, so a bare `{ok:false}` with stderr on a
+    /// fresh pane is impossible to misdiagnose.
+    #[test]
+    fn send_failure_keeps_raw_bytes() {
+        let line = format_send_failure("coder-1", "", "herdr: agent_not_ready", false, 1);
+        assert!(line.contains("coder-1"), "names the target: {line:?}");
+        assert!(
+            line.contains("herdr: agent_not_ready"),
+            "stderr bytes kept: {line:?}"
+        );
+        assert!(line.contains("status=1"), "exit status kept: {line:?}");
     }
 }
 
