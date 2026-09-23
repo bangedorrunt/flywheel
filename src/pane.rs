@@ -49,11 +49,55 @@ use crate::{headless, state};
 pub struct PaneRunCtx {
     /// workspace id the crew lives in
     pub workspace_id: String,
-    /// spawn-registry entries (pane_id, name, profile)
-    pub entries: Vec<SpawnEntry>,
+    /// spawn-registry entries (pane_id, name, profile) — live-gated, so
+    /// dispatch resolution below cannot see a dead pane (bd-qx0z).
+    pub entries: LiveRegistry,
     /// true when the workspace must NOT be reaped at run end (--reuse or
     /// --retain)
     pub retained: bool,
+}
+
+/// bd-qx0z: registry rows proven live against a pane set. The ONLY way to
+/// build one is [`LiveRegistry::prune`] with the live pane ids — dispatch
+/// and send resolution take `&LiveRegistry`, never a bare `Vec`, so an
+/// unpruned read cannot compile into the dispatch path.
+#[derive(Debug, Clone, Default)]
+pub struct LiveRegistry(Vec<SpawnEntry>);
+
+impl LiveRegistry {
+    pub fn prune(
+        entries: Vec<SpawnEntry>,
+        live_pane_ids: &std::collections::HashSet<String>,
+    ) -> Self {
+        Self(prune_dead_pane_rows(entries, live_pane_ids))
+    }
+
+    pub fn entries(&self) -> &[SpawnEntry] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// bd-qx0z: dispatch-time registry for runners without a live client in
+/// scope (cron engines): load + prune against a fresh pane listing.
+/// Fail-open: an unreachable herdr keeps every loaded row (today's
+/// behavior — no regression, just no pruning). One socket roundtrip per
+/// construction; callers build once per engine, not per step.
+pub fn live_registry_for_dispatch(project: &str) -> LiveRegistry {
+    let entries = crate::state::load_spawn_registry(project);
+    let live: std::collections::HashSet<String> =
+        match Client::connect(None).and_then(|mut c| c.pane_list(None)) {
+            Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
+            Err(_) => entries.iter().map(|e| e.pane_id.clone()).collect(),
+        };
+    LiveRegistry::prune(entries, &live)
 }
 
 /// Names a crew pane: `crew-<workflow>-<role><ordinal>` (1-based per role),
@@ -88,11 +132,12 @@ pub fn crew_agent_name(wf_name: &str, role: &str, ordinal: u32) -> String {
 /// Resolve which registry entry serves a dispatch target: first the entry
 /// whose PROFILE matches `@role`, else an entry whose NAME matches. Pure —
 /// the runner's `@role -> running pane` mapping (ADR-0010 Spec A pane row).
-pub fn resolve_pane_entry<'a>(entries: &'a [SpawnEntry], profile: &str) -> Option<&'a SpawnEntry> {
+pub fn resolve_pane_entry<'a>(entries: &'a LiveRegistry, profile: &str) -> Option<&'a SpawnEntry> {
     entries
+        .entries()
         .iter()
         .find(|e| e.profile.as_deref() == Some(profile))
-        .or_else(|| entries.iter().find(|e| e.name == profile))
+        .or_else(|| entries.entries().iter().find(|e| e.name == profile))
 }
 
 /// bd-op8b: drop registry rows whose pane no longer exists anywhere.
@@ -156,10 +201,10 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
 /// without one (pre-bd-lvyi registry) falls back to its profile's harness
 /// via the catalog. `None` → no pane of the override harness exists.
 pub fn resolve_pane_by_harness<'a>(
-    entries: &'a [SpawnEntry],
+    entries: &'a LiveRegistry,
     harness: &str,
 ) -> Option<&'a SpawnEntry> {
-    entries.iter().find(|e| {
+    entries.entries().iter().find(|e| {
         if let Some(h) = &e.harness {
             return h == harness;
         }
@@ -333,7 +378,7 @@ fn spawn_crew_into(
     c: &mut Client,
     ws_id: &str,
     label: &str,
-) -> Result<Vec<SpawnEntry>> {
+) -> Result<LiveRegistry> {
     // Preserve pre-existing registry entries (swarm panes, prior crew) —
     // only entries whose NAME we are about to (re)spawn are replaced, so a
     // --reuse re-run re-binds the crew without clobbering unrelated panes.
@@ -342,16 +387,19 @@ fn spawn_crew_into(
     // fresh-crew work into closed panes (live proof fw-composed-2026-09-23).
     // Fail-open: an unlistable backend keeps every row (existing behavior).
     let mut registry: Vec<SpawnEntry> = state::load_spawn_registry(project);
-    if let Ok(panes) = c.pane_list(None) {
-        let live: std::collections::HashSet<String> =
-            panes.into_iter().map(|p| p.pane_id).collect();
+    let mut live_known: Option<std::collections::HashSet<String>> = c
+        .pane_list(None)
+        .ok()
+        .map(|panes| panes.into_iter().map(|p| p.pane_id).collect());
+    if let Some(live) = &live_known {
         let before = registry.len();
-        registry = prune_dead_pane_rows(registry, &live);
+        registry = prune_dead_pane_rows(registry, live);
         let pruned = before - registry.len();
         if pruned > 0 {
             eprintln!("flywheel: pruned {pruned} dead-pane registry row(s) for {project}");
         }
     }
+    let mut new_panes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     // pane-split chain: first agent on the root pane, rest split down.
     let mut prev: Option<String> = None;
@@ -597,12 +645,27 @@ fn spawn_crew_into(
                 incarnation: 0,
             });
             eprintln!("  crew {}: {} ({}) @{}", label, name, agent_pane_id, role);
+            // bd-qx0z: panes split here are live by construction — track
+            // them so the returned LiveRegistry covers the fresh crew even
+            // though the load-time snapshot predates the splits.
+            if let Some(live) = live_known.as_mut() {
+                live.insert(agent_pane_id.clone());
+            }
         }
     }
     // Persist the crew registry (pane_id, name, profile) — `__send`'s auto-
     // heal re-binds lost names from it.
     state::save_spawn_registry(project, &registry)?;
-    Ok(registry)
+    Ok(match live_known {
+        // Fail-open twin of the prune above: with no pane listing the live
+        // set is exactly what we hold — keeps every row (existing behavior).
+        Some(live) => LiveRegistry::prune(registry, &live),
+        None => {
+            let all: std::collections::HashSet<String> =
+                registry.iter().map(|e| e.pane_id.clone()).collect();
+            LiveRegistry::prune(registry, &all)
+        }
+    })
 }
 
 /// bd-wave-swarm-graduation-fix-98io: dispatch-reason transiency, named.
@@ -655,7 +718,7 @@ pub fn pane_dispatch(
     project: &str,
     wf_name: &str,
     inputs: &Value,
-    entries: &[SpawnEntry],
+    entries: &LiveRegistry,
     action: &Action,
 ) -> Result<Value> {
     let Action::DispatchJob { spec, .. } = action else {
@@ -722,6 +785,7 @@ pub fn pane_dispatch(
                     bail!(
                         "pane dispatch: step @{profile_name} overrides harness={override_h} but no crew pane runs it (panes: {}) — per-step harness overrides land in --mode headless, or spawn a squad containing a {override_h} pane",
                         entries
+                            .entries()
                             .iter()
                             .map(|e| format!("{}={}", e.name, e.harness.as_deref().unwrap_or("?")))
                             .collect::<Vec<_>>()
@@ -750,6 +814,7 @@ pub fn pane_dispatch(
             anyhow!(
                 "pane dispatch: no crew pane for @{profile_name} (spawned: {})",
                 entries
+                    .entries()
                     .iter()
                     .map(|e| e.profile.as_deref().unwrap_or(&e.name))
                     .collect::<Vec<_>>()
@@ -1054,7 +1119,7 @@ fn dispatch_breaker() -> &'static std::sync::Mutex<crate::breaker::ConsecutiveBr
 /// self-contained, or the step fails loud.
 pub fn dispatch_reroute_target(
     catalog: &ProfileCatalog,
-    entries: &[SpawnEntry],
+    entries: &LiveRegistry,
     profile_name: &str,
     attempted: &[String],
 ) -> Option<(String, String)> {
@@ -2038,10 +2103,10 @@ mod tests {
             skills_injected: false,
             incarnation: 0,
         };
-        let entries = vec![
+        let entries = as_live(vec![
             entry("w1:p1", "crew-wf-oracle", "oracle"),
             entry("w1:p2", "crew-wf-coder", "coder"),
-        ];
+        ]);
         // Oracle 429s → coder pane is live: one hop.
         assert_eq!(
             dispatch_reroute_target(&catalog, &entries, "oracle", &[]),
@@ -2053,7 +2118,7 @@ mod tests {
             None
         );
         // Fallback pane not live in this run: no hop.
-        let oracle_only = vec![entry("w1:p1", "crew-wf-oracle", "oracle")];
+        let oracle_only = as_live(vec![entry("w1:p1", "crew-wf-oracle", "oracle")]);
         assert_eq!(
             dispatch_reroute_target(&catalog, &oracle_only, "oracle", &[]),
             None
@@ -2118,9 +2183,55 @@ mod tests {
 
     /// P10.3: `@role` resolves via the registry PROFILE column; a bare name
     /// falls back to the name match; missing → None (never a panic).
+    /// bd-qx0z (red first): resolution takes a live-gated registry —
+    /// prune with the live set, resolve, fresh row wins over the dead one
+    /// even though the dead row sorts first.
+    #[test]
+    fn live_registry_gates_unpruned_vecs() {
+        use std::collections::HashSet;
+        let stale = SpawnEntry {
+            pane_id: "wOld:p9".into(),
+            name: "flywheel-x-planner".into(),
+            profile: Some("planner".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: true,
+            incarnation: 0,
+        };
+        let fresh = SpawnEntry {
+            pane_id: "wNew:p1".into(),
+            name: "crew-wf-planner".into(),
+            profile: Some("planner".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        };
+        let live: HashSet<String> = ["wNew:p1".to_string()].into_iter().collect();
+        let reg = LiveRegistry::prune(vec![stale, fresh], &live);
+        assert_eq!(reg.len(), 1);
+        let e = resolve_pane_entry(&reg, "planner").expect("fresh hit");
+        assert_eq!(e.name, "crew-wf-planner");
+    }
+
+    /// Test fixtures are live by construction — prune with their own pane
+    /// ids (identity), so existing resolve tests keep their semantics while
+    /// going through the gate.
+    fn as_live(entries: Vec<SpawnEntry>) -> LiveRegistry {
+        use std::collections::HashSet;
+        let live: HashSet<String> = entries.iter().map(|e| e.pane_id.clone()).collect();
+        LiveRegistry::prune(entries, &live)
+    }
+
     #[test]
     fn resolve_pane_entry_prefers_profile_then_name() {
-        let entries = vec![
+        let entries = as_live(vec![
             SpawnEntry {
                 pane_id: "w1:p1".into(),
                 name: "crew-wf-planner".into(),
@@ -2146,7 +2257,7 @@ mod tests {
                 incarnation: 0,
             },
             SpawnEntry::legacy("w1:p3", "plain-agent"),
-        ];
+        ]);
         let e = resolve_pane_entry(&entries, "planner").expect("profile hit");
         assert_eq!(e.name, "crew-wf-planner");
         let e = resolve_pane_entry(&entries, "plain-agent").expect("name fallback");
@@ -2229,7 +2340,7 @@ mod tests {
     /// HARNESS (the `harness` column), not the step profile's pane.
     #[test]
     fn resolve_pane_by_harness_finds_override_harness_pane() {
-        let entries = vec![
+        let entries = as_live(vec![
             SpawnEntry {
                 pane_id: "w1:p1".into(),
                 name: "crew-wf-reviewer".into(),
@@ -2254,7 +2365,7 @@ mod tests {
                 skills_injected: false,
                 incarnation: 0,
             },
-        ];
+        ]);
         let e = resolve_pane_by_harness(&entries, "opencode").expect("opencode pane");
         assert_eq!(e.name, "crew-wf-scout");
         assert_eq!(e.harness.as_deref(), Some("opencode"));
@@ -2267,7 +2378,7 @@ mod tests {
     /// neither harness nor profile never matches.
     #[test]
     fn resolve_pane_by_harness_legacy_entry_falls_back_to_profile() {
-        let entries = vec![
+        let entries = as_live(vec![
             SpawnEntry::legacy("w1:p1", "legacy-omp-agent"),
             SpawnEntry {
                 pane_id: "w1:p2".into(),
@@ -2282,7 +2393,7 @@ mod tests {
                 incarnation: 0,
             },
             SpawnEntry::legacy("w1:p3", "plain"),
-        ];
+        ]);
         // Legacy entries have profile=None → never match (honest: unknown).
         assert!(
             resolve_pane_by_harness(&entries, "omp").is_some(),
@@ -2358,7 +2469,7 @@ mod tests {
             incarnation: 0,
         };
         // No opencode pane anywhere — the role pane runs pi.
-        let entries = vec![entry("w1:p1", "crew-goal-reviewer", "reviewer", "pi")];
+        let entries = as_live(vec![entry("w1:p1", "crew-goal-reviewer", "reviewer", "pi")]);
         let action = Action::DispatchJob {
             assignee: "x".into(),
             spec: toron_workflow::schema::DispatchSpec {
@@ -2382,7 +2493,7 @@ mod tests {
     #[test]
     fn pane_dispatch_harness_pin_missing_role_still_bails() {
         let catalog = test_catalog_with_reviewer_harness("pi");
-        let entries = vec![SpawnEntry {
+        let entries = as_live(vec![SpawnEntry {
             pane_id: "w1:p1".into(),
             name: "crew-goal-coder".into(),
             profile: Some("coder".into()),
@@ -2393,7 +2504,7 @@ mod tests {
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
-        }];
+        }]);
         let action = Action::DispatchJob {
             assignee: "x".into(),
             spec: toron_workflow::schema::DispatchSpec {
