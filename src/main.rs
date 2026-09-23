@@ -27780,6 +27780,62 @@ fn skill_injection_prefix(entry: &state::SpawnEntry, skills: &[String]) -> Optio
     Some(format!("Read {paths} before starting.\n\n"))
 }
 
+/// bd-83as: first-dispatch predicate for the readiness gate — true only
+/// when no landed record exists for this (project, agent) AND the spawn
+/// registry shows skills not yet injected. Later dispatches skip the gate
+/// entirely (zero behavior change past the first send).
+fn is_first_dispatch(records: &[state::SentRecord], name: &str, skills_injected: bool) -> bool {
+    if skills_injected {
+        return false;
+    }
+    !records.iter().any(|r| r.name == name && r.landed)
+}
+
+/// bd-83as: have this agent's skills been injected yet (spawn registry)?
+/// Absent registry or entry reads as not-injected (fail toward gating —
+/// the gate is a no-op wait on already-booted panes).
+fn skills_injected_for(project: &str, name: &str) -> bool {
+    state::load_spawn_registry(project)
+        .iter()
+        .find(|e| e.name == name)
+        .is_some_and(|e| e.skills_injected)
+}
+
+/// bd-83as: bounded readiness wait over an injected lister (scriptable —
+/// unit tests feed scripted boot sequences, production passes the live
+/// backend list). Returns the fresh row once the pane stops booting; past
+/// the deadline it fails typed, never hangs, never a bare ok:false downstream.
+fn await_agent_ready<F>(
+    mut list_agents: F,
+    name: &str,
+    ws_id: &str,
+    deadline: Duration,
+) -> anyhow::Result<AgentInfo>
+where
+    F: FnMut() -> anyhow::Result<Vec<AgentInfo>>,
+{
+    const GATE_BOUND: Duration = Duration::from_secs(10);
+    let bound = deadline.min(GATE_BOUND).max(Duration::from_millis(1));
+    let start = std::time::Instant::now();
+    loop {
+        let agents = list_agents()?;
+        if let Some(a) = agents
+            .iter()
+            .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
+            && !crate::herdr_shim::agent_still_booting(a)
+        {
+            return Ok(a.clone());
+        }
+        if start.elapsed() >= bound {
+            anyhow::bail!(
+                "agent {name} still booting after {}s — first dispatch held at the readiness gate (bd-83as)",
+                bound.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// internal leaf: send one prompt to a named agent.
 ///
 /// **ADR-0002 note:** this leaf is NOT yet migrated to the trait factory. The
@@ -27926,6 +27982,24 @@ fn cmd_internal_send(
         }
     }
     let agent = agent.ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
+    // bd-83as: first dispatch to a still-booting agent waits bounded (10s)
+    // instead of firing into the boot window and producing a reasonless
+    // leaf downstream. Later dispatches skip the gate entirely.
+    let agent = if is_first_dispatch(
+        &state::load_last_sent(project),
+        name,
+        skills_injected_for(project, name),
+    ) && crate::herdr_shim::agent_still_booting(&agent)
+    {
+        await_agent_ready(
+            || backend.agent_list().map_err(anyhow::Error::from),
+            name,
+            &ws_id,
+            Duration::from_secs(10),
+        )?
+    } else {
+        agent
+    };
     let target = agent_target(&agent).to_string();
 
     // last-sent registry: record what was delivered (or attempted). Best-
@@ -34075,6 +34149,95 @@ mod send_failure_log_tests {
             "stderr bytes kept: {line:?}"
         );
         assert!(line.contains("status=1"), "exit status kept: {line:?}");
+    }
+}
+
+#[cfg(test)]
+mod first_dispatch_gate_tests {
+    use super::*;
+    use crate::state::SentRecord;
+
+    fn sent(name: &str, landed: bool) -> SentRecord {
+        SentRecord {
+            name: name.to_string(),
+            text_hash: 1,
+            invocation: String::new(),
+            iteration: 0,
+            landed,
+            ambiguous: false,
+        }
+    }
+
+    fn agent_row(booting: bool) -> AgentInfo {
+        AgentInfo {
+            agent: None,
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: !booting,
+            launch_pending: booting,
+            name: Some("crew-x-planner".to_string()),
+            pane_id: "w9:p1".to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            state_labels: serde_json::Map::new(),
+            tab_id: "w9:t1".to_string(),
+            terminal_id: "term-1".to_string(),
+            terminal_title: None,
+            workspace_id: "w9".to_string(),
+        }
+    }
+
+    /// bd-83as T2 (red first): first dispatch = no landed record AND skills
+    /// not yet injected. Anything landed, or an injected lane, skips the gate.
+    #[test]
+    fn first_dispatch_predicate() {
+        assert!(is_first_dispatch(&[], "x", false));
+        assert!(is_first_dispatch(&[sent("x", false)], "x", false));
+        assert!(!is_first_dispatch(&[sent("x", true)], "x", false));
+        assert!(!is_first_dispatch(&[], "x", true));
+        assert!(is_first_dispatch(&[sent("y", true)], "x", false));
+    }
+
+    /// bd-83as T2 (red first): scripted not-ready then ready proceeds and
+    /// observes every listing.
+    #[test]
+    fn first_dispatch_waits_for_readiness() {
+        let script = vec![
+            vec![agent_row(true)],
+            vec![agent_row(true)],
+            vec![agent_row(false)],
+        ];
+        let calls = std::cell::Cell::new(0);
+        let out = await_agent_ready(
+            || {
+                let i = calls.get();
+                calls.set(i + 1);
+                Ok(script[i.min(script.len() - 1)].clone())
+            },
+            "crew-x-planner",
+            "w9",
+            std::time::Duration::from_secs(10),
+        )
+        .expect("ready on third listing");
+        assert_eq!(calls.get(), 3);
+        assert!(!out.launch_pending);
+    }
+
+    /// bd-83as T2 (red first): a pane that never leaves boot fails typed
+    /// inside the bound — never hangs, never a bare ok:false downstream.
+    #[test]
+    fn boot_timeout_is_typed() {
+        let err = await_agent_ready(
+            || Ok(vec![agent_row(true)]),
+            "crew-x-planner",
+            "w9",
+            std::time::Duration::from_millis(120),
+        )
+        .expect_err("must time out");
+        assert!(err.to_string().contains("still booting"), "{err:?}");
     }
 }
 
