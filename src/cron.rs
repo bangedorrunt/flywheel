@@ -738,7 +738,7 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::engine::EffectRunner {
         CronMode::Pane => {
             let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
             let project = "flywheel";
-            let entries = crate::state::load_spawn_registry(project);
+            let entries = crate::pane::live_registry_for_dispatch(project);
             let name = entry.name.clone();
             let inputs = Value::Null;
             std::sync::Arc::new(move |inv: &ActionInvocation| {
@@ -826,7 +826,7 @@ pub fn spec_runner(spec: &CronSpec) -> toron_workflow::engine::EffectRunner {
         SpecMode::Pane => {
             let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
             let project = "flywheel";
-            let entries = crate::state::load_spawn_registry(project);
+            let entries = crate::pane::live_registry_for_dispatch(project);
             let name = spec.name.clone();
             let inputs = Value::Null;
             std::sync::Arc::new(move |inv: &ActionInvocation| {
