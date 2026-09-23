@@ -104,7 +104,22 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Restart => lifecycle::restart(&cfg),
         Cmd::Status => lifecycle::status(&cfg),
         Cmd::Install => lifecycle::install(&cfg),
-        Cmd::Serve | Cmd::InternalServe => serve::run(&cfg).await,
+        Cmd::Serve | Cmd::InternalServe => {
+            // A daemon must exit the moment its shutdown completes: the
+            // tokio runtime drop waits on in-flight blocking tasks
+            // (health refresh, CLI probes), which kept this process alive
+            // past stop's 15s grace AFTER "shutting down" was already
+            // printed — the false SIGKILL escalation of 16:48. finish()
+            // already released the pidfile and leases, so nothing else
+            // needs to run; an Err still exits non-zero.
+            match serve::run(&cfg).await {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("Error: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Cmd::Migrate { from } => {
             let copied = migrate::migrate(&from, &cfg.state_dir)?;
             println!("{}", serde_json::json!({"migrated": copied}));
