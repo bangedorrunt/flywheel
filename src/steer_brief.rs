@@ -55,6 +55,11 @@ pub struct BriefingContext {
     pub models: Vec<RoleModelChoice>,
     /// squad recommendation from the profile catalog, if one fits
     pub squad_recommendation: Option<String>,
+    /// bd-adv4: Jev profile-pick suggestion for the implement seat (the
+    /// offline table when Jev is unreachable). Advisory only — the user
+    /// decides via the coder_profile input or crew remix. None renders
+    /// nothing.
+    pub profile_suggestion: Option<String>,
     /// bare harness+provider/model override the operator may type instead of
     /// a squad/profile choice (bd-j3so surface)
     pub bare_override: Option<String>,
@@ -202,6 +207,15 @@ pub fn run_briefing(
             dim("recommended squad:")
         )?,
     }
+    if let Some(s) = &ctx.profile_suggestion {
+        writeln!(
+            out,
+            "  {} {} {}",
+            dim("profile suggestion:"),
+            accent(s),
+            dim("(profile-pick; user decides — coder_profile input or keep @coder)")
+        )?;
+    }
     match &ctx.bare_override {
         Some(bare) => writeln!(out, "  {} {}", dim("bare override accepted:"), accent(bare))?,
         None => writeln!(
@@ -302,6 +316,7 @@ mod tests {
                 ],
             }],
             squad_recommendation: Some("build".into()),
+            profile_suggestion: None,
             bare_override: None,
             stage_chain: vec!["plan".into(), "implement".into(), "review".into()],
             funded: BTreeMap::new(),
@@ -359,6 +374,25 @@ mod tests {
         assert_eq!(outcome, BriefingOutcome::Abort);
         assert!(rendered.contains("aborted."));
         assert!(!rendered.contains("dispatching."));
+    }
+
+    /// bd-adv4: a set profile suggestion renders its line (advisory — the
+    /// prompt flow is unchanged); None renders nothing.
+    #[test]
+    fn profile_pick_suggestion_renders_when_set() {
+        let mut c = ctx();
+        c.profile_suggestion = Some("@rust-coder".into());
+        let mut inp = std::io::Cursor::new("");
+        let mut out: Vec<u8> = Vec::new();
+        run_briefing(&c, &mut inp, &mut out).expect("briefing");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("profile suggestion:"), "{rendered}");
+        assert!(rendered.contains("@rust-coder"), "{rendered}");
+        let mut inp2 = std::io::Cursor::new("");
+        let mut out2: Vec<u8> = Vec::new();
+        run_briefing(&ctx(), &mut inp2, &mut out2).expect("briefing");
+        let plain = String::from_utf8(out2).expect("utf8");
+        assert!(!plain.contains("profile suggestion:"), "{plain}");
     }
 
     #[test]
@@ -420,6 +454,7 @@ mod tests {
             crew_plan: BTreeMap::from([("coder".into(), 1)]),
             models: vec![],
             squad_recommendation: None,
+            profile_suggestion: None,
             bare_override: None,
             stage_chain: vec!["review".into(), "ship".into()],
             funded: BTreeMap::new(),
