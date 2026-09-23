@@ -201,17 +201,20 @@ fn read_pid(path: &PathBuf) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Exclusive-create pidfile claim (symlink to the pid string). `serve`
-/// claims the pidfile itself once both binds succeed — a launchd/systemd
-/// started daemon is then pidfile-managed exactly like a `start` child,
-/// so stop/status/restart see one management surface (the bd-start-adopt
-/// lesson: only `start` used to write the pidfile, leaving a unit-started
-/// daemon "foreign" forever).
+/// Exclusive-create pidfile claim. `serve` claims the regular pidfile itself
+/// once both binds succeed — a launchd/systemd started daemon is then
+/// pidfile-managed exactly like a `start` child, so stop/status/restart see
+/// one management surface (the bd-start-adopt lesson: only `start` used to
+/// write the pidfile, leaving a unit-started daemon "foreign" forever).
 #[cfg(unix)]
 pub fn claim_pid_file(path: &PathBuf, pid: u32) -> std::io::Result<()> {
-    let target = format!("{pid}");
-    let _ = std::fs::remove_file(path); // stale claim; the bind fence is authoritative
-    std::os::unix::fs::symlink(&target, path)
+    // Keep the pidfile as a regular file. A relative symlink whose target is
+    // the PID string is dangling, so status/restart lose ownership of a
+    // healthy daemon immediately after serve claims it.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{pid}\n"))
 }
 #[cfg(not(unix))]
 pub fn claim_pid_file(path: &PathBuf, pid: u32) -> std::io::Result<()> {
@@ -324,6 +327,49 @@ fn health_probe(cfg: &Config) -> Option<serde_json::Value> {
     let body = health_get(cfg, "/health")?;
     serde_json::from_str(&body).ok()
 }
+
+fn tcp_endpoint_alive(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}")
+            .parse()
+            .expect("loopback address"),
+        Duration::from_millis(100),
+    )
+    .is_ok()
+}
+
+#[cfg(unix)]
+fn socket_endpoint_alive(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn socket_endpoint_alive(_path: &std::path::Path) -> bool {
+    false
+}
+
+fn reap_failed_start(cfg: &Config, pid: u32) {
+    if pid_alive(pid) {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+    let _ = wait_for(
+        || {
+            !pid_alive(pid)
+                && !tcp_endpoint_alive(cfg.port)
+                && !socket_endpoint_alive(&cfg.socket_path())
+        },
+        STOP_GRACE,
+    );
+    if read_pid(&cfg.pid_file()) == Some(pid) {
+        let _ = std::fs::remove_file(cfg.pid_file());
+    }
+    if !socket_endpoint_alive(&cfg.socket_path()) {
+        let _ = std::fs::remove_file(cfg.socket_path());
+    }
+}
+
 fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -335,12 +381,38 @@ fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     cond()
 }
 
+fn disable_supervisor() {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(uid) = uid {
+            let _ = std::process::Command::new("launchctl")
+                .args(["bootout", &format!("gui/{uid}/com.doorbell.serve")])
+                .output();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", "doorbell.service"])
+            .output();
+    }
+}
+
 /// Start: adopt an already-running daemon when one exists (managed or
 /// healthy protocol peer), else spawn the detached serve child and verify
 /// /health, exit 0 only when the daemon answers. Stale socket files are
 /// removed after proving nothing listens; a live TCP squatter fails
 /// loudly (bind fence is .3).
 pub fn start(cfg: &Config) -> Result<()> {
+    std::fs::create_dir_all(&cfg.state_dir)
+        .with_context(|| format!("create state dir {}", cfg.state_dir.display()))?;
     if let Some(pid) = try_adopt(cfg)? {
         println!(
             "doorbell: already running (pid {pid}, port {}) — adopted",
@@ -366,16 +438,22 @@ pub fn start(cfg: &Config) -> Result<()> {
     for (p, w) in &cfg.hosts {
         cmd.arg("--host").arg(format!("{p}/{w}"));
     }
-    let child = cmd
+    let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(err_log)
         .spawn()
         .context("spawn serve child")?;
-    // Detached by disowning: never wait on it (reparented on unix).
+    // Claim the pid before detaching. If the claim fails, terminate the
+    // child instead of returning an error with an untracked daemon behind it.
     let pid = child.id();
+    if let Err(error) = std::fs::write(cfg.pid_file(), format!("{pid}\n")) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).with_context(|| format!("write pidfile {}", cfg.pid_file().display()));
+    }
+    // Detached by disowning: never wait on it (reparented on unix).
     std::mem::forget(child);
-    std::fs::write(cfg.pid_file(), format!("{pid}\n")).context("write pidfile")?;
     if wait_for(|| health_probe(cfg).is_some(), START_TIMEOUT) {
         // The probe answering is not enough: a stale orphan on this port
         // answers too. The owner must be the child we just spawned — or a
@@ -389,6 +467,11 @@ pub fn start(cfg: &Config) -> Result<()> {
                 return Ok(());
             }
             OwnerVerdict::Managed(p) | OwnerVerdict::Unclaimed(p) => {
+                if p != pid {
+                    // Another daemon won the bind race; do not leave our
+                    // losing child alive behind the adopted peer.
+                    reap_failed_start(cfg, pid);
+                }
                 if pf != Some(p) {
                     let _ = std::fs::write(cfg.pid_file(), format!("{p}\n"));
                 }
@@ -398,13 +481,17 @@ pub fn start(cfg: &Config) -> Result<()> {
                 );
                 return Ok(());
             }
-            OwnerVerdict::Squatter => anyhow::bail!(
-                "doorbell: port {} answered by foreign owner, not child {pid}",
-                cfg.port
-            ),
+            OwnerVerdict::Squatter => {
+                reap_failed_start(cfg, pid);
+                anyhow::bail!(
+                    "doorbell: port {} answered by foreign owner, not child {pid}",
+                    cfg.port
+                )
+            }
             OwnerVerdict::Unknown => {}
         }
     }
+    reap_failed_start(cfg, pid);
     anyhow::bail!("doorbell: serve child (pid {pid}) never answered /health");
 }
 
@@ -413,18 +500,37 @@ pub fn start(cfg: &Config) -> Result<()> {
 pub fn stop(cfg: &Config, force: bool) -> Result<()> {
     match managed(cfg) {
         Some(pid) => {
+            // Unload the installed supervisor before SIGTERM. Otherwise
+            // launchd/systemd can replace the process and make a successful
+            // stop look false.
+            disable_supervisor();
             let _ = std::process::Command::new("kill")
                 .arg(pid.to_string())
                 .status();
-            if wait_for(|| !pid_alive(pid), STOP_GRACE) {
+            if wait_for(
+                || {
+                    !pid_alive(pid)
+                        && !tcp_endpoint_alive(cfg.port)
+                        && !socket_endpoint_alive(&cfg.socket_path())
+                },
+                STOP_GRACE,
+            ) {
                 let _ = std::fs::remove_file(cfg.pid_file());
+                // A dead daemon can leave a stale UDS path. Remove it only
+                // after proving no listener accepts connections on it.
+                let _ = std::fs::remove_file(cfg.socket_path());
+                if tcp_endpoint_alive(cfg.port) || socket_endpoint_alive(&cfg.socket_path()) {
+                    anyhow::bail!(
+                        "doorbell: pid {pid} exited but endpoint or socket is still live"
+                    );
+                }
                 println!("doorbell: stopped (pid {pid})");
                 return Ok(());
             }
-            anyhow::bail!("doorbell: pid {pid} ignored SIGTERM within 5s");
+            anyhow::bail!("doorbell: pid {pid} ignored SIGTERM or endpoint stayed live within 5s");
         }
         None => {
-            if health_probe(cfg).is_some() {
+            if health_probe(cfg).is_some() || tcp_endpoint_alive(cfg.port) {
                 if !force {
                     anyhow::bail!(
                         "doorbell: port {} answers but no live pidfile — unmanaged holder, refusing (use --force)",
@@ -443,9 +549,16 @@ pub fn stop(cfg: &Config, force: bool) -> Result<()> {
     }
 }
 
+fn restart_after_stop(
+    stop: impl FnOnce() -> Result<()>,
+    start: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    stop()?;
+    start()
+}
+
 pub fn restart(cfg: &Config) -> Result<()> {
-    let _ = stop(cfg, false);
-    start(cfg)
+    restart_after_stop(|| stop(cfg, false), || start(cfg))
 }
 
 pub fn status(cfg: &Config) -> Result<()> {
@@ -821,6 +934,27 @@ mod tests {
             "protocol": doorbell_rt::api::PING.protocol,
             "owner": {"pid": pid},
         })
+    }
+
+    #[test]
+    fn claim_pid_file_round_trips_through_read_and_release() {
+        let dir = tmp_lifecycle("pidfile");
+        let path = dir.join("doorbell.pid");
+        claim_pid_file(&path, 42).unwrap();
+        assert_eq!(read_pid(&path), Some(42));
+        release_pid_file(&path, 42);
+        assert!(!path.exists(), "release removes only our pidfile");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_propagates_stop_failure() {
+        let result = restart_after_stop(
+            || anyhow::bail!("stop failed"),
+            || anyhow::bail!("start must not run after a failed stop"),
+        );
+        let error = result.expect_err("restart must fail when stop fails");
+        assert!(error.to_string().contains("stop failed"));
     }
 
     #[test]

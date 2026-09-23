@@ -503,13 +503,22 @@ pub async fn run(cfg: &Config) -> Result<()> {
                 .join(", ")
         }
     );
-    // Host loops: one Brain per configured workspace. Shutdown = drop
-    // every sender (tickers + loop handle), so each brain drains its
-    // sinks, journals undelivered intents, and returns its report.
-    let loops: Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>> =
+    // The cache is created before workers so a worker supervisor can
+    // invalidate /health in the same task turn that removes a dead host.
+    let health: Shared<CachedHealth> = std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+        body: String::new(),
+        computed_at: std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or(std::time::Instant::now()),
+    }));
+    // Host loops: one Brain per configured workspace. Supervisors own the
+    // JoinHandles, remove dead workers from `hosted`, release their lease,
+    // and invalidate the health snapshot before the next probe can advertise
+    // a worker that no longer exists.
+    let loops: Shared<Vec<tokio::task::JoinHandle<()>>> =
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     for (project, workspace) in &cfg.hosts {
-        spawn_host_loop(cfg, &hosted, &loops, project, workspace);
+        spawn_host_loop(cfg, &hosted, &loops, &owned, &health, project, workspace);
     }
     let rotate_tick = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -522,12 +531,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
         started,
         fw_state: cfg.flywheel_state.clone(),
         hosted: hosted.clone(),
-        health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
-            body: String::new(),
-            computed_at: std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(3600))
-                .unwrap_or(std::time::Instant::now()),
-        })),
+        health: health.clone(),
     };
     // bd-o86s: the /health snapshot tick. Recomputes the body on its own
     // cadence so request handlers never pay the shells-and-greps cost.
@@ -600,12 +604,13 @@ pub async fn run(cfg: &Config) -> Result<()> {
         let hosted = hosted.clone();
         let loops = loops.clone();
         let owned = owned.clone();
+        let health = health.clone();
         async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                reconcile_once(&cfg, &hosted, &loops, &owned);
+                reconcile_once(&cfg, &hosted, &loops, &owned, &health);
             }
         }
     }));
@@ -670,7 +675,9 @@ fn bins_allow_hosting(toron_resolved: bool, herdr_resolved: bool) -> bool {
 fn spawn_host_loop(
     cfg: &Config,
     hosted: &Hosts,
-    loops: &Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>>,
+    loops: &Shared<Vec<tokio::task::JoinHandle<()>>>,
+    owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
+    health: &Shared<CachedHealth>,
     project: &str,
     workspace: &str,
 ) {
@@ -708,6 +715,7 @@ fn spawn_host_loop(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        release_owned_lease(&cfg.flywheel_state, owned, workspace);
         return;
     }
     // bd-ba8t: say out loud whether this workspace's wakes have anywhere to
@@ -739,21 +747,61 @@ fn spawn_host_loop(
         workspace.to_string(),
     );
     let loop_tx = tx.clone();
+    let supervised_key = key.clone();
+    let supervised_workspace = workspace.to_string();
+    let supervised_state = cfg.flywheel_state.clone();
+    let supervised_hosted = hosted.clone();
+    let supervised_owned = owned.clone();
+    let supervised_health = health.clone();
+    // Register before spawning: a very fast startup failure must not win a
+    // race against registration and leave a stale hosted row behind.
+    hosted.lock().push(HostedLoop {
+        key: key.clone(),
+        tx: tx.clone(),
+    });
     loops.lock().push(tokio::spawn(async move {
-        host_workspace(fw, p, w, loop_tx, rx).await
+        // Await a child task so panic/abort is also a supervised completion:
+        // the outer task still removes the hosted row and releases its lease.
+        let child = tokio::spawn(host_workspace(fw, p, w, loop_tx, rx));
+        let report = match child.await {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("doorbell serve: hosted loop {supervised_key} failed: {error}");
+                doorbell_rt::RunReport {
+                    undelivered: Vec::new(),
+                    stats: doorbell_rt::api::Stats::default(),
+                }
+            }
+        };
+        eprintln!(
+            "doorbell serve: supervised loop {supervised_key} exited (injects={} sheds={} degraded={})",
+            report.stats.injects, report.stats.sheds, report.stats.degraded
+        );
+        if remove_host(&supervised_hosted, &supervised_key) {
+            release_owned_lease(
+                &supervised_state,
+                &supervised_owned,
+                &supervised_workspace,
+            );
+            invalidate_health_snapshot(&supervised_health);
+            eprintln!(
+                "doorbell serve: removed dead hosted worker {supervised_key} from health"
+            );
+        }
     }));
     // The table keeps its OWN sender: the loop's clones live inside the task,
     // so this handle is the only one reconcile can address. `try_send` on it
     // is how a retiring loop is told to drain (bd-mk60).
-    hosted.lock().push(HostedLoop { key, tx });
 }
 /// auto-host of every nameable subscribed (project, workspace).
 fn reconcile_once(
     cfg: &Config,
     hosted: &Hosts,
-    loops: &Shared<Vec<tokio::task::JoinHandle<doorbell_rt::RunReport>>>,
+    loops: &Shared<Vec<tokio::task::JoinHandle<()>>>,
     owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
+    health: &Shared<CachedHealth>,
 ) {
+    loops.lock().retain(|handle| !handle.is_finished());
     use doorbell_rt::lease;
     use doorbell_rt::subscribe::{Actor, SubscriptionStore};
     let mut store = SubscriptionStore::open(&cfg.flywheel_state);
@@ -792,7 +840,9 @@ fn reconcile_once(
             Ok(l) => {
                 owned.lock().push((workspace.clone(), l));
                 eprintln!("doorbell serve: auto-hosting {project}/{workspace} (subscribed)");
-                spawn_host_loop(cfg, hosted, loops, &project, &workspace);
+                // The worker shares the served cache, so an immediate
+                // startup failure invalidates the same snapshot /health uses.
+                spawn_host_loop(cfg, hosted, loops, owned, health, &project, &workspace);
             }
             Err(e) => {
                 eprintln!("doorbell serve: auto-host {project}/{workspace} lease failed: {e:?}")
@@ -804,7 +854,7 @@ fn reconcile_once(
     // ordering is what makes the retire rule safe: an auto-hosted key is in
     // `subscribed_keys(subs)`, so it can never be retired on the same tick.
     let hosted_now = hosted_keys(&hosted.lock());
-    retire_unsubscribed(cfg, hosted, owned, &subs, &hosted_now);
+    retire_unsubscribed(cfg, hosted, owned, health, &subs, &hosted_now);
 }
 
 /// bd-mk60: stop the loops whose subscriptions went away.
@@ -821,6 +871,7 @@ fn retire_unsubscribed(
     cfg: &Config,
     hosted: &Hosts,
     owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
+    health: &Shared<CachedHealth>,
     subs: &[doorbell_rt::subscribe::Subscription],
     hosted_now: &[String],
 ) {
@@ -844,6 +895,9 @@ fn retire_unsubscribed(
             }
         });
     }
+    if !stopped.is_empty() {
+        invalidate_health_snapshot(health);
+    }
     for l in &stopped {
         eprintln!(
             "doorbell serve: retiring {} (no subscription references it)",
@@ -864,6 +918,31 @@ fn retire_unsubscribed(
             doorbell_rt::lease::release_lease(&cfg.flywheel_state, &ws, &lease);
         }
     }
+}
+
+fn remove_host(hosted: &Hosts, key: &str) -> bool {
+    let mut hosts = hosted.lock();
+    let before = hosts.len();
+    hosts.retain(|host| host.key != key);
+    hosts.len() != before
+}
+
+fn release_owned_lease(
+    state: &std::path::Path,
+    owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
+    workspace: &str,
+) {
+    let mut leases = owned.lock();
+    if let Some(pos) = leases.iter().position(|(ws, _)| ws == workspace) {
+        let (_, lease) = leases.remove(pos);
+        doorbell_rt::lease::release_lease(state, workspace, &lease);
+    }
+}
+
+fn invalidate_health_snapshot(health: &Shared<CachedHealth>) {
+    health.lock().computed_at = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(HEALTH_CACHE_TTL_SECS + 1))
+        .unwrap_or_else(std::time::Instant::now);
 }
 
 fn parent_of(p: &std::path::Path) -> &std::path::Path {
@@ -1455,6 +1534,26 @@ mod tests {
             key: key.to_string(),
             tx,
         }
+    }
+
+    #[test]
+    fn dead_worker_removal_is_keyed_and_invalidates_health() {
+        let hosted: super::Hosts = std::sync::Arc::new(parking_lot::Mutex::new(vec![
+            host_for_test("proj/live"),
+            host_for_test("proj/dead"),
+        ]));
+        let health = std::sync::Arc::new(parking_lot::Mutex::new(super::CachedHealth {
+            body: "cached".into(),
+            computed_at: std::time::Instant::now(),
+        }));
+        assert!(super::remove_host(&hosted, "proj/dead"));
+        assert!(!super::remove_host(&hosted, "proj/missing"));
+        assert_eq!(super::hosted_keys(&hosted.lock()), vec!["proj/live"]);
+        super::invalidate_health_snapshot(&health);
+        assert!(
+            health.lock().computed_at.elapsed().as_secs() > super::HEALTH_CACHE_TTL_SECS,
+            "worker exit must force the next /health request to recompute"
+        );
     }
 
     /// bd-mk60: reconcile retires a loop whose subscription went away, and
