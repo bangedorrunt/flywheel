@@ -3664,30 +3664,32 @@ fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<
     let registry = models::ModelRegistry::load_routing()?;
     // ADR-0007 D1 (implicit): a bare kind/count spawn with NO --model uses
     // the harness's implied slot's model (opencode→cheap, pi→standard,
-    // grok→premium). Unknown kind / unconfigured slot → no model flag.
+    // grok/omp→premium). Unknown kind / unconfigured slot → no model flag.
     let model = if model.is_empty() {
-        if harness == "grok" {
-            // bd-ovew: never imply the premium zai id onto the grok
-            // harness — it runs only its own models. Route a registered
-            // grok-family id (user entries first); with none registered,
-            // fail loud naming --model instead of launching wrong.
-            match registry.grok_default_model() {
-                Some(id) => id,
-                None => anyhow::bail!(
+        // bd-88m4: coupled harnesses (grok/claude/codex) run only their
+        // own models — a registered family id wins (grok pattern). grok
+        // with none fails loud (bd-ovew: never a foreign id); claude/codex
+        // with none fall through to the implied slot (none today) and
+        // launch model-less, exactly as now.
+        match registry.coupled_default_model(harness) {
+            Some(id) => id,
+            None if harness == "grok" => {
+                anyhow::bail!(
                     "bare grok spawn has no grok-family model registered — add \
                      [models.\"grok/<id>\"] to ~/.config/flywheel/models.toml \
                      or pass --model grok/<id> (the grok harness runs only its \
                      own models; premium zai ids are not routed there)"
-                ),
+                )
             }
-        } else {
-            // bd-ll3k: defaults-aware exactly like the reconfirm table —
-            // display and launch must never disagree on the model.
-            match models::implied_slot_name_for_harness(harness)
-                .and_then(|n| registry.effective_slot_model(n))
-            {
-                Some(m) if !m.is_empty() => m,
-                _ => return Ok(vec![]),
+            None => {
+                // bd-ll3k: defaults-aware exactly like the reconfirm table —
+                // display and launch must never disagree on the model.
+                match models::implied_slot_name_for_harness(harness)
+                    .and_then(|n| registry.effective_slot_model(n))
+                {
+                    Some(m) if !m.is_empty() => m,
+                    _ => return Ok(vec![]),
+                }
             }
         }
     } else {
@@ -4211,11 +4213,11 @@ mod spawn_profile_plan_tests {
         assert_eq!(args, vec!["--model=ghost-model"]);
         let args = bare_model_launch_args("omp", "ghost-model", "qqq").expect("pair passthrough");
         assert_eq!(args, vec!["--model=qqq/ghost-model"]);
-        // Empty model: no flags at all — omp has no implied slot.
-        assert!(
-            bare_model_launch_args("omp", "", "")
-                .expect("empty model")
-                .is_empty()
+        // Empty model: bd-88m4 — omp rides the premium slot now.
+        assert_eq!(
+            bare_model_launch_args("omp", "", "").expect("empty model"),
+            vec!["--model=zai/glm-5.3"],
+            "bare omp without --model uses the premium slot"
         );
     }
 
@@ -4241,10 +4243,17 @@ mod spawn_profile_plan_tests {
             vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
             "pi spawn without --model uses the standard slot: {args:?}"
         );
+        // bd-88m4: omp IS the premium harness — a bare omp spawn rides
+        // the premium slot instead of launching model-less.
+        assert_eq!(
+            bare_model_launch_args("omp", "", "").expect("omp implies premium"),
+            vec!["--model=zai/glm-5.3"],
+            "omp spawn without --model uses the premium slot"
+        );
         // Unknown kind: no implied slot → no flags (unchanged).
         assert!(
-            bare_model_launch_args("omp", "", "")
-                .expect("omp has no implied slot")
+            bare_model_launch_args("kind-without-slot", "", "")
+                .expect("unknown kind has no implied slot")
                 .is_empty()
         );
     }
@@ -5207,6 +5216,27 @@ mod steer_engine_tests {
         // stage chain and crew plan are identical for same workflow
         assert_eq!(steer_ctx.stage_chain, wf_ctx.stage_chain);
         assert_eq!(steer_ctx.crew_plan, wf_ctx.crew_plan);
+    }
+
+    /// bd-88m4: the briefing context carries the tier-pick suggestion —
+    /// a frontier-cued objective suggests the premium band, a routine one
+    /// the cheap band, a generic one stays silent (None = current
+    /// behavior).
+    #[test]
+    fn tier_pick_briefing_context_carries_tier() {
+        let premium_ctx =
+            steer_briefing_context("plan the security migration with a perf budget", "goal")
+                .expect("steer ctx");
+        assert_eq!(
+            premium_ctx.tier_suggestion.as_deref(),
+            Some("@premium"),
+            "frontier objective suggests the premium band"
+        );
+        let plain_ctx = steer_briefing_context("fix the flake", "goal").expect("steer ctx");
+        assert_eq!(
+            plain_ctx.tier_suggestion, None,
+            "generic objective renders no tier suggestion"
+        );
     }
 
     /// bd-adv4: the briefing context carries the profile-pick suggestion —
@@ -24545,6 +24575,10 @@ fn briefing_context_inner(
             "@coder" => None,
             s => Some(s.to_string()),
         },
+        // bd-88m4: Jev tier-pick suggestion for the model band — the
+        // offline table when Jev is unreachable. None IS current behavior:
+        // no line renders, today's menus stand, the user decides.
+        tier_suggestion: crate::judgment::suggest_tier_pick(objective).map(str::to_string),
         bare_override: None,
         stage_chain,
         funded: std::collections::BTreeMap::new(),

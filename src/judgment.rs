@@ -1672,6 +1672,9 @@ pub enum AnnotateSurface {
     /// bd-adv4: smart profile pickup — one coder-family candidate per
     /// call, the caller ranks repeated calls; the user decides.
     ProfilePick,
+    /// bd-88m4: model+harness tier suggestion — reasoning depth picks the
+    /// cost band, harness coupling flags proprietary-harness tasks.
+    TierPick,
 }
 
 impl AnnotateSurface {
@@ -1681,6 +1684,7 @@ impl AnnotateSurface {
             "wave-readiness" => Some(Self::WaveReadiness),
             "reviewer-rank" => Some(Self::ReviewerRank),
             "profile-pick" => Some(Self::ProfilePick),
+            "tier-pick" => Some(Self::TierPick),
             _ => None,
         }
     }
@@ -1691,6 +1695,7 @@ impl AnnotateSurface {
             Self::WaveReadiness => "wave-readiness",
             Self::ReviewerRank => "reviewer-rank",
             Self::ProfilePick => "profile-pick",
+            Self::TierPick => "tier-pick",
         }
     }
 }
@@ -1759,7 +1764,60 @@ pub fn fold_annotate(surface: AnnotateSurface, answers: &Answers, pack: &Questio
                 .unwrap_or(("unknown".to_string(), 0.0));
             format!("annotate profile: fit={level} ({lv_conf:.2})")
         }
+        AnnotateSurface::TierPick => {
+            let depth = answers
+                .by_question
+                .get("reasoning_depth")
+                .and_then(|a| match a {
+                    Answer::Choice(c) => Some(c.choice.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("substantial");
+            let coupling = answers
+                .by_question
+                .get("harness_coupling")
+                .and_then(|a| match a {
+                    Answer::Choice(c) => Some(c.choice.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("open");
+            let conf = pack_confidence(answers);
+            format!("annotate tier: depth={depth} coupling={coupling} ({conf:.2})")
+        }
     }
+}
+
+/// bd-88m4: offline FallbackTable for the tier-pick pack — strong textual
+/// cues map to a slot band, everything else returns None, which IS current
+/// behavior (the briefing renders no suggestion and today's menus stand).
+/// The live path is `annotate(project, AnnotateSurface::TierPick, ...)`;
+/// the user always decides — a suggestion never dispatches.
+pub fn suggest_tier_pick(objective: &str) -> Option<&'static str> {
+    let lower = objective.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = |w: &str| tokens.contains(&w);
+    if has("typo")
+        || has("rename")
+        || lower.contains("one-line")
+        || lower.contains("one line")
+        || has("docs")
+        || lower.contains("mechanical")
+    {
+        return Some("@cheap");
+    }
+    if has("architecture")
+        || has("redesign")
+        || has("migration")
+        || has("security")
+        || lower.contains("perf budget")
+        || lower.contains("frontier")
+    {
+        return Some("@premium");
+    }
+    None
 }
 
 /// bd-adv4: offline FallbackTable for the profile-pick pack — deterministic
@@ -2756,6 +2814,77 @@ questions:
         let line = fold_annotate(AnnotateSurface::ProfilePick, &answers, &pack);
         assert!(line.contains("fit=strong"), "{line}");
         assert!(AnnotateSurface::parse("profile-pick") == Some(AnnotateSurface::ProfilePick));
+    }
+
+    /// bd-88m4: the tier-pick fold combines both questions; parse knows
+    /// the surface.
+    #[test]
+    fn tier_pick_fold_combines_depth_and_coupling() {
+        let pack = QuestionPack::parse_yaml(
+            r#"
+id: tier-pick
+version: 1
+model: jev-1.13.0
+questions:
+  - id: reasoning_depth
+    kind: choice
+    instructions: "depth?"
+    options: [routine, substantial, frontier]
+    criteria: ["r", "s", "f"]
+  - id: harness_coupling
+    kind: choice
+    instructions: "coupling?"
+    options: [open, coupled]
+    criteria: ["o", "c"]
+"#,
+        )
+        .expect("tier-pick test pack parses");
+        let answers = Answers {
+            model_id: JEV_MODEL_PIN.into(),
+            pack_id: "tier-pick".into(),
+            pack_version: 1,
+            by_question: BTreeMap::from([
+                (
+                    "reasoning_depth".into(),
+                    Answer::Choice(ChoiceAnswer {
+                        choice: "frontier".into(),
+                        probs: BTreeMap::from([
+                            ("frontier".into(), 0.7),
+                            ("substantial".into(), 0.2),
+                            ("routine".into(), 0.1),
+                        ]),
+                    }),
+                ),
+                (
+                    "harness_coupling".into(),
+                    Answer::Choice(ChoiceAnswer {
+                        choice: "coupled".into(),
+                        probs: BTreeMap::from([("coupled".into(), 0.8), ("open".into(), 0.2)]),
+                    }),
+                ),
+            ]),
+            usage: "{}".into(),
+        };
+        let line = fold_annotate(AnnotateSurface::TierPick, &answers, &pack);
+        assert!(line.contains("depth=frontier"), "{line}");
+        assert!(line.contains("coupling=coupled"), "{line}");
+        assert!(AnnotateSurface::parse("tier-pick") == Some(AnnotateSurface::TierPick));
+    }
+
+    /// bd-88m4: the offline tier-pick table fires only on strong cues —
+    /// anything else is None, which is current behavior.
+    #[test]
+    fn tier_pick_suggest_offline_falls_back_to_current() {
+        assert_eq!(
+            suggest_tier_pick("fix the typo in the docs"),
+            Some("@cheap")
+        );
+        assert_eq!(
+            suggest_tier_pick("plan the security migration with a perf budget"),
+            Some("@premium")
+        );
+        assert_eq!(suggest_tier_pick("fix the flake"), None);
+        assert_eq!(suggest_tier_pick("sharpen the objective into beads"), None);
     }
 
     /// bd-adv4: the offline profile-pick table routes by language cue and

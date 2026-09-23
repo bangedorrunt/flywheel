@@ -60,6 +60,10 @@ pub struct BriefingContext {
     /// decides via the coder_profile input or crew remix. None renders
     /// nothing.
     pub profile_suggestion: Option<String>,
+    /// bd-88m4: Jev tier-pick suggestion for the model band (a slot alias:
+    /// @cheap or @premium). Advisory only — the user decides via
+    /// --role-model. None IS current behavior and renders nothing.
+    pub tier_suggestion: Option<String>,
     /// bare harness+provider/model override the operator may type instead of
     /// a squad/profile choice (bd-j3so surface)
     pub bare_override: Option<String>,
@@ -216,6 +220,15 @@ pub fn run_briefing(
             dim("(profile-pick; user decides — coder_profile input or keep @coder)")
         )?;
     }
+    if let Some(s) = &ctx.tier_suggestion {
+        writeln!(
+            out,
+            "  {} {} {}",
+            dim("tier suggestion:"),
+            accent(s),
+            dim("(tier-pick; user decides — --role-model or keep default)")
+        )?;
+    }
     match &ctx.bare_override {
         Some(bare) => writeln!(out, "  {} {}", dim("bare override accepted:"), accent(bare))?,
         None => writeln!(
@@ -317,6 +330,7 @@ mod tests {
             }],
             squad_recommendation: Some("build".into()),
             profile_suggestion: None,
+            tier_suggestion: None,
             bare_override: None,
             stage_chain: vec!["plan".into(), "implement".into(), "review".into()],
             funded: BTreeMap::new(),
@@ -395,6 +409,22 @@ mod tests {
         assert!(!plain.contains("profile suggestion:"), "{plain}");
     }
 
+    /// bd-88m4: a set tier suggestion renders beside the profile line;
+    /// None renders nothing.
+    #[test]
+    fn tier_pick_suggestion_renders_beside_profile() {
+        let mut c = ctx();
+        c.profile_suggestion = Some("@rust-coder".into());
+        c.tier_suggestion = Some("@premium".into());
+        let mut inp = std::io::Cursor::new("");
+        let mut out: Vec<u8> = Vec::new();
+        run_briefing(&c, &mut inp, &mut out).expect("briefing");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("profile suggestion:"), "{rendered}");
+        assert!(rendered.contains("tier suggestion:"), "{rendered}");
+        assert!(rendered.contains("@premium"), "{rendered}");
+    }
+
     #[test]
     fn edits_apply_budget() {
         let (outcome, rendered) = drive(&["4", "1", "", "y"]);
@@ -455,6 +485,7 @@ mod tests {
             models: vec![],
             squad_recommendation: None,
             profile_suggestion: None,
+            tier_suggestion: None,
             bare_override: None,
             stage_chain: vec!["review".into(), "ship".into()],
             funded: BTreeMap::new(),
