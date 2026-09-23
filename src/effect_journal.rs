@@ -689,13 +689,25 @@ fn dispatch_request(inv: &ActionInvocation) -> DispatchRequest {
 fn fenced_outcome(result: Result<toron_mcp::workflow_host::DispatchResult>) -> Value {
     match result {
         Ok(res) if res.state == EffectState::Settled => res.outcome,
-        Ok(res) => serde_json::json!({
-            "ok": false,
-            "effect_key": res.effect_key,
-            "effect_state": res.state.as_str(),
-            "outcome": res.outcome,
-            "stage": "effect",
-        }),
+        Ok(res) => {
+            // bd-6ppj: the engine fallback reads flat .error, so a fenced
+            // non-settled shape carries the provider error top-level too —
+            // nested outcome.error alone printed bare "step failed" live.
+            let err = res
+                .outcome
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("effect {} (unproven)", res.state.as_str()));
+            serde_json::json!({
+                "ok": false,
+                "error": err,
+                "effect_key": res.effect_key,
+                "effect_state": res.state.as_str(),
+                "outcome": res.outcome,
+                "stage": "effect",
+            })
+        }
         Err(e) => serde_json::json!({
             "ok": false,
             "error": format!("{e:#}"),
@@ -725,6 +737,41 @@ mod tests {
             .await
             .expect("migrate");
         (dir, WorkflowEffectStore::new(pool))
+    }
+
+    /// bd-6ppj (failing first): a fenced non-settled outcome always
+    /// carries a top-level error — live proof fw-composed-2026-09-23T04:28
+    /// showed provider errors nesting under outcome.error while the engine
+    /// fallback reads flat .error and prints bare "step failed".
+    #[test]
+    fn fenced_failed_shape_always_carries_top_level_error() {
+        use toron_mcp::workflow_host::DispatchResult;
+        let failed = DispatchResult {
+            effect_key: "k1".to_string(),
+            attempt: 1,
+            state: EffectState::Failed,
+            outcome: serde_json::json!({"error": "agent x not found"}),
+        };
+        let v = fenced_outcome(Ok(failed));
+        assert_eq!(v.get("ok"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(
+            v.get("error").and_then(|e| e.as_str()),
+            Some("agent x not found"),
+            "provider error must ride top-level: {v}"
+        );
+        let bare = DispatchResult {
+            effect_key: "k2".to_string(),
+            attempt: 1,
+            state: EffectState::Failed,
+            outcome: serde_json::json!({"ok": false}),
+        };
+        let v2 = fenced_outcome(Ok(bare));
+        assert!(
+            v2.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "even a bare outcome names the state: {v2}"
+        );
     }
 
     fn dispatch_job() -> Action {
