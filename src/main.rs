@@ -27791,6 +27791,13 @@ fn is_first_dispatch(records: &[state::SentRecord], name: &str, skills_injected:
     !records.iter().any(|r| r.name == name && r.landed)
 }
 
+/// bd-mcax: gate decision — a first dispatch gates when the agent row is
+/// missing (fresh pane still binding) or still booting. Anything else
+/// proceeds straight to the normal send path.
+fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
+    first && agent.map_or(true, |a| crate::herdr_shim::agent_still_booting(a))
+}
+
 /// bd-83as: have this agent's skills been injected yet (spawn registry)?
 /// Absent registry or entry reads as not-injected (fail toward gating —
 /// the gate is a no-op wait on already-booted panes).
@@ -27828,7 +27835,7 @@ where
         }
         if start.elapsed() >= bound {
             anyhow::bail!(
-                "agent {name} still booting after {}s — first dispatch held at the readiness gate (bd-83as)",
+                "agent {name} still booting or missing after {}s — first dispatch held at the readiness gate (bd-83as/bd-mcax)",
                 bound.as_secs()
             );
         }
@@ -27981,16 +27988,16 @@ fn cmd_internal_send(
                 .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
         }
     }
-    let agent = agent.ok_or_else(|| anyhow!("agent {name} not found in {project}"))?;
-    // bd-83as: first dispatch to a still-booting agent waits bounded (10s)
-    // instead of firing into the boot window and producing a reasonless
-    // leaf downstream. Later dispatches skip the gate entirely.
-    let agent = if is_first_dispatch(
+    let first = is_first_dispatch(
         &state::load_last_sent(project),
         name,
         skills_injected_for(project, name),
-    ) && crate::herdr_shim::agent_still_booting(&agent)
-    {
+    );
+    // bd-83as/bd-mcax: first dispatch gates when the agent row is missing
+    // (fresh pane still binding) or still booting — bounded 10s wait
+    // instead of firing into the window and producing a reasonless leaf
+    // downstream. Later dispatches skip the gate entirely.
+    let agent = if should_gate_first_dispatch(first, agent.as_ref()) {
         await_agent_ready(
             || backend.agent_list().map_err(anyhow::Error::from),
             name,
@@ -27998,7 +28005,7 @@ fn cmd_internal_send(
             Duration::from_secs(10),
         )?
     } else {
-        agent
+        agent.ok_or_else(|| anyhow!("agent {name} not found in {project}"))?
     };
     let target = agent_target(&agent).to_string();
 
@@ -34199,6 +34206,39 @@ mod first_dispatch_gate_tests {
         assert!(!is_first_dispatch(&[sent("x", true)], "x", false));
         assert!(!is_first_dispatch(&[], "x", true));
         assert!(is_first_dispatch(&[sent("y", true)], "x", false));
+    }
+
+    /// bd-mcax (red first): the gate decision — first dispatch gates when
+    /// the agent is missing (fresh pane still binding) or still booting.
+    /// Later dispatches, and found-and-ready agents, never gate.
+    #[test]
+    fn gate_decision_covers_missing_and_booting() {
+        assert!(should_gate_first_dispatch(true, None));
+        assert!(should_gate_first_dispatch(true, Some(&agent_row(true))));
+        assert!(!should_gate_first_dispatch(true, Some(&agent_row(false))));
+        assert!(!should_gate_first_dispatch(false, None));
+        assert!(!should_gate_first_dispatch(false, Some(&agent_row(true))));
+    }
+
+    /// bd-mcax (red first): scripted missing then present proceeds —
+    /// the live gap was a missing row failing instantly.
+    #[test]
+    fn missing_then_present_proceeds() {
+        let script = vec![vec![], vec![], vec![agent_row(false)]];
+        let calls = std::cell::Cell::new(0);
+        let out = await_agent_ready(
+            || {
+                let i = calls.get();
+                calls.set(i + 1);
+                Ok(script[i.min(script.len() - 1)].clone())
+            },
+            "crew-x-planner",
+            "w9",
+            std::time::Duration::from_secs(10),
+        )
+        .expect("present on third listing");
+        assert_eq!(calls.get(), 3);
+        assert!(!out.launch_pending);
     }
 
     /// bd-83as T2 (red first): scripted not-ready then ready proceeds and
