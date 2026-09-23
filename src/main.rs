@@ -27780,15 +27780,14 @@ fn skill_injection_prefix(entry: &state::SpawnEntry, skills: &[String]) -> Optio
     Some(format!("Read {paths} before starting.\n\n"))
 }
 
-/// bd-83as: first-dispatch predicate for the readiness gate — true only
-/// when no landed record exists for this (project, agent) AND the spawn
-/// registry shows skills not yet injected. Later dispatches skip the gate
-/// entirely (zero behavior change past the first send).
-fn is_first_dispatch(records: &[state::SentRecord], name: &str, skills_injected: bool) -> bool {
-    if skills_injected {
-        return false;
-    }
-    !records.iter().any(|r| r.name == name && r.landed)
+/// bd-83as/bd-mcax: first-dispatch predicate for the readiness gate —
+/// true while the spawn registry shows skills not yet injected, i.e. this
+/// pane booted fresh under the current spawn. Landed history is NOT
+/// consulted: herdr names are stable across respawns, so a landed record
+/// would silence the gate forever after the first send. Later dispatches
+/// (injected lane) skip the gate entirely.
+fn is_first_dispatch(skills_injected: bool) -> bool {
+    !skills_injected
 }
 
 /// bd-mcax: gate decision — a first dispatch gates when the agent row is
@@ -27988,11 +27987,7 @@ fn cmd_internal_send(
                 .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name));
         }
     }
-    let first = is_first_dispatch(
-        &state::load_last_sent(project),
-        name,
-        skills_injected_for(project, name),
-    );
+    let first = is_first_dispatch(skills_injected_for(project, name));
     // bd-83as/bd-mcax: first dispatch gates when the agent row is missing
     // (fresh pane still binding) or still booting — bounded 10s wait
     // instead of firing into the window and producing a reasonless leaf
@@ -34164,17 +34159,6 @@ mod first_dispatch_gate_tests {
     use super::*;
     use crate::state::SentRecord;
 
-    fn sent(name: &str, landed: bool) -> SentRecord {
-        SentRecord {
-            name: name.to_string(),
-            text_hash: 1,
-            invocation: String::new(),
-            iteration: 0,
-            landed,
-            ambiguous: false,
-        }
-    }
-
     fn agent_row(booting: bool) -> AgentInfo {
         AgentInfo {
             agent: None,
@@ -34197,15 +34181,13 @@ mod first_dispatch_gate_tests {
         }
     }
 
-    /// bd-83as T2 (red first): first dispatch = no landed record AND skills
-    /// not yet injected. Anything landed, or an injected lane, skips the gate.
+    /// bd-83as/bd-mcax: first dispatch = skills not yet injected (fresh
+    /// spawn). Landed history never silences the gate — herdr names are
+    /// stable across respawns, so a landed record would mute it forever.
     #[test]
     fn first_dispatch_predicate() {
-        assert!(is_first_dispatch(&[], "x", false));
-        assert!(is_first_dispatch(&[sent("x", false)], "x", false));
-        assert!(!is_first_dispatch(&[sent("x", true)], "x", false));
-        assert!(!is_first_dispatch(&[], "x", true));
-        assert!(is_first_dispatch(&[sent("y", true)], "x", false));
+        assert!(is_first_dispatch(false));
+        assert!(!is_first_dispatch(true));
     }
 
     /// bd-mcax (red first): the gate decision — first dispatch gates when
