@@ -293,6 +293,31 @@ fn try_adopt(cfg: &Config) -> Result<Option<u32>> {
     }
 }
 
+/// What one tick of the `start` watch observed: a dead child first (it
+/// must never be masked by a peer answering /health on this port), then
+/// health, then the deadline. Pure — tests script all three observations
+/// with no clock, child, or socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boot {
+    Healthy,
+    Exited(std::process::ExitStatus),
+    TimedOut,
+}
+
+fn boot_probe(
+    exited: Option<std::process::ExitStatus>,
+    health_answered: bool,
+    timed_out: bool,
+) -> Option<Boot> {
+    if let Some(status) = exited {
+        return Some(Boot::Exited(status));
+    }
+    if health_answered {
+        return Some(Boot::Healthy);
+    }
+    timed_out.then_some(Boot::TimedOut)
+}
+
 fn pid_alive(pid: u32) -> bool {
     if pid <= 1 {
         return false;
@@ -756,20 +781,14 @@ pub fn start(cfg: &Config) -> Result<()> {
     // reason is in the log tail — waiting out START_TIMEOUT for a corpse
     // only ever produced the misleading "never answered /health".
     let deadline = std::time::Instant::now() + START_TIMEOUT;
-    enum Boot {
-        Healthy,
-        Exited(std::process::ExitStatus),
-        TimedOut,
-    }
     let boot = loop {
-        if let Some(status) = child.try_wait().context("poll serve child")? {
-            break Boot::Exited(status);
-        }
-        if health_probe(cfg).is_some() {
-            break Boot::Healthy;
-        }
-        if std::time::Instant::now() >= deadline {
-            break Boot::TimedOut;
+        let exited = child.try_wait().context("poll serve child")?;
+        // No health probe once the child is gone: a dead child must never
+        // be masked by a peer answering on this port.
+        let health_answered = exited.is_none() && health_probe(cfg).is_some();
+        let timed_out = std::time::Instant::now() >= deadline;
+        if let Some(decision) = boot_probe(exited, health_answered, timed_out) {
+            break decision;
         }
         std::thread::sleep(Duration::from_millis(200));
     };
@@ -875,88 +894,164 @@ pub fn stop(cfg: &Config, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Budget-injected core of `stop` (tests script a SIGTERM-ignoring child
-/// with a 400ms grace instead of waiting 15s). Returns the summary line so
-/// the caller prints exactly what happened — escalation included.
+/// Budget-injected wrapper: the policy numbers are data, and the world
+/// behind them is one seam (see [`StopWorld`]).
 fn stop_with_budgets(
     cfg: &Config,
     force: bool,
     grace: Duration,
     kill_grace: Duration,
 ) -> Result<String> {
-    match stop_target(cfg) {
-        Some(pid) => {
-            // TERM first, unload second: serve needs its full drain budget,
-            // and launchd's bootout SIGKILLs at its 5s exit timeout —
-            // booting out first beheaded the drain and made healthy
-            // daemons look like SIGTERM-ignorers. Once the pid is gone,
-            // bootout keeps KeepAlive{SuccessfulExit=false} from
-            // respawning the unclean exit (the restart storm).
-            let _ = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status();
-            let mut escalated = false;
-            if !wait_for(|| !pid_alive(pid), grace) {
-                eprintln!(
-                    "doorbell: pid {pid} still alive after {grace:?} grace — sending SIGKILL"
-                );
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status();
-                escalated = true;
-                if !wait_for(|| !pid_alive(pid), kill_grace) {
-                    disable_supervisor(cfg);
-                    anyhow::bail!(
-                        "doorbell: pid {pid} survived SIGKILL — investigate (lsof -nP -iTCP:{}) before retrying",
-                        cfg.port
-                    );
-                }
+    stop_core(
+        &mut RealStop { cfg },
+        cfg.port,
+        &cfg.socket_path(),
+        force,
+        grace,
+        kill_grace,
+    )
+}
+
+/// The signal stop delivers: `Term` first, `Kill` only as escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sig {
+    Term,
+    Kill,
+}
+
+/// The world `stop` touches — one seam so the interpreter test scripts the
+/// process, endpoints, and supervisor as plain data (effect law: clock and
+/// services substituted; no real sleep, signal, or socket in the decision
+/// test).
+trait StopWorld {
+    /// First pid to signal: live /health owner, else live pidfile pid.
+    fn stop_target(&mut self) -> Option<u32>;
+    fn signal(&mut self, pid: u32, sig: Sig);
+    /// Poll until the pid is dead or `grace` elapses; true = dead.
+    fn wait_dead(&mut self, pid: u32, grace: Duration) -> bool;
+    fn unload_supervisor(&mut self);
+    fn health_answers(&mut self) -> bool;
+    fn tcp_alive(&mut self, port: u16) -> bool;
+    fn uds_alive(&mut self, path: &std::path::Path) -> bool;
+    /// Managed branch: cleanup after the pid is proven dead.
+    fn cleanup_state(&mut self, pid: u32);
+    /// Nothing-of-ours branch: drop the stale claim and stale socket path.
+    fn cleanup_stale(&mut self, path: &std::path::Path);
+}
+
+/// Real world behind [`StopWorld`], bound to this config.
+struct RealStop<'a> {
+    cfg: &'a Config,
+}
+
+impl StopWorld for RealStop<'_> {
+    fn stop_target(&mut self) -> Option<u32> {
+        stop_target(self.cfg)
+    }
+    fn signal(&mut self, pid: u32, sig: Sig) {
+        let mut cmd = std::process::Command::new("kill");
+        match sig {
+            Sig::Term => {
+                cmd.arg(pid.to_string());
             }
-            disable_supervisor(cfg);
-            // The pid is gone; a live endpoint now belongs to a DIFFERENT
-            // process. Never report success for a port we no longer own.
-            if tcp_endpoint_alive(cfg.port) || socket_endpoint_alive(&cfg.socket_path()) {
-                anyhow::bail!(
-                    "doorbell: pid {pid} stopped but port {} (or its socket) is still held by another process — identify it with lsof -nP -iTCP:{} and stop it",
-                    cfg.port,
-                    cfg.port
-                );
+            Sig::Kill => {
+                cmd.args(["-KILL", &pid.to_string()]);
             }
-            if read_pid(&cfg.pid_file()) == Some(pid) {
-                let _ = std::fs::remove_file(cfg.pid_file());
-            }
-            // Proof of death above: whatever is left is a stale UDS path.
-            let _ = std::fs::remove_file(cfg.socket_path());
-            Ok(if escalated {
-                format!(
-                    "doorbell: stopped (pid {pid}, SIGKILL after {}s grace)",
-                    grace.as_secs()
-                )
-            } else {
-                format!("doorbell: stopped (pid {pid})")
-            })
         }
-        None => {
-            if health_probe(cfg).is_some() || tcp_endpoint_alive(cfg.port) {
-                if !force {
-                    anyhow::bail!(
-                        "doorbell: port {} answers but no doorbell owner or live pidfile — unmanaged holder, refusing (use --force)",
-                        cfg.port
-                    );
-                }
-                anyhow::bail!(
-                    "doorbell: port {} answers but owner unknown — --force cannot kill what it cannot identify; stop the owner instead (lsof -nP -iTCP:{})",
-                    cfg.port,
-                    cfg.port
-                );
-            }
-            let _ = std::fs::remove_file(cfg.pid_file());
-            if !socket_endpoint_alive(&cfg.socket_path()) {
-                let _ = std::fs::remove_file(cfg.socket_path());
-            }
-            Ok("doorbell: already stopped".to_string())
+        let _ = cmd.status();
+    }
+    fn wait_dead(&mut self, pid: u32, grace: Duration) -> bool {
+        wait_for(|| !pid_alive(pid), grace)
+    }
+    fn unload_supervisor(&mut self) {
+        disable_supervisor(self.cfg);
+    }
+    fn health_answers(&mut self) -> bool {
+        health_probe(self.cfg).is_some()
+    }
+    fn tcp_alive(&mut self, port: u16) -> bool {
+        tcp_endpoint_alive(port)
+    }
+    fn uds_alive(&mut self, path: &std::path::Path) -> bool {
+        socket_endpoint_alive(path)
+    }
+    fn cleanup_state(&mut self, pid: u32) {
+        if read_pid(&self.cfg.pid_file()) == Some(pid) {
+            let _ = std::fs::remove_file(self.cfg.pid_file());
+        }
+        // The caller proved the endpoint dead: what remains of the socket
+        // path is stale by definition.
+        let _ = std::fs::remove_file(self.cfg.socket_path());
+    }
+    fn cleanup_stale(&mut self, path: &std::path::Path) {
+        let _ = std::fs::remove_file(self.cfg.pid_file());
+        if !socket_endpoint_alive(path) {
+            let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// The stop decision itself: observations and policy only, no I/O — tests
+/// script a clean exit, a hanging drain, an unkillable pid, a foreign
+/// endpoint, and the unmanaged/already-stopped arms through [`StopWorld`].
+fn stop_core<W: StopWorld>(
+    world: &mut W,
+    port: u16,
+    socket: &std::path::Path,
+    force: bool,
+    grace: Duration,
+    kill_grace: Duration,
+) -> Result<String> {
+    let Some(pid) = world.stop_target() else {
+        if world.health_answers() || world.tcp_alive(port) {
+            if !force {
+                anyhow::bail!(
+                    "doorbell: port {port} answers but no doorbell owner or live pidfile — unmanaged holder, refusing (use --force)"
+                );
+            }
+            anyhow::bail!(
+                "doorbell: port {port} answers but owner unknown — --force cannot kill what it cannot identify; stop the owner instead (lsof -nP -iTCP:{port})"
+            );
+        }
+        world.cleanup_stale(socket);
+        return Ok("doorbell: already stopped".to_string());
+    };
+    // TERM first, unload second: serve needs its full drain budget, and
+    // launchd's bootout SIGKILLs at its 5s exit timeout — booting out
+    // first beheaded the drain and made healthy daemons look like
+    // SIGTERM-ignorers. Once the pid is gone, bootout keeps
+    // KeepAlive{SuccessfulExit=false} from respawning the unclean exit
+    // (the restart storm).
+    world.signal(pid, Sig::Term);
+    let mut escalated = false;
+    if !world.wait_dead(pid, grace) {
+        eprintln!("doorbell: pid {pid} still alive after {grace:?} grace — sending SIGKILL");
+        world.signal(pid, Sig::Kill);
+        escalated = true;
+        if !world.wait_dead(pid, kill_grace) {
+            world.unload_supervisor();
+            anyhow::bail!(
+                "doorbell: pid {pid} survived SIGKILL — investigate (lsof -nP -iTCP:{port}) before retrying"
+            );
+        }
+    }
+    world.unload_supervisor();
+    // The pid is gone; a live endpoint now belongs to a DIFFERENT process.
+    // Never report success for a port we no longer own.
+    if world.tcp_alive(port) || world.uds_alive(socket) {
+        anyhow::bail!(
+            "doorbell: pid {pid} stopped but port {port} (or its socket) is still held by another process — identify it with lsof -nP -iTCP:{port} and stop it"
+        );
+    }
+    world.cleanup_state(pid);
+    Ok(if escalated {
+        format!(
+            "doorbell: stopped (pid {pid}, SIGKILL after {}s grace)",
+            grace.as_secs()
+        )
+    } else {
+        format!("doorbell: stopped (pid {pid})")
+    })
 }
 
 fn restart_after_stop(
@@ -1557,6 +1652,202 @@ mod tests {
             body,
             std::path::Path::new("/tmp/dbcl-scratch")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_probe_keeps_a_dead_child_visible_and_bounds_the_wait() {
+        use std::os::unix::process::ExitStatusExt;
+        let dead = std::process::ExitStatus::from_raw(9 << 8);
+        assert!(
+            matches!(boot_probe(Some(dead), true, false), Some(Boot::Exited(_))),
+            "a dead child beats a peer answering /health"
+        );
+        assert_eq!(boot_probe(None, true, true), Some(Boot::Healthy));
+        assert_eq!(boot_probe(None, false, true), Some(Boot::TimedOut));
+        assert_eq!(boot_probe(None, false, false), None, "keep waiting");
+    }
+
+    /// Scripted stand-in for the process/endpoints/supervisor world: every
+    /// observation is data, so these tests carry no real clock, sleep,
+    /// signal, or socket (effect law: interpreter test by substitution).
+    #[derive(Debug, Default)]
+    struct ScriptedStop {
+        target: Option<u32>,
+        /// Answer for each `wait_dead` call: true = pid exits within budget.
+        dead_after: std::collections::VecDeque<bool>,
+        health: bool,
+        tcp: bool,
+        uds: bool,
+        actions: Vec<String>,
+    }
+
+    impl ScriptedStop {
+        fn stop(&mut self, force: bool) -> Result<String> {
+            stop_core(
+                self,
+                18980,
+                std::path::Path::new("/tmp/scripted.sock"),
+                force,
+                Duration::from_secs(15),
+                Duration::from_secs(5),
+            )
+        }
+        fn position(&self, action: &str) -> usize {
+            self.actions
+                .iter()
+                .position(|a| a == action)
+                .unwrap_or_else(|| panic!("missing {action} in {:?}", self.actions))
+        }
+    }
+
+    impl StopWorld for ScriptedStop {
+        fn stop_target(&mut self) -> Option<u32> {
+            self.target
+        }
+        fn signal(&mut self, pid: u32, sig: Sig) {
+            self.actions.push(format!("signal {pid} {sig:?}"));
+        }
+        fn wait_dead(&mut self, pid: u32, grace: Duration) -> bool {
+            self.actions.push(format!("wait {pid} {grace:?}"));
+            self.dead_after.pop_front().unwrap_or(true)
+        }
+        fn unload_supervisor(&mut self) {
+            self.actions.push("unload".into());
+        }
+        fn health_answers(&mut self) -> bool {
+            self.health
+        }
+        fn tcp_alive(&mut self, _port: u16) -> bool {
+            self.tcp
+        }
+        fn uds_alive(&mut self, _path: &std::path::Path) -> bool {
+            self.uds
+        }
+        fn cleanup_state(&mut self, pid: u32) {
+            self.actions.push(format!("cleanup {pid}"));
+        }
+        fn cleanup_stale(&mut self, _path: &std::path::Path) {
+            self.actions.push("cleanup-stale".into());
+        }
+    }
+
+    #[test]
+    fn stop_core_signals_before_unloading_and_reports_the_clean_exit() {
+        let mut w = ScriptedStop {
+            target: Some(9),
+            dead_after: vec![true].into(),
+            ..Default::default()
+        };
+        let msg = w.stop(false).expect("clean stop");
+        assert_eq!(msg, "doorbell: stopped (pid 9)");
+        // Load-bearing order: TERM is delivered BEFORE the supervisor
+        // unload (bootout-first beheaded the drain — the restart bug).
+        let term = w.position("signal 9 Term");
+        let unload = w.position("unload");
+        assert!(term < unload, "TERM must precede unload: {:?}", w.actions);
+        assert!(
+            !w.actions.iter().any(|a| a == "signal 9 Kill"),
+            "{:?}",
+            w.actions
+        );
+        assert_eq!(
+            w.actions.last().map(String::as_str),
+            Some("cleanup 9"),
+            "{:?}",
+            w.actions
+        );
+    }
+
+    #[test]
+    fn stop_core_escalates_a_hanging_drain_and_still_unloads() {
+        let mut w = ScriptedStop {
+            target: Some(9),
+            dead_after: vec![false, true].into(),
+            ..Default::default()
+        };
+        let msg = w.stop(false).expect("escalated stop");
+        assert!(msg.contains("SIGKILL"), "{msg}");
+        let kill = w.position("signal 9 Kill");
+        let unload = w.position("unload");
+        assert!(kill < unload, "SIGKILL before unload: {:?}", w.actions);
+    }
+
+    #[test]
+    fn stop_core_reports_an_unkillable_pid_instead_of_success() {
+        let mut w = ScriptedStop {
+            target: Some(9),
+            dead_after: vec![false, false].into(),
+            ..Default::default()
+        };
+        let err = w.stop(false).expect_err("unkillable pid must fail");
+        assert!(err.to_string().contains("survived SIGKILL"));
+        assert!(
+            w.actions.iter().any(|a| a == "unload"),
+            "supervisor still unloaded on the hard-fail path: {:?}",
+            w.actions
+        );
+        assert!(
+            !w.actions.iter().any(|a| a.starts_with("cleanup")),
+            "no success cleanup on failure: {:?}",
+            w.actions
+        );
+    }
+
+    #[test]
+    fn stop_core_refuses_success_while_a_foreign_endpoint_survives() {
+        let mut w = ScriptedStop {
+            target: Some(9),
+            dead_after: vec![true].into(),
+            tcp: true,
+            ..Default::default()
+        };
+        let err = w
+            .stop(false)
+            .expect_err("surviving endpoint must fail the stop");
+        assert!(err.to_string().contains("still held by another process"));
+        assert!(
+            !w.actions.iter().any(|a| a.starts_with("cleanup")),
+            "{:?}",
+            w.actions
+        );
+    }
+
+    #[test]
+    fn stop_core_unmanaged_arms_refuse_loudly_and_never_touch_a_stranger() {
+        // Busy port, no identifiable owner: refused without force…
+        let mut busy = ScriptedStop {
+            tcp: true,
+            ..Default::default()
+        };
+        let err = busy.stop(false).expect_err("unmanaged holder");
+        assert!(err.to_string().contains("unmanaged holder"));
+        // …same when only /health answers (no owner attestation)…
+        let mut via_health = ScriptedStop {
+            health: true,
+            ..Default::default()
+        };
+        let err = via_health.stop(false).expect_err("unmanaged holder");
+        assert!(err.to_string().contains("unmanaged holder"));
+        // …and --force still refuses, because it cannot identify a target.
+        let mut busy_f = ScriptedStop {
+            tcp: true,
+            ..Default::default()
+        };
+        let err = busy_f.stop(true).expect_err("force cannot identify");
+        assert!(
+            err.to_string()
+                .contains("cannot kill what it cannot identify")
+        );
+        // Nothing answers: idempotent already-stopped, stale state dropped.
+        let mut idle = ScriptedStop::default();
+        let msg = idle.stop(false).expect("already stopped");
+        assert_eq!(msg, "doorbell: already stopped");
+        assert!(
+            idle.actions.iter().any(|a| a == "cleanup-stale"),
+            "{:?}",
+            idle.actions
+        );
     }
 
     #[cfg(target_os = "macos")]
