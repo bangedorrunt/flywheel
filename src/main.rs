@@ -13339,6 +13339,20 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         for (k, st) in &integrations {
             println!("  {}", integration_status_line(k, st));
         }
+        // bd-nwnb: dead registry rows are visible here before dispatch
+        // trips on them — reaped automatically on next spawn/close.
+        let dead = pane::dead_registry_rows(project, &mut c);
+        if dead.is_empty() {
+            println!("  {}", dim("registry: no dead rows"));
+        } else {
+            println!(
+                "  {}",
+                output::warn(&format!("registry: {} dead row(s)", dead.len()))
+            );
+            for (pane_id, name) in &dead {
+                println!("    {pane_id} {name}");
+            }
+        }
         println!("{report}");
         println!(
             "{} {} last_wake={} pin={}",
