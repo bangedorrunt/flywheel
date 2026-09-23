@@ -7611,6 +7611,8 @@ projects available: {}",
                 eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
             }
         }
+        // bd-bfwj: those panes are dead — reap their registry rows now.
+        pane::reap_dead_registry_rows(project, &mut c);
     }
     let orphans = live_owned;
     if !orphans.is_empty() {
@@ -7634,6 +7636,8 @@ projects available: {}",
                     eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
                 }
             }
+            // bd-bfwj: retired panes are dead — reap their registry rows now.
+            pane::reap_dead_registry_rows(project, &mut c);
         } else if opts.join {
             eprintln!(
                 "JOINING — not spawning  project={project} live={}  (ADR-0011 D5; reuse first workspace)",
@@ -25240,6 +25244,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         ctx.workspace_id
                     ),
                 }
+                // bd-bfwj: reaped panes are dead — drop their registry rows.
+                pane::reap_dead_registry_rows(project.as_deref().unwrap_or("flywheel"), &mut c);
             }
             // ADR-0032 Spec 9 tail (bd-40d1): the ledger row carries the
             // run's real terminal status, real project, and failure
@@ -25810,6 +25816,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         ctx.workspace_id
                     ),
                 }
+                // bd-bfwj: reaped panes are dead — drop their registry rows.
+                pane::reap_dead_registry_rows(project.as_deref().unwrap_or("flywheel"), &mut c);
             }
             // ADR-0032 Spec 9 tail (bd-40d1): same truthful ledger row for
             // composed runs — real terminal status, real project, failure
