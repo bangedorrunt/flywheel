@@ -95,6 +95,21 @@ pub fn resolve_pane_entry<'a>(entries: &'a [SpawnEntry], profile: &str) -> Optio
         .or_else(|| entries.iter().find(|e| e.name == profile))
 }
 
+/// bd-op8b: drop registry rows whose pane no longer exists anywhere.
+/// Loaded registries otherwise carry dead rows forever; the first
+/// profile-match then steals fresh-crew dispatches (and a stale
+/// skills_injected=true mutes the readiness gate). Pure — the caller
+/// supplies the live pane set and decides failure policy.
+pub fn prune_dead_pane_rows(
+    entries: Vec<SpawnEntry>,
+    live_pane_ids: &std::collections::HashSet<String>,
+) -> Vec<SpawnEntry> {
+    entries
+        .into_iter()
+        .filter(|e| live_pane_ids.contains(&e.pane_id))
+        .collect()
+}
+
 /// bd-lvyi: resolve a per-step harness override to a crew pane running THAT
 /// harness. The pane's `harness` column is authoritative; a legacy entry
 /// without one (pre-bd-lvyi registry) falls back to its profile's harness
@@ -278,7 +293,21 @@ fn spawn_crew_into(
     // Preserve pre-existing registry entries (swarm panes, prior crew) —
     // only entries whose NAME we are about to (re)spawn are replaced, so a
     // --reuse re-run re-binds the crew without clobbering unrelated panes.
+    // bd-op8b: prune rows whose pane is gone everywhere first — dead rows
+    // otherwise win the first profile-match in dispatch resolution and send
+    // fresh-crew work into closed panes (live proof fw-composed-2026-09-23).
+    // Fail-open: an unlistable backend keeps every row (existing behavior).
     let mut registry: Vec<SpawnEntry> = state::load_spawn_registry(project);
+    if let Ok(panes) = c.pane_list(None) {
+        let live: std::collections::HashSet<String> =
+            panes.into_iter().map(|p| p.pane_id).collect();
+        let before = registry.len();
+        registry = prune_dead_pane_rows(registry, &live);
+        let pruned = before - registry.len();
+        if pruned > 0 {
+            eprintln!("flywheel: pruned {pruned} dead-pane registry row(s) for {project}");
+        }
+    }
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     // pane-split chain: first agent on the root pane, rest split down.
     let mut prev: Option<String> = None;
@@ -668,7 +697,9 @@ pub fn pane_dispatch(
     };
     let prompt = base;
     // @role -> running pane: a per-step harness override's matched pane
-    // wins; otherwise profile column first, name fallback.
+    // wins; otherwise profile column first, name fallback. bd-op8b: the
+    // resolved target is logged — dispatching into a dead pane used to be
+    // silent until the bare leaf downstream.
     let entry = override_entry
         .or_else(|| resolve_pane_entry(entries, profile_name))
         .ok_or_else(|| {
@@ -681,6 +712,10 @@ pub fn pane_dispatch(
                     .join(", ")
             )
         })?;
+    eprintln!(
+        "flywheel: dispatch @{} → {} ({})",
+        profile_name, entry.name, entry.pane_id
+    );
 
     // Subprocess-reuse (Spec A): the `__send` leaf owns the confirmed send
     // (landing wait, last-sent dedup, auto-heal, Spec C conditioning) — no
@@ -2074,6 +2109,44 @@ mod tests {
         assert_eq!(e.name, "plain-agent");
         assert_eq!(e.profile, None);
         assert!(resolve_pane_entry(&entries, "ghost").is_none());
+    }
+
+    /// bd-op8b (red first): loaded registry rows whose pane is gone must
+    /// not survive into dispatch resolution — a stale first match stole
+    /// fresh-crew dispatches live (stale skills_injected=true also muted
+    /// the readiness gate). Live panes in any workspace are kept.
+    #[test]
+    fn prune_dead_pane_rows_keeps_only_live_panes() {
+        use std::collections::HashSet;
+        let stale = SpawnEntry {
+            pane_id: "wOld:p9".into(),
+            name: "flywheel-chiebukuro-planner".into(),
+            profile: Some("planner".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: true,
+            incarnation: 0,
+        };
+        let fresh = SpawnEntry {
+            pane_id: "wNew:p1".into(),
+            name: "crew-wf-planner".into(),
+            profile: Some("planner".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        };
+        let live: HashSet<String> = ["wNew:p1".to_string()].into_iter().collect();
+        let kept = prune_dead_pane_rows(vec![stale, fresh], &live);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "crew-wf-planner");
+        assert!(!kept[0].skills_injected);
     }
 
     /// bd-lvyi: a per-step harness override resolves to a crew pane OF THAT
