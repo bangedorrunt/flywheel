@@ -110,6 +110,47 @@ pub fn prune_dead_pane_rows(
         .collect()
 }
 
+/// bd-bfwj: split a registry into live rows plus a pruned count, given
+/// the live pane set. Pure — tests pin the decision, the IO helper below
+/// supplies the live set and persists.
+pub fn reap_closed_rows(
+    entries: Vec<SpawnEntry>,
+    live_pane_ids: &std::collections::HashSet<String>,
+) -> (Vec<SpawnEntry>, usize) {
+    let before = entries.len();
+    let kept = prune_dead_pane_rows(entries, live_pane_ids);
+    let pruned = before.saturating_sub(kept.len());
+    (kept, pruned)
+}
+
+/// bd-bfwj: reap registry rows whose pane is gone everywhere. Called after
+/// closes that actually kill panes (orphan retire, pre-existing retire,
+/// compose reap, kill) — never where children survive (captain-continue
+/// keeps panes listed, so nothing is gone). Fail-open: an unlistable
+/// backend keeps every row (existing behavior).
+pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
+    let live: std::collections::HashSet<String> = match c.pane_list(None) {
+        Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
+        Err(e) => {
+            eprintln!("flywheel: dead-row reap skipped (pane list failed: {e:#})");
+            return 0;
+        }
+    };
+    let (kept, pruned) = reap_closed_rows(state::load_spawn_registry(project), &live);
+    if pruned == 0 {
+        return 0;
+    }
+    match state::save_spawn_registry(project, &kept) {
+        Ok(()) => {
+            eprintln!("flywheel: reaped {pruned} dead-pane registry row(s) for {project}");
+            pruned
+        }
+        Err(e) => {
+            eprintln!("flywheel: dead-row reap save failed: {e:#}");
+            0
+        }
+    }
+}
 /// bd-lvyi: resolve a per-step harness override to a crew pane running THAT
 /// harness. The pane's `harness` column is authoritative; a legacy entry
 /// without one (pre-bd-lvyi registry) falls back to its profile's harness
@@ -245,6 +286,9 @@ pub fn pre_spawn_crew(
                     eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
                 }
             }
+            // bd-bfwj: closing kills these panes — reap their registry rows
+            // now so no later dispatch resolves them.
+            reap_dead_registry_rows(project, &mut c);
         } else {
             bail!(
                 "found {} pre-existing workspace(s) for {project} — stale panes would race the crew: {}. Close them first (flywheel kill {project} or herdr workspace close <id>), or pass --retire-orphans / --reuse.",
@@ -2147,6 +2191,38 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].name, "crew-wf-planner");
         assert!(!kept[0].skills_injected);
+    }
+
+    /// bd-bfwj (red first): closing a workspace reaps exactly its dead
+    /// rows — live panes anywhere are kept, gone panes are dropped, and
+    /// the pruned count is reported for the close log line.
+    #[test]
+    fn reap_close_drops_only_gone_panes() {
+        use std::collections::HashSet;
+        let mk = |pane: &str, name: &str| SpawnEntry {
+            pane_id: pane.into(),
+            name: name.into(),
+            profile: Some("planner".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        };
+        let entries = vec![
+            mk("wDead:p1", "crew-old-planner"),
+            mk("wLive:p1", "crew-new-planner"),
+            mk("wOther:p1", "flywheel-other-oc"),
+        ];
+        let live: HashSet<String> = ["wLive:p1".to_string(), "wOther:p1".to_string()]
+            .into_iter()
+            .collect();
+        let (kept, pruned) = reap_closed_rows(entries, &live);
+        assert_eq!(pruned, 1);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|e| e.pane_id != "wDead:p1"));
     }
 
     /// bd-lvyi: a per-step harness override resolves to a crew pane OF THAT
