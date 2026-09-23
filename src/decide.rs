@@ -1343,11 +1343,7 @@ mod tests {
     fn beadless_profile_only_is_not_wave_swarm() {
         for t in ["spawn --profile coder", "wave-swarm --profile coder"] {
             let d = decide(t, &with_beads(0));
-            assert_eq!(
-                d.primitive, "spawn-send",
-                "target: {t} argv: {:?}",
-                d.argv
-            );
+            assert_eq!(d.primitive, "spawn-send", "target: {t} argv: {:?}", d.argv);
             assert_eq!(d.topology, "open", "target: {t}");
         }
         let d = decide("wave-swarm --profile coder", &with_beads(3));

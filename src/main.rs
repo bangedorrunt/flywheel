@@ -19248,7 +19248,13 @@ fn cmd_loop(
                         let code = out.status.code().unwrap_or(-1);
                         eprintln!(
                             "{}",
-                            format_send_failure(name, raw.trim(), err_bytes.trim(), out.status.success(), code)
+                            format_send_failure(
+                                name,
+                                raw.trim(),
+                                err_bytes.trim(),
+                                out.status.success(),
+                                code
+                            )
                         );
                         // the item was already popped by plan_actions — put it
                         // back at the FRONT so the next poll retries it (a
@@ -27999,7 +28005,13 @@ fn cmd_internal_send(
 /// bd-n9hy: one-line failure record for a __send subprocess dispatch — keeps
 /// the raw stdout+stderr bytes plus exit status so a bare `{ok:false}` on a
 /// fresh pane stays diagnosable. Log-only shape, never parsed.
-fn format_send_failure(name: &str, stdout: &str, stderr: &str, status_ok: bool, code: i32) -> String {
+fn format_send_failure(
+    name: &str,
+    stdout: &str,
+    stderr: &str,
+    status_ok: bool,
+    code: i32,
+) -> String {
     let out = if stdout.is_empty() { "<empty>" } else { stdout };
     let err = if stderr.is_empty() { "<empty>" } else { stderr };
     format!(
