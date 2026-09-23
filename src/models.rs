@@ -140,7 +140,10 @@ pub fn implied_slot_name_for_harness(kind: &str) -> Option<&'static str> {
     match kind {
         "opencode" | "oc" => Some(SLOT_CHEAP),
         "pi" => Some(SLOT_STANDARD),
-        "grok" | "gk" => Some(SLOT_PREMIUM),
+        // bd-88m4: omp IS the premium harness (ADR-0007: premium =
+        // omp/zai/glm-5.3) — a bare omp spawn rides the premium slot
+        // instead of launching model-less.
+        "grok" | "gk" | "omp" => Some(SLOT_PREMIUM),
         _ => None,
     }
 }
@@ -613,15 +616,29 @@ impl ModelRegistry {
     /// foreign-provider id: the grok harness runs only its own models
     /// (operator note, `resolve_profile_route_full` step 4).
     pub fn grok_default_model(&self) -> Option<String> {
+        self.coupled_default_model("grok")
+    }
+
+    /// bd-88m4: coupled-harness default, the grok pattern generalized —
+    /// grok, claude and codex harnesses run only their own models
+    /// (model-opaque, no key needed): a registered `<harness>/...` family
+    /// id (user entries first, then any compiled-in one), else `None` so
+    /// the caller keeps current behavior (implied slot or harness
+    /// default). Non-coupled harnesses always return `None`. Never a
+    /// foreign-provider id.
+    pub fn coupled_default_model(&self, harness: &str) -> Option<String> {
+        if !matches!(harness, "grok" | "claude" | "codex") {
+            return None;
+        }
         let mut user = self.models.keys().filter(|k| {
-            self.user_keys.contains(k.as_str()) && self.family_of(k.as_str()) == "grok"
+            self.user_keys.contains(k.as_str()) && self.family_of(k.as_str()) == harness
         });
         if let Some(key) = user.next() {
             return Some(key.clone());
         }
         self.models
             .keys()
-            .find(|k| self.family_of(k.as_str()) == "grok")
+            .find(|k| self.family_of(k.as_str()) == harness)
             .cloned()
     }
 
@@ -1679,7 +1696,42 @@ model = "opencode/big-pickle"
             Some("grok"),
             "grok implies premium, whose fallback_harness is grok"
         );
-        assert!(reg.implied_slot_for_harness("omp").is_none());
+        // bd-88m4: omp IS the premium harness — a bare omp spawn rides
+        // the premium slot instead of launching model-less.
+        assert_eq!(
+            reg.implied_slot_for_harness("omp")
+                .map(|s| s.model.as_str()),
+            Some("zai/glm-5.3")
+        );
+    }
+
+    /// bd-88m4: coupled no-model defaults follow the grok pattern — a
+    /// registered `<harness>/...` family id wins (user entries first),
+    /// absent entries and non-coupled harnesses stay `None` (current
+    /// behavior: implied slot or harness default).
+    #[test]
+    fn tier_pick_coupled_defaults_follow_grok_pattern() {
+        let mut reg = ModelRegistry::default();
+        assert_eq!(reg.coupled_default_model("claude"), None);
+        assert_eq!(reg.coupled_default_model("codex"), None);
+        assert_eq!(
+            reg.coupled_default_model("pi"),
+            None,
+            "open harness: never coupled"
+        );
+        reg.models.insert("claude/sonnet-x".into(), sample_entry());
+        reg.models.insert("codex/gpt-x".into(), sample_entry());
+        assert_eq!(
+            reg.coupled_default_model("claude").as_deref(),
+            Some("claude/sonnet-x")
+        );
+        assert_eq!(
+            reg.coupled_default_model("codex").as_deref(),
+            Some("codex/gpt-x")
+        );
+        // The grok wrapper rides the same helper — no behavior change.
+        reg.models.insert("grok/grok-4.5".into(), sample_entry());
+        assert_eq!(reg.grok_default_model().as_deref(), Some("grok/grok-4.5"));
     }
 
     /// bd-ovew: the grok default prefers user entries, then any compiled

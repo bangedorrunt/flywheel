@@ -46,7 +46,7 @@ pub(crate) enum JudgmentCmd {
     /// Coordination annotator: advisory text for one surface over a goal.
     /// Never dispatches — the captain acts on the text.
     Annotate {
-        /// coalition-intent|wave-readiness|reviewer-rank|profile-pick
+        /// coalition-intent|wave-readiness|reviewer-rank|profile-pick|tier-pick
         #[arg(long)]
         surface: String,
         /// goal text to judge
@@ -150,7 +150,7 @@ pub(crate) fn cmd_judgment(cmd: &JudgmentCmd) -> Result<()> {
             json,
         } => {
             let surface = judgment::AnnotateSurface::parse(surface)
-                .ok_or_else(|| anyhow::anyhow!("unknown surface {surface:?}; want coalition-intent|wave-readiness|reviewer-rank|profile-pick"))?;
+                .ok_or_else(|| anyhow::anyhow!("unknown surface {surface:?}; want coalition-intent|wave-readiness|reviewer-rank|profile-pick|tier-pick"))?;
             let mut extra = BTreeMap::new();
             if let Some(s) = state_json {
                 let v: serde_json::Value = serde_json::from_str(s)
