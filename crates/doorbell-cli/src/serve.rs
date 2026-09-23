@@ -388,6 +388,19 @@ fn journal_age_secs(fw_state: &std::path::Path, ws: &str) -> Option<u64> {
 /// "ignored SIGTERM" and aborted the restart (bd-xwgh round 2).
 const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Pure note for the drain outcome — a budget exhaustion must never read
+/// as a clean join (scripted in tests; hang case included).
+fn drain_note(joined: bool, remaining: usize, total: usize) -> String {
+    if joined {
+        "doorbell serve: loops joined, releasing leases".to_string()
+    } else {
+        format!(
+            "doorbell serve: DRAIN BUDGET EXCEEDED ({}s) — {remaining} of {total} loop(s) did not join; releasing leases and exiting",
+            DRAIN_BUDGET.as_secs()
+        )
+    }
+}
+
 pub async fn run(cfg: &Config) -> Result<()> {
     use doorbell_rt::lease;
     let now = lease::unix_now();
@@ -683,7 +696,12 @@ pub async fn run(cfg: &Config) -> Result<()> {
             let mut remaining = total;
             let drain = async {
                 for h in handles {
-                    let _ = h.await;
+                    // A JoinError here is a DEFECT (a panicked loop task),
+                    // not a clean join: swallowing it made a crashed Brain
+                    // look like a graceful drain.
+                    if let Err(e) = h.await {
+                        eprintln!("doorbell serve: hosted loop task ended abnormally ({e})");
+                    }
                     remaining -= 1;
                 }
             };
@@ -691,13 +709,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
             // grace. A Brain that never joins used to hold the pid alive
             // until stop declared "ignored SIGTERM"; now we say so, release,
             // and exit anyway.
-            match tokio::time::timeout(DRAIN_BUDGET, drain).await {
-                Ok(()) => eprintln!("doorbell serve: loops joined, releasing leases"),
-                Err(_) => eprintln!(
-                    "doorbell serve: DRAIN BUDGET EXCEEDED ({}s) — {remaining} of {total} loop(s) did not join; releasing leases and exiting",
-                    DRAIN_BUDGET.as_secs()
-                ),
-            }
+            let joined = tokio::time::timeout(DRAIN_BUDGET, drain).await.is_ok();
+            eprintln!("{}", drain_note(joined, remaining, total));
             finish();
             eprintln!("doorbell serve: shutting down");
             Ok(())
@@ -1551,6 +1564,15 @@ fn stats_body(app: &AppState) -> String {
 mod tests {
     use super::known_journal_workspaces;
     use super::{PortHolder, classify_port_holder};
+
+    #[test]
+    fn drain_note_never_calls_a_budget_exhaustion_a_clean_join() {
+        let joined = super::drain_note(true, 0, 6);
+        assert!(joined.contains("loops joined"), "{joined}");
+        let hung = super::drain_note(false, 3, 6);
+        assert!(hung.contains("DRAIN BUDGET EXCEEDED"), "{hung}");
+        assert!(hung.contains("3 of 6"), "{hung}");
+    }
     use super::{
         REAP_AFTER_SECS, bins_allow_hosting, inbox_path_down, reap_candidates, unhosted_subscribed,
     };
