@@ -132,12 +132,45 @@ pub fn crew_agent_name(wf_name: &str, role: &str, ordinal: u32) -> String {
 /// Resolve which registry entry serves a dispatch target: first the entry
 /// whose PROFILE matches `@role`, else an entry whose NAME matches. Pure —
 /// the runner's `@role -> running pane` mapping (ADR-0010 Spec A pane row).
-pub fn resolve_pane_entry<'a>(entries: &'a LiveRegistry, profile: &str) -> Option<&'a SpawnEntry> {
+/// bd-rkx8: next generation for a respawned name — one past the highest
+/// incarnation on record, 0 for a fresh name. Pure.
+pub fn next_incarnation(entries: &[SpawnEntry], name: &str) -> u64 {
     entries
-        .entries()
         .iter()
-        .find(|e| e.profile.as_deref() == Some(profile))
-        .or_else(|| entries.entries().iter().find(|e| e.name == profile))
+        .filter(|e| e.name == name)
+        .map(|e| e.incarnation)
+        .max()
+        .map_or(0, |m| m.saturating_add(1))
+}
+
+/// bd-rkx8: highest incarnation wins, ties keep insertion order
+/// (previous first-match behavior, unchanged).
+fn best_generation<'a>(
+    it: impl Iterator<Item = (usize, &'a SpawnEntry)>,
+) -> Option<&'a SpawnEntry> {
+    it.max_by(|(ia, a), (ib, b)| a.incarnation.cmp(&b.incarnation).then_with(|| ib.cmp(ia)))
+        .map(|(_, e)| e)
+}
+
+pub fn resolve_pane_entry<'a>(entries: &'a LiveRegistry, profile: &str) -> Option<&'a SpawnEntry> {
+    // bd-rkx8: highest incarnation wins — names are stable across
+    // respawns, so first-match could return a stale generation.
+    best_generation(
+        entries
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.profile.as_deref() == Some(profile)),
+    )
+    .or_else(|| {
+        best_generation(
+            entries
+                .entries()
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.name == profile),
+        )
+    })
 }
 
 /// bd-op8b: drop registry rows whose pane no longer exists anywhere.
@@ -204,7 +237,8 @@ pub fn resolve_pane_by_harness<'a>(
     entries: &'a LiveRegistry,
     harness: &str,
 ) -> Option<&'a SpawnEntry> {
-    entries.entries().iter().find(|e| {
+    // bd-rkx8: highest incarnation wins, ties keep insertion order.
+    best_generation(entries.entries().iter().enumerate().filter(|(_, e)| {
         if let Some(h) = &e.harness {
             return h == harness;
         }
@@ -220,7 +254,7 @@ pub fn resolve_pane_by_harness<'a>(
                 .is_some_and(|p| p.harness == harness),
             Err(_) => false,
         }
-    })
+    }))
 }
 
 /// Fail-fast guard: pane mode needs a non-empty crew plan (pure, tested).
@@ -627,6 +661,10 @@ fn spawn_crew_into(
                 (agent.pane_id.clone(), name.clone(), model_pin)
             };
             prev = Some(agent_pane_id.clone());
+            // bd-rkx8: generation past the highest on record — names are
+            // stable across respawns, so the new row must outrank any
+            // surviving row for resolution and readiness.
+            let incarnation = next_incarnation(&registry, &name);
             registry.retain(|e| e.name != name);
             // bd-627z.4: the pin (drawn pre-split above) binds this pane's
             // agent deterministically — assign resolves through it.
@@ -642,7 +680,7 @@ fn spawn_crew_into(
                 skills_digest: crate::profile::skills_digest(&profile.skills),
                 mail_identity,
                 skills_injected: false,
-                incarnation: 0,
+                incarnation,
             });
             eprintln!("  crew {}: {} ({}) @{}", label, name, agent_pane_id, role);
             // bd-qx0z: panes split here are live by construction — track
@@ -2227,6 +2265,46 @@ mod tests {
         use std::collections::HashSet;
         let live: HashSet<String> = entries.iter().map(|e| e.pane_id.clone()).collect();
         LiveRegistry::prune(entries, &live)
+    }
+
+    #[test]
+    /// bd-rkx8 (red first): among same-profile rows the highest
+    /// incarnation wins even when a stale row sorts first — names are
+    /// stable across respawns, generations are not.
+    #[test]
+    fn resolve_prefers_highest_incarnation() {
+        use std::collections::HashSet;
+        let stale = SpawnEntry {
+            pane_id: "wOld:p9".into(),
+            name: "crew-wf-planner".into(),
+            profile: Some("planner".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: true,
+            incarnation: 0,
+        };
+        let fresh = SpawnEntry {
+            pane_id: "wNew:p1".into(),
+            name: "crew-wf-planner".into(),
+            profile: Some("planner".into()),
+            harness: Some("pi".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 1,
+        };
+        let live: HashSet<String> = ["wOld:p9".to_string(), "wNew:p1".to_string()]
+            .into_iter()
+            .collect();
+        let reg = LiveRegistry::prune(vec![stale, fresh], &live);
+        let e = resolve_pane_entry(&reg, "planner").expect("hit");
+        assert_eq!(e.pane_id, "wNew:p1");
+        assert_eq!(next_incarnation(reg.entries(), "crew-wf-planner"), 2);
     }
 
     #[test]

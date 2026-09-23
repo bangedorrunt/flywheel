@@ -25279,7 +25279,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     "spawn": spawn_receipts,
                 });
                 if let Some(ctx) = &pane_ctx {
-                    out["panes"] = json!(ctx.entries);
+                    out["panes"] = json!(ctx.entries.entries());
                     out["workspace_id"] = json!(ctx.workspace_id);
                     out["reaped"] = json!(reaped);
                 }
@@ -25295,7 +25295,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         ctx.entries.len(),
                         ctx.workspace_id
                     );
-                    for e in &ctx.entries {
+                    for e in ctx.entries.entries() {
                         println!(
                             "    {} ({}) [{}]",
                             e.name,
@@ -27809,9 +27809,12 @@ fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
 /// Absent registry or entry reads as not-injected (fail toward gating —
 /// the gate is a no-op wait on already-booted panes).
 fn skills_injected_for(project: &str, name: &str) -> bool {
+    // bd-rkx8: highest generation wins — a stale row must not speak for a
+    // fresh pane sharing its name.
     state::load_spawn_registry(project)
         .iter()
-        .find(|e| e.name == name)
+        .filter(|e| e.name == name)
+        .max_by_key(|e| e.incarnation)
         .is_some_and(|e| e.skills_injected)
 }
 
