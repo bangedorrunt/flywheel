@@ -175,6 +175,45 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
 
     let token = is_compose_token(decision.primitive).then(|| decision.primitive.to_string());
 
+    // governed-by: bd-7lms — every decide family gets a visible alternative
+    // so no stack scenario (refactor, cron, coalition, debate, forensics,
+    // steer, joinable) falls off the briefing surface silently.
+    let mut alternatives = vec![
+        Alternative {
+            topology: "loop".into(),
+            workflow: Some("loop-work".into()),
+            when: "ready beads exist and you want solo durable dispatch".into(),
+        },
+        Alternative {
+            topology: "open".into(),
+            workflow: None,
+            when: "current pane, no spawn".into(),
+        },
+        Alternative {
+            topology: "swarm".into(),
+            workflow: Some("wave-swarm".into()),
+            when: "multi-lane and no live fleet to join".into(),
+        },
+    ];
+    if world.joinable && !alternatives.iter().any(|a| a.topology == "join") {
+        alternatives.push(Alternative {
+            topology: "join".into(),
+            workflow: Some("join".into()),
+            when: "live fleet — join instead of spawning".into(),
+        });
+    }
+    if !matches!(decision.primitive, "loop-work" | "none" | "wave-swarm")
+        && !alternatives
+            .iter()
+            .any(|a| a.workflow.as_deref() == Some(decision.primitive))
+    {
+        alternatives.push(Alternative {
+            topology: topology.clone(),
+            workflow: Some(decision.primitive.to_string()),
+            when: decision.reason.clone(),
+        });
+    }
+
     Briefing {
         schema: SCHEMA.into(),
         objective: objective.into(),
@@ -192,23 +231,7 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
             argv,
             role: None,
         },
-        alternatives: vec![
-            Alternative {
-                topology: "loop".into(),
-                workflow: Some("loop-work".into()),
-                when: "ready beads exist and you want solo durable dispatch".into(),
-            },
-            Alternative {
-                topology: "open".into(),
-                workflow: None,
-                when: "current pane, no spawn".into(),
-            },
-            Alternative {
-                topology: "swarm".into(),
-                workflow: Some("wave-swarm".into()),
-                when: "multi-lane and no live fleet to join".into(),
-            },
-        ],
+        alternatives,
         questions: vec![
             Question {
                 id: "topology".into(),
@@ -978,5 +1001,110 @@ mod tests {
             "{:?}",
             b.proposal.argv
         );
+    }
+
+    // governed-by: bd-7lms — every decide topology + workflow family gets a
+    // briefing proposal with crew/model questions. One scenario, one path.
+    fn has_crew_and_model_questions(b: &Briefing) -> bool {
+        ["topology", "crew", "model"]
+            .iter()
+            .all(|id| b.questions.iter().any(|q| &q.id == id))
+    }
+
+    fn assert_family_surfaced(b: &Briefing, workflow: &str) {
+        assert!(
+            b.alternatives
+                .iter()
+                .any(|a| a.workflow.as_deref() == Some(workflow)),
+            "alternatives must surface {workflow}: {:?}",
+            b.alternatives
+        );
+    }
+
+    #[test]
+    fn briefing_covers_refactor_swarm() {
+        let b = assemble("refactor the auth module", &world_empty(), &[], 5);
+        assert_eq!(b.proposal.topology, "swarm");
+        assert_eq!(b.proposal.workflow, "refactoring");
+        assert!(has_crew_and_model_questions(&b));
+        assert_family_surfaced(&b, "refactoring");
+    }
+
+    #[test]
+    fn briefing_covers_cron_swarm() {
+        let b = assemble("cron nightly digest", &world_empty(), &[], 5);
+        assert_eq!(b.proposal.topology, "swarm");
+        assert_eq!(b.proposal.workflow, "cron-start");
+        assert!(has_crew_and_model_questions(&b));
+        assert_family_surfaced(&b, "cron-start");
+    }
+
+    #[test]
+    fn briefing_covers_coalition_swarm() {
+        let b = assemble("coalition shared-file contention", &world_empty(), &[], 5);
+        assert_eq!(b.proposal.topology, "swarm");
+        assert_eq!(b.proposal.workflow, "coalition-form");
+        assert!(has_crew_and_model_questions(&b));
+        assert_family_surfaced(&b, "coalition-form");
+    }
+
+    #[test]
+    fn briefing_covers_debate_swarm() {
+        let b = assemble("debate the api design", &world_empty(), &[], 5);
+        assert_eq!(b.proposal.topology, "swarm");
+        assert_eq!(b.proposal.workflow, "debate");
+        assert!(has_crew_and_model_questions(&b));
+        assert_family_surfaced(&b, "debate");
+    }
+
+    #[test]
+    fn briefing_covers_forensics_open() {
+        let b = assemble(
+            "diagnose the mailbox leak: spindump the idle cpu",
+            &world_empty(),
+            &[],
+            5,
+        );
+        assert_eq!(b.proposal.topology, "open");
+        assert_eq!(b.proposal.workflow, "forensics");
+        assert!(has_crew_and_model_questions(&b));
+        assert_family_surfaced(&b, "forensics");
+    }
+
+    #[test]
+    fn briefing_covers_single_lane_steer() {
+        let b = assemble("crew-steer the peer mention fix", &world_empty(), &[], 5);
+        assert_eq!(b.proposal.topology, "swarm");
+        assert_eq!(b.proposal.workflow, "steer");
+        assert!(has_crew_and_model_questions(&b));
+        assert_family_surfaced(&b, "steer");
+    }
+
+    #[test]
+    fn briefing_covers_joinable_world() {
+        let world = World {
+            project: "toron".into(),
+            dispatcher: "up".into(),
+            joinable: true,
+            pin_count: 3,
+            ..World::default()
+        };
+        let b = assemble("refactor the auth module", &world, &[], 5);
+        assert_eq!(b.proposal.topology, "join");
+        assert!(has_crew_and_model_questions(&b));
+        assert!(
+            b.alternatives.iter().any(|a| a.topology == "join"),
+            "alternatives must surface join: {:?}",
+            b.alternatives
+        );
+    }
+
+    #[test]
+    fn briefing_multi_lane_without_trigger_is_explicit_none_not_open() {
+        let b = assemble("two lanes auth and billing", &world_empty(), &[], 5);
+        assert_eq!(b.proposal.topology, "none");
+        assert_eq!(b.proposal.workflow, "none");
+        assert!(b.proposal.argv.is_empty(), "{:?}", b.proposal.argv);
+        assert!(has_crew_and_model_questions(&b));
     }
 }
