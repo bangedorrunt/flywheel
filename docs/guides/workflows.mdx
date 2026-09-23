@@ -31,7 +31,7 @@ flywheel workflow compose "<t>" --parts "role:coder ce-execute" --parts "retry(2
 
 | Token | Shape |
 |---|---|
-| `wave-swarm` | eight phases: GATE, DISPATCH, EXECUTE, OBSERVE, REVIEW, VERIFY, COMPOUND, SIGNOFF. REVIEW audits diffs pre-verify; COMPOUND captures learnings post-verify. |
+| `wave-swarm` | eight phases: GATE, DISPATCH, EXECUTE, OBSERVE, REVIEW, VERIFY, COMPOUND, SIGNOFF. REVIEW audits diffs pre-verify; COMPOUND captures learnings post-verify. Requires ready beads — beadless goals route to spawn-send, never here. |
 | `repair-until-verified` | crew coder:1 + reviewer:1, uses fresh-context `ce-evaluate` before each VERIFY, and loops until the VERIFY fence passes, never auto-balloons. |
 | `beads-lifecycle` | grill, create, review1, review2, integrate, implement, verify, outer SIGNOFF; nests builtins via `call_workflow`; `inputs.until` early-exits SUCCESS after any phase. After integrate, hand off to wave-swarm, never merge. |
 
