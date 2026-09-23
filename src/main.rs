@@ -1999,6 +1999,27 @@ fn agent_ordinal(name: &str, project: &str, short: &str) -> Option<u32> {
     name.strip_prefix(&pfx)?.parse().ok()
 }
 
+/// bd-o1zh: unique name per spawn attempt. A retried `spawn --profile`
+/// reuses the fixed ordinal-1 name; when herdr still holds it (stale
+/// binding or a launch_pending registration) the retry collides
+/// agent_name_taken. Bump past every taken name so the attempt lands on a
+/// free one. Pure: `taken` is the live herdr name set. The spawn
+/// derivation (effect-journal label) stays stable — only the herdr agent
+/// name gains the suffix, so the retry is idempotent, not a duplicate.
+// governed-by: bd-o1zh
+pub(crate) fn free_spawn_ordinal(
+    project: &str,
+    short: &str,
+    start: u32,
+    taken: &std::collections::HashSet<String>,
+) -> u32 {
+    let mut ordinal = start.max(1);
+    while taken.contains(&agent_name_n(project, short, ordinal)) {
+        ordinal += 1;
+    }
+    ordinal
+}
+
 /// Resolve a herdr workspace for a project by label; error if missing.
 /// Labels that resolve `project` for status/send/kill: default swarm
 /// label, spawn-meta custom label, the raw token, and its slug.
@@ -7749,6 +7770,12 @@ projects available: {}",
     // H3 (bd-harness-integration-preflight): one status read per spawn;
     // preflight each kind before its first agent launches (deduped — a
     // recipe + explicit flags may repeat a kind).
+    // bd-o1zh: snapshot the live herdr names once so retried spawns skip
+    // taken ones (fail-open to empty on an unlistable backend).
+    let mut taken_names: std::collections::HashSet<String> = c
+        .agent_list()
+        .map(|agents| agents.into_iter().filter_map(|a| a.name).collect())
+        .unwrap_or_default();
     let integration_statuses = read_integration_statuses();
     let mut preflighted_kinds: HashSet<String> = HashSet::new();
     for item in &items {
@@ -7759,7 +7786,14 @@ projects available: {}",
         for _ in 0..item.count {
             let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
             *ordinal += 1;
+            // bd-o1zh: unique name per spawn attempt — skip names herdr
+            // still holds (stale binding / launch_pending) so a retried
+            // spawn does not collide agent_name_taken on the fixed
+            // ordinal-1 name. Fail-open: an unlistable backend keeps the
+            // ordinal the plan asked for.
+            *ordinal = free_spawn_ordinal(project, &item.short, *ordinal, &taken_names);
             let name = agent_name_n(project, &item.short, *ordinal);
+            taken_names.insert(name.clone());
             // S9 (ADR-0018 D1a) + bd-pin-public-plane-s-easy.2: draw the
             // adj+noun PIN BEFORE the pane exists so the pane env carries
             // AGENT_NAME/FLYWHEEL_MAIL_AS (herdr injects env only at
@@ -21203,6 +21237,21 @@ mod loop_tests {
         assert_eq!(agent_ordinal("flywheel-proj-oc2", "proj", "oc"), Some(2));
         assert_eq!(agent_ordinal("flywheel-proj-ocr", "proj", "oc"), None);
         assert_eq!(agent_ordinal("flywheel-proj-gk", "proj", "oc"), None);
+    }
+
+    #[test]
+    fn spawn_retry_bumps_ordinal_past_taken_names() {
+        use std::collections::HashSet;
+        // bd-o1zh: a retried spawn must not reuse a name herdr holds.
+        let taken: HashSet<String> = ["flywheel-flywheel-pi", "flywheel-flywheel-pi2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(free_spawn_ordinal("flywheel", "pi", 1, &taken), 3);
+        assert_eq!(free_spawn_ordinal("flywheel", "pi", 2, &taken), 3);
+        assert_eq!(free_spawn_ordinal("flywheel", "pi", 1, &HashSet::new()), 1);
+        // other shorts are unaffected by pi's taken names
+        assert_eq!(free_spawn_ordinal("flywheel", "oc", 1, &taken), 1);
     }
 
     #[test]
