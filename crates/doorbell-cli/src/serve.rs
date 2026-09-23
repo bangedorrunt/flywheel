@@ -382,6 +382,12 @@ fn journal_age_secs(fw_state: &std::path::Path, ws: &str) -> Option<u64> {
     Some(doorbell_rt::lease::unix_now().saturating_sub(secs))
 }
 
+/// SIGTERM drain budget. `doorbell stop` allows 15s before escalating to
+/// SIGKILL, so the drain must always finish inside this: a Brain that
+/// never joins used to keep the pid alive until stop misreported
+/// "ignored SIGTERM" and aborted the restart (bd-xwgh round 2).
+const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub async fn run(cfg: &Config) -> Result<()> {
     use doorbell_rt::lease;
     let now = lease::unix_now();
@@ -404,25 +410,29 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let tcp = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", cfg.port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // D9 layer 2: healthy doorbell peer → clean exit 0 (no respawn
-            // war under Restart=on-failure); anyone else → hard fail naming
-            // the squatter (toron serve_lock precedent).
-            match peer_health(cfg).await {
-                Some(v)
-                    if v.get("protocol").and_then(|p| p.as_str())
-                        == Some(doorbell_rt::api::PING.protocol) =>
-                {
-                    eprintln!(
-                        "doorbell serve: healthy doorbell peer on {}, exiting 0",
-                        cfg.port
-                    );
-                    std::process::exit(0);
-                }
-                _ => anyhow::bail!(
-                    "doorbell serve: port {} held by non-doorbell squatter",
+            // D9 layer 2, conflict-class: EVERY arm exits 0 so the unit's
+            // KeepAlive{SuccessfulExit=false} never respawn-wars against a
+            // holder that will not move. The old exit-1 "squatter" bail is
+            // what produced runs=69 / watch_restart_loop whenever a
+            // mid-shutdown doorbell merely failed to answer in time.
+            match classify_port_holder(peer_health(cfg).await.as_ref()) {
+                PortHolder::Peer => eprintln!(
+                    "doorbell serve: healthy doorbell peer on {}, exiting 0",
+                    cfg.port
+                ),
+                PortHolder::Unresponsive => eprintln!(
+                    "doorbell serve: port {} accepts connections but never answers /health \
+                     (a daemon mid-shutdown, or a wedged process) — exiting 0 (stay dead; \
+                     inspect with lsof -nP -iTCP:{} then stop/retry)",
+                    cfg.port, cfg.port
+                ),
+                PortHolder::Foreign => eprintln!(
+                    "doorbell serve: port {} answers with a non-doorbell protocol — foreign \
+                     squatter, exiting 0 (stay dead; free the port then start again)",
                     cfg.port
                 ),
             }
+            std::process::exit(0);
         }
         Err(e) => return Err(e).with_context(|| format!("bind 127.0.0.1:{}", cfg.port)),
     };
@@ -639,10 +649,26 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let shutdown = async {
         tokio::signal::ctrl_c().await.ok();
     };
-    tokio::select! {
-        r = serve_tcp => { finish(); r }
-        r = serve_uds => { finish(); r }
-        _ = shutdown => {
+    let accepting = tokio::select! {
+        r = serve_tcp => Some(r),
+        r = serve_uds => Some(r),
+        _ = shutdown => None,
+    };
+    // Free the endpoints FIRST on SIGTERM: `tcp`/`uds` are owned here, so
+    // dropping the accept futures above does NOT close the listeners — a
+    // listener whose accept loop is gone still accepts into the backlog
+    // without ever answering, every probe then times out, and the dying
+    // daemon is misread as a "non-doorbell squatter" (the restart-storm
+    // root cause). Shutdown is therefore: listeners closed, drain bounded,
+    // leases released, exit.
+    drop(tcp);
+    drop(uds);
+    match accepting {
+        Some(r) => {
+            finish();
+            r
+        }
+        None => {
             // Shutdown travels as a message (ticker + forwarder senders
             // stay open until their tasks end with the brain).
             eprintln!("doorbell serve: shutdown signal received, draining loops");
@@ -653,10 +679,25 @@ pub async fn run(cfg: &Config) -> Result<()> {
             eprintln!("doorbell serve: shutdown sent, joining loops");
             drop(retiring);
             let handles = std::mem::take(&mut *loops.lock());
-            for h in handles {
-                let _ = h.await;
+            let total = handles.len();
+            let mut remaining = total;
+            let drain = async {
+                for h in handles {
+                    let _ = h.await;
+                    remaining -= 1;
+                }
+            };
+            // Bounded drain: SIGTERM must always finish inside stop's 15s
+            // grace. A Brain that never joins used to hold the pid alive
+            // until stop declared "ignored SIGTERM"; now we say so, release,
+            // and exit anyway.
+            match tokio::time::timeout(DRAIN_BUDGET, drain).await {
+                Ok(()) => eprintln!("doorbell serve: loops joined, releasing leases"),
+                Err(_) => eprintln!(
+                    "doorbell serve: DRAIN BUDGET EXCEEDED ({}s) — {remaining} of {total} loop(s) did not join; releasing leases and exiting",
+                    DRAIN_BUDGET.as_secs()
+                ),
             }
-            eprintln!("doorbell serve: loops joined, releasing leases");
             finish();
             eprintln!("doorbell serve: shutting down");
             Ok(())
@@ -947,6 +988,30 @@ fn invalidate_health_snapshot(health: &Shared<CachedHealth>) {
 
 fn parent_of(p: &std::path::Path) -> &std::path::Path {
     p.parent().unwrap_or(std::path::Path::new("/tmp"))
+}
+
+/// Who holds a port we could not bind, as one /health probe tells it:
+/// a healthy doorbell peer, an unresponsive holder (the socket accepts
+/// but nothing answers — a daemon mid-shutdown or wedged), or a foreign
+/// process answering with something else entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortHolder {
+    Peer,
+    Unresponsive,
+    Foreign,
+}
+
+fn classify_port_holder(health: Option<&serde_json::Value>) -> PortHolder {
+    match health {
+        None => PortHolder::Unresponsive,
+        Some(v)
+            if v.get("protocol").and_then(|p| p.as_str())
+                == Some(doorbell_rt::api::PING.protocol) =>
+        {
+            PortHolder::Peer
+        }
+        Some(_) => PortHolder::Foreign,
+    }
 }
 
 /// Minimal blocking /health probe for the bind fence (async callers use
@@ -1485,9 +1550,25 @@ fn stats_body(app: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::known_journal_workspaces;
+    use super::{PortHolder, classify_port_holder};
     use super::{
         REAP_AFTER_SECS, bins_allow_hosting, inbox_path_down, reap_candidates, unhosted_subscribed,
     };
+
+    /// bd-xwgh round 2: a mid-shutdown doorbell whose accept loop is gone
+    /// still accepts into the backlog but never answers — it must read as
+    /// Unresponsive (exit 0, stay dead), never as the old exit-1
+    /// "non-doorbell squatter" bail that respawn-warred the launchd unit
+    /// (runs=69, watch_restart_loop).
+    #[test]
+    fn port_holder_distinguishes_peer_unresponsive_and_foreign() {
+        let peer =
+            serde_json::json!({"protocol": doorbell_rt::api::PING.protocol, "owner": {"pid": 1}});
+        let foreign = serde_json::json!({"hello": "world"});
+        assert_eq!(classify_port_holder(Some(&peer)), PortHolder::Peer);
+        assert_eq!(classify_port_holder(None), PortHolder::Unresponsive);
+        assert_eq!(classify_port_holder(Some(&foreign)), PortHolder::Foreign);
+    }
 
     /// bd-fuql: hosting with either CLI unresolvable is refused — a deaf
     /// plane must never read as hosted.

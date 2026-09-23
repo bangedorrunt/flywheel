@@ -34,7 +34,8 @@ struct Cli {
 enum Cmd {
     /// Start the daemon (bind UDS+TCP, verify /health, exit 0).
     Start,
-    /// Stop the daemon (5s grace; refuses unmanaged holders w/o --force).
+    /// Stop the daemon (TERM + 15s drain grace, then KILL; endpoint-verified;
+    /// refuses unmanaged holders w/o --force).
     Stop {
         #[arg(long)]
         force: bool,
@@ -86,12 +87,14 @@ async fn main() -> anyhow::Result<()> {
     // user-managed: never touch, migrate manually instead.
     if using_default_dir && let Some(old) = lifecycle::legacy_platform_state_dir() {
         match lifecycle::maybe_migrate_to_default(&cfg.state_dir, &old) {
-            Ok(Some(copied)) => eprintln!(
+            // Silent when nothing actually moved: an EMPTY legacy dir would
+            // otherwise re-print this line on every doorbell command.
+            Ok(Some(copied)) if !copied.is_empty() => eprintln!(
                 "doorbell: migrated {} file(s) from {} (one-time XDG move)",
                 copied.len(),
                 old.display()
             ),
-            Ok(None) => {}
+            Ok(_) => {}
             Err(e) => anyhow::bail!("doorbell: state migration failed: {e:#}"),
         }
     }
