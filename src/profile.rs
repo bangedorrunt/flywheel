@@ -720,6 +720,63 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
                 ..Profile::default()
             },
         ),
+        // governed-by: bd-ln4k — language-specialized coders share the CODER
+        // discipline plus the effect-oriented skill; language idioms ride the
+        // behavior text (no new skill docs per laziness-protocol).
+        (
+            "rust-coder",
+            Profile {
+                harness: String::new(),
+                model: "@standard".into(),
+                effort: "high".into(),
+                role: "coder".into(),
+                task_hint: "Rust: TDD, ownership-first, Result over panic".into(),
+                when: "Rust code".into(),
+                behavior: "You are a RUST CODER. Unverified code is a lie.\n\nRULES:\n- RED-GREEN-REFACTOR. Failing test first, minimal pass, refactor green.\n- Effect-oriented: pure core, imperative shell. Fallible work returns Result; unwrap/expect only in tests.\n- Ownership-first: borrow over clone, &str over String at boundaries, Drop/RAII for cleanup.\n- No script-based edits. Revise in place. Verify before you claim (test + build clean).\n\nPRINCIPLES: prove-it-works · fix-root-causes · sequence-verifiable-units · type-system-discipline. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output.".into(),
+                skills: vec![
+                    "effect-oriented".into(),
+                    "rust-engineer".into(),
+                    "rust-testing".into(),
+                ],
+                ..Profile::default()
+            },
+        ),
+        (
+            "ts-coder",
+            Profile {
+                harness: String::new(),
+                model: "@standard".into(),
+                effort: "high".into(),
+                role: "coder".into(),
+                task_hint: "TypeScript: TDD, strict types, Effect for fallible work".into(),
+                when: "TypeScript/JavaScript code".into(),
+                behavior: "You are a TYPESCRIPT CODER. Unverified code is a lie.\n\nRULES:\n- RED-GREEN-REFACTOR. Failing test first, minimal pass, refactor green.\n- Effect-oriented: pure core, imperative shell. Fallible async work uses the Effect library (never bare throw across boundaries); strict types, no `any` at boundaries.\n- No script-based edits. Revise in place. Verify before you claim (test + typecheck clean).\n\nPRINCIPLES: prove-it-works · fix-root-causes · sequence-verifiable-units · type-system-discipline. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output.".into(),
+                skills: vec![
+                    "effect-oriented".into(),
+                    "tdd".into(),
+                    "code-quality".into(),
+                ],
+                ..Profile::default()
+            },
+        ),
+        (
+            "zig-coder",
+            Profile {
+                harness: String::new(),
+                model: "@standard".into(),
+                effort: "high".into(),
+                role: "coder".into(),
+                task_hint: "Zig: TDD, error unions, explicit allocators".into(),
+                when: "Zig code".into(),
+                behavior: "You are a ZIG CODER. Unverified code is a lie.\n\nRULES:\n- RED-GREEN-REFACTOR. Failing test first, minimal pass, refactor green.\n- Effect-oriented: pure core, imperative shell. Fallible work returns error unions; defer/errdefer for cleanup; allocators passed explicitly, never hidden.\n- No script-based edits. Revise in place. Verify before you claim (test + build clean).\n\nPRINCIPLES: prove-it-works · fix-root-causes · sequence-verifiable-units · type-system-discipline. Steer by these NAMES: when one changes a decision, cite `name — the decision it changed` in your output.".into(),
+                skills: vec![
+                    "effect-oriented".into(),
+                    "tdd".into(),
+                    "code-quality".into(),
+                ],
+                ..Profile::default()
+            },
+        ),
     ] {
         m.insert(name.to_string(), profile);
     }
@@ -946,12 +1003,15 @@ behavior = "be terse"
             "planner",
             "reviewer",
             "coder",
+            "rust-coder",
+            "ts-coder",
+            "zig-coder",
             "scout",
             "housekeeper",
         ] {
             assert!(cat.get(name).is_some(), "{name} built-in missing");
         }
-        assert_eq!(cat.names().len(), 6, "6 job profiles (ADR-0007 D2)");
+        assert_eq!(cat.names().len(), 9, "9 job profiles (ADR-0007 D2)");
         assert!(
             cat.get("pa").is_none(),
             "pa is a harness recipe, not a profile"
