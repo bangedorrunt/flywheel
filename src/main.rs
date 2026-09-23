@@ -5188,6 +5188,26 @@ mod steer_engine_tests {
         assert_eq!(steer_ctx.crew_plan, wf_ctx.crew_plan);
     }
 
+    /// bd-adv4: the briefing context carries the profile-pick suggestion —
+    /// a language-cued objective suggests the specialist, a generic one
+    /// stays silent (None = keep @coder).
+    #[test]
+    fn profile_pick_briefing_context_carries_suggestion() {
+        let rust_ctx =
+            steer_briefing_context("fix the borrow checker error in cargo build", "goal")
+                .expect("steer ctx");
+        assert_eq!(
+            rust_ctx.profile_suggestion.as_deref(),
+            Some("@rust-coder"),
+            "rust objective suggests rust-coder"
+        );
+        let plain_ctx = steer_briefing_context("fix the flake", "goal").expect("steer ctx");
+        assert_eq!(
+            plain_ctx.profile_suggestion, None,
+            "generic objective renders no suggestion"
+        );
+    }
+
     /// Shared harness: the exact execution shape the Run arm builds for a
     /// pane-mode steer — recording/counting runner, builtin+catalog
     /// workflow resolver, crew fan-out resolution, local engine over
@@ -24469,6 +24489,13 @@ fn briefing_context_inner(
         default_budget: unique.max(1).min(cap),
         models,
         squad_recommendation,
+        // bd-adv4: Jev profile-pick suggestion for the implement seat —
+        // the offline table when Jev is unreachable. Advisory only: only
+        // a non-default suggestion renders, the user decides.
+        profile_suggestion: match crate::judgment::suggest_profile_pick(objective) {
+            "@coder" => None,
+            s => Some(s.to_string()),
+        },
         bare_override: None,
         stage_chain,
         funded: std::collections::BTreeMap::new(),
@@ -33534,14 +33561,17 @@ mod profile_cli_tests {
     }
 
     #[test]
-    fn profile_catalog_lists_six_builtins() {
+    fn profile_catalog_lists_nine_builtins() {
         let cat = profile::ProfileCatalog::load_from(None).expect("defaults");
-        assert_eq!(cat.names().len(), 6, "6 job profiles (ADR-0007 D2)");
+        assert_eq!(cat.names().len(), 9, "9 job profiles (ADR-0007 D2)");
         for name in [
             "oracle",
             "planner",
             "reviewer",
             "coder",
+            "rust-coder",
+            "ts-coder",
+            "zig-coder",
             "scout",
             "housekeeper",
         ] {
@@ -33633,7 +33663,7 @@ mod profile_cli_tests {
                 "no user recipe named {name} in a fresh install"
             );
         }
-        assert_eq!(names.len(), 6, "6 job profiles (ADR-0007 D2)");
+        assert_eq!(names.len(), 9, "9 job profiles (ADR-0007 D2)");
     }
 
     #[test]
