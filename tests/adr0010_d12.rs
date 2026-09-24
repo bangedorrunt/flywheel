@@ -72,6 +72,22 @@ fn adr0010_d12_ce_compound_stamps_tier_and_reinforced() {
 }
 
 #[test]
+fn bd_21og_ce_compound_depth_lightweight_or_full_default_full() {
+    // R1: depth input (lightweight|full, default full) rides the workflow;
+    // the task interpolates it. Backward compatible: default fills the slot.
+    for needle in ["- name: depth", "lightweight", "{{inputs.depth}}"] {
+        assert!(
+            WORKFLOWS.contains(needle),
+            "ce-compound depth missing {needle} (builtin_workflows.rs)"
+        );
+    }
+    assert!(
+        WORKFLOWS.contains("default: \"full\""),
+        "ce-compound depth must default full"
+    );
+}
+
+#[test]
 fn adr0010_d12_readme_documents_the_frontmatter() {
     for needle in ["tier:", "reinforced:", "pinned", "aging", "perishable"] {
         assert!(
