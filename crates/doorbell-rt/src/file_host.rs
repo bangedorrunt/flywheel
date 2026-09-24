@@ -358,6 +358,68 @@ fn herdr_agent_statuses(herdr_bin: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// (pane_id, agent_status, toron_pin token) rows from one
+/// `herdr agent list`. Empty vec = herdr did not answer (same guard as
+/// the status/pane readers): callers keep prior state, never clear it.
+fn herdr_agent_roster(herdr_bin: &str) -> Vec<(String, String, Option<String>)> {
+    let out = run_cli(herdr_bin, &["agent", "list"], CLI_TIMEOUT_SECS);
+    let Some(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    parse_agent_roster(&v)
+}
+
+/// Pure roster projection: (pane_id, agent_status, toron_pin token).
+/// Agents without a pane or status are skipped; a missing/empty token
+/// yields None (spawned crew — registry owns their route).
+fn parse_agent_roster(v: &serde_json::Value) -> Vec<(String, String, Option<String>)> {
+    let empty = Vec::new();
+    v.get("result")
+        .and_then(|r| r.get("agents"))
+        .and_then(|a| a.as_array())
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|a| {
+            let pane = a.get("pane_id").and_then(|p| p.as_str())?;
+            let status = a.get("agent_status").and_then(|s| s.as_str())?;
+            let pin = a
+                .get("tokens")
+                .and_then(|t| t.get("toron_pin"))
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.is_empty())
+                .map(str::to_string);
+            Some((pane.to_string(), status.to_string(), pin))
+        })
+        .collect()
+}
+
+/// bd-3vr9: union herdr-known operator panes into the routing set.
+/// Spawn-registry rows cover spawned crews; an operator pane (never
+/// spawned) carries its pin in the `toron_pin` token instead. For every
+/// wanted pin with no route yet, bind the pane whose token names it.
+/// Pure: `roster` is one agent-list snapshot, `want` the swept +
+/// subscribed pins, `routed` the pins the registry already covers.
+/// Returns (pin, pane_id) pairs — pane ids prompt directly.
+fn operator_targets(
+    roster: &[(String, String, Option<String>)],
+    want: &[String],
+    routed: &std::collections::HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (pane, _status, token) in roster {
+        let Some(pin) = token else { continue };
+        if !want.contains(pin) || routed.contains(pin) || out.iter().any(|(p, _)| p == pin) {
+            continue;
+        }
+        out.push((pin.clone(), pane.clone()));
+    }
+    out
+}
+
 /// Pane ids from one `herdr pane list` (bd-adms). Pane EXISTENCE is a
 /// different question from injectability (bd-ba8t's `agent_status`): a pane
 /// can exist with no agent in it. An empty set means herdr did not answer
@@ -502,6 +564,9 @@ pub struct FileHost {
     stale_panes: BTreeMap<String, u64>,
     /// Pins already audited as reaped, so the audit fires once per episode.
     reaped_pins: Vec<String>,
+    /// Operator pins currently bound via herdr token (bd-3vr9), so the
+    /// `operator_pane_routed` audit fires on change, not every refresh.
+    operator_routed_pins: Vec<String>,
     /// The subset of `index_pins` with no spawn-registry row, so no pane and
     /// no herdr target (bd-bk9t). Mirrored onto
     /// `reducer.model.unroutable`; kept here too so the index change guard
@@ -557,6 +622,7 @@ impl FileHost {
             stale_panes: BTreeMap::new(),
             reaped_pins: Vec::new(),
             unroutable_pins: Vec::new(),
+            operator_routed_pins: Vec::new(),
             index_refreshed_at: 0,
             retry: crate::policy::WatchRetry::default(),
             daemon_exe,
@@ -783,6 +849,33 @@ impl FileHost {
                     .iter()
                     .map(|(pin, _, name)| (pin.clone(), name.clone())),
             );
+            // bd-3vr9: union herdr-known operator panes (same resolver, no
+            // second table). A subscribed pin whose pane was never spawned
+            // carries its pin in the herdr `toron_pin` token; bind it so
+            // has_route holds and the wake prompts instead of digesting
+            // forever. Vanished panes drop out on the next refresh because
+            // the roster no longer names them.
+            let routed: std::collections::HashSet<String> = targets.keys().cloned().collect();
+            let ops = operator_targets(&herdr_agent_roster(&self.cfg.herdr_bin), &pins, &routed);
+            for (pin, pane) in &ops {
+                targets.insert(pin.clone(), pane.clone());
+                self.panes.insert(pane.clone(), pin.clone());
+            }
+            if !ops.is_empty() {
+                let current: Vec<String> = ops.iter().map(|(p, _)| p.clone()).collect();
+                if current != self.operator_routed_pins {
+                    self.operator_routed_pins = current;
+                    self.audit_file(
+                        "operator_pane_routed",
+                        serde_json::json!({
+                            "pins": ops.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                        }),
+                    );
+                }
+            } else if !self.operator_routed_pins.is_empty() {
+                self.operator_routed_pins.clear();
+            }
+            unroutable.retain(|p| !ops.iter().any(|(q, _)| q == p));
         }
         for pin in &pins {
             if self.npubs.contains_key(pin) {
@@ -1464,6 +1557,65 @@ impl Host for FileHost {
 mod tests {
     use super::*;
     use crate::host::Host;
+
+    /// bd-3vr9: the operator-pane union. A swept pin with no registry
+    /// route binds the pane whose herdr `toron_pin` token names it, so
+    /// has_route holds and the wake prompts. Pins already routed, pins
+    /// nobody names, and token-less crew panes are untouched — an
+    /// unroutable pin keeps exactly one fate: digest-bound.
+    #[test]
+    fn operator_pane_joins_target_set_by_token() {
+        let roster = vec![
+            ("w6:p1".into(), "idle".into(), Some("BrightBadger".into())),
+            ("w1W:p1".into(), "working".into(), None),
+        ];
+        let want = vec!["BrightBadger".to_string()];
+        let routed: std::collections::HashSet<String> =
+            ["DustyReef".to_string()].into_iter().collect();
+        let ops = operator_targets(&roster, &want, &routed);
+        assert_eq!(ops, vec![("BrightBadger".to_string(), "w6:p1".to_string())]);
+    }
+
+    #[test]
+    fn operator_union_skips_routed_and_unnamed() {
+        let roster = vec![
+            ("w6:p1".into(), "idle".into(), Some("BrightBadger".into())),
+            ("w6:p2".into(), "idle".into(), None),
+            ("w6:p3".into(), "idle".into(), Some("Stranger".into())),
+        ];
+        let want = vec!["BrightBadger".to_string(), "Gone".to_string()];
+        // Already registry-routed: token must not double-bind.
+        let routed: std::collections::HashSet<String> =
+            ["BrightBadger".to_string()].into_iter().collect();
+        assert!(operator_targets(&roster, &want, &routed).is_empty());
+        // Unwanted pins and the token-less pane never route: Gone stays
+        // digest-bound, never queued into a table that cannot drain it.
+        let empty: std::collections::HashSet<String> = Default::default();
+        assert!(operator_targets(&roster, &["Gone".to_string()], &empty).is_empty());
+    }
+
+    #[test]
+    fn roster_parse_reads_pin_token_and_skips_bare_panes() {
+        let v = serde_json::json!({
+            "result": {"agents": [
+                {"pane_id": "w6:p1", "agent_status": "idle",
+                 "tokens": {"toron_pin": "BrightBadger"}},
+                {"pane_id": "w1W:p1", "agent_status": "working"},
+                {"agent_status": "idle"},
+            ]}
+        });
+        assert_eq!(
+            parse_agent_roster(&v),
+            vec![
+                (
+                    "w6:p1".to_string(),
+                    "idle".to_string(),
+                    Some("BrightBadger".to_string())
+                ),
+                ("w1W:p1".to_string(), "working".to_string(), None),
+            ]
+        );
+    }
 
     fn tmp_state(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("dbrt-fh-{name}-{}", std::process::id()));
