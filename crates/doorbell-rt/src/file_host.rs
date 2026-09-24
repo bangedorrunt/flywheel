@@ -1385,19 +1385,24 @@ impl Host for FileHost {
             }
             std::thread::spawn(move || {
                 use std::io::BufRead;
-                // Heartbeat, throttled to 1s: `/health` reads this mtime so
-                // a watcher on the wrong bus (or a dead child) is visible
-                // instead of indistinguishable from a quiet workspace.
-                let mut stamped: Option<std::time::Instant> = None;
+                // GS-062: event stamp on each line; hb on 1s tick while child alive.
+                let hb_state = fw_state.clone();
+                let hb_ws = workspace.clone();
+                let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+                std::thread::spawn(move || {
+                    loop {
+                        match stop_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                crate::watchbeat::touch_heartbeat(&hb_state, &hb_ws);
+                            }
+                        }
+                    }
+                });
                 for line in std::io::BufReader::new(stdout).lines() {
                     match line {
                         Ok(l) => {
-                            if stamped
-                                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
-                            {
-                                crate::watchbeat::touch(&fw_state, &workspace);
-                                stamped = Some(std::time::Instant::now());
-                            }
+                            crate::watchbeat::touch_event(&fw_state, &workspace);
                             if tx.blocking_send(BrainMsg::Watch(l)).is_err() {
                                 break;
                             }
@@ -1405,6 +1410,7 @@ impl Host for FileHost {
                         Err(_) => break,
                     }
                 }
+                let _ = stop_tx.send(());
                 let _ = tx.blocking_send(BrainMsg::Died);
             });
         });

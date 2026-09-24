@@ -83,7 +83,7 @@ mod steer_brief;
 mod toron_embed;
 mod upstream_parity;
 mod verdict;
-mod wake_liveness; // library-only pending captain A/B cutover — not wired to /health
+mod wake_liveness; // GS-062: wired into serve /health
 mod work;
 mod workflow_catalog;
 mod workspace;
@@ -9397,22 +9397,31 @@ where
     let workspace = workspace.to_string();
     std::thread::spawn(move || {
         use std::io::BufRead;
-        // Heartbeat (throttled 1s) so `/health` can tell a quiet bus from a
-        // deaf watcher — the one signal that would have caught a daemon
-        // watching a different mailbox immediately instead of by inference.
-        let mut stamped: Option<std::time::Instant> = None;
+        // GS-062: split event vs heartbeat stamps (never conflate into last_event).
+        // Event stamp on every NDJSON line; heartbeat on a 1s tick while alive.
+        let hb_dir = state_dir.clone();
+        let hb_ws = workspace.clone();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        doorbell_rt::watchbeat::touch_heartbeat(&hb_dir, &hb_ws);
+                    }
+                }
+            }
+        });
         for line in std::io::BufReader::new(stdout).lines() {
             match line {
                 Ok(l) => {
-                    if stamped.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
-                        doorbell_rt::watchbeat::touch(&state_dir, &workspace);
-                        stamped = Some(std::time::Instant::now());
-                    }
+                    doorbell_rt::watchbeat::touch_event(&state_dir, &workspace);
                     on_event(Some(l));
                 }
                 Err(_) => break,
             }
         }
+        let _ = stop_tx.send(());
         on_event(None); // Died
     });
     Some(WatchChild(child))
@@ -31896,8 +31905,40 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
             Arc<std::sync::Mutex<std::collections::HashMap<String, crate::doorbell::PinBudget>>>,
     }
 
-    async fn health() -> &'static str {
-        "{\"status\":\"ok\"}"
+    async fn health(State(st): State<Arc<AppState>>) -> String {
+        // GS-062: wake_liveness classify over split event/hb stamps.
+        // Aggregate/default workspace when AppState has no single workspace —
+        // operators stamp per-workspace under state_dir/doorbell/.
+        let state_dir = config::state_dir();
+        let workspace_root = st.cfg.workspace_root();
+        let workspace = workspace_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("default");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last_event_ms = doorbell_rt::watchbeat::last_event_ms(&state_dir, workspace);
+        let last_heartbeat_ms = doorbell_rt::watchbeat::last_heartbeat_ms(&state_dir, workspace);
+        // Never max(event, hb) into last_event_ms — classifier tests encode this.
+        let pipe = wake_liveness::classify(
+            now_ms,
+            last_event_ms,
+            last_heartbeat_ms,
+            wake_liveness::DEFAULT_DEAF_CEILING_MS,
+        );
+        json!({
+            "status": "ok",
+            "wake": {
+                "workspace": workspace,
+                "pipe": wake_liveness::to_json(pipe),
+                "last_event_ms": last_event_ms,
+                "last_heartbeat_ms": last_heartbeat_ms,
+                "deaf_ceiling_ms": wake_liveness::DEFAULT_DEAF_CEILING_MS,
+            }
+        })
+        .to_string()
     }
 
     async fn snapshot(State(st): State<Arc<AppState>>) -> Result<String, StatusCode> {

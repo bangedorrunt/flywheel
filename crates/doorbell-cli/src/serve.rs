@@ -1088,10 +1088,11 @@ fn hosted_subscribers(fw_state: &std::path::Path, hosted: &[String]) -> usize {
 /// Age of the most recent bus event across the hosted workspaces (min age =
 /// most recent), read back from the watch heartbeat.
 fn hosted_watch_age(fw_state: &std::path::Path, hosted: &[String]) -> Option<u64> {
+    // GS-062: last_event_age_s from the **event** stamp (not hb).
     hosted
         .iter()
         .filter_map(|h| hosted_workspace(h))
-        .filter_map(|ws| doorbell_rt::watchbeat::age_secs(fw_state, ws))
+        .filter_map(|ws| doorbell_rt::watchbeat::event_age_secs(fw_state, ws))
         .min()
 }
 
@@ -1251,9 +1252,8 @@ fn health_body(app: &AppState) -> String {
                 "herdr": bins.herdr_resolved,
             },
         },
-        // last_event_age_s is MEASURED from the watch heartbeat (None =
-        // this workspace has never seen a bus event: wrong bus or dead
-        // child), not the literal `null` it used to be.
+        // last_event_age_s is MEASURED from the watch **event** stamp (GS-062
+        // split; None = never seen a bus event: wrong bus or dead child).
         "watch": {
             "state": if hosted.is_empty() { "standby" } else { "hosted" },
             "last_event_age_s": watch_age,
