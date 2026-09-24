@@ -190,18 +190,21 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// bd-0km8: the pin moves only with genuine re-verification — version,
+    /// ref, and checked_at advance together, and the delta note lives in
+    /// the manifest (wtf-only delta 3.26.2 → 3.28.2, no surface changes).
     #[test]
     fn checked_manifest_has_current_upstream_refs() {
         let manifest = manifest().expect("parity manifest validates");
         assert_eq!(manifest.schema, SCHEMA);
-        assert_eq!(manifest.checked_at, "2026-09-15");
+        assert_eq!(manifest.checked_at, "2026-09-24");
         let compound = manifest
             .sources
             .iter()
             .find(|source| source.name == "compound-engineering")
             .expect("compound source");
-        assert_eq!(compound.version, "3.26.2");
-        assert_eq!(compound.git_ref, "0ec66db4e9f7391c6df9e363b65c664265ccd538");
+        assert_eq!(compound.version, "3.28.2");
+        assert_eq!(compound.git_ref, "4fbabcd32b6ca7d8ebb82f15840fe34ef7562a64");
         let pstack = manifest
             .sources
             .iter()

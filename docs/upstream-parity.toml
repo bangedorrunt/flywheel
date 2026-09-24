@@ -1,13 +1,17 @@
 schema = "flywheel-upstream-parity.v1"
-checked_at = "2026-09-15"
+checked_at = "2026-09-24"
 refresh_policy = "Refresh refs and re-run offline validation after an upstream release or material workflow change. Network access is intentionally not required by the build."
 
 [[sources]]
 name = "compound-engineering"
 repository = "https://github.com/EveryInc/compound-engineering-plugin"
-ref = "0ec66db4e9f7391c6df9e363b65c664265ccd538"
-version = "3.26.2"
-observed_at = "2026-09-15T06:58:03Z"
+ref = "4fbabcd32b6ca7d8ebb82f15840fe34ef7562a64"
+version = "3.28.2"
+observed_at = "2026-09-24T00:00:00Z"
+# Delta 3.26.2 → 3.28.2 (bd-a1st review, bd-0km8 re-pin): +1 skill `wtf`
+# (plain-language explainer, no stage/workflow/token surface); skills/
+# relocated to .agy/skills/; no removals; nothing in the delta touches
+# the ce- lifecycle, review, or compound surfaces.
 
 [[sources]]
 name = "pstack"
