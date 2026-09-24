@@ -71,6 +71,56 @@ pub fn rebind_hint(ev: &CaptainEvidence, heartbeat_fresh: bool) -> Option<String
     (!holder_stale(ev)).then(|| holder.clone())
 }
 
+/// bd-8pis: is a bound pane LIVE? A whois `pane_id` alone can lie (dead
+/// panes stay bound) — against a reachable herdr daemon the pane must be
+/// in the live set; when the daemon is unreachable the binding is trusted
+/// (best-effort, never a warn storm from a down daemon). None pane_id is
+/// never live.
+pub fn bound_pane_is_live(
+    pane_id: Option<&str>,
+    live_panes: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    match (pane_id, live_panes) {
+        (Some(_), None) => true,
+        (Some(pid), Some(set)) => set.contains(pid),
+        _ => false,
+    }
+}
+
+/// bd-8pis: the dead-fold health line — shared by arrive and helm so the
+/// captain fold reads the same in every health surface. Pure text; the
+/// caller decides liveness via [`rebind_hint`].
+pub fn dead_fold_message(project: &str, pin: &str) -> String {
+    format!(
+        "flywheel: captain `{pin}` is held on roster-presence alone — no live pane, no \
+         dispatcher, no presence heartbeat; mail to `captain` may reach nobody live. Rebind: \
+         toron contact captain --project {project} --pin <pin>  (or --clear to vacate)"
+    )
+}
+
+/// bd-8pis: dead-pin send warnings — pure over resolved targets,
+/// pane-bound pins, and heartbeat pins. Every target with neither a bound
+/// pane nor a fresh heartbeat warns (advisory; mail stays async). A lone
+/// leading `@` is stripped; matching is exact after that.
+pub fn dead_pin_warnings(
+    targets: &[String],
+    pane_pins: &std::collections::HashSet<String>,
+    heartbeat_pins: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for t in targets {
+        let pin = t.strip_prefix('@').unwrap_or(t.as_str());
+        if pane_pins.contains(pin) || heartbeat_pins.contains(pin) {
+            continue;
+        }
+        out.push(format!(
+            "flywheel: mail send to `{t}` may reach nobody — no live herdr pane, no presence \
+             heartbeat (advisory; mail stays async)"
+        ));
+    }
+    out
+}
+
 pub fn claim_line(action: &CaptainAction) -> Option<String> {
     match action {
         CaptainAction::Claim {
@@ -178,6 +228,52 @@ mod tests {
         let mut ov = e.clone();
         ov.override_pin = Some("HumanPin".into());
         assert!(rebind_hint(&ov, false).is_none());
+    }
+
+    /// bd-8pis: dead-pin warnings fire only for targets with neither a
+    /// bound pane nor a heartbeat — live signals stay silent.
+    #[test]
+    fn dead_pin_warnings_fire_only_without_live_signal() {
+        use std::collections::HashSet;
+        let pane: HashSet<String> = ["PlumGoose".to_string()].into_iter().collect();
+        let heart: HashSet<String> = ["TealDune".to_string()].into_iter().collect();
+        // Bound pane: silent. Heartbeat (CLI actor, no pane): silent.
+        assert!(dead_pin_warnings(&["PlumGoose".into()], &pane, &heart).is_empty());
+        assert!(dead_pin_warnings(&["TealDune".into()], &pane, &heart).is_empty());
+        // Roster-only pin (bound to nothing, no heartbeat): loud.
+        let warns = dead_pin_warnings(&["QuietHeron".into()], &pane, &heart);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("QuietHeron"), "{}", warns[0]);
+        assert!(warns[0].contains("advisory"), "{}", warns[0]);
+        // Lone @ stripped; empty targets warn nothing.
+        assert_eq!(
+            dead_pin_warnings(&["@QuietHeron".into()], &pane, &heart).len(),
+            1
+        );
+        assert!(dead_pin_warnings(&[], &pane, &heart).is_empty());
+    }
+
+    /// bd-8pis: bound-but-dead panes warn; daemon-down trusts the
+    /// binding; unbound never lives.
+    #[test]
+    fn dead_pin_bound_pane_needs_live_herdr() {
+        use std::collections::HashSet;
+        let live: HashSet<String> = ["w1W:p2".to_string()].into_iter().collect();
+        assert!(bound_pane_is_live(Some("w1W:p2"), Some(&live)));
+        assert!(!bound_pane_is_live(Some("w6:p1"), Some(&live)));
+        assert!(bound_pane_is_live(Some("w6:p1"), None));
+        assert!(!bound_pane_is_live(None, Some(&live)));
+        assert!(!bound_pane_is_live(None, None));
+    }
+
+    /// bd-8pis: the dead-fold line names the pin, the project, and the
+    /// rebind verb — arrive and helm print the same text.
+    #[test]
+    fn dead_pin_fold_message_names_pin_and_rebind() {
+        let line = dead_fold_message("flywheel", "QuietHeron");
+        assert!(line.contains("QuietHeron"), "{line}");
+        assert!(line.contains("--project flywheel"), "{line}");
+        assert!(line.contains("may reach nobody"), "{line}");
     }
 
     #[test]

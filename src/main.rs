@@ -13256,17 +13256,17 @@ fn cmd_arrive(
     // no heartbeat, dispatcher down) still reads fresh and `mail --to
     // captain` reaches nobody. OFFER the rebind verb; never auto-rebind —
     // a quiet human operator looks identical to a dead session pin.
-    let heartbeat_fresh = ev
-        .holder
-        .as_deref()
-        .map(|h| captain_presence_live(project, h))
-        .unwrap_or(false);
-    if let Some(pin) = captain_slot::rebind_hint(&ev, heartbeat_fresh) {
-        eprintln!(
-            "flywheel: captain `{pin}` is held on roster-presence alone — no live pane, no \
-             dispatcher, no presence heartbeat; mail to `captain` may reach nobody live. Rebind: \
-             toron contact captain --project {project} --pin <pin>  (or --clear to vacate)"
-        );
+    // bd-8pis: the dead-fold decision lives in captain_fold_health_line
+    // (shared with helm, byte-identical output).
+    if let Some(line) = captain_fold_health_line(
+        project,
+        ev.holder.clone(),
+        !ev.presence_fresh,
+        ev.pane_alive,
+        ev.last_wake_fresh,
+        ev.override_pin.as_deref(),
+    ) {
+        eprintln!("{line}");
     }
     match cmd_doorbell_start(cfg, project) {
         Ok(()) => {}
@@ -13344,12 +13344,125 @@ fn captain_presence_live(project: &str, pin: &str) -> bool {
     let Ok(rows) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
         return false;
     };
+    presence_pins(project).contains(pin)
+}
+
+/// bd-8pis: pins with a presence row in `project` (heartbeats, any state).
+/// Best-effort: toron failure reads as nobody-heartbeating, never an error.
+fn presence_pins(project: &str) -> HashSet<String> {
+    let out = std::process::Command::new("toron")
+        .args(["presence", "list", "--project", project, "--json"])
+        .output();
+    let Ok(out) = out else {
+        return HashSet::new();
+    };
+    if !out.status.success() {
+        return HashSet::new();
+    }
+    let Ok(rows) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return HashSet::new();
+    };
     rows.as_array()
         .map(|a| {
             a.iter()
-                .any(|r| r.get("name").and_then(|n| n.as_str()) == Some(pin))
+                .filter_map(|r| r.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
+}
+
+/// bd-8pis: the herdr pane bound to `pin` (toron whois `pane_id`), if any.
+/// Best-effort: whois failure reads as unbound (the caller warns).
+fn whois_pane_id(project: &str, pin: &str) -> Option<String> {
+    let out = std::process::Command::new("toron")
+        .args(["mail", "whois", project, pin, "--json"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("pane_id")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// bd-8pis: live herdr pane ids (status != dead). None when the daemon is
+/// unreachable — the caller trusts whois bindings instead of warn-storming.
+fn live_herdr_panes(cfg: &Config) -> Option<HashSet<String>> {
+    let mut c = Client::connect(Some(&cfg.socket_path())).ok()?;
+    let agents = c.agent_list().ok()?;
+    Some(
+        agents
+            .into_iter()
+            .filter(|a| a.agent_status.as_str() != "dead")
+            .map(|a| a.pane_id)
+            .collect(),
+    )
+}
+
+/// bd-8pis: dead-pin send warnings — resolve `captain` to its holder,
+/// fetch heartbeat pins once, whois each target for a bound pane; warn
+/// (advisory) for targets with neither. Best-effort lookups warn rather
+/// than staying silent. Mail stays async — the caller always proceeds.
+pub(crate) fn send_liveness_warnings(
+    cfg: &Config,
+    project: &str,
+    targets: &[String],
+) -> Vec<String> {
+    let resolved: Vec<String> = targets
+        .iter()
+        .map(|t| {
+            if t.eq_ignore_ascii_case("captain") {
+                lookup_captain_holder(project)
+                    .0
+                    .unwrap_or_else(|| t.clone())
+            } else {
+                t.clone()
+            }
+        })
+        .collect();
+    let heartbeats = presence_pins(project);
+    // A whois binding alone can lie (dead panes stay bound) — check it
+    // against the live herdr set when the daemon answers.
+    let live_panes = live_herdr_panes(cfg);
+    let mut pane_pins = HashSet::new();
+    for p in &resolved {
+        let bound = whois_pane_id(project, p);
+        if crate::captain_slot::bound_pane_is_live(bound.as_deref(), live_panes.as_ref()) {
+            pane_pins.insert(p.strip_prefix('@').unwrap_or(p).to_string());
+        }
+    }
+    crate::captain_slot::dead_pin_warnings(&resolved, &pane_pins, &heartbeats)
+}
+
+/// bd-8pis: dead captain-fold health line shared by arrive and helm —
+/// whois holder + snap panes + dispatcher + presence heartbeat. None when
+/// any live signal backs the holder (or no holder / override).
+fn captain_fold_health_line(
+    project: &str,
+    holder: Option<String>,
+    whois_stale: bool,
+    pane_alive: bool,
+    dispatcher_up: bool,
+    override_pin: Option<&str>,
+) -> Option<String> {
+    let ev = captain_slot::CaptainEvidence {
+        holder,
+        // whois.stale=false is live (CLI actors like TealDune have no pane).
+        presence_fresh: !whois_stale,
+        last_wake_fresh: dispatcher_up,
+        pane_alive,
+        override_pin: override_pin.map(str::to_string),
+    };
+    let heartbeat_fresh = ev
+        .holder
+        .as_deref()
+        .map(|h| captain_presence_live(project, h))
+        .unwrap_or(false);
+    captain_slot::rebind_hint(&ev, heartbeat_fresh)
+        .map(|pin| captain_slot::dead_fold_message(project, &pin))
 }
 
 fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
@@ -13359,6 +13472,23 @@ fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
     let now = doorbell_now_unix();
     let snap = snapshot::assemble(cfg, project, &ws_label, now);
     print!("{}", snapshot::render_helm(&snap, now));
+    // bd-8pis: captain-fold liveness in health output — the same dead-fold
+    // line arrive prints. Silent while any live signal backs the holder.
+    let (holder, whois_stale) = lookup_captain_holder(project);
+    let pane_alive = holder
+        .as_ref()
+        .map(|h| snap.pins.iter().any(|p| p.pin == *h))
+        .unwrap_or(false);
+    if let Some(line) = captain_fold_health_line(
+        project,
+        holder,
+        whois_stale,
+        pane_alive,
+        snap.dispatcher == "up",
+        None,
+    ) {
+        eprintln!("{line}");
+    }
     Ok(())
 }
 

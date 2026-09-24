@@ -769,6 +769,12 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                     anyhow::bail!(e);
                 }
             }
+            // bd-8pis: dead-pin hardening — loud advisory warn per
+            // recipient with no live pane and no heartbeat. Mail stays
+            // async: the send below runs regardless.
+            for line in crate::send_liveness_warnings(cfg, project, &targets) {
+                eprintln!("{line}");
+            }
             let v = mail.send_with_wake(
                 &key,
                 &targets,
