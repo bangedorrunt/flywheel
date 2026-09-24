@@ -83,6 +83,7 @@ mod steer_brief;
 mod toron_embed;
 mod upstream_parity;
 mod verdict;
+mod wake_liveness; // library-only pending captain A/B cutover — not wired to /health
 mod work;
 mod workflow_catalog;
 mod workspace;
