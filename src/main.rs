@@ -88,6 +88,7 @@ mod workflow_catalog;
 mod workspace;
 mod workspace_policy;
 mod workspace_reporting;
+mod wake_liveness;
 mod write_liveness;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
