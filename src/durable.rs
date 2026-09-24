@@ -9324,6 +9324,28 @@ mod dispatch_guard_tests {
         assert!(err.contains("unexpired peer announce"), "{err}");
     }
 
+    /// bd-gkwu: the guard obeys the INJECTED clock only — the same facts
+    /// flip verdict purely by the passed now_us, deterministically across
+    /// repeats. No wall read inside: substitution witness for Law 2.
+    #[test]
+    fn authority_edge_dispatch_guard_obeys_injected_clock() {
+        let facts = DispatchGuardFacts {
+            signals: vec![sig(900 * MIN, GuardSignalKind::Announce)],
+            receipts_fresh_us: None,
+        };
+        // Announce at t=900: fresh at now=901 (within TTL) → hold …
+        let hold = eval_dispatch_guard(&facts, 901 * MIN, DISPATCH_GUARD_TTL_US);
+        assert!(hold.is_err(), "fresh announce must hold");
+        // … stale at now=900+TTL+1 → dispatch, and repeat-identical.
+        let ttl_min = DISPATCH_GUARD_TTL_US / (60 * 1_000_000);
+        let late = (900 + ttl_min + 1) * MIN;
+        assert!(
+            eval_dispatch_guard(&facts, late, DISPATCH_GUARD_TTL_US).is_ok()
+                && eval_dispatch_guard(&facts, late, DISPATCH_GUARD_TTL_US).is_ok(),
+            "same injected now must decide identically every time"
+        );
+    }
+
     #[test]
     fn stale_announce_falls_through_to_dispatch() {
         let now = 10_000 * MIN;
@@ -10431,6 +10453,30 @@ mod tests {
             status: None,
             reason: reason.map(str::to_string),
         }
+    }
+
+    /// bd-gkwu: cancellation is a first-class outcome — distinct from
+    /// success, typed failure, and Unknown. It never respawns, never counts
+    /// as health failure, and never collapses into Accept.
+    #[test]
+    fn authority_edge_cancellation_stays_distinct() {
+        let mut outcome = so(Some(false), Some("cancelled"));
+        outcome.cancelled = true;
+        assert_eq!(
+            escalate(&outcome, 0),
+            Escalation::Cancelled,
+            "cancelled must escalate Cancelled"
+        );
+        assert_ne!(
+            escalate(&outcome, 0),
+            Escalation::Accept,
+            "cancelled must never read as success"
+        );
+        assert_ne!(
+            escalate(&outcome, 5),
+            Escalation::FailStop,
+            "cancelled must never trip the failure budget"
+        );
     }
 
     #[test]

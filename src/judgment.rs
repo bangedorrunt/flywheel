@@ -2114,6 +2114,34 @@ pub fn annotate(
 mod tests {
     use super::*;
 
+    /// bd-gkwu: the judgment transport is built from explicit authority —
+    /// no env read at the effect site. A keyed authority constructs; a
+    /// keyless one fails loud naming the missing credential.
+    #[test]
+    fn authority_edge_transport_built_from_explicit_authority() {
+        let mut keyed = crate::authority::HostAuthority::for_test("/tmp/fw-home");
+        keyed.typesafe_api_key = Some("test-key".into());
+        let auth = crate::authority::RuntimeAuthority {
+            host: keyed,
+            clock: std::sync::Arc::new(crate::authority::FixedClock { now: 1 }),
+            monotonic: std::sync::Arc::new(crate::authority::FixedMonotonicClock { now: 1 }),
+        };
+        assert!(
+            UreqTransport::from_authority(&auth).is_ok(),
+            "explicit key must construct without env"
+        );
+        let bare = crate::authority::RuntimeAuthority {
+            host: crate::authority::HostAuthority::for_test("/tmp/fw-home"),
+            clock: std::sync::Arc::new(crate::authority::FixedClock { now: 1 }),
+            monotonic: std::sync::Arc::new(crate::authority::FixedMonotonicClock { now: 1 }),
+        };
+        let err = UreqTransport::from_authority(&bare).expect_err("keyless must refuse");
+        assert!(
+            format!("{err:?}").contains("unset"),
+            "refusal must name the missing credential: {err:?}"
+        );
+    }
+
     fn choice_probs(top: f64, second: f64) -> Answer {
         Answer::Choice(ChoiceAnswer {
             choice: "a".into(),
