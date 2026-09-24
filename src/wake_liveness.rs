@@ -54,9 +54,7 @@ pub fn classify(
     if let Some(ev) = last_event_ms {
         let age = now_ms.saturating_sub(ev);
         if age <= deaf_ceiling_ms {
-            return PipeHealth::Live {
-                last_event_ms: ev,
-            };
+            return PipeHealth::Live { last_event_ms: ev };
         }
     }
     if let Some(hb) = last_heartbeat_ms {
@@ -78,9 +76,7 @@ pub fn classify(
     let silent_for_ms = match (last_event_ms, last_heartbeat_ms) {
         (Some(ev), None) => now_ms.saturating_sub(ev),
         (None, Some(hb)) => now_ms.saturating_sub(hb),
-        (Some(ev), Some(hb)) => now_ms
-            .saturating_sub(ev)
-            .min(now_ms.saturating_sub(hb)),
+        (Some(ev), Some(hb)) => now_ms.saturating_sub(ev).min(now_ms.saturating_sub(hb)),
         (None, None) => unreachable!("handled above"),
     };
     PipeHealth::Deaf { silent_for_ms }
