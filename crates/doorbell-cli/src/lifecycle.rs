@@ -13,7 +13,20 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// SIGKILL. Must stay ABOVE serve's DRAIN_BUDGET (10s): the old 5s beat
 /// every realistic drain, so healthy shutdowns were misreported as
 /// "pid ignored SIGTERM" and restart aborted (bd-xwgh round 2).
-const STOP_GRACE: Duration = Duration::from_secs(15);
+/// bd-pf3b raised 15s → 20s: the grace must also cover one probe window
+/// (200ms) + EXIT_PATH_ALLOWANCE — during `mbx install` the stragglers rode
+/// the full drain and the post-budget tail blew the old 15s → SIGKILL →
+/// respawn race → "port still held".
+const STOP_GRACE: Duration = Duration::from_secs(20);
+
+/// bd-pf3b: what STOP_GRACE must cover AFTER the drain budget expires —
+/// the straggler note, the liveness probe window, and finish() (leases,
+/// pidfile, process exit) under load. Sized from the live incident: during
+/// `mbx install` the post-budget tail alone pushed the total past the old
+/// 15s grace → SIGKILL → respawn race → "port still held".
+/// Test-only: STOP_GRACE (the production number) is asserted against it.
+#[cfg(test)]
+const EXIT_PATH_ALLOWANCE: Duration = Duration::from_secs(5);
 /// Extra patience after our own SIGKILL before declaring the pid
 /// unkillable (stuck in uninterruptible state).
 const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -1010,23 +1023,26 @@ fn stop_core<W: StopWorld>(
     // TERM first, unload second: serve needs its full drain budget, and
     // launchd's bootout SIGKILLs at its 5s exit timeout — booting out
     // first beheaded the drain and made healthy daemons look like
-    // SIGTERM-ignorers. Once the pid is gone, bootout keeps
-    // KeepAlive{SuccessfulExit=false} from respawning the unclean exit
-    // (the restart storm).
+    // SIGTERM-ignorers. bd-pf3b: on escalation the unload moves BEFORE
+    // the SIGKILL (still after the full grace): KeepAlive respawns an
+    // unclean exit sub-second, so kill-then-unload raced a respawn that
+    // grabbed the port ("stopped but still held"). The job is dropped
+    // first, so the unclean exit has nothing to respawn it.
     world.signal(pid, Sig::Term);
     let mut escalated = false;
     if !world.wait_dead(pid, grace) {
         eprintln!("doorbell: pid {pid} still alive after {grace:?} grace — sending SIGKILL");
+        world.unload_supervisor();
         world.signal(pid, Sig::Kill);
         escalated = true;
         if !world.wait_dead(pid, kill_grace) {
-            world.unload_supervisor();
             anyhow::bail!(
                 "doorbell: pid {pid} survived SIGKILL — investigate (lsof -nP -iTCP:{port}) before retrying"
             );
         }
+    } else {
+        world.unload_supervisor();
     }
-    world.unload_supervisor();
     // The pid is gone; a live endpoint now belongs to a DIFFERENT process.
     // Never report success for a port we no longer own.
     if world.tcp_alive(port) || world.uds_alive(socket) {
@@ -1645,7 +1661,7 @@ mod tests {
     fn stop_escalates_to_sigkill_when_sigterm_is_ignored() {
         // `trap '' TERM` + exec: sleep inherits an ignored SIGTERM, so only
         // SIGKILL can end it. A 400ms budget proves the escalation path
-        // without a 15s wait (budgets are injected, never ambient).
+        // without the real grace wait (budgets are injected, never ambient).
         let dir = tmp_lifecycle("stop-kill");
         let cfg = test_cfg(&dir, 0);
         let mut sh = std::process::Command::new("sh");
@@ -1905,7 +1921,58 @@ mod tests {
         assert!(msg.contains("SIGKILL"), "{msg}");
         let kill = w.position("signal 9 Kill");
         let unload = w.position("unload");
-        assert!(kill < unload, "SIGKILL before unload: {:?}", w.actions);
+        // bd-pf3b flipped this ordering (respawn race): the job must be
+        // gone before the unclean exit — escalation_unloads_before_sigkill
+        // owns the full term < unload < kill contract.
+        assert!(unload < kill, "unload before SIGKILL: {:?}", w.actions);
+    }
+
+    /// bd-pf3b: STOP_GRACE must cover the daemon's own contract — the full
+    /// 10s drain, one liveness-probe window (200ms), and the post-drain
+    /// exit path (flush, journal, load stretch = EXIT_PATH_ALLOWANCE).
+    /// The old 15s lost this arithmetic under load: 5/5 stragglers rode
+    /// the full drain, then SIGKILL plus the respawn race produced
+    /// "port still held".
+    #[test]
+    fn stop_grace_covers_drain_probe_and_exit_path() {
+        use crate::serve::{DRAIN_BUDGET, LIVENESS_PROBE_SAMPLE};
+        let drain = DRAIN_BUDGET;
+        let probe = LIVENESS_PROBE_SAMPLE;
+        let exit_path = super::EXIT_PATH_ALLOWANCE;
+        assert!(
+            super::STOP_GRACE >= drain + probe + exit_path,
+            "STOP_GRACE {:?} < drain {drain:?} + probe {probe:?} + exit {exit_path:?}",
+            super::STOP_GRACE
+        );
+    }
+
+    /// bd-pf3b's respawn race, inverted from the old ordering: SIGKILL is an
+    /// unclean exit, and KeepAlive{SuccessfulExit=false} respawns it BEFORE
+    /// a post-kill bootout runs — the respawn grabbed the port and stop
+    /// bailed "still held by another process". Unload first (drop the job),
+    /// then kill: the unclean exit finds nothing to respawn. The full grace
+    /// still precedes the unload, so the drain keeps its budget.
+    #[test]
+    fn escalation_unloads_before_sigkill_so_keepalive_never_respawns() {
+        let mut w = ScriptedStop {
+            target: Some(9),
+            dead_after: vec![false, true].into(),
+            ..Default::default()
+        };
+        w.stop(false).expect("escalated stop");
+        let term = w.position("signal 9 Term");
+        let unload = w.position("unload");
+        let kill = w.position("signal 9 Kill");
+        assert!(
+            term < unload,
+            "drain grace precedes unload: {:?}",
+            w.actions
+        );
+        assert!(
+            unload < kill,
+            "job dropped before the unclean exit: {:?}",
+            w.actions
+        );
     }
 
     #[test]

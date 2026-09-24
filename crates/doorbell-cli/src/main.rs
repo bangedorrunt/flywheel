@@ -34,7 +34,7 @@ struct Cli {
 enum Cmd {
     /// Start the daemon (bind UDS+TCP, verify /health, exit 0).
     Start,
-    /// Stop the daemon (TERM + 15s drain grace, then KILL; endpoint-verified;
+    /// Stop the daemon (TERM + 20s drain grace, then KILL; endpoint-verified;
     /// refuses unmanaged holders w/o --force).
     Stop {
         #[arg(long)]
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
             // A daemon must exit the moment its shutdown completes: the
             // tokio runtime drop waits on in-flight blocking tasks
             // (health refresh, CLI probes), which kept this process alive
-            // past stop's 15s grace AFTER "shutting down" was already
+            // past stop's 20s grace AFTER "shutting down" was already
             // printed — the false SIGKILL escalation of 16:48. finish()
             // already released the pidfile and leases, so nothing else
             // needs to run; an Err still exits non-zero.
