@@ -469,12 +469,20 @@ pub fn injection_picture(
 /// A `toron watch` child that is killed + reaped when dropped. Wrapping is
 /// the point: a bare `std::process::Child` drop leaves the process running,
 /// which is how `Died`-driven restarts littered long-lived watchers.
-struct WatchChild(std::process::Child);
+/// Watch child + optional stamp-stop handle (GS062-ADV-5): Drop stops the
+/// hb ticker even if the reader thread is parked on a full Brain channel.
+struct WatchChild {
+    child: std::process::Child,
+    stamp_stop: Option<std::sync::mpsc::Sender<()>>,
+}
 
 impl Drop for WatchChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Some(tx) = self.stamp_stop.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -1380,32 +1388,38 @@ impl Host for FileHost {
                     return;
                 }
             };
+            // GS062-ADV-4: stamp on hosting task before nesting the reader thread.
+            let mut stamps = crate::watchbeat::spawn_stamp_threads(fw_state, workspace);
+            // GS062-ADV-5: couple stop to WatchChild Drop (shared stop) so a
+            // reader parked on BrainMsg::Watch cannot leave hb ticking forever.
+            let stamp_stop = stamps.stop_handle();
             if let Ok(mut g) = slot.lock() {
-                *g = Some(WatchChild(child));
+                *g = Some(WatchChild {
+                    child,
+                    stamp_stop,
+                });
             }
             std::thread::spawn(move || {
                 use std::io::BufRead;
-                // Heartbeat, throttled to 1s: `/health` reads this mtime so
-                // a watcher on the wrong bus (or a dead child) is visible
-                // instead of indistinguishable from a quiet workspace.
-                let mut stamped: Option<std::time::Instant> = None;
+                // GS-062: event stamp throttled ~1s; hb on 1s tick while child alive.
+                // GS062-ADV-5: try_send Watch (never park on Watch). On Full/Closed
+                // stop hb first, then deliver Died with blocking_send so Full cannot
+                // drop restart_watch. Stamp .event only after Watch Ok.
                 for line in std::io::BufReader::new(stdout).lines() {
                     match line {
-                        Ok(l) => {
-                            if stamped
-                                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
-                            {
-                                crate::watchbeat::touch(&fw_state, &workspace);
-                                stamped = Some(std::time::Instant::now());
+                        Ok(l) => match tx.try_send(BrainMsg::Watch(l)) {
+                            Ok(()) => stamps.on_event(),
+                            Err(_) => {
+                                stamps.stop();
+                                crate::msg::deliver_died_blocking(&tx);
+                                return;
                             }
-                            if tx.blocking_send(BrainMsg::Watch(l)).is_err() {
-                                break;
-                            }
-                        }
+                        },
                         Err(_) => break,
                     }
                 }
-                let _ = tx.blocking_send(BrainMsg::Died);
+                stamps.stop();
+                crate::msg::deliver_died_blocking(&tx);
             });
         });
     }
