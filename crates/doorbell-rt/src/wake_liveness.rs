@@ -104,12 +104,84 @@ pub fn to_json(h: PipeHealth) -> serde_json::Value {
 }
 
 
+/// Worst-of severity for multi-hosted wake aggregation (ask-user F).
+/// Higher = worse. Order (worst → best):
+/// [`PipeHealth::NeverStamped`] > [`PipeHealth::Deaf`] > [`PipeHealth::Quiet`]
+/// > [`PipeHealth::Live`].
+///
+/// Deaf/NeverStamped must win over Live when any hosted workspace is bad —
+/// mirrors how `watch.last_event_age_s` aggregates across all hosted (min age),
+/// but for class we take the **worst** pipe rather than primary-only.
+pub fn pipe_severity(h: PipeHealth) -> u8 {
+    match h {
+        PipeHealth::NeverStamped => 3,
+        PipeHealth::Deaf { .. } => 2,
+        PipeHealth::Quiet { .. } => 1,
+        PipeHealth::Live { .. } => 0,
+    }
+}
+
+/// Return the worse of two pipe healths per [`pipe_severity`].
+pub fn worse_pipe(a: PipeHealth, b: PipeHealth) -> PipeHealth {
+    if pipe_severity(a) >= pipe_severity(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Classify each hosted `(last_event_ms, last_heartbeat_ms)` pair and return
+/// the **worst** [`PipeHealth`] (ask-user F).
+///
+/// Empty iterator → [`PipeHealth::NeverStamped`] (no alive hosted / nothing to
+/// observe). Does **not** max-merge stamps then classify once (that would let
+/// one Live workspace mask another Deaf).
+pub fn classify_worst_of(
+    now_ms: u64,
+    stamps: impl IntoIterator<Item = (Option<u64>, Option<u64>)>,
+    deaf_ceiling_ms: u64,
+) -> PipeHealth {
+    let mut worst: Option<PipeHealth> = None;
+    for (ev, hb) in stamps {
+        let h = classify(now_ms, ev, hb, deaf_ceiling_ms);
+        worst = Some(match worst {
+            None => h,
+            Some(w) => worse_pipe(w, h),
+        });
+    }
+    worst.unwrap_or(PipeHealth::NeverStamped)
+}
+
+/// Like [`classify_worst_of`], also returning the stamp pair of the chosen
+/// worst workspace (first max-severity in iteration order). Empty →
+/// `(NeverStamped, None, None)`.
+pub fn classify_worst_of_stamps(
+    now_ms: u64,
+    stamps: impl IntoIterator<Item = (Option<u64>, Option<u64>)>,
+    deaf_ceiling_ms: u64,
+) -> (PipeHealth, Option<u64>, Option<u64>) {
+    let mut best: Option<(PipeHealth, Option<u64>, Option<u64>)> = None;
+    for (ev, hb) in stamps {
+        let h = classify(now_ms, ev, hb, deaf_ceiling_ms);
+        let replace = match &best {
+            None => true,
+            // Strictly worse replaces; equal severity keeps first (stable).
+            Some((w, _, _)) => pipe_severity(h) > pipe_severity(*w),
+        };
+        if replace {
+            best = Some((h, ev, hb));
+        }
+    }
+    best.unwrap_or((PipeHealth::NeverStamped, None, None))
+}
+
 /// GS-062: shared `/health` hosted order — alive-first, then stable alphabetical
 /// by `sort_key` (typically the workspace slug).
 ///
-/// Flywheel `serve` and doorbell operator `/health` both pick primary as
-/// `hosted.first()`; this helper keeps that order identical across surfaces.
-/// Does **not** change wake classification aggregation (ask-user F).
+/// Flywheel `serve` and doorbell operator `/health` list hosted in this order.
+/// Wake **class** aggregation is ask-user F [`classify_worst_of`] over the
+/// **alive** partition only — never fall through to `other` when alive is
+/// empty (orphan stamps → false Quiet). Empty alive → [`PipeHealth::NeverStamped`].
 pub fn order_hosted_alive_first(
     alive: Vec<String>,
     other: Vec<String>,
@@ -273,5 +345,80 @@ mod tests {
         assert_eq!(deaf["class"], "Deaf");
         let never = to_json(classify(0, None, None, 60_000));
         assert_eq!(never["class"], "NeverStamped");
+    }
+
+    #[test]
+    fn worst_of_severity_order_never_gt_deaf_gt_quiet_gt_live() {
+        assert!(pipe_severity(PipeHealth::NeverStamped) > pipe_severity(PipeHealth::Deaf { silent_for_ms: 1 }));
+        assert!(
+            pipe_severity(PipeHealth::Deaf { silent_for_ms: 1 })
+                > pipe_severity(PipeHealth::Quiet {
+                    last_heartbeat_ms: 1
+                })
+        );
+        assert!(
+            pipe_severity(PipeHealth::Quiet {
+                last_heartbeat_ms: 1
+            }) > pipe_severity(PipeHealth::Live {
+                last_event_ms: 1
+            })
+        );
+    }
+
+    #[test]
+    fn worst_of_deaf_plus_live_is_deaf() {
+        // Multi-hosted: one Deaf + one Live → wake=Deaf (not Live/primary).
+        let now = 200_000u64;
+        let ceiling = 60_000u64;
+        let stamps = [
+            (None, Some(100_000u64)),       // Deaf (hb age 100s)
+            (Some(199_000u64), Some(198_000u64)), // Live
+        ];
+        let h = classify_worst_of(now, stamps, ceiling);
+        assert_eq!(
+            h,
+            PipeHealth::Deaf {
+                silent_for_ms: 100_000
+            },
+            "Deaf must win over Live: {h:?}"
+        );
+    }
+
+    #[test]
+    fn worst_of_never_stamped_wins_over_live() {
+        let now = 50_000u64;
+        let ceiling = 60_000u64;
+        let stamps = [
+            (None, None),                         // NeverStamped
+            (Some(49_000u64), Some(48_000u64)), // Live
+        ];
+        assert_eq!(
+            classify_worst_of(now, stamps, ceiling),
+            PipeHealth::NeverStamped
+        );
+    }
+
+    #[test]
+    fn worst_of_empty_is_never_stamped() {
+        let empty: [(Option<u64>, Option<u64>); 0] = [];
+        assert_eq!(
+            classify_worst_of(0, empty, 60_000),
+            PipeHealth::NeverStamped
+        );
+    }
+
+    #[test]
+    fn worst_of_does_not_max_merge_stamps_into_live() {
+        // Max-merging stamps would yield Live; worst-of must stay Deaf.
+        let now = 200_000u64;
+        let h = classify_worst_of(
+            now,
+            [
+                (Some(100_000u64), None),             // Deaf
+                (Some(199_000u64), Some(198_000u64)), // Live
+            ],
+            60_000,
+        );
+        assert!(matches!(h, PipeHealth::Deaf { .. }), "got {h:?}");
     }
 }

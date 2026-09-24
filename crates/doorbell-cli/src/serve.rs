@@ -1114,9 +1114,12 @@ fn hosted_watch_age(fw_state: &std::path::Path, hosted: &[String]) -> Option<u64
         .min()
 }
 
-/// GS-062 ASK-USER E (captain locked): wake_liveness Quiet/Live/Deaf on
+/// GS-062 ASK-USER E + F (captain locked): wake_liveness Quiet/Live/Deaf on
 /// operator `/health` (:18980), using hosted AppState workspace keys
-/// (same labels stamp writers use). Primary = first hosted workspace.
+/// (same labels stamp writers use). Ask-user F: **worst-of** across ALL
+/// hosted workspaces (consistent with `hosted_watch_age` min-across-hosted),
+/// not primary-only. In-memory HostedLoops are all alive — empty hosted →
+/// NeverStamped.
 fn hosted_wake_pipe(fw_state: &std::path::Path, hosted: &[String]) -> serde_json::Value {
     use doorbell_rt::wake_liveness::{self, DEFAULT_DEAF_CEILING_MS};
     let now_ms = std::time::SystemTime::now()
@@ -1125,21 +1128,19 @@ fn hosted_wake_pipe(fw_state: &std::path::Path, hosted: &[String]) -> serde_json
         .unwrap_or(0);
     let workspaces: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
     let workspace = workspaces.first().copied().unwrap_or("");
-    let (last_event_ms, last_heartbeat_ms) = if workspace.is_empty() {
-        (None, None)
-    } else {
-        (
-            doorbell_rt::watchbeat::last_event_ms(fw_state, workspace),
-            doorbell_rt::watchbeat::last_heartbeat_ms(fw_state, workspace),
-        )
-    };
-    // Never max(event, hb) into last_event_ms.
-    let pipe = wake_liveness::classify(
-        now_ms,
-        last_event_ms,
-        last_heartbeat_ms,
-        DEFAULT_DEAF_CEILING_MS,
-    );
+    // Worst-of over every hosted workspace (ask-user F). Never max-merge
+    // stamps then classify once (Live would mask Deaf).
+    let stamps: Vec<(Option<u64>, Option<u64>)> = workspaces
+        .iter()
+        .map(|ws| {
+            (
+                doorbell_rt::watchbeat::last_event_ms(fw_state, ws),
+                doorbell_rt::watchbeat::last_heartbeat_ms(fw_state, ws),
+            )
+        })
+        .collect();
+    let (pipe, last_event_ms, last_heartbeat_ms) =
+        wake_liveness::classify_worst_of_stamps(now_ms, stamps, DEFAULT_DEAF_CEILING_MS);
     serde_json::json!({
         "workspace": workspace,
         "hosted": workspaces,
@@ -1532,6 +1533,60 @@ mod tests {
             health,
             vec!["aaa/alpha".to_string(), "zzz/beta".to_string()],
             "health primary follows alphabetical workspace slug"
+        );
+    }
+
+    #[test]
+    fn hosted_wake_pipe_empty_is_never_stamped() {
+        let dir = std::env::temp_dir().join(format!(
+            "db-wake-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let wake = super::hosted_wake_pipe(&dir, &[]);
+        assert_eq!(wake["pipe"]["class"], "NeverStamped", "{wake}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosted_wake_pipe_live_only_is_live() {
+        let dir = std::env::temp_dir().join(format!(
+            "db-wake-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join("doorbell")).expect("dir");
+        doorbell_rt::watchbeat::touch_event(&dir, "live-ws");
+        doorbell_rt::watchbeat::touch_heartbeat(&dir, "live-ws");
+        let wake = super::hosted_wake_pipe(&dir, &["proj/live-ws".into()]);
+        assert_eq!(wake["pipe"]["class"], "Live", "{wake}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosted_wake_pipe_worst_of_deaf_plus_live() {
+        // Stamp-pair unit (mtime backdate not required): Deaf + Live → Deaf.
+        let pipe = doorbell_rt::wake_liveness::classify_worst_of(
+            200_000,
+            [
+                (None, Some(100_000u64)),             // Deaf
+                (Some(199_000u64), Some(198_000u64)), // Live
+            ],
+            doorbell_rt::wake_liveness::DEFAULT_DEAF_CEILING_MS,
+        );
+        assert_eq!(
+            pipe,
+            doorbell_rt::wake_liveness::PipeHealth::Deaf {
+                silent_for_ms: 100_000
+            },
+            "ask-user F: Deaf must win over Live"
         );
     }
 
