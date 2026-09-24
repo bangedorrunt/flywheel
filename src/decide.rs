@@ -897,12 +897,13 @@ pub fn decide(target: &str, snap: &Snapshot) -> Decision {
     // ready beads is one-pane work, so short-circuit to the spawn-send row
     // before earliest-match can let an incidental "wave-swarm" claim it.
     // With beads the declared trigger still routes via the table below.
-    if snap.ready_bead_count == 0 && target.to_ascii_lowercase().contains("--profile") {
-        if let Some(entry) = ROUTING_TABLE.iter().find(|e| e.primitive == "spawn-send") {
-            let mut d = build_decision(entry, target, snap);
-            apply_crew_budget(&mut d, target);
-            return d;
-        }
+    if snap.ready_bead_count == 0
+        && target.to_ascii_lowercase().contains("--profile")
+        && let Some(entry) = ROUTING_TABLE.iter().find(|e| e.primitive == "spawn-send")
+    {
+        let mut d = build_decision(entry, target, snap);
+        apply_crew_budget(&mut d, target);
+        return d;
     }
     let mut d = classify(target, snap);
     apply_crew_budget(&mut d, target);
