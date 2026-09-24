@@ -527,7 +527,7 @@ graph:
         "ce-compound",
         r#"
 name: ce-compound
-description: "ADR-0009 standalone compound gate: capture the durable learning from a verified bead/wave/session into docs/learnings/ — usable from ANY topology (open/loop/swarm). One learning per run; clean_skip is a success."
+description: "ADR-0009 standalone compound gate: capture the durable learning from a verified bead/wave/session into docs/learnings/inbox/ as tier-perishable (bd-iqte) — usable from ANY topology (open/loop/swarm). One learning per run; clean_skip is a success."
 trigger:
   type: webhook
 crew: auto
@@ -546,7 +546,7 @@ steps:
       profile: "@housekeeper"
       phase: compound
       stage: ce-compound
-      task: 'Run the compound gate (ADR-0009) over: bead {{inputs.bead}} {{inputs.source}}. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Reply with ONLY the terminal JSON. One learning per run.'
+      task: 'Run the compound gate (ADR-0009, bd-iqte) over: bead {{inputs.bead}} {{inputs.source}}. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Read lanes are rg + chie qmd search + chie memory recall (labeled, offline-safe). Qualifying learnings are memory-recorded and filed to docs/learnings/inbox/ as tier: perishable with expires: and provenance (reinforced: stamped today) — never straight to docs/learnings/, never gated on a human at write time. Reply with ONLY the terminal JSON. The terminal signal (inboxed|clean_skip) IS the run verdict — never prose around it. One learning per run.'
     on_error: continue
 "#,
     ),
@@ -569,7 +569,7 @@ steps:
     assignee: x
     spec:
       profile: "@housekeeper"
-      task: 'SWEEP docs/learnings/ (ADR-0009): for EACH entry, classify Keep / Update / Consolidate / Replace / Archive (ADR-0010 D12: Delete is retired — decay is archival, never destructive). Evidence per verdict: cited paths still exist, cited SHAs still reachable, guidance-layer contradictions (standing-orders / AGENTS.md / skill) named explicitly — a contradiction resolves by which side current code follows, and a wrong guidance FILE is reported, never edited here. High-overlap pairs become ONE canonical doc (oldest path wins, last_updated stamped). TIER RULES (ADR-0010 D12): MIGRATION — every entry missing tier/reinforced gains `tier: aging` + `reinforced: <today>` so the GATE projection does not empty on day one. tier: pinned never archives (invariants); tier: aging archives after 30d unreinforced; tier: perishable archives after 7d unreinforced and MUST name a checkable expiry (expires: field in frontmatter). REINFORCE on re-verification: re-stamp `reinforced: <today>` instead of archiving a still-true entry. ARCHIVE = `git mv` to docs/learnings/archive/ (still rg-able, out of the GATE projection) in the same commit. Output a JSON array [{path, verdict, evidence}] and apply the Archives/Consolidates directly in git (one commit, message cites ce-sweep).'
+      task: 'SWEEP docs/learnings/ (ADR-0009, bd-iqte): FIRST triage docs/learnings/inbox/ — the human gate sits here, not at write time. Per inbox entry: PROMOTE (move into docs/learnings/, re-tier aging — pinned ONLY for never-decay invariants — re-stamp reinforced: <today>) or ARCHIVE (expired or untrue; archival, never destructive). Then for EACH entry, classify Keep / Update / Consolidate / Replace / Archive (ADR-0010 D12: Delete is retired — decay is archival, never destructive). Evidence per verdict: cited paths still exist, cited SHAs still reachable, guidance-layer contradictions (standing-orders / AGENTS.md / skill) named explicitly — a contradiction resolves by which side current code follows, and a wrong guidance FILE is reported, never edited here. High-overlap pairs become ONE canonical doc (oldest path wins, last_updated stamped). TIER RULES (ADR-0010 D12): MIGRATION — every entry missing tier/reinforced gains `tier: aging` + `reinforced: <today>` so the GATE projection does not empty on day one. tier: pinned never archives (invariants); tier: aging archives after 30d unreinforced; tier: perishable archives after 7d unreinforced and MUST name a checkable expiry (expires: field in frontmatter). REINFORCE on re-verification: re-stamp `reinforced: <today>` instead of archiving a still-true entry. ARCHIVE = `git mv` to docs/learnings/archive/ (still rg-able, out of the GATE projection) in the same commit. Output a JSON array [{path, verdict, evidence}] and apply the Archives/Consolidates directly in git (one commit, message cites ce-sweep).'
     on_error: fail_run
 "#,
     ),
@@ -1242,7 +1242,7 @@ steps:
       profile: "@planner"
       phase: compound
       stage: ce-compound
-      task: 'Run the compound gate over {{inputs.wave_label}} for {{inputs.objective}}: the wave''s verified solutions + the OBSERVE escalation lessons — capture what qualifies to docs/learnings/, clean_skip the rest. Report written/updated/clean_skip counts.'
+      task: 'Run the compound gate over {{inputs.wave_label}} for {{inputs.objective}}: the wave''s verified solutions + the OBSERVE escalation lessons — memory-record and file what qualifies to docs/learnings/inbox/ (tier: perishable, bd-iqte), clean_skip the rest. Report inboxed/clean_skip counts.'
     on_error: continue
   - name: signoff
     action: request_approval
