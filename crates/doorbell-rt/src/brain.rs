@@ -162,35 +162,73 @@ impl<H: Host> Brain<H> {
             self.cfg.digest_interval_secs.max(1),
         ));
         digest_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // bd-burk: the exit-trace inputs. `dispatched` counts every message
+        // this Brain entered; `elapsed_ms` ages each step note (see ExitStep).
+        let ws = self.cfg.workspace.clone();
+        let started = tokio::time::Instant::now();
+        let mut dispatched = 0usize;
+        let elapsed_ms = || started.elapsed().as_millis();
         loop {
             tokio::select! {
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
                     if matches!(msg, BrainMsg::Shutdown) {
+                        eprintln!(
+                            "{}",
+                            ExitStep::ShutdownReceived.note(&ws, dispatched, elapsed_ms())
+                        );
                         break;
                     }
                     // bd-zzgb: name a dispatch that is holding the loop past
                     // the warn bound — a queued Shutdown behind it is how a
                     // Brain misses the 10s drain. Never cancelled.
                     let label = brain_msg_label(&msg);
-                    let ws = self.cfg.workspace.clone();
+                    dispatched += 1;
+                    let ws_d = ws.clone();
                     run_dispatch_with_slow_warn(label, self.dispatch(msg), move |label| {
                         eprintln!(
-                            "doorbell serve: brain {ws} dispatch {label} still running after {}s",
+                            "doorbell serve: brain {ws_d} dispatch {label} still running after {}s",
                             SLOW_DISPATCH_WARN.as_secs()
                         );
                     })
                     .await;
                 }
                 _ = digest_tick.tick() => {
-                    self.maybe_flush_digest().await;
+                    // bd-burk coverage hole: this flush is NOT a dispatch, so
+                    // the dispatch warn never saw a Brain park here.
+                    let ws_t = ws.clone();
+                    run_dispatch_with_slow_warn(
+                        "digest-flush",
+                        self.maybe_flush_digest(),
+                        move |label| {
+                            eprintln!(
+                                "doorbell serve: brain {ws_t} dispatch {label} still running after {}s",
+                                SLOW_DISPATCH_WARN.as_secs()
+                            );
+                        },
+                    )
+                    .await;
                 }
             }
         }
+        // bd-burk: each exit step logs ON ENTRY — if this Brain never joins,
+        // doorbell.log's last line for it IS the step holding it.
+        eprintln!(
+            "{}",
+            ExitStep::FlushDigest.note(&ws, dispatched, elapsed_ms())
+        );
         // Drain any pending digest batch before the sinks shut down.
         self.maybe_flush_digest().await;
+        eprintln!(
+            "{}",
+            ExitStep::SinkShutdown.note(&ws, dispatched, elapsed_ms())
+        );
         let undelivered = self.sinks.shutdown().await;
         if !undelivered.is_empty() {
+            eprintln!(
+                "{}",
+                ExitStep::JournalUndelivered.note(&ws, dispatched, elapsed_ms())
+            );
             let pins: Vec<String> = undelivered.iter().map(|u| u.pin.clone()).collect();
             let _ = self.store.append_journal(
                 &self.cfg.workspace,
@@ -200,6 +238,7 @@ impl<H: Host> Brain<H> {
                 &pins,
             );
         }
+        eprintln!("{}", ExitStep::Complete.note(&ws, dispatched, elapsed_ms()));
         RunReport {
             undelivered,
             stats: self.stats.clone(),
@@ -955,6 +994,42 @@ where
     }
 }
 
+/// bd-burk: typed steps of the post-shutdown exit path. Each logs ON ENTRY,
+/// so when a Brain never joins, doorbell.log's last line for it IS the step
+/// holding it. Typed so a new step is spelled through the enum — no bare
+/// literals at call sites — and the labels stay grep-stable for operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitStep {
+    ShutdownReceived,
+    FlushDigest,
+    SinkShutdown,
+    JournalUndelivered,
+    Complete,
+}
+
+impl ExitStep {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExitStep::ShutdownReceived => "shutdown received",
+            ExitStep::FlushDigest => "flush digest",
+            ExitStep::SinkShutdown => "sink shutdown",
+            ExitStep::JournalUndelivered => "journal undelivered",
+            ExitStep::Complete => "exit complete",
+        }
+    }
+
+    /// One log line: step, workspace, dispatch backlog cleared, and elapsed
+    /// since `Brain::run` started — the backlog discriminator (a Brain that
+    /// logs `shutdown received` with a huge count ate its drain window
+    /// clearing a deep queue; one that never logs it was parked).
+    fn note(self, ws: &str, dispatched: usize, since_ms: u128) -> String {
+        format!(
+            "doorbell serve: brain {ws} exit: {} (dispatched={dispatched} +{since_ms}ms)",
+            self.as_str()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,6 +1102,43 @@ mod tests {
         })
         .await;
         assert!(seen.lock().unwrap().is_empty(), "fast dispatch stays quiet");
+    }
+
+    /// bd-burk: the exit-path note must name the step, the workspace, the
+    /// dispatch backlog it cleared, and the elapsed time — that note IS the
+    /// pin (doorbell.log's last line for a straggler = the step holding it).
+    #[test]
+    fn exit_step_note_names_the_blocking_step_with_backlog_and_time() {
+        let note = super::ExitStep::FlushDigest.note("flywheel/flywheel-flywheel", 41, 12);
+        assert!(note.contains("exit: flush digest"), "{note}");
+        assert!(note.contains("flywheel/flywheel-flywheel"), "{note}");
+        assert!(note.contains("dispatched=41"), "{note}");
+        assert!(note.contains("+12ms"), "{note}");
+    }
+
+    /// The step strings are what operators grep for — pin them, and force
+    /// every new exit step to be spelled through the enum (no bare literals
+    /// at the call sites).
+    #[test]
+    fn exit_step_labels_are_stable() {
+        use super::ExitStep::*;
+        assert_eq!(ShutdownReceived.as_str(), "shutdown received");
+        assert_eq!(FlushDigest.as_str(), "flush digest");
+        assert_eq!(SinkShutdown.as_str(), "sink shutdown");
+        assert_eq!(JournalUndelivered.as_str(), "journal undelivered");
+        assert_eq!(Complete.as_str(), "exit complete");
+    }
+
+    /// The backlog discriminator: a Brain that logs "shutdown received" with
+    /// a huge dispatched count ate its 10s clearing a deep queue (no single
+    /// slow dispatch exists); one that NEVER logs it was parked pre-break
+    /// (timer flush or undelivered Shutdown).
+    #[test]
+    fn shutdown_received_note_carries_the_dispatch_backlog() {
+        let note = super::ExitStep::ShutdownReceived.note("flywheel/flywheel-flywheel", 41, 10_230);
+        assert!(note.contains("shutdown received"), "{note}");
+        assert!(note.contains("dispatched=41"), "{note}");
+        assert!(note.contains("+10230ms"), "{note}");
     }
 
     /// bd-adms: `toron ack-sla` re-reports every corr still past SLA, so an
