@@ -817,6 +817,26 @@ mod tests {
         assert!(!process_alive(0));
     }
 
+    /// governed-by: bd-z7w0 — Degraded-arm reachability: the env opt-out
+    /// deterministically produces Degraded (the ensure_running fall-through
+    /// that keeps embedded mode). KEEP + documented; fires whenever the
+    /// operator sets FLYWHEEL_NO_DOORBELL_ENSURE=1.
+    #[test]
+    fn degraded_audit_ensure_degraded_on_opt_out() {
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
+        let prior = std::env::var_os("FLYWHEEL_NO_DOORBELL_ENSURE");
+        unsafe { std::env::set_var("FLYWHEEL_NO_DOORBELL_ENSURE", "1") };
+        let got = ensure_doorbell_spawn();
+        match prior {
+            Some(v) => unsafe { std::env::set_var("FLYWHEEL_NO_DOORBELL_ENSURE", v) },
+            None => unsafe { std::env::remove_var("FLYWHEEL_NO_DOORBELL_ENSURE") },
+        }
+        assert!(
+            matches!(got, DoorbellEnsure::Degraded { .. }),
+            "opt-out must degrade, got {got:?}"
+        );
+    }
+
     #[test]
     fn resonate_ensure_loopback_classification() {
         // bd-ykqd: autostart is loopback-only; url parsing feeds both the
