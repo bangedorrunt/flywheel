@@ -1966,7 +1966,11 @@ pub fn live_profile_suggestion<T: Transport>(
 /// @cheap, frontier to @premium, substantial (the unsure middle) to
 /// nothing; the whole suggestion gates on pack confidence. Err = deny
 /// (the caller keeps the FallbackTable).
-pub fn live_tier_suggestion<T: Transport>(
+/// Shared tier-pick ask: one request, confidence gate, depth band name.
+/// `None` = gate rejected or no depth answer (caller keeps its default).
+/// Err = deny (the caller keeps its table). One site for the ask shape so
+/// the slot-band and effort arms cannot drift apart.
+fn ask_depth_band<T: Transport>(
     transport: &T,
     pack: &QuestionPack,
     goal: &str,
@@ -1979,18 +1983,55 @@ pub fn live_tier_suggestion<T: Transport>(
         return Ok(None);
     }
     let depth = answers.by_question.get("reasoning_depth");
-    let band = match depth {
+    Ok(match depth {
         Some(Answer::Score(s)) => pack
             .questions
             .iter()
             .find(|q| q.id == "reasoning_depth")
             .and_then(|q| q.options.get(s.level))
-            .map(String::as_str),
+            .cloned(),
         _ => None,
-    };
-    match band {
+    })
+}
+
+pub fn live_tier_suggestion<T: Transport>(
+    transport: &T,
+    pack: &QuestionPack,
+    goal: &str,
+) -> Result<Option<String>, JevError> {
+    match ask_depth_band(transport, pack, goal)?.as_deref() {
         Some("routine") => Ok(Some("@cheap".to_string())),
         Some("frontier") => Ok(Some("@premium".to_string())),
+        _ => Ok(None),
+    }
+}
+
+/// governed-by: bd-ulzi — tier-pick reasoning_depth maps to a harness
+/// effort level: routine/low, substantial/high, frontier/max. Unknown
+/// (or empty) maps to empty, which means the profile default stands —
+/// a suggestion never fabricates an effort. Levels are the shared
+/// pi/omp/pa vocabulary (off/minimal/low/medium/high/xhigh/max).
+pub fn effort_for_depth(depth: &str) -> &'static str {
+    match depth.trim() {
+        "routine" => "low",
+        "substantial" => "high",
+        "frontier" => "max",
+        _ => "",
+    }
+}
+
+/// governed-by: bd-ulzi — live effort suggestion: the same tier-pick ask
+/// and confidence gate as [`live_tier_suggestion`], but the depth maps to
+/// an effort level for the dispatch-spec effort input (not a model slot).
+/// Unlike the slot band, the unsure middle IS covered (substantial/high).
+/// Err = deny (the caller keeps the profile default).
+pub fn live_effort_suggestion<T: Transport>(
+    transport: &T,
+    pack: &QuestionPack,
+    goal: &str,
+) -> Result<Option<String>, JevError> {
+    match ask_depth_band(transport, pack, goal)?.as_deref() {
+        Some(d) if !effort_for_depth(d).is_empty() => Ok(Some(effort_for_depth(d).to_string())),
         _ => Ok(None),
     }
 }
@@ -3318,6 +3359,50 @@ questions:
             None
         );
         assert!(live_tier_suggestion(&OfflineTransport, &pack, "fix the flake").is_err());
+    }
+
+    /// governed-by: bd-ulzi — tier-pick reasoning_depth maps to effort:
+    /// routine/low, substantial/high, frontier/max. Unknown stays empty
+    /// so the profile default stands (never a fabricated effort).
+    #[test]
+    fn jev_effort_depth_maps_to_effort() {
+        assert_eq!(effort_for_depth("routine"), "low");
+        assert_eq!(effort_for_depth("substantial"), "high");
+        assert_eq!(effort_for_depth("frontier"), "max");
+        assert_eq!(effort_for_depth("unknown"), "");
+        assert_eq!(effort_for_depth(""), "");
+    }
+
+    /// governed-by: bd-ulzi — the live effort suggestion returns an
+    /// effort level (not a model slot) under the same confidence gate;
+    /// deny is an Err so the caller keeps the profile default.
+    #[test]
+    fn jev_effort_live_suggestion_returns_effort() {
+        let pack = tier_pick_pack_for_live();
+        let frontier = CannedBatch {
+            levels: BTreeMap::from([("reasoning_depth".into(), 2)]),
+        };
+        assert_eq!(
+            live_effort_suggestion(&frontier, &pack, "plan the security migration")
+                .expect("answered"),
+            Some("max".to_string())
+        );
+        let routine = CannedBatch {
+            levels: BTreeMap::from([("reasoning_depth".into(), 0)]),
+        };
+        assert_eq!(
+            live_effort_suggestion(&routine, &pack, "fix the typo").expect("answered"),
+            Some("low".to_string())
+        );
+        let middle = CannedBatch {
+            levels: BTreeMap::from([("reasoning_depth".into(), 1)]),
+        };
+        assert_eq!(
+            live_effort_suggestion(&middle, &pack, "add the feature").expect("answered"),
+            None,
+            "weak middle carries no confidence — profile default stands"
+        );
+        assert!(live_effort_suggestion(&OfflineTransport, &pack, "fix the flake").is_err());
     }
 
     /// bd-adv4: the offline profile-pick table routes by language cue and
