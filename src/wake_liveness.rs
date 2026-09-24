@@ -1,8 +1,13 @@
 //! Wake pipe quiet-vs-deaf classifier (GS-061 / ADR-0036 / Buzz #7546 pattern).
 //!
-//! Distinguishes a **quiet** wake.sock (heartbeats arriving, no events) from a
-//! **deaf** pipe (no frames at all past the idle ceiling). No second broker /
-//! Redis / Funnel — pure classification over host-observed timestamps.
+//! **Library-only** until captain chooses A (keep library) vs B (wire into
+//! `/health`). Distinguishes a **quiet** wake.sock (heartbeats arriving, no
+//! events) from a **deaf** pipe (no frames at all past the idle ceiling), or
+//! **never-stamped** UNKNOWN. No second broker / Redis / Funnel — pure
+//! classification over host-observed timestamps. Not live on `/health` yet.
+
+// Expected unused until captain B wires /health — keep export surface compilable.
+#![allow(dead_code)]
 
 /// Default deaf ceiling (ms): silence past this is deaf, never quiet.
 pub const DEFAULT_DEAF_CEILING_MS: u64 = 60_000;
@@ -15,14 +20,22 @@ pub enum PipeHealth {
     /// No events, but heartbeats prove the pipe is alive.
     Quiet { last_heartbeat_ms: u64 },
     /// No frame of any kind past the ceiling — watcher is deaf.
-    Deaf { silent_for_ms: u64 },
+    ///
+    /// `silent_for_ms` is the measured age of the most recent observed frame
+    /// (min of present event/hb ages). `None` means never stamped — UNKNOWN,
+    /// never a fabricated ceiling age (watchbeat honesty: None ≠ 0).
+    Deaf { silent_for_ms: Option<u64> },
 }
 
 /// Classify wake-pipe liveness from host-observed timestamps.
 ///
-/// `last_frame_ms` = last event OR heartbeat. `last_heartbeat_ms` = last
-/// heartbeat only (None if never seen). Quiet requires a heartbeat inside
-/// the ceiling; deaf is total silence.
+/// - `last_event_ms` — last **event** only (not heartbeat). Do **not** pass
+///   `max(event, hb)` here; that collapses Quiet into Live.
+/// - `last_heartbeat_ms` — last heartbeat only (`None` if never seen).
+///
+/// Quiet requires a heartbeat inside the ceiling; deaf is silence past the
+/// ceiling after a known observation. Never-stamped (both `None`) is
+/// `Deaf { silent_for_ms: None }` — UNKNOWN, not age=ceiling.
 pub fn classify(
     now_ms: u64,
     last_event_ms: Option<u64>,
@@ -44,12 +57,21 @@ pub fn classify(
                 last_heartbeat_ms: hb,
             };
         }
-        return PipeHealth::Deaf { silent_for_ms: age };
     }
-    // Never saw a frame.
-    PipeHealth::Deaf {
-        silent_for_ms: deaf_ceiling_ms,
-    }
+
+    // Deaf: measured last-frame age from present stamps only. Ceiling is the
+    // Live/Quiet threshold above — never a stand-in timestamp when unstamped.
+    let silent_for_ms = match (last_event_ms, last_heartbeat_ms) {
+        (None, None) => None,
+        (Some(ev), None) => Some(now_ms.saturating_sub(ev)),
+        (None, Some(hb)) => Some(now_ms.saturating_sub(hb)),
+        (Some(ev), Some(hb)) => Some(
+            now_ms
+                .saturating_sub(ev)
+                .min(now_ms.saturating_sub(hb)),
+        ),
+    };
+    PipeHealth::Deaf { silent_for_ms }
 }
 
 #[cfg(test)]
@@ -73,7 +95,7 @@ mod tests {
         assert_eq!(
             h,
             PipeHealth::Deaf {
-                silent_for_ms: 100_000
+                silent_for_ms: Some(100_000)
             }
         );
     }
@@ -85,6 +107,61 @@ mod tests {
             h,
             PipeHealth::Live {
                 last_event_ms: 49_000
+            }
+        );
+    }
+
+    #[test]
+    fn never_stamped_is_unknown_deaf_not_ceiling() {
+        // both None at t≈0 — must not invent silent_for_ms = ceiling
+        let h = classify(0, None, None, 60_000);
+        assert_eq!(h, PipeHealth::Deaf { silent_for_ms: None });
+        let h = classify(1_000, None, None, 60_000);
+        assert_eq!(h, PipeHealth::Deaf { silent_for_ms: None });
+    }
+
+    #[test]
+    fn stale_event_without_heartbeat_uses_event_age() {
+        // last_heartbeat None + stale event: measured age, not ceiling stand-in
+        let h = classify(200_000, Some(100_000), None, 60_000);
+        assert_eq!(
+            h,
+            PipeHealth::Deaf {
+                silent_for_ms: Some(100_000)
+            }
+        );
+    }
+
+    #[test]
+    fn both_stale_silent_for_is_min_frame_age() {
+        // event more recent than hb, both past ceiling → min age = event age
+        let h = classify(200_000, Some(120_000), Some(100_000), 60_000);
+        assert_eq!(
+            h,
+            PipeHealth::Deaf {
+                silent_for_ms: Some(80_000)
+            }
+        );
+    }
+
+    #[test]
+    fn event_only_param_does_not_treat_hb_as_event() {
+        // Passing hb-only via last_heartbeat keeps Quiet; last_event stays None.
+        // Callers must not collapse max(event,hb) into last_event_ms.
+        let h = classify(100_000, None, Some(95_000), 60_000);
+        assert_eq!(
+            h,
+            PipeHealth::Quiet {
+                last_heartbeat_ms: 95_000
+            }
+        );
+        // If a caller wrongly stuffed hb into last_event_ms, they'd get Live —
+        // document via this contrast that Quiet is the honest shape.
+        let collapsed = classify(100_000, Some(95_000), Some(95_000), 60_000);
+        assert_eq!(
+            collapsed,
+            PipeHealth::Live {
+                last_event_ms: 95_000
             }
         );
     }
