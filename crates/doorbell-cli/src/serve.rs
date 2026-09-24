@@ -173,7 +173,7 @@ struct LoopEntry {
 /// Second sample width for the growth test (bd-y40k): short enough to sit
 /// inside a diagnostic path nobody waits on in the happy case, long enough
 /// for a churning brain to log another wake.
-const LIVENESS_PROBE_SAMPLE: std::time::Duration = std::time::Duration::from_millis(200);
+pub(crate) const LIVENESS_PROBE_SAMPLE: std::time::Duration = std::time::Duration::from_millis(200);
 
 type Loops = Shared<Vec<LoopEntry>>;
 
@@ -405,11 +405,11 @@ fn journal_age_secs(fw_state: &std::path::Path, ws: &str) -> Option<u64> {
     Some(doorbell_rt::lease::unix_now().saturating_sub(secs))
 }
 
-/// SIGTERM drain budget. `doorbell stop` allows 15s before escalating to
+/// SIGTERM drain budget. `doorbell stop` allows 20s before escalating to
 /// SIGKILL, so the drain must always finish inside this: a Brain that
 /// never joins used to keep the pid alive until stop misreported
 /// "ignored SIGTERM" and aborted the restart (bd-xwgh round 2).
-const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Pure note for the drain outcome — a budget exhaustion must never read
 /// as a clean join (scripted in tests; hang case included).
@@ -492,23 +492,37 @@ async fn drain_loops(entries: &mut [LoopEntry], budget: std::time::Duration) -> 
                 .map(|e| e.key.clone())
                 .collect();
             let remaining = stragglers.len();
-            // bd-y40k: probe each straggler's shared liveness AT the deadline.
-            // Age answers first (stale wake = never scheduled); while the wake
-            // is recent, a second sample 200ms on separates churn (count still
-            // growing) from a parked lost-wake (flat after one wake). The gap
-            // rides the substituted test clock — no wall-time sampling here.
-            let mut verdicts = Vec::new();
+            // bd-y40k verdicts, bd-pf3b timing: sample EVERY straggler first
+            // (age + wake count at the deadline), then ONE shared window —
+            // a serial sleep per key stacked N×200ms onto the drain and
+            // pushed total shutdown past stop's grace under load. Growth is
+            // read across the single window; age is the deadline-age (the
+            // honest "last wake N ms before the probe").
+            let mut samples: Vec<(
+                String,
+                std::sync::Arc<doorbell_rt::brain::BrainLiveness>,
+                u64,
+                u64,
+            )> = Vec::new();
             for entry in entries.iter().filter(|e| !e.task.is_finished()) {
-                let Some(liv) = entry.liveness.as_ref() else {
-                    continue;
-                };
-                let age = liv.age_ms(tokio::time::Instant::now());
-                let wakes_before = liv.wakes();
+                if let Some(liv) = entry.liveness.as_ref() {
+                    samples.push((
+                        entry.key.clone(),
+                        liv.clone(),
+                        liv.wakes(),
+                        liv.age_ms(tokio::time::Instant::now()),
+                    ));
+                }
+            }
+            if !samples.is_empty() {
                 tokio::time::sleep(LIVENESS_PROBE_SAMPLE).await;
+            }
+            let mut verdicts = Vec::new();
+            for (key, liv, wakes_before, age_at_deadline) in samples {
                 let grew = liv.wakes() > wakes_before;
                 verdicts.push((
-                    entry.key.clone(),
-                    doorbell_rt::brain::classify_liveness(age, grew).describe(),
+                    key,
+                    doorbell_rt::brain::classify_liveness(age_at_deadline, grew).describe(),
                 ));
             }
             DrainReport {
@@ -832,8 +846,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
             eprintln!("doorbell serve: shutdown sent, joining loops");
             drop(retiring);
             let mut entries = std::mem::take(&mut *loops.lock());
-            // Bounded drain: SIGTERM must always finish inside stop's 15s
-            // grace. Joins race the budget CONCURRENTLY (bd-zzgb): the old
+            // Bounded drain: SIGTERM must always finish inside stop's 20s
+            // grace (drain 10s + probe window + exit allowance, bd-pf3b). Joins race the budget CONCURRENTLY (bd-zzgb): the old
             // head-of-line await meant one hung Brain stalled the scan and
             // the note claimed every loop missed the deadline even when the
             // ones behind it had already exited. At the deadline the stragglers
@@ -1753,6 +1767,31 @@ mod tests {
             report.verdicts[0].1.contains("starved"),
             "no wake across the window: {}",
             report.verdicts[0].1
+        );
+    }
+
+    /// bd-pf3b: the probe must cost ONE sample window for ALL stragglers —
+    /// a serial sleep per key stacked N×200ms onto the drain budget and
+    /// pushed total shutdown past stop's grace under load. Paused clock:
+    /// serial costs budget + 3×SAMPLE, one window costs budget + 1×SAMPLE.
+    #[tokio::test(start_paused = true)]
+    async fn drain_probes_every_straggler_in_one_window() {
+        let mk = |key: &str| super::LoopEntry {
+            key: key.into(),
+            task: tokio::spawn(async { std::future::pending::<()>().await }),
+            liveness: Some(std::sync::Arc::new(doorbell_rt::brain::BrainLiveness::new())),
+        };
+        let mut entries = vec![mk("a/a"), mk("b/b"), mk("c/c")];
+        let budget = std::time::Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let report = super::drain_loops(&mut entries, budget).await;
+        let elapsed = started.elapsed();
+        assert!(!report.joined);
+        assert_eq!(report.verdicts.len(), 3, "every straggler classified");
+        assert!(
+            elapsed <= budget + super::LIVENESS_PROBE_SAMPLE,
+            "probe must not stack per-key windows: {elapsed:?} > {:?}",
+            budget + super::LIVENESS_PROBE_SAMPLE
         );
     }
 
