@@ -61,16 +61,17 @@ pub const STAMP_INTERVAL: Duration = Duration::from_secs(1);
 /// Spawn a stoppable 1s heartbeat ticker. `send`/`drop` on the returned
 /// sender stops it. Stamps `.hb` while the watch subscription/child lives.
 ///
-/// Touches heartbeat **immediately** on spawn so `/health` does not observe
-/// a NeverStamped window before the first 1s tick.
+/// Touches heartbeat on the **calling thread** before `std::thread::spawn` so
+/// `/health` cannot observe a NeverStamped window from scheduler delay.
 pub fn spawn_heartbeat_ticker(
     state_dir: PathBuf,
     workspace: String,
 ) -> std::sync::mpsc::Sender<()> {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    // Close NeverStamped on the *calling* thread before spawn — a post-spawn
+    // touch still races /health with thread scheduling delay.
+    touch_heartbeat(&state_dir, &workspace);
     std::thread::spawn(move || {
-        // Close the NeverStamped gap before the first recv_timeout interval.
-        touch_heartbeat(&state_dir, &workspace);
         loop {
             match stop_rx.recv_timeout(STAMP_INTERVAL) {
                 Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -253,17 +254,12 @@ mod tests {
     fn spawn_heartbeat_ticker_stamps_immediately() {
         let d = dir("hb-immediate");
         let stop = spawn_heartbeat_ticker(d.clone(), "w".into());
-        // Poll briefly for the spawn-time touch (thread may lag a tick).
-        let mut saw = false;
-        for _ in 0..50 {
-            if last_heartbeat_ms(&d, "w").is_some() {
-                saw = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        // Calling-thread touch: stamp must exist before spawn returns (no poll).
+        assert!(
+            last_heartbeat_ms(&d, "w").is_some(),
+            "touch_heartbeat before std::thread::spawn must close NeverStamped gap"
+        );
         let _ = stop.send(());
-        assert!(saw, "immediate touch_heartbeat on spawn must close NeverStamped gap");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
