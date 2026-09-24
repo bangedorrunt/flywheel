@@ -2115,6 +2115,43 @@ mod tests {
         assert!(!super::bootout_absent(
             "Boot-out failed: 1: Operation not permitted"
         ));
+        assert!(super::bootout_absent(
+            "Could not find service \"com.doorbell.serve\" in domain for user gui: 501"
+        ));
+    }
+
+    /// Clean-arm policy pinned: a failing unload after a SIGTERM-honouring
+    /// exit is warned loud, not fatal — the daemon IS stopped (a 0-exit is
+    /// not respawned, so no misattribution is possible), and the arm makes
+    /// exactly ONE attempt. Escalation owns retry-once-then-bail; a retry
+    /// here would grow the success path for a stale-definition side effect
+    /// `doorbell install` already heals via the reload plan.
+    #[test]
+    fn stop_succeeds_with_one_loud_unload_attempt_when_clean_exit_unload_fails() {
+        let mut w = ScriptedStop {
+            target: Some(9),
+            dead_after: vec![true].into(),
+            unload_fails: 1,
+            ..Default::default()
+        };
+        let msg = w.stop(false).expect("clean exit stays a successful stop");
+        assert_eq!(msg, "doorbell: stopped (pid 9)");
+        assert_eq!(
+            w.actions.iter().filter(|a| *a == "unload-failed").count(),
+            1,
+            "clean path attempts once, no retry: {:?}",
+            w.actions
+        );
+        assert!(
+            !w.actions.iter().any(|a| a == "signal 9 Kill"),
+            "clean exit never escalates: {:?}",
+            w.actions
+        );
+        assert!(
+            w.actions.iter().any(|a| a.starts_with("cleanup")),
+            "the successful stop still cleans up: {:?}",
+            w.actions
+        );
     }
 
     #[test]
