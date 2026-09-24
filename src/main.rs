@@ -31877,16 +31877,22 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
 /// GS-062 ASK-USER D: hosted workspace labels from the doorbell hosting
 /// registry (`{state}/doorbell/*.gen`). Same keys stamp writers use
 /// (`flywheel-{project}` / spawn meta) — not `workspace_root` basename.
-/// Alive dispatchers sort first so `/health` prefers a live pipe.
+/// Alive dispatchers sort first so `/health` prefers a live pipe
+/// ([`doorbell_rt::wake_liveness::order_hosted_alive_first`]).
 ///
-/// Skip `{workspace}.daemon.gen` (doorbell-rt daemon gen gate): its stem is
-/// `{workspace}.daemon`, which is not a stamp-writer slug. Stamp writers use
-/// labels without dots; accepting the daemon sibling made `/health` primary
-/// miss `watch-flywheel-X.{event,hb}` and report NeverStamped (captain D).
+/// FileHost / doorbell serve only write `{workspace}.daemon.gen`
+/// (`ensure_daemon_gen`) — not `{workspace}.gen`. Accept both:
+/// - `{slug}.daemon.gen` → label = strip `.daemon.gen`
+/// - `{slug}.gen` → label = file stem
+/// Then reject if the resulting slug still contains `.` (no-dot defense).
+/// Deduplicate so a fleet with both siblings yields one label. Skipping
+/// `.daemon.gen` blinded flywheel serve `/health` → empty hosted → permanent
+/// NeverStamped while watch stamps + doorbell wake were live.
 fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
     let db = state_dir.join("doorbell");
     let mut alive = Vec::new();
     let mut other = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let Ok(entries) = std::fs::read_dir(&db) else {
         return Vec::new();
     };
@@ -31895,16 +31901,19 @@ fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
         if path.extension().and_then(|x| x.to_str()) != Some("gen") {
             continue;
         }
-        // `{slug}.daemon.gen` → stem `{slug}.daemon`; also reject any other
-        // dotted stem so only real `{slug}.gen` workspace labels remain.
         let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
-        if name.ends_with(".daemon.gen") {
-            continue;
-        }
-        let Some(label) = path.file_stem().and_then(|x| x.to_str()) else {
-            continue;
+        let label = if let Some(slug) = name.strip_suffix(".daemon.gen") {
+            slug
+        } else {
+            match path.file_stem().and_then(|x| x.to_str()) {
+                Some(stem) => stem,
+                None => continue,
+            }
         };
         if label.is_empty() || label.contains('.') {
+            continue;
+        }
+        if !seen.insert(label.to_string()) {
             continue;
         }
         let is_alive = doorbell::read_pid(&doorbell::pid_file(state_dir, label))
@@ -31915,10 +31924,7 @@ fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
             other.push(label.to_string());
         }
     }
-    alive.sort();
-    other.sort();
-    alive.extend(other);
-    alive
+    doorbell_rt::wake_liveness::order_hosted_alive_first(alive, other)
 }
 
 #[cfg(test)]
@@ -31926,14 +31932,14 @@ mod hosted_workspaces_from_registry_tests {
     use super::hosted_workspaces_from_registry;
 
     #[test]
-    fn skips_daemon_gen_keeps_slug_gen() {
+    fn daemon_gen_and_slug_gen_dedup_to_slug() {
         let dir = tempfile_state();
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).expect("doorbell dir");
         // Real hosting registry entry — stamp-writer slug, no dots.
         std::fs::write(db.join("flywheel-proj.gen"), b"{}").expect("slug.gen");
-        // Daemon gen gate sibling (doorbell-rt ensure_daemon_gen). Must not
-        // become primary label `flywheel-proj.daemon`.
+        // Daemon gen gate sibling (doorbell-rt ensure_daemon_gen). Must
+        // yield the same slug, not `flywheel-proj.daemon`.
         std::fs::write(db.join("flywheel-proj.daemon.gen"), b"{}").expect("daemon.gen");
         // Junk dotted stem (defense in depth).
         std::fs::write(db.join("flywheel-proj.extra.gen"), b"{}").expect("extra.gen");
@@ -31944,21 +31950,23 @@ mod hosted_workspaces_from_registry_tests {
         assert_eq!(
             got,
             vec!["flywheel-proj".to_string()],
-            "only slug .gen labels; daemon/dotted stems excluded"
+            "slug .gen + .daemon.gen dedup; dotted stems excluded"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn empty_when_only_daemon_gen_present() {
+    fn daemon_only_fleet_yields_slug() {
         let dir = tempfile_state();
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).expect("doorbell dir");
+        // FileHost/doorbell serve write only `{workspace}.daemon.gen`.
         std::fs::write(db.join("flywheel-only.daemon.gen"), b"{}").expect("daemon.gen");
         let got = hosted_workspaces_from_registry(&dir);
-        assert!(
-            got.is_empty(),
-            "only .daemon.gen must not invent a primary workspace: {got:?}"
+        assert_eq!(
+            got,
+            vec!["flywheel-only".to_string()],
+            "daemon-only fleets must yield the slug (not empty): {got:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

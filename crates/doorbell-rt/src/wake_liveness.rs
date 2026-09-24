@@ -103,9 +103,77 @@ pub fn to_json(h: PipeHealth) -> serde_json::Value {
     }
 }
 
+
+/// GS-062: shared `/health` hosted order — alive-first, then stable alphabetical
+/// by `sort_key` (typically the workspace slug).
+///
+/// Flywheel `serve` and doorbell operator `/health` both pick primary as
+/// `hosted.first()`; this helper keeps that order identical across surfaces.
+/// Does **not** change wake classification aggregation (ask-user F).
+pub fn order_hosted_alive_first(
+    alive: Vec<String>,
+    other: Vec<String>,
+) -> Vec<String> {
+    order_hosted_alive_first_by(alive, other, |s| s)
+}
+
+/// Like [`order_hosted_alive_first`], but compare via `sort_key` (e.g. workspace
+/// slug extracted from `project/workspace`). Tie-break on the full string.
+pub fn order_hosted_alive_first_by<F>(
+    mut alive: Vec<String>,
+    mut other: Vec<String>,
+    sort_key: F,
+) -> Vec<String>
+where
+    F: Fn(&str) -> &str,
+{
+    let cmp = |a: &String, b: &String| {
+        sort_key(a)
+            .cmp(sort_key(b))
+            .then_with(|| a.as_str().cmp(b.as_str()))
+    };
+    alive.sort_by(cmp);
+    other.sort_by(cmp);
+    alive.extend(other);
+    alive
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_hosted_alive_first_alive_then_alpha() {
+        let got = order_hosted_alive_first(
+            vec!["z-alive".into(), "a-alive".into()],
+            vec!["m-dead".into(), "b-dead".into()],
+        );
+        assert_eq!(
+            got,
+            vec![
+                "a-alive".to_string(),
+                "z-alive".to_string(),
+                "b-dead".to_string(),
+                "m-dead".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn order_hosted_alive_first_by_slug_not_full_key() {
+        // project/workspace keys: alpha slug must win over project alpha.
+        let got = order_hosted_alive_first_by(
+            vec!["zzz/alpha".into(), "aaa/beta".into()],
+            Vec::new(),
+            |k| k.rsplit_once('/').map(|(_, ws)| ws).unwrap_or(k),
+        );
+        assert_eq!(
+            got,
+            vec!["zzz/alpha".to_string(), "aaa/beta".to_string()],
+            "slug alpha before beta even when project zzz > aaa"
+        );
+    }
+
 
     #[test]
     fn quiet_when_heartbeat_inside_ceiling() {
