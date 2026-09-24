@@ -25,6 +25,7 @@ async fn host_workspace(
     workspace: String,
     tx: tokio::sync::mpsc::Sender<doorbell_rt::BrainMsg>,
     rx: tokio::sync::mpsc::Receiver<doorbell_rt::BrainMsg>,
+    liveness: std::sync::Arc<doorbell_rt::brain::BrainLiveness>,
 ) -> doorbell_rt::RunReport {
     use doorbell_rt::{Brain, BrainConfig, FileHost, FileHostConfig, Host, SinkManager};
     use doorbell_rt::{CliPromptSink, FileStore};
@@ -101,7 +102,8 @@ async fn host_workspace(
             now: doorbell_rt::lease::unix_now(),
         },
     );
-    let brain = Brain::new(BrainConfig::new(&workspace), host, store, sinks);
+    let brain =
+        Brain::new(BrainConfig::new(&workspace), host, store, sinks).with_liveness(liveness);
     let report = brain.run(rx).await;
     drop(sweep_ticker);
     eprintln!(
@@ -163,7 +165,15 @@ type Hosts = Shared<Vec<HostedLoop>>;
 struct LoopEntry {
     key: String,
     task: tokio::task::JoinHandle<()>,
+    /// bd-y40k: the shared probe this brain's task touches — read at the
+    /// drain deadline for the straggler's starve/churn/lost-wake verdict.
+    liveness: Option<std::sync::Arc<doorbell_rt::brain::BrainLiveness>>,
 }
+
+/// Second sample width for the growth test (bd-y40k): short enough to sit
+/// inside a diagnostic path nobody waits on in the happy case, long enough
+/// for a churning brain to log another wake.
+const LIVENESS_PROBE_SAMPLE: std::time::Duration = std::time::Duration::from_millis(200);
 
 type Loops = Shared<Vec<LoopEntry>>;
 
@@ -423,6 +433,9 @@ struct DrainReport {
     remaining: usize,
     total: usize,
     stragglers: Vec<String>,
+    /// bd-y40k: (key, verdict) per straggler probed at the deadline —
+    /// a diagnosis nobody prints pins nothing.
+    verdicts: Vec<(String, String)>,
 }
 
 /// Send `Shutdown` to every retiring loop, returning the keys whose channel
@@ -469,6 +482,7 @@ async fn drain_loops(entries: &mut [LoopEntry], budget: std::time::Duration) -> 
                 remaining: 0,
                 total,
                 stragglers: Vec::new(),
+                verdicts: Vec::new(),
             }
         }
         Err(_elapsed) => {
@@ -478,11 +492,31 @@ async fn drain_loops(entries: &mut [LoopEntry], budget: std::time::Duration) -> 
                 .map(|e| e.key.clone())
                 .collect();
             let remaining = stragglers.len();
+            // bd-y40k: probe each straggler's shared liveness AT the deadline.
+            // Age answers first (stale wake = never scheduled); while the wake
+            // is recent, a second sample 200ms on separates churn (count still
+            // growing) from a parked lost-wake (flat after one wake). The gap
+            // rides the substituted test clock — no wall-time sampling here.
+            let mut verdicts = Vec::new();
+            for entry in entries.iter().filter(|e| !e.task.is_finished()) {
+                let Some(liv) = entry.liveness.as_ref() else {
+                    continue;
+                };
+                let age = liv.age_ms(tokio::time::Instant::now());
+                let wakes_before = liv.wakes();
+                tokio::time::sleep(LIVENESS_PROBE_SAMPLE).await;
+                let grew = liv.wakes() > wakes_before;
+                verdicts.push((
+                    entry.key.clone(),
+                    doorbell_rt::brain::classify_liveness(age, grew).describe(),
+                ));
+            }
             DrainReport {
                 joined: false,
                 remaining,
                 total,
                 stragglers,
+                verdicts,
             }
         }
     }
@@ -494,11 +528,16 @@ fn straggler_note(report: &DrainReport) -> Option<String> {
     if report.stragglers.is_empty() {
         return None;
     }
-    Some(format!(
+    let mut note = format!(
         "doorbell serve: straggler loop(s) still running after {}s: {}",
         DRAIN_BUDGET.as_secs(),
         report.stragglers.join(", ")
-    ))
+    );
+    // bd-y40k: the mechanism, named per key — starved / churning / lost-wake.
+    for (key, verdict) in &report.verdicts {
+        note.push_str(&format!("\n  {key}: {verdict}"));
+    }
+    Some(note)
 }
 
 pub async fn run(cfg: &Config) -> Result<()> {
@@ -906,6 +945,10 @@ fn spawn_host_loop(
     let supervised_hosted = hosted.clone();
     let supervised_owned = owned.clone();
     let supervised_health = health.clone();
+    // bd-y40k: ONE probe per loop, shared by the brain's touches (inside
+    // the task) and the drain's deadline read (from the table entry).
+    let liveness = std::sync::Arc::new(doorbell_rt::brain::BrainLiveness::new());
+    let supervised_liveness = liveness.clone();
     // Register before spawning: a very fast startup failure must not win a
     // race against registration and leave a stale hosted row behind.
     hosted.lock().push(HostedLoop {
@@ -915,7 +958,7 @@ fn spawn_host_loop(
     let task = tokio::spawn(async move {
         // Await a child task so panic/abort is also a supervised completion:
         // the outer task still removes the hosted row and releases its lease.
-        let child = tokio::spawn(host_workspace(fw, p, w, loop_tx, rx));
+        let child = tokio::spawn(host_workspace(fw, p, w, loop_tx, rx, supervised_liveness));
         let report = match child.await {
             Ok(report) => report,
             Err(error) => {
@@ -936,7 +979,11 @@ fn spawn_host_loop(
             eprintln!("doorbell serve: removed dead hosted worker {supervised_key} from health");
         }
     });
-    loops.lock().push(LoopEntry { key, task });
+    loops.lock().push(LoopEntry {
+        key,
+        task,
+        liveness: Some(liveness),
+    });
     // The table keeps its OWN sender: the loop's clones live inside the task,
     // so this handle is the only one reconcile can address. `try_send` on it
     // is how a retiring loop is told to drain (bd-mk60).
@@ -1659,6 +1706,56 @@ mod tests {
     use super::known_journal_workspaces;
     use super::{PortHolder, classify_port_holder};
 
+    /// bd-y40k: the drain's timeout verdict must SURFACE in the straggler
+    /// note — a diagnosis nobody prints pins nothing.
+    #[test]
+    fn straggler_note_carries_the_liveness_verdict() {
+        let report = super::DrainReport {
+            joined: false,
+            remaining: 1,
+            total: 2,
+            stragglers: vec!["flywheel/flywheel-flywheel".into()],
+            verdicts: vec![(
+                "flywheel/flywheel-flywheel".into(),
+                "starved: last select wake 10200ms before the probe".into(),
+            )],
+        };
+        let note = super::straggler_note(&report).expect("a straggler must note");
+        assert!(note.contains("starved"), "verdict rendered: {note}");
+        assert!(
+            note.contains("flywheel/flywheel-flywheel"),
+            "key still named: {note}"
+        );
+    }
+
+    /// The timeout probe reads the SAME liveness the brain touches: a
+    /// straggler that never woke during the drain window classifies
+    /// starved, off the substituted clock (start_paused, no real wait).
+    #[tokio::test(start_paused = true)]
+    async fn drain_timeout_probes_straggler_liveness() {
+        let liv = std::sync::Arc::new(doorbell_rt::brain::BrainLiveness::new());
+        liv.touch();
+        let mut entries = vec![super::LoopEntry {
+            key: "stuck/one".into(),
+            task: tokio::spawn(async { std::future::pending::<()>().await }),
+            liveness: Some(liv),
+        }];
+        let report = super::drain_loops(&mut entries, std::time::Duration::from_secs(10)).await;
+        assert!(!report.joined, "budget expires: {report:?}");
+        assert_eq!(report.stragglers, ["stuck/one"]);
+        assert_eq!(
+            report.verdicts.len(),
+            1,
+            "one verdict per straggler: {report:?}"
+        );
+        assert_eq!(report.verdicts[0].0, "stuck/one");
+        assert!(
+            report.verdicts[0].1.contains("starved"),
+            "no wake across the window: {}",
+            report.verdicts[0].1
+        );
+    }
+
     #[test]
     fn drain_note_never_calls_a_budget_exhaustion_a_clean_join() {
         let joined = super::drain_note(true, 0, 6);
@@ -1678,10 +1775,12 @@ mod tests {
             super::LoopEntry {
                 key: "fast/flywheel".into(),
                 task: tokio::spawn(async {}),
+                liveness: None,
             },
             super::LoopEntry {
                 key: "stuck/flywheel".into(),
                 task: tokio::spawn(async { std::future::pending::<()>().await }),
+                liveness: None,
             },
         ];
         let report = super::drain_loops(&mut entries, std::time::Duration::from_secs(10)).await;
@@ -1700,10 +1799,12 @@ mod tests {
             super::LoopEntry {
                 key: "a/a".into(),
                 task: tokio::spawn(async {}),
+                liveness: None,
             },
             super::LoopEntry {
                 key: "b/b".into(),
                 task: tokio::spawn(async {}),
+                liveness: None,
             },
         ];
         let report = super::drain_loops(&mut entries, std::time::Duration::from_secs(10)).await;
@@ -1751,6 +1852,7 @@ mod tests {
             remaining: 2,
             total: 3,
             stragglers: vec!["p/one".into(), "p/two".into()],
+            verdicts: Vec::new(),
         };
         let note = super::straggler_note(&stuck).expect("stuck loops must be named");
         assert!(note.contains("p/one") && note.contains("p/two"), "{note}");
@@ -1759,6 +1861,7 @@ mod tests {
             remaining: 0,
             total: 3,
             stragglers: vec![],
+            verdicts: Vec::new(),
         };
         assert!(super::straggler_note(&clean).is_none());
     }

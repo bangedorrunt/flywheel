@@ -45,6 +45,96 @@ pub struct RunReport {
     pub stats: Stats,
 }
 
+/// bd-y40k: sampled liveness for the drain's straggler diagnosis. The brain
+/// touches it on every select wake; the drain reads age + wake growth AT the
+/// budget deadline, through a shared `Arc`. The clock is tokio's (substituted
+/// under `start_paused`) and arrives as a parameter on read, so no probe path
+/// samples wall time on its own.
+pub struct BrainLiveness {
+    epoch: tokio::time::Instant,
+    last_wake_ms: std::sync::atomic::AtomicU64,
+    wakes: std::sync::atomic::AtomicU64,
+}
+
+impl BrainLiveness {
+    pub fn new() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            last_wake_ms: std::sync::atomic::AtomicU64::new(0),
+            wakes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Stamp the virtual clock and count the wake (relaxed atomics: the
+    /// probe is diagnostic, never a synchronization point).
+    pub fn touch(&self) {
+        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_wake_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+        self.wakes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last select wake, read at the caller's `now`.
+    pub fn age_ms(&self, now: tokio::time::Instant) -> u64 {
+        let elapsed = u64::try_from(now.duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX);
+        elapsed.saturating_sub(self.last_wake_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn wakes(&self) -> u64 {
+        self.wakes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for BrainLiveness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// No select wake for this long at the probe = the executor never scheduled
+/// the task (bd-burk's live signature: silent for the whole 10s window).
+pub const STARVATION_THRESHOLD_MS: u64 = 2_000;
+
+/// bd-y40k's three-way straggler verdict: starvation wins on age (a stale
+/// wake already answers "was it ever scheduled"); growth is only consulted
+/// while the wake is recent, where it separates a churning backlog from a
+/// task that woke once and went flat (the silent-park class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivenessVerdict {
+    Starved { age_ms: u64 },
+    Churning { age_ms: u64 },
+    LostWake { age_ms: u64 },
+}
+
+impl LivenessVerdict {
+    /// The straggler note renders these labels verbatim.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Starved { age_ms } => format!(
+                "starved: no select wake for {age_ms}ms (>= {STARVATION_THRESHOLD_MS}ms) — never scheduled"
+            ),
+            Self::Churning { age_ms } => format!(
+                "churning: last wake {age_ms}ms ago, wake count still growing — chewing a backlog"
+            ),
+            Self::LostWake { age_ms } => format!(
+                "lost-wake: last wake {age_ms}ms ago, count flat across the probe — parked after one wake"
+            ),
+        }
+    }
+}
+
+/// Pure classification (bd-y40k): age first, growth second.
+pub fn classify_liveness(age_ms: u64, wakes_grew: bool) -> LivenessVerdict {
+    if age_ms >= STARVATION_THRESHOLD_MS {
+        LivenessVerdict::Starved { age_ms }
+    } else if wakes_grew {
+        LivenessVerdict::Churning { age_ms }
+    } else {
+        LivenessVerdict::LostWake { age_ms }
+    }
+}
+
 pub struct Brain<H: Host> {
     cfg: BrainConfig,
     host: H,
@@ -73,6 +163,10 @@ pub struct Brain<H: Host> {
     /// 60s, forever), so only a CHANGE is news — a steady backlog is one
     /// fact, not one row per minute.
     sla_seen: std::collections::BTreeSet<String>,
+    /// bd-y40k: the shared probe the drain reads at its deadline — the
+    /// brain touches it on every select wake, the drain classifies
+    /// starve/churn/lost-wake from age + wake growth.
+    liveness: std::sync::Arc<BrainLiveness>,
 }
 
 impl<H: Host> Brain<H> {
@@ -150,7 +244,20 @@ impl<H: Host> Brain<H> {
             deaf_attempts: BTreeMap::new(),
             dedup_high_us: None,
             sla_seen: std::collections::BTreeSet::new(),
+            liveness: std::sync::Arc::new(BrainLiveness::new()),
         }
+    }
+
+    /// bd-y40k: share ONE probe between the brain's touches and the drain's
+    /// deadline read (spawn wires the same Arc into both).
+    pub fn with_liveness(mut self, liveness: std::sync::Arc<BrainLiveness>) -> Self {
+        self.liveness = liveness;
+        self
+    }
+
+    /// bd-y40k: the handle the drain keeps for its straggler diagnosis.
+    pub fn liveness(&self) -> std::sync::Arc<BrainLiveness> {
+        self.liveness.clone()
     }
 
     pub async fn run(mut self, mut rx: tokio::sync::mpsc::Receiver<BrainMsg>) -> RunReport {
@@ -169,6 +276,9 @@ impl<H: Host> Brain<H> {
         let mut dispatched = 0usize;
         let elapsed_ms = || started.elapsed().as_millis();
         loop {
+            // bd-y40k: every select wake stamps the shared probe — the drain
+            // reads it at the deadline to settle churn-vs-starvation.
+            self.liveness.touch();
             tokio::select! {
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
@@ -1036,6 +1146,80 @@ mod tests {
     use crate::host::MockHost;
     use crate::sinks::MockSink;
     use std::collections::VecDeque;
+
+    /// bd-y40k: the three-way straggler diagnosis, pure. Starvation wins on
+    /// age (the bead's rule: stale = starved); growth is only consulted
+    /// while the wake is recent, because a moving age already answers.
+    #[test]
+    fn liveness_classifies_starved_churning_lost_wake() {
+        use super::{LivenessVerdict, STARVATION_THRESHOLD_MS, classify_liveness};
+        assert!(
+            matches!(
+                classify_liveness(STARVATION_THRESHOLD_MS, false),
+                LivenessVerdict::Starved { .. }
+            ),
+            "age at threshold is starved"
+        );
+        assert!(
+            matches!(
+                classify_liveness(10_200, false),
+                LivenessVerdict::Starved { .. }
+            ),
+            "a whole budget without a wake is starved"
+        );
+        assert!(
+            matches!(
+                classify_liveness(80, true),
+                LivenessVerdict::Churning { .. }
+            ),
+            "recent wake + growing count = backlog churn"
+        );
+        assert!(
+            matches!(
+                classify_liveness(80, false),
+                LivenessVerdict::LostWake { .. }
+            ),
+            "recent wake + flat count across the probe = parked after one wake"
+        );
+    }
+
+    /// The probe follows the substituted clock: touch stamps virtual now,
+    /// sleeps advance it, and age reads the gap since the last touch. A
+    /// brain that never touches again crosses the starvation threshold.
+    #[tokio::test(start_paused = true)]
+    async fn liveness_touch_tracks_wakes_and_age_on_the_clock() {
+        use super::{BrainLiveness, STARVATION_THRESHOLD_MS, classify_liveness};
+        let liv = BrainLiveness::new();
+        liv.touch();
+        tokio::time::sleep(std::time::Duration::from_millis(3_000)).await;
+        liv.touch();
+        let age = liv.age_ms(tokio::time::Instant::now());
+        assert_eq!(liv.wakes(), 2, "one count per wake");
+        assert!(age < 100, "just touched: age {age}ms");
+        tokio::time::sleep(std::time::Duration::from_millis(5_000)).await;
+        let age = liv.age_ms(tokio::time::Instant::now());
+        assert!(
+            age >= STARVATION_THRESHOLD_MS,
+            "parked 5s: age {age}ms crosses the threshold"
+        );
+        assert!(
+            matches!(
+                classify_liveness(age, false),
+                super::LivenessVerdict::Starved { .. }
+            ),
+            "parked classifies starved"
+        );
+    }
+
+    /// A fresh probe starts at wake-zero-with-creation-baseline: age is 0
+    /// right after construction/touch and never underflows.
+    #[tokio::test(start_paused = true)]
+    async fn liveness_fresh_probe_reads_age_zero() {
+        let liv = super::BrainLiveness::new();
+        liv.touch();
+        assert_eq!(liv.age_ms(tokio::time::Instant::now()), 0);
+        assert_eq!(liv.wakes(), 1);
+    }
 
     fn test_brain(
         name: &str,
