@@ -922,6 +922,27 @@ mod tests {
         (brain, rx, tx)
     }
 
+    /// bd-nuf2: Brain::run exits inside the drain budget with a hung
+    /// endpoint — Shutdown breaks the loop, the digest flushes, the sink
+    /// join gives up on the straggler, the drain journals, and the report
+    /// returns. Multi-thread: the stall blocks a thread, like the live
+    /// 30s CLI send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn brain_run_exits_inside_budget_with_hung_endpoint() {
+        let (mut brain, rx, tx) = test_brain("drain", vec![]);
+        let (mut sink, _sent) = MockSink::new();
+        sink.stall_ms = 12_000;
+        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.send("herdr", "p", "slow").await;
+        // Let the worker pop the intent so it sits inside the 12s send.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tx.send(BrainMsg::Shutdown).await.expect("shutdown queues");
+        let report = tokio::time::timeout(std::time::Duration::from_secs(8), brain.run(rx))
+            .await
+            .expect("run must exit inside budget with a hung endpoint");
+        let _ = report;
+    }
+
     /// bd-adms: `toron ack-sla` re-reports every corr still past SLA, so an
     /// unchanged backlog re-fired the same wake ~1440x/day (live: `count: 89`
     /// on every beat) — noise that buries a genuine regression. Only a CHANGE
