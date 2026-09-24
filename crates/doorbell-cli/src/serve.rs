@@ -154,9 +154,24 @@ struct HostedLoop {
 
 type Hosts = Shared<Vec<HostedLoop>>;
 
-/// The hosted keys, in insertion order — what `/health` reports as `hosted`.
+/// Hosted keys in insertion order (reconcile / stats bookkeeping).
 fn hosted_keys(hosts: &[HostedLoop]) -> Vec<String> {
     hosts.iter().map(|h| h.key.clone()).collect()
+}
+
+/// GS-062: `/health` hosted order — alive-first then alphabetical **workspace
+/// slug** (shared with flywheel serve via
+/// [`doorbell_rt::wake_liveness::order_hosted_alive_first_by`]).
+///
+/// In-memory [`HostedLoop`]s are all live in this process, so the alive
+/// partition holds every key. Sort by the workspace half of
+/// `project/workspace` (not insertion order) so primary converges with
+/// flywheel's slug order.
+fn hosted_keys_for_health(hosts: &[HostedLoop]) -> Vec<String> {
+    let alive: Vec<String> = hosts.iter().map(|h| h.key.clone()).collect();
+    doorbell_rt::wake_liveness::order_hosted_alive_first_by(alive, Vec::new(), |k| {
+        hosted_workspace(k).unwrap_or(k)
+    })
 }
 
 /// The external CLIs this daemon execs. Resolved through the shared search
@@ -1086,7 +1101,10 @@ fn hosted_subscribers(fw_state: &std::path::Path, hosted: &[String]) -> usize {
 }
 
 /// Age of the most recent bus event across the hosted workspaces (min age =
-/// most recent), from the `.event` stamp.
+/// most recent), from the `.event` stamp only.
+///
+/// GS-062: `watch.last_event_age_s` is **event-only** — under Quiet wake
+/// (heartbeats alive, no lines) this is `null`/stale while `wake.class=Quiet`.
 fn hosted_watch_age(fw_state: &std::path::Path, hosted: &[String]) -> Option<u64> {
     // GS-062: last_event_age_s from the **event** stamp (not hb).
     hosted
@@ -1188,7 +1206,8 @@ fn known_journal_workspaces(fw_state: &std::path::Path) -> Vec<String> {
 
 fn health_body(app: &AppState) -> String {
     // bd-2o1v: hosting is dynamic — snapshot under the lock once.
-    let hosted = hosted_keys(&app.hosted.lock());
+    // GS-062: alive-first + alphabetical slug (not insertion order).
+    let hosted = hosted_keys_for_health(&app.hosted.lock());
     // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut degraded = Vec::new();
@@ -1290,8 +1309,9 @@ fn health_body(app: &AppState) -> String {
                 "herdr": bins.herdr_resolved,
             },
         },
-        // last_event_age_s is MEASURED from the watch **event** stamp (GS-062
-        // split; None = never seen a bus event: wrong bus or dead child).
+        // last_event_age_s is .event-only (GS-062 split; not hb). Quiet wake
+        // (hb live, no bus lines) → null/stale here while wake.class=Quiet.
+        // None also covers never-seen events (wrong bus or dead child).
         "watch": {
             "state": if hosted.is_empty() { "standby" } else { "hosted" },
             "last_event_age_s": watch_age,
@@ -1496,6 +1516,23 @@ mod tests {
             key: key.to_string(),
             tx,
         }
+    }
+
+    #[test]
+    fn hosted_keys_for_health_orders_by_workspace_slug() {
+        // Insertion order: beta then alpha; health order must be alpha first.
+        let hosts = vec![
+            host_for_test("zzz/beta"),
+            host_for_test("aaa/alpha"),
+        ];
+        let keys = super::hosted_keys(&hosts);
+        assert_eq!(keys[0], "zzz/beta", "insertion order preserved for reconcile");
+        let health = super::hosted_keys_for_health(&hosts);
+        assert_eq!(
+            health,
+            vec!["aaa/alpha".to_string(), "zzz/beta".to_string()],
+            "health primary follows alphabetical workspace slug"
+        );
     }
 
     /// bd-mk60: reconcile retires a loop whose subscription went away, and
