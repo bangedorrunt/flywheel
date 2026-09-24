@@ -216,6 +216,10 @@ pub(crate) enum MailCmd {
         /// digest every registered agent (table, --json = array)
         #[arg(long)]
         all: bool,
+        /// product-scoped captain digest (bd-jcqq): fan one digest per
+        /// member project with loud per-member gaps; --project is ignored
+        #[arg(long, value_name = "PRODUCT")]
+        product: Option<String>,
     },
     /// wait until a thread gains a new message (blocks; Ctrl-C to abort)
     Watch {
@@ -652,7 +656,47 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             project_flag,
             as_agent,
             all,
+            product,
         } => {
+            if let Some(pkey) = product {
+                // governed-by: bd-jcqq — product fan-out lives in
+                // product_digest_for; the CLI only lists members, anchors
+                // the actor, and resolves member dirs.
+                let probe = crate::mail_or_die(cfg)?;
+                let members: Vec<String> = probe
+                    .ensure_product(pkey, None)?
+                    .get("member_projects")
+                    .and_then(|m| m.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Actor anchor: first member (ensure+register there, like
+                // the single-project path). No members → bare facade, no
+                // writes; product_digest_for renders the gap.
+                let mail = match members.first() {
+                    Some(first) => crate::mail_as(
+                        cfg,
+                        &crate::project_dir_str(cfg, first)?,
+                        as_agent.as_deref(),
+                    )?,
+                    None => match as_agent.as_deref() {
+                        Some(a) if !a.trim().is_empty() => {
+                            crate::mail_or_die(cfg)?.with_name(a.trim().to_string())
+                        }
+                        _ => crate::mail_or_die(cfg)?,
+                    },
+                };
+                let mut dirs = Vec::new();
+                for m in &members {
+                    dirs.push((m.clone(), crate::project_dir_str(cfg, m)?));
+                }
+                let name = mail.name.clone();
+                print_json(&crate::product_digest_for(&mail, pkey, &name, &dirs));
+                return Ok(());
+            }
             let project = crate::mail_project(project, project_flag, "digest")?;
             let key = crate::project_dir_str(cfg, project)?;
             if *all {
