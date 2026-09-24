@@ -635,8 +635,8 @@ async fn run_embedded_async(
     );
     let store = FileStore::new(config::state_dir());
     // Watch source: in-process bus watch first (zero fork), CLI child fallback.
-    // Both stamp the watch heartbeat, and the child goes through the host's
-    // slot so the respawn path reaps its predecessor.
+    // Both use watchbeat StampThreads (event + hb); child goes through the
+    // host's slot so the respawn path reaps its predecessor.
     let watch_slot = host.watch_child.clone();
     if !spawn_bus_watch(&cfg, project, workspace, tx.clone()) {
         let tx_w = tx.clone();
@@ -769,7 +769,10 @@ fn spawn_bus_watch(
         let mut sub = crate::mail_shim::block_on(bus.subscribe_trusted(filter)).ok()?;
         let ws = workspace.to_string();
         std::thread::spawn(move || {
-            let mut stamped: Option<std::time::Instant> = None;
+            // GS-062: mirror child watch — touch_event on each Event; stoppable
+            // 1s touch_heartbeat while the subscription lives (never conflate).
+            let mut stamps =
+                doorbell_rt::watchbeat::spawn_stamp_threads(config::state_dir(), ws.clone());
             loop {
                 let ev_opt = crate::mail_shim::block_on(sub.next());
                 match ev_opt {
@@ -784,13 +787,7 @@ fn spawn_bus_watch(
                             "tags": tags,
                             "created_at": e.created_at.as_secs(),
                         });
-                        // Heartbeat the in-process path too: it is the
-                        // preferred watcher, so `/health` must be able to
-                        // see it delivering (or not) exactly like the child.
-                        if stamped.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
-                            doorbell_rt::watchbeat::touch(&config::state_dir(), &ws);
-                            stamped = Some(std::time::Instant::now());
-                        }
+                        stamps.on_event();
                         if let Ok(line) = serde_json::to_string(&v)
                             && tx.blocking_send(BrainMsg::Watch(line)).is_err()
                         {
@@ -799,6 +796,7 @@ fn spawn_bus_watch(
                     }
                     Some(toron_core::bus::SubscriptionEvent::Eose) => continue,
                     Some(toron_core::bus::SubscriptionEvent::Closed(_)) | None => {
+                        stamps.stop();
                         let _ = tx.blocking_send(BrainMsg::Died);
                         break;
                     }

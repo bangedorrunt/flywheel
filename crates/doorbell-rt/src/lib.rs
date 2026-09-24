@@ -21,6 +21,7 @@ pub mod sinks;
 pub mod store;
 pub mod subscribe;
 pub mod tailprobe;
+pub mod wake_liveness;
 pub mod watchbeat;
 pub use api::{AskError, Ping, Stats, ask};
 pub use brain::{Brain, BrainConfig, HearTracker, RunReport};

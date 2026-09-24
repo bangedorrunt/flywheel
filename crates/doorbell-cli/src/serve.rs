@@ -1086,7 +1086,7 @@ fn hosted_subscribers(fw_state: &std::path::Path, hosted: &[String]) -> usize {
 }
 
 /// Age of the most recent bus event across the hosted workspaces (min age =
-/// most recent), read back from the watch heartbeat.
+/// most recent), from the `.event` stamp.
 fn hosted_watch_age(fw_state: &std::path::Path, hosted: &[String]) -> Option<u64> {
     // GS-062: last_event_age_s from the **event** stamp (not hb).
     hosted
@@ -1094,6 +1094,42 @@ fn hosted_watch_age(fw_state: &std::path::Path, hosted: &[String]) -> Option<u64
         .filter_map(|h| hosted_workspace(h))
         .filter_map(|ws| doorbell_rt::watchbeat::event_age_secs(fw_state, ws))
         .min()
+}
+
+/// GS-062 ASK-USER E (captain locked): wake_liveness Quiet/Live/Deaf on
+/// operator `/health` (:18980), using hosted AppState workspace keys
+/// (same labels stamp writers use). Primary = first hosted workspace.
+fn hosted_wake_pipe(fw_state: &std::path::Path, hosted: &[String]) -> serde_json::Value {
+    use doorbell_rt::wake_liveness::{self, DEFAULT_DEAF_CEILING_MS};
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let workspaces: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
+    let workspace = workspaces.first().copied().unwrap_or("");
+    let (last_event_ms, last_heartbeat_ms) = if workspace.is_empty() {
+        (None, None)
+    } else {
+        (
+            doorbell_rt::watchbeat::last_event_ms(fw_state, workspace),
+            doorbell_rt::watchbeat::last_heartbeat_ms(fw_state, workspace),
+        )
+    };
+    // Never max(event, hb) into last_event_ms.
+    let pipe = wake_liveness::classify(
+        now_ms,
+        last_event_ms,
+        last_heartbeat_ms,
+        DEFAULT_DEAF_CEILING_MS,
+    );
+    serde_json::json!({
+        "workspace": workspace,
+        "hosted": workspaces,
+        "pipe": wake_liveness::to_json(pipe),
+        "last_event_ms": last_event_ms,
+        "last_heartbeat_ms": last_heartbeat_ms,
+        "deaf_ceiling_ms": DEFAULT_DEAF_CEILING_MS,
+    })
 }
 
 fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u64>, u64) {
@@ -1176,6 +1212,8 @@ fn health_body(app: &AppState) -> String {
     }
     let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &hosted);
     let watch_age = hosted_watch_age(&app.fw_state, &hosted);
+    // ASK-USER E: Quiet/Live/Deaf via wake_liveness on hosted AppState keys.
+    let wake = hosted_wake_pipe(&app.fw_state, &hosted);
     // D2/P3: the daemon's own edges degrade loudly. Two facts that were
     // live-invisible: every inbox fetch failing (`inbox_error` audits) and a
     // watch child that dies far faster than its idle-exit cadence
@@ -1258,6 +1296,9 @@ fn health_body(app: &AppState) -> String {
             "state": if hosted.is_empty() { "standby" } else { "hosted" },
             "last_event_age_s": watch_age,
         },
+        // GS-062 ASK-USER E: wake_liveness Quiet/Live/Deaf (same shape as
+        // flywheel serve /health). Keys come from AppState.hosted.
+        "wake": wake,
         "sweep": {"last_age_s": sweep_age},
         // Measured, not hardcoded: the literal `0` here read as "no wake
         // subscriptions" even on a fully hosted daemon mid-ring, and sent
