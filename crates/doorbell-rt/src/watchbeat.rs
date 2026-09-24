@@ -14,6 +14,7 @@
 //! workspace?".
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// `{state}/doorbell/watch-{workspace}.hb` (heartbeat only).
 pub fn path(state_dir: &Path, workspace: &str) -> PathBuf {
@@ -51,6 +52,94 @@ pub fn touch_heartbeat(state_dir: &Path, workspace: &str) {
 /// stay honest; prefer [`touch_event`] / [`touch_heartbeat`] explicitly.
 pub fn touch(state_dir: &Path, workspace: &str) {
     touch_heartbeat(state_dir, workspace);
+}
+
+/// Interval for hb ticker and event-stamp throttle. Classifier only needs
+/// freshness within deaf_ceiling; 1s matches the pre-GS-062 IO budget.
+pub const STAMP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Spawn a stoppable 1s heartbeat ticker. `send`/`drop` on the returned
+/// sender stops it. Stamps `.hb` while the watch subscription/child lives.
+pub fn spawn_heartbeat_ticker(
+    state_dir: PathBuf,
+    workspace: String,
+) -> std::sync::mpsc::Sender<()> {
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        loop {
+            match stop_rx.recv_timeout(STAMP_INTERVAL) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    touch_heartbeat(&state_dir, &workspace);
+                }
+            }
+        }
+    });
+    stop_tx
+}
+
+/// Stamp `.event` at most once per [`STAMP_INTERVAL`]. Returns true if written.
+pub fn touch_event_throttled(
+    state_dir: &Path,
+    workspace: &str,
+    last: &mut Option<Instant>,
+) -> bool {
+    if last.is_none_or(|t| t.elapsed() >= STAMP_INTERVAL) {
+        touch_event(state_dir, workspace);
+        *last = Some(Instant::now());
+        true
+    } else {
+        false
+    }
+}
+
+/// Shared stoppable 1s hb-ticker + throttled event-stamp for watch paths
+/// (file_host child, main `spawn_watch_child`, doorbell_host in-process bus).
+///
+/// Contract: `.event` on delivered lines/Events (≤1/s); `.hb` every 1s while
+/// this handle lives. Drop/`stop` ends the ticker.
+pub struct StampThreads {
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    state_dir: PathBuf,
+    workspace: String,
+    last_event: Option<Instant>,
+}
+
+impl StampThreads {
+    /// Start the hb ticker. Call [`Self::on_event`] on each delivered watch
+    /// line / bus Event. Drop or [`Self::stop`] ends the heartbeat.
+    pub fn spawn(state_dir: PathBuf, workspace: String) -> Self {
+        let stop_tx = spawn_heartbeat_ticker(state_dir.clone(), workspace.clone());
+        Self {
+            stop_tx: Some(stop_tx),
+            state_dir,
+            workspace,
+            last_event: None,
+        }
+    }
+
+    /// Throttled `.event` stamp (~1s).
+    pub fn on_event(&mut self) {
+        touch_event_throttled(&self.state_dir, &self.workspace, &mut self.last_event);
+    }
+
+    /// Stop the heartbeat ticker (also runs on Drop).
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for StampThreads {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Start shared stoppable 1s hb-ticker + throttled event-stamp helper.
+pub fn spawn_stamp_threads(state_dir: PathBuf, workspace: String) -> StampThreads {
+    StampThreads::spawn(state_dir, workspace)
 }
 
 /// Absolute mtime of a stamp file in unix **milliseconds**, or `None`.
@@ -141,6 +230,17 @@ mod tests {
         touch_heartbeat(&d, "w");
         assert!(age_secs(&d, "w").is_some_and(|a| a < 5));
         assert_eq!(age_secs(&d, "other"), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn event_throttle_skips_within_interval() {
+        let d = dir("throttle");
+        let mut last = None;
+        assert!(touch_event_throttled(&d, "w", &mut last));
+        assert!(last_event_ms(&d, "w").is_some());
+        // Immediate second call must not rewrite (still Some last).
+        assert!(!touch_event_throttled(&d, "w", &mut last));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

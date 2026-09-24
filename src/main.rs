@@ -9398,30 +9398,19 @@ where
     std::thread::spawn(move || {
         use std::io::BufRead;
         // GS-062: split event vs heartbeat stamps (never conflate into last_event).
-        // Event stamp on every NDJSON line; heartbeat on a 1s tick while alive.
-        let hb_dir = state_dir.clone();
-        let hb_ws = workspace.clone();
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            loop {
-                match stop_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        doorbell_rt::watchbeat::touch_heartbeat(&hb_dir, &hb_ws);
-                    }
-                }
-            }
-        });
+        // Event stamp throttled ~1s; heartbeat on a 1s tick while alive.
+        let mut stamps =
+            doorbell_rt::watchbeat::spawn_stamp_threads(state_dir.clone(), workspace.clone());
         for line in std::io::BufReader::new(stdout).lines() {
             match line {
                 Ok(l) => {
-                    doorbell_rt::watchbeat::touch_event(&state_dir, &workspace);
+                    stamps.on_event();
                     on_event(Some(l));
                 }
                 Err(_) => break,
             }
         }
-        let _ = stop_tx.send(());
+        stamps.stop();
         on_event(None); // Died
     });
     Some(WatchChild(child))
@@ -31885,6 +31874,42 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
     }
 }
 
+/// GS-062 ASK-USER D: hosted workspace labels from the doorbell hosting
+/// registry (`{state}/doorbell/*.gen`). Same keys stamp writers use
+/// (`flywheel-{project}` / spawn meta) — not `workspace_root` basename.
+/// Alive dispatchers sort first so `/health` prefers a live pipe.
+fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
+    let db = state_dir.join("doorbell");
+    let mut alive = Vec::new();
+    let mut other = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&db) else {
+        return Vec::new();
+    };
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("gen") {
+            continue;
+        }
+        let Some(label) = path.file_stem().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if label.is_empty() {
+            continue;
+        }
+        let is_alive = doorbell::read_pid(&doorbell::pid_file(state_dir, label))
+            .is_some_and(doorbell::pid_alive);
+        if is_alive {
+            alive.push(label.to_string());
+        } else {
+            other.push(label.to_string());
+        }
+    }
+    alive.sort();
+    other.sort();
+    alive.extend(other);
+    alive
+}
+
 #[cfg(feature = "serve")]
 fn cmd_serve(cfg: &Config, port: u16) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -31903,24 +31928,41 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         cfg: config::Config,
         emit_budgets:
             Arc<std::sync::Mutex<std::collections::HashMap<String, crate::doorbell::PinBudget>>>,
+        /// Stamp-writer workspace labels (`flywheel-{project}` / spawn meta).
+        /// Plumbed from the doorbell hosting registry (`{state}/doorbell/*.gen`)
+        /// — the same keys `__doorbell` / spawn write under. Not
+        /// `workspace_root().file_name()`.
+        hosted_workspaces: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     async fn health(State(st): State<Arc<AppState>>) -> String {
         // GS-062: wake_liveness classify over split event/hb stamps.
-        // Aggregate/default workspace when AppState has no single workspace —
-        // operators stamp per-workspace under state_dir/doorbell/.
+        // ASK-USER D (captain locked): workspace key = hosted label from
+        // AppState (flywheel-{project}), matching stamp writers.
         let state_dir = config::state_dir();
-        let workspace_root = st.cfg.workspace_root();
-        let workspace = workspace_root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("default");
+        let hosted = {
+            let mut g = st
+                .hosted_workspaces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *g = hosted_workspaces_from_registry(&state_dir);
+            g.clone()
+        };
+        // Primary = first alive-hosted label (registry order). Empty →
+        // NeverStamped (honest: nothing hosted yet).
+        let workspace = hosted.first().cloned().unwrap_or_default();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let last_event_ms = doorbell_rt::watchbeat::last_event_ms(&state_dir, workspace);
-        let last_heartbeat_ms = doorbell_rt::watchbeat::last_heartbeat_ms(&state_dir, workspace);
+        let (last_event_ms, last_heartbeat_ms) = if workspace.is_empty() {
+            (None, None)
+        } else {
+            (
+                doorbell_rt::watchbeat::last_event_ms(&state_dir, &workspace),
+                doorbell_rt::watchbeat::last_heartbeat_ms(&state_dir, &workspace),
+            )
+        };
         // Never max(event, hb) into last_event_ms — classifier tests encode this.
         let pipe = wake_liveness::classify(
             now_ms,
@@ -31932,6 +31974,7 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
             "status": "ok",
             "wake": {
                 "workspace": workspace,
+                "hosted": hosted,
                 "pipe": wake_liveness::to_json(pipe),
                 "last_event_ms": last_event_ms,
                 "last_heartbeat_ms": last_heartbeat_ms,
@@ -32094,6 +32137,9 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
     let st = Arc::new(AppState {
         cfg: cfg.clone(),
         emit_budgets: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        hosted_workspaces: Arc::new(std::sync::Mutex::new(hosted_workspaces_from_registry(
+            &config::state_dir(),
+        ))),
     });
     let app = Router::new()
         .route("/health", get(health))

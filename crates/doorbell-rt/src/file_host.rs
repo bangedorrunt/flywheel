@@ -1385,24 +1385,13 @@ impl Host for FileHost {
             }
             std::thread::spawn(move || {
                 use std::io::BufRead;
-                // GS-062: event stamp on each line; hb on 1s tick while child alive.
-                let hb_state = fw_state.clone();
-                let hb_ws = workspace.clone();
-                let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-                std::thread::spawn(move || {
-                    loop {
-                        match stop_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                crate::watchbeat::touch_heartbeat(&hb_state, &hb_ws);
-                            }
-                        }
-                    }
-                });
+                // GS-062: event stamp throttled ~1s; hb on 1s tick while child alive.
+                let mut stamps =
+                    crate::watchbeat::spawn_stamp_threads(fw_state.clone(), workspace.clone());
                 for line in std::io::BufReader::new(stdout).lines() {
                     match line {
                         Ok(l) => {
-                            crate::watchbeat::touch_event(&fw_state, &workspace);
+                            stamps.on_event();
                             if tx.blocking_send(BrainMsg::Watch(l)).is_err() {
                                 break;
                             }
@@ -1410,7 +1399,7 @@ impl Host for FileHost {
                         Err(_) => break,
                     }
                 }
-                let _ = stop_tx.send(());
+                stamps.stop();
                 let _ = tx.blocking_send(BrainMsg::Died);
             });
         });
