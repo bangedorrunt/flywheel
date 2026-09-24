@@ -522,24 +522,14 @@ fn start_via_supervisor(cfg: &Config, unit: &std::path::Path) -> Result<Option<u
             match uid {
                 None => false,
                 Some(uid) => {
-                    let boot = std::process::Command::new("launchctl")
-                        .args([
-                            "bootstrap",
-                            &format!("gui/{uid}"),
-                            &unit.display().to_string(),
-                        ])
-                        .output();
-                    match boot {
-                        Ok(o) if o.status.success() => true,
-                        _ => {
-                            // Loaded-but-stopped or throttled: kickstart
-                            // restarts into the installed unit (also
-                            // recovers a wedged loaded daemon).
-                            std::process::Command::new("launchctl")
-                                .args(["kickstart", "-k", &format!("gui/{uid}/com.doorbell.serve")])
-                                .output()
-                                .map(|o| o.status.success())
-                                .unwrap_or(false)
+                    // Reload semantics (bd-jvu7): a stale loaded definition
+                    // must be dropped, not kickstarted — kickstart restarts
+                    // the OLD def and file edits never reach the job.
+                    match run_reload_plan(&reload_plan(&uid, unit)) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("doorbell: {e}");
+                            false
                         }
                     }
                 }
@@ -725,6 +715,7 @@ pub fn start(cfg: &Config) -> Result<()> {
             cfg.port,
             &cfg.flywheel_state.display().to_string(),
             &cfg.hosts,
+            &toron_mcp_url(),
         );
         if existing == rendered {
             match start_via_supervisor(cfg, &unit)? {
@@ -1096,6 +1087,15 @@ pub fn status(cfg: &Config) -> Result<()> {
 
 /// Install the autostart unit (idempotent) and load it: macOS launchd
 /// agent, Linux systemd user unit. Template placeholders take the live
+/// The MCP URL the daemon hands its toron children through the unit env
+/// (bd-jvu7): beside a live toron daemon, a child without it refuses to open
+/// the store ("one store per project") and every sweep appends an
+/// `inbox_error` audit row. Operator env wins; default = toron's documented
+/// daemon port (docs/agent-instructions/backends.md).
+fn toron_mcp_url() -> String {
+    std::env::var("TORON_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:18080/mcp".to_string())
+}
+
 /// binary path + state dir; `serve` reads both back from argv/env so the
 /// unit and the pidfile path never diverge. Other platforms: loud error
 /// naming manual `doorbell start`.
@@ -1107,6 +1107,7 @@ pub fn install(cfg: &Config) -> Result<()> {
         cfg.port,
         &cfg.flywheel_state.display().to_string(),
         &cfg.hosts,
+        &toron_mcp_url(),
     );
     install_rendered(cfg, &body)
 }
@@ -1123,6 +1124,7 @@ pub fn render_autostart(
     port: u16,
     flywheel_state: &str,
     hosts: &[(String, String)],
+    toron_mcp_url: &str,
 ) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -1142,6 +1144,8 @@ pub fn render_autostart(
             .replace("DOORBELL_BIN", exe)
             .replace("DOORBELL_STATE_DIR_VALUE", state_dir)
             .replace("DOORBELL_STATE_DIR_KEY", "DOORBELL_STATE_DIR")
+            .replace("DOORBELL_TORON_MCP_URL_VALUE", toron_mcp_url)
+            .replace("DOORBELL_TORON_MCP_URL_KEY", "TORON_MCP_URL")
             .replace("DOORBELL_SERVE_ARGS", &args.join("\n        "))
     }
     #[cfg(not(target_os = "macos"))]
@@ -1162,8 +1166,68 @@ pub fn render_autostart(
             .replace("DOORBELL_BIN", exe)
             .replace("DOORBELL_STATE_DIR_VALUE", state_dir)
             .replace("DOORBELL_STATE_DIR_KEY", "DOORBELL_STATE_DIR")
+            .replace("DOORBELL_TORON_MCP_URL_VALUE", toron_mcp_url)
+            .replace("DOORBELL_TORON_MCP_URL_KEY", "TORON_MCP_URL")
             .replace("DOORBELL_SERVE_ARGS", &args.join(" "))
     }
+}
+
+/// The launchctl sequence that gets a rewritten unit file **actually
+/// loaded**: cheap `bootstrap` (fresh installs never bootout), then `bootout`
+/// to drop the stale loaded definition — `kickstart -k` restarts the OLD
+/// definition, so file edits never reach an already-loaded job — then
+/// `bootstrap` fresh, with `kickstart` last (wedged-domain recovery).
+/// Shared by install and start so neither regresses into kickstart-on-stale.
+fn reload_plan(uid: &str, unit: &std::path::Path) -> Vec<Vec<String>> {
+    let domain = format!("gui/{uid}/com.doorbell.serve");
+    let target = unit.display().to_string();
+    vec![
+        vec![
+            "launchctl".into(),
+            "bootstrap".into(),
+            format!("gui/{uid}"),
+            target.clone(),
+        ],
+        vec!["launchctl".into(), "bootout".into(), domain.clone()],
+        vec![
+            "launchctl".into(),
+            "bootstrap".into(),
+            format!("gui/{uid}"),
+            target,
+        ],
+        vec!["launchctl".into(), "kickstart".into(), "-k".into(), domain],
+    ]
+}
+
+/// Run the plan in order: the first bootstrap/kickstart success wins;
+/// `bootout` is best-effort (dropping the definition is the goal, not its
+/// exit code — an already-unloaded job must not abort the fresh load).
+/// Every real failure's stderr is kept, so a bail names the actual
+/// launchctl cause instead of just the step list.
+fn run_reload_plan(plan: &[Vec<String>]) -> std::result::Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    for cmd in plan {
+        let step = cmd.get(1).cloned().unwrap_or_default();
+        let out = std::process::Command::new(&cmd[0]).args(&cmd[1..]).output();
+        let (ok, err) = match out {
+            Ok(o) => (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            ),
+            Err(e) => (false, e.to_string()),
+        };
+        if step == "bootout" {
+            continue; // best-effort by contract, never a blocker
+        }
+        if ok {
+            return Ok(());
+        }
+        errors.push(format!("{step}: {err}"));
+    }
+    Err(format!(
+        "launchctl reload plan failed: {}",
+        errors.join(" | ")
+    ))
 }
 
 fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
@@ -1181,26 +1245,11 @@ fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "501".to_string());
-        let domain = format!("gui/{uid}/com.doorbell.serve");
-        let boot = std::process::Command::new("launchctl")
-            .args([
-                "bootstrap",
-                &format!("gui/{uid}"),
-                &path.display().to_string(),
-            ])
-            .output();
-        match boot {
-            Ok(o) if o.status.success() => {}
-            _ => {
-                // Already loaded (or kicked): kickstart -k restarts into the
-                // current binary instead of failing install.
-                let kick = std::process::Command::new("launchctl")
-                    .args(["kickstart", "-k", &domain])
-                    .output();
-                if !kick.map(|o| o.status.success()).unwrap_or(false) {
-                    anyhow::bail!("launchctl bootstrap + kickstart both failed for {domain}");
-                }
-            }
+        let domain = format!("gui/{uid}/com.doorbell.serve"); // bd-jvu7: rewriting the file is not loading it. The old fallback
+        // (`kickstart -k`) restarted the LOADED definition, so a rewritten
+        // plist (e.g. the toron MCP env) never reached a running job.
+        if let Err(e) = run_reload_plan(&reload_plan(&uid, &path)) {
+            anyhow::bail!("{e} for {domain}");
         }
         println!("doorbell: autostart installed ({})", path.display());
         return Ok(());
@@ -1395,7 +1444,14 @@ mod tests {
     #[test]
     fn render_substitutes_live_paths() {
         let hosts = vec![("proj".to_string(), "ws".to_string())];
-        let body = render_autostart("/opt/doorbell", "/var/dbll", 18980, "/var/fw", &hosts);
+        let body = render_autostart(
+            "/opt/doorbell",
+            "/var/dbll",
+            18980,
+            "/var/fw",
+            &hosts,
+            "http://127.0.0.1:18080/mcp",
+        );
         assert!(body.contains("/opt/doorbell"), "binary path rendered");
         assert!(body.contains("/var/dbll"), "state dir rendered");
         assert!(body.contains("18980"), "port rendered");
@@ -1426,11 +1482,90 @@ mod tests {
     #[test]
     fn render_empty_hosts_is_standby() {
         // No --host = standby (bind + reads only), same as `start`.
-        let body = render_autostart("/opt/doorbell", "/var/dbll", 18980, "/var/fw", &[]);
+        let body = render_autostart(
+            "/opt/doorbell",
+            "/var/dbll",
+            18980,
+            "/var/fw",
+            &[],
+            "http://127.0.0.1:18080/mcp",
+        );
         assert!(!body.contains("--host"), "standby carries no --host");
         assert!(
             !body.contains("DOORBELL_SERVE_ARGS"),
             "no placeholder survives"
+        );
+    }
+
+    /// bd-jvu7: the launchd env carried only `DOORBELL_STATE_DIR`, so every
+    /// bd-jvu7's second half: `install` rewrites the plist, but launchd's
+    /// `kickstart` restarts the **loaded** definition — file edits never
+    /// reach an already-loaded job (the stale env kept refusing
+    /// `toron mail inbox` forever while the file on disk looked correct).
+    /// The reload plan must drop the stale definition, bootstrap fresh, and
+    /// keep kickstart as last resort only.
+    #[test]
+    fn reload_plan_drops_the_stale_definition_before_rebootstrap() {
+        let plist = "/Users/x/Library/LaunchAgents/com.doorbell.serve.plist";
+        let plan = super::reload_plan("501", std::path::Path::new(plist));
+        let flat: Vec<String> = plan.iter().map(|c| c.join(" ")).collect();
+        assert_eq!(
+            flat.first().map(String::as_str),
+            Some(format!("launchctl bootstrap gui/501 {plist}").as_str()),
+            "cheap bootstrap first (fresh machines never bootout): {flat:?}"
+        );
+        let bootout = flat
+            .iter()
+            .position(|c| c.starts_with("launchctl bootout "))
+            .expect("bootout must be in the plan — the stale definition is the bug");
+        let rebootstrap = flat
+            .iter()
+            .rposition(|c| c.starts_with("launchctl bootstrap "))
+            .expect("re-bootstrap after the drop");
+        assert!(
+            bootout < rebootstrap,
+            "stale definition dropped before the fresh load: {flat:?}"
+        );
+        assert!(
+            flat.last()
+                .map(|c| c.starts_with("launchctl kickstart -k "))
+                .unwrap_or(false),
+            "kickstart only as last resort: {flat:?}"
+        );
+    }
+
+    /// The `toron mail inbox` child refused beside the live toron daemon
+    /// ("no daemon URL is configured … one store per project") and every
+    /// sweep appended an `inbox_error` audit row — live rows at
+    /// 2026-09-24T10:31Z, pins PlumGoose/BrightBadger. The unit must hand the
+    /// daemon (and therefore every toron child it spawns) the MCP URL.
+    #[test]
+    fn rendered_unit_forwards_toron_mcp_url_to_the_daemon_env() {
+        let body = render_autostart(
+            "/opt/doorbell",
+            "/var/dbll",
+            18980,
+            "/var/fw",
+            &[],
+            "http://127.0.0.1:18080/mcp",
+        );
+        assert!(
+            body.contains("TORON_MCP_URL"),
+            "the env name reaches the unit: {body}"
+        );
+        assert!(
+            body.contains("http://127.0.0.1:18080/mcp"),
+            "the URL value reaches the unit"
+        );
+        assert!(
+            !body.contains("DOORBELL_TORON_MCP_URL_VALUE")
+                && !body.contains("DOORBELL_TORON_MCP_URL_KEY"),
+            "no placeholder survives"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            body.contains("<key>TORON_MCP_URL</key>"),
+            "launchd env dict entry is well-formed"
         );
     }
 
