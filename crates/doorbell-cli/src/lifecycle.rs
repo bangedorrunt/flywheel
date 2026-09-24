@@ -428,14 +428,19 @@ fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     cond()
 }
 
-fn disable_supervisor(cfg: &Config) {
+/// Unload the supervisor, reporting a REAL failure (bd-yvte): the old
+/// `let _ = .output()` swallowed it, SIGKILL then respawned through
+/// KeepAlive, and the endpoint bail blamed "another process" for our own
+/// job. Absence counts as success — bootout of a never-loaded job (manual
+/// start) must never block a stop.
+fn disable_supervisor(cfg: &Config) -> Result<(), String> {
     // Never unload THE service on behalf of a scratch instance (tests and
     // probes run `stop` against temp state dirs while the real unit is
     // loaded — an unconditional bootout there killed the live daemon).
     if let Some(body) = installed_unit_path().and_then(|p| std::fs::read_to_string(p).ok())
         && !unit_body_serves(&body, &cfg.state_dir)
     {
-        return;
+        return Ok(());
     }
     #[cfg(target_os = "macos")]
     {
@@ -447,17 +452,58 @@ fn disable_supervisor(cfg: &Config) {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty());
         if let Some(uid) = uid {
-            let _ = std::process::Command::new("launchctl")
+            let out = std::process::Command::new("launchctl")
                 .args(["bootout", &format!("gui/{uid}/com.doorbell.serve")])
-                .output();
+                .output()
+                .map_err(|e| format!("launchctl bootout could not run: {e}"))?;
+            if !out.status.success() {
+                let text = format!(
+                    "{} {}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if !bootout_absent(&text) {
+                    return Err(format!(
+                        "launchctl bootout failed ({}): {}",
+                        out.status,
+                        text.trim()
+                    ));
+                }
+            }
         }
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("systemctl")
+        let out = std::process::Command::new("systemctl")
             .args(["--user", "stop", "doorbell.service"])
-            .output();
+            .output()
+            .map_err(|e| format!("systemctl stop could not run: {e}"))?;
+        if !out.status.success() {
+            let text = format!(
+                "{} {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if !bootout_absent(&text) {
+                return Err(format!(
+                    "systemctl stop failed ({}): {}",
+                    out.status,
+                    text.trim()
+                ));
+            }
+        }
     }
+    Ok(())
+}
+
+/// Absence signatures of `bootout`/`stop` on a job that is not loaded —
+/// the goal (nothing left to respawn) is already met, so those count as
+/// success. Pure, so the classification is unit-tested without launchd.
+fn bootout_absent(output: &str) -> bool {
+    let s = output.to_ascii_lowercase();
+    ["no such process", "could not find service", "not loaded"]
+        .iter()
+        .any(|p| s.contains(p))
 }
 
 /// The installed unit serves this state dir (its argv names it). A unit
@@ -933,7 +979,7 @@ trait StopWorld {
     fn signal(&mut self, pid: u32, sig: Sig);
     /// Poll until the pid is dead or `grace` elapses; true = dead.
     fn wait_dead(&mut self, pid: u32, grace: Duration) -> bool;
-    fn unload_supervisor(&mut self);
+    fn unload_supervisor(&mut self) -> Result<(), String>;
     fn health_answers(&mut self) -> bool;
     fn tcp_alive(&mut self, port: u16) -> bool;
     fn uds_alive(&mut self, path: &std::path::Path) -> bool;
@@ -967,8 +1013,8 @@ impl StopWorld for RealStop<'_> {
     fn wait_dead(&mut self, pid: u32, grace: Duration) -> bool {
         wait_for(|| !pid_alive(pid), grace)
     }
-    fn unload_supervisor(&mut self) {
-        disable_supervisor(self.cfg);
+    fn unload_supervisor(&mut self) -> Result<(), String> {
+        disable_supervisor(self.cfg)
     }
     fn health_answers(&mut self) -> bool {
         health_probe(self.cfg).is_some()
@@ -1032,7 +1078,18 @@ fn stop_core<W: StopWorld>(
     let mut escalated = false;
     if !world.wait_dead(pid, grace) {
         eprintln!("doorbell: pid {pid} still alive after {grace:?} grace — sending SIGKILL");
-        world.unload_supervisor();
+        // bd-yvte: the unload IS the respawn guard (bd-pf3b), so its failure
+        // can never be swallowed: retry once (launchd busy), then refuse the
+        // kill — SIGKILL into a loaded job respawns sub-second and the
+        // endpoint bail would misattribute our own respawn as a squatter.
+        if let Err(first) = world.unload_supervisor() {
+            eprintln!("doorbell: supervisor unload failed ({first}) — retrying once");
+            if let Err(second) = world.unload_supervisor() {
+                anyhow::bail!(
+                    "doorbell: cannot stop pid {pid} — supervisor unload failed twice ({second}; first: {first}); SIGKILL would be respawned by the supervisor. Unload it manually (launchctl bootout / systemctl stop doorbell.service) and retry"
+                );
+            }
+        }
         world.signal(pid, Sig::Kill);
         escalated = true;
         if !world.wait_dead(pid, kill_grace) {
@@ -1041,7 +1098,14 @@ fn stop_core<W: StopWorld>(
             );
         }
     } else {
-        world.unload_supervisor();
+        // Clean exit: a 0-exit is not respawned (KeepAlive guards on
+        // unsuccessful exit), but a still-loaded definition goes stale on
+        // the next edit — loud, not fatal (bd-yvte: never silent).
+        if let Err(e) = world.unload_supervisor() {
+            eprintln!(
+                "doorbell: supervisor unload failed after clean exit ({e}) — run `doorbell install` to reload the definition"
+            );
+        }
     }
     // The pid is gone; a live endpoint now belongs to a DIFFERENT process.
     // Never report success for a port we no longer own.
@@ -1830,6 +1894,9 @@ mod tests {
         health: bool,
         tcp: bool,
         uds: bool,
+        /// Leading `unload_supervisor` calls that fail (bd-yvte):
+        /// decremented per call; 0 = the scripted world unloads cleanly.
+        unload_fails: usize,
         actions: Vec<String>,
     }
 
@@ -1863,8 +1930,15 @@ mod tests {
             self.actions.push(format!("wait {pid} {grace:?}"));
             self.dead_after.pop_front().unwrap_or(true)
         }
-        fn unload_supervisor(&mut self) {
-            self.actions.push("unload".into());
+        fn unload_supervisor(&mut self) -> Result<(), String> {
+            if self.unload_fails > 0 {
+                self.unload_fails -= 1;
+                self.actions.push("unload-failed".into());
+                Err("scripted bootout failure".into())
+            } else {
+                self.actions.push("unload".into());
+                Ok(())
+            }
         }
         fn health_answers(&mut self) -> bool {
             self.health
@@ -1934,14 +2008,15 @@ mod tests {
     /// the full drain, then SIGKILL plus the respawn race produced
     /// "port still held".
     #[test]
-    fn stop_grace_covers_drain_probe_and_exit_path() {
-        use crate::serve::{DRAIN_BUDGET, LIVENESS_PROBE_SAMPLE};
+    fn stop_grace_covers_send_drain_probe_and_exit_path() {
+        use crate::serve::{DRAIN_BUDGET, LIVENESS_PROBE_SAMPLE, SEND_BUDGET};
+        let send = SEND_BUDGET;
         let drain = DRAIN_BUDGET;
         let probe = LIVENESS_PROBE_SAMPLE;
         let exit_path = super::EXIT_PATH_ALLOWANCE;
         assert!(
-            super::STOP_GRACE >= drain + probe + exit_path,
-            "STOP_GRACE {:?} < drain {drain:?} + probe {probe:?} + exit {exit_path:?}",
+            super::STOP_GRACE >= send + drain + probe + exit_path,
+            "STOP_GRACE {:?} < send {send:?} + drain {drain:?} + probe {probe:?} + exit {exit_path:?}",
             super::STOP_GRACE
         );
     }
@@ -1973,6 +2048,73 @@ mod tests {
             "job dropped before the unclean exit: {:?}",
             w.actions
         );
+    }
+
+    /// bd-yvte: the unload IS the respawn guard — swallowing its failure
+    /// let SIGKILL resurrect the daemon and the endpoint bail then blamed
+    /// "another process" for launchd's own respawn. Persistent bootout
+    /// failure must stop the sequence BEFORE the kill, naming the real cause.
+    #[test]
+    fn escalation_bails_before_sigkill_when_bootout_persists_so_respawn_never_masks_the_cause() {
+        let mut w = ScriptedStop {
+            target: Some(9),
+            dead_after: vec![false, false].into(),
+            unload_fails: 2,
+            ..Default::default()
+        };
+        let err = w
+            .stop(false)
+            .expect_err("a dead respawn guard must refuse the kill");
+        assert!(
+            err.to_string().contains("supervisor unload failed twice"),
+            "{err}"
+        );
+        assert!(
+            !w.actions.iter().any(|a| a == "signal 9 Kill"),
+            "SIGKILL with a loaded job = guaranteed respawn: {:?}",
+            w.actions
+        );
+        assert_eq!(
+            w.actions.iter().filter(|a| *a == "unload-failed").count(),
+            2,
+            "both bootout attempts observed: {:?}",
+            w.actions
+        );
+    }
+
+    /// Retry-once policy: a transient launchd busy must not fail the stop —
+    /// one clean retry, then the normal kill path proceeds.
+    #[test]
+    fn escalation_retries_a_failed_bootout_once_before_killing() {
+        let mut w = ScriptedStop {
+            target: Some(9),
+            dead_after: vec![false, true].into(),
+            unload_fails: 1,
+            ..Default::default()
+        };
+        let msg = w.stop(false).expect("retry succeeds");
+        assert!(msg.contains("SIGKILL"), "{msg}");
+        let failed = w.position("unload-failed");
+        let unload = w.position("unload");
+        let kill = w.position("signal 9 Kill");
+        assert!(
+            failed < unload && unload < kill,
+            "fail, retry, then kill: {:?}",
+            w.actions
+        );
+    }
+
+    /// Absence is success: bootout of a never-loaded job (manual start, no
+    /// launchd job) must not block a stop — only a real failure does.
+    #[test]
+    fn bootout_absence_is_success_and_real_failures_are_not() {
+        assert!(super::bootout_absent("Boot-out failed: 3: No such process"));
+        assert!(super::bootout_absent(
+            "Failed to stop unit: doorbell.service not loaded"
+        ));
+        assert!(!super::bootout_absent(
+            "Boot-out failed: 1: Operation not permitted"
+        ));
     }
 
     #[test]
