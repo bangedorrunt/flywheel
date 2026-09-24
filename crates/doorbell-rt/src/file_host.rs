@@ -1486,16 +1486,23 @@ impl Host for FileHost {
                 },
                 move |out| {
                     use crate::wake_sock::WakeOutcome;
+                    // GS062-ADV-5 (ported onto wake-sock): try_send Watch (never
+                    // park); stamp .event only after Ok; Died via blocking_send
+                    // so Full cannot drop restart_wake.
                     match out {
-                        WakeOutcome::Watch(l) => {
-                            crate::watchbeat::touch(&beat_state, &beat_workspace);
-                            let _ = tx.blocking_send(BrainMsg::Watch(l));
-                        }
+                        WakeOutcome::Watch(l) => match tx.try_send(BrainMsg::Watch(l)) {
+                            Ok(()) => {
+                                crate::watchbeat::touch_event(&beat_state, &beat_workspace);
+                            }
+                            Err(_) => {
+                                crate::msg::deliver_died_blocking(&tx);
+                            }
+                        },
                         WakeOutcome::Heartbeat => {
-                            crate::watchbeat::touch(&beat_state, &beat_workspace);
+                            crate::watchbeat::touch_heartbeat(&beat_state, &beat_workspace);
                         }
                         WakeOutcome::Died => {
-                            let _ = tx.blocking_send(BrainMsg::Died);
+                            crate::msg::deliver_died_blocking(&tx);
                         }
                     }
                 },
