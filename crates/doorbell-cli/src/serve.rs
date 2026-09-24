@@ -154,9 +154,24 @@ struct HostedLoop {
 
 type Hosts = Shared<Vec<HostedLoop>>;
 
-/// The hosted keys, in insertion order — what `/health` reports as `hosted`.
+/// Hosted keys in insertion order (reconcile / stats bookkeeping).
 fn hosted_keys(hosts: &[HostedLoop]) -> Vec<String> {
     hosts.iter().map(|h| h.key.clone()).collect()
+}
+
+/// GS-062: `/health` hosted order — alive-first then alphabetical **workspace
+/// slug** (shared with flywheel serve via
+/// [`doorbell_rt::wake_liveness::order_hosted_alive_first_by`]).
+///
+/// In-memory [`HostedLoop`]s are all live in this process, so the alive
+/// partition holds every key. Sort by the workspace half of
+/// `project/workspace` (not insertion order) so primary converges with
+/// flywheel's slug order.
+fn hosted_keys_for_health(hosts: &[HostedLoop]) -> Vec<String> {
+    let alive: Vec<String> = hosts.iter().map(|h| h.key.clone()).collect();
+    doorbell_rt::wake_liveness::order_hosted_alive_first_by(alive, Vec::new(), |k| {
+        hosted_workspace(k).unwrap_or(k)
+    })
 }
 
 /// The external CLIs this daemon execs. Resolved through the shared search
@@ -1086,13 +1101,56 @@ fn hosted_subscribers(fw_state: &std::path::Path, hosted: &[String]) -> usize {
 }
 
 /// Age of the most recent bus event across the hosted workspaces (min age =
-/// most recent), read back from the watch heartbeat.
+/// most recent), from the `.event` stamp only.
+///
+/// GS-062: `watch.last_event_age_s` is **event-only** — under Quiet wake
+/// (heartbeats alive, no lines) this is `null`/stale while `wake.class=Quiet`.
 fn hosted_watch_age(fw_state: &std::path::Path, hosted: &[String]) -> Option<u64> {
+    // GS-062: last_event_age_s from the **event** stamp (not hb).
     hosted
         .iter()
         .filter_map(|h| hosted_workspace(h))
-        .filter_map(|ws| doorbell_rt::watchbeat::age_secs(fw_state, ws))
+        .filter_map(|ws| doorbell_rt::watchbeat::event_age_secs(fw_state, ws))
         .min()
+}
+
+/// GS-062 ASK-USER E + F (captain locked): wake_liveness Quiet/Live/Deaf on
+/// operator `/health` (:18980), using hosted AppState workspace keys
+/// (same labels stamp writers use). Ask-user F: **worst-of** across ALL
+/// hosted workspaces (consistent with `hosted_watch_age` min-across-hosted),
+/// not primary-only. In-memory HostedLoops are all alive — empty hosted →
+/// NeverStamped.
+fn hosted_wake_pipe(fw_state: &std::path::Path, hosted: &[String]) -> serde_json::Value {
+    use doorbell_rt::wake_liveness::{self, DEFAULT_DEAF_CEILING_MS};
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let workspaces: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
+    // Worst-of over every hosted workspace (ask-user F). Never max-merge
+    // stamps then classify once (Live would mask Deaf). Winner label becomes
+    // wake.workspace so stamps match the class (not first-alive).
+    let stamps: Vec<(&str, Option<u64>, Option<u64>)> = workspaces
+        .iter()
+        .map(|ws| {
+            (
+                *ws,
+                doorbell_rt::watchbeat::last_event_ms(fw_state, ws),
+                doorbell_rt::watchbeat::last_heartbeat_ms(fw_state, ws),
+            )
+        })
+        .collect();
+    let (pipe, worst_ws, last_event_ms, last_heartbeat_ms) =
+        wake_liveness::classify_worst_of_stamps(now_ms, stamps, DEFAULT_DEAF_CEILING_MS);
+    let workspace = worst_ws.unwrap_or("");
+    serde_json::json!({
+        "workspace": workspace,
+        "hosted": workspaces,
+        "pipe": wake_liveness::to_json(pipe),
+        "last_event_ms": last_event_ms,
+        "last_heartbeat_ms": last_heartbeat_ms,
+        "deaf_ceiling_ms": DEFAULT_DEAF_CEILING_MS,
+    })
 }
 
 fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u64>, u64) {
@@ -1151,7 +1209,8 @@ fn known_journal_workspaces(fw_state: &std::path::Path) -> Vec<String> {
 
 fn health_body(app: &AppState) -> String {
     // bd-2o1v: hosting is dynamic — snapshot under the lock once.
-    let hosted = hosted_keys(&app.hosted.lock());
+    // GS-062: alive-first + alphabetical slug (not insertion order).
+    let hosted = hosted_keys_for_health(&app.hosted.lock());
     // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut degraded = Vec::new();
@@ -1175,6 +1234,8 @@ fn health_body(app: &AppState) -> String {
     }
     let (sweep_age, max_seq) = hosted_sweep_age(&app.fw_state, &hosted);
     let watch_age = hosted_watch_age(&app.fw_state, &hosted);
+    // ASK-USER E: Quiet/Live/Deaf via wake_liveness on hosted AppState keys.
+    let wake = hosted_wake_pipe(&app.fw_state, &hosted);
     // D2/P3: the daemon's own edges degrade loudly. Two facts that were
     // live-invisible: every inbox fetch failing (`inbox_error` audits) and a
     // watch child that dies far faster than its idle-exit cadence
@@ -1251,13 +1312,16 @@ fn health_body(app: &AppState) -> String {
                 "herdr": bins.herdr_resolved,
             },
         },
-        // last_event_age_s is MEASURED from the watch heartbeat (None =
-        // this workspace has never seen a bus event: wrong bus or dead
-        // child), not the literal `null` it used to be.
+        // last_event_age_s is .event-only (GS-062 split; not hb). Quiet wake
+        // (hb live, no bus lines) → null/stale here while wake.class=Quiet.
+        // None also covers never-seen events (wrong bus or dead child).
         "watch": {
             "state": if hosted.is_empty() { "standby" } else { "hosted" },
             "last_event_age_s": watch_age,
         },
+        // GS-062 ASK-USER E: wake_liveness Quiet/Live/Deaf (same shape as
+        // flywheel serve /health). Keys come from AppState.hosted.
+        "wake": wake,
         "sweep": {"last_age_s": sweep_age},
         // Measured, not hardcoded: the literal `0` here read as "no wake
         // subscriptions" even on a fully hosted daemon mid-ring, and sent
@@ -1455,6 +1519,97 @@ mod tests {
             key: key.to_string(),
             tx,
         }
+    }
+
+    #[test]
+    fn hosted_keys_for_health_orders_by_workspace_slug() {
+        // Insertion order: beta then alpha; health order must be alpha first.
+        let hosts = vec![
+            host_for_test("zzz/beta"),
+            host_for_test("aaa/alpha"),
+        ];
+        let keys = super::hosted_keys(&hosts);
+        assert_eq!(keys[0], "zzz/beta", "insertion order preserved for reconcile");
+        let health = super::hosted_keys_for_health(&hosts);
+        assert_eq!(
+            health,
+            vec!["aaa/alpha".to_string(), "zzz/beta".to_string()],
+            "health primary follows alphabetical workspace slug"
+        );
+    }
+
+    #[test]
+    fn hosted_wake_pipe_empty_is_never_stamped() {
+        let dir = std::env::temp_dir().join(format!(
+            "db-wake-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let wake = super::hosted_wake_pipe(&dir, &[]);
+        assert_eq!(wake["pipe"]["class"], "NeverStamped", "{wake}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosted_wake_pipe_live_only_is_live() {
+        let dir = std::env::temp_dir().join(format!(
+            "db-wake-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join("doorbell")).expect("dir");
+        doorbell_rt::watchbeat::touch_event(&dir, "live-ws");
+        doorbell_rt::watchbeat::touch_heartbeat(&dir, "live-ws");
+        let wake = super::hosted_wake_pipe(&dir, &["proj/live-ws".into()]);
+        assert_eq!(wake["pipe"]["class"], "Live", "{wake}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosted_wake_pipe_worst_of_deaf_plus_live() {
+        // Stamp-pair unit (mtime backdate not required): Deaf + Live → Deaf.
+        let pipe = doorbell_rt::wake_liveness::classify_worst_of(
+            200_000,
+            [
+                (None, Some(100_000u64)),             // Deaf
+                (Some(199_000u64), Some(198_000u64)), // Live
+            ],
+            doorbell_rt::wake_liveness::DEFAULT_DEAF_CEILING_MS,
+        );
+        assert_eq!(
+            pipe,
+            doorbell_rt::wake_liveness::PipeHealth::Deaf {
+                silent_for_ms: 100_000
+            },
+            "ask-user F: Deaf must win over Live"
+        );
+    }
+
+    #[test]
+    fn hosted_wake_pipe_worst_workspace_label_matches_stamps() {
+        // Winner label from classify_worst_of_stamps must be the Deaf ws, not
+        // first-alive Live — same contract hosted_wake_pipe uses for workspace.
+        let (pipe, winner, ev, hb) = doorbell_rt::wake_liveness::classify_worst_of_stamps(
+            200_000,
+            [
+                ("live-ws", Some(199_000u64), Some(198_000u64)),
+                ("deaf-ws", None, Some(100_000u64)),
+            ],
+            doorbell_rt::wake_liveness::DEFAULT_DEAF_CEILING_MS,
+        );
+        assert!(matches!(
+            pipe,
+            doorbell_rt::wake_liveness::PipeHealth::Deaf { .. }
+        ));
+        assert_eq!(winner, Some("deaf-ws"));
+        assert_eq!((ev, hb), (None, Some(100_000)));
     }
 
     /// bd-mk60: reconcile retires a loop whose subscription went away, and
