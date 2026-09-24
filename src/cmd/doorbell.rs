@@ -641,7 +641,28 @@ pub(crate) fn cmd_doorbell_digest(
                 .and_then(|p| p.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_str()).any(|p| p == id))
                 .unwrap_or(false);
-            if tag != Some(id) && !in_pins {
+            // bd-ff92: watch-decided rows carry pins:[] — the addressed pin
+            // lives only inside actions[].Digest.pin (digest-bound wake for
+            // a pane-less pin). Without this the observed live wake line is
+            // invisible to `digest --identity`, exactly the reported symptom.
+            let in_actions = entry
+                .get("actions")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter().any(|v| {
+                        v.get("Digest")
+                            .and_then(|d| d.get("pin"))
+                            .and_then(|p| p.as_str())
+                            == Some(id)
+                            || v
+                                .get("Prompt")
+                                .and_then(|d| d.get("pin"))
+                                .and_then(|p| p.as_str())
+                                == Some(id)
+                    })
+                })
+                .unwrap_or(false);
+            if tag != Some(id) && !in_pins && !in_actions {
                 continue;
             }
         }
