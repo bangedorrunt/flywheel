@@ -477,7 +477,8 @@ impl Host for RtHost {
                     match ev {
                         Some(l) => tx_g.try_send(BrainMsg::Watch(l)).is_ok(),
                         None => {
-                            let _ = tx_g.try_send(BrainMsg::Died);
+                            // GS062-ADV-5: Died must not be lossy under Full.
+                            doorbell_rt::msg::deliver_died_blocking(&tx_g);
                             true
                         }
                     }
@@ -651,7 +652,8 @@ async fn run_embedded_async(
                 match ev {
                     Some(l) => tx_w.try_send(BrainMsg::Watch(l)).is_ok(),
                     None => {
-                        let _ = tx_w.try_send(BrainMsg::Died);
+                        // GS062-ADV-5: Died must not be lossy under Full.
+                        doorbell_rt::msg::deliver_died_blocking(&tx_w);
                         true
                     }
                 }
@@ -797,15 +799,15 @@ fn spawn_bus_watch(
                             "tags": tags,
                             "created_at": e.created_at.as_secs(),
                         });
-                        stamps.on_event();
-                        // GS062-ADV-5: try_send; on Full/Closed mirror Closed —
-                        // stamps.stop()+Died (was bare break → perpetual Quiet).
+                        // GS062-ADV-5: try_send Watch; on Full/Closed stop hb +
+                        // blocking_send Died (Full must not drop restart). Stamp
+                        // .event only after Watch Ok.
                         if let Ok(line) = serde_json::to_string(&v) {
                             match tx.try_send(BrainMsg::Watch(line)) {
-                                Ok(()) => {}
+                                Ok(()) => stamps.on_event(),
                                 Err(_) => {
                                     stamps.stop();
-                                    let _ = tx.try_send(BrainMsg::Died);
+                                    doorbell_rt::msg::deliver_died_blocking(&tx);
                                     break;
                                 }
                             }
@@ -814,7 +816,7 @@ fn spawn_bus_watch(
                     Some(toron_core::bus::SubscriptionEvent::Eose) => continue,
                     Some(toron_core::bus::SubscriptionEvent::Closed(_)) | None => {
                         stamps.stop();
-                        let _ = tx.try_send(BrainMsg::Died);
+                        doorbell_rt::msg::deliver_died_blocking(&tx);
                         break;
                     }
                 }

@@ -1127,20 +1127,22 @@ fn hosted_wake_pipe(fw_state: &std::path::Path, hosted: &[String]) -> serde_json
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let workspaces: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
-    let workspace = workspaces.first().copied().unwrap_or("");
     // Worst-of over every hosted workspace (ask-user F). Never max-merge
-    // stamps then classify once (Live would mask Deaf).
-    let stamps: Vec<(Option<u64>, Option<u64>)> = workspaces
+    // stamps then classify once (Live would mask Deaf). Winner label becomes
+    // wake.workspace so stamps match the class (not first-alive).
+    let stamps: Vec<(&str, Option<u64>, Option<u64>)> = workspaces
         .iter()
         .map(|ws| {
             (
+                *ws,
                 doorbell_rt::watchbeat::last_event_ms(fw_state, ws),
                 doorbell_rt::watchbeat::last_heartbeat_ms(fw_state, ws),
             )
         })
         .collect();
-    let (pipe, last_event_ms, last_heartbeat_ms) =
+    let (pipe, worst_ws, last_event_ms, last_heartbeat_ms) =
         wake_liveness::classify_worst_of_stamps(now_ms, stamps, DEFAULT_DEAF_CEILING_MS);
+    let workspace = worst_ws.unwrap_or("");
     serde_json::json!({
         "workspace": workspace,
         "hosted": workspaces,
@@ -1588,6 +1590,26 @@ mod tests {
             },
             "ask-user F: Deaf must win over Live"
         );
+    }
+
+    #[test]
+    fn hosted_wake_pipe_worst_workspace_label_matches_stamps() {
+        // Winner label from classify_worst_of_stamps must be the Deaf ws, not
+        // first-alive Live — same contract hosted_wake_pipe uses for workspace.
+        let (pipe, winner, ev, hb) = doorbell_rt::wake_liveness::classify_worst_of_stamps(
+            200_000,
+            [
+                ("live-ws", Some(199_000u64), Some(198_000u64)),
+                ("deaf-ws", None, Some(100_000u64)),
+            ],
+            doorbell_rt::wake_liveness::DEFAULT_DEAF_CEILING_MS,
+        );
+        assert!(matches!(
+            pipe,
+            doorbell_rt::wake_liveness::PipeHealth::Deaf { .. }
+        ));
+        assert_eq!(winner, Some("deaf-ws"));
+        assert_eq!((ev, hb), (None, Some(100_000)));
     }
 
     /// bd-mk60: reconcile retires a loop whose subscription went away, and

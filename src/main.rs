@@ -9419,12 +9419,14 @@ where
         for line in std::io::BufReader::new(stdout).lines() {
             match line {
                 Ok(l) => {
-                    stamps.on_event();
+                    // GS062-ADV-5: stamp only after Brain enqueue Ok — Full/Closed
+                    // must not refresh .event then stop hb (false Live).
                     if !on_event(Some(l)) {
                         stamps.stop();
-                        let _ = on_event(None); // Died
+                        let _ = on_event(None); // Died (callback: blocking_send)
                         return;
                     }
+                    stamps.on_event();
                 }
                 Err(_) => break,
             }
@@ -32271,28 +32273,31 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
             *g = hosted.clone();
             (alive, hosted)
         };
-        // Primary display = first alive. Empty alive → NeverStamped.
-        let workspace = alive.first().cloned().unwrap_or_default();
+        // Empty alive → NeverStamped. wake.workspace = worst-of winner
+        // (stamps match class; not first-alive).
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         // Worst-of over alive stamps only (ask-user F). Never max-merge then
         // classify once — that lets one Live mask another Deaf.
-        let stamps: Vec<(Option<u64>, Option<u64>)> = alive
+        let stamps: Vec<(String, Option<u64>, Option<u64>)> = alive
             .iter()
             .map(|ws| {
                 (
+                    ws.clone(),
                     doorbell_rt::watchbeat::last_event_ms(&state_dir, ws),
                     doorbell_rt::watchbeat::last_heartbeat_ms(&state_dir, ws),
                 )
             })
             .collect();
-        let (pipe, last_event_ms, last_heartbeat_ms) = wake_liveness::classify_worst_of_stamps(
-            now_ms,
-            stamps,
-            wake_liveness::DEFAULT_DEAF_CEILING_MS,
-        );
+        let (pipe, worst_ws, last_event_ms, last_heartbeat_ms) =
+            wake_liveness::classify_worst_of_stamps(
+                now_ms,
+                stamps,
+                wake_liveness::DEFAULT_DEAF_CEILING_MS,
+            );
+        let workspace = worst_ws.unwrap_or_default();
         json!({
             "status": "ok",
             "wake": {
