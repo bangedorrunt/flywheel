@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`wake` on `/health` (GS-062 / PR #16).** Operator doorbell `:18980` and flywheel `serve` expose wake_liveness: `workspace` / `hosted`, `pipe.class` Quiet|Live|Deaf|NeverStamped (with class-specific stamps / `silent_for_ms`), split `last_event_ms` / `last_heartbeat_ms` (`.event` / `.hb`, never max-merged), `deaf_ceiling_ms` (60s), worst-of across hosted so one Deaf cannot hide behind another Live, and ADV-5 (`try_send` Watch; stamp `.event` only after Ok; Died via `blocking_send`). Guides: `docs/guides/doorbell.mdx` (`/health.wake`), `docs/guides/troubleshooting.mdx`.
+
 ## [0.7.0] — 2026-09-19 doorbell vision leftovers
 
 Classifier honesty, HITL bind, and the doorbell wake gaps from live flywheel×toron collab (bd-gpj0).

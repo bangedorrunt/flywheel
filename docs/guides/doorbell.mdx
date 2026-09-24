@@ -189,6 +189,54 @@ plane's own files rather than tracked in RAM, so it survives a restart:
 | `standby_with_known_workspaces` | the daemon is hosting nothing while workspaces that expect rings exist — re-arm it |
 | `no_injectable_panes` | the exact opposite of a bug: hosting, registry pins exist, and `herdr agent list` knows the panes of **none** of them. Wakes classify, queue, and digest, and no prompt can land — start agents (`herdr agent start`) or fix the stale registry |
 
+
+### Reading `/health.wake`
+
+GS-062 (PR #16) puts wake-pipe liveness on both operator doorbell `/health`
+(`:18980`) and flywheel `serve` `/health`. The object is the same shape on
+both surfaces:
+
+```json
+"wake": {
+  "workspace": "flywheel-flywheel",
+  "hosted": ["flywheel-flywheel", "other-ws"],
+  "pipe": { "class": "Quiet", "last_heartbeat_ms": 1727000000123 },
+  "last_event_ms": null,
+  "last_heartbeat_ms": 1727000000123,
+  "deaf_ceiling_ms": 60000
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `workspace` | Worst-of **winner** workspace (stamps match the class — not "first alive") |
+| `hosted` | Hosted workspace labels the classifier considered (alive-first order on flywheel `serve`; in-memory hosts on operator doorbell) |
+| `pipe` | Classified pipe health — see classes below |
+| `last_event_ms` / `last_heartbeat_ms` | Absolute unix-ms stamps from the **winner** workspace only (`null` if never stamped). Event and heartbeat are **split**: files `watch-<ws>.event` and `watch-<ws>.hb` under state `doorbell/`. Never pass `max(event, hb)` into `last_event_ms` — that collapses Quiet into Live |
+| `deaf_ceiling_ms` | Silence ceiling (default **60000**). Live/Quiet require a frame inside this window; past it → Deaf |
+
+`pipe.class` (and class-specific fields inside `pipe`):
+
+| Class | Means | Extra fields |
+|---|---|---|
+| `Live` | A recent **event** inside the ceiling | `last_event_ms` |
+| `Quiet` | No recent event, but a **heartbeat** inside the ceiling proves the pipe is alive | `last_heartbeat_ms` |
+| `Deaf` | A known stamp exists, but no frame of either kind inside the ceiling | `silent_for_ms` (measured age of the most recent frame — never a fabricated ceiling stand-in) |
+| `NeverStamped` | Never observed either stamp — **unknown ≠ deaf** | _(none)_ |
+
+**Worst-of aggregate.** Multi-hosted classification takes the **worst** pipe
+across hosted workspaces (`NeverStamped` > `Deaf` > `Quiet` > `Live`), not
+primary-only and not a max-merge of stamps then one classify (one Live would
+mask another Deaf). Empty alive/hosted → `NeverStamped`.
+
+**ADV-5 (operators).** The wake consumer stamps `.event` only after a
+successful `try_send` of `Watch` onto the brain channel; a full channel does
+**not** stamp a delivered-looking event. `Died` uses `blocking_send` so a
+full channel cannot drop `restart_wake`. Heartbeats stamp `.hb` without a
+brain send.
+
+See toron `docs/guides/buzz-parity` (PR #6) for Buzz×mail parity SoT.
+
 ### Signal hygiene: the audit file must stay readable
 
 Two live faults were *found* only by reading the plane's own files, and both
@@ -255,7 +303,7 @@ serve/migrate/ping).
 | Subscriptions | `flywheel doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair and is required: a project-less row is refused loud, bd-zawk — it would never ring) |
 | Cross-workspace | `flywheel doorbell subscribe --workspace wA --pin P --extra wB --project <slug>` (scope printed, never implicit; `--project` required) |
 | Human wake (no pane) | `flywheel doorbell subscribe --sink webhook --url http://host:port/path` + `DOORBELL_WEBHOOK_ALLOWLIST=host` on the daemon (see above) |
-| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded` |
+| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded`, and `wake` (see Reading `/health.wake` above) |
 
 Cross-project wake is a captain hold: `br hold --kind captain --corr external:<proj>:<bead> <your-bead>` rings once when the foreign bead closes; you still resolve the hold.
 
