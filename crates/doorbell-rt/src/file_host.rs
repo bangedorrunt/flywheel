@@ -397,14 +397,14 @@ fn parse_agent_roster(v: &serde_json::Value) -> Vec<(String, String, Option<Stri
         .collect()
 }
 
-/// bd-3vr9: union herdr-known operator panes into the routing set.
-/// Spawn-registry rows cover spawned crews; an operator pane (never
+/// bd-3vr9: union herdr-known captain panes into the routing set.
+/// Spawn-registry rows cover spawned crews; a captain pane (never
 /// spawned) carries its pin in the `toron_pin` token instead. For every
 /// wanted pin with no route yet, bind the pane whose token names it.
 /// Pure: `roster` is one agent-list snapshot, `want` the swept +
 /// subscribed pins, `routed` the pins the registry already covers.
 /// Returns (pin, pane_id) pairs — pane ids prompt directly.
-fn operator_targets(
+fn captain_pane_targets(
     roster: &[(String, String, Option<String>)],
     want: &[String],
     routed: &std::collections::HashSet<String>,
@@ -466,6 +466,11 @@ struct StaleReap {
 /// before the registry row is written, but herdr may brief us mid-flight),
 /// short enough that a dead fleet stops costing fetches.
 const STALE_PANE_GRACE_SECS: u64 = 120;
+
+/// bd-3vr9: a presence verdict older than this yields to live herdr
+/// status. Presence rows arrive only on agent publish; hook-less panes
+/// keep stale words for hours.
+const PRESENCE_STALE_SECS: u64 = 120;
 
 /// Can the ring's LAST hop land here at all? (bd-ba8t)
 ///
@@ -537,6 +542,10 @@ pub struct FileHost {
     /// Sticky presence verdicts — ONLY `Presence` msgs write here
     /// (mirrors the workspace tick arm: direct insert, no fallback).
     presence: BTreeMap<String, PresenceVerdict>,
+    /// Wall seconds of the last `Presence` msg per pin (bd-3vr9). A verdict
+    /// with no fresh publisher is stale evidence: live herdr status
+    /// outranks it, fresh self-report outranks herdr.
+    presence_ts: BTreeMap<String, u64>,
     /// Last-known herdr statuses by pin (poll-joined via registry).
     herdr: BTreeMap<String, String>,
     /// Role binds (role -> pin), drained from the pending files at sweep
@@ -565,8 +574,8 @@ pub struct FileHost {
     /// Pins already audited as reaped, so the audit fires once per episode.
     reaped_pins: Vec<String>,
     /// Operator pins currently bound via herdr token (bd-3vr9), so the
-    /// `operator_pane_routed` audit fires on change, not every refresh.
-    operator_routed_pins: Vec<String>,
+    /// `captain_pane_routed` audit fires on change, not every refresh.
+    captain_routed_pins: Vec<String>,
     /// The subset of `index_pins` with no spawn-registry row, so no pane and
     /// no herdr target (bd-bk9t). Mirrored onto
     /// `reducer.model.unroutable`; kept here too so the index change guard
@@ -612,6 +621,7 @@ impl FileHost {
             cfg,
             reducer: CoreReducer::default(),
             presence: BTreeMap::new(),
+            presence_ts: BTreeMap::new(),
             herdr: BTreeMap::new(),
             roles: BTreeMap::new(),
             panes: BTreeMap::new(),
@@ -622,7 +632,7 @@ impl FileHost {
             stale_panes: BTreeMap::new(),
             reaped_pins: Vec::new(),
             unroutable_pins: Vec::new(),
-            operator_routed_pins: Vec::new(),
+            captain_routed_pins: Vec::new(),
             index_refreshed_at: 0,
             retry: crate::policy::WatchRetry::default(),
             daemon_exe,
@@ -849,31 +859,32 @@ impl FileHost {
                     .iter()
                     .map(|(pin, _, name)| (pin.clone(), name.clone())),
             );
-            // bd-3vr9: union herdr-known operator panes (same resolver, no
+            // bd-3vr9: union herdr-known captain panes (same resolver, no
             // second table). A subscribed pin whose pane was never spawned
             // carries its pin in the herdr `toron_pin` token; bind it so
             // has_route holds and the wake prompts instead of digesting
             // forever. Vanished panes drop out on the next refresh because
             // the roster no longer names them.
             let routed: std::collections::HashSet<String> = targets.keys().cloned().collect();
-            let ops = operator_targets(&herdr_agent_roster(&self.cfg.herdr_bin), &pins, &routed);
+            let ops =
+                captain_pane_targets(&herdr_agent_roster(&self.cfg.herdr_bin), &pins, &routed);
             for (pin, pane) in &ops {
                 targets.insert(pin.clone(), pane.clone());
                 self.panes.insert(pane.clone(), pin.clone());
             }
             if !ops.is_empty() {
                 let current: Vec<String> = ops.iter().map(|(p, _)| p.clone()).collect();
-                if current != self.operator_routed_pins {
-                    self.operator_routed_pins = current;
+                if current != self.captain_routed_pins {
+                    self.captain_routed_pins = current;
                     self.audit_file(
-                        "operator_pane_routed",
+                        "captain_pane_routed",
                         serde_json::json!({
                             "pins": ops.iter().map(|(p, _)| p).collect::<Vec<_>>(),
                         }),
                     );
                 }
-            } else if !self.operator_routed_pins.is_empty() {
-                self.operator_routed_pins.clear();
+            } else if !self.captain_routed_pins.is_empty() {
+                self.captain_routed_pins.clear();
             }
             unroutable.retain(|p| !ops.iter().any(|(q, _)| q == p));
         }
@@ -1092,15 +1103,35 @@ impl FileHost {
                 // behavior drift (parity tests prove it). Threading the
                 // real budget signal (Queue) is the follow-up.
                 Effect::Prompt { pin, line } => {
+                    // bd-3vr9: live herdr status outranks a stale presence
+                    // row — but ONLY for captain-pane-unioned pins, whose
+                    // panes run no presence hooks (self-report goes stale
+                    // forever). Spawned crews keep the presence contract
+                    // (bd-v8vi): fresh self-report wins transient races,
+                    // absent presence holds.
+                    let now = Self::now_unix();
+                    let presence_stale = self
+                        .presence_ts
+                        .get(&pin)
+                        .is_none_or(|t| now.saturating_sub(*t) >= PRESENCE_STALE_SECS);
+                    let unioned = self.captain_routed_pins.contains(&pin);
+                    let presence = if unioned && presence_stale {
+                        self.herdr
+                            .get(&pin)
+                            .map(|s| doorbell_core::wake_core::parse_presence_word(s))
+                            .or_else(|| self.presence.get(&pin).copied())
+                            .unwrap_or(PresenceVerdict::Unknown)
+                    } else {
+                        self.presence
+                            .get(&pin)
+                            .copied()
+                            .unwrap_or(PresenceVerdict::Unknown)
+                    };
                     let input = doorbell_core::wake_core::RouteInput {
                         pin: pin.clone(),
                         line: line.clone(),
                         urgent: doorbell_core::is_urgent_line(&line),
-                        presence: self
-                            .presence
-                            .get(&pin)
-                            .copied()
-                            .unwrap_or(PresenceVerdict::Unknown),
+                        presence,
                         has_route: true,
                         budget_allows: true,
                     };
@@ -1291,6 +1322,7 @@ impl Host for FileHost {
                 // Direct insert (mirrors the workspace tick arm).
                 self.presence
                     .insert(pin.clone(), doorbell_core::parse_presence_word(state));
+                self.presence_ts.insert(pin.clone(), Self::now_unix());
                 Vec::new()
             }
             BrainMsg::InboxFetched { pin, rows } => {
@@ -1558,13 +1590,13 @@ mod tests {
     use super::*;
     use crate::host::Host;
 
-    /// bd-3vr9: the operator-pane union. A swept pin with no registry
+    /// bd-3vr9: the captain-pane union. A swept pin with no registry
     /// route binds the pane whose herdr `toron_pin` token names it, so
     /// has_route holds and the wake prompts. Pins already routed, pins
     /// nobody names, and token-less crew panes are untouched — an
     /// unroutable pin keeps exactly one fate: digest-bound.
     #[test]
-    fn operator_pane_joins_target_set_by_token() {
+    fn captain_pane_joins_target_set_by_token() {
         let roster = vec![
             ("w6:p1".into(), "idle".into(), Some("BrightBadger".into())),
             ("w1W:p1".into(), "working".into(), None),
@@ -1572,12 +1604,12 @@ mod tests {
         let want = vec!["BrightBadger".to_string()];
         let routed: std::collections::HashSet<String> =
             ["DustyReef".to_string()].into_iter().collect();
-        let ops = operator_targets(&roster, &want, &routed);
+        let ops = captain_pane_targets(&roster, &want, &routed);
         assert_eq!(ops, vec![("BrightBadger".to_string(), "w6:p1".to_string())]);
     }
 
     #[test]
-    fn operator_union_skips_routed_and_unnamed() {
+    fn captain_union_skips_routed_and_unnamed() {
         let roster = vec![
             ("w6:p1".into(), "idle".into(), Some("BrightBadger".into())),
             ("w6:p2".into(), "idle".into(), None),
@@ -1587,11 +1619,11 @@ mod tests {
         // Already registry-routed: token must not double-bind.
         let routed: std::collections::HashSet<String> =
             ["BrightBadger".to_string()].into_iter().collect();
-        assert!(operator_targets(&roster, &want, &routed).is_empty());
+        assert!(captain_pane_targets(&roster, &want, &routed).is_empty());
         // Unwanted pins and the token-less pane never route: Gone stays
         // digest-bound, never queued into a table that cannot drain it.
         let empty: std::collections::HashSet<String> = Default::default();
-        assert!(operator_targets(&roster, &["Gone".to_string()], &empty).is_empty());
+        assert!(captain_pane_targets(&roster, &["Gone".to_string()], &empty).is_empty());
     }
 
     #[test]
@@ -2180,6 +2212,61 @@ mod tests {
             fx.iter()
                 .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
             "busy + urgent prompts: {fx:?}"
+        );
+    }
+
+    /// bd-3vr9: live herdr status outranks a stale presence row.
+    /// Presence self-reports only on agent publish; herdr observes every
+    /// sweep. Stale Busy presence + live idle herdr must prompt; live
+    /// working herdr + stale idle presence must digest.
+    #[test]
+    fn live_herdr_status_outranks_stale_presence() {
+        let (mut host, _dir) = host_with_registry("t-herdr", entries());
+        host.refresh_index();
+        // Simulate the captain-pane union: PinA routed by token, not registry.
+        host.captain_routed_pins.push("PinA".into());
+        let line = |id: &str, ts: u64| {
+            serde_json::json!({"kind": 9, "id": id, "pubkey": "ab",
+                "tags": [["h","c"],["p","PinA"]],
+                "content": "hi", "created_at": ts})
+            .to_string()
+        };
+        host.tick(&BrainMsg::Presence {
+            pin: "PinA".into(),
+            state: "working".into(),
+        });
+        // Age the self-report past the freshness window: supervisor truth
+        // must win from here on.
+        host.presence_ts.insert("PinA".into(), 0);
+        host.tick(&BrainMsg::HerdrStatus {
+            pin: "PinA".into(),
+            status: "idle".into(),
+        });
+        let fx = host.tick(&BrainMsg::Watch(line("h1", 1)));
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
+            "live idle herdr must win over stale presence: {fx:?}"
+        );
+        host.tick(&BrainMsg::Presence {
+            pin: "PinA".into(),
+            state: "idle".into(),
+        });
+        host.presence_ts.insert("PinA".into(), 0);
+        host.tick(&BrainMsg::HerdrStatus {
+            pin: "PinA".into(),
+            status: "working".into(),
+        });
+        let fx = host.tick(&BrainMsg::Watch(line("h2", 2)));
+        assert!(
+            fx.iter()
+                .all(|e| !matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
+            "live working herdr must hold the prompt despite idle presence: {fx:?}"
+        );
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Audit { kind, .. } if kind == "queued")),
+            "held wake stays visible as queued: {fx:?}"
         );
     }
 
