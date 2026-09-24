@@ -37,17 +37,41 @@ pub struct HarnessOutcome {
 /// headless argv builder and the pane-runner spawn path (P10.3, bd-ghcj.1).
 /// omp also carries the thinking/effort flag (`--thinking=<level>`,
 /// bd-42fs) when an effort is given.
+///
+/// governed-by: bd-ulzi — pi wires effort natively (`--thinking=<level>`,
+/// verified `pi --help`: `--thinking <level>` + `--model provider/id`
+/// shorthand). opencode v2 has no effort flag (`-m provider/model#variant`
+/// only, `--thinking` is a display toggle) — effort there degrades LOUDLY
+/// via [`effort_degraded`] (warn at the shared site, never silent).
+pub fn effort_degraded(harness: &str) -> bool {
+    matches!(harness, "opencode")
+}
+
 pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<String> {
+    let effort = effort.filter(|e| !e.is_empty());
+    if let Some(e) = effort
+        && effort_degraded(harness)
+    {
+        eprintln!(
+            "flywheel: effort {e:?} has no native flag on harness {harness:?} — degrading to model-only (profile default stands)"
+        );
+    }
     match harness {
         "opencode" | "grok" => vec!["-m".to_string(), model.to_string()],
         "omp" => {
             let mut args = vec![format!("--model={model}")];
-            if let Some(e) = effort.filter(|e| !e.is_empty()) {
+            if let Some(e) = effort {
                 args.push(format!("--thinking={e}"));
             }
             args
         }
-        "pi" => vec!["--model".to_string(), model.to_string()],
+        "pi" => {
+            let mut args = vec!["--model".to_string(), model.to_string()];
+            if let Some(e) = effort {
+                args.push(format!("--thinking={e}"));
+            }
+            args
+        }
         // H2 (bd-harness-jcode): jcode takes provider and model as SEPARATE
         // flags (`-p opencode-go -m muse-spark-1.2-contributor`); the
         // composite registry key is split so `-m` carries the bare id.
@@ -631,6 +655,64 @@ mod tests {
         assert!(
             model_args("hermes", "x", None).is_empty(),
             "unknown harness: no model args"
+        );
+    }
+
+    /// governed-by: bd-ulzi — pi wires effort natively (`--thinking=`;
+    /// provider/id passes through verbatim, the pi shorthand); opencode
+    /// v2 keeps `-m provider/model#variant` verbatim and degrades LOUDLY
+    /// on effort (no effort flag); empty effort emits no thinking flag.
+    #[test]
+    fn jev_effort_pi_thinking_native_opencode_loud_degrade() {
+        assert_eq!(
+            model_args("pi", "glm-5.2", Some("high")),
+            vec!["--model", "glm-5.2", "--thinking=high"]
+        );
+        assert_eq!(
+            model_args("pi", "opencode-go/deepseek-v4-flash", Some("low")),
+            vec!["--model", "opencode-go/deepseek-v4-flash", "--thinking=low"]
+        );
+        assert_eq!(
+            model_args("pi", "glm-5.2", None),
+            vec!["--model", "glm-5.2"]
+        );
+        assert_eq!(
+            model_args("opencode", "acme/sonnet#thinking", Some("max")),
+            vec!["-m", "acme/sonnet#thinking"],
+            "opencode v2 variant passes through; effort has no flag"
+        );
+        assert!(effort_degraded("opencode"), "opencode effort degrades loud");
+        assert!(!effort_degraded("pi"), "pi effort is native");
+        assert!(!effort_degraded("omp"), "omp effort is native");
+        assert!(!effort_degraded("pa"), "pa effort is native");
+    }
+
+    /// governed-by: bd-ulzi — the dispatch-spec effort input rides the
+    /// generic renderer (typed field + `{{inputs.x}}` refs, like plan):
+    /// a Jev depth→effort value or author literal reaches the leaf, which
+    /// lets it win over the profile default for that step only.
+    #[test]
+    fn jev_effort_dispatch_spec_effort_reaches_leaf() {
+        let spec = DispatchSpec {
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            spec_extra(&spec, "effort", &serde_json::json!({})).as_deref(),
+            Some("high")
+        );
+        let templated = DispatchSpec {
+            effort: Some("{{inputs.effort}}".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            spec_extra(&templated, "effort", &serde_json::json!({"effort": "max"})).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            spec_extra(&DispatchSpec::default(), "effort", &serde_json::json!({})),
+            None,
+            "absent effort means the profile default stands"
         );
     }
 

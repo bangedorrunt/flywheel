@@ -64,6 +64,11 @@ pub struct BriefingContext {
     /// @cheap or @premium). Advisory only — the user decides via
     /// --role-model. None IS current behavior and renders nothing.
     pub tier_suggestion: Option<String>,
+    /// governed-by: bd-ulzi — Jev tier-pick suggestion for the effort
+    /// level (low/high/max, via the dispatch-spec effort input).
+    /// Advisory only — the user decides via an explicit effort override.
+    /// None IS current behavior and renders nothing.
+    pub effort_suggestion: Option<String>,
     /// bare harness+provider/model override the operator may type instead of
     /// a squad/profile choice (bd-j3so surface)
     pub bare_override: Option<String>,
@@ -229,6 +234,15 @@ pub fn run_briefing(
             dim("(tier-pick; user decides — --role-model or keep default)")
         )?;
     }
+    if let Some(s) = &ctx.effort_suggestion {
+        writeln!(
+            out,
+            "  {} {} {}",
+            dim("effort suggestion:"),
+            accent(s),
+            dim("(tier-pick; user decides — explicit effort or profile default)")
+        )?;
+    }
     match &ctx.bare_override {
         Some(bare) => writeln!(out, "  {} {}", dim("bare override accepted:"), accent(bare))?,
         None => writeln!(
@@ -331,6 +345,7 @@ mod tests {
             squad_recommendation: Some("build".into()),
             profile_suggestion: None,
             tier_suggestion: None,
+            effort_suggestion: None,
             bare_override: None,
             stage_chain: vec!["plan".into(), "implement".into(), "review".into()],
             funded: BTreeMap::new(),
@@ -409,8 +424,27 @@ mod tests {
         assert!(!plain.contains("profile suggestion:"), "{plain}");
     }
 
-    /// bd-88m4: a set tier suggestion renders beside the profile line;
-    /// None renders nothing.
+    /// governed-by: bd-ulzi — a set effort suggestion renders beside the
+    /// tier line; None renders nothing.
+    #[test]
+    fn jev_effort_suggestion_renders_beside_tier() {
+        let mut c = ctx();
+        c.tier_suggestion = Some("@premium".into());
+        c.effort_suggestion = Some("max".into());
+        let mut inp = std::io::Cursor::new("");
+        let mut out: Vec<u8> = Vec::new();
+        run_briefing(&c, &mut inp, &mut out).expect("briefing");
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("effort suggestion:"), "{rendered}");
+        assert!(rendered.contains("max"), "{rendered}");
+        let mut plain = ctx();
+        plain.effort_suggestion = None;
+        let mut inp2 = std::io::Cursor::new("");
+        let mut out2: Vec<u8> = Vec::new();
+        run_briefing(&plain, &mut inp2, &mut out2).expect("briefing");
+        let rendered2 = String::from_utf8(out2).expect("utf8");
+        assert!(!rendered2.contains("effort suggestion:"), "{rendered2}");
+    }
     #[test]
     fn tier_pick_suggestion_renders_beside_profile() {
         let mut c = ctx();
@@ -486,6 +520,7 @@ mod tests {
             squad_recommendation: None,
             profile_suggestion: None,
             tier_suggestion: None,
+            effort_suggestion: None,
             bare_override: None,
             stage_chain: vec!["review".into(), "ship".into()],
             funded: BTreeMap::new(),

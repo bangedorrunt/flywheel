@@ -1851,6 +1851,11 @@ enum Commands {
         /// mechanic degrades loudly + tags the run log `phase_degraded`
         #[arg(long)]
         phase: Option<String>,
+        /// per-step effort override (governed-by: bd-ulzi): the Jev
+        /// depth→effort value rides the dispatch-spec effort input here;
+        /// wins over the profile default for THIS step only
+        #[arg(long)]
+        effort: Option<String>,
         /// one JSON line for the parent runner (default: human summary)
         #[arg(long)]
         json: bool,
@@ -3314,6 +3319,7 @@ fn main() {
             workflow,
             cron,
             phase,
+            effort,
             json,
         }) => cmd_internal_run_headless(
             profile,
@@ -3323,6 +3329,7 @@ fn main() {
             workflow.as_deref(),
             cron.as_deref(),
             phase.as_deref(),
+            effort.as_deref(),
             *json,
         ),
         None => {
@@ -24518,6 +24525,14 @@ fn enrich_suggestions_live(
     {
         ctx.tier_suggestion = s;
     }
+    // governed-by: bd-ulzi — the same tier-pick ask yields the effort
+    // override candidate (low/high/max for the dispatch-spec effort
+    // input). Advisory like the slot band: renders, never dispatches.
+    if let Ok(pack) = crate::judgment::find_pack_for(".", "tier-pick")
+        && let Ok(s) = crate::judgment::live_effort_suggestion(&transport, &pack, objective)
+    {
+        ctx.effort_suggestion = s;
+    }
 }
 
 /// bd-xe9r: everything the interactive briefing renders, computed BEFORE any
@@ -24655,6 +24670,9 @@ fn briefing_context_inner(
         // offline table when Jev is unreachable. None IS current behavior:
         // no line renders, today's menus stand, the user decides.
         tier_suggestion: crate::judgment::suggest_tier_pick(objective).map(str::to_string),
+        // governed-by: bd-ulzi — no offline effort table: Jev-only.
+        // None renders nothing; the profile default stands.
+        effort_suggestion: None,
         bare_override: None,
         stage_chain,
         funded: std::collections::BTreeMap::new(),
@@ -28844,6 +28862,7 @@ fn cmd_internal_run_headless(
     workflow: Option<&str>,
     cron: Option<&str>,
     phase: Option<&str>,
+    effort_override: Option<&str>,
     json: bool,
 ) -> Result<()> {
     use sha1::Digest;
@@ -28959,7 +28978,16 @@ fn cmd_internal_run_headless(
             })
         };
 
-    let mut attempt = run_once(harness, &model_id, &model, &profile.effort)?;
+    let mut attempt = run_once(
+        harness,
+        &model_id,
+        &model,
+        // governed-by: bd-ulzi — effort stays profile-default with Jev
+        // override: the spec effort input wins for this step only.
+        effort_override
+            .filter(|e| !e.trim().is_empty())
+            .unwrap_or(profile.effort.as_str()),
+    )?;
     let mut retried_fallback = false;
     {
         let err_str = attempt.outcome.error.as_deref().unwrap_or("");
@@ -29332,6 +29360,14 @@ pub(crate) fn headless_dispatch(
         && !p.trim().is_empty()
     {
         cmd.arg("--phase").arg(p);
+    }
+    // governed-by: bd-ulzi — the spec effort input rides to the leaf,
+    // which lets it win over the profile default for this step only.
+    // Rendered against inputs so `{{inputs.x}}` refs resolve like plan.
+    if let Some(e) = headless::spec_extra(spec, "effort", inputs)
+        && !e.trim().is_empty()
+    {
+        cmd.arg("--effort").arg(e);
     }
     if let Some(cron) = cron {
         cmd.arg("--cron").arg(cron);
