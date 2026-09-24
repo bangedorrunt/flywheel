@@ -1,0 +1,36 @@
+# Flywheel captain-pane plugin manifest (bd-xenf).
+
+id = "flywheel.captain-pane"
+name = "Captain Pane"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+# Floor note (bd-xenf): installed binary is 0.9.1-preview but the running
+# daemon reports 0.9.0, and the link gate enforces the daemon version.
+# 0.9.0 stands only because every surface below is proven against the
+# live daemon by simulated events (presence, toast, reconcile); if any
+# surface fails, raise this back to 0.9.1 and require a daemon restart.
+description = "Captain-pane presence, toast, and binding reconcile. Read-and-notify only: never dispatches, closes, or writes beads."
+platforms = ["macos", "linux"]
+
+# Presence upsert on every lifecycle edge. One script, three events.
+[[events]]
+on = "pane.closed"
+command = ["./scripts/captain-presence.sh"]
+
+[[events]]
+on = "pane.exited"
+command = ["./scripts/captain-presence.sh"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./scripts/captain-presence.sh"]
+
+# Toast on urgent captain-pane transitions (blocked only).
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./scripts/captain-notify.sh"]
+
+# Stale-binding reconcile on close.
+[[events]]
+on = "pane.closed"
+command = ["./scripts/captain-reconcile.sh"]
