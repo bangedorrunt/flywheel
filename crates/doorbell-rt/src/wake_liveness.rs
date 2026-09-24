@@ -152,27 +152,34 @@ pub fn classify_worst_of(
     worst.unwrap_or(PipeHealth::NeverStamped)
 }
 
-/// Like [`classify_worst_of`], also returning the stamp pair of the chosen
-/// worst workspace (first max-severity in iteration order). Empty →
-/// `(NeverStamped, None, None)`.
-pub fn classify_worst_of_stamps(
+/// Like [`classify_worst_of`], also returning the **winner label** and stamp
+/// pair of the chosen worst workspace (first max-severity in iteration order).
+/// Empty → `(NeverStamped, None, None, None)`.
+///
+/// Callers should set `wake.workspace` from the returned label so displayed
+/// stamps match the workspace that produced the worst-of class (not
+/// first-alive).
+pub fn classify_worst_of_stamps<L>(
     now_ms: u64,
-    stamps: impl IntoIterator<Item = (Option<u64>, Option<u64>)>,
+    stamps: impl IntoIterator<Item = (L, Option<u64>, Option<u64>)>,
     deaf_ceiling_ms: u64,
-) -> (PipeHealth, Option<u64>, Option<u64>) {
-    let mut best: Option<(PipeHealth, Option<u64>, Option<u64>)> = None;
-    for (ev, hb) in stamps {
+) -> (PipeHealth, Option<L>, Option<u64>, Option<u64>) {
+    let mut best: Option<(PipeHealth, L, Option<u64>, Option<u64>)> = None;
+    for (label, ev, hb) in stamps {
         let h = classify(now_ms, ev, hb, deaf_ceiling_ms);
         let replace = match &best {
             None => true,
             // Strictly worse replaces; equal severity keeps first (stable).
-            Some((w, _, _)) => pipe_severity(h) > pipe_severity(*w),
+            Some((w, _, _, _)) => pipe_severity(h) > pipe_severity(*w),
         };
         if replace {
-            best = Some((h, ev, hb));
+            best = Some((h, label, ev, hb));
         }
     }
-    best.unwrap_or((PipeHealth::NeverStamped, None, None))
+    match best {
+        Some((h, label, ev, hb)) => (h, Some(label), ev, hb),
+        None => (PipeHealth::NeverStamped, None, None, None),
+    }
 }
 
 /// GS-062: shared `/health` hosted order — alive-first, then stable alphabetical
@@ -420,5 +427,39 @@ mod tests {
             60_000,
         );
         assert!(matches!(h, PipeHealth::Deaf { .. }), "got {h:?}");
+    }
+
+    #[test]
+    fn worst_of_stamps_winner_label_matches_stamps() {
+        // Multi-ws: first-alive Live must not become wake.workspace when
+        // worst-of picks a later Deaf — label + stamps stay coherent.
+        let now = 200_000u64;
+        let ceiling = 60_000u64;
+        let (pipe, winner, ev, hb) = classify_worst_of_stamps(
+            now,
+            [
+                ("live-ws", Some(199_000u64), Some(198_000u64)), // Live
+                ("deaf-ws", None, Some(100_000u64)),             // Deaf
+            ],
+            ceiling,
+        );
+        assert_eq!(
+            pipe,
+            PipeHealth::Deaf {
+                silent_for_ms: 100_000
+            }
+        );
+        assert_eq!(winner.as_deref(), Some("deaf-ws"));
+        assert_eq!(ev, None);
+        assert_eq!(hb, Some(100_000));
+    }
+
+    #[test]
+    fn worst_of_stamps_empty_label_none() {
+        let empty: [(&str, Option<u64>, Option<u64>); 0] = [];
+        let (pipe, winner, ev, hb) = classify_worst_of_stamps(0, empty, 60_000);
+        assert_eq!(pipe, PipeHealth::NeverStamped);
+        assert!(winner.is_none());
+        assert!(ev.is_none() && hb.is_none());
     }
 }

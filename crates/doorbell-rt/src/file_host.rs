@@ -1402,27 +1402,24 @@ impl Host for FileHost {
             std::thread::spawn(move || {
                 use std::io::BufRead;
                 // GS-062: event stamp throttled ~1s; hb on 1s tick while child alive.
-                // GS062-ADV-5: try_send (never blocking_send) — under D3 park the
-                // child can die while send blocks → stamps never stop → false Quiet.
-                // Full or Closed → stop ticker + Died.
+                // GS062-ADV-5: try_send Watch (never park on Watch). On Full/Closed
+                // stop hb first, then deliver Died with blocking_send so Full cannot
+                // drop restart_watch. Stamp .event only after Watch Ok.
                 for line in std::io::BufReader::new(stdout).lines() {
                     match line {
-                        Ok(l) => {
-                            stamps.on_event();
-                            match tx.try_send(BrainMsg::Watch(l)) {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    stamps.stop();
-                                    let _ = tx.try_send(BrainMsg::Died);
-                                    return;
-                                }
+                        Ok(l) => match tx.try_send(BrainMsg::Watch(l)) {
+                            Ok(()) => stamps.on_event(),
+                            Err(_) => {
+                                stamps.stop();
+                                crate::msg::deliver_died_blocking(&tx);
+                                return;
                             }
-                        }
+                        },
                         Err(_) => break,
                     }
                 }
                 stamps.stop();
-                let _ = tx.try_send(BrainMsg::Died);
+                crate::msg::deliver_died_blocking(&tx);
             });
         });
     }
