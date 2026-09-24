@@ -3036,6 +3036,34 @@ mod tests {
         );
     }
 
+    /// bd-pe5o: live kind-9 channel-post frame contract. A real
+    /// `channel post --mention` frame (h channel tag + t project tag +
+    /// p npub-hex tag + @Pin content, exactly as toron emits) must ring
+    /// Channel for the mentioned pin. Tripwire for the post-to-wake path:
+    /// when wakes stop arriving, this test says whether the flywheel half
+    /// still holds its end of the seam.
+    #[test]
+    fn doorbell_wake_kind9_mention_post_rings_channel() {
+        let mut index = SelfIndex::default();
+        index.insert_pin(
+            "BrightBadger".into(),
+            Some(
+                "699d97318e69efb667767a917972bebf396d63a10bd6d68bec01e698a903b746".into(),
+            ),
+        );
+        // Exact shape of a verified live post (event 17baed1e).
+        let line = r#"{"kind":9,"id":"17baed1e20b74f424c1c2117bdf7b0b334d928bec923b7194c46cf33116b8b49","tags":[["h","steer-flywheel"],["t","flywheel"],["p","699d97318e69efb667767a917972bebf396d63a10bd6d68bec01e698a903b746"]],"content":"@BrightBadger wake probe4 bd-pe5o"}"#;
+        let (class, _) = parse_watch_ndjson(line, &index).expect("mention post must ring");
+        assert_eq!(class, EventClass::Channel);
+        // Content-only path (no p tag): @mention in the body still addresses.
+        let bare = r#"{"kind":9,"id":"cc","tags":[["h","steer-flywheel"],["t","flywheel"]],"content":"@BrightBadger ping"}"#;
+        let (class, _) = parse_watch_ndjson(bare, &index).expect("@mention must ring");
+        assert_eq!(class, EventClass::Channel);
+        // Unknown pin, no mention: room chatter stays silent.
+        let chatter = r#"{"kind":9,"id":"dd","tags":[["h","steer-flywheel"],["t","flywheel"]],"content":"hello room"}"#;
+        assert!(parse_watch_ndjson(chatter, &index).is_none());
+    }
+
     #[test]
     fn gs006_kind39002_join_leave_rings_when_addressed() {
         // 39002 join/leave: when p-tag addresses self, doorbell must ring (subscribe + classify).
