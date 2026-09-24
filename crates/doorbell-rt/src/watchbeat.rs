@@ -114,6 +114,11 @@ pub struct StampThreads {
 impl StampThreads {
     /// Start the hb ticker. Call [`Self::on_event`] on each delivered watch
     /// line / bus Event. Drop or [`Self::stop`] ends the heartbeat.
+    ///
+    /// Call on the thread that hosts the watch **before** nesting a reader
+    /// thread (GS062-ADV-4) so `/health` cannot observe NeverStamped while
+    /// the nested reader schedules. [`spawn_heartbeat_ticker`] also touches
+    /// `.hb` on this calling thread before its own ticker spawn.
     pub fn spawn(state_dir: PathBuf, workspace: String) -> Self {
         let stop_tx = spawn_heartbeat_ticker(state_dir.clone(), workspace.clone());
         Self {

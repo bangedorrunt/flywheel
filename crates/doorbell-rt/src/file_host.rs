@@ -1383,11 +1383,11 @@ impl Host for FileHost {
             if let Ok(mut g) = slot.lock() {
                 *g = Some(WatchChild(child));
             }
+            // GS062-ADV-4: stamp on hosting task before nesting the reader thread.
+            let mut stamps = crate::watchbeat::spawn_stamp_threads(fw_state, workspace);
             std::thread::spawn(move || {
                 use std::io::BufRead;
                 // GS-062: event stamp throttled ~1s; hb on 1s tick while child alive.
-                let mut stamps =
-                    crate::watchbeat::spawn_stamp_threads(fw_state.clone(), workspace.clone());
                 for line in std::io::BufReader::new(stdout).lines() {
                     match line {
                         Ok(l) => {

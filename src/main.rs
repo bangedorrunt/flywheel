@@ -9393,14 +9393,16 @@ where
         .spawn()
         .ok()?;
     let stdout = child.stdout.take()?;
-    let state_dir = state_dir.to_path_buf();
-    let workspace = workspace.to_string();
+    // GS-062 / GS062-ADV-4: spawn stamp threads on the hosting thread before
+    // nesting the reader — closes NeverStamped gap while the reader schedules.
+    let mut stamps = doorbell_rt::watchbeat::spawn_stamp_threads(
+        state_dir.to_path_buf(),
+        workspace.to_string(),
+    );
     std::thread::spawn(move || {
         use std::io::BufRead;
         // GS-062: split event vs heartbeat stamps (never conflate into last_event).
         // Event stamp throttled ~1s; heartbeat on a 1s tick while alive.
-        let mut stamps =
-            doorbell_rt::watchbeat::spawn_stamp_threads(state_dir.clone(), workspace.clone());
         for line in std::io::BufReader::new(stdout).lines() {
             match line {
                 Ok(l) => {
@@ -31889,11 +31891,14 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
 /// `.daemon.gen` blinded flywheel serve `/health` → empty hosted → permanent
 /// NeverStamped while watch stamps + doorbell wake were live.
 ///
-/// Alive partition (GS062-ADV-1): FileHost/doorbell write `.daemon.gen` +
+/// Alive partition (GS062-ADV-1/ADV-3): FileHost/doorbell write `.daemon.gen` +
 /// `owner-{ws}.json` lease, **not** `{slug}.pid`. Pid-only left stale
-/// `aaa.daemon.gen` ahead of live `zzz` stamps → primary=aaa NeverStamped/Deaf
-/// while zzz Live. Prefer lease freshness and/or recent watch stamps within
-/// deaf ceiling — no invented GC of stale `.daemon.gen` files.
+/// `aaa.daemon.gen` ahead of live `zzz` → primary=aaa NeverStamped/Deaf while
+/// zzz Live. Alive = `{slug}.pid` live OR owner lease non-stale **only**
+/// (GS062-ADV-3: watch stamps are NOT an alive disjunct — post-stop/crash
+/// leaves `watch-*.{hb,event}` fresh → false Quiet primary; multi-ws orphan
+/// aaa stamps can outrank live zzz). Keep `.daemon.gen`→slug mapping; no
+/// invented GC of stale `.daemon.gen` files.
 fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
     let db = state_dir.join("doorbell");
     let mut alive = Vec::new();
@@ -31903,11 +31908,6 @@ fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
         return Vec::new();
     };
     let now_unix = doorbell_rt::lease::unix_now();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let deaf_ms = doorbell_rt::wake_liveness::DEFAULT_DEAF_CEILING_MS;
     for ent in entries.flatten() {
         let path = ent.path();
         if path.extension().and_then(|x| x.to_str()) != Some("gen") {
@@ -31928,7 +31928,7 @@ fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
         if !seen.insert(label.to_string()) {
             continue;
         }
-        let is_alive = registry_label_alive(state_dir, label, now_unix, now_ms, deaf_ms);
+        let is_alive = registry_label_alive(state_dir, label, now_unix);
         if is_alive {
             alive.push(label.to_string());
         } else {
@@ -31939,14 +31939,8 @@ fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
 }
 
 /// True when a registry label should sort into the `/health` alive partition.
-/// Pid OR live owner lease OR watch event/hb stamp within deaf ceiling.
-fn registry_label_alive(
-    state_dir: &std::path::Path,
-    label: &str,
-    now_unix: u64,
-    now_ms: u64,
-    deaf_ms: u64,
-) -> bool {
+/// Alive = `{slug}.pid` live OR owner lease non-stale only (GS062-ADV-3).
+fn registry_label_alive(state_dir: &std::path::Path, label: &str, now_unix: u64) -> bool {
     if doorbell::read_pid(&doorbell::pid_file(state_dir, label)).is_some_and(doorbell::pid_alive) {
         return true;
     }
@@ -31955,9 +31949,7 @@ fn registry_label_alive(
     {
         return true;
     }
-    let stamp_fresh = |ms: Option<u64>| ms.is_some_and(|t| now_ms.saturating_sub(t) <= deaf_ms);
-    stamp_fresh(doorbell_rt::watchbeat::last_event_ms(state_dir, label))
-        || stamp_fresh(doorbell_rt::watchbeat::last_heartbeat_ms(state_dir, label))
+    false
 }
 
 #[cfg(test)]
@@ -32004,25 +31996,26 @@ mod hosted_workspaces_from_registry_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// GS062-ADV-1: stale aaa.daemon.gen (no pid/lease/stamps) must not sort
-    /// ahead of live zzz watch stamps — primary must be zzz (or at least not
-    /// stale aaa ahead of live).
+    /// GS062-ADV-1: stale aaa.daemon.gen (no pid/lease) must not sort ahead
+    /// of live zzz — primary via lease/pid on zzz (not stamps alone).
     #[test]
     fn stale_aaa_daemon_gen_does_not_outrank_live_zzz_stamps() {
         let dir = tempfile_state();
         let db = dir.join("doorbell");
         std::fs::create_dir_all(&db).expect("doorbell dir");
-        // Stale registry label only — no pid, no lease, no stamps.
+        // Stale registry label only — no pid, no lease.
         std::fs::write(db.join("aaa.daemon.gen"), b"{}").expect("aaa.daemon.gen");
-        // Live zzz: daemon.gen + fresh watch hb stamp (FileHost shape).
+        // Live zzz: daemon.gen + live owner lease (FileHost shape).
         std::fs::write(db.join("zzz.daemon.gen"), b"{}").expect("zzz.daemon.gen");
-        doorbell_rt::watchbeat::touch_heartbeat(&dir, "zzz");
+        let now = doorbell_rt::lease::unix_now();
+        let claimed = doorbell_rt::lease::acquire_lease(&dir, "zzz", now).expect("lease");
+        assert_eq!(claimed.pid, std::process::id());
 
         let got = hosted_workspaces_from_registry(&dir);
         assert_eq!(
             got.first().map(String::as_str),
             Some("zzz"),
-            "live zzz stamps must beat stale aaa for primary: {got:?}"
+            "live zzz lease must beat stale aaa for primary: {got:?}"
         );
         let zzz_pos = got.iter().position(|s| s == "zzz").expect("zzz present");
         let aaa_pos = got.iter().position(|s| s == "aaa").expect("aaa present");
@@ -32052,6 +32045,44 @@ mod hosted_workspaces_from_registry_tests {
             got.first().map(String::as_str),
             Some("zzz"),
             "live owner lease must put zzz ahead of stale aaa: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GS062-ADV-3: fresh orphan watch stamps alone must NOT put a label in
+    /// the alive partition (post-stop/crash leaves hb/event fresh).
+    #[test]
+    fn fresh_orphan_stamps_alone_do_not_mark_registry_label_alive() {
+        let dir = tempfile_state();
+        let db = dir.join("doorbell");
+        std::fs::create_dir_all(&db).expect("doorbell dir");
+        // Live zzz via lease — must stay primary.
+        std::fs::write(db.join("zzz.daemon.gen"), b"{}").expect("zzz.daemon.gen");
+        let now = doorbell_rt::lease::unix_now();
+        doorbell_rt::lease::acquire_lease(&dir, "zzz", now).expect("zzz lease");
+        // Orphan aaa: daemon.gen + fresh event+hb stamps, no pid, no lease.
+        std::fs::write(db.join("aaa.daemon.gen"), b"{}").expect("aaa.daemon.gen");
+        doorbell_rt::watchbeat::touch_event(&dir, "aaa");
+        doorbell_rt::watchbeat::touch_heartbeat(&dir, "aaa");
+
+        let got = hosted_workspaces_from_registry(&dir);
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some("zzz"),
+            "orphan aaa stamps must not outrank live zzz: {got:?}"
+        );
+        let zzz_pos = got.iter().position(|s| s == "zzz").expect("zzz present");
+        let aaa_pos = got.iter().position(|s| s == "aaa").expect("aaa present");
+        assert!(
+            zzz_pos < aaa_pos,
+            "zzz (lease alive) before aaa (stamps-only orphan): {got:?}"
+        );
+        // Stamps-only label must land in the other partition (after alive).
+        // With only aaa stamps-only + zzz alive → aaa is sole "other".
+        assert_eq!(
+            &got[zzz_pos + 1..],
+            &["aaa".to_string()],
+            "aaa must be other-only, not alive: {got:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

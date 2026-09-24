@@ -767,12 +767,14 @@ fn spawn_bus_watch(
                 .hashtag(project)
         };
         let mut sub = crate::mail_shim::block_on(bus.subscribe_trusted(filter)).ok()?;
-        let ws = workspace.to_string();
+        // GS062-ADV-4: stamp on hosting thread before nesting the reader.
+        let mut stamps = doorbell_rt::watchbeat::spawn_stamp_threads(
+            config::state_dir(),
+            workspace.to_string(),
+        );
         std::thread::spawn(move || {
             // GS-062: mirror child watch — touch_event on each Event; stoppable
             // 1s touch_heartbeat while the subscription lives (never conflate).
-            let mut stamps =
-                doorbell_rt::watchbeat::spawn_stamp_threads(config::state_dir(), ws.clone());
             loop {
                 let ev_opt = crate::mail_shim::block_on(sub.next());
                 match ev_opt {
