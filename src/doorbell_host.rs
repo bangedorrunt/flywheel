@@ -473,10 +473,14 @@ impl Host for RtHost {
             let tx_g = tx.clone();
             let spawned =
                 crate::spawn_watch_child(&project, &workspace, &config::state_dir(), move |ev| {
-                    let _ = match ev {
-                        Some(l) => tx_g.blocking_send(BrainMsg::Watch(l)),
-                        None => tx_g.blocking_send(BrainMsg::Died),
-                    };
+                    // GS062-ADV-5: try_send — never park; false → reader stops hb.
+                    match ev {
+                        Some(l) => tx_g.try_send(BrainMsg::Watch(l)).is_ok(),
+                        None => {
+                            let _ = tx_g.try_send(BrainMsg::Died);
+                            true
+                        }
+                    }
                 });
             match spawned {
                 Some(child) => {
@@ -643,10 +647,14 @@ async fn run_embedded_async(
         let project = project.to_string();
         let spawned =
             crate::spawn_watch_child(&project, workspace, &config::state_dir(), move |ev| {
-                let _ = match ev {
-                    Some(l) => tx_w.blocking_send(BrainMsg::Watch(l)),
-                    None => tx_w.blocking_send(BrainMsg::Died),
-                };
+                // GS062-ADV-5: try_send — never park; false → reader stops hb.
+                match ev {
+                    Some(l) => tx_w.try_send(BrainMsg::Watch(l)).is_ok(),
+                    None => {
+                        let _ = tx_w.try_send(BrainMsg::Died);
+                        true
+                    }
+                }
             });
         if let Ok(mut g) = watch_slot.lock() {
             *g = spawned;
@@ -790,16 +798,23 @@ fn spawn_bus_watch(
                             "created_at": e.created_at.as_secs(),
                         });
                         stamps.on_event();
-                        if let Ok(line) = serde_json::to_string(&v)
-                            && tx.blocking_send(BrainMsg::Watch(line)).is_err()
-                        {
-                            break;
+                        // GS062-ADV-5: try_send; on Full/Closed mirror Closed —
+                        // stamps.stop()+Died (was bare break → perpetual Quiet).
+                        if let Ok(line) = serde_json::to_string(&v) {
+                            match tx.try_send(BrainMsg::Watch(line)) {
+                                Ok(()) => {}
+                                Err(_) => {
+                                    stamps.stop();
+                                    let _ = tx.try_send(BrainMsg::Died);
+                                    break;
+                                }
+                            }
                         }
                     }
                     Some(toron_core::bus::SubscriptionEvent::Eose) => continue,
                     Some(toron_core::bus::SubscriptionEvent::Closed(_)) | None => {
                         stamps.stop();
-                        let _ = tx.blocking_send(BrainMsg::Died);
+                        let _ = tx.try_send(BrainMsg::Died);
                         break;
                     }
                 }

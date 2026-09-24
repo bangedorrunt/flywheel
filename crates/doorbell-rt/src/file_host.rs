@@ -469,12 +469,20 @@ pub fn injection_picture(
 /// A `toron watch` child that is killed + reaped when dropped. Wrapping is
 /// the point: a bare `std::process::Child` drop leaves the process running,
 /// which is how `Died`-driven restarts littered long-lived watchers.
-struct WatchChild(std::process::Child);
+/// Watch child + optional stamp-stop handle (GS062-ADV-5): Drop stops the
+/// hb ticker even if the reader thread is parked on a full Brain channel.
+struct WatchChild {
+    child: std::process::Child,
+    stamp_stop: Option<std::sync::mpsc::Sender<()>>,
+}
 
 impl Drop for WatchChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Some(tx) = self.stamp_stop.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -1380,27 +1388,41 @@ impl Host for FileHost {
                     return;
                 }
             };
-            if let Ok(mut g) = slot.lock() {
-                *g = Some(WatchChild(child));
-            }
             // GS062-ADV-4: stamp on hosting task before nesting the reader thread.
             let mut stamps = crate::watchbeat::spawn_stamp_threads(fw_state, workspace);
+            // GS062-ADV-5: couple stop to WatchChild Drop (shared stop) so a
+            // reader parked on BrainMsg::Watch cannot leave hb ticking forever.
+            let stamp_stop = stamps.stop_handle();
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(WatchChild {
+                    child,
+                    stamp_stop,
+                });
+            }
             std::thread::spawn(move || {
                 use std::io::BufRead;
                 // GS-062: event stamp throttled ~1s; hb on 1s tick while child alive.
+                // GS062-ADV-5: try_send (never blocking_send) — under D3 park the
+                // child can die while send blocks → stamps never stop → false Quiet.
+                // Full or Closed → stop ticker + Died.
                 for line in std::io::BufReader::new(stdout).lines() {
                     match line {
                         Ok(l) => {
                             stamps.on_event();
-                            if tx.blocking_send(BrainMsg::Watch(l)).is_err() {
-                                break;
+                            match tx.try_send(BrainMsg::Watch(l)) {
+                                Ok(()) => {}
+                                Err(_) => {
+                                    stamps.stop();
+                                    let _ = tx.try_send(BrainMsg::Died);
+                                    return;
+                                }
                             }
                         }
                         Err(_) => break,
                     }
                 }
                 stamps.stop();
-                let _ = tx.blocking_send(BrainMsg::Died);
+                let _ = tx.try_send(BrainMsg::Died);
             });
         });
     }

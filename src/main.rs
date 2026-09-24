@@ -9367,12 +9367,20 @@ const DOORBELL_WATCH_KINDS: &str = "9,14,20001,30013,43001,30031,39002";
 /// point: dropping a bare `std::process::Child` does NOT terminate it, so
 /// every `Died`-driven restart leaked another long-lived watcher holding a
 /// live bus subscription (observed live as PPID-1 orphans).
-pub struct WatchChild(pub std::process::Child);
+/// Watch child + optional stamp-stop handle (GS062-ADV-5): Drop stops the
+/// hb ticker even if the reader thread is parked on a full Brain channel.
+pub struct WatchChild {
+    pub child: std::process::Child,
+    stamp_stop: Option<std::sync::mpsc::Sender<()>>,
+}
 
 impl Drop for WatchChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Some(tx) = self.stamp_stop.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -9383,7 +9391,9 @@ fn spawn_watch_child<F>(
     on_event: F,
 ) -> Option<WatchChild>
 where
-    F: Fn(Option<String>) + Send + 'static,
+    // Returns false when the Brain channel rejected the Watch (Full/Closed) so
+    // the reader can stop hb stamps (GS062-ADV-5). None = Died.
+    F: Fn(Option<String>) -> bool + Send + 'static,
 {
     let kinds = DOORBELL_WATCH_KINDS;
     let mut child = Command::new("toron")
@@ -9399,23 +9409,33 @@ where
         state_dir.to_path_buf(),
         workspace.to_string(),
     );
+    // GS062-ADV-5: couple stop to WatchChild Drop (shared stop).
+    let stamp_stop = stamps.stop_handle();
     std::thread::spawn(move || {
         use std::io::BufRead;
         // GS-062: split event vs heartbeat stamps (never conflate into last_event).
         // Event stamp throttled ~1s; heartbeat on a 1s tick while alive.
+        // GS062-ADV-5: on_event returns false on try_send Full/Closed → stop hb.
         for line in std::io::BufReader::new(stdout).lines() {
             match line {
                 Ok(l) => {
                     stamps.on_event();
-                    on_event(Some(l));
+                    if !on_event(Some(l)) {
+                        stamps.stop();
+                        let _ = on_event(None); // Died
+                        return;
+                    }
                 }
                 Err(_) => break,
             }
         }
         stamps.stop();
-        on_event(None); // Died
+        let _ = on_event(None); // Died
     });
-    Some(WatchChild(child))
+    Some(WatchChild {
+        child,
+        stamp_stop,
+    })
 }
 
 /// Pins plus npubs so live kind-9 `p` tags (hex) resolve to the pin.
@@ -31899,13 +31919,19 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
 /// leaves `watch-*.{hb,event}` fresh → false Quiet primary; multi-ws orphan
 /// aaa stamps can outrank live zzz). Keep `.daemon.gen`→slug mapping; no
 /// invented GC of stale `.daemon.gen` files.
-fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
+/// Alive / other partitions of the doorbell hosting registry.
+/// Wake classify uses **alive only** (GS062 alive-empty WARNING): when
+/// `alive` is empty do **not** fall through to `other` (orphan stamps →
+/// false Quiet) — empty alive → NeverStamped.
+fn hosted_registry_partitions(
+    state_dir: &std::path::Path,
+) -> (Vec<String>, Vec<String>) {
     let db = state_dir.join("doorbell");
     let mut alive = Vec::new();
     let mut other = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let Ok(entries) = std::fs::read_dir(&db) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let now_unix = doorbell_rt::lease::unix_now();
     for ent in entries.flatten() {
@@ -31935,7 +31961,19 @@ fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
             other.push(label.to_string());
         }
     }
+    (alive, other)
+}
+
+fn hosted_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
+    let (alive, other) = hosted_registry_partitions(state_dir);
     doorbell_rt::wake_liveness::order_hosted_alive_first(alive, other)
+}
+
+/// Alive-only hosted labels for wake classify (ask-user F / alive-empty WARNING).
+#[cfg(test)]
+fn hosted_alive_workspaces_from_registry(state_dir: &std::path::Path) -> Vec<String> {
+    let (alive, _other) = hosted_registry_partitions(state_dir);
+    doorbell_rt::wake_liveness::order_hosted_alive_first(alive, Vec::new())
 }
 
 /// True when a registry label should sort into the `/health` alive partition.
@@ -32087,6 +32125,91 @@ mod hosted_workspaces_from_registry_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Alive-empty WARNING: orphan stamps in `other` must not drive wake —
+    /// classify from alive only; empty alive → NeverStamped (not Quiet).
+    #[test]
+    fn alive_empty_orphan_stamps_wake_is_never_stamped() {
+        let dir = tempfile_state();
+        let db = dir.join("doorbell");
+        std::fs::create_dir_all(&db).expect("doorbell dir");
+        // Orphan only: daemon.gen + fresh stamps, no pid/lease → other.
+        std::fs::write(db.join("orphan.daemon.gen"), b"{}").expect("orphan.daemon.gen");
+        doorbell_rt::watchbeat::touch_event(&dir, "orphan");
+        doorbell_rt::watchbeat::touch_heartbeat(&dir, "orphan");
+
+        let alive = super::hosted_alive_workspaces_from_registry(&dir);
+        assert!(
+            alive.is_empty(),
+            "orphan must not be alive: {alive:?}"
+        );
+        let hosted = hosted_workspaces_from_registry(&dir);
+        assert_eq!(hosted, vec!["orphan".to_string()]);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let stamps: Vec<(Option<u64>, Option<u64>)> = alive
+            .iter()
+            .map(|ws| {
+                (
+                    doorbell_rt::watchbeat::last_event_ms(&dir, ws),
+                    doorbell_rt::watchbeat::last_heartbeat_ms(&dir, ws),
+                )
+            })
+            .collect();
+        let pipe = doorbell_rt::wake_liveness::classify_worst_of(
+            now_ms,
+            stamps,
+            doorbell_rt::wake_liveness::DEFAULT_DEAF_CEILING_MS,
+        );
+        assert_eq!(
+            pipe,
+            doorbell_rt::wake_liveness::PipeHealth::NeverStamped,
+            "alive=[] must not classify orphan Quiet: {pipe:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ASK-USER F: multi-alive Deaf + Live → wake=Deaf (worst-of).
+    #[test]
+    fn multi_alive_deaf_plus_live_wake_is_deaf() {
+        let dir = tempfile_state();
+        let db = dir.join("doorbell");
+        std::fs::create_dir_all(&db).expect("doorbell dir");
+        let now = doorbell_rt::lease::unix_now();
+        for ws in ["deaf-ws", "live-ws"] {
+            std::fs::write(db.join(format!("{ws}.daemon.gen")), b"{}").expect("daemon.gen");
+            doorbell_rt::lease::acquire_lease(&dir, ws, now).expect("lease");
+        }
+        // Fresh Live stamps on live-ws.
+        doorbell_rt::watchbeat::touch_event(&dir, "live-ws");
+        doorbell_rt::watchbeat::touch_heartbeat(&dir, "live-ws");
+        // Stale Deaf stamps on deaf-ws (age >> ceiling): write old mtime via
+        // absolute ms far in the past by writing then backdating is hard;
+        // instead pass explicit stamp pairs to classify_worst_of (unit).
+        let now_ms = 200_000u64;
+        let stamps = [
+            (None, Some(100_000u64)),             // Deaf
+            (Some(199_000u64), Some(198_000u64)), // Live
+        ];
+        let pipe = doorbell_rt::wake_liveness::classify_worst_of(
+            now_ms,
+            stamps,
+            doorbell_rt::wake_liveness::DEFAULT_DEAF_CEILING_MS,
+        );
+        assert_eq!(
+            pipe,
+            doorbell_rt::wake_liveness::PipeHealth::Deaf {
+                silent_for_ms: 100_000
+            }
+        );
+        // Registry still lists both as alive.
+        let alive = super::hosted_alive_workspaces_from_registry(&dir);
+        assert_eq!(alive.len(), 2, "both leases alive: {alive:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tempfile_state() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "fw-hosted-reg-{}-{}",
@@ -32130,35 +32253,44 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         // GS-062: wake_liveness classify over split event/hb stamps.
         // ASK-USER D (captain locked): workspace key = hosted label from
         // AppState (flywheel-{project}), matching stamp writers.
+        // ASK-USER F: worst-of across ALL alive hosted (not primary-only).
+        // Alive-empty WARNING: classify from alive only — never fall through
+        // to other/orphan stamps (false Quiet).
         let state_dir = config::state_dir();
-        let hosted = {
+        let (alive, hosted) = {
+            let (a, o) = hosted_registry_partitions(&state_dir);
+            let alive = doorbell_rt::wake_liveness::order_hosted_alive_first(a, Vec::new());
+            let hosted = doorbell_rt::wake_liveness::order_hosted_alive_first(
+                alive.clone(),
+                o,
+            );
             let mut g = st
                 .hosted_workspaces
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *g = hosted_workspaces_from_registry(&state_dir);
-            g.clone()
+            *g = hosted.clone();
+            (alive, hosted)
         };
-        // Primary = first alive-hosted label (registry order). Empty →
-        // NeverStamped (honest: nothing hosted yet).
-        let workspace = hosted.first().cloned().unwrap_or_default();
+        // Primary display = first alive. Empty alive → NeverStamped.
+        let workspace = alive.first().cloned().unwrap_or_default();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let (last_event_ms, last_heartbeat_ms) = if workspace.is_empty() {
-            (None, None)
-        } else {
-            (
-                doorbell_rt::watchbeat::last_event_ms(&state_dir, &workspace),
-                doorbell_rt::watchbeat::last_heartbeat_ms(&state_dir, &workspace),
-            )
-        };
-        // Never max(event, hb) into last_event_ms — classifier tests encode this.
-        let pipe = wake_liveness::classify(
+        // Worst-of over alive stamps only (ask-user F). Never max-merge then
+        // classify once — that lets one Live mask another Deaf.
+        let stamps: Vec<(Option<u64>, Option<u64>)> = alive
+            .iter()
+            .map(|ws| {
+                (
+                    doorbell_rt::watchbeat::last_event_ms(&state_dir, ws),
+                    doorbell_rt::watchbeat::last_heartbeat_ms(&state_dir, ws),
+                )
+            })
+            .collect();
+        let (pipe, last_event_ms, last_heartbeat_ms) = wake_liveness::classify_worst_of_stamps(
             now_ms,
-            last_event_ms,
-            last_heartbeat_ms,
+            stamps,
             wake_liveness::DEFAULT_DEAF_CEILING_MS,
         );
         json!({

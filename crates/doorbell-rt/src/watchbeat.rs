@@ -134,6 +134,12 @@ impl StampThreads {
         touch_event_throttled(&self.state_dir, &self.workspace, &mut self.last_event);
     }
 
+    /// Cloneable stop signal — couple to [`Drop`] of a watch child so hb
+    /// stops even if the reader thread is parked / slow to exit (GS062-ADV-5).
+    pub fn stop_handle(&self) -> Option<std::sync::mpsc::Sender<()>> {
+        self.stop_tx.clone()
+    }
+
     /// Stop the heartbeat ticker (also runs on Drop).
     pub fn stop(&mut self) {
         if let Some(tx) = self.stop_tx.take() {
