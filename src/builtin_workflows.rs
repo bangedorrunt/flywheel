@@ -538,6 +538,8 @@ inputs:
     default: ""
   - name: bead
     default: ""
+  - name: depth
+    default: "full"
 steps:
   - name: compound
     action: dispatch_job
@@ -546,7 +548,7 @@ steps:
       profile: "@housekeeper"
       phase: compound
       stage: ce-compound
-      task: 'Run the compound gate (ADR-0009, bd-iqte) over: bead {{inputs.bead}} {{inputs.source}}. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Read lanes are rg + chie qmd search + chie memory recall (labeled, offline-safe). Qualifying learnings are memory-recorded and filed to docs/learnings/inbox/ as tier: perishable with expires: and provenance (reinforced: stamped today) — never straight to docs/learnings/, never gated on a human at write time. Reply with ONLY the terminal JSON. The terminal signal (inboxed|clean_skip) IS the run verdict — never prose around it. One learning per run.'
+      task: 'Run the compound gate (ADR-0009, bd-iqte) over: bead {{inputs.bead}} {{inputs.source}}. Depth {{inputs.depth}}: "full" (default) runs the complete gate with all read lanes; "lightweight" captures one learning with minimal probes. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Read lanes are rg + chie qmd search + chie memory recall (labeled, offline-safe). Qualifying learnings are memory-recorded and filed to docs/learnings/inbox/ as tier: perishable with expires: and provenance (reinforced: stamped today) — never straight to docs/learnings/, never gated on a human at write time. Reply with ONLY the terminal JSON. The terminal signal (inboxed|clean_skip) IS the run verdict — never prose around it. One learning per run.'
     on_error: continue
 "#,
     ),
