@@ -1,19 +1,24 @@
-//! Wake pipe quiet-vs-deaf classifier (GS-061 / ADR-0036 / Buzz #7546 pattern).
+//! Wake pipe quiet-vs-deaf classifier — GS-061 wake quiet-vs-deaf library
+//! wedge (toron ADR-0036 / GS-061 scout pattern, external; not an in-repo ADR).
 //!
 //! **Library-only** until captain chooses A (keep library) vs B (wire into
 //! `/health`). Distinguishes a **quiet** wake.sock (heartbeats arriving, no
 //! events) from a **deaf** pipe (no frames at all past the idle ceiling), or
-//! **never-stamped** UNKNOWN. No second broker / Redis / Funnel — pure
-//! classification over host-observed timestamps. Not live on `/health` yet.
-
-// Expected unused until captain B wires /health — keep export surface compilable.
-#![allow(dead_code)]
+//! **never-stamped** (never observed ≠ deaf). No second broker / Redis /
+//! Funnel — pure classification over host-observed timestamps. Not live on
+//! `/health` yet.
 
 /// Default deaf ceiling (ms): silence past this is deaf, never quiet.
+#[allow(dead_code)] // export surface until captain B wires /health
 pub const DEFAULT_DEAF_CEILING_MS: u64 = 60_000;
 
 /// Pipe health relative to wake.sock heartbeats / events.
+///
+/// Shape note for future `/health` serializers: `Live` / `Quiet` carry
+/// **absolute** millisecond stamps; `Deaf` carries a measured **age**
+/// (`silent_for_ms`); `NeverStamped` carries neither (never observed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // export surface until captain B wires /health
 pub enum PipeHealth {
     /// Events flowing recently.
     Live { last_event_ms: u64 },
@@ -22,9 +27,12 @@ pub enum PipeHealth {
     /// No frame of any kind past the ceiling — watcher is deaf.
     ///
     /// `silent_for_ms` is the measured age of the most recent observed frame
-    /// (min of present event/hb ages). `None` means never stamped — UNKNOWN,
-    /// never a fabricated ceiling age (watchbeat honesty: None ≠ 0).
-    Deaf { silent_for_ms: Option<u64> },
+    /// (min of present event/hb ages). Always a real age — never a fabricated
+    /// ceiling stand-in.
+    Deaf { silent_for_ms: u64 },
+    /// Never observed a stamp — UNKNOWN. Distinct from [`Deaf`]: never
+    /// observed ≠ silent-too-long (watchbeat honesty).
+    NeverStamped,
 }
 
 /// Classify wake-pipe liveness from host-observed timestamps.
@@ -35,7 +43,8 @@ pub enum PipeHealth {
 ///
 /// Quiet requires a heartbeat inside the ceiling; deaf is silence past the
 /// ceiling after a known observation. Never-stamped (both `None`) is
-/// `Deaf { silent_for_ms: None }` — UNKNOWN, not age=ceiling.
+/// [`PipeHealth::NeverStamped`] — not Deaf.
+#[allow(dead_code)] // export surface until captain B wires /health
 pub fn classify(
     now_ms: u64,
     last_event_ms: Option<u64>,
@@ -59,17 +68,20 @@ pub fn classify(
         }
     }
 
+    // Never stamped: never observed ≠ deaf.
+    if last_event_ms.is_none() && last_heartbeat_ms.is_none() {
+        return PipeHealth::NeverStamped;
+    }
+
     // Deaf: measured last-frame age from present stamps only. Ceiling is the
     // Live/Quiet threshold above — never a stand-in timestamp when unstamped.
     let silent_for_ms = match (last_event_ms, last_heartbeat_ms) {
-        (None, None) => None,
-        (Some(ev), None) => Some(now_ms.saturating_sub(ev)),
-        (None, Some(hb)) => Some(now_ms.saturating_sub(hb)),
-        (Some(ev), Some(hb)) => Some(
-            now_ms
-                .saturating_sub(ev)
-                .min(now_ms.saturating_sub(hb)),
-        ),
+        (Some(ev), None) => now_ms.saturating_sub(ev),
+        (None, Some(hb)) => now_ms.saturating_sub(hb),
+        (Some(ev), Some(hb)) => now_ms
+            .saturating_sub(ev)
+            .min(now_ms.saturating_sub(hb)),
+        (None, None) => unreachable!("handled above"),
     };
     PipeHealth::Deaf { silent_for_ms }
 }
@@ -95,7 +107,7 @@ mod tests {
         assert_eq!(
             h,
             PipeHealth::Deaf {
-                silent_for_ms: Some(100_000)
+                silent_for_ms: 100_000
             }
         );
     }
@@ -112,12 +124,12 @@ mod tests {
     }
 
     #[test]
-    fn never_stamped_is_unknown_deaf_not_ceiling() {
-        // both None at t≈0 — must not invent silent_for_ms = ceiling
+    fn never_stamped_is_unknown_not_deaf() {
+        // both None — never observed ≠ Deaf (watchbeat honesty)
         let h = classify(0, None, None, 60_000);
-        assert_eq!(h, PipeHealth::Deaf { silent_for_ms: None });
+        assert_eq!(h, PipeHealth::NeverStamped);
         let h = classify(1_000, None, None, 60_000);
-        assert_eq!(h, PipeHealth::Deaf { silent_for_ms: None });
+        assert_eq!(h, PipeHealth::NeverStamped);
     }
 
     #[test]
@@ -127,7 +139,7 @@ mod tests {
         assert_eq!(
             h,
             PipeHealth::Deaf {
-                silent_for_ms: Some(100_000)
+                silent_for_ms: 100_000
             }
         );
     }
@@ -139,7 +151,7 @@ mod tests {
         assert_eq!(
             h,
             PipeHealth::Deaf {
-                silent_for_ms: Some(80_000)
+                silent_for_ms: 80_000
             }
         );
     }
