@@ -154,6 +154,19 @@ struct HostedLoop {
 
 type Hosts = Shared<Vec<HostedLoop>>;
 
+/// One hosted loop's supervised task, keyed like `HostedLoop`: bd-mk60's
+/// lesson applied to the drain (bd-zzgb). An anonymous
+/// `Vec<JoinHandle>` cannot name WHICH loop missed the deadline, so a
+/// budget bail reported only a count and pinned nothing — and awaiting
+/// those handles head-of-line let one hung Brain claim every other loop
+/// had failed too.
+struct LoopEntry {
+    key: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+type Loops = Shared<Vec<LoopEntry>>;
+
 /// The hosted keys, in insertion order — what `/health` reports as `hosted`.
 fn hosted_keys(hosts: &[HostedLoop]) -> Vec<String> {
     hosts.iter().map(|h| h.key.clone()).collect()
@@ -401,6 +414,78 @@ fn drain_note(joined: bool, remaining: usize, total: usize) -> String {
     }
 }
 
+/// What one drain learned: whether the budget held, how many loops were
+/// still running at the deadline, and WHICH keys they were (bd-zzgb — an
+/// anonymous count could not pin the loop that missed the drain).
+#[derive(Debug, PartialEq)]
+struct DrainReport {
+    joined: bool,
+    remaining: usize,
+    total: usize,
+    stragglers: Vec<String>,
+}
+
+/// Join every supervised loop CONCURRENTLY inside `budget` (bd-zzgb).
+/// The old drain awaited handles in order, so a single hung brain stalled
+/// the whole scan: loops that finished behind it were never observed and
+/// the note claimed they all missed the deadline ("6 of 6"). All handles
+/// race the budget together; stragglers are read from `is_finished` AFTER
+/// the timeout, never from a decrement counter. A JoinError is still
+/// surfaced loudly per key — a panicked Brain is a defect, not a clean
+/// join. At the deadline the join future is dropped; the handles stay
+/// owned by `entries` (only the borrow ends), so nothing is cancelled
+/// mid-write — the exiting process is what stops the stragglers.
+async fn drain_loops(entries: &mut [LoopEntry], budget: std::time::Duration) -> DrainReport {
+    let total = entries.len();
+    let joins: Vec<&mut tokio::task::JoinHandle<()>> =
+        entries.iter_mut().map(|e| &mut e.task).collect();
+    match tokio::time::timeout(budget, futures::future::join_all(joins)).await {
+        Ok(done) => {
+            for (entry, res) in entries.iter().zip(done) {
+                if let Err(e) = res {
+                    eprintln!(
+                        "doorbell serve: hosted loop {} task ended abnormally ({e})",
+                        entry.key
+                    );
+                }
+            }
+            DrainReport {
+                joined: true,
+                remaining: 0,
+                total,
+                stragglers: Vec::new(),
+            }
+        }
+        Err(_elapsed) => {
+            let stragglers: Vec<String> = entries
+                .iter()
+                .filter(|e| !e.task.is_finished())
+                .map(|e| e.key.clone())
+                .collect();
+            let remaining = stragglers.len();
+            DrainReport {
+                joined: false,
+                remaining,
+                total,
+                stragglers,
+            }
+        }
+    }
+}
+
+/// Names the loops that outlived the drain budget — the live pin for
+/// bd-zzgb's next occurrence. None when everything joined.
+fn straggler_note(report: &DrainReport) -> Option<String> {
+    if report.stragglers.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "doorbell serve: straggler loop(s) still running after {}s: {}",
+        DRAIN_BUDGET.as_secs(),
+        report.stragglers.join(", ")
+    ))
+}
+
 pub async fn run(cfg: &Config) -> Result<()> {
     use doorbell_rt::lease;
     let now = lease::unix_now();
@@ -538,8 +623,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // JoinHandles, remove dead workers from `hosted`, release their lease,
     // and invalidate the health snapshot before the next probe can advertise
     // a worker that no longer exists.
-    let loops: Shared<Vec<tokio::task::JoinHandle<()>>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let loops: Loops = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     for (project, workspace) in &cfg.hosts {
         spawn_host_loop(cfg, &hosted, &loops, &owned, &health, project, workspace);
     }
@@ -691,26 +775,24 @@ pub async fn run(cfg: &Config) -> Result<()> {
             }
             eprintln!("doorbell serve: shutdown sent, joining loops");
             drop(retiring);
-            let handles = std::mem::take(&mut *loops.lock());
-            let total = handles.len();
-            let mut remaining = total;
-            let drain = async {
-                for h in handles {
-                    // A JoinError here is a DEFECT (a panicked loop task),
-                    // not a clean join: swallowing it made a crashed Brain
-                    // look like a graceful drain.
-                    if let Err(e) = h.await {
-                        eprintln!("doorbell serve: hosted loop task ended abnormally ({e})");
-                    }
-                    remaining -= 1;
-                }
-            };
+            let mut entries = std::mem::take(&mut *loops.lock());
             // Bounded drain: SIGTERM must always finish inside stop's 15s
-            // grace. A Brain that never joins used to hold the pid alive
-            // until stop declared "ignored SIGTERM"; now we say so, release,
-            // and exit anyway.
-            let joined = tokio::time::timeout(DRAIN_BUDGET, drain).await.is_ok();
-            eprintln!("{}", drain_note(joined, remaining, total));
+            // grace. Joins race the budget CONCURRENTLY (bd-zzgb): the old
+            // head-of-line await meant one hung Brain stalled the scan and
+            // the note claimed every loop missed the deadline even when the
+            // ones behind it had already exited. At the deadline the stragglers
+            // are named loudly, then the process exits (their handles drop here;
+            // the tasks detach — bd-nuf2: intents were journaled pre-delivery,
+            // resume redelivers).
+            let report = drain_loops(&mut entries, DRAIN_BUDGET).await;
+            eprintln!(
+                "{}",
+                drain_note(report.joined, report.remaining, report.total)
+            );
+            if let Some(note) = straggler_note(&report) {
+                eprintln!("{note}");
+            }
+            drop(entries);
             finish();
             eprintln!("doorbell serve: shutting down");
             Ok(())
@@ -729,7 +811,7 @@ fn bins_allow_hosting(toron_resolved: bool, herdr_resolved: bool) -> bool {
 fn spawn_host_loop(
     cfg: &Config,
     hosted: &Hosts,
-    loops: &Shared<Vec<tokio::task::JoinHandle<()>>>,
+    loops: &Loops,
     owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
     health: &Shared<CachedHealth>,
     project: &str,
@@ -813,7 +895,7 @@ fn spawn_host_loop(
         key: key.clone(),
         tx: tx.clone(),
     });
-    loops.lock().push(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // Await a child task so panic/abort is also a supervised completion:
         // the outer task still removes the hosted row and releases its lease.
         let child = tokio::spawn(host_workspace(fw, p, w, loop_tx, rx));
@@ -832,17 +914,12 @@ fn spawn_host_loop(
             report.stats.injects, report.stats.sheds, report.stats.degraded
         );
         if remove_host(&supervised_hosted, &supervised_key) {
-            release_owned_lease(
-                &supervised_state,
-                &supervised_owned,
-                &supervised_workspace,
-            );
+            release_owned_lease(&supervised_state, &supervised_owned, &supervised_workspace);
             invalidate_health_snapshot(&supervised_health);
-            eprintln!(
-                "doorbell serve: removed dead hosted worker {supervised_key} from health"
-            );
+            eprintln!("doorbell serve: removed dead hosted worker {supervised_key} from health");
         }
-    }));
+    });
+    loops.lock().push(LoopEntry { key, task });
     // The table keeps its OWN sender: the loop's clones live inside the task,
     // so this handle is the only one reconcile can address. `try_send` on it
     // is how a retiring loop is told to drain (bd-mk60).
@@ -851,11 +928,11 @@ fn spawn_host_loop(
 fn reconcile_once(
     cfg: &Config,
     hosted: &Hosts,
-    loops: &Shared<Vec<tokio::task::JoinHandle<()>>>,
+    loops: &Loops,
     owned: &Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>>,
     health: &Shared<CachedHealth>,
 ) {
-    loops.lock().retain(|handle| !handle.is_finished());
+    loops.lock().retain(|entry| !entry.task.is_finished());
     use doorbell_rt::lease;
     use doorbell_rt::subscribe::{Actor, SubscriptionStore};
     let mut store = SubscriptionStore::open(&cfg.flywheel_state);
@@ -1572,6 +1649,74 @@ mod tests {
         let hung = super::drain_note(false, 3, 6);
         assert!(hung.contains("DRAIN BUDGET EXCEEDED"), "{hung}");
         assert!(hung.contains("3 of 6"), "{hung}");
+    }
+
+    /// bd-zzgb: the old drain awaited handles HEAD-OF-LINE and decremented
+    /// only as each await returned, so one hung brain reported "6 of 6 did
+    /// not join" while the loops behind it had already exited. Stragglers
+    /// must be read from the handles, never from a decrement counter.
+    #[tokio::test(start_paused = true)]
+    async fn drain_counts_a_finished_loop_even_when_one_never_joins() {
+        let mut entries = vec![
+            super::LoopEntry {
+                key: "fast/flywheel".into(),
+                task: tokio::spawn(async {}),
+            },
+            super::LoopEntry {
+                key: "stuck/flywheel".into(),
+                task: tokio::spawn(async { std::future::pending::<()>().await }),
+            },
+        ];
+        let report = super::drain_loops(&mut entries, std::time::Duration::from_secs(10)).await;
+        assert!(!report.joined, "budget must expire: {report:?}");
+        assert_eq!(
+            (report.remaining, report.total),
+            (1, 2),
+            "only the stuck loop may remain: {report:?}"
+        );
+        assert_eq!(report.stragglers, ["stuck/flywheel"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_is_a_clean_join_when_every_loop_finishes() {
+        let mut entries = vec![
+            super::LoopEntry {
+                key: "a/a".into(),
+                task: tokio::spawn(async {}),
+            },
+            super::LoopEntry {
+                key: "b/b".into(),
+                task: tokio::spawn(async {}),
+            },
+        ];
+        let report = super::drain_loops(&mut entries, std::time::Duration::from_secs(10)).await;
+        assert!(
+            report.joined && report.remaining == 0 && report.stragglers.is_empty(),
+            "{report:?}"
+        );
+        assert!(
+            super::drain_note(report.joined, report.remaining, report.total)
+                .contains("loops joined")
+        );
+    }
+
+    #[test]
+    fn straggler_note_names_every_loop_that_missed_the_deadline() {
+        let stuck = super::DrainReport {
+            joined: false,
+            remaining: 2,
+            total: 3,
+            stragglers: vec!["p/one".into(), "p/two".into()],
+        };
+        let note = super::straggler_note(&stuck).expect("stuck loops must be named");
+        assert!(note.contains("p/one") && note.contains("p/two"), "{note}");
+        let clean = super::DrainReport {
+            joined: true,
+            remaining: 0,
+            total: 3,
+            stragglers: vec![],
+        };
+        assert!(super::straggler_note(&clean).is_none());
     }
     use super::{
         REAP_AFTER_SECS, bins_allow_hosting, inbox_path_down, reap_candidates, unhosted_subscribed,

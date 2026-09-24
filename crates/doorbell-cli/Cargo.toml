@@ -11,6 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 doorbell-rt = { path = "../doorbell-rt" }
+# Concurrent drain join (bd-zzgb): join_all races every supervised handle
+# against the budget while keeping the handles owned by the loop table —
+# tokio alone has no handle-preserving combinator.
+futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -19,3 +23,7 @@ anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+
+[dev-dependencies]
+# start_paused drain tests substitute the budget clock; no real 10s sleep.
+tokio = { version = "1", features = ["test-util"] }

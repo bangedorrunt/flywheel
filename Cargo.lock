@@ -975,6 +975,7 @@ dependencies = [
  "clap",
  "dirs",
  "doorbell-rt",
+ "futures",
  "parking_lot",
  "serde",
  "serde_json",

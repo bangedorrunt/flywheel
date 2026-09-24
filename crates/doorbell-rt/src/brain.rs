@@ -169,7 +169,18 @@ impl<H: Host> Brain<H> {
                     if matches!(msg, BrainMsg::Shutdown) {
                         break;
                     }
-                    self.dispatch(msg).await;
+                    // bd-zzgb: name a dispatch that is holding the loop past
+                    // the warn bound — a queued Shutdown behind it is how a
+                    // Brain misses the 10s drain. Never cancelled.
+                    let label = brain_msg_label(&msg);
+                    let ws = self.cfg.workspace.clone();
+                    run_dispatch_with_slow_warn(label, self.dispatch(msg), move |label| {
+                        eprintln!(
+                            "doorbell serve: brain {ws} dispatch {label} still running after {}s",
+                            SLOW_DISPATCH_WARN.as_secs()
+                        );
+                    })
+                    .await;
                 }
                 _ = digest_tick.tick() => {
                     self.maybe_flush_digest().await;
@@ -897,6 +908,53 @@ fn count_journaled_prompts(store: &FileStore, workspace: &str) -> usize {
         .count()
 }
 
+/// bd-zzgb: bound on one dispatch before the Brain warns it is holding
+/// the message loop. A dispatch outliving this cannot see the Shutdown
+/// queued behind it, so the Brain misses the 10s SIGTERM drain — naming
+/// the variant HERE, while the process still lives, is the live pin.
+const SLOW_DISPATCH_WARN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Variant name for the slow-dispatch warn. Exhaustive on purpose: a new
+/// `BrainMsg` variant fails the build here instead of silently losing the
+/// diagnostic.
+fn brain_msg_label(msg: &BrainMsg) -> &'static str {
+    match msg {
+        BrainMsg::Watch(_) => "watch",
+        BrainMsg::HerdrStatus { .. } => "status",
+        BrainMsg::Died => "died",
+        BrainMsg::Sweep { .. } => "sweep",
+        BrainMsg::RoleBound { .. } => "rolebound",
+        BrainMsg::Fact { .. } => "fact",
+        BrainMsg::AckSlaTick { .. } => "ack-sla",
+        BrainMsg::Presence { .. } => "presence",
+        BrainMsg::InboxFetched { .. } => "inbox-fetched",
+        BrainMsg::SlaFired { .. } => "sla-fired",
+        BrainMsg::Degraded { .. } => "degraded",
+        BrainMsg::Delivered { .. } => "delivered",
+        BrainMsg::Ask { .. } => "ask",
+        BrainMsg::Shutdown => "shutdown",
+    }
+}
+
+/// Warns (via `on_slow`) when `work` outlives `SLOW_DISPATCH_WARN`, then
+/// STILL awaits it to completion — never cancels (effect law: a mid-write
+/// abort corrupts; the drain budget is what exits the process anyway). The
+/// raced timer is what lets the warn print while a hung dispatch is still
+/// running, i.e. before the drain deadline kills the daemon.
+async fn run_dispatch_with_slow_warn<F>(label: &str, work: F, on_slow: impl FnOnce(&str))
+where
+    F: std::future::Future<Output = ()>,
+{
+    let mut work = std::pin::pin!(work);
+    tokio::select! {
+        _ = work.as_mut() => {}
+        _ = tokio::time::sleep(SLOW_DISPATCH_WARN) => {
+            on_slow(label);
+            let _ = work.as_mut().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,6 +999,34 @@ mod tests {
             .await
             .expect("run must exit inside budget with a hung endpoint");
         let _ = report;
+    }
+
+    /// bd-zzgb: a dispatch outliving the warn bound must be NAMED while it
+    /// still runs (the drain prints this before the process exits) and must
+    /// NOT be cancelled — a mid-write abort corrupts, and the budget is what
+    /// exits us. The work still runs to completion after the warn.
+    #[tokio::test(start_paused = true)]
+    async fn slow_dispatch_warns_once_and_still_finishes() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        super::run_dispatch_with_slow_warn(
+            "sweep",
+            async { tokio::time::sleep(std::time::Duration::from_secs(30)).await },
+            move |label| seen_c.lock().unwrap().push(label.to_string()),
+        )
+        .await;
+        assert_eq!(seen.lock().unwrap().join(","), "sweep");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_dispatch_never_warns() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        super::run_dispatch_with_slow_warn("fact", std::future::ready(()), move |label| {
+            seen_c.lock().unwrap().push(label.to_string())
+        })
+        .await;
+        assert!(seen.lock().unwrap().is_empty(), "fast dispatch stays quiet");
     }
 
     /// bd-adms: `toron ack-sla` re-reports every corr still past SLA, so an
