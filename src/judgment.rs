@@ -1765,13 +1765,20 @@ pub fn fold_annotate(surface: AnnotateSurface, answers: &Answers, pack: &Questio
             format!("annotate profile: fit={level} ({lv_conf:.2})")
         }
         AnnotateSurface::TierPick => {
+            // bd-vlvn: reasoning_depth is a Score — the level indexes the
+            // pack's ordered options, mirroring the reviewer-rank arm.
             let depth = answers
                 .by_question
                 .get("reasoning_depth")
                 .and_then(|a| match a {
-                    Answer::Choice(c) => Some(c.choice.as_str()),
+                    Answer::Score(s) => pack
+                        .questions
+                        .iter()
+                        .find(|q| q.id == "reasoning_depth")
+                        .and_then(|q| q.options.get(s.level)),
                     _ => None,
                 })
+                .map(String::as_str)
                 .unwrap_or("substantial");
             let coupling = answers
                 .by_question
@@ -1818,6 +1825,174 @@ pub fn suggest_tier_pick(objective: &str) -> Option<&'static str> {
         return Some("@premium");
     }
     None
+}
+
+/// bd-vlvn: reject-all confidence gate — a live suggestion renders only
+/// when its calibrated confidence clears the announce-only bar (default
+/// 0.7, captain-tunable). Below the bar the suggestion is NOTHING (not
+/// even the table): a weak live signal is evidence against the table cue,
+/// while a deny (no signal at all) keeps it.
+pub fn suggestion_gate(conf: f64) -> bool {
+    conf >= active_thresholds().announce_only
+}
+
+/// One batched candidate score (bd-vlvn): the candidate, its Score level
+/// and level name, and the calibrated confidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateScore {
+    pub candidate: String,
+    pub level: usize,
+    pub level_name: String,
+    pub confidence: f64,
+}
+
+/// bd-vlvn: batch per-candidate scores into ONE request. Clone the Score
+/// question per candidate (`<qid>__<candidate>`, instructions specialized
+/// to that candidate), ask once, split the answers back. The transport
+/// still sees a single POST; options/criteria ride each clone unchanged.
+pub fn batch_pack_for_candidates(
+    pack: &QuestionPack,
+    qid: &str,
+    candidates: &[String],
+) -> Result<QuestionPack, String> {
+    let template = pack
+        .questions
+        .iter()
+        .find(|q| q.id == qid)
+        .ok_or_else(|| format!("batch: question {qid:?} not in pack {}", pack.id))?;
+    if !matches!(template.kind, QuestionKind::Score) {
+        return Err(format!("batch: question {qid:?} is not a Score"));
+    }
+    let questions = candidates
+        .iter()
+        .map(|c| QuestionDef {
+            id: format!("{qid}__{c}"),
+            kind: template.kind,
+            instructions: template
+                .instructions
+                .replace("`candidate`", &format!("`{c}`")),
+            options: template.options.clone(),
+            criteria: template.criteria.clone(),
+        })
+        .collect();
+    Ok(QuestionPack {
+        id: pack.id.clone(),
+        version: pack.version,
+        model: pack.model.clone(),
+        questions,
+    })
+}
+
+/// bd-vlvn: split batched answers back per candidate. Missing or
+/// non-Score answers drop that candidate (loud skip, never invented).
+pub fn split_batched_scores(
+    answers: &Answers,
+    pack: &QuestionPack,
+    qid: &str,
+    candidates: &[String],
+) -> Vec<CandidateScore> {
+    let mut out = Vec::new();
+    for c in candidates {
+        let key = format!("{qid}__{c}");
+        let Some(Answer::Score(s)) = answers.by_question.get(&key) else {
+            continue;
+        };
+        let name = pack
+            .questions
+            .iter()
+            .find(|q| q.id == key)
+            .and_then(|q| q.options.get(s.level))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        out.push(CandidateScore {
+            candidate: c.clone(),
+            level: s.level,
+            level_name: name,
+            confidence: confidence_of(&Answer::Score(ScoreAnswer {
+                level: s.level,
+                levels: s.levels,
+            })),
+        });
+    }
+    out
+}
+
+/// bd-vlvn: rank batched scores — highest level wins, confidence breaks
+/// ties. None when empty.
+pub fn rank_candidate_scores(scores: &[CandidateScore]) -> Option<&CandidateScore> {
+    scores.iter().max_by(|a, b| {
+        a.level.cmp(&b.level).then_with(|| {
+            a.confidence
+                .partial_cmp(&b.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    })
+}
+
+/// bd-vlvn: live profile suggestion — batch-score implement candidates in
+/// ONE request (candidate when-scope excerpts ride the state), rank, then
+/// gate. Ok(Some) = gated `@profile`; Ok(None) = answered-but-weak
+/// (nothing, not even the table) or no candidates; Err = deny (the caller
+/// keeps the FallbackTable).
+pub fn live_profile_suggestion<T: Transport>(
+    transport: &T,
+    pack: &QuestionPack,
+    goal: &str,
+    candidates: &[(String, String)],
+) -> Result<Option<String>, JevError> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let names: Vec<String> = candidates.iter().map(|(n, _)| n.clone()).collect();
+    let batch =
+        batch_pack_for_candidates(pack, "profile_fit", &names).map_err(JevError::Malformed)?;
+    let mut fields = BTreeMap::new();
+    fields.insert("goal.text".to_string(), goal.to_string());
+    for (name, when) in candidates {
+        fields.insert(format!("candidate.{name}.when"), when.clone());
+    }
+    let slice = build_state_slice(fields);
+    let answers = transport.ask(&slice, &batch)?;
+    let scores = split_batched_scores(&answers, &batch, "profile_fit", &names);
+    let best = rank_candidate_scores(&scores);
+    match best {
+        Some(b) if suggestion_gate(b.confidence) => Ok(Some(format!("@{}", b.candidate))),
+        _ => Ok(None),
+    }
+}
+
+/// bd-vlvn: live tier suggestion — one request over the tier-pick pack
+/// (reasoning_depth Score + harness_coupling Choice). routine maps to
+/// @cheap, frontier to @premium, substantial (the unsure middle) to
+/// nothing; the whole suggestion gates on pack confidence. Err = deny
+/// (the caller keeps the FallbackTable).
+pub fn live_tier_suggestion<T: Transport>(
+    transport: &T,
+    pack: &QuestionPack,
+    goal: &str,
+) -> Result<Option<String>, JevError> {
+    let mut fields = BTreeMap::new();
+    fields.insert("goal.text".to_string(), goal.to_string());
+    let slice = build_state_slice(fields);
+    let answers = transport.ask(&slice, pack)?;
+    if !suggestion_gate(pack_confidence(&answers)) {
+        return Ok(None);
+    }
+    let depth = answers.by_question.get("reasoning_depth");
+    let band = match depth {
+        Some(Answer::Score(s)) => pack
+            .questions
+            .iter()
+            .find(|q| q.id == "reasoning_depth")
+            .and_then(|q| q.options.get(s.level))
+            .map(String::as_str),
+        _ => None,
+    };
+    match band {
+        Some("routine") => Ok(Some("@cheap".to_string())),
+        Some("frontier") => Ok(Some("@premium".to_string())),
+        _ => Ok(None),
+    }
 }
 
 /// bd-adv4: offline FallbackTable for the profile-pick pack — deterministic
@@ -2827,7 +3002,7 @@ version: 1
 model: jev-1.13.0
 questions:
   - id: reasoning_depth
-    kind: choice
+    kind: score
     instructions: "depth?"
     options: [routine, substantial, frontier]
     criteria: ["r", "s", "f"]
@@ -2846,13 +3021,9 @@ questions:
             by_question: BTreeMap::from([
                 (
                     "reasoning_depth".into(),
-                    Answer::Choice(ChoiceAnswer {
-                        choice: "frontier".into(),
-                        probs: BTreeMap::from([
-                            ("frontier".into(), 0.7),
-                            ("substantial".into(), 0.2),
-                            ("routine".into(), 0.1),
-                        ]),
+                    Answer::Score(ScoreAnswer {
+                        level: 2,
+                        levels: 3,
                     }),
                 ),
                 (
@@ -2885,6 +3056,268 @@ questions:
         );
         assert_eq!(suggest_tier_pick("fix the flake"), None);
         assert_eq!(suggest_tier_pick("sharpen the objective into beads"), None);
+    }
+
+    /// bd-vlvn: the reject-all gate clears the announce-only bar and
+    /// rejects below it (tracks the captain-tunable bar, default 0.6).
+    #[test]
+    fn jev_live_suggestion_gate_clears_at_bar() {
+        let bar = active_thresholds().announce_only;
+        assert!(suggestion_gate(bar));
+        assert!(suggestion_gate(1.0));
+        assert!(!suggestion_gate(bar - 0.01));
+        assert!(!suggestion_gate(0.0));
+    }
+
+    /// bd-vlvn: batching clones the Score question per candidate into one
+    /// pack; non-Score or unknown questions refuse.
+    #[test]
+    fn jev_live_batch_pack_clones_score_per_candidate() {
+        let pack = QuestionPack::parse_yaml(
+            r#"
+id: profile-pick
+version: 1
+model: jev-1.13.0
+questions:
+  - id: profile_fit
+    kind: score
+    instructions: "How fit is `candidate`?"
+    options: [poor, adequate, strong]
+    criteria: ["p", "a", "s"]
+"#,
+        )
+        .expect("batch test pack parses");
+        let cands = vec!["coder".to_string(), "rust-coder".to_string()];
+        let batch = batch_pack_for_candidates(&pack, "profile_fit", &cands).expect("batch");
+        assert_eq!(batch.questions.len(), 2);
+        assert_eq!(batch.questions[0].id, "profile_fit__coder");
+        assert!(batch.questions[1].instructions.contains("`rust-coder`"));
+        assert!(batch_pack_for_candidates(&pack, "missing", &cands).is_err());
+    }
+
+    /// bd-vlvn: split drops missing candidates instead of inventing
+    /// scores; rank takes the highest level, confidence breaking ties.
+    #[test]
+    fn jev_live_split_drops_missing_and_ranks_best() {
+        let pack = QuestionPack::parse_yaml(
+            r#"
+id: profile-pick
+version: 1
+model: jev-1.13.0
+questions:
+  - id: profile_fit__coder
+    kind: score
+    instructions: "?"
+    options: [poor, adequate, strong]
+    criteria: ["p", "a", "s"]
+  - id: profile_fit__rust-coder
+    kind: score
+    instructions: "?"
+    options: [poor, adequate, strong]
+    criteria: ["p", "a", "s"]
+"#,
+        )
+        .expect("split test pack parses");
+        let cands = vec![
+            "coder".to_string(),
+            "rust-coder".to_string(),
+            "ghost".to_string(),
+        ];
+        let answers = Answers {
+            model_id: JEV_MODEL_PIN.into(),
+            pack_id: "profile-pick".into(),
+            pack_version: 1,
+            by_question: BTreeMap::from([
+                (
+                    "profile_fit__coder".into(),
+                    Answer::Score(ScoreAnswer {
+                        level: 1,
+                        levels: 3,
+                    }),
+                ),
+                (
+                    "profile_fit__rust-coder".into(),
+                    Answer::Score(ScoreAnswer {
+                        level: 2,
+                        levels: 3,
+                    }),
+                ),
+            ]),
+            usage: "{}".into(),
+        };
+        let scores = split_batched_scores(&answers, &pack, "profile_fit", &cands);
+        assert_eq!(scores.len(), 2, "ghost drops, never invented");
+        let best = rank_candidate_scores(&scores).expect("best");
+        assert_eq!(best.candidate, "rust-coder");
+        assert_eq!(best.level_name, "strong");
+        assert!(suggestion_gate(best.confidence));
+        assert!(rank_candidate_scores(&[]).is_none());
+    }
+
+    /// Canned batch transport for the live-suggestion tests: one POST,
+    /// per-candidate Score answers from the map.
+    struct CannedBatch {
+        levels: BTreeMap<String, usize>,
+    }
+
+    impl Transport for CannedBatch {
+        fn ask(&self, _slice: &StateSlice, pack: &QuestionPack) -> Result<Answers, JevError> {
+            let mut by_question = BTreeMap::new();
+            for q in &pack.questions {
+                let level = self.levels.get(&q.id).copied().unwrap_or(1);
+                if !matches!(q.kind, QuestionKind::Score) {
+                    // harness_coupling Choice: sharp open (conf 0.9).
+                    by_question.insert(
+                        q.id.clone(),
+                        Answer::Choice(ChoiceAnswer {
+                            choice: "open".into(),
+                            probs: BTreeMap::from([
+                                ("open".into(), 0.95),
+                                ("coupled".into(), 0.05),
+                            ]),
+                        }),
+                    );
+                    continue;
+                }
+                by_question.insert(
+                    q.id.clone(),
+                    Answer::Score(ScoreAnswer {
+                        level,
+                        levels: q.options.len(),
+                    }),
+                );
+            }
+            Ok(Answers {
+                model_id: JEV_MODEL_PIN.into(),
+                pack_id: pack.id.clone(),
+                pack_version: pack.version,
+                by_question,
+                usage: "{}".into(),
+            })
+        }
+    }
+
+    fn profile_pick_pack_for_live() -> QuestionPack {
+        QuestionPack::parse_yaml(
+            r#"
+id: profile-pick
+version: 1
+model: jev-1.13.0
+questions:
+  - id: profile_fit
+    kind: score
+    instructions: "How fit is `candidate`?"
+    options: [poor, adequate, strong]
+    criteria: ["p", "a", "s"]
+"#,
+        )
+        .expect("live test pack parses")
+    }
+
+    fn tier_pick_pack_for_live() -> QuestionPack {
+        QuestionPack::parse_yaml(
+            r#"
+id: tier-pick
+version: 1
+model: jev-1.13.0
+questions:
+  - id: reasoning_depth
+    kind: score
+    instructions: "depth?"
+    options: [routine, substantial, frontier]
+    criteria: ["r", "s", "f"]
+  - id: harness_coupling
+    kind: choice
+    instructions: "coupling?"
+    options: [open, coupled]
+    criteria: ["o", "c"]
+"#,
+        )
+        .expect("live tier test pack parses")
+    }
+
+    /// bd-vlvn: live profile suggestion on sample objectives — a strong
+    /// candidate clears the gate; all-adequate rejects everything (the
+    /// reject-all gate); deny is an Err so the caller keeps the table.
+    #[test]
+    fn jev_live_profile_suggestion_gates_strong_only() {
+        let pack = profile_pick_pack_for_live();
+        let cands = vec![
+            ("coder".to_string(), "write/fix code".to_string()),
+            ("rust-coder".to_string(), "Rust code".to_string()),
+        ];
+        // Sample 1: strong rust-coder for a borrow-checker objective.
+        let strong = CannedBatch {
+            levels: BTreeMap::from([
+                ("profile_fit__coder".into(), 1),
+                ("profile_fit__rust-coder".into(), 2),
+            ]),
+        };
+        assert_eq!(
+            live_profile_suggestion(
+                &strong,
+                &pack,
+                "fix the borrow checker error in cargo build",
+                &cands
+            )
+            .expect("answered"),
+            Some("@rust-coder".to_string())
+        );
+        // Sample 2: every candidate merely adequate — reject ALL.
+        let weak = CannedBatch {
+            levels: BTreeMap::from([
+                ("profile_fit__coder".into(), 1),
+                ("profile_fit__rust-coder".into(), 1),
+            ]),
+        };
+        assert_eq!(
+            live_profile_suggestion(&weak, &pack, "sharpen the objective", &cands)
+                .expect("answered"),
+            None,
+            "adequate everywhere carries no confidence — nothing, not even the table"
+        );
+        // Deny keeps the table: Err, never a fabricated suggestion.
+        assert!(
+            live_profile_suggestion(&OfflineTransport, &pack, "fix the flake", &cands).is_err()
+        );
+        assert!(
+            live_profile_suggestion(&strong, &pack, "fix the flake", &[])
+                .expect("empty")
+                .is_none()
+        );
+    }
+
+    /// bd-vlvn: live tier suggestion maps edge depths to bands and the
+    /// unsure middle to nothing, all under the gate.
+    #[test]
+    fn jev_live_tier_suggestion_maps_edges_only() {
+        let pack = tier_pick_pack_for_live();
+        // frontier → @premium (depth conf 1.0, coupling conf 0.9).
+        let frontier = CannedBatch {
+            levels: BTreeMap::from([("reasoning_depth".into(), 2)]),
+        };
+        assert_eq!(
+            live_tier_suggestion(&frontier, &pack, "plan the security migration")
+                .expect("answered"),
+            Some("@premium".to_string())
+        );
+        // routine → @cheap.
+        let routine = CannedBatch {
+            levels: BTreeMap::from([("reasoning_depth".into(), 0)]),
+        };
+        assert_eq!(
+            live_tier_suggestion(&routine, &pack, "fix the typo").expect("answered"),
+            Some("@cheap".to_string())
+        );
+        // substantial (level 1, conf 0) → gate rejects → None.
+        let middle = CannedBatch {
+            levels: BTreeMap::from([("reasoning_depth".into(), 1)]),
+        };
+        assert_eq!(
+            live_tier_suggestion(&middle, &pack, "add the feature").expect("answered"),
+            None
+        );
+        assert!(live_tier_suggestion(&OfflineTransport, &pack, "fix the flake").is_err());
     }
 
     /// bd-adv4: the offline profile-pick table routes by language cue and
