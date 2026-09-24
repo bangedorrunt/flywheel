@@ -3047,9 +3047,7 @@ mod tests {
         let mut index = SelfIndex::default();
         index.insert_pin(
             "BrightBadger".into(),
-            Some(
-                "699d97318e69efb667767a917972bebf396d63a10bd6d68bec01e698a903b746".into(),
-            ),
+            Some("699d97318e69efb667767a917972bebf396d63a10bd6d68bec01e698a903b746".into()),
         );
         // Exact shape of a verified live post (event 17baed1e).
         let line = r#"{"kind":9,"id":"17baed1e20b74f424c1c2117bdf7b0b334d928bec923b7194c46cf33116b8b49","tags":[["h","steer-flywheel"],["t","flywheel"],["p","699d97318e69efb667767a917972bebf396d63a10bd6d68bec01e698a903b746"]],"content":"@BrightBadger wake probe4 bd-pe5o"}"#;
