@@ -2033,6 +2033,26 @@ pub fn start_spawn_drainer(
 mod tests {
     use super::*;
 
+    /// bd-gkwu: the dispatch retry schedule is pure policy data —
+    /// deterministic per attempt, bounded by the cap, no sleep inside.
+    /// (The sleep lives at the single call site in the interpreter.)
+    #[test]
+    fn authority_edge_dispatch_retry_is_policy_schedule() {
+        let policy = dispatch_retry_policy();
+        let d0 = policy.delay_for(0);
+        assert_eq!(d0, policy.delay_for(0), "schedule must be deterministic");
+        assert!(d0 <= policy.cap, "attempt 0 within cap: {d0:?}");
+        assert!(
+            policy.delay_for(100) <= policy.cap + policy.cap / 10,
+            "far attempts bounded by cap plus the 10% jitter"
+        );
+        assert!(
+            policy.delay_for(1) >= d0,
+            "backoff must not shrink: {:?} vs {d0:?}",
+            policy.delay_for(1)
+        );
+    }
+
     /// bd-8pjr: per-site fail-twice-then-succeed through the shared driver
     /// with THIS site's policy (no-op sleep — the loop itself needs a live
     /// pane, so the config rides the driver here, not the subprocess).

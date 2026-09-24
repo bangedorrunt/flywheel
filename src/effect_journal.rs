@@ -725,6 +725,23 @@ mod tests {
     use toron_workflow::engine::{ExecutionPolicy, RunContext};
     use toron_workflow::schema::{Action, DispatchSpec};
 
+    /// bd-gkwu: an uncovered sink refuses loud — `{ok:false}` naming the
+    /// sink — instead of running unjournaled or settling work nobody did.
+    #[test]
+    fn authority_edge_uncovered_sink_refuses() {
+        let v = refuse_unjournaled("ghost-sink", "no provider performs this sink");
+        assert_eq!(
+            v.get("ok").and_then(|b| b.as_bool()),
+            Some(false),
+            "refusal must be ok:false"
+        );
+        let err = v.get("error").and_then(|s| s.as_str()).unwrap_or("");
+        assert!(
+            err.contains("ghost-sink"),
+            "refusal must name the sink: {err}"
+        );
+    }
+
     /// A migrated, throwaway journal — the same `connect` + `migrate` pair
     /// `mail_shim::build_mailbox` runs against the real index.
     async fn test_store() -> (tempfile::TempDir, WorkflowEffectStore) {

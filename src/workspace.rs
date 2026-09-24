@@ -6289,6 +6289,28 @@ mod gs048_reclassify_tests {
         assert_eq!(r1.last_vehicle.as_deref(), Some("none: raw"));
     }
 
+    /// bd-gkwu: the reclassify effect key is a pure derivation of
+    /// (goal, reason, topology, pin) — retries attach to the same journal
+    /// primary key (Law 8: a retry is another attempt, not a new action).
+    /// Authority rides the caller (threaded `&RuntimeAuthority`), never a
+    /// mid-path resolve: same derivation ⇒ same key under any authority.
+    #[test]
+    fn authority_edge_reclassify_key_stable_per_derivation() {
+        let k1 = reclassify_effect_key("goal-a", "why", None, "pin-x");
+        let k2 = reclassify_effect_key("goal-a", "why", None, "pin-x");
+        assert_eq!(k1, k2, "same derivation must journal under one key");
+        assert_ne!(
+            k1,
+            reclassify_effect_key("goal-a", "other-why", None, "pin-x"),
+            "a new reason is a new derivation"
+        );
+        assert_ne!(
+            k1,
+            reclassify_effect_key("goal-a", "why", None, "pin-y"),
+            "a new pin is a new derivation"
+        );
+    }
+
     #[test]
     fn expand_reclassify_cmds_runs_decide_outside_tick() {
         let mut m = idle_captain();
