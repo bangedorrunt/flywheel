@@ -5239,6 +5239,40 @@ mod steer_engine_tests {
         );
     }
 
+    /// bd-vlvn: live enrichment without a key keeps the FallbackTable —
+    /// hermetic (returns before any pack lookup or network).
+    #[test]
+    fn jev_live_enrich_keeps_table_without_key() {
+        let authority = crate::authority::RuntimeAuthority {
+            host: crate::authority::HostAuthority {
+                agent_name: None,
+                home: String::new(),
+                cwd: std::env::temp_dir(),
+                exe: std::env::temp_dir().join("flywheel"),
+                typesafe_api_key: None,
+            },
+            clock: Arc::new(crate::authority::SystemClock),
+            monotonic: Arc::new(crate::authority::SystemMonotonicClock::default()),
+        };
+        let mut ctx = steer_briefing_context("fix the borrow checker error in cargo build", "goal")
+            .expect("steer ctx");
+        assert_eq!(
+            ctx.profile_suggestion.as_deref(),
+            Some("@rust-coder"),
+            "table suggestion present before enrich"
+        );
+        enrich_suggestions_live(
+            &mut ctx,
+            "fix the borrow checker error in cargo build",
+            &authority,
+        );
+        assert_eq!(
+            ctx.profile_suggestion.as_deref(),
+            Some("@rust-coder"),
+            "keyless enrich keeps the table"
+        );
+    }
+
     /// bd-adv4: the briefing context carries the profile-pick suggestion —
     /// a language-cued objective suggests the specialist, a generic one
     /// stays silent (None = keep @coder).
@@ -24362,7 +24396,15 @@ fn cmd_steer(
             let snap = snapshot::assemble(cfg, p, &ws_label, doorbell_now_unix());
             eprintln!("{}", snapshot::bearings_line(&snap));
         }
-        let ctx = steer_briefing_context(objective, if direct { "goal-direct" } else { "goal" })?;
+        let mut ctx =
+            steer_briefing_context(objective, if direct { "goal-direct" } else { "goal" })?;
+        // bd-vlvn: live Jev suggestions when a key is present; the table
+        // stands otherwise.
+        enrich_suggestions_live(
+            &mut ctx,
+            objective,
+            &crate::authority::RuntimeAuthority::resolve(),
+        );
         let outcome =
             steer_brief::run_briefing(&ctx, &mut std::io::stdin().lock(), &mut std::io::stdout())?;
         match outcome {
@@ -24441,6 +24483,40 @@ fn steer_run_cmd(
         allow_worktree: false,
         role_model: role_model.to_vec(),
         role_harness: role_harness.to_vec(),
+    }
+}
+
+/// bd-vlvn: live suggestion enrichment for the TTY briefing — when a key
+/// is present, batch-score the implement candidates (ONE request,
+/// when-scope excerpts in state) plus one tier ask; gated wins overwrite
+/// the table suggestions, denies keep them. Keyless (or pack-missing)
+/// runs keep the FallbackTable untouched.
+fn enrich_suggestions_live(
+    ctx: &mut steer_brief::BriefingContext,
+    objective: &str,
+    authority: &crate::authority::RuntimeAuthority,
+) {
+    let transport = match crate::judgment::UreqTransport::from_authority(authority) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let catalog = crate::profile::ProfileCatalog::load().unwrap_or_default();
+    let candidates: Vec<(String, String)> = ["coder", "rust-coder", "ts-coder", "zig-coder"]
+        .iter()
+        .filter_map(|n| catalog.get(n).map(|p| (n.to_string(), p.when.clone())))
+        .collect();
+    // Answered-but-weak carries no confidence: nothing, not even the
+    // table. Deny keeps the table.
+    if let Ok(pack) = crate::judgment::find_pack_for(".", "profile-pick")
+        && let Ok(s) =
+            crate::judgment::live_profile_suggestion(&transport, &pack, objective, &candidates)
+    {
+        ctx.profile_suggestion = s;
+    }
+    if let Ok(pack) = crate::judgment::find_pack_for(".", "tier-pick")
+        && let Ok(s) = crate::judgment::live_tier_suggestion(&transport, &pack, objective)
+    {
+        ctx.tier_suggestion = s;
     }
 }
 
@@ -25039,7 +25115,15 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         "flywheel: warn: --yes is redundant with an explicit --crew (briefing already skipped)"
                     );
                 }
-                let ctx = workflow_briefing_context(name, inputs.as_deref())?;
+                let mut ctx = workflow_briefing_context(name, inputs.as_deref())?;
+                // bd-vlvn: live Jev suggestions when a key is present; the
+                // table stands otherwise.
+                let objective = ctx.objective.clone();
+                enrich_suggestions_live(
+                    &mut ctx,
+                    &objective,
+                    &crate::authority::RuntimeAuthority::resolve(),
+                );
                 let outcome = steer_brief::run_briefing(
                     &ctx,
                     &mut std::io::stdin().lock(),
