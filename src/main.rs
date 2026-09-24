@@ -16965,6 +16965,105 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
     }))
 }
 
+/// governed-by: bd-jcqq — product-scoped captain digest. Fans one digest
+/// per member project (read-only aggregation, one high-water per member
+/// via each member's own inbox water), with unreadable members as loud
+/// gap rows — never a silent skip, never an abort that hides the readable
+/// members. Unknown/empty products render a gap, not an empty success.
+///
+/// Identity fold: before reading member M as `name`, bind the pin's
+/// EXISTING key into M's slot from the first member slot that holds it
+/// ([`bind_source_key`], never a mint). A pin known nowhere renders gaps
+/// everywhere and mints nothing.
+///
+/// `member_dirs`: (slug, registry dir-key) pairs; the CLI resolves dirs
+/// via `project_dir_str`, tests pass slugs (no registry → name fallback).
+fn product_digest_for(
+    mail: &mail_shim::Mail,
+    product_key: &str,
+    name: &str,
+    member_dirs: &[(String, String)],
+) -> Value {
+    let mut members_out = Vec::new();
+    let mut gaps_out = Vec::new();
+    let gap = |project: &str, reason: String| json!({ "project": project, "gap": reason });
+    let slugs: Vec<String> = match mail.ensure_product(product_key, None) {
+        Ok(v) => v
+            .get("member_projects")
+            .and_then(|m| m.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(e) => {
+            gaps_out.push(gap(product_key, format!("product unreadable: {e:#}")));
+            return json!({ "product": product_key, "agent": name, "members": members_out, "gaps": gaps_out });
+        }
+    };
+    if slugs.is_empty() {
+        gaps_out.push(gap(
+            product_key,
+            "unknown product or no member projects — link members with `toron products-link` first"
+                .to_string(),
+        ));
+        return json!({ "product": product_key, "agent": name, "members": members_out, "gaps": gaps_out });
+    }
+    let dirs: std::collections::BTreeMap<&str, &str> = member_dirs
+        .iter()
+        .map(|(s, d)| (s.as_str(), d.as_str()))
+        .collect();
+    let (data_dir, _) = mail_shim::mailbox_roots();
+    for slug in &slugs {
+        let Some(dir) = dirs.get(slug.as_str()) else {
+            gaps_out.push(gap(slug, "no project dir supplied for member".to_string()));
+            continue;
+        };
+        // Fold: bind the pin's existing key into this member's slot from
+        // the first member slot holding it. Never mints — no source key
+        // anywhere means this member (and only this member) gaps.
+        if crate::mail_key_present(&data_dir, slug, name).is_none() {
+            let donor = slugs
+                .iter()
+                .find(|s| crate::mail_key_present(&data_dir, s, name).is_some());
+            match donor {
+                Some(from) => {
+                    if let Err(e) = bind_source_key(&data_dir, from, slug, name) {
+                        gaps_out.push(gap(slug, format!("identity fold failed: {e:#}")));
+                        continue;
+                    }
+                }
+                None => {
+                    gaps_out.push(gap(
+                        slug,
+                        format!(
+                            "no key for `{name}` in any member — register it in one member first \
+                             (`flywheel mail register <member> --name {name}`); refusing to mint"
+                        ),
+                    ));
+                    continue;
+                }
+            }
+        }
+        match digest_for(mail, dir, name) {
+            Ok(mut row) => {
+                row["project"] = json!(slug);
+                members_out.push(row);
+            }
+            Err(e) => gaps_out.push(gap(slug, format!("digest failed: {e:#}"))),
+        }
+    }
+    json!({ "product": product_key, "agent": name, "members": members_out, "gaps": gaps_out })
+}
+
+/// Key-file presence probe for the identity fold (bd-jcqq): `Some` when
+/// `{data}/{slug}/agents/{name}/key.ncryptsec` (or the legacy layout)
+/// exists. Read-only — never creates.
+fn mail_key_present(data_dir: &std::path::Path, slug: &str, name: &str) -> Option<PathBuf> {
+    import_source_key(data_dir, slug, name)
+}
+
 /// S8.1: the wake identity for a herdr agent name. The spawn-registry /
 /// agent-names pin (pane → name → mail identity) wins; otherwise the
 /// canonical name itself — the identity flywheel registers at spawn and the
@@ -36154,5 +36253,162 @@ mod adr0010_d1_tests {
             Some("d-77"),
             "--fire-and-forget <id> = idempotent re-enqueue key"
         );
+    }
+}
+
+/// governed-by: bd-jcqq — product-scoped captain digest + cross-project
+/// identity fold. Seeded mail in each member must surface in one digest;
+/// unreadable members render as loud gaps (never silent skips, never an
+/// abort); the fold binds the pin's EXISTING key across members (never
+/// mints a second npub).
+#[cfg(test)]
+mod product_digest_tests {
+    use super::*;
+
+    fn pd_mail() -> mail_shim::Mail {
+        mail_shim::Mail::from_config(None)
+            .expect("mail ok")
+            .expect("mail Some")
+    }
+
+    fn pd_slug(tag: &str) -> String {
+        format!("pd-{tag}-{}", std::process::id())
+    }
+
+    fn pd_register(mail: &mail_shim::Mail, project: &str, pin: &str) {
+        mail.ensure_project(project).expect("ensure member");
+        mail.register_agent(project, pin, "flywheel", "m", "t")
+            .expect("register pin");
+    }
+
+    fn pd_seed(mail: &mail_shim::Mail, project: &str, pin: &str, subject: &str) {
+        let sender = mail.clone().with_name(pin.to_string());
+        sender
+            .send(
+                project,
+                &[pin.to_string()],
+                subject,
+                "seed body",
+                "normal",
+                false,
+                None,
+            )
+            .expect("seed mail");
+    }
+
+    fn pd_product(mail: &mail_shim::Mail, key: &str, members: &[String]) {
+        mail.ensure_product(key, None).expect("ensure product");
+        for m in members {
+            mail.products_link(key, m).expect("link member");
+        }
+    }
+
+    #[test]
+    fn product_digest_surfaces_seeded_mail_per_member() {
+        let mail = pd_mail();
+        let (a, b) = (pd_slug("mema"), pd_slug("memb"));
+        let key = format!("pd-key-{}", std::process::id());
+        let pin = "DigestFalcon";
+        pd_register(&mail, &a, pin);
+        pd_register(&mail, &b, pin);
+        pd_seed(&mail, &a, pin, "report from A");
+        pd_seed(&mail, &b, pin, "report from B");
+        pd_product(&mail, &key, &[a.clone(), b.clone()]);
+        let dirs = vec![(a.clone(), a.clone()), (b.clone(), b.clone())];
+        let v = product_digest_for(&mail, &key, pin, &dirs);
+        let members = v
+            .get("members")
+            .and_then(|m| m.as_array())
+            .expect("members");
+        assert_eq!(members.len(), 2, "both members surface: {v}");
+        for m in members {
+            let recent = m.get("recent").and_then(|r| r.as_u64()).unwrap_or(0);
+            assert!(
+                recent > 0,
+                "seeded mail surfaces for {}: {m}",
+                m.get("project").unwrap_or(&Value::Null)
+            );
+        }
+        assert!(
+            v.get("gaps")
+                .and_then(|g| g.as_array())
+                .map(|g| g.is_empty())
+                .unwrap_or(false),
+            "no gaps when all members read: {v}"
+        );
+    }
+
+    #[test]
+    fn product_digest_unreadable_member_is_loud_gap() {
+        let mail = pd_mail();
+        let (a, ghost) = (pd_slug("ok"), pd_slug("ghost"));
+        let key = format!("pd-gap-{}", std::process::id());
+        let pin = "GapFalcon";
+        pd_register(&mail, &a, pin);
+        pd_seed(&mail, &a, pin, "report from A");
+        // ghost is linked but the pin is known nowhere near it: no project,
+        // no key, nothing to fold — must render as a gap, not abort A.
+        pd_product(&mail, &key, &[a.clone(), ghost.clone()]);
+        let dirs = vec![(a.clone(), a.clone()), (ghost.clone(), ghost.clone())];
+        let v = product_digest_for(&mail, &key, "NowherePin", &dirs);
+        let gaps = v.get("gaps").and_then(|g| g.as_array()).expect("gaps");
+        assert!(!gaps.is_empty(), "unreadable pin renders loud gaps: {v}");
+        // …and nothing was minted for the unknown pin anywhere.
+        assert!(
+            mail.whois(&a, "NowherePin").is_err(),
+            "gap path never mints a key"
+        );
+    }
+
+    #[test]
+    fn product_digest_unknown_product_is_gap_not_empty() {
+        let mail = pd_mail();
+        let v = product_digest_for(
+            &mail,
+            &format!("pd-nope-{}", std::process::id()),
+            "DigestFalcon",
+            &[],
+        );
+        let gaps = v.get("gaps").and_then(|g| g.as_array()).expect("gaps");
+        assert!(!gaps.is_empty(), "unknown product renders a gap: {v}");
+        assert_eq!(
+            v.get("members").and_then(|m| m.as_array()).map(|m| m.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn product_digest_binds_key_across_members_without_mint() {
+        let mail = pd_mail();
+        let (a, b) = (pd_slug("folda"), pd_slug("foldb"));
+        let key = format!("pd-fold-{}", std::process::id());
+        let pin = "FoldFalcon";
+        // Pin lives in A only; B has the project but no identity.
+        pd_register(&mail, &a, pin);
+        mail.ensure_project(&b).expect("ensure B");
+        pd_seed(&mail, &a, pin, "report from A");
+        pd_product(&mail, &key, &[a.clone(), b.clone()]);
+        let dirs = vec![(a.clone(), a.clone()), (b.clone(), b.clone())];
+        let v = product_digest_for(&mail, &key, pin, &dirs);
+        let members = v
+            .get("members")
+            .and_then(|m| m.as_array())
+            .expect("members");
+        assert_eq!(members.len(), 2, "fold makes B readable: {v}");
+        // One key across members, never a second: the fold copies the
+        // EXISTING key file (whois profiles stay the member's own
+        // onboarding — a read verb never publishes those).
+        let (data_dir, _) = mail_shim::mailbox_roots();
+        let key_of = |p: &str| {
+            std::fs::read(
+                data_dir
+                    .join(p)
+                    .join("agents")
+                    .join(pin)
+                    .join("key.ncryptsec"),
+            )
+            .expect("fold-bound key file")
+        };
+        assert_eq!(key_of(&a), key_of(&b), "same key bytes in both members");
     }
 }
