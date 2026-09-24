@@ -3578,4 +3578,56 @@ mod tests {
         inject_cleanup(proj);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// governed-by: bd-z7w0 — resolve_host Embedded arms reachability.
+    /// Dead configured URL → TakeLease embedded (+ loud WARNING).
+    /// KEEP: fires whenever the configured daemon is down.
+    #[test]
+    fn degraded_audit_resolve_host_embedded_on_dead_url() {
+        let dir = std::env::temp_dir().join(format!("dbll-audit-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Bind-drop: guaranteed RST, no timing flake.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let host = resolve_host(
+            &dir,
+            Some(format!("http://127.0.0.1:{port}")),
+            Some(("proj", "ws")),
+        );
+        assert_eq!(host, DoorbellHost::Embedded, "dead daemon URL embeds");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// governed-by: bd-z7w0 — RefuseDoubleRun arm reachability. A live
+    /// lease held by another writer refuses the second loop (embedded).
+    /// KEEP: fires on every concurrent-loop attempt.
+    #[test]
+    fn degraded_audit_resolve_host_refuses_double_run() {
+        use doorbell_rt::lease::{OwnerLease, owner_file};
+        let dir = std::env::temp_dir().join(format!("dbll-audit-lease-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).unwrap();
+        let now = doorbell_rt::lease::unix_now();
+        let lease = OwnerLease {
+            pid: std::process::id(),
+            boot_id: "audit".into(),
+            host: "audit".into(),
+            started_unix: now,
+            heartbeat_unix: now,
+        };
+        std::fs::write(
+            owner_file(&dir, "ws"),
+            serde_json::to_string(&lease).unwrap(),
+        )
+        .unwrap();
+        let host = resolve_host(&dir, None, Some(("proj", "ws")));
+        assert_eq!(
+            host,
+            DoorbellHost::Embedded,
+            "live foreign lease refuses the second loop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
