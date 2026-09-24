@@ -1737,6 +1737,14 @@ enum Commands {
         /// FLYWHEEL_GATE_BUDGET env)
         #[arg(long)]
         budget: Option<usize>,
+        /// bd-0km8: wiki lane export (chiebukuro knowledge plane JSON
+        /// array). Absent = corpus only, current behavior.
+        #[arg(long)]
+        wiki: Option<String>,
+        /// bd-0km8: memory lane export (chiebukuro memory plane JSON
+        /// array). Absent = corpus only, current behavior.
+        #[arg(long)]
+        memory: Option<String>,
     },
     /// internal: the project's expected-reply entries (checkpointed leaf —
     /// collab may have written new ones while the loop runs)
@@ -3218,9 +3226,17 @@ fn main() {
             cmd_internal_mail_digest(&cfg, project, agent)
         }
         Some(Commands::__SubagentGuard { tool, role }) => cmd_subagent_guard(tool, role.as_deref()),
-        Some(Commands::__GateLearnings { root, budget }) => {
-            cmd_gate_learnings(&root, budget.unwrap_or_else(default_gate_budget))
-        }
+        Some(Commands::__GateLearnings {
+            root,
+            budget,
+            wiki,
+            memory,
+        }) => cmd_gate_learnings(
+            &root,
+            budget.unwrap_or_else(default_gate_budget),
+            wiki.as_deref(),
+            memory.as_deref(),
+        ),
         Some(Commands::__CheckReply {
             project,
             name,
@@ -30127,8 +30143,16 @@ fn default_gate_budget() -> usize {
 /// grounding read — top-N by reinforcement recency within the budget.
 /// Cost estimate per entry: frontmatter + rg-context allowance (chars/4);
 /// the projection never touches the corpus (ce-sweep archives, never this).
-fn cmd_gate_learnings(root: &str, budget: usize) -> Result<()> {
-    use stages::learning::{LearningEntry, gate_projection, parse_learning_frontmatter};
+fn cmd_gate_learnings(
+    root: &str,
+    budget: usize,
+    wiki: Option<&str>,
+    memory: Option<&str>,
+) -> Result<()> {
+    use stages::learning::{
+        LearningEntry, LearningLane, gate_projection, parse_lane_entries,
+        parse_learning_frontmatter,
+    };
     let today = chrono::Local::now().date_naive();
     let mut entries: Vec<LearningEntry> = Vec::new();
     for path in walkdir_sorted(root)? {
@@ -30151,13 +30175,38 @@ fn cmd_gate_learnings(root: &str, budget: usize) -> Result<()> {
             tier,
             reinforced,
             cost_tokens,
+            lane: stages::learning::LearningLane::Corpus,
         });
     }
+    // bd-0km8: wiki/memory lanes feed the SAME pool — the budget is
+    // shared, never per-lane. Absent lane files = corpus only, exactly
+    // as before. A bad lane file warns and continues; the gate never
+    // fails a wave on lane plumbing.
+    for (path, lane) in [(wiki, LearningLane::Wiki), (memory, LearningLane::Memory)] {
+        let Some(path) = path else { continue };
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                eprintln!("flywheel: gate lane file {path} unreadable ({e}) — lane skipped");
+                continue;
+            }
+        };
+        let (mut lane_entries, skipped) = parse_lane_entries(&raw, lane);
+        if skipped > 0 {
+            eprintln!("flywheel: gate lane file {path} skipped {skipped} malformed row(s)");
+        }
+        entries.append(&mut lane_entries);
+    }
     let projected = gate_projection(&entries, today, budget);
+    let mut lanes = std::collections::BTreeMap::new();
+    for e in &projected {
+        *lanes.entry(e.lane.name()).or_insert(0usize) += 1;
+    }
     print_json(&json!({
         "budget": budget,
         "corpus": entries.len(),
         "projected": projected,
+        "lanes": lanes,
     }));
     Ok(())
 }

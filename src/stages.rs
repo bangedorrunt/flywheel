@@ -304,7 +304,7 @@ impl StageLibrary {
             // gate.
             (
                 "wave-gate",
-                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow` — a failed check STOPS the wave (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report.",
+                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow` — a failed check STOPS the wave (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report.",
             ),
             (
                 "wave-dispatch",
@@ -648,6 +648,31 @@ pub mod learning {
         Perishable,
     }
 
+    /// Grounding lane (bd-0km8): which return-arrow source an entry came
+    /// from. Lanes compete for ONE shared budget inside [`gate_projection`]
+    /// — the cap is never per-lane.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum LearningLane {
+        /// `docs/learnings/` corpus files.
+        Corpus,
+        /// Curated wiki pages (chiebukuro knowledge plane export).
+        Wiki,
+        /// Prior session decisions (chiebukuro memory plane export).
+        Memory,
+    }
+
+    impl LearningLane {
+        /// Lowercase lane name for reports and per-lane counts.
+        pub fn name(&self) -> &'static str {
+            match self {
+                Self::Corpus => "corpus",
+                Self::Wiki => "wiki",
+                Self::Memory => "memory",
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
     pub struct LearningEntry {
         pub path: String,
@@ -657,6 +682,60 @@ pub mod learning {
         /// Estimated token cost of grounding on this entry (frontmatter +
         /// rg context). The projection sums these under the budget.
         pub cost_tokens: usize,
+        /// Source lane — see [`LearningLane`]. Defaults to corpus at
+        /// construction sites that predate lanes.
+        pub lane: LearningLane,
+    }
+
+    /// Default grounding cost for lane-file entries without an explicit
+    /// `cost_tokens`: the same ~40-line rg-context allowance the corpus
+    /// arm uses.
+    pub const LANE_DEFAULT_COST_TOKENS: usize = 150;
+
+    /// Parse a lane export file (bd-0km8): a JSON array of
+    /// `{path, tier?, reinforced?, cost_tokens?}` objects. Returns
+    /// `(entries, skipped)` — malformed rows skip (the caller warns; the
+    /// gate never fails a wave on a bad lane file). Unknown tier strings
+    /// fall back to Aging, matching [`parse_learning_frontmatter`].
+    pub fn parse_lane_entries(json: &str, lane: LearningLane) -> (Vec<LearningEntry>, usize) {
+        let mut out = Vec::new();
+        let mut skipped = 0usize;
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(_) => return (out, 1),
+        };
+        let arr = match value.as_array() {
+            Some(a) => a,
+            None => return (out, 1),
+        };
+        for row in arr {
+            let Some(path) = row.get("path").and_then(|p| p.as_str()) else {
+                skipped += 1;
+                continue;
+            };
+            let tier = match row.get("tier").and_then(|t| t.as_str()).unwrap_or("aging") {
+                "pinned" => LearningTier::Pinned,
+                "perishable" => LearningTier::Perishable,
+                _ => LearningTier::Aging,
+            };
+            let reinforced = row
+                .get("reinforced")
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            let cost_tokens = row
+                .get("cost_tokens")
+                .and_then(|c| c.as_u64())
+                .map(|c| c as usize)
+                .unwrap_or(LANE_DEFAULT_COST_TOKENS);
+            out.push(LearningEntry {
+                path: path.to_string(),
+                tier,
+                reinforced,
+                cost_tokens,
+                lane,
+            });
+        }
+        (out, skipped)
     }
 
     /// Parse `tier` + `reinforced` from a learning file's frontmatter
@@ -732,7 +811,8 @@ mod adr0010_d12_tests {
     // governed-by: ADR-0010 D12 (bd-fmya) — learnings tier/reinforced +
     // bounded GATE projection.
     use super::learning::{
-        LearningEntry, LearningTier, gate_projection, parse_learning_frontmatter,
+        LearningEntry, LearningLane, LearningTier, gate_projection, parse_lane_entries,
+        parse_learning_frontmatter,
     };
     use chrono::NaiveDate;
 
@@ -751,7 +831,76 @@ mod adr0010_d12_tests {
             tier,
             reinforced: reinforced.map(String::from),
             cost_tokens: tokens,
+            lane: LearningLane::Corpus,
         }
+    }
+
+    fn lane_entry(path: &str, lane: LearningLane, tokens: usize) -> LearningEntry {
+        LearningEntry {
+            path: path.to_string(),
+            tier: LearningTier::Pinned,
+            reinforced: Some("2026-09-24".to_string()),
+            cost_tokens: tokens,
+            lane,
+        }
+    }
+
+    /// bd-0km8: the 4k budget is SHARED across lanes — corpus + wiki +
+    /// memory entries compete for one pool, and the pool never exceeds
+    /// the cap no matter how many lanes feed it.
+    #[test]
+    fn gate_budget_is_shared_across_corpus_wiki_memory_lanes() {
+        let today = d("2026-09-24");
+        let entries = vec![
+            lane_entry("docs/learnings/a.md", LearningLane::Corpus, 2000),
+            lane_entry("wiki:attention", LearningLane::Wiki, 2000),
+            lane_entry("memory:conclusion-1", LearningLane::Memory, 2000),
+        ];
+        let projected = gate_projection(&entries, today, 4000);
+        let spent: usize = projected.iter().map(|e| e.cost_tokens).sum();
+        assert!(spent <= 4000, "shared pool never exceeds cap: {spent}");
+        assert_eq!(
+            projected.len(),
+            2,
+            "two 2000-token entries fit, third loses"
+        );
+        let lanes: Vec<LearningLane> = projected.iter().map(|e| e.lane).collect();
+        assert!(
+            lanes.contains(&LearningLane::Wiki) || lanes.contains(&LearningLane::Memory),
+            "lanes compete on equal footing, no lane starved by kind: {lanes:?}"
+        );
+    }
+
+    /// bd-0km8: lane-file parsing tags every entry and skips malformed
+    /// rows loudly (counted, never silent).
+    #[test]
+    fn lane_files_parse_and_count_skips() {
+        let (entries, skipped) = parse_lane_entries(
+            r#"[
+                {"path": "wiki:attention", "tier": "pinned", "reinforced": "2026-09-24", "cost_tokens": 120},
+                {"path": "memory:c1", "cost_tokens": 80},
+                {"nope": true},
+                {"path": "wiki:x", "tier": "nonsense"}
+            ]"#,
+            LearningLane::Memory,
+        );
+        assert_eq!(skipped, 1, "one row without a path skips");
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|e| e.lane == LearningLane::Memory));
+        assert_eq!(
+            entries[1].tier,
+            LearningTier::Aging,
+            "tier defaults to Aging"
+        );
+        assert_eq!(entries[1].cost_tokens, 80);
+        assert_eq!(
+            entries[2].tier,
+            LearningTier::Aging,
+            "unknown tier falls back"
+        );
+        let (none, skipped_all) = parse_lane_entries("not json", LearningLane::Wiki);
+        assert!(none.is_empty());
+        assert_eq!(skipped_all, 1);
     }
 
     // AC: GATE output bounded under budget with 50 seeded learnings.
