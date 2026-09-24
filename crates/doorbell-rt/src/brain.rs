@@ -111,14 +111,16 @@ impl LivenessVerdict {
     /// The straggler note renders these labels verbatim.
     pub fn describe(&self) -> String {
         match self {
+            // Observation first, candidates second (bd-925m): the probe
+            // measures age + one delta — it never observes the mechanism.
             Self::Starved { age_ms } => format!(
-                "starved: no select wake for {age_ms}ms (>= {STARVATION_THRESHOLD_MS}ms) — never scheduled"
+                "starved: no select wake for {age_ms}ms (>= {STARVATION_THRESHOLD_MS}ms) — unscheduled, or a >2s dispatch (which logs its own warn)"
             ),
             Self::Churning { age_ms } => format!(
-                "churning: last wake {age_ms}ms ago, wake count still growing — chewing a backlog"
+                "churning: last wake {age_ms}ms ago, wake count still growing — chewing queued work"
             ),
             Self::LostWake { age_ms } => format!(
-                "lost-wake: last wake {age_ms}ms ago, count flat across the probe — parked after one wake"
+                "lost-wake: last wake {age_ms}ms ago, count flat across the probe — parked, mid-exit-path, or mid-dispatch"
             ),
         }
     }
@@ -1180,6 +1182,23 @@ mod tests {
                 LivenessVerdict::LostWake { .. }
             ),
             "recent wake + flat count across the probe = parked after one wake"
+        );
+        // Review finding (effect/typesafe-ai, bd-925m): describe must state
+        // the OBSERVATION first and name every live candidate — the probe
+        // measures age + one 200ms delta, never the mechanism.
+        assert!(
+            LivenessVerdict::LostWake { age_ms: 80 }
+                .describe()
+                .contains("parked, mid-exit-path, or mid-dispatch"),
+            "LostWake names all three candidates: {}",
+            LivenessVerdict::LostWake { age_ms: 80 }.describe()
+        );
+        assert!(
+            LivenessVerdict::Starved { age_ms: 10_200 }
+                .describe()
+                .contains("dispatch"),
+            "Starved points at the slow-dispatch-warn cross-check: {}",
+            LivenessVerdict::Starved { age_ms: 10_200 }.describe()
         );
     }
 
