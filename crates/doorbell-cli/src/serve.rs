@@ -425,6 +425,21 @@ struct DrainReport {
     stragglers: Vec<String>,
 }
 
+/// Send `Shutdown` to every retiring loop, returning the keys whose channel
+/// was already closed (bd-burk: the old `let _ =` swallowed exactly that
+/// error — a stale hosted row sending into a dead receiver looked identical
+/// to a brain still chewing its backlog, and the two could never be told
+/// apart from the log). Failures come back as VALUES; the caller is loud.
+async fn send_shutdowns(retiring: &[HostedLoop]) -> Vec<String> {
+    let mut failed = Vec::new();
+    for h in retiring {
+        if h.tx.send(doorbell_rt::BrainMsg::Shutdown).await.is_err() {
+            failed.push(h.key.clone());
+        }
+    }
+    failed
+}
+
 /// Join every supervised loop CONCURRENTLY inside `budget` (bd-zzgb).
 /// The old drain awaited handles in order, so a single hung brain stalled
 /// the whole scan: loops that finished behind it were never observed and
@@ -770,8 +785,10 @@ pub async fn run(cfg: &Config) -> Result<()> {
             // stay open until their tasks end with the brain).
             eprintln!("doorbell serve: shutdown signal received, draining loops");
             let retiring = std::mem::take(&mut *hosted.lock());
-            for h in &retiring {
-                let _ = h.tx.send(doorbell_rt::BrainMsg::Shutdown).await;
+            for key in send_shutdowns(&retiring).await {
+                eprintln!(
+                    "doorbell serve: shutdown send FAILED (channel closed) for {key} — stale hosted row"
+                );
             }
             eprintln!("doorbell serve: shutdown sent, joining loops");
             drop(retiring);
@@ -1697,6 +1714,33 @@ mod tests {
         assert!(
             super::drain_note(report.joined, report.remaining, report.total)
                 .contains("loops joined")
+        );
+    }
+
+    /// bd-burk's second discriminator: a Shutdown whose channel was already
+    /// closed (stale hosted row) used to be swallowed by `let _ =` — dead
+    /// indistinguishable from a brain still chewing its backlog. The failed
+    /// keys come back as VALUES; the caller makes them loud.
+    #[tokio::test]
+    async fn shutdown_send_names_loops_whose_channel_is_already_closed() {
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(4);
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel(4);
+        drop(dead_rx);
+        let retiring = vec![
+            super::HostedLoop {
+                key: "alive/ws".into(),
+                tx: live_tx,
+            },
+            super::HostedLoop {
+                key: "stale/ws".into(),
+                tx: dead_tx,
+            },
+        ];
+        let failed = super::send_shutdowns(&retiring).await;
+        assert_eq!(failed, ["stale/ws"], "only the closed channel fails");
+        assert!(
+            matches!(live_rx.try_recv(), Ok(doorbell_rt::BrainMsg::Shutdown)),
+            "the live loop still received Shutdown"
         );
     }
 
