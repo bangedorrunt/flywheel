@@ -9495,7 +9495,6 @@ const DOORBELL_WATCH_KINDS: &str = "9,14,20001,30013,43001,30031,39002";
 /// Wake-bus socket consumer (bd-qe1r wave 2) — replaces the `toron watch`
 /// child: subscribes the daemon `wake.sock`, outcomes map onto `BrainMsg`
 /// at the call site (mapping byte-identical by the doorbell-rt golden test).
-
 fn spawn_wake_consumer<F>(
     project: &str,
     workspace: &str,
@@ -28158,7 +28157,7 @@ fn is_first_dispatch(skills_injected: bool) -> bool {
 /// missing (fresh pane still binding) or still booting. Anything else
 /// proceeds straight to the normal send path.
 fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
-    first && agent.map_or(true, |a| crate::herdr_shim::agent_still_booting(a))
+    first && agent.is_none_or(|a| crate::herdr_shim::agent_still_booting(a))
 }
 
 /// bd-83as: have this agent's skills been injected yet (spawn registry)?
@@ -34594,7 +34593,7 @@ mod first_dispatch_gate_tests {
     /// the live gap was a missing row failing instantly.
     #[test]
     fn missing_then_present_proceeds() {
-        let script = vec![vec![], vec![], vec![agent_row(false)]];
+        let script = [vec![], vec![], vec![agent_row(false)]];
         let calls = std::cell::Cell::new(0);
         let out = await_agent_ready(
             || {
@@ -34615,7 +34614,7 @@ mod first_dispatch_gate_tests {
     /// observes every listing.
     #[test]
     fn first_dispatch_waits_for_readiness() {
-        let script = vec![
+        let script = [
             vec![agent_row(true)],
             vec![agent_row(true)],
             vec![agent_row(false)],
