@@ -407,9 +407,17 @@ fn journal_age_secs(fw_state: &std::path::Path, ws: &str) -> Option<u64> {
 
 /// SIGTERM drain budget. `doorbell stop` allows 20s before escalating to
 /// SIGKILL, so the drain must always finish inside this: a Brain that
-/// never joins used to keep the pid alive until stop misreported
-/// "ignored SIGTERM" and aborted the restart (bd-xwgh round 2).
+/// never joins used to keep the pid alive until stop misreported    /// "ignored SIGTERM" and aborted the restart (bd-xwgh round 2).
 pub(crate) const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The send phase's own bound (bd-umuh): `Shutdown` sends rode ahead of
+/// the drain with no timeout of their own — one brain not receiving
+/// parked the serial walk, the 10s drain budget never started, and
+/// stop's 20s grace expired mid-drain (SIGKILL before any note printed).
+/// Healthy sends enqueue in microseconds; 2s only ever trips a brain
+/// that never recv()s. Stop math: SEND + DRAIN + probe + exit = 17.2s
+/// ≤ STOP_GRACE 20s (asserted in `stop_grace_covers_...`).
+pub(crate) const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Pure note for the drain outcome — a budget exhaustion must never read
 /// as a clean join (scripted in tests; hang case included).
@@ -437,17 +445,49 @@ struct DrainReport {
     /// a diagnosis nobody prints pins nothing.
     verdicts: Vec<(String, String)>,
 }
+/// Why a `Shutdown` send failed — observation first, inference never
+/// (bd-925m): `ChannelClosed` is proof the receiver is gone; a budget
+/// exhaustion only proves the enqueue did not finish in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFail {
+    ChannelClosed,
+    BudgetExhausted,
+}
 
-/// Send `Shutdown` to every retiring loop, returning the keys whose channel
-/// was already closed (bd-burk: the old `let _ =` swallowed exactly that
-/// error — a stale hosted row sending into a dead receiver looked identical
-/// to a brain still chewing its backlog, and the two could never be told
-/// apart from the log). Failures come back as VALUES; the caller is loud.
-async fn send_shutdowns(retiring: &[HostedLoop]) -> Vec<String> {
+impl std::fmt::Display for SendFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendFail::ChannelClosed => write!(f, "channel closed"),
+            SendFail::BudgetExhausted => write!(f, "send budget exhausted"),
+        }
+    }
+}
+
+/// Send `Shutdown` to every retiring loop under ONE shared deadline,
+/// returning each failure as a VALUE with its reason — the caller is
+/// loud (bd-burk: closed channels; bd-umuh: a bounded budget).
+/// Cancellation-safe: a dropped `send` future enqueues nothing, and a
+/// timed-out walk reports the blocked key plus every key behind it that
+/// never got the message.
+async fn send_shutdowns(
+    retiring: &[HostedLoop],
+    budget: std::time::Duration,
+) -> Vec<(String, SendFail)> {
+    let deadline = tokio::time::Instant::now() + budget;
     let mut failed = Vec::new();
-    for h in retiring {
-        if h.tx.send(doorbell_rt::BrainMsg::Shutdown).await.is_err() {
-            failed.push(h.key.clone());
+    for (i, h) in retiring.iter().enumerate() {
+        match tokio::time::timeout_at(deadline, h.tx.send(doorbell_rt::BrainMsg::Shutdown)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => failed.push((h.key.clone(), SendFail::ChannelClosed)),
+            Err(_) => {
+                failed.push((h.key.clone(), SendFail::BudgetExhausted));
+                failed.extend(
+                    retiring[i + 1..]
+                        .iter()
+                        .map(|h| (h.key.clone(), SendFail::BudgetExhausted)),
+                );
+                break;
+            }
         }
     }
     failed
@@ -838,10 +878,14 @@ pub async fn run(cfg: &Config) -> Result<()> {
             // stay open until their tasks end with the brain).
             eprintln!("doorbell serve: shutdown signal received, draining loops");
             let retiring = std::mem::take(&mut *hosted.lock());
-            for key in send_shutdowns(&retiring).await {
-                eprintln!(
-                    "doorbell serve: shutdown send FAILED (channel closed) for {key} — stale hosted row"
-                );
+            for (key, why) in send_shutdowns(&retiring, SEND_BUDGET).await {
+                let hint = match why {
+                    SendFail::ChannelClosed => "stale hosted row".to_string(),
+                    SendFail::BudgetExhausted => format!(
+                        "no Shutdown enqueued within {SEND_BUDGET:?} — the brain dies with the process"
+                    ),
+                };
+                eprintln!("doorbell serve: shutdown send FAILED ({why}) for {key} — {hint}");
             }
             eprintln!("doorbell serve: shutdown sent, joining loops");
             drop(retiring);
@@ -1876,11 +1920,51 @@ mod tests {
                 tx: dead_tx,
             },
         ];
-        let failed = super::send_shutdowns(&retiring).await;
-        assert_eq!(failed, ["stale/ws"], "only the closed channel fails");
+        let failed = super::send_shutdowns(&retiring, std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            failed,
+            [("stale/ws".to_string(), super::SendFail::ChannelClosed)],
+            "only the closed channel fails"
+        );
         assert!(
             matches!(live_rx.try_recv(), Ok(doorbell_rt::BrainMsg::Shutdown)),
             "the live loop still received Shutdown"
+        );
+    }
+
+    /// bd-umuh: the send phase ran unbounded ahead of the bounded drain —
+    /// one brain not receiving (mid `run_cli`, up to 15s) parked the serial
+    /// walk, the 10s drain budget never even started, and stop's grace
+    /// expired mid-drain (SIGKILL before any note printed). The budget is
+    /// injected policy; an exhausted budget reports the blocked key AND
+    /// every key behind it that never got its Shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn send_shutdowns_bounds_the_send_phase_and_names_every_unsent_key() {
+        // Capacity 1, pre-filled: the next send parks until the budget fires.
+        let (blocked_tx, _blocked_rx) = tokio::sync::mpsc::channel(1);
+        blocked_tx
+            .try_send(doorbell_rt::BrainMsg::Shutdown)
+            .unwrap();
+        let (behind_tx, _behind_rx) = tokio::sync::mpsc::channel(1);
+        behind_tx.try_send(doorbell_rt::BrainMsg::Shutdown).unwrap();
+        let retiring = vec![
+            super::HostedLoop {
+                key: "busy/ws".into(),
+                tx: blocked_tx,
+            },
+            super::HostedLoop {
+                key: "queued/ws".into(),
+                tx: behind_tx,
+            },
+        ];
+        let failed = super::send_shutdowns(&retiring, std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            failed,
+            [
+                ("busy/ws".to_string(), super::SendFail::BudgetExhausted),
+                ("queued/ws".to_string(), super::SendFail::BudgetExhausted),
+            ],
+            "blocked key and the never-attempted key behind it both report the exhausted budget: {failed:?}"
         );
     }
 
