@@ -1,24 +1,25 @@
-//! Wake pipe quiet-vs-deaf classifier — GS-061 wake quiet-vs-deaf library
-//! wedge (toron ADR-0036 / GS-061 scout pattern, external; not an in-repo ADR).
+//! Wake pipe quiet-vs-deaf classifier — GS-062 live on `/health`
+//! (toron ADR-0036 / GS-061 scout pattern, external; not an in-repo ADR).
 //!
-//! **Library-only** until captain chooses A (keep library) vs B (wire into
-//! `/health`). Distinguishes a **quiet** wake.sock (heartbeats arriving, no
-//! events) from a **deaf** pipe (no frames at all past the idle ceiling), or
-//! **never-stamped** (never observed ≠ deaf). No second broker / Redis /
-//! Funnel — pure classification over host-observed timestamps. Not live on
-//! `/health` yet.
+//! Distinguishes a **quiet** wake pipe (heartbeats arriving, no events) from
+//! a **deaf** pipe (no frames past the idle ceiling), or **never-stamped**
+//! (never observed ≠ deaf). No second broker / Redis / Funnel — pure
+//! classification over host-observed timestamps. Wired into flywheel
+//! `serve` `/health` JSON (GS-062).
+//!
+//! Callers must stamp **event** and **heartbeat** separately
+//! (`doorbell_rt::watchbeat::{touch_event,touch_heartbeat}`) — never pass
+//! `max(event, hb)` into `last_event_ms`.
 
 /// Default deaf ceiling (ms): silence past this is deaf, never quiet.
-#[allow(dead_code)] // export surface until captain B wires /health
 pub const DEFAULT_DEAF_CEILING_MS: u64 = 60_000;
 
 /// Pipe health relative to wake.sock heartbeats / events.
 ///
-/// Shape note for future `/health` serializers: `Live` / `Quiet` carry
-/// **absolute** millisecond stamps; `Deaf` carries a measured **age**
-/// (`silent_for_ms`); `NeverStamped` carries neither (never observed).
+/// `/health` serializers: `Live` / `Quiet` carry **absolute** millisecond
+/// stamps; `Deaf` carries a measured **age** (`silent_for_ms`);
+/// `NeverStamped` carries neither (never observed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // export surface until captain B wires /health
 pub enum PipeHealth {
     /// Events flowing recently.
     Live { last_event_ms: u64 },
@@ -44,7 +45,6 @@ pub enum PipeHealth {
 /// Quiet requires a heartbeat inside the ceiling; deaf is silence past the
 /// ceiling after a known observation. Never-stamped (both `None`) is
 /// [`PipeHealth::NeverStamped`] — not Deaf.
-#[allow(dead_code)] // export surface until captain B wires /health
 pub fn classify(
     now_ms: u64,
     last_event_ms: Option<u64>,
@@ -80,6 +80,27 @@ pub fn classify(
         (None, None) => unreachable!("handled above"),
     };
     PipeHealth::Deaf { silent_for_ms }
+}
+
+/// Serde-friendly JSON object for `/health` (no serde derive required).
+pub fn to_json(h: PipeHealth) -> serde_json::Value {
+    match h {
+        PipeHealth::Live { last_event_ms } => serde_json::json!({
+            "class": "Live",
+            "last_event_ms": last_event_ms,
+        }),
+        PipeHealth::Quiet { last_heartbeat_ms } => serde_json::json!({
+            "class": "Quiet",
+            "last_heartbeat_ms": last_heartbeat_ms,
+        }),
+        PipeHealth::Deaf { silent_for_ms } => serde_json::json!({
+            "class": "Deaf",
+            "silent_for_ms": silent_for_ms,
+        }),
+        PipeHealth::NeverStamped => serde_json::json!({
+            "class": "NeverStamped",
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +193,17 @@ mod tests {
                 last_event_ms: 95_000
             }
         );
+    }
+
+    #[test]
+    fn health_json_shape_from_classify() {
+        let live = to_json(classify(50_000, Some(49_000), Some(40_000), 60_000));
+        assert_eq!(live["class"], "Live");
+        let quiet = to_json(classify(100_000, None, Some(90_000), 60_000));
+        assert_eq!(quiet["class"], "Quiet");
+        let deaf = to_json(classify(200_000, None, Some(100_000), 60_000));
+        assert_eq!(deaf["class"], "Deaf");
+        let never = to_json(classify(0, None, None, 60_000));
+        assert_eq!(never["class"], "NeverStamped");
     }
 }
