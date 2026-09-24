@@ -69,6 +69,12 @@ struct Sink {
     factory: Option<SinkFactory>,
 }
 
+/// Bound for the shutdown worker join across all sinks (bd-nuf2): a Brain
+/// must exit well inside the 10s SIGTERM drain budget. Healthy in-flight
+/// sends (a herdr CLI prompt is ~100ms) finish far inside this; only a
+/// hung endpoint rides out the grace.
+const SHUTDOWN_WORKER_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Per-subscription sink actors with shed-to-digest and supervision.
 pub struct SinkManager {
     // Ordered by sink name so shutdown, status, and audit traversal are
@@ -263,8 +269,18 @@ impl SinkManager {
     /// Graceful stop: close every queue, join workers, return everything
     /// still held. The brain journals these; resume redelivers from the
     /// journal (the intent was already journaled pre-delivery, D4.2).
+    ///
+    /// bd-nuf2: the worker join is BOUNDED — a worker inside a hung
+    /// endpoint send (live: 30s herdr CLI timeout) used to hold this await
+    /// past every drain budget, so Brains never joined and every stop
+    /// logged DRAIN BUDGET EXCEEDED. Past the grace the join gives up and
+    /// shutdown returns; the straggler stays detached until its endpoint
+    /// answers (the process is exiting — abort cannot preempt a blocking
+    /// send anyway). Its in-flight intent was journaled pre-delivery, so
+    /// resume redelivers it.
     pub async fn shutdown(&mut self) -> Vec<Undelivered> {
         let mut out = Vec::new();
+        let mut workers = Vec::new();
         for (name, st) in self.sinks.iter_mut() {
             {
                 let mut inner = st.inner.lock().await;
@@ -286,9 +302,15 @@ impl SinkManager {
                 inner.notify.notify_waiters();
             }
             if let Some(w) = st.worker.take() {
-                let _ = w.await;
+                workers.push(w);
             }
         }
+        let _ = tokio::time::timeout(SHUTDOWN_WORKER_GRACE, async {
+            for w in workers {
+                let _ = w.await;
+            }
+        })
+        .await;
         out
     }
 
@@ -783,6 +805,29 @@ mod tests {
         assert!(matches!(outcome, SendOutcome::Queued), "got {outcome:?}");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(sent_len(&sent), 1, "intent must deliver after the park");
+    }
+
+    /// bd-nuf2: a worker inside a hung endpoint send (live: 30s herdr CLI
+    /// timeout) must not hold the drain past budget — shutdown bounds the
+    /// worker join and returns. The in-flight intent was journaled
+    /// pre-delivery (D4.2); resume redelivers it. Multi-thread: the stall
+    /// is a blocking sleep, so a current-thread runtime would freeze the
+    /// test timeout too and prove nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_bounds_hung_endpoint_join() {
+        let (deg_tx, _deg_rx) = mpsc::channel(16);
+        let mut mgr = SinkManager::new(deg_tx);
+        let (mut sink, _sent) = MockSink::new();
+        sink.stall_ms = 12_000;
+        mgr.add_sink("herdr", Box::new(sink));
+        mgr.send("herdr", "p", "in-flight").await;
+        // Let the worker pop the intent so it sits inside the 20s send.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let done = tokio::time::timeout(std::time::Duration::from_secs(8), mgr.shutdown()).await;
+        assert!(
+            done.is_ok(),
+            "shutdown must bound a hung endpoint instead of riding its send"
+        );
     }
 
     #[tokio::test]
