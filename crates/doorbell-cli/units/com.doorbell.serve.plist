@@ -32,6 +32,8 @@
     <dict>
         <key>DOORBELL_STATE_DIR_KEY</key>
         <string>DOORBELL_STATE_DIR_VALUE</string>
+        <key>DOORBELL_TORON_MCP_URL_KEY</key>
+        <string>DOORBELL_TORON_MCP_URL_VALUE</string>
     </dict>
 </dict>
 </plist>
