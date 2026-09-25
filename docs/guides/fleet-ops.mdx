@@ -26,6 +26,25 @@ flywheel snapshot <p>                     # fleet snapshot contract (flywheel-sn
 flywheel timeline <p>; flywheel audit <p> # event trail; full log
 ```
 
+```text
+QuietHarbor   working  pane wK:p2   bead bd-guide-walkthroughs-twke
+DustySparrow  idle     pane wK:p3   no ticket
+runs pending: 0
+digest: 2 unread · 0 owed · 0 overdue
+
+{ "afk": 0, "coalitions": [], "decisions": [], "degraded": [] }
+```
+
+A non-empty `degraded` array in the snapshot is the one field to read before
+trusting any other line in this block: it means a subsystem is up but not
+healthy, which is exactly the state that looks fine while wakes are not being
+delivered.
+
+If it fails: `--status` is not a flag. The loop's readout is one of the
+`--robot-*` machine doors, so `loop-mode run <p> --status` dies with
+`unexpected argument` rather than printing a partial answer. Use
+`--robot-status` for machines and `flywheel watch` for humans.
+
 Monitor git and beads for truth, not mail. Address the captain by pin: `flywheel mail whois <project> captain` resolves the alias. `flywheel mail watch <p> --thread <t>` blocks on one thread.
 
 ## Intervene
@@ -55,6 +74,23 @@ flywheel kill <p> --force-working         # include working agents
 flywheel kill <p> --drain                 # graceful two-phase stop
 flywheel coalition disband <id>
 ```
+
+```text
+drain: requested on active loop · 2 working agents
+drain: grace 1/3 · QuietHarbor finishing VERIFY fence
+drain: grace 3/3 · force-stop DustySparrow (bead bd-guide-walkthroughs-twke)
+stopped · 2 panes closed · reservations preserved
+```
+
+The three-phase readout is the contract: a drain that reaches phase three is
+telling you an agent did not finish in time and was stopped while its work is
+still unverified. The close is skipped in that case, deliberately.
+
+If it fails: `kill` refuses while an agent is `working` unless you pass
+`--force-working` or `--drain`. That refusal exists because Escape and kill
+keys drop a pane to a shell and lose whatever the agent was mid-way through.
+`--force-working` is not the upgrade path from a failed drain, it is the
+abandonment path.
 
 `--drain` asks each working agent to finish its VERIFY fence, records the drain on the active loop, enforces a 3-poll grace, then force-stops with the bead id; the close is skipped. Do not kill working agents casually.
 

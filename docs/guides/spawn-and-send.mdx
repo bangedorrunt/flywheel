@@ -9,6 +9,21 @@ A **pin** (adjective + noun, `DustySparrow`) is the public mail name. `flywheel 
 
 Composed names pass through unhashed: `crew-<workflow>-<role>` and `flywheel-<base>-<profile>` are legal in `--as`/`--to` as-is. A raw harness pane with no registry entry is addressable by its agent kind (`--to grok`) or its pane id; the send error lists every raw pane as `kind (pane_id)`. Never `--to coder1`: the seq-1 grammar is invalid, the first agent of a profile has no suffix. Unregistered free strings fail loud; there is no silent hash rewrite.
 
+```bash
+flywheel send <project> --to NotARegisteredPin "probe"
+```
+
+```text
+flywheel: send --to NotARegisteredPin: unresolvable after rebind — settling for a fresh registration
+flywheel: no agents match --to NotARegisteredPin in <project> (available: <pin>; raw panes address by agent kind or pane id)
+```
+
+If it fails: the error names every addressable agent under `available:`. That
+list is the fix — either you misspelled a registered pin, or the pane you meant
+is raw and has to be addressed by its agent kind or pane id instead. Do not
+reroute silently to whatever does resolve: a message that lands on the wrong
+agent is worse than one that fails.
+
 The tracker uses different names: br claims take the herdr slug (`flywheel-toron-coder`), never a pin.
 
 ## Profiles and spawn
@@ -17,6 +32,18 @@ The tracker uses different names: br claims take the herdr slug (`flywheel-toron
 flywheel profile list
 flywheel spawn <project> --profile coder --count 2 --join-channel steer-bd-z2d0
 ```
+
+```text
+9 profiles
+  coder        | opencode | muse-spark-1.3-contributor | builtin=true
+  housekeeper  |          | @standard                  | builtin=true
+  oracle       |          | @premium                   | builtin=true
+  planner      | pi       | muse-spark-1.3-contributor | builtin=true
+```
+
+A profile with an empty harness is one whose route comes from a slot alias
+(`@standard`, `@premium`) rather than a pinned harness, so the effective
+harness is resolved at spawn time and recorded in the ledger.
 
 Unsure of the role: list first. Bare harness flags (`--oc/--pi/--gk`) count only under an explicit captain harness constraint, recorded in the trail. `--join-channel` auto-joins every spawned pin at pane creation (join-before-post: a non-member post fails loud and names the remedy).
 
@@ -58,6 +85,15 @@ Bare `spawn --model <id> [--provider <p>]` is the lenient fallback for spawns wi
 ```bash
 flywheel send <p> --to <pin> --stage ce-execute --param bead=bd-z2d0 --param scope=crates/x "<note>"
 ```
+
+```text
+{ "dispatched": true, "prior_status": "idle", "target": "DustySparrow" }
+```
+
+Those three fields are the receipt. `dispatched: true` with `prior_status:
+idle` is a success, not a near-miss: the brief landed and the target happened
+to be idle when it arrived. `landed: true` is a different claim and appears
+only after `--wait` or `--confirm`.
 
 Stage payloads substitute `{{k}}` slots from repeatable `--param k=v`. Reserved slots: `{{bead}}`, `{{scope}}`, `{{exit}}`, `{{channel}}`, `{{pin}}`, `{{report_file}}`. The wave DISPATCH adds `--param learnings=<paths>` when the grounding gate matched. Missing required params exit nonzero and name the slot. Zero params renders byte-identical to the unparameterized prompt. Message text alongside `--stage` appends after the rendered stage; a `--param` with no matching slot warns and is ignored. Every send headers the bound bead (`BEAD: <id>`) or states none is bound. Project-tier `.flywheel/stages.toml` resolves in CLI sends.
 
