@@ -103,7 +103,6 @@ pub fn to_json(h: PipeHealth) -> serde_json::Value {
     }
 }
 
-
 /// Worst-of severity for multi-hosted wake aggregation (ask-user F).
 /// Higher = worse. Order (worst → best):
 /// [`PipeHealth::NeverStamped`] > [`PipeHealth::Deaf`] > [`PipeHealth::Quiet`]
@@ -189,10 +188,7 @@ pub fn classify_worst_of_stamps<L>(
 /// Wake **class** aggregation is ask-user F [`classify_worst_of`] over the
 /// **alive** partition only — never fall through to `other` when alive is
 /// empty (orphan stamps → false Quiet). Empty alive → [`PipeHealth::NeverStamped`].
-pub fn order_hosted_alive_first(
-    alive: Vec<String>,
-    other: Vec<String>,
-) -> Vec<String> {
+pub fn order_hosted_alive_first(alive: Vec<String>, other: Vec<String>) -> Vec<String> {
     order_hosted_alive_first_by(alive, other, |s| s)
 }
 
@@ -252,7 +248,6 @@ mod tests {
             "slug alpha before beta even when project zzz > aaa"
         );
     }
-
 
     #[test]
     fn quiet_when_heartbeat_inside_ceiling() {
@@ -356,7 +351,10 @@ mod tests {
 
     #[test]
     fn worst_of_severity_order_never_gt_deaf_gt_quiet_gt_live() {
-        assert!(pipe_severity(PipeHealth::NeverStamped) > pipe_severity(PipeHealth::Deaf { silent_for_ms: 1 }));
+        assert!(
+            pipe_severity(PipeHealth::NeverStamped)
+                > pipe_severity(PipeHealth::Deaf { silent_for_ms: 1 })
+        );
         assert!(
             pipe_severity(PipeHealth::Deaf { silent_for_ms: 1 })
                 > pipe_severity(PipeHealth::Quiet {
@@ -366,9 +364,7 @@ mod tests {
         assert!(
             pipe_severity(PipeHealth::Quiet {
                 last_heartbeat_ms: 1
-            }) > pipe_severity(PipeHealth::Live {
-                last_event_ms: 1
-            })
+            }) > pipe_severity(PipeHealth::Live { last_event_ms: 1 })
         );
     }
 
@@ -378,7 +374,7 @@ mod tests {
         let now = 200_000u64;
         let ceiling = 60_000u64;
         let stamps = [
-            (None, Some(100_000u64)),       // Deaf (hb age 100s)
+            (None, Some(100_000u64)),             // Deaf (hb age 100s)
             (Some(199_000u64), Some(198_000u64)), // Live
         ];
         let h = classify_worst_of(now, stamps, ceiling);
@@ -396,7 +392,7 @@ mod tests {
         let now = 50_000u64;
         let ceiling = 60_000u64;
         let stamps = [
-            (None, None),                         // NeverStamped
+            (None, None),                       // NeverStamped
             (Some(49_000u64), Some(48_000u64)), // Live
         ];
         assert_eq!(

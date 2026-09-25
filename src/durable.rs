@@ -9789,79 +9789,84 @@ mod tests {
     /// queue is empty), working and unknown wait and never dispatch
     /// (bd-unknown-skip-dispatch), blocked reports. Fixtures and expectations
     /// are the eight tests this replaces.
+    /// One row of the `plan_actions` table, named rather than a five-tuple:
+    /// the fields read at the assertion sites, and clippy's `type_complexity`
+    /// stays quiet (same shape as `pane`'s `RouteRow`).
+    struct PlanRow {
+        name: &'static str,
+        states: Vec<AgentState>,
+        queue: &'static [&'static str],
+        nudge: Option<&'static str>,
+        expected: Vec<LoopAction>,
+    }
+
     #[test]
     fn plan_actions_rows() {
-        let rows: [(
-            &str,
-            Vec<AgentState>,
-            &[&str],
-            Option<&str>,
-            Vec<LoopAction>,
-        ); 8] = [
-            (
-                "idle-pops-queue",
-                vec![st("a", "idle")],
-                &["p1", "p6"],
-                None,
-                vec![send("a", "p1")],
-            ),
-            (
-                "queue-drains-across-idle-agents-in-order",
-                vec![st("a", "idle"), st("b", "done")],
-                &["p1", "p6"],
-                None,
-                vec![send("a", "p1"), send("b", "p6")],
-            ),
-            (
-                "working-gets-nothing",
-                vec![st("a", "working")],
-                &["p1"],
-                None,
-                vec![LoopAction::Wait],
-            ),
-            (
-                "blocked-reports-and-keeps-queue",
-                vec![st("a", "blocked")],
-                &["p1"],
-                None,
-                vec![LoopAction::Blocked {
+        let rows: [PlanRow; 8] = [
+            PlanRow {
+                name: "idle-pops-queue",
+                states: vec![st("a", "idle")],
+                queue: &["p1", "p6"],
+                nudge: None,
+                expected: vec![send("a", "p1")],
+            },
+            PlanRow {
+                name: "queue-drains-across-idle-agents-in-order",
+                states: vec![st("a", "idle"), st("b", "done")],
+                queue: &["p1", "p6"],
+                nudge: None,
+                expected: vec![send("a", "p1"), send("b", "p6")],
+            },
+            PlanRow {
+                name: "working-gets-nothing",
+                states: vec![st("a", "working")],
+                queue: &["p1"],
+                nudge: None,
+                expected: vec![LoopAction::Wait],
+            },
+            PlanRow {
+                name: "blocked-reports-and-keeps-queue",
+                states: vec![st("a", "blocked")],
+                queue: &["p1"],
+                nudge: None,
+                expected: vec![LoopAction::Blocked {
                     name: "a".to_string(),
                 }],
-            ),
-            (
-                "empty-queue-with-nudge-nudges",
-                vec![st("a", "idle")],
-                &[],
-                Some("proceed"),
-                vec![LoopAction::Nudge {
+            },
+            PlanRow {
+                name: "empty-queue-with-nudge-nudges",
+                states: vec![st("a", "idle")],
+                queue: &[],
+                nudge: Some("proceed"),
+                expected: vec![LoopAction::Nudge {
                     name: "a".to_string(),
                 }],
-            ),
-            (
-                "empty-queue-no-nudge-waits",
-                vec![st("a", "done")],
-                &[],
-                None,
-                vec![LoopAction::Wait],
-            ),
-            (
-                "unknown-keeps-queue",
-                vec![st("a", "unknown")],
-                &["p1"],
-                None,
-                vec![LoopAction::Wait],
-            ),
-            (
-                "unknown-with-nudge-no-send",
-                vec![st("a", "unknown")],
-                &[],
-                Some("proceed"),
-                vec![LoopAction::Wait],
-            ),
+            },
+            PlanRow {
+                name: "empty-queue-no-nudge-waits",
+                states: vec![st("a", "done")],
+                queue: &[],
+                nudge: None,
+                expected: vec![LoopAction::Wait],
+            },
+            PlanRow {
+                name: "unknown-keeps-queue",
+                states: vec![st("a", "unknown")],
+                queue: &["p1"],
+                nudge: None,
+                expected: vec![LoopAction::Wait],
+            },
+            PlanRow {
+                name: "unknown-with-nudge-no-send",
+                states: vec![st("a", "unknown")],
+                queue: &[],
+                nudge: Some("proceed"),
+                expected: vec![LoopAction::Wait],
+            },
         ];
-        for (name, states, queue, nudge, expected) in rows {
-            let got = plan(queue, &states, nudge);
-            assert_eq!(got, expected, "row {name}: {got:?}");
+        for row in rows {
+            let got = plan(row.queue, &row.states, row.nudge);
+            assert_eq!(got, row.expected, "row {}: {got:?}", row.name);
         }
     }
 

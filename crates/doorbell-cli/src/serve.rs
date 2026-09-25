@@ -2142,12 +2142,12 @@ mod tests {
     #[test]
     fn hosted_keys_for_health_orders_by_workspace_slug() {
         // Insertion order: beta then alpha; health order must be alpha first.
-        let hosts = vec![
-            host_for_test("zzz/beta"),
-            host_for_test("aaa/alpha"),
-        ];
+        let hosts = vec![host_for_test("zzz/beta"), host_for_test("aaa/alpha")];
         let keys = super::hosted_keys(&hosts);
-        assert_eq!(keys[0], "zzz/beta", "insertion order preserved for reconcile");
+        assert_eq!(
+            keys[0], "zzz/beta",
+            "insertion order preserved for reconcile"
+        );
         let health = super::hosted_keys_for_health(&hosts);
         assert_eq!(
             health,
