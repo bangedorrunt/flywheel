@@ -28984,38 +28984,26 @@ fn cmd_internal_run_headless(
                 if fb_id.is_empty() || fb_id == &model_id {
                     continue;
                 }
-                let agent = agent_ref::AgentRef::new("flywheel", profile_name);
-                let from = agent_ref::AgentBinding {
-                    profile_name: profile_name.to_string(),
-                    model: model_id.clone(),
-                    harness: harness.to_string(),
-                };
-                let to = agent_ref::AgentBinding {
-                    profile_name: profile_name.to_string(),
-                    model: fb_id.clone(),
-                    harness: harness.to_string(),
-                };
-                let intent = agent_ref::RebindIntent::prepare(
-                    agent,
-                    from,
-                    to,
-                    agent_ref::RebindReason::ModelFallback {
-                        kind: "rate_limit".into(),
-                        evidence: err_ev.clone(),
-                    },
-                    0,
+                // One route for both halves: the harness the journal row
+                // names IS the harness the run dispatches on. The row used to
+                // record the caller's harness while the run used the
+                // grok-coupled one, so a grok-family entry was journaled under
+                // a harness it never ran on (and keyed on that wrong harness).
+                let rung = registry.route_for(fb_id, harness);
+                let intent = pane::model_fallback_intent(
+                    "flywheel",
+                    profile_name,
+                    profile_name,
+                    &model_id,
+                    harness,
+                    &rung,
+                    err_ev.clone(),
                 );
-                let fb_harness = if registry.family_of(fb_id) == "grok" {
-                    "grok"
-                } else {
-                    harness
-                };
-                let fb_model = registry.resolve(fb_id, fb_harness);
                 eprintln!(
                     "flywheel: @{profile_name} rate-limited on {model_id} (429) — model_fallback hop to {fb_id}"
                 );
                 match agent_ref::commit_rebind("flywheel", intent, |_| {
-                    run_once(fb_harness, fb_id, &fb_model, &profile.effort)
+                    run_once(&rung.harness, &rung.model_id, &rung.model, &profile.effort)
                 }) {
                     Ok(fb) => {
                         attempt = fb;
@@ -29035,7 +29023,7 @@ fn cmd_internal_run_headless(
             // the I4 row are shared with the pane hop: one implementation, and
             // the same inputs derive the same effect_key either way.
             if let Some(route) = registry.fallback_route(&model_id, harness) {
-                let intent = pane::registry_fallback_intent(
+                let intent = pane::model_fallback_intent(
                     "flywheel",
                     profile_name,
                     profile_name,
