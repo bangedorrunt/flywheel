@@ -69,7 +69,14 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
         "pi" => {
             let mut args = vec!["--model".to_string(), model.to_string()];
             if let Some(e) = effort {
-                args.push(format!("--thinking={e}"));
+                // bd-pi-thinking-equals-form: TWO argv entries, not
+                // `--thinking=<e>`. pi 0.87.1's parser accepts the space form and
+                // rejects the equals form with `Unknown option: --thinking`,
+                // even though its own --help advertises the flag. Matches the
+                // `pa` arm below. Covered by
+                // pi_emitted_effort_arg_form_is_accepted_by_the_real_binary.
+                args.push("--thinking".to_string());
+                args.push(e.to_string());
             }
             args
         }
@@ -668,15 +675,26 @@ mod tests {
     /// provider/id passes through verbatim, the pi shorthand); opencode
     /// v2 keeps `--model provider/model#variant` verbatim and degrades LOUDLY
     /// on effort (no effort flag); empty effort emits no thinking flag.
+    ///
+    /// bd-pi-thinking-equals-form: pi's `--thinking` is TWO argv entries. This
+    /// test previously asserted the equals form `--thinking=high`, which pi's
+    /// parser rejects; the shape is now pinned by
+    /// `pi_emitted_effort_arg_form_is_accepted_by_the_real_binary`, which asks
+    /// the binary instead of trusting this one.
     #[test]
     fn jev_effort_pi_thinking_native_opencode_loud_degrade() {
         assert_eq!(
             model_args("pi", "glm-5.2", Some("high")),
-            vec!["--model", "glm-5.2", "--thinking=high"]
+            vec!["--model", "glm-5.2", "--thinking", "high"]
         );
         assert_eq!(
             model_args("pi", "opencode-go/deepseek-v4-flash", Some("low")),
-            vec!["--model", "opencode-go/deepseek-v4-flash", "--thinking=low"]
+            vec![
+                "--model",
+                "opencode-go/deepseek-v4-flash",
+                "--thinking",
+                "low"
+            ]
         );
         assert_eq!(
             model_args("pi", "glm-5.2", None),
@@ -691,6 +709,49 @@ mod tests {
         assert!(!effort_degraded("pi"), "pi effort is native");
         assert!(!effort_degraded("omp"), "omp effort is native");
         assert!(!effort_degraded("pa"), "pa effort is native");
+    }
+
+    /// bd-pi-thinking-equals-form: the argv we EMIT must be argv pi PARSES.
+    ///
+    /// The sibling test above can only prove we emit what we emit — it locked in
+    /// `--thinking=high` because that is what the code did, and its doc comment
+    /// claimed `pi --help` verified it. It did not. Against pi 0.87.1:
+    ///
+    ///   pi --thinking=high  -> Error: Unknown option: --thinking
+    ///   pi --thinking high  -> args parse; fails later on the model
+    ///
+    /// So the equals form is rejected by the real parser while pi's own --help
+    /// advertises the space form. This test closes that gap by asking the
+    /// binary, with a deliberately bogus model so it fails at model resolution
+    /// (no network, no real completion) and `Unknown option` is the only signal
+    /// that means the ARG FORM was wrong.
+    #[test]
+    fn pi_emitted_effort_arg_form_is_accepted_by_the_real_binary() {
+        let bogus_model = "bogus/model-flywheel-argcheck";
+        let emitted = model_args("pi", bogus_model, Some("high"));
+
+        let output = match std::process::Command::new("pi")
+            .args(["--print"])
+            .args(&emitted)
+            .arg("x")
+            .output()
+        {
+            Ok(o) => o,
+            // pi is not installed here; the pure argv assertions still cover the
+            // shape. Skipping loudly beats a green test that proved nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("pi not on PATH — skipping the real-binary arg check");
+                return;
+            }
+            Err(e) => panic!("spawn pi: {e}"),
+        };
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Unknown option"),
+            "pi rejected the argv flywheel emits: {emitted:?}\n{stderr}\n\
+             pi takes `--thinking <level>` as two argv entries, not `--thinking=<level>`."
+        );
     }
 
     /// governed-by: bd-ulzi — the dispatch-spec effort input rides the
