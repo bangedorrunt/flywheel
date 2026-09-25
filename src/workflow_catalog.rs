@@ -41,6 +41,202 @@ use crate::config::config_dir;
 /// ("builtin" | "catalog") — the vocabulary `workflow list` reports.
 pub type ResolvedWorkflow = (Workflow, &'static str);
 
+/// One user-tier seed or drift result. The resolver remains layered; this is
+/// an operator report, never a second catalog path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogEntryStatus {
+    pub kind: String,
+    pub name: String,
+    pub status: String,
+    pub source: String,
+    pub compose_token: bool,
+}
+
+/// Seed copies compiled-in defaults into the user tier without replacing an
+/// authored copy. Re-running is therefore safe and makes the user's override
+/// surface explicit.
+pub fn seed_user_catalog(config_root: &Path) -> Result<CatalogSeedReport> {
+    let mut report = CatalogSeedReport::default();
+    let workflow_dir = config_root.join("workflows");
+    for (name, workflow) in crate::builtin_workflows::builtin_workflows() {
+        let path = workflow_dir.join(format!("{name}.yaml"));
+        if path.exists() {
+            report.kept_workflows.push(name);
+        } else {
+            write_workflow_yaml(&workflow_dir, &workflow)?;
+            report.created_workflows.push(name);
+        }
+    }
+
+    let stage_path = config_root.join("stages.toml");
+    let mut file = if stage_path.is_file() {
+        let raw = std::fs::read_to_string(&stage_path)
+            .with_context(|| format!("read {}", stage_path.display()))?;
+        raw.parse::<toml::Table>()
+            .with_context(|| format!("parse {}", stage_path.display()))?
+    } else {
+        toml::Table::new()
+    };
+    let stages = file
+        .entry("stages".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .context("stages.toml `stages` must be a table")?;
+    let compiled = crate::stages::StageLibrary::compiled_in();
+    for name in compiled.list() {
+        let stage = compiled
+            .get_stage(name)
+            .expect("compiled stage list and stage map agree");
+        if stages.contains_key(name) {
+            report.kept_stages.push(name.to_string());
+        } else {
+            let value = toml::Value::try_from(stage.clone()).context("serialize compiled stage")?;
+            stages.insert(name.to_string(), value);
+            report.created_stages.push(name.to_string());
+        }
+    }
+    if !report.created_stages.is_empty() || !stage_path.exists() {
+        if let Some(parent) = stage_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let raw = toml::to_string(&file).context("serialize seeded stages.toml")?;
+        std::fs::write(&stage_path, raw)
+            .with_context(|| format!("write {}", stage_path.display()))?;
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CatalogSeedReport {
+    pub created_workflows: Vec<String>,
+    pub kept_workflows: Vec<String>,
+    pub created_stages: Vec<String>,
+    pub kept_stages: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct UserStages {
+    #[serde(default)]
+    stages: BTreeMap<String, crate::stages::Stage>,
+}
+
+fn load_user_workflows(config_root: &Path) -> Result<BTreeMap<String, (Workflow, String)>> {
+    let dir = config_root.join("workflows");
+    if !dir.is_dir() {
+        return Ok(BTreeMap::new());
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == "yaml" || ext == "yml")
+        })
+        .collect();
+    paths.sort();
+    let mut out = BTreeMap::new();
+    for path in paths {
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let workflow =
+            parse_workflow(&raw).with_context(|| format!("parse workflow {}", path.display()))?;
+        out.insert(workflow.name.clone(), (workflow, raw));
+    }
+    Ok(out)
+}
+
+fn load_user_stages(config_root: &Path) -> Result<BTreeMap<String, crate::stages::Stage>> {
+    let path = config_root.join("stages.toml");
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let file: UserStages =
+        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    Ok(file.stages)
+}
+
+/// Compare the user tier with the compiled-in defaults. A user copy always
+/// wins resolution, while `stale` makes the intentional shadow visible.
+pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
+    let builtins = crate::builtin_workflows::builtin_workflows();
+    let user_workflows = load_user_workflows(config_root)?;
+    let mut rows = Vec::new();
+    for (name, builtin) in &builtins {
+        let builtin_yaml = serde_yaml::to_string(builtin).ok();
+        let status = match user_workflows.get(name) {
+            None => "missing",
+            Some((_, source))
+                if builtin_yaml
+                    .as_deref()
+                    .is_some_and(|yaml| yaml.trim_end() == source.trim_end()) =>
+            {
+                "current"
+            }
+            Some(_) => "stale",
+        };
+        rows.push(CatalogEntryStatus {
+            kind: "workflow".into(),
+            name: name.clone(),
+            status: status.into(),
+            source: if user_workflows.contains_key(name) {
+                "user"
+            } else {
+                "builtin"
+            }
+            .into(),
+            compose_token: crate::builtin_workflows::is_compose_token(name),
+        });
+    }
+    for name in user_workflows.keys() {
+        if !builtins.contains_key(name) {
+            rows.push(CatalogEntryStatus {
+                kind: "workflow".into(),
+                name: name.clone(),
+                status: "custom".into(),
+                source: "user".into(),
+                compose_token: false,
+            });
+        }
+    }
+
+    let compiled = crate::stages::StageLibrary::compiled_in();
+    let user_stages = load_user_stages(config_root)?;
+    for name in compiled.list() {
+        let status = match user_stages.get(name) {
+            None => "missing",
+            Some(user) if Some(user) == compiled.get_stage(name) => "current",
+            Some(_) => "stale",
+        };
+        rows.push(CatalogEntryStatus {
+            kind: "stage".into(),
+            name: name.to_string(),
+            status: status.into(),
+            source: if user_stages.contains_key(name) {
+                "user"
+            } else {
+                "builtin"
+            }
+            .into(),
+            compose_token: false,
+        });
+    }
+    for name in user_stages.keys() {
+        if !compiled.has(name) {
+            rows.push(CatalogEntryStatus {
+                kind: "stage".into(),
+                name: name.clone(),
+                status: "custom".into(),
+                source: "user".into(),
+                compose_token: false,
+            });
+        }
+    }
+    rows.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
+    Ok(rows)
+}
+
 /// bd-xmq5: THE one builtin+user(+project) merge. Previously copy-pasted at
 /// ~7 sites with inconsistent tiers (some user-only `load()`, some
 /// `load_layered`), so project-tier overrides applied on some paths and were
@@ -819,6 +1015,60 @@ msg = "legacy triage"
         assert_eq!(from, "fresh-eyes-explore,systematic-execute");
         assert_eq!(first_run, "2026-08-21T12:00:00Z");
         assert_eq!(author, "TealDune");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_catalog_seed_is_non_destructive_and_drift_is_honest() {
+        let dir = config_root("seed-drift");
+        let before = catalog_drift(&dir).unwrap();
+        assert!(before.iter().any(|row| row.status == "missing"));
+        write(
+            &dir.join("stages.toml"),
+            "[operator]\nkeep = \"yes\"\n\n[stages.custom]\nname = \"custom\"\nprompt = \"operator stage\"\n",
+        );
+
+        let seed = seed_user_catalog(&dir).unwrap();
+        assert!(!seed.created_workflows.is_empty());
+        assert!(!seed.created_stages.is_empty());
+        assert!(seed.kept_workflows.is_empty());
+        let after_seed = catalog_drift(&dir).unwrap();
+        assert!(
+            after_seed
+                .iter()
+                .all(|row| matches!(row.status.as_str(), "current" | "custom"))
+        );
+        assert!(
+            after_seed
+                .iter()
+                .any(|row| row.name == "custom" && row.status == "custom")
+        );
+        let seeded_stages = fs::read_to_string(dir.join("stages.toml")).unwrap();
+        assert!(seeded_stages.contains("[operator]"));
+        assert!(seeded_stages.contains("keep = \"yes\""));
+
+        let mut custom = crate::builtin_workflows::builtin_workflows()["goal"].clone();
+        custom.description = Some("operator-owned copy".into());
+        write_workflow_yaml(&dir.join("workflows"), &custom).unwrap();
+        let mut stage = crate::stages::StageLibrary::compiled_in()
+            .get_stage("ce-execute")
+            .unwrap()
+            .clone();
+        stage.prompt.push_str("\noperator override");
+        crate::stages::upsert_stage_in_file(&dir.join("stages.toml"), &stage).unwrap();
+
+        let after = catalog_drift(&dir).unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|row| row.name == "goal" && row.status == "stale")
+        );
+        assert!(
+            after
+                .iter()
+                .any(|row| row.name == "ce-execute" && row.status == "stale")
+        );
+        assert!(after.iter().all(|row| row.status != "missing"));
         let _ = fs::remove_dir_all(&dir);
     }
 

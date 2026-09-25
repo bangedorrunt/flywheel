@@ -133,10 +133,12 @@ pub(crate) enum WorkflowCmd {
         /// optional base workflow whose steps seed the composition
         #[arg(long)]
         base: Option<String>,
-        /// parts: comma-separated `role:stage`, `workflow:name`, bare stage,
-        /// or compose token (`wave-swarm` / `repair-until-verified` /
-        /// `beads-lifecycle`). Preferred
-        /// door for compose tokens: `compose … --parts <token> --run`.
+        /// parts: comma-separated `stage:<stage>`, `role:<role>:<stage>`,
+        /// `phase:<phase>:<stage>`, compact `<role>:<stage>` / `<phase>:<stage>`,
+        /// `workflow:<name>`, bare stage, or compose token. Control forms:
+        /// `each:<param>:<part>`, `parallel:<param>:<part>`, `when:<guard>:<part>`,
+        /// `retry(n):<part>`. Tokens: wave-swarm / repair-until-verified /
+        /// beads-lifecycle. Preferred door for tokens: `compose … --parts <token> --run`.
         #[arg(long, value_delimiter = ',')]
         parts: Vec<String>,
         /// planner arm: an agent authors the workflow from the target
@@ -225,6 +227,18 @@ pub(crate) enum WorkflowCmd {
         #[arg(long)]
         reuse: Option<String>,
         /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Seed compiled-in workflow and stage defaults into the user tier
+    Seed {
+        /// JSON output for agent drivers
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report user-tier workflow/stage copies that are missing, stale, or custom
+    Drift {
+        /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
     },

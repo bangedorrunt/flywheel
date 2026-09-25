@@ -435,6 +435,12 @@ pub fn plan_crew(workflow: &Workflow) -> CrewPlan {
 /// — affinity-resolved + the §4 lifecycle phase, W3), or a workflow part
 /// (`workflow:name` — a `call_workflow` sub-run). Parsed from
 /// `flywheel workflow compose --parts`.
+pub const COMPOSE_PART_FORMS: &str = "bare <stage>, stage:<stage>, role:<role>:<stage>, <role>:<stage>, phase:<phase>:<stage>, <phase>:<stage>, workflow:<name>, each:<param>:<part>, parallel:<param>:<part>, when:<guard>:<part>, retry(n):<part>";
+
+fn compose_part_error(token: &str, detail: impl std::fmt::Display) -> String {
+    format!("compose part {token:?}: {detail}; supported forms: {COMPOSE_PART_FORMS}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposePart {
     /// `role:stage` → a dispatch_job step (profile @role, stage prompt).
@@ -480,17 +486,16 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
         // §3.8 stage-first: a bare stage name is a valid part.
         let stage = t.trim();
         if stage.is_empty() {
-            return Err(format!("compose part {token:?}: empty stage name"));
+            return Err(compose_part_error(token, "empty stage name"));
         }
         // Fail closed (§3.6 envelope #1): a colon-less token SHAPED like a
         // T1 control form — a lone keyword or `retry(n)` with no inner part
         // — is a malformed structured form, never a stage literally named
         // like one. Keywords shadow stage names the way phases shadow roles.
         if matches!(stage, "each" | "when" | "parallel" | "retry") || stage.starts_with("retry(") {
-            return Err(format!(
-                "compose part {token:?}: incomplete compose form — \
-                 control parts need an inner part (`retry(n):<part>` / \
-                 `<keyword>:<param>:<part>`)"
+            return Err(compose_part_error(
+                token,
+                "incomplete compose form; control parts need an inner part",
             ));
         }
         return Ok(ComposePart::StageFirst {
@@ -498,6 +503,35 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
         });
     };
     match kind.trim() {
+        "stage" => {
+            let stage = value.trim();
+            if stage.is_empty() || stage.contains(':') {
+                return Err(compose_part_error(
+                    token,
+                    "stage form needs one non-empty stage name",
+                ));
+            }
+            Ok(ComposePart::StageFirst {
+                stage: stage.to_string(),
+            })
+        }
+        "role" => {
+            let (role, stage) = value
+                .split_once(':')
+                .ok_or_else(|| compose_part_error(token, "role form needs `<role>:<stage>`"))?;
+            let role = role.trim();
+            let stage = stage.trim();
+            if role.is_empty() || stage.is_empty() || stage.contains(':') {
+                return Err(compose_part_error(
+                    token,
+                    "role form needs one non-empty role and one non-empty stage",
+                ));
+            }
+            Ok(ComposePart::Dispatch {
+                role: role.to_string(),
+                stage: stage.to_string(),
+            })
+        }
         "workflow" => {
             let name = value.trim();
             if name.is_empty() {
@@ -576,10 +610,29 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
                 inner,
             })
         }
-        phase if crate::stages::PHASES.contains(&phase) => {
+        phase if crate::stages::PHASES.contains(&phase) && !value.contains(':') => {
             let stage = value.trim();
             if stage.is_empty() {
-                return Err(format!("compose part {token:?}: empty stage name"));
+                return Err(compose_part_error(token, "empty stage name"));
+            }
+            Ok(ComposePart::PhaseStage {
+                phase: phase.to_string(),
+                stage: stage.to_string(),
+            })
+        }
+        "phase" => {
+            let (phase, stage) = match value.split_once(':') {
+                Some((phase, stage)) => (phase.trim(), stage.trim()),
+                None => (value.trim(), value.trim()),
+            };
+            if !crate::stages::PHASES.contains(&phase) || stage.is_empty() || stage.contains(':') {
+                return Err(compose_part_error(
+                    token,
+                    format!(
+                        "unknown phase {phase:?}; valid phases: {}",
+                        crate::stages::PHASES.join(", ")
+                    ),
+                ));
             }
             Ok(ComposePart::PhaseStage {
                 phase: phase.to_string(),
@@ -590,8 +643,9 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
             let role = role.trim();
             let stage = value.trim();
             if role.is_empty() || stage.is_empty() {
-                return Err(format!(
-                    "compose part {token:?}: role and stage must be non-empty"
+                return Err(compose_part_error(
+                    token,
+                    "role and stage must be non-empty",
                 ));
             }
             Ok(ComposePart::Dispatch {
@@ -1692,6 +1746,31 @@ steps:
                 stage: "decompose-beads".into(),
             }
         );
+        // Explicit tags remove the role/phase vocabulary collision without
+        // removing the compact legacy forms.
+        assert_eq!(
+            parse_compose_part("stage:ce-execute").unwrap(),
+            ComposePart::StageFirst {
+                stage: "ce-execute".into(),
+            }
+        );
+        assert_eq!(
+            parse_compose_part("role:reviewer:ce-review").unwrap(),
+            ComposePart::Dispatch {
+                role: "reviewer".into(),
+                stage: "ce-review".into(),
+            }
+        );
+        assert_eq!(
+            parse_compose_part("phase:implement:ce-execute").unwrap(),
+            ComposePart::PhaseStage {
+                phase: "implement".into(),
+                stage: "ce-execute".into(),
+            }
+        );
+        let err = parse_compose_part("phase:mars:ce-execute").unwrap_err();
+        assert!(err.contains("valid phases: resolve, plan, implement, review, verify, compound"));
+        assert!(err.contains("supported forms:"));
     }
 
     /// W6: stage-first parts resolve the role through the declared affinity;
