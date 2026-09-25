@@ -418,6 +418,102 @@ pub fn pre_spawn_crew(
     })
 }
 
+/// Where a rate-limited pane spawn retries: the registry `ModelEntry.fallback`
+/// rung of the one-shot pane fallback (ADR-0024 W1a / bd-42fs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryFallbackRoute {
+    /// the registry `fallback` id that drove the hop (also the journal's `to`)
+    pub model_id: String,
+    /// harness for the retry — `grok` when the fallback's family is grok (its
+    /// harness is coupled and cannot be inherited), else the pane's own harness
+    pub harness: String,
+    /// the injection string `ModelRegistry::resolve` produced for that harness
+    pub model: String,
+}
+
+/// Decide the one-shot registry fallback for a FAILED pane spawn. `None` means
+/// "re-raise the original error untouched": a non-rate-limit failure, an
+/// unreadable registry, an unknown profile model, or a model whose entry
+/// carries no `fallback`.
+///
+/// One shot by construction: the decision is made once per failed spawn, and
+/// the caller journals and retries once inside the same `commit_rebind`. A
+/// fallback that also rate-limits propagates as an error instead of hopping
+/// again — there is no loop here to re-enter.
+///
+/// Pure over (error, profile model, harness, loader): the caller owns every
+/// effect. `load_registry` is called ONLY once the gate opens, so a failure
+/// that cannot hop never pays for reading `models.toml`.
+pub(crate) fn registry_fallback_route<F>(
+    error: &str,
+    profile_model: &str,
+    harness: &str,
+    load_registry: F,
+) -> Option<RegistryFallbackRoute>
+where
+    F: FnOnce() -> Option<ModelRegistry>,
+{
+    // Stage-typed classify: the pane spawn hop is an INPUT failure, and only a
+    // rate limit opens it. A timeout or an auth failure must re-raise — those
+    // do not get better by changing the model.
+    let cf = crate::failure::classify_with_action_stage(
+        error,
+        None,
+        None,
+        Some(crate::kernel::ActionStage::Input),
+    );
+    if cf.kind != crate::failure::FailureKind::RateLimit {
+        return None;
+    }
+    let registry = load_registry()?;
+    let model_id = registry.get(profile_model)?.fallback.clone()?;
+    let harness = if registry.family_of(&model_id) == "grok" {
+        "grok".to_string()
+    } else {
+        harness.to_string()
+    };
+    let model = registry.resolve(&model_id, &harness);
+    Some(RegistryFallbackRoute {
+        model_id,
+        harness,
+        model,
+    })
+}
+
+/// The I4 journal intent for a decided registry fallback hop (GS-043). The
+/// `to` binding records the registry fallback ID that drove the decision, not
+/// the harness-resolved injection string: the hop's *identity* is the model
+/// swap, and the rendering is derived from it.
+pub(crate) fn registry_fallback_intent(
+    project: &str,
+    name: &str,
+    role: &str,
+    profile_model: &str,
+    harness: &str,
+    route: &RegistryFallbackRoute,
+    evidence: String,
+) -> crate::agent_ref::RebindIntent {
+    crate::agent_ref::RebindIntent::prepare(
+        crate::agent_ref::AgentRef::new(project, name),
+        crate::agent_ref::AgentBinding {
+            profile_name: role.to_string(),
+            model: profile_model.to_string(),
+            harness: harness.to_string(),
+        },
+        crate::agent_ref::AgentBinding {
+            profile_name: role.to_string(),
+            model: route.model_id.clone(),
+            harness: route.harness.clone(),
+        },
+        // The gate above is RateLimit, so the reason kind is fixed here.
+        crate::agent_ref::RebindReason::ModelFallback {
+            kind: "rate_limit".into(),
+            evidence,
+        },
+        0,
+    )
+}
+
 /// The actual pane splits + agent starts for one workspace (shared by the
 /// fresh-spawn and --reuse paths). Returns the registry entries.
 #[allow(clippy::too_many_arguments)] // one param per caller mirror, mirrors cmd_spawn
@@ -571,91 +667,56 @@ fn spawn_crew_into(
                     &profile.plan,
                 ));
                 // ADR-0024 W1a: pane spawn one-shot registry-fallback for rate_limit (bd-42fs pattern)
-                let agent = match crate::start_agent_with_retry(
-                    c,
-                    &name,
-                    harness,
-                    &pane_id,
-                    &agent_args,
-                ) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        let cf = crate::failure::classify_with_action_stage(
-                            &e.to_string(),
-                            None,
-                            None,
-                            Some(crate::kernel::ActionStage::Input),
-                        );
-                        if cf.kind == crate::failure::FailureKind::RateLimit {
-                            if let Ok(registry) = ModelRegistry::load_routing() {
-                                if let Some(fallback_id) = registry
-                                    .get(&profile.model)
-                                    .and_then(|m| m.fallback.clone())
-                                {
-                                    let fallback_harness =
-                                        if registry.family_of(&fallback_id) == "grok" {
-                                            "grok"
-                                        } else {
-                                            harness
-                                        };
-                                    let fallback_model =
-                                        registry.resolve(&fallback_id, fallback_harness);
-                                    let mut fallback_args = headless::model_args(
-                                        fallback_harness,
-                                        &fallback_model,
-                                        (!profile.effort.is_empty())
-                                            .then_some(profile.effort.as_str()),
-                                    );
-                                    fallback_args.extend(headless::role_model_args(
-                                        fallback_harness,
-                                        &profile.smol,
-                                        &profile.slow,
-                                        &profile.plan,
-                                    ));
-                                    // GS-043 I4: journal before ModelEntry.fallback hop.
-                                    let evidence = e.to_string();
-                                    let intent = crate::agent_ref::RebindIntent::prepare(
-                                        crate::agent_ref::AgentRef::new(project, &name),
-                                        crate::agent_ref::AgentBinding {
-                                            profile_name: role.to_string(),
-                                            model: profile.model.clone(),
-                                            harness: harness.to_string(),
-                                        },
-                                        crate::agent_ref::AgentBinding {
-                                            profile_name: role.to_string(),
-                                            model: fallback_id.clone(),
-                                            harness: fallback_harness.to_string(),
-                                        },
-                                        crate::agent_ref::RebindReason::ModelFallback {
-                                            kind: "rate_limit".into(),
-                                            evidence,
-                                        },
-                                        0,
-                                    );
-                                    eprintln!(
-                                        "pane crew: @{role} rate-limited on {} — registry fallback {fallback_id}",
-                                        profile.model
-                                    );
-                                    crate::agent_ref::commit_rebind(project, intent, |_| {
-                                        crate::start_agent_with_retry(
-                                            c,
-                                            &name,
-                                            fallback_harness,
-                                            &pane_id,
-                                            &fallback_args,
-                                        )
-                                    })?
-                                } else {
-                                    return Err(e);
-                                }
-                            } else {
-                                return Err(e);
-                            }
-                        } else {
-                            return Err(e);
+                let agent =
+                    match crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            // A registry we cannot read, a failure that is not a
+                            // rate limit, or a model with no fallback all re-raise
+                            // the original error untouched.
+                            let route = registry_fallback_route(
+                                &e.to_string(),
+                                &profile.model,
+                                harness,
+                                || ModelRegistry::load_routing().ok(),
+                            );
+                            let Some(route) = route else { return Err(e) };
+                            let mut fallback_args = headless::model_args(
+                                &route.harness,
+                                &route.model,
+                                (!profile.effort.is_empty()).then_some(profile.effort.as_str()),
+                            );
+                            fallback_args.extend(headless::role_model_args(
+                                &route.harness,
+                                &profile.smol,
+                                &profile.slow,
+                                &profile.plan,
+                            ));
+                            // GS-043 I4: journal before ModelEntry.fallback hop.
+                            let intent = registry_fallback_intent(
+                                project,
+                                &name,
+                                role,
+                                &profile.model,
+                                harness,
+                                &route,
+                                e.to_string(),
+                            );
+                            eprintln!(
+                                "pane crew: @{role} rate-limited on {} — registry fallback {}",
+                                profile.model, route.model_id
+                            );
+                            crate::agent_ref::commit_rebind(project, intent, |_| {
+                                crate::start_agent_with_retry(
+                                    c,
+                                    &name,
+                                    &route.harness,
+                                    &pane_id,
+                                    &fallback_args,
+                                )
+                            })?
                         }
-                    }
-                };
+                    };
                 // bd-pin-public-plane-s-easy.2: bind the pane identity now
                 // that the pane exists (pane → pin bridge + registry).
                 crate::bind_pane_mail_identity(
@@ -3108,5 +3169,199 @@ mod bd_5yzp_tests {
             let e = dispatch_failure_error("coder", "WittyAnt", stdout, stderr);
             assert_eq!(e, expected, "row {name}");
         }
+    }
+}
+
+/// ADR-0024 W1a / bd-42fs: the pane spawn one-shot registry fallback. The
+/// decision is pure, so these rows need no herdr pane and no live harness.
+#[cfg(test)]
+mod pane_registry_fallback_tests {
+    use super::*;
+    use crate::models::ModelEntry;
+
+    /// The routing table the rows resolve against: two models carrying a
+    /// 429 rung, one carrying none, plus the rung targets themselves.
+    fn routing() -> ModelRegistry {
+        let mut r = ModelRegistry::default();
+        r.models.insert(
+            "fleet/claude-opus-4".into(),
+            ModelEntry {
+                fallback: Some("openai/gpt-5.2".into()),
+                ..ModelEntry::default()
+            },
+        );
+        r.models.insert(
+            "fleet/grok-hopper".into(),
+            ModelEntry {
+                fallback: Some("grok/grok-4".into()),
+                ..ModelEntry::default()
+            },
+        );
+        r.models
+            .insert("fleet/no-rung".into(), ModelEntry::default());
+        r.models
+            .insert("openai/gpt-5.2".into(), ModelEntry::default());
+        r.models.insert("grok/grok-4".into(), ModelEntry::default());
+        r
+    }
+
+    /// One routing row — a struct rather than a tuple so each field is named
+    /// at the assertion sites and clippy's `type_complexity` stays quiet.
+    struct RouteRow {
+        case: &'static str,
+        error: &'static str,
+        profile_model: &'static str,
+        harness: &'static str,
+        /// `None` = re-raise the original error; otherwise the hop's
+        /// (registry rung id, harness, injection string).
+        expected: Option<(&'static str, &'static str, &'static str)>,
+    }
+
+    /// One row per decision the hop can reach: hop to the entry's rung, flip
+    /// the harness when the rung is grok-family, or stay put. `None` means
+    /// "re-raise the original error" — the half of this function that is easy
+    /// to get wrong, so it gets a row for each reason it can happen.
+    #[test]
+    fn registry_fallback_route_rows() {
+        let rows = [
+            RouteRow {
+                case: "rate-limit-hops-to-a-non-grok-rung",
+                error: "429 Too Many Requests",
+                profile_model: "fleet/claude-opus-4",
+                harness: "claude",
+                expected: Some(("openai/gpt-5.2", "claude", "openai/gpt-5.2")),
+            },
+            RouteRow {
+                // the grok harness is coupled: it cannot inherit the pane's
+                // harness, and its flag form is the BARE model id.
+                case: "rate-limit-grok-rung-flips-harness",
+                error: "429 Too Many Requests",
+                profile_model: "fleet/grok-hopper",
+                harness: "claude",
+                expected: Some(("grok/grok-4", "grok", "grok-4")),
+            },
+            RouteRow {
+                case: "rate-limit-without-a-rung-stays-put",
+                error: "429 Too Many Requests",
+                profile_model: "fleet/no-rung",
+                harness: "claude",
+                expected: None,
+            },
+            RouteRow {
+                case: "rate-limit-on-an-unregistered-model-stays-put",
+                error: "429 Too Many Requests",
+                profile_model: "fleet/not-registered",
+                harness: "claude",
+                expected: None,
+            },
+            RouteRow {
+                // A timeout never reaches the hop, and a 401 is
+                // reroute-eligible WITHOUT being model-swappable — neither
+                // gets better by changing the model.
+                case: "timeout-never-hops",
+                error: "operation timeout after 30s",
+                profile_model: "fleet/claude-opus-4",
+                harness: "claude",
+                expected: None,
+            },
+            RouteRow {
+                case: "auth-failure-never-hops",
+                error: "401 Unauthorized",
+                profile_model: "fleet/claude-opus-4",
+                harness: "claude",
+                expected: None,
+            },
+            RouteRow {
+                case: "reservation-conflict-never-hops",
+                error: "reservation conflict: path held",
+                profile_model: "fleet/claude-opus-4",
+                harness: "claude",
+                expected: None,
+            },
+        ];
+        for row in rows {
+            let case = row.case;
+            let got = registry_fallback_route(row.error, row.profile_model, row.harness, || {
+                Some(routing())
+            });
+            match row.expected {
+                None => assert_eq!(got, None, "row {case}"),
+                Some((model_id, want_harness, want_model)) => {
+                    let route = got.unwrap_or_else(|| panic!("row {case}: expected a hop"));
+                    assert_eq!(route.model_id, model_id, "row {case}");
+                    assert_eq!(route.harness, want_harness, "row {case}");
+                    assert_eq!(route.model, want_model, "row {case}");
+                }
+            }
+        }
+    }
+
+    /// The gate comes BEFORE the registry load: a failure that cannot hop must
+    /// not pay for reading `models.toml`. The loader panics, so a future
+    /// reorder that loads first fails loudly here instead of silently costing
+    /// a file read on every failed spawn.
+    #[test]
+    fn failures_that_cannot_hop_never_read_the_registry() {
+        for error in [
+            "operation timeout after 30s",
+            "401 Unauthorized",
+            "reservation conflict: path held",
+        ] {
+            let route = registry_fallback_route(error, "fleet/claude-opus-4", "claude", || {
+                panic!("{error}: a non-rate-limit failure must not read the registry")
+            });
+            assert_eq!(route, None, "{error}");
+        }
+    }
+
+    /// GS-043 I4: the hop journals prepared → in_flight → failed around
+    /// exactly ONE apply, and a fallback that also rate-limits propagates
+    /// instead of re-entering. Drives the real intent builder, so the row's
+    /// `to` binding is the tested one: the registry ID that drove the
+    /// decision, never the harness-resolved injection string.
+    #[test]
+    fn rate_limit_hop_journals_once_and_cannot_hop_twice() {
+        let _home = crate::config::test_state_home();
+        let project = "pane-registry-fallback-oneshot";
+        let route = registry_fallback_route(
+            "429 Too Many Requests",
+            "fleet/claude-opus-4",
+            "claude",
+            || Some(routing()),
+        )
+        .expect("a rate limit with a rung routes");
+        let intent = registry_fallback_intent(
+            project,
+            "WittyAnt",
+            "coder",
+            "fleet/claude-opus-4",
+            "claude",
+            &route,
+            "429 Too Many Requests".into(),
+        );
+        assert_eq!(intent.from.model, "fleet/claude-opus-4", "the id we left");
+        assert_eq!(intent.to.model, "openai/gpt-5.2", "the registry rung id");
+        assert_eq!(intent.to.profile_name, "coder", "the role is stable");
+        assert_eq!(intent.state, crate::agent_ref::EffectState::Prepared);
+
+        let mut applies = 0;
+        let err = crate::agent_ref::commit_rebind(project, intent, |_| {
+            applies += 1;
+            // the rung rate-limited too: fail, do not hop again
+            Err::<(), _>(anyhow!("429 Too Many Requests"))
+        });
+        assert!(err.is_err(), "a failed fallback must propagate");
+        assert_eq!(applies, 1, "one shot: apply ran exactly once");
+
+        let log = std::fs::read_to_string(crate::state::project_log_path(project))
+            .expect("rebind journal written");
+        for state in ["prepared", "in_flight", "failed"] {
+            assert!(
+                log.contains(&format!("\"state\":\"{state}\"")),
+                "{state} must be journaled: {log}"
+            );
+        }
+        assert!(!log.contains("\"state\":\"settled\""), "{log}");
+        assert!(log.contains("\"kind\":\"rate_limit\""), "{log}");
     }
 }
