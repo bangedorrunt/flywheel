@@ -1498,78 +1498,90 @@ mod process_liveness_tests {
         }
     }
 
-    /// Live agent: the agent binary leads the foreground group (pid == fgpgid).
+    /// Every liveness classification in one table, each row keeping the
+    /// exact process shape (and its original comment) it was pinned on.
     #[test]
-    fn live_opencode_classified_alive() {
-        let i = info(
-            Some(100),
-            Some(50),
-            vec![proc("opencode", 100), proc("node", 101), proc("uv", 102)],
-        );
-        assert_eq!(pane_agent_alive(&i, "opencode"), Some(true));
-    }
-
-    /// Dead process: pane exists but the shell owns the foreground — the
-    /// exact bd-1np false-negative shape (pane present, process gone).
-    #[test]
-    fn dead_process_shell_foreground_classified_dead() {
-        let i = info(Some(50), Some(50), vec![proc("zsh", 50)]);
-        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
-    }
-
-    /// Dead process with orphaned children still listed (MCP servers linger
-    /// after the agent died): no agent binary, foreground not shell-owned.
-    #[test]
-    fn dead_process_orphan_children_classified_dead() {
-        let i = info(
-            Some(103),
-            Some(50),
-            vec![proc("node", 103), proc("uv", 104)],
-        );
-        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
-    }
-
-    /// Empty foreground list: nothing running.
-    #[test]
-    fn empty_foreground_classified_dead() {
-        let i = info(Some(50), Some(50), vec![]);
-        assert_eq!(pane_agent_alive(&i, "opencode"), Some(false));
-    }
-
-    /// Unknown kind with no other signal: inconclusive, never "healthy".
-    #[test]
-    fn unknown_kind_inconclusive() {
-        let i = info(Some(200), Some(50), vec![proc("mystery-agent", 200)]);
-        assert_eq!(pane_agent_alive(&i, "mystery-kind"), None);
-    }
-
-    /// Unknown kind but shell owns the foreground: still provably dead.
-    #[test]
-    fn unknown_kind_shell_foreground_dead() {
-        let i = info(Some(50), Some(50), vec![proc("zsh", 50)]);
-        assert_eq!(pane_agent_alive(&i, "mystery-kind"), Some(false));
-    }
-
-    /// Kind aliases: grok's binary can be grok-build.
-    #[test]
-    fn kind_alias_matches() {
-        let i = info(Some(300), Some(50), vec![proc("grok-build", 300)]);
-        assert_eq!(pane_agent_alive(&i, "grok"), Some(true));
-    }
-
-    /// Argv0-only match (name may be a comm name like python3.14t).
-    #[test]
-    fn argv0_match_counts() {
-        let i = info(
-            Some(400),
-            Some(50),
-            vec![PaneProcessInfoProcess {
-                pid: 400,
-                name: "opencode".to_string(),
-                argv0: Some("/opt/bin/opencode".to_string()),
-            }],
-        );
-        assert_eq!(pane_agent_alive(&i, "opencode"), Some(true));
+    fn pane_agent_alive_rows() {
+        let cases: [(&str, &str, PaneProcessInfo, Option<bool>); 8] = [
+            // Live agent: the agent binary leads the foreground group (pid == fgpgid).
+            (
+                "live_opencode_classified_alive",
+                "opencode",
+                info(
+                    Some(100),
+                    Some(50),
+                    vec![proc("opencode", 100), proc("node", 101), proc("uv", 102)],
+                ),
+                Some(true),
+            ),
+            // Dead process: pane exists but the shell owns the foreground — the
+            // exact bd-1np false-negative shape (pane present, process gone).
+            (
+                "dead_process_shell_foreground_classified_dead",
+                "opencode",
+                info(Some(50), Some(50), vec![proc("zsh", 50)]),
+                Some(false),
+            ),
+            // Dead process with orphaned children still listed (MCP servers
+            // linger after the agent died): no agent binary, foreground not
+            // shell-owned.
+            (
+                "dead_process_orphan_children_classified_dead",
+                "opencode",
+                info(
+                    Some(103),
+                    Some(50),
+                    vec![proc("node", 103), proc("uv", 104)],
+                ),
+                Some(false),
+            ),
+            // Empty foreground list: nothing running.
+            (
+                "empty_foreground_classified_dead",
+                "opencode",
+                info(Some(50), Some(50), vec![]),
+                Some(false),
+            ),
+            // Unknown kind with no other signal: inconclusive, never "healthy".
+            (
+                "unknown_kind_inconclusive",
+                "mystery-kind",
+                info(Some(200), Some(50), vec![proc("mystery-agent", 200)]),
+                None,
+            ),
+            // Unknown kind but shell owns the foreground: still provably dead.
+            (
+                "unknown_kind_shell_foreground_dead",
+                "mystery-kind",
+                info(Some(50), Some(50), vec![proc("zsh", 50)]),
+                Some(false),
+            ),
+            // Kind aliases: grok's binary can be grok-build.
+            (
+                "kind_alias_matches",
+                "grok",
+                info(Some(300), Some(50), vec![proc("grok-build", 300)]),
+                Some(true),
+            ),
+            // Argv0-only match (name may be a comm name like python3.14t).
+            (
+                "argv0_match_counts",
+                "opencode",
+                info(
+                    Some(400),
+                    Some(50),
+                    vec![PaneProcessInfoProcess {
+                        pid: 400,
+                        name: "opencode".to_string(),
+                        argv0: Some("/opt/bin/opencode".to_string()),
+                    }],
+                ),
+                Some(true),
+            ),
+        ];
+        for (case, kind, i, want) in cases {
+            assert_eq!(pane_agent_alive(&i, kind), want, "{case}");
+        }
     }
 
     #[test]
@@ -1724,62 +1736,87 @@ mod sanitize_pane_text_tests {
 mod responsiveness_tests {
     use super::{Responsiveness, responsiveness_verdict};
 
-    /// Seq advanced across the window: state changed, so the agent is
-    /// responsive whatever the idle status or window length.
+    /// Every verdict shape in one table: advanced seq across three windows,
+    /// the bd-a8i frozen-idle respawn, busy-frozen, sub-second window, and a
+    /// seq regression.
     #[test]
-    fn advanced_seq_responsive() {
-        assert_eq!(
-            responsiveness_verdict(10, 11, 3, true),
-            Responsiveness::Responsive
-        );
-        assert_eq!(
-            responsiveness_verdict(10, 11, 0, true),
-            Responsiveness::Responsive
-        );
-        assert_eq!(
-            responsiveness_verdict(10, 42, 3, false),
-            Responsiveness::Responsive
-        );
-    }
-
-    /// The bd-a8i shape: seq frozen + Idle across a full window — alive as a
-    /// PID, unresponsive to input, needs respawn.
-    #[test]
-    fn frozen_seq_idle_unresponsive() {
-        assert_eq!(
-            responsiveness_verdict(10, 10, 3, true),
-            Responsiveness::Unresponsive
-        );
-    }
-
-    /// Frozen seq but the agent reports non-idle: Working/Blocked agents may
-    /// legitimately hold the counter — never respawn on ambiguous evidence.
-    #[test]
-    fn frozen_seq_busy_inconclusive() {
-        assert_eq!(
-            responsiveness_verdict(10, 10, 3, false),
-            Responsiveness::Inconclusive
-        );
-    }
-
-    /// Sub-second window: not enough time to observe a change — a frozen
-    /// agent must not be declared from a near-zero window.
-    #[test]
-    fn zero_window_inconclusive() {
-        assert_eq!(
-            responsiveness_verdict(10, 10, 0, true),
-            Responsiveness::Inconclusive
-        );
-    }
-
-    /// Seq regression: the per-pane counter is monotonic; a regression means
-    /// the samples are unreliable, so the verdict is inconclusive.
-    #[test]
-    fn regressed_seq_inconclusive() {
-        assert_eq!(
-            responsiveness_verdict(10, 9, 3, true),
-            Responsiveness::Inconclusive
-        );
+    fn responsiveness_verdict_rows() {
+        let cases: [(&str, u64, u64, u64, bool, Responsiveness); 7] = [
+            // Seq advanced across the window: state changed, so the agent is
+            // responsive whatever the idle status or window length.
+            (
+                "advanced_seq_responsive_3s",
+                10,
+                11,
+                3,
+                true,
+                Responsiveness::Responsive,
+            ),
+            (
+                "advanced_seq_responsive_zero_window",
+                10,
+                11,
+                0,
+                true,
+                Responsiveness::Responsive,
+            ),
+            (
+                "advanced_seq_responsive_not_idle",
+                10,
+                42,
+                3,
+                false,
+                Responsiveness::Responsive,
+            ),
+            // The bd-a8i shape: seq frozen + Idle across a full window — alive
+            // as a PID, unresponsive to input, needs respawn.
+            (
+                "frozen_seq_idle_unresponsive",
+                10,
+                10,
+                3,
+                true,
+                Responsiveness::Unresponsive,
+            ),
+            // Frozen seq but the agent reports non-idle: Working/Blocked agents
+            // may legitimately hold the counter — never respawn on ambiguous
+            // evidence.
+            (
+                "frozen_seq_busy_inconclusive",
+                10,
+                10,
+                3,
+                false,
+                Responsiveness::Inconclusive,
+            ),
+            // Sub-second window: not enough time to observe a change — a frozen
+            // agent must not be declared from a near-zero window.
+            (
+                "zero_window_inconclusive",
+                10,
+                10,
+                0,
+                true,
+                Responsiveness::Inconclusive,
+            ),
+            // Seq regression: the per-pane counter is monotonic; a regression
+            // means the samples are unreliable, so the verdict is inconclusive.
+            (
+                "regressed_seq_inconclusive",
+                10,
+                9,
+                3,
+                true,
+                Responsiveness::Inconclusive,
+            ),
+        ];
+        for (case, prev_seq, curr_seq, window_secs, idle, want) in cases {
+            assert_eq!(
+                responsiveness_verdict(prev_seq, curr_seq, window_secs, idle),
+                want,
+                "{case}"
+            );
+        }
     }
 }
 

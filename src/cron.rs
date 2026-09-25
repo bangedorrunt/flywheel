@@ -2391,33 +2391,46 @@ owner = "housekeeper"
 mod kind_classify_tests {
     use crate::failure;
 
+    /// Classification shapes for cron errors in one table; the retryable
+    /// pin is optional because the unclassified case never asserted it.
     #[test]
-    fn kind_classify_cron_rate_limit() {
-        let cf = failure::classify("429 Too Many Requests", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
-        assert!(cf.retryable);
-    }
-
-    #[test]
-    fn kind_classify_cron_timeout() {
-        let cf = failure::classify("deadline exceeded for cron tick", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Timeout);
-        assert!(cf.retryable);
-    }
-
-    #[test]
-    fn kind_classify_cron_auth() {
-        let cf = failure::classify("401 Unauthorized for cron provider", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Auth);
-        assert!(!cf.retryable);
-    }
-
-    #[test]
-    fn kind_classify_cron_unclassified_stays_continue() {
-        let cf = failure::classify("cron succeeded but no error", None, None);
-        // No error string should be Unknown, and the engine's default on_error is Continue
-        // The cron runner should not abort retryable kinds; it should surface kind and let engine decide
-        assert_eq!(cf.kind, failure::FailureKind::Unknown);
+    fn kind_classify_cron_rows() {
+        let cases: [(&str, &str, failure::FailureKind, Option<bool>); 4] = [
+            (
+                "rate_limit",
+                "429 Too Many Requests",
+                failure::FailureKind::RateLimit,
+                Some(true),
+            ),
+            (
+                "timeout",
+                "deadline exceeded for cron tick",
+                failure::FailureKind::Timeout,
+                Some(true),
+            ),
+            (
+                "auth",
+                "401 Unauthorized for cron provider",
+                failure::FailureKind::Auth,
+                Some(false),
+            ),
+            // No error string should be Unknown, and the engine's default
+            // on_error is Continue: the cron runner surfaces the kind and lets
+            // the engine decide.
+            (
+                "unclassified_stays_continue",
+                "cron succeeded but no error",
+                failure::FailureKind::Unknown,
+                None,
+            ),
+        ];
+        for (case, err, kind, retryable) in cases {
+            let cf = failure::classify(err, None, None);
+            assert_eq!(cf.kind, kind, "{case}");
+            if let Some(want) = retryable {
+                assert_eq!(cf.retryable, want, "{case}");
+            }
+        }
     }
 
     #[test]

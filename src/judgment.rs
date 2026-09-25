@@ -2256,12 +2256,6 @@ questions:
         assert_eq!(p.model, JEV_MODEL_PIN);
     }
 
-    #[test]
-    fn pack_rejects_jev_latest() {
-        let bad = PACK_YAML.replace("jev-1.13.0", "jev-latest");
-        assert!(QuestionPack::parse_yaml(&bad).is_err());
-    }
-
     /// bd-lpn6: every LIVE pack (highest version per id) parses, pins the
     /// model, and carries criteria defining each Choice/Score option 1:1
     /// (typesafe-ai shaping). Older versions stay on disk for audit and are
@@ -2317,9 +2311,15 @@ questions:
         assert!(seen >= 5, "reclassify + 4 lpn6 packs, got {seen}");
     }
 
+    /// Every malformed pack the parser must refuse in one table. The
+    /// jev-latest row is the shipped pack with only the model pin swapped.
     #[test]
-    fn pack_rejects_misaligned_criteria() {
-        let bad = r#"
+    fn pack_rejects_malformed_yaml_rows() {
+        let cases: [(&str, String); 3] = [
+            ("jev-latest", PACK_YAML.replace("jev-1.13.0", "jev-latest")),
+            (
+                "misaligned_criteria",
+                r#"
 id: x
 version: 1
 model: jev-1.13.0
@@ -2329,13 +2329,12 @@ questions:
     instructions: "?"
     options: [a, b]
     criteria: ["only one"]
-"#;
-        assert!(QuestionPack::parse_yaml(bad).is_err());
-    }
-
-    #[test]
-    fn pack_rejects_choice_without_options() {
-        let bad = r#"
+"#
+                .to_string(),
+            ),
+            (
+                "choice_without_options",
+                r#"
 id: x
 version: 1
 model: jev-1.13.0
@@ -2344,8 +2343,16 @@ questions:
     kind: choice
     instructions: "?"
     options: [only]
-"#;
-        assert!(QuestionPack::parse_yaml(bad).is_err());
+"#
+                .to_string(),
+            ),
+        ];
+        for (case, bad) in cases {
+            assert!(
+                QuestionPack::parse_yaml(&bad).is_err(),
+                "{case} must be refused"
+            );
+        }
     }
 
     // --- slices ---
