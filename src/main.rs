@@ -2522,7 +2522,7 @@ fn main() {
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
             "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
-                "coalition debate plan-review profile squad model slot catalog runs",
+                "coalition debate plan-review profile squad model slot catalog runs list/show/pending/digest/reconcile",
                 "workflow cron recipes workflows pipeline template stage ensemble",
                 "workflow seed/drift — copy builtin workflows+stages to user tier without overwrite; report missing/current/stale/custom",
                 "checkpoint timeline audit history changes resume analytics",
@@ -3426,12 +3426,12 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
 fn snapshot_runs() -> Vec<Value> {
     use state::EventKind;
     let dir = config::state_dir();
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
+    let mut entries = Vec::new();
+    let Ok(files) = std::fs::read_dir(&dir) else {
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
+    for file in files.flatten() {
+        let name = file.file_name().to_string_lossy().to_string();
         if !name.ends_with(".jsonl") {
             continue;
         }
@@ -3439,35 +3439,67 @@ fn snapshot_runs() -> Vec<Value> {
         let Ok(rows) = state::read_log(&project) else {
             continue;
         };
-        for e in rows {
-            if !matches!(
-                e.kind,
+        for entry in rows {
+            if matches!(
+                entry.kind,
                 EventKind::Workflow | EventKind::Pipeline | EventKind::Loop
             ) {
-                continue;
+                entries.push((project.clone(), entry));
             }
-            let run_kind = run_row_kind(&project, &e);
+        }
+    }
+
+    latest_run_entries(entries)
+        .into_iter()
+        .map(|(project, entry)| {
+            let run_kind = run_row_kind(&project, &entry);
             let owner = ["workflow", "pipeline", "loop", "agent"]
                 .iter()
-                .find_map(|k| e.data.get(*k).and_then(Value::as_str).map(String::from))
+                .find_map(|key| {
+                    entry
+                        .data
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
                 .unwrap_or_default();
-            out.push(json!({
-                "id": format!("{project}:{}", e.ts),
+            json!({
+                "id": format!("{project}:{}", entry.ts),
                 "project": project,
                 "kind": run_kind,
                 "owner": owner,
-                "state": history_row_status(&e.data),
-                "ts": e.ts,
-            }));
-        }
-    }
-    out.sort_by(|a, b| {
-        b.get("ts")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .cmp(a.get("ts").and_then(Value::as_str).unwrap_or(""))
-    });
-    out
+                "run_id": entry.data.get("run_id").cloned().unwrap_or(Value::Null),
+                "state": history_row_status(&entry.data),
+                "ts": entry.ts,
+            })
+        })
+        .collect()
+}
+
+/// Reconcile lifecycle transitions to the latest outcome for each logical run.
+///
+/// A start row and its later terminal row share `run_id`; treating both as
+/// current makes a completed run look stuck. Annotation rows are not outcomes
+/// and rows without a `run_id` cannot be safely correlated, so both remain
+/// visible. This is deliberately a read projection: it never edits history or
+/// turns an unresolved run into a guessed terminal state.
+pub(crate) fn latest_run_entries(
+    mut entries: Vec<(String, state::LogEntry)>,
+) -> Vec<(String, state::LogEntry)> {
+    entries.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
+    let mut seen = std::collections::BTreeSet::new();
+    entries
+        .into_iter()
+        .filter(|(project, entry)| {
+            if is_annotation_row(entry) {
+                return true;
+            }
+            let Some(run_id) = entry.data.get("run_id").and_then(Value::as_str) else {
+                return true;
+            };
+            seen.insert((project.clone(), run_id.to_string()))
+        })
+        .collect()
 }
 
 /// Only used by the serve-gated SSE server; gate it so the lean
@@ -23802,6 +23834,7 @@ fn run_list_row(project: &str, e: &state::LogEntry) -> Value {
         "project": project,
         "kind": run_row_kind(project, e),
         "owner": run_owner(e),
+        "run_id": e.data.get("run_id").cloned().unwrap_or(Value::Null),
         "state": state_status,
         "status": normalized,
         "cost": run_cost(e),
@@ -23911,8 +23944,9 @@ mod runs_status_tests {
 #[cfg(test)]
 mod run_ledger_truth_tests {
     use super::{
-        history_row_status, is_annotation_row, loop_monitor_notice, parse_leaf_output,
-        plan_warning_notice, run_list_row, run_terminal_status, stage_prompt_for_project,
+        history_row_status, is_annotation_row, latest_run_entries, loop_monitor_notice,
+        parse_leaf_output, plan_warning_notice, run_list_row, run_terminal_status,
+        stage_prompt_for_project,
     };
     use crate::state::{EventKind, LogEntry};
     use serde_json::json;
@@ -24076,6 +24110,56 @@ mod run_ledger_truth_tests {
         assert_eq!(
             latest.data["error"],
             json!("compose host exited before terminal transition")
+        );
+    }
+
+    #[test]
+    fn run_ledger_truth_latest_outcome_reconciles_lifecycle_rows() {
+        let project = "flywheel";
+        let run_id = "fw-composed-test";
+        let mut started = row_entry(
+            project,
+            json!({"run_id": run_id, "status": "running", "workflow": "compose"}),
+        );
+        started.ts = "2026-09-25T08:38:20Z".into();
+        let mut succeeded = row_entry(
+            project,
+            json!({"run_id": run_id, "status": "succeeded", "workflow": "compose"}),
+        );
+        succeeded.ts = "2026-09-25T08:39:51Z".into();
+        let mut annotation = row_entry(
+            project,
+            json!({"run_id": run_id, "phase_gate": true, "status": "unknown"}),
+        );
+        annotation.ts = "2026-09-25T08:40:00Z".into();
+        let unrelated = row_entry(project, json!({"status": "running"}));
+
+        let rows = latest_run_entries(vec![
+            (project.into(), started),
+            (project.into(), succeeded),
+            (project.into(), annotation),
+            (project.into(), unrelated),
+        ]);
+
+        assert_eq!(rows.len(), 3, "terminal outcome replaces its start row");
+        assert!(rows.iter().any(|(_, entry)| {
+            entry.data.get("status").and_then(serde_json::Value::as_str) == Some("succeeded")
+        }));
+        assert!(
+            !rows.iter().any(|(_, entry)| {
+                entry.data.get("status").and_then(serde_json::Value::as_str) == Some("running")
+                    && entry.data.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
+            }),
+            "the historical start transition is not current state"
+        );
+        assert!(
+            rows.iter().any(|(_, entry)| is_annotation_row(entry)),
+            "annotations remain visible beside the reconciled outcome"
+        );
+        assert!(
+            rows.iter()
+                .any(|(_, entry)| entry.data.get("run_id").is_none()),
+            "rows without a logical run id are not collapsed"
         );
     }
 
