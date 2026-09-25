@@ -76,13 +76,15 @@ for the new builtin.
 
 ## Failure policy
 
-`error_kinds` is a declaration checked by the toron-workflow R-E2 lint. Retry
-itself is centralized in `FailureKind::is_retry_candidate()`: `rate_limit` and
-`timeout` retry; `blocked`, `auth`, `cancelled`, and `unknown` escalate. A
-missing `error_kinds` declaration is therefore a hygiene warning, not a runtime
-retry switch. Do not populate dozens of dead fields to silence it. If a future
-policy needs per-step retry overrides, that belongs in toron-workflow and must
-land there with its own migration and tests.
+The R-E2 `error_kinds` declaration and its lint rule have been removed. The
+field was never read by the engine, so retaining it made policy look
+configurable while runtime behavior stayed centralized.
+
+Retry and escalation now have one authority:
+`FailureKind::is_retry_candidate()` retries `rate_limit` and `timeout`, while
+`blocked`, `auth`, `cancelled`, and `unknown` escalate. Per-step retry overrides
+require a real toron-workflow runtime contract and tests; they must not return as
+YAML-only metadata.
 
 ## What was reduced
 

@@ -10,7 +10,7 @@
 //! Harness shapes (verified against each binary's --help, 2026-08-09):
 //! - `pi`:      `pi -p --mode json [--model X] PROMPT` → NDJSON stream
 //! - `omp`:     `omp -p --mode=json [--model=X] PROMPT` → NDJSON stream
-//! - `opencode`: `opencode run --format json [-m X] PROMPT` → NDJSON stream
+//! - `opencode`: `opencode run --format json [--model X] PROMPT` → NDJSON stream
 //! - `grok`:    `grok -p --output-format streaming-messages-json [-m X] PROMPT`
 //!
 //! governed-by: ADR-0010 (Spec A, Spec E)
@@ -40,7 +40,7 @@ pub struct HarnessOutcome {
 ///
 /// governed-by: bd-ulzi — pi wires effort natively (`--thinking=<level>`,
 /// verified `pi --help`: `--thinking <level>` + `--model provider/id`
-/// shorthand). opencode v2 has no effort flag (`-m provider/model#variant`
+/// shorthand). opencode v2 has no effort flag (`--model provider/model#variant`
 /// only, `--thinking` is a display toggle) — effort there degrades LOUDLY
 /// via [`effort_degraded`] (warn at the shared site, never silent).
 pub fn effort_degraded(harness: &str) -> bool {
@@ -57,7 +57,8 @@ pub fn model_args(harness: &str, model: &str, effort: Option<&str>) -> Vec<Strin
         );
     }
     match harness {
-        "opencode" | "grok" => vec!["-m".to_string(), model.to_string()],
+        "opencode" => vec!["--model".to_string(), model.to_string()],
+        "grok" => vec!["-m".to_string(), model.to_string()],
         "omp" => {
             let mut args = vec![format!("--model={model}")];
             if let Some(e) = effort {
@@ -571,7 +572,7 @@ mod tests {
                     "run",
                     "--format",
                     "json",
-                    "-m",
+                    "--model",
                     "anthropic/claude-sonnet-4",
                     "hi",
                 ]
@@ -611,7 +612,7 @@ mod tests {
     fn model_args_follow_harness_forms() {
         assert_eq!(
             model_args("opencode", "claude-sonnet-4", None),
-            vec!["-m", "claude-sonnet-4"]
+            vec!["--model", "claude-sonnet-4"]
         );
         assert_eq!(model_args("grok", "grok-4", None), vec!["-m", "grok-4"]);
         assert_eq!(model_args("omp", "gpt-5.2", None), vec!["--model=gpt-5.2"]);
@@ -655,9 +656,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opencode_v2_model_flag_is_long_form() {
+        assert_eq!(
+            model_args("opencode", "opencode/big-pickle", None),
+            vec!["--model", "opencode/big-pickle"]
+        );
+    }
+
     /// governed-by: bd-ulzi — pi wires effort natively (`--thinking=`;
     /// provider/id passes through verbatim, the pi shorthand); opencode
-    /// v2 keeps `-m provider/model#variant` verbatim and degrades LOUDLY
+    /// v2 keeps `--model provider/model#variant` verbatim and degrades LOUDLY
     /// on effort (no effort flag); empty effort emits no thinking flag.
     #[test]
     fn jev_effort_pi_thinking_native_opencode_loud_degrade() {
@@ -675,7 +684,7 @@ mod tests {
         );
         assert_eq!(
             model_args("opencode", "acme/sonnet#thinking", Some("max")),
-            vec!["-m", "acme/sonnet#thinking"],
+            vec!["--model", "acme/sonnet#thinking"],
             "opencode v2 variant passes through; effort has no flag"
         );
         assert!(effort_degraded("opencode"), "opencode effort degrades loud");
@@ -944,7 +953,7 @@ mod tests {
                 "hi".into(),
             ]
         );
-        // opencode ignores roles (uses -m for everything).
+        // opencode ignores roles (uses --model for everything).
         assert_eq!(
             build_argv_roles(
                 "opencode",
@@ -961,7 +970,7 @@ mod tests {
                 "run".into(),
                 "--format".into(),
                 "json".into(),
-                "-m".into(),
+                "--model".into(),
                 "claude-sonnet-4".into(),
                 "hi".into(),
             ]

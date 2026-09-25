@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`wake` on `/health` (GS-062 / PR #16).** Operator doorbell `:18980` and flywheel `serve` expose wake_liveness: `workspace` / `hosted`, `pipe.class` Quiet|Live|Deaf|NeverStamped (with class-specific stamps / `silent_for_ms`), split `last_event_ms` / `last_heartbeat_ms` (`.event` / `.hb`, never max-merged), `deaf_ceiling_ms` (60s), worst-of across hosted so one Deaf cannot hide behind another Live, and ADV-5 (`try_send` Watch; stamp `.event` only after Ok; Died via `blocking_send`). Guides: `docs/guides/doorbell.mdx` (`/health.wake`), `docs/guides/troubleshooting.mdx`.
 
+### Removed
+- **Inert R-E2 failure metadata (bd-mtyu, bd-xdqx).** `error_kinds` and its declaration-only lint rule are removed from toron-workflow. Runtime retry/escalation remains centralized in `FailureKind::is_retry_candidate()`.
+
+### Fixed
+- **OpenCode v2 and current Toron API compatibility (bd-l0y1, bd-76st).** Spawn argv now uses `--model` for OpenCode, and embedded Toron startup passes the current `serve_http` extra-hosts argument.
+- **Composed workflow lifecycle honesty (bd-e1yz).** A compose run that exits after publishing its `running` row now terminalizes that same row as failed instead of leaving a permanently live history entry.
+
 ## [0.7.0] — 2026-09-19 doorbell vision leftovers
 
 Classifier honesty, HITL bind, and the doorbell wake gaps from live flywheel×toron collab (bd-gpj0).
