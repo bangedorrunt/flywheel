@@ -3083,44 +3083,59 @@ steps:
 mod kind_classify_tests {
     use crate::failure;
 
+    /// Classification shapes for pane errors in one table, plus the kind
+    /// label / reroute pins the singular tests carried.
     #[test]
-    fn kind_classify_pane_rate_limit() {
-        let cf = failure::classify("429 Too Many Requests", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
-        assert!(cf.retryable);
-        assert_eq!(cf.kind.to_string(), "rate_limit");
-    }
-
-    #[test]
-    fn kind_classify_pane_timeout() {
-        let cf = failure::classify("operation timeout after 30s", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Timeout);
-        assert!(cf.retryable);
-    }
-
-    #[test]
-    fn kind_classify_pane_auth() {
-        let cf = failure::classify("401 Unauthorized", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Auth);
-        assert!(!cf.retryable);
-        assert!(cf.reroute_eligible);
-    }
-
-    #[test]
-    fn kind_classify_pane_blocked_is_not_retryable() {
-        let cf = failure::classify("reservation conflict: path held", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Blocked);
-        assert!(!cf.retryable);
-        assert!(!cf.reroute_eligible);
-    }
-
-    #[test]
-    fn kind_classify_pane_unclassified_stays_continue() {
-        let cf = failure::classify("some random error without kind", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Unknown);
-        assert!(!cf.retryable);
-        // Unclassified default is Continue (engine's on_error default remains Continue)
-        // The kind-aware fail_run predicate lives in the engine, here only classification
+    fn kind_classify_pane_rows() {
+        let cases: [(&str, &str, failure::FailureKind, bool); 5] = [
+            (
+                "rate_limit",
+                "429 Too Many Requests",
+                failure::FailureKind::RateLimit,
+                true,
+            ),
+            (
+                "timeout",
+                "operation timeout after 30s",
+                failure::FailureKind::Timeout,
+                true,
+            ),
+            (
+                "auth",
+                "401 Unauthorized",
+                failure::FailureKind::Auth,
+                false,
+            ),
+            (
+                "blocked_is_not_retryable",
+                "reservation conflict: path held",
+                failure::FailureKind::Blocked,
+                false,
+            ),
+            // Unclassified default is Continue (engine's on_error default
+            // remains Continue); the kind-aware fail_run predicate lives in
+            // the engine, here only classification.
+            (
+                "unclassified_stays_continue",
+                "some random error without kind",
+                failure::FailureKind::Unknown,
+                false,
+            ),
+        ];
+        for (case, err, kind, retryable) in cases {
+            let cf = failure::classify(err, None, None);
+            assert_eq!(cf.kind, kind, "{case}");
+            assert_eq!(cf.retryable, retryable, "{case}");
+        }
+        // Extra pins from the singular tests: kind label and reroute verdicts.
+        assert_eq!(
+            failure::classify("429 Too Many Requests", None, None)
+                .kind
+                .to_string(),
+            "rate_limit"
+        );
+        assert!(failure::classify("401 Unauthorized", None, None).reroute_eligible);
+        assert!(!failure::classify("reservation conflict: path held", None, None).reroute_eligible);
     }
 
     #[test]

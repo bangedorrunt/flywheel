@@ -5452,78 +5452,86 @@ mod workspace_origin_tests {
         }
     }
 
-    // bd-627z.3 gate: a foreign workspace (captain/omp session labeled like
-    // the project) is NOT flywheel-owned — spawn must warn + proceed.
+    /// bd-627z.3 gate: every ownership signal in one table — base label,
+    /// swarm label, flywheel-prefixed agents, recorded spawn meta, plain
+    /// agents, unrelated workspaces, and the precedence pairs.
     #[test]
-    fn base_label_alone_is_foreign() {
-        let w = ws("w17", "toron", 2);
-        assert_eq!(
-            classify_workspace_origin("toron", &w, &[], None),
-            Some(WorkspaceOrigin::Foreign)
-        );
-    }
-
-    #[test]
-    fn swarm_label_is_owned() {
-        let w = ws("w2A", "flywheel-toron", 3);
-        assert_eq!(
-            classify_workspace_origin("toron", &w, &[], None),
-            Some(WorkspaceOrigin::Owned)
-        );
-    }
-
-    #[test]
-    fn flywheel_prefixed_agents_mark_owned() {
-        let w = ws("w9", "custom-swarm-label", 1);
-        let agents = vec![agent("flywheel-toron-oc", "w9")];
-        assert_eq!(
-            classify_workspace_origin("toron", &w, &agents, None),
-            Some(WorkspaceOrigin::Owned)
-        );
-    }
-
-    #[test]
-    fn recorded_spawn_meta_label_marks_owned() {
-        let w = ws("w9", "my-special-label", 1);
-        assert_eq!(
-            classify_workspace_origin("toron", &w, &[], Some("my-special-label")),
-            Some(WorkspaceOrigin::Owned)
-        );
-    }
-
-    #[test]
-    fn unrelated_workspace_is_skipped() {
-        let w = ws("w1", "scratchpad", 1);
-        assert_eq!(classify_workspace_origin("toron", &w, &[], None), None);
-    }
-
-    #[test]
-    fn base_label_with_plain_agent_stays_foreign() {
-        let w = ws("w17", "toron", 1);
-        let agents = vec![agent("oc", "w17")];
-        assert_eq!(
-            classify_workspace_origin("toron", &w, &agents, None),
-            Some(WorkspaceOrigin::Foreign)
-        );
-    }
-
-    #[test]
-    fn spawn_meta_beats_base_label() {
-        let w = ws("w2B", "toron", 1);
-        assert_eq!(
-            classify_workspace_origin("toron", &w, &[], Some("toron")),
-            Some(WorkspaceOrigin::Owned)
-        );
-    }
-
-    #[test]
-    fn flywheel_agents_beat_base_label() {
-        let w = ws("w17", "toron", 1);
-        let agents = vec![agent("flywheel-toron-oc", "w17")];
-        assert_eq!(
-            classify_workspace_origin("toron", &w, &agents, None),
-            Some(WorkspaceOrigin::Owned)
-        );
+    fn classify_workspace_origin_rows() {
+        let cases: [(
+            &str,
+            WorkspaceInfo,
+            Vec<AgentInfo>,
+            Option<&str>,
+            Option<WorkspaceOrigin>,
+        ); 8] = [
+            // A foreign workspace (captain/omp session labeled like the
+            // project) is NOT flywheel-owned — spawn must warn + proceed.
+            (
+                "base_label_alone_is_foreign",
+                ws("w17", "toron", 2),
+                vec![],
+                None,
+                Some(WorkspaceOrigin::Foreign),
+            ),
+            (
+                "swarm_label_is_owned",
+                ws("w2A", "flywheel-toron", 3),
+                vec![],
+                None,
+                Some(WorkspaceOrigin::Owned),
+            ),
+            (
+                "flywheel_prefixed_agents_mark_owned",
+                ws("w9", "custom-swarm-label", 1),
+                vec![agent("flywheel-toron-oc", "w9")],
+                None,
+                Some(WorkspaceOrigin::Owned),
+            ),
+            (
+                "recorded_spawn_meta_label_marks_owned",
+                ws("w9", "my-special-label", 1),
+                vec![],
+                Some("my-special-label"),
+                Some(WorkspaceOrigin::Owned),
+            ),
+            (
+                "unrelated_workspace_is_skipped",
+                ws("w1", "scratchpad", 1),
+                vec![],
+                None,
+                None,
+            ),
+            (
+                "base_label_with_plain_agent_stays_foreign",
+                ws("w17", "toron", 1),
+                vec![agent("oc", "w17")],
+                None,
+                Some(WorkspaceOrigin::Foreign),
+            ),
+            // Recorded spawn meta and flywheel-prefixed agents both beat the
+            // base label.
+            (
+                "spawn_meta_beats_base_label",
+                ws("w2B", "toron", 1),
+                vec![],
+                Some("toron"),
+                Some(WorkspaceOrigin::Owned),
+            ),
+            (
+                "flywheel_agents_beat_base_label",
+                ws("w17", "toron", 1),
+                vec![agent("flywheel-toron-oc", "w17")],
+                None,
+                Some(WorkspaceOrigin::Owned),
+            ),
+        ];
+        for (case, w, agents, spawn_label, want) in cases {
+            assert_eq!(
+                classify_workspace_origin("toron", &w, &agents, spawn_label),
+                want,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -15181,6 +15189,8 @@ mod bd_4pxy_tests {
         assert_eq!(tries, 1);
     }
 
+    /// bd-8pjr: settle_retry fail-twice-then-succeeds end to end (sleep 0
+    /// keeps it hermetic; the shared driver owns the backoff math).
     #[test]
     fn settle_retry_recovers_transient_miss_within_budget() {
         let mut tries = 0;
@@ -15217,19 +15227,6 @@ mod bd_4pxy_tests {
         assert!(out.is_ok());
         assert_eq!(calls, 3);
         assert_eq!(sleeps, 2);
-    }
-
-    /// bd-8pjr: settle_retry fail-twice-then-succeeds end to end (sleep 0
-    /// keeps it hermetic; the shared driver owns the backoff math).
-    #[test]
-    fn settle_retry_fail_twice_then_succeeds() {
-        let mut tries = 0;
-        let out: Result<&str, &str> = settle_retry(3, 0, || {
-            tries += 1;
-            if tries < 3 { Err("miss") } else { Ok("hit") }
-        });
-        assert_eq!(out, Ok("hit"));
-        assert_eq!(tries, 3);
     }
 
     #[test]
@@ -35247,11 +35244,45 @@ mod kind_classify_headless_tests {
     use super::*;
     use crate::failure;
 
+    /// Classification shapes for headless errors in one table; the retryable
+    /// pin stays optional because the unclassified case never asserted it.
     #[test]
-    fn kind_classify_headless_rate_limit() {
-        let cf = failure::classify("429 Too Many Requests", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
-        assert!(cf.retryable);
+    fn kind_classify_headless_rows() {
+        let cases: [(&str, &str, failure::FailureKind, Option<bool>); 4] = [
+            (
+                "rate_limit",
+                "429 Too Many Requests",
+                failure::FailureKind::RateLimit,
+                Some(true),
+            ),
+            (
+                "timeout",
+                "operation timeout after 30s",
+                failure::FailureKind::Timeout,
+                Some(true),
+            ),
+            (
+                "auth",
+                "401 Unauthorized",
+                failure::FailureKind::Auth,
+                Some(false),
+            ),
+            // Unclassified default is Continue (engine's on_error default
+            // remains Continue).
+            (
+                "unclassified_stays_continue",
+                "some random error",
+                failure::FailureKind::Unknown,
+                None,
+            ),
+        ];
+        for (case, err, kind, retryable) in cases {
+            let cf = failure::classify(err, None, None);
+            assert_eq!(cf.kind, kind, "{case}");
+            if let Some(want) = retryable {
+                assert_eq!(cf.retryable, want, "{case}");
+            }
+        }
         // headless's is_rate_limited should also detect 429
         let outcome = crate::headless::HarnessOutcome {
             response: String::new(),
@@ -35264,27 +35295,6 @@ mod kind_classify_headless_tests {
             error: Some("429 Too Many Requests".to_string()),
         };
         assert!(is_rate_limited(&outcome));
-    }
-
-    #[test]
-    fn kind_classify_headless_timeout() {
-        let cf = failure::classify("operation timeout after 30s", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Timeout);
-        assert!(cf.retryable);
-    }
-
-    #[test]
-    fn kind_classify_headless_auth() {
-        let cf = failure::classify("401 Unauthorized", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Auth);
-        assert!(!cf.retryable);
-    }
-
-    #[test]
-    fn kind_classify_headless_unclassified_stays_continue() {
-        let cf = failure::classify("some random error", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::Unknown);
-        // Unclassified default is Continue (engine's on_error default remains Continue)
     }
 
     #[test]

@@ -348,23 +348,6 @@ mod tests {
         assert_eq!(check_principles(4, ""), PrinciplesCheck::Complete);
     }
 
-    /// A name-only line (no decision clause) is a cargo-cult citation.
-    #[test]
-    fn principles_brief_checker_rejects_name_only_line() {
-        assert!(matches!(
-            check_principles(2, "prove-it-works"),
-            PrinciplesCheck::Incomplete { .. }
-        ));
-        assert!(matches!(
-            check_principles(2, "prove-it-works —"),
-            PrinciplesCheck::Incomplete { .. }
-        ));
-        assert!(matches!(
-            check_principles(2, "fix-root-causes\nprove-it-works"),
-            PrinciplesCheck::Incomplete { .. }
-        ));
-    }
-
     /// `name — decision it changed` passes, single and multi-line.
     #[test]
     fn principles_brief_checker_accepts_name_decision() {
@@ -385,22 +368,29 @@ mod tests {
         );
     }
 
-    /// An unknown name fails regardless of priority.
+    /// Every rejection shape in one table: name-only lines (no decision
+    /// clause) are cargo-cult citations, and an unknown name fails
+    /// regardless of priority.
     #[test]
-    fn principles_brief_checker_rejects_unknown_name() {
-        assert!(matches!(
-            check_principles(2, "prove-it-work — did something"),
-            PrinciplesCheck::Incomplete { .. }
-        ));
-        assert!(matches!(
-            check_principles(4, "laziness — deleted a wrapper"),
-            PrinciplesCheck::Incomplete { .. }
-        ));
-        // A known name in a garbled line still fails on the name parse.
-        assert!(matches!(
-            check_principles(2, "prove-it-works - checked the ledger"),
-            PrinciplesCheck::Incomplete { .. }
-        ));
+    fn principles_brief_checker_rejects_bad_citations() {
+        let cases: [(&str, u8, &str); 6] = [
+            ("name_only", 2, "prove-it-works"),
+            ("name_only_dangling_dash", 2, "prove-it-works —"),
+            ("name_only_multiline", 2, "fix-root-causes\nprove-it-works"),
+            ("unknown_name_typo", 2, "prove-it-work — did something"),
+            ("unknown_name_truncated", 4, "laziness — deleted a wrapper"),
+            // A known name in a garbled line still fails on the name parse.
+            ("garbled_line", 2, "prove-it-works - checked the ledger"),
+        ];
+        for (case, priority, text) in cases {
+            assert!(
+                matches!(
+                    check_principles(priority, text),
+                    PrinciplesCheck::Incomplete { .. }
+                ),
+                "{case}"
+            );
+        }
     }
 
     /// bd-4spn GAP 2 cross-repo bridge: tamper one name in the flywheel
