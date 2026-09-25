@@ -1257,12 +1257,24 @@ crew:
   coder: 1
   reviewer: 1
 inputs:
+  # bd-mb0z: a standalone `workflow run bug-fix` composes this recipe without a
+  # bead, so `bead_id` and `ledger_path` had no declared default and the STRICT
+  # renderer failed the whole run on `{{inputs.bead_id}}` — the same class
+  # 7f9e117 fixed for coder_profile. The sentinels are self-describing on
+  # purpose: an empty string renders "Repair iteration 1 for :" and reads as a
+  # broken prompt rather than an honestly bead-less run.
+  #
+  # `verify` is deliberately left with NO default. It is this recipe's real
+  # gate, and an empty verify command would pass vacuously — a missing VERIFY
+  # must keep failing loud.
   - name: bead_id
+    default: "(no bead id supplied)"
   - name: verify
   - name: max_iterations
     default: 3
   - name: run_id
   - name: ledger_path
+    default: "(no ledger path supplied)"
   - name: coder_profile
     default: "@coder"
 graph:
