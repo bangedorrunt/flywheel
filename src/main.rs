@@ -17018,7 +17018,9 @@ fn product_digest_for(
         .iter()
         .map(|(s, d)| (s.as_str(), d.as_str()))
         .collect();
-    let (data_dir, _) = mail_shim::mailbox_roots();
+    // The LIVE mailbox's roots, not a fresh env resolution: the fold probes
+    // where the keys actually are (see mail_shim::BUILT_ROOTS).
+    let (data_dir, _) = mail_shim::built_mailbox_roots();
     for slug in &slugs {
         let Some(dir) = dirs.get(slug.as_str()) else {
             gaps_out.push(gap(slug, "no project dir supplied for member".to_string()));
@@ -36462,7 +36464,7 @@ mod product_digest_tests {
         // One key across members, never a second: the fold copies the
         // EXISTING key file (whois profiles stay the member's own
         // onboarding — a read verb never publishes those).
-        let (data_dir, _) = mail_shim::mailbox_roots();
+        let (data_dir, _) = mail_shim::built_mailbox_roots();
         let key_of = |p: &str| {
             std::fs::read(
                 data_dir
@@ -36474,5 +36476,54 @@ mod product_digest_tests {
             .expect("fold-bound key file")
         };
         assert_eq!(key_of(&a), key_of(&b), "same key bytes in both members");
+    }
+
+    /// bd-jcqq: the fold probes the root the LIVE mailbox was built with.
+    /// Proves it the way the suite poisons roots — clear the TORON_*
+    /// overrides under the env lock, call the fold, restore — because before
+    /// the fix the probe re-resolved env, landed on the home fallback, found
+    /// no key for the pin it had just registered, and gapped both members
+    /// with "refusing to mint".
+    #[test]
+    fn product_digest_fold_probes_the_built_root_not_a_fresh_env_resolution() {
+        let _g = crate::config::lock_env();
+        let mail = pd_mail();
+        let (a, b) = (pd_slug("proba"), pd_slug("probb"));
+        let key = format!("pd-probe-{}", std::process::id());
+        let pin = "ProbeFalcon";
+        pd_register(&mail, &a, pin);
+        mail.ensure_project(&b).expect("ensure B");
+        pd_seed(&mail, &a, pin, "report from A");
+        pd_product(&mail, &key, &[a.clone(), b.clone()]);
+        let dirs = vec![(a.clone(), a.clone()), (b.clone(), b.clone())];
+
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["TORON_DATA_DIR", "TORON_MCP_DATA_DIR"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+        unsafe {
+            std::env::remove_var("TORON_DATA_DIR");
+            std::env::remove_var("TORON_MCP_DATA_DIR");
+        }
+        let v = product_digest_for(&mail, &key, pin, &dirs);
+        for (name, value) in saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        let members = v
+            .get("members")
+            .and_then(|m| m.as_array())
+            .expect("members");
+        assert_eq!(
+            members.len(),
+            2,
+            "the fold must probe the built mail root, not a fresh env resolution: {v}"
+        );
     }
 }

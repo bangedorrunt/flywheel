@@ -172,6 +172,27 @@ pub fn mailbox_roots() -> (PathBuf, PathBuf) {
     (mailbox_data_dir(&root), db_at(&root))
 }
 
+/// Root dirs of the LIVE in-process mailbox: recorded once by
+/// `build_mailbox`, never re-resolved.
+///
+/// `mailbox_roots()` reads process env on EVERY call, so a reader that probes
+/// the store by re-resolving can disagree with a mailbox built earlier — env
+/// is process-global and several tests flip `TORON_DATA_DIR` /
+/// `TORON_MCP_DATA_DIR` / `XDG_DATA_HOME` under the env lock. That is how the
+/// product-digest identity fold reported "no key for `{name}` in any member —
+/// refusing to mint" for a pin it had just registered: the key sat in the
+/// pinned root while the probe resolved a flipped one. Readers that must
+/// agree with the live store take these dirs; readers that must mirror an
+/// EXTERNAL writer's own env resolution (presence, toron parity) keep
+/// `mailbox_roots()`. Falls back to a fresh resolution while no mailbox
+/// exists (nothing to agree with yet).
+static BUILT_ROOTS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+
+/// The live mailbox's own root dirs (see [`BUILT_ROOTS`]).
+pub(crate) fn built_mailbox_roots() -> (PathBuf, PathBuf) {
+    BUILT_ROOTS.get().cloned().unwrap_or_else(mailbox_roots)
+}
+
 /// bd-hdec: the Mailbox data dir is the DURABLE ROOT'S `projects/` segment
 /// (`{root}/projects/`), matching toron's MCP/CLI/bootstrap exactly
 /// (toron-mcp passes `ToronPaths::projects_dir()` as the Mailbox data dir).
@@ -278,7 +299,9 @@ mod bd_vhia_migrate_hint_tests {
 }
 
 async fn build_mailbox() -> anyhow::Result<toron_core::mailbox::Mailbox> {
-    let (data_dir, db) = mailbox_roots();
+    // Record the roots this store is built from: every reader that probes the
+    // live store takes the same pair (BUILT_ROOTS).
+    let (data_dir, db) = BUILT_ROOTS.get_or_init(mailbox_roots).clone();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create mail data dir {}", data_dir.display()))?;
     // bd-enov: a legacy private store means this process used to fork the
