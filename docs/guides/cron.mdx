@@ -33,19 +33,30 @@ Schema: `name` and `schedule` are required; `owner` is required (the owning prof
 ## Commands
 
 ```bash
-flywheel cron lint weekly-upgrade     # fail-stop gate; run always
-flywheel cron run weekly-upgrade      # on demand (25s dry-run default; --live fires once)
-flywheel cron list / show / status    # catalog (builtin | global | project); paused | due | running | succeeded | failed
-flywheel cron pause / resume / history / remove weekly-upgrade
+flywheel cron list                    # catalog: builtin | global | project
+flywheel cron status                  # one line per cron: due | paused | running
+flywheel cron lint weekly-review      # fail-stop gate; run always
+flywheel cron run weekly-review       # on demand (25s dry-run default; --live fires once)
+flywheel cron history weekly-review   # NAME is required here, not optional
 flywheel cron start                   # start or resume the durable cron loops
 ```
 
 ```text
-cron lint: ok · schedule "0 3 * * 0" · owner=devops · scope=host · mode=headless
-run  weekly-upgrade  dry-run (25s)  · pass --live to dispatch for real
-catalog: 1 project · 0 global · 7 builtin
+$ flywheel cron list
+NAME                         OWNER                  SCHEDULE         SCOPE   SOURCE   STATUS    STEPS  STATE
+awareness-digest             flywheel               */15 * * * *     project builtin  due       1      on
+weekly-review                oracle                 0 4 * * 0        host    global   due       1      on
+
+$ flywheel cron status
+NAME                         STATUS    STATE    NEXT_DUE     SOURCE
+awareness-digest             due       on       1790379900 builtin
+weekly-review                due       on       1790481600 global
 ```
 
+`NEXT_DUE` is a unix second. `weekly-review` is this host's global-tier cron; use
+whatever `cron list` prints instead of copying a name out of a guide.
+
+`cron lint` prints nothing when the file is clean — the exit code is the signal.
 `cron run` without `--live` is a dry arm: it performs no effect, so it writes no
 effect-journal row and mints no run. That is why a dry run looks like nothing
 happened — nothing did, on purpose.
