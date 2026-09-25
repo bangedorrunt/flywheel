@@ -1280,26 +1280,57 @@ fn reload_plan(uid: &str, unit: &std::path::Path) -> Vec<Vec<String>> {
 }
 
 /// Run the plan in order: the first bootstrap/kickstart success wins;
-/// `bootout` is best-effort (dropping the definition is the goal, not its
-/// exit code — an already-unloaded job must not abort the fresh load).
-/// Every real failure's stderr is kept, so a bail names the actual
-/// launchctl cause instead of just the step list.
+/// `bootout` never blocks the fresh load (an already-unloaded job is not
+/// an error — bd-yvte's absence classifier decides that). Every real
+/// failure's stderr is kept, so a bail names the actual launchctl cause
+/// instead of just the step list. The world runs here, at the edge — the
+/// decision fold below is pure and scripted in tests (effect law: no real
+/// launchctl in a unit test).
 fn run_reload_plan(plan: &[Vec<String>]) -> std::result::Result<(), String> {
-    let mut errors: Vec<String> = Vec::new();
-    for cmd in plan {
-        let step = cmd.get(1).cloned().unwrap_or_default();
-        let out = std::process::Command::new(&cmd[0]).args(&cmd[1..]).output();
-        let (ok, err) = match out {
+    run_reload_plan_with(plan, |cmd| {
+        match std::process::Command::new(&cmd[0]).args(&cmd[1..]).output() {
             Ok(o) => (
                 o.status.success(),
                 String::from_utf8_lossy(&o.stderr).trim().to_string(),
             ),
             Err(e) => (false, e.to_string()),
-        };
+        }
+    })
+}
+
+/// The decision fold over scripted step results (bd-rxyi): a REAL bootout
+/// failure (not absence) means the stale loaded definition was never
+/// dropped, so a later `kickstart -k` success restarts the OLD definition
+/// and must not count as plan success — install would report success while
+/// the daemon runs stale env (the bd-jvu7 misattribution class on the
+/// install path). Kickstart counts only when no real drop was needed or
+/// the drop succeeded. Absence stays benign: nothing to drop, nothing to
+/// re-load. A real bootout failure also joins the all-fail bail — the old
+/// best-effort `continue` dropped its cause from the list entirely.
+fn run_reload_plan_with(
+    plan: &[Vec<String>],
+    mut exec: impl FnMut(&[String]) -> (bool, String),
+) -> std::result::Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut stale_drop_failed: Option<String> = None;
+    for cmd in plan {
+        let step = cmd.get(1).cloned().unwrap_or_default();
+        let (ok, err) = exec(cmd);
         if step == "bootout" {
-            continue; // best-effort by contract, never a blocker
+            if !ok && !bootout_absent(&err) {
+                stale_drop_failed = Some(err.clone());
+                errors.push(format!("{step}: {err}"));
+            }
+            continue; // never a blocker for the fresh-load arms
         }
         if ok {
+            if step == "kickstart"
+                && let Some(drop_err) = &stale_drop_failed
+            {
+                return Err(format!(
+                    "launchctl reload plan failed: the stale loaded definition was never dropped ({drop_err}), so kickstart -k restarted the OLD definition — the rewritten unit file was not loaded; retry `doorbell install` or run the bootout manually"
+                ));
+            }
             return Ok(());
         }
         errors.push(format!("{step}: {err}"));
@@ -1612,6 +1643,87 @@ mod tests {
                 .unwrap_or(false),
             "kickstart only as last resort: {flat:?}"
         );
+    }
+
+    /// bd-rxyi: bootstrap fails (definition loaded) → bootout fails for a
+    /// REAL reason (permission, not absence) → re-bootstrap fails ("already
+    /// loaded") → `kickstart -k` restarts the OLD loaded definition and
+    /// succeeds. The old plan returned Ok here: install reported success
+    /// while the daemon ran the stale unit — the bd-jvu7 misattribution
+    /// class on the install path. Kickstart success counts only when no
+    /// real drop was needed or the drop succeeded.
+    #[test]
+    fn reload_plan_refuses_kickstart_success_after_a_failed_stale_drop() {
+        let plan = super::reload_plan("501", std::path::Path::new("/tmp/p.plist"));
+        let err = super::run_reload_plan_with(&plan, |cmd| match cmd.get(1).map(String::as_str) {
+            Some("bootstrap") => (false, "service already loaded".into()),
+            Some("bootout") => (false, "Boot-out failed: 1: Operation not permitted".into()),
+            Some("kickstart") => (true, String::new()),
+            _ => (false, "unexpected step".into()),
+        })
+        .expect_err("kickstart on a stale definition must not report plan success");
+        assert!(
+            err.contains("never dropped"),
+            "explains the stale restart: {err}"
+        );
+        assert!(
+            err.contains("Operation not permitted"),
+            "names the real bootout cause: {err}"
+        );
+    }
+
+    /// Absence is not a failed drop: bootout finding no job (manual start)
+    /// leaves the plan's verdict exactly as before — a later kickstart
+    /// success still counts (bd-yvte's absence classifier reused).
+    #[test]
+    fn reload_plan_bootout_absence_never_poisons_a_kickstart_recovery() {
+        let plan = super::reload_plan("501", std::path::Path::new("/tmp/p.plist"));
+        super::run_reload_plan_with(&plan, |cmd| match cmd.get(1).map(String::as_str) {
+            Some("bootstrap") => (false, "transient busy".into()),
+            Some("bootout") => (false, "Boot-out failed: 3: No such process".into()),
+            Some("kickstart") => (true, String::new()),
+            _ => (false, "unexpected step".into()),
+        })
+        .expect("absence means no drop was needed — kickstart success still wins");
+    }
+
+    /// First success wins and STOPS the walk: a fresh bootstrap (step 1)
+    /// must not run bootout/kickstart after the new file is already
+    /// loaded — no world touch after success.
+    #[test]
+    fn reload_plan_first_bootstrap_success_wins_and_stops_running_steps() {
+        let plan = super::reload_plan("501", std::path::Path::new("/tmp/p.plist"));
+        let mut ran: Vec<String> = Vec::new();
+        super::run_reload_plan_with(&plan, |cmd| {
+            ran.push(cmd.get(1).cloned().unwrap_or_default());
+            (true, String::new())
+        })
+        .expect("fresh bootstrap succeeds");
+        assert_eq!(
+            ran,
+            ["bootstrap"],
+            "walk stops at the first success: {ran:?}"
+        );
+    }
+
+    /// The all-fail bail keeps every real cause — including bootout's,
+    /// which the old best-effort `continue` silently dropped from the
+    /// error list even when nothing else succeeded either.
+    #[test]
+    fn reload_plan_final_bail_carries_the_real_bootout_cause() {
+        let plan = super::reload_plan("501", std::path::Path::new("/tmp/p.plist"));
+        let err = super::run_reload_plan_with(&plan, |cmd| match cmd.get(1).map(String::as_str) {
+            Some("bootstrap") => (false, "service already loaded".into()),
+            Some("bootout") => (false, "Boot-out failed: 1: Operation not permitted".into()),
+            Some("kickstart") => (false, "could not find service".into()),
+            _ => (false, "unexpected step".into()),
+        })
+        .expect_err("every step failing must bail");
+        assert!(
+            err.contains("bootout: Boot-out failed"),
+            "bootout cause listed: {err}"
+        );
+        assert!(err.contains("kickstart"), "kickstart cause listed: {err}");
     }
 
     /// The `toron mail inbox` child refused beside the live toron daemon
