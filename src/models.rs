@@ -231,6 +231,20 @@ pub struct ModelRegistry {
     pub defaults: Option<DefaultsSpec>,
 }
 
+/// Where a rate-limited run retries: the registry `ModelEntry.fallback` rung
+/// (bd-42fs, ADR-0024 W1a). The hop's identity is `model_id` (the registry
+/// id); the harness and the injection string are derived from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackRoute {
+    /// the registry `fallback` id that drove the hop
+    pub model_id: String,
+    /// harness that runs it — `grok` when the rung's family is grok (that
+    /// harness is coupled and cannot inherit the caller's), else the caller's
+    pub harness: String,
+    /// the injection string [`ModelRegistry::resolve`] produced for `harness`
+    pub model: String,
+}
+
 impl ModelRegistry {
     /// Load from `~/.config/flywheel/models.toml`. Missing file = empty
     /// registry (zero-config; resolution then passes everything through).
@@ -589,6 +603,29 @@ impl ModelRegistry {
             Some(key) => split_key(&key).0.to_string(),
             None => id.to_string(),
         }
+    }
+
+    /// The registry rung for `model_id`: its `ModelEntry.fallback`, the harness
+    /// that can run that rung, and the injection string for that harness.
+    /// `None` = this model has no rung (unknown id, or no `fallback`), and the
+    /// caller keeps whatever it was going to do — the original error, or the
+    /// next rung of its own ladder.
+    ///
+    /// The grok flip is not a preference: the grok harness runs only its own
+    /// models, so a grok-family rung cannot inherit the caller's harness.
+    pub fn fallback_route(&self, model_id: &str, harness: &str) -> Option<FallbackRoute> {
+        let model_id = self.get(model_id)?.fallback.clone()?;
+        let harness = if self.family_of(&model_id) == "grok" {
+            "grok".to_string()
+        } else {
+            harness.to_string()
+        };
+        let model = self.resolve(&model_id, &harness);
+        Some(FallbackRoute {
+            model_id,
+            harness,
+            model,
+        })
     }
 
     /// bd-88m4: coupled-harness default, the grok pattern generalized —
@@ -1770,5 +1807,61 @@ model = "opencode/big-pickle"
             .resolve_profile_route("", "zai/glm-5.2")
             .expect_err("must pin harness or slot");
         assert!(err.to_string().contains("@cheap"));
+    }
+
+    /// The registry rung a rate-limited run retries with (bd-42fs, ADR-0024
+    /// W1a): its `fallback`, the harness that can run it, and the injection
+    /// string for that harness. Shared by the pane hop and the headless rung,
+    /// so the grok coupling is pinned here once.
+    #[test]
+    fn fallback_route_rows() {
+        let mut reg = ModelRegistry::default();
+        reg.models.insert(
+            "a/current".into(),
+            ModelEntry {
+                fallback: Some("b/next".into()),
+                ..sample_entry()
+            },
+        );
+        reg.models.insert(
+            "a/grok-hopper".into(),
+            ModelEntry {
+                fallback: Some("grok/grok-4".into()),
+                ..sample_entry()
+            },
+        );
+        reg.models.insert("a/no-rung".into(), sample_entry());
+        // the rung targets, so `resolve` has an entry to render
+        reg.models.insert("b/next".into(), sample_entry());
+        reg.models.insert("grok/grok-4".into(), sample_entry());
+
+        assert_eq!(
+            reg.fallback_route("a/current", "claude"),
+            Some(FallbackRoute {
+                model_id: "b/next".into(),
+                harness: "claude".into(),
+                model: "b/next".into(),
+            }),
+            "a non-grok rung keeps the caller's harness"
+        );
+        assert_eq!(
+            reg.fallback_route("a/grok-hopper", "claude"),
+            Some(FallbackRoute {
+                model_id: "grok/grok-4".into(),
+                harness: "grok".into(),
+                model: "grok-4".into(),
+            }),
+            "grok is coupled: the rung forces that harness and the bare id"
+        );
+        assert_eq!(
+            reg.fallback_route("a/no-rung", "claude"),
+            None,
+            "an entry with no fallback has no rung"
+        );
+        assert_eq!(
+            reg.fallback_route("a/not-registered", "claude"),
+            None,
+            "an id the registry never heard of has no rung"
+        );
     }
 }
