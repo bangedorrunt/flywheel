@@ -38,7 +38,7 @@ use crate::authority::Clock;
 use crate::config::Config;
 use crate::crew::CrewPlan;
 use crate::herdr_shim::{AgentStatus, Client};
-use crate::models::ModelRegistry;
+use crate::models::{FallbackRoute, ModelRegistry};
 use crate::profile::ProfileCatalog;
 use crate::state::SpawnEntry;
 use crate::{headless, state};
@@ -418,19 +418,6 @@ pub fn pre_spawn_crew(
     })
 }
 
-/// Where a rate-limited pane spawn retries: the registry `ModelEntry.fallback`
-/// rung of the one-shot pane fallback (ADR-0024 W1a / bd-42fs).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RegistryFallbackRoute {
-    /// the registry `fallback` id that drove the hop (also the journal's `to`)
-    pub model_id: String,
-    /// harness for the retry — `grok` when the fallback's family is grok (its
-    /// harness is coupled and cannot be inherited), else the pane's own harness
-    pub harness: String,
-    /// the injection string `ModelRegistry::resolve` produced for that harness
-    pub model: String,
-}
-
 /// Decide the one-shot registry fallback for a FAILED pane spawn. `None` means
 /// "re-raise the original error untouched": a non-rate-limit failure, an
 /// unreadable registry, an unknown profile model, or a model whose entry
@@ -449,7 +436,7 @@ pub(crate) fn registry_fallback_route<F>(
     profile_model: &str,
     harness: &str,
     load_registry: F,
-) -> Option<RegistryFallbackRoute>
+) -> Option<FallbackRoute>
 where
     F: FnOnce() -> Option<ModelRegistry>,
 {
@@ -465,19 +452,7 @@ where
     if cf.kind != crate::failure::FailureKind::RateLimit {
         return None;
     }
-    let registry = load_registry()?;
-    let model_id = registry.get(profile_model)?.fallback.clone()?;
-    let harness = if registry.family_of(&model_id) == "grok" {
-        "grok".to_string()
-    } else {
-        harness.to_string()
-    };
-    let model = registry.resolve(&model_id, &harness);
-    Some(RegistryFallbackRoute {
-        model_id,
-        harness,
-        model,
-    })
+    load_registry()?.fallback_route(profile_model, harness)
 }
 
 /// The I4 journal intent for a decided registry fallback hop (GS-043). The
@@ -490,7 +465,7 @@ pub(crate) fn registry_fallback_intent(
     role: &str,
     profile_model: &str,
     harness: &str,
-    route: &RegistryFallbackRoute,
+    route: &FallbackRoute,
     evidence: String,
 ) -> crate::agent_ref::RebindIntent {
     crate::agent_ref::RebindIntent::prepare(
@@ -3179,8 +3154,10 @@ mod pane_registry_fallback_tests {
     use super::*;
     use crate::models::ModelEntry;
 
-    /// The routing table the rows resolve against: two models carrying a
-    /// 429 rung, one carrying none, plus the rung targets themselves.
+    /// The routing table the rows resolve against: one model carrying a 429
+    /// rung, one carrying none, and the rung target itself. The rung
+    /// mechanics (grok harness coupling, the injection form) are pinned in
+    /// `models::tests::fallback_route_rows`; this file owns the GATE.
     fn routing() -> ModelRegistry {
         let mut r = ModelRegistry::default();
         r.models.insert(
@@ -3190,18 +3167,10 @@ mod pane_registry_fallback_tests {
                 ..ModelEntry::default()
             },
         );
-        r.models.insert(
-            "fleet/grok-hopper".into(),
-            ModelEntry {
-                fallback: Some("grok/grok-4".into()),
-                ..ModelEntry::default()
-            },
-        );
         r.models
             .insert("fleet/no-rung".into(), ModelEntry::default());
         r.models
             .insert("openai/gpt-5.2".into(), ModelEntry::default());
-        r.models.insert("grok/grok-4".into(), ModelEntry::default());
         r
     }
 
@@ -3230,15 +3199,6 @@ mod pane_registry_fallback_tests {
                 profile_model: "fleet/claude-opus-4",
                 harness: "claude",
                 expected: Some(("openai/gpt-5.2", "claude", "openai/gpt-5.2")),
-            },
-            RouteRow {
-                // the grok harness is coupled: it cannot inherit the pane's
-                // harness, and its flag form is the BARE model id.
-                case: "rate-limit-grok-rung-flips-harness",
-                error: "429 Too Many Requests",
-                profile_model: "fleet/grok-hopper",
-                harness: "claude",
-                expected: Some(("grok/grok-4", "grok", "grok-4")),
             },
             RouteRow {
                 case: "rate-limit-without-a-rung-stays-put",
@@ -3363,5 +3323,53 @@ mod pane_registry_fallback_tests {
         }
         assert!(!log.contains("\"state\":\"settled\""), "{log}");
         assert!(log.contains("\"kind\":\"rate_limit\""), "{log}");
+    }
+
+    /// The headless rung in `main.rs` now journals through this builder too.
+    /// Pin the row it handed `commit_rebind` BEFORE the builder existed: the
+    /// effect_key is durable journal identity, so a reuse that moved the pin,
+    /// the project, or either binding would orphan every row already written.
+    #[test]
+    fn headless_rung_wires_the_same_row_as_its_inline_literal() {
+        let route = registry_fallback_route(
+            "429 Too Many Requests",
+            "fleet/claude-opus-4",
+            "claude",
+            || Some(routing()),
+        )
+        .expect("a rate limit with a rung routes");
+        // main.rs passes the profile name as both pin and role, under its
+        // hardcoded "flywheel" project.
+        let got = registry_fallback_intent(
+            "flywheel",
+            "coder",
+            "coder",
+            "fleet/claude-opus-4",
+            "claude",
+            &route,
+            "429 Too Many Requests".into(),
+        );
+        let inline_literal = crate::agent_ref::RebindIntent::prepare(
+            crate::agent_ref::AgentRef::new("flywheel", "coder"),
+            crate::agent_ref::AgentBinding {
+                profile_name: "coder".to_string(),
+                model: "fleet/claude-opus-4".to_string(),
+                harness: "claude".to_string(),
+            },
+            crate::agent_ref::AgentBinding {
+                profile_name: "coder".to_string(),
+                model: "openai/gpt-5.2".to_string(),
+                harness: "claude".to_string(),
+            },
+            crate::agent_ref::RebindReason::ModelFallback {
+                kind: "rate_limit".into(),
+                evidence: "429 Too Many Requests".into(),
+            },
+            0,
+        );
+        assert_eq!(
+            got, inline_literal,
+            "the shared builder must not move the headless rung's effect_key"
+        );
     }
 }
