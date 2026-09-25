@@ -508,97 +508,94 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// One row per harness argv shape: pi/omp/opencode/grok differ only in
+    /// their flags (pi `--mode json`, omp the `=` form, opencode `run
+    /// --format json`, grok `--single` + streaming-messages-json), and a
+    /// `None` model drops the model flag entirely. Same argv as the five
+    /// tests this replaces.
     #[test]
-    fn pi_argv_with_model() {
-        assert_eq!(
-            build_argv_roles(
-                "pi",
-                Some("google/gemini-2.5-flash"),
-                None,
-                "",
-                "",
-                "",
-                "hello"
-            )
-            .unwrap(),
-            vec![
-                "pi".to_string(),
-                "-p".into(),
-                "--mode".into(),
-                "json".into(),
-                "--model".into(),
-                "google/gemini-2.5-flash".into(),
-                "hello".into(),
-            ]
-        );
-    }
-
-    #[test]
-    fn pi_argv_without_model() {
-        assert_eq!(
-            build_argv_roles("pi", None, None, "", "", "", "hello").unwrap(),
-            vec![
-                "pi".to_string(),
-                "-p".into(),
-                "--mode".into(),
-                "json".into(),
-                "hello".into(),
-            ]
-        );
-    }
-
-    #[test]
-    fn omp_argv_uses_equals_form() {
-        assert_eq!(
-            build_argv_roles("omp", Some("gpt-5.2"), None, "", "", "", "hi").unwrap(),
-            vec![
-                "omp".to_string(),
-                "-p".into(),
-                "--mode=json".into(),
-                "--model=gpt-5.2".into(),
-                "hi".into(),
-            ]
-        );
-    }
-
-    #[test]
-    fn opencode_argv_uses_run_with_json_format() {
-        assert_eq!(
-            build_argv_roles(
-                "opencode",
-                Some("anthropic/claude-sonnet-4"),
-                None,
-                "",
-                "",
-                "",
-                "hi"
-            )
-            .unwrap(),
-            vec![
-                "opencode".to_string(),
-                "run".into(),
-                "--format".into(),
-                "json".into(),
-                "-m".into(),
-                "anthropic/claude-sonnet-4".into(),
-                "hi".into(),
-            ]
-        );
-    }
-
-    #[test]
-    fn grok_argv_uses_streaming_messages_json() {
-        assert_eq!(
-            build_argv_roles("grok", Some("grok-4"), None, "", "", "", "hi").unwrap(),
-            vec![
-                "grok".to_string(),
-                "--single=hi".into(),
-                "--output-format".into(),
-                "streaming-messages-json".into(),
-                "-m".into(),
-                "grok-4".into(),
-            ]
-        );
+    fn build_argv_roles_rows() {
+        let rows = [
+            (
+                "pi-with-model",
+                build_argv_roles(
+                    "pi",
+                    Some("google/gemini-2.5-flash"),
+                    None,
+                    "",
+                    "",
+                    "",
+                    "hello",
+                )
+                .unwrap(),
+                [
+                    "pi",
+                    "-p",
+                    "--mode",
+                    "json",
+                    "--model",
+                    "google/gemini-2.5-flash",
+                    "hello",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+            (
+                "pi-without-model",
+                build_argv_roles("pi", None, None, "", "", "", "hello").unwrap(),
+                ["pi", "-p", "--mode", "json", "hello"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            (
+                "omp-equals-form",
+                build_argv_roles("omp", Some("gpt-5.2"), None, "", "", "", "hi").unwrap(),
+                ["omp", "-p", "--mode=json", "--model=gpt-5.2", "hi"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            (
+                "opencode-run-json",
+                build_argv_roles(
+                    "opencode",
+                    Some("anthropic/claude-sonnet-4"),
+                    None,
+                    "",
+                    "",
+                    "",
+                    "hi",
+                )
+                .unwrap(),
+                [
+                    "opencode",
+                    "run",
+                    "--format",
+                    "json",
+                    "-m",
+                    "anthropic/claude-sonnet-4",
+                    "hi",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+            (
+                "grok-streaming-messages-json",
+                build_argv_roles("grok", Some("grok-4"), None, "", "", "", "hi").unwrap(),
+                [
+                    "grok",
+                    "--single=hi",
+                    "--output-format",
+                    "streaming-messages-json",
+                    "-m",
+                    "grok-4",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+        ];
+        for (name, got, want) in rows {
+            assert_eq!(got, want, "row {name}");
+        }
     }
 
     #[test]

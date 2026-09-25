@@ -274,9 +274,17 @@ mod tests {
 
     // ---- ts parsing ----
 
+    /// One row per accepted shape: `Z` and a fractional second both land on
+    /// the same second (fractions truncate, they never round up).
     #[test]
-    fn parse_ts_zulu() {
-        assert_eq!(parse_ts("2026-08-03T03:00:00Z"), Some(1_785_726_000));
+    fn parse_ts_zulu_and_fractional() {
+        let rows = [
+            ("zulu", "2026-08-03T03:00:00Z", 1_785_726_000),
+            ("fractional", "2026-08-03T03:00:00.500Z", 1_785_726_000),
+        ];
+        for (name, input, expected) in rows {
+            assert_eq!(parse_ts(input), Some(expected), "row {name}");
+        }
     }
 
     #[test]
@@ -284,11 +292,6 @@ mod tests {
         assert_eq!(parse_ts("2026-08-03T03:00:00+02:00"), Some(1_785_718_800));
         assert_eq!(parse_ts("2026-08-03T03:00:00-05:00"), Some(1_785_744_000));
         assert_eq!(parse_ts("2026-08-03T03:00:00+00:00"), Some(1_785_726_000));
-    }
-
-    #[test]
-    fn parse_ts_fractional() {
-        assert_eq!(parse_ts("2026-08-03T03:00:00.500Z"), Some(1_785_726_000));
     }
 
     #[test]
