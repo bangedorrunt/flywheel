@@ -605,27 +605,34 @@ impl ModelRegistry {
         }
     }
 
-    /// The registry rung for `model_id`: its `ModelEntry.fallback`, the harness
-    /// that can run that rung, and the injection string for that harness.
-    /// `None` = this model has no rung (unknown id, or no `fallback`), and the
-    /// caller keeps whatever it was going to do — the original error, or the
-    /// next rung of its own ladder.
+    /// The route for a fallback id the caller already chose — a profile's
+    /// `model_fallback` entry. Same grok coupling and resolution as the
+    /// registry rung, minus the lookup, and infallible: a config-authored hop
+    /// and a registry-authored one cannot end up routed differently.
     ///
     /// The grok flip is not a preference: the grok harness runs only its own
     /// models, so a grok-family rung cannot inherit the caller's harness.
-    pub fn fallback_route(&self, model_id: &str, harness: &str) -> Option<FallbackRoute> {
-        let model_id = self.get(model_id)?.fallback.clone()?;
-        let harness = if self.family_of(&model_id) == "grok" {
+    pub fn route_for(&self, model_id: &str, harness: &str) -> FallbackRoute {
+        let harness = if self.family_of(model_id) == "grok" {
             "grok".to_string()
         } else {
             harness.to_string()
         };
-        let model = self.resolve(&model_id, &harness);
-        Some(FallbackRoute {
-            model_id,
+        let model = self.resolve(model_id, harness.as_str());
+        FallbackRoute {
+            model_id: model_id.to_string(),
             harness,
             model,
-        })
+        }
+    }
+
+    /// The registry rung for `model_id`: its `ModelEntry.fallback`, routed
+    /// through [`Self::route_for`]. `None` = this model has no rung (unknown
+    /// id, or no `fallback`), and the caller keeps whatever it was going to do
+    /// — the original error, or the next rung of its own ladder.
+    pub fn fallback_route(&self, model_id: &str, harness: &str) -> Option<FallbackRoute> {
+        let rung = self.get(model_id)?.fallback.clone()?;
+        Some(self.route_for(&rung, harness))
     }
 
     /// bd-88m4: coupled-harness default, the grok pattern generalized —
@@ -1862,6 +1869,32 @@ model = "opencode/big-pickle"
             reg.fallback_route("a/not-registered", "claude"),
             None,
             "an id the registry never heard of has no rung"
+        );
+    }
+
+    /// The routing when the fallback id comes from a profile's
+    /// `model_fallback` list rather than a registry entry: the grok coupling
+    /// must not depend on who named the id.
+    #[test]
+    fn route_for_couples_grok_whoever_named_the_id() {
+        let reg = reg_with_keys(&["a/next", "grok/grok-4"]);
+        assert_eq!(
+            reg.route_for("a/next", "omp"),
+            FallbackRoute {
+                model_id: "a/next".into(),
+                harness: "omp".into(),
+                model: "a/next".into(),
+            },
+            "a non-grok id keeps the caller's harness"
+        );
+        assert_eq!(
+            reg.route_for("grok/grok-4", "omp"),
+            FallbackRoute {
+                model_id: "grok/grok-4".into(),
+                harness: "grok".into(),
+                model: "grok-4".into(),
+            },
+            "a grok id flips the harness whoever named it"
         );
     }
 }

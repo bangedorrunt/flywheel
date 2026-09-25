@@ -455,11 +455,13 @@ where
     load_registry()?.fallback_route(profile_model, harness)
 }
 
-/// The I4 journal intent for a decided registry fallback hop (GS-043). The
-/// `to` binding records the registry fallback ID that drove the decision, not
-/// the harness-resolved injection string: the hop's *identity* is the model
-/// swap, and the rendering is derived from it.
-pub(crate) fn registry_fallback_intent(
+/// The I4 journal intent for a decided model-fallback hop (GS-043), shared by
+/// the pane hop and both headless rungs. The `to` binding records the id that
+/// drove the decision, not the harness-resolved injection string: the hop's
+/// *identity* is the model swap, and the rendering is derived from it. It
+/// takes the caller's `&FallbackRoute` so the row and the dispatch read one
+/// value — a row can never name a harness the run did not use.
+pub(crate) fn model_fallback_intent(
     project: &str,
     name: &str,
     role: &str,
@@ -653,7 +655,19 @@ fn spawn_crew_into(
                                 &e.to_string(),
                                 &profile.model,
                                 harness,
-                                || ModelRegistry::load_routing().ok(),
+                                || match ModelRegistry::load_routing() {
+                                    Ok(registry) => Some(registry),
+                                    // An unparseable models.toml is LOUD by
+                                    // design. Do not let the fallback path
+                                    // swallow it into a bare "no fallback".
+                                    Err(err) => {
+                                        eprintln!(
+                                            "pane crew: model registry unreadable \
+                                             — no rate-limit fallback: {err:#}"
+                                        );
+                                        None
+                                    }
+                                },
                             );
                             let Some(route) = route else { return Err(e) };
                             let mut fallback_args = headless::model_args(
@@ -668,7 +682,7 @@ fn spawn_crew_into(
                                 &profile.plan,
                             ));
                             // GS-043 I4: journal before ModelEntry.fallback hop.
-                            let intent = registry_fallback_intent(
+                            let intent = model_fallback_intent(
                                 project,
                                 &name,
                                 role,
@@ -3290,7 +3304,7 @@ mod pane_registry_fallback_tests {
             || Some(routing()),
         )
         .expect("a rate limit with a rung routes");
-        let intent = registry_fallback_intent(
+        let intent = model_fallback_intent(
             project,
             "WittyAnt",
             "coder",
@@ -3307,6 +3321,21 @@ mod pane_registry_fallback_tests {
         let mut applies = 0;
         let err = crate::agent_ref::commit_rebind(project, intent, |_| {
             applies += 1;
+            // The effect law: intent is journaled BEFORE the provider runs.
+            // Read the log from inside the attempt — that is the only place
+            // the ordering is observable at all.
+            let before = std::fs::read_to_string(crate::state::project_log_path(project))
+                .expect("journal written before the provider ran");
+            for state in ["prepared", "in_flight"] {
+                assert!(
+                    before.contains(&format!("\"state\":\"{state}\"")),
+                    "apply ran before {state} was journaled: {before}"
+                );
+            }
+            assert!(
+                !before.contains("\"state\":\"settled\""),
+                "nothing may be settled while apply is still running: {before}"
+            );
             // the rung rate-limited too: fail, do not hop again
             Err::<(), _>(anyhow!("429 Too Many Requests"))
         });
@@ -3325,6 +3354,34 @@ mod pane_registry_fallback_tests {
         assert!(log.contains("\"kind\":\"rate_limit\""), "{log}");
     }
 
+    /// The row names the harness the run is about to use, not the one the
+    /// failed run used. The headless `model_fallback` rung journaled the
+    /// caller's harness while dispatching the grok-coupled one, so it recorded
+    /// (and keyed) a route it never took.
+    #[test]
+    fn hop_row_records_the_harness_being_dispatched() {
+        let route = FallbackRoute {
+            model_id: "grok/grok-4".into(),
+            harness: "grok".into(),
+            model: "grok-4".into(),
+        };
+        let intent = model_fallback_intent(
+            "flywheel",
+            "coder",
+            "coder",
+            "zai/glm-5.2",
+            "omp",
+            &route,
+            "429 Too Many Requests".into(),
+        );
+        assert_eq!(intent.from.harness, "omp", "where the hop came from");
+        assert_eq!(
+            intent.to.harness, "grok",
+            "where it is going, not where it was"
+        );
+        assert_eq!(intent.to.model, "grok/grok-4", "the id that drove it");
+    }
+
     /// The headless rung in `main.rs` now journals through this builder too.
     /// Pin the row it handed `commit_rebind` BEFORE the builder existed: the
     /// effect_key is durable journal identity, so a reuse that moved the pin,
@@ -3340,7 +3397,7 @@ mod pane_registry_fallback_tests {
         .expect("a rate limit with a rung routes");
         // main.rs passes the profile name as both pin and role, under its
         // hardcoded "flywheel" project.
-        let got = registry_fallback_intent(
+        let got = model_fallback_intent(
             "flywheel",
             "coder",
             "coder",
