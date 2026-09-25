@@ -35240,50 +35240,16 @@ mod register_identity_tests {
 }
 
 #[cfg(test)]
-mod kind_classify_headless_tests {
+mod is_rate_limited_tests {
     use super::*;
-    use crate::failure;
 
-    /// Classification shapes for headless errors in one table; the retryable
-    /// pin stays optional because the unclassified case never asserted it.
+    /// The one genuinely headless-local pin in this module: the 429 detector
+    /// over a `HarnessOutcome`, which no other call site has. The classify rows
+    /// this module used to carry live in the single `failure.rs` table now —
+    /// cron, pane, and headless all ran the same `classify(err, None, None)`,
+    /// so a module-local copy pinned nothing about the module.
     #[test]
-    fn kind_classify_headless_rows() {
-        let cases: [(&str, &str, failure::FailureKind, Option<bool>); 4] = [
-            (
-                "rate_limit",
-                "429 Too Many Requests",
-                failure::FailureKind::RateLimit,
-                Some(true),
-            ),
-            (
-                "timeout",
-                "operation timeout after 30s",
-                failure::FailureKind::Timeout,
-                Some(true),
-            ),
-            (
-                "auth",
-                "401 Unauthorized",
-                failure::FailureKind::Auth,
-                Some(false),
-            ),
-            // Unclassified default is Continue (engine's on_error default
-            // remains Continue).
-            (
-                "unclassified_stays_continue",
-                "some random error",
-                failure::FailureKind::Unknown,
-                None,
-            ),
-        ];
-        for (case, err, kind, retryable) in cases {
-            let cf = failure::classify(err, None, None);
-            assert_eq!(cf.kind, kind, "{case}");
-            if let Some(want) = retryable {
-                assert_eq!(cf.retryable, want, "{case}");
-            }
-        }
-        // headless's is_rate_limited should also detect 429
+    fn is_rate_limited_detects_429() {
         let outcome = crate::headless::HarnessOutcome {
             response: String::new(),
             tokens_in: 0,
@@ -35295,44 +35261,6 @@ mod kind_classify_headless_tests {
             error: Some("429 Too Many Requests".to_string()),
         };
         assert!(is_rate_limited(&outcome));
-    }
-
-    #[test]
-    fn kind_classify_headless_one_shot_fallback_fires_once_then_kind() {
-        let mut registry = crate::models::ModelRegistry::default();
-        registry.models.insert(
-            "headless/primary".to_string(),
-            crate::models::ModelEntry {
-                cost_in_per_mtok: 0.0,
-                cost_out_per_mtok: 0.0,
-                caps: vec![],
-                fallback: Some("headless/fallback".to_string()),
-                effort: None,
-                tier: None,
-            },
-        );
-        registry.models.insert(
-            "headless/fallback".to_string(),
-            crate::models::ModelEntry {
-                cost_in_per_mtok: 0.0,
-                cost_out_per_mtok: 0.0,
-                caps: vec![],
-                fallback: None,
-                effort: None,
-                tier: None,
-            },
-        );
-        let fb = registry
-            .get("headless/primary")
-            .and_then(|m| m.fallback.clone());
-        assert_eq!(fb, Some("headless/fallback".to_string()));
-        let fb2 = registry
-            .get("headless/fallback")
-            .and_then(|m| m.fallback.clone());
-        assert_eq!(fb2, None);
-        let cf = failure::classify("429 quota exceeded", None, None);
-        assert_eq!(cf.kind, failure::FailureKind::RateLimit);
-        assert!(cf.retryable);
     }
 }
 
