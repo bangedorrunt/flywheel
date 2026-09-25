@@ -1192,7 +1192,6 @@ steps:
       stage: wave-gate
       task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` to the label; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. Objective: {{inputs.objective}}'
     on_error: fail_run
-    error_kinds: [timeout, rate_limit, unknown]
   - name: dispatch
     action: dispatch_job
     assignee: x
@@ -1201,7 +1200,6 @@ steps:
       stage: wave-dispatch
       task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage ce-execute --param payload per bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. Objective: {{inputs.objective}}'
     on_error: fail_run
-    error_kinds: [timeout, rate_limit, unknown]
   - name: execute
     action: dispatch_job
     assignee: x
@@ -1210,7 +1208,6 @@ steps:
       stage: ce-execute
       task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). Objective: {{inputs.objective}}'
     on_error: fail_run
-    error_kinds: [timeout, rate_limit, unknown]
   - name: observe
     action: dispatch_job
     assignee: x
@@ -1227,7 +1224,6 @@ steps:
       stage: ce-review
       task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
     on_error: fail_run
-    error_kinds: [timeout, rate_limit, unknown]
   - name: verify
     action: dispatch_job
     assignee: x
@@ -1236,7 +1232,6 @@ steps:
       stage: wave-verify
       task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). Objective: {{inputs.objective}}'
     on_error: fail_run
-    error_kinds: [timeout, rate_limit, unknown]
   - name: compound
     action: dispatch_job
     assignee: x
@@ -1280,7 +1275,6 @@ graph:
         context: fresh
         task: "Repair iteration 1 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}} (read the file, do not trust prompt). VERIFY: {{inputs.verify}}"
       on_error: fail_run
-      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     evaluate-1:
       needs: [repair-1]
       action: dispatch_job
@@ -1292,7 +1286,6 @@ graph:
         plan: "Repair iteration 1 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}."
         task: "Evaluate iteration 1 and return the ce-evaluate JSON contract."
       on_error: fail_run
-      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-1:
       needs: [evaluate-1]
       action: verify
@@ -1307,7 +1300,6 @@ graph:
         context: fresh
         task: "Repair iteration 2 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}}."
       on_error: fail_run
-      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     evaluate-2:
       needs: [repair-2]
       action: dispatch_job
@@ -1319,7 +1311,6 @@ graph:
         plan: "Repair iteration 2 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}. Prior evaluator report: {{steps.evaluate-1}}"
         task: "Evaluate iteration 2 and return the ce-evaluate JSON contract."
       on_error: fail_run
-      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-2:
       needs: [evaluate-2]
       action: verify
@@ -1334,7 +1325,6 @@ graph:
         context: fresh
         task: "Repair iteration 3 for {{inputs.bead_id}}."
       on_error: fail_run
-      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     evaluate-3:
       needs: [repair-3]
       action: dispatch_job
@@ -1346,7 +1336,6 @@ graph:
         plan: "Repair iteration 3 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}. Prior evaluator report: {{steps.evaluate-2}}"
         task: "Evaluate iteration 3 and return the ce-evaluate JSON contract."
       on_error: fail_run
-      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
     verify-3:
       needs: [evaluate-3]
       action: verify
@@ -1367,7 +1356,6 @@ graph:
         - action: verify
           command: "false 'no verify succeeded — repair loop exhausted without a passing VERIFY'"
           on_error: fail_run
-      error_kinds: [rate_limit, timeout, blocked, auth, cancelled, unknown]
 "#,
     ),
     // ---- ADR-0008 §6.7 beads-lifecycle compose token (bd-adr0008-token-yaml-kimg) ------

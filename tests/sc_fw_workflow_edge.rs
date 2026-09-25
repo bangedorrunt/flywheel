@@ -274,7 +274,6 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
                 name: Some("send-0".into()),
                 guard: None,
                 on_error: Default::default(),
-                error_kinds: Vec::new(),
                 build_slot: false,
                 action: Action::DispatchJob {
                     assignee: "pi".into(),
@@ -293,7 +292,6 @@ async fn sc_fw_absorbed_legacy_workflow_round_trips_through_engine() {
                 name: Some("wait-0".into()),
                 guard: None,
                 on_error: Default::default(),
-                error_kinds: Vec::new(),
                 build_slot: false,
                 action: Action::Delay { secs: 0 },
             },

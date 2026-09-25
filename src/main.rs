@@ -3661,8 +3661,8 @@ fn spawn_item_kind(
 }
 
 /// Model + role-model launch args for a profiled spawn (bd-eign.9): the
-/// per-harness `-m <model>` / `--model=<model>` flag (headless.rs) plus the
-/// omp role flags (`--smol`/`--slow`/`--plan`, bd-gsvn.2). Order matters —
+/// per-harness `-m <model>` / `--model <model>` / `--model=<model>` flag plus
+/// the omp role flags (`--smol`/`--slow`/`--plan`, bd-gsvn.2). Order matters —
 /// flags precede any launch text (peer template) so a one-shot-capable
 /// harness (opencode) does not swallow the flags as a prompt.
 ///
@@ -4081,7 +4081,7 @@ mod spawn_profile_plan_tests {
         let p = profile("opencode", "deepseek-v4-flash");
         assert_eq!(
             profile_launch_args("opencode", &p, None).expect("opencode"),
-            vec!["-m", "opencode-go/deepseek-v4-flash"]
+            vec!["--model", "opencode-go/deepseek-v4-flash"]
         );
         let pi = profile("pi", "glm-5.3");
         assert_eq!(
@@ -4258,7 +4258,7 @@ mod spawn_profile_plan_tests {
         let args = bare_model_launch_args("opencode", "", "").expect("cheap implied");
         assert_eq!(
             args,
-            vec!["-m", "opencode/big-pickle"],
+            vec!["--model", "opencode/big-pickle"],
             "opencode spawn without --model uses the cheap slot: {args:?}"
         );
         let args = bare_model_launch_args("pi", "", "").expect("standard implied");
@@ -4395,7 +4395,7 @@ mod spawn_profile_plan_tests {
         assert_eq!(
             profile_launch_args("opencode", &profile("opencode", "big-pickle"), None)
                 .expect("capped harness ok"),
-            vec!["-m", "opencode/big-pickle"]
+            vec!["--model", "opencode/big-pickle"]
         );
         // A role model (smol) is held to the same standard.
         let mut role = profile("omp", "deepseek-v4-flash");
@@ -4413,7 +4413,7 @@ mod spawn_profile_plan_tests {
         args.extend(vec!["peer template".to_string()]);
         assert_eq!(
             args,
-            vec!["-m", "opencode-go/deepseek-v4-flash", "peer template"]
+            vec!["--model", "opencode-go/deepseek-v4-flash", "peer template"]
         );
     }
 
@@ -14840,6 +14840,71 @@ fn running_run_row_exists(project: &str, run_id: &str) -> bool {
         == Some("running")
 }
 
+/// Keeps a composed run's pre-spawn lifecycle row terminal across every exit.
+struct ComposeRunLifecycle {
+    project: String,
+    workflow: String,
+    run_id: String,
+    terminal: bool,
+}
+
+impl ComposeRunLifecycle {
+    fn start(project: &str, workflow: &str, run_id: &str, crew: impl serde::Serialize) -> Self {
+        log(
+            project,
+            EventKind::Workflow,
+            json!({
+                "workflow": workflow,
+                "status": "running",
+                "crew": crew,
+                "run_id": run_id,
+                "mode": "pane",
+                "started": state::now_iso(),
+            }),
+        );
+        Self {
+            project: project.to_string(),
+            workflow: workflow.to_string(),
+            run_id: run_id.to_string(),
+            terminal: false,
+        }
+    }
+
+    fn fail(&mut self, error: &str) {
+        if self.terminal {
+            return;
+        }
+        log(
+            &self.project,
+            EventKind::Workflow,
+            json!({
+                "workflow": self.workflow,
+                "status": "failed",
+                "run_id": self.run_id,
+                "mode": "pane",
+                "error": error,
+            }),
+        );
+        self.terminal = true;
+    }
+
+    fn finish(&mut self, data: Value) {
+        if self.terminal {
+            return;
+        }
+        log(&self.project, EventKind::Workflow, data);
+        self.terminal = true;
+    }
+}
+
+impl Drop for ComposeRunLifecycle {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.fail("compose host exited before terminal transition");
+        }
+    }
+}
+
 /// One lifecycle read-back for a pane, by target or name.
 fn read_pane_status(c: &mut Client, target: &str, name: &str) -> Option<String> {
     c.agent_list().ok().and_then(|list| {
@@ -23990,6 +24055,30 @@ mod run_ledger_truth_tests {
         assert_eq!(run_list_row("flywheel", &nullish)["artifacts"], json!([]));
     }
 
+    #[test]
+    fn stale_composed_run_guard_terminalizes_on_scope_exit() {
+        let _g = crate::config::test_state_home();
+        let project = format!("compose-lifecycle-test-{}", std::process::id());
+        let run_id = "compose-run-1";
+        let lifecycle =
+            crate::ComposeRunLifecycle::start(&project, "compose-test", run_id, json!([]));
+        drop(lifecycle);
+
+        let events = crate::state::read_log(&project).expect("compose lifecycle log");
+        let latest = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.data.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
+            })
+            .expect("terminal lifecycle row");
+        assert_eq!(latest.data["status"], json!("failed"));
+        assert_eq!(
+            latest.data["error"],
+            json!("compose host exited before terminal transition")
+        );
+    }
+
     /// `--robot-snapshot` feeds agents, so its run rows obey the same honesty
     /// rule as `runs list`: a status-less row reads `unknown`, never a
     /// defaulted `done`.
@@ -25758,17 +25847,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                      workflow history`, or pass a fresh --idempotency-key."
                 );
             }
-            log(
+            let mut lifecycle = ComposeRunLifecycle::start(
                 project_name,
-                EventKind::Workflow,
-                json!({
-                    "workflow": wf_name,
-                    "status": "running",
-                    "crew": crew_plan.members,
-                    "run_id": run_id,
-                    "mode": "pane",
-                    "started": state::now_iso(),
-                }),
+                &wf_name,
+                &run_id,
+                crew_plan.members.clone(),
             );
             let mut catalog = profile::ProfileCatalog::load()?;
             catalog.apply_role_models(role_model)?;
@@ -25881,17 +25964,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         // CLOSE its `running` row — a stuck running row would
                         // make the idempotency adopt-or-refuse guard refuse
                         // every future retry of the same key.
-                        log(
-                            project_name,
-                            EventKind::Workflow,
-                            json!({
-                                "workflow": wf_name,
-                                "status": "failed",
-                                "run_id": run_id,
-                                "mode": "pane",
-                                "error": e.to_string(),
-                            }),
-                        );
+                        lifecycle.fail(&e.to_string());
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
                         return Err(e);
                     }
@@ -25941,22 +26014,18 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             let terminal = run_terminal_status(&output);
             let artifact_paths = write_terminal_artifact(project_name, &run_id, &output, terminal);
             let action_stage = output_action_stage(&output);
-            log(
-                project_name,
-                EventKind::Workflow,
-                json!({
-                    "workflow": wf_name,
-                    "status": terminal,
-                    "crew": crew_plan.members,
-                    "run_id": run_id,
-                    "mode": "pane",
-                    "panes": entries.len(),
-                    "reaped": reaped,
-                    "policy_events": policy_receipts_count,
-                    "artifact_paths": artifact_paths,
-                    "stage": action_stage,
-                }),
-            );
+            lifecycle.finish(json!({
+                "workflow": wf_name,
+                "status": terminal,
+                "crew": crew_plan.members,
+                "run_id": run_id,
+                "mode": "pane",
+                "panes": entries.len(),
+                "reaped": reaped,
+                "policy_events": policy_receipts_count,
+                "artifact_paths": artifact_paths,
+                "stage": action_stage,
+            }));
             // W6 (§3.7 T3): graduate a GREEN composed run into the project
             // catalog. Green = invoke returned Ok and the derived terminal
             // status is not "failed" (same signal the ledger row records).

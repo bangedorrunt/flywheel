@@ -118,7 +118,7 @@ async fn start_mcp(port: u16, stdio: bool) -> Result<()> {
         let res = if stdio {
             toron_mcp::serve_stdio().await
         } else {
-            toron_mcp::serve_http(&format!("127.0.0.1:{port}")).await
+            toron_mcp::serve_http(&format!("127.0.0.1:{port}"), &[]).await
         };
         let _ = tx.send(res);
     });

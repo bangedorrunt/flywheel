@@ -563,7 +563,6 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
                     name: Some(format!("send-{i}")),
                     guard: None,
                     on_error: Default::default(),
-                    error_kinds: Vec::new(),
                     build_slot: false,
                     action: Action::DispatchJob {
                         assignee: to.clone(),
@@ -586,7 +585,6 @@ fn absorb_workflow_steps(name: &str, steps: &[LegacyStep]) -> (Workflow, Vec<Map
                     name: Some(format!("wait-{i}")),
                     guard: None,
                     on_error: Default::default(),
-                    error_kinds: Vec::new(),
                     build_slot: false,
                     action: Action::Delay {
                         // Round UP (is1.5): integer division truncates a
@@ -628,7 +626,6 @@ fn absorb_pipeline(name: &str, chain: &[String]) -> (Workflow, Vec<MappingNote>)
             name: Some(format!("call-{i}")),
             guard: None,
             on_error: Default::default(),
-            error_kinds: Vec::new(),
             build_slot: false,
             action: Action::CallWorkflow {
                 workflow: wf_name.clone(),
@@ -960,7 +957,6 @@ msg = "legacy triage"
                 name: Some("leaf".into()),
                 guard: None,
                 on_error: Default::default(),
-                error_kinds: Vec::new(),
                 build_slot: false,
                 action: Action::DispatchJob {
                     assignee: "x".into(),
