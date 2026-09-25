@@ -1480,55 +1480,13 @@ pub enum CrossScopeDeny {
     Store(doorbell_rt::subscribe::Refusal),
 }
 
-/// The `br`-shaped command seam: `(cmd, args, stdin) -> Some(stdout)`, or
-/// `None` when the command could not run. Prod shells out to `br`; tests
-/// inject a closure so the cross-project sweep stays offline.
-#[cfg(test)]
-type BlockRun<'a> = &'a dyn Fn(&str, &[&str], Option<&str>) -> Option<String>;
-
-#[cfg(test)]
-pub fn check_external_unblocks_in(
-    project: &str,
-    foreign_paths: &std::collections::HashMap<String, String>,
-    run: BlockRun<'_>,
-    cross_on: bool,
-) -> Vec<String> {
-    if !cross_on {
-        return Vec::new();
-    }
-    let holds_raw = run("br", &["hold", "--list", "--json"], None).unwrap_or_default();
-    let holds: serde_json::Value =
-        serde_json::from_str(&holds_raw).unwrap_or(serde_json::Value::Null);
-    let rows = holds
-        .get("holds")
-        .and_then(|h| h.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut rerung = Vec::new();
-    for row in rows {
-        let corr = row.get("corr").and_then(|c| c.as_str()).unwrap_or("");
-        let Some((fproj, fbead)) = parse_external_corr(corr) else {
-            continue;
-        };
-        let Some(fpath) = foreign_paths.get(&fproj) else {
-            continue;
-        };
-        let show = run("br", &["show", &fbead, "--json"], Some(fpath)).unwrap_or_default();
-        let st = serde_json::from_str::<serde_json::Value>(&show)
-            .ok()
-            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
-            .unwrap_or_default();
-        if st != "closed" {
-            continue;
-        }
-        run("br", &["hold", "--resolve", "--corr", corr], None);
-        let summary = format!("external {fproj}:{fbead} closed — re-ring {corr}");
-        if crate::append_pending_fact(project, &summary).is_ok() {
-            rerung.push(corr.to_string());
-        }
-    }
-    rerung
-}
+// A test-only external-unblock sweep used to live here, with its own
+// `br`-shaped command seam and `parse_external_corr` copy. It is deleted: the
+// live path is `doorbell_rt::pollers::spawn_external_rering` (called from
+// `src/doorbell_host.rs`), whose `detect_external_closed` covers the same corr
+// parse plus fire-once, and which refuses ids containing a quote. The copy
+// also resolved the hold itself — a job the live poller deliberately leaves to
+// the waiter — so keeping it risked two answers to one question.
 
 #[cfg(test)]
 pub fn journal_append(
@@ -1570,17 +1528,6 @@ pub fn journal_file(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir
         .join("journals")
         .join(format!("doorbell-journal-{workspace}.jsonl"))
-}
-
-/// Parse an external-block corr (`external:<project>:<bead>`).
-#[cfg(test)]
-pub fn parse_external_corr(corr: &str) -> Option<(String, String)> {
-    let rest = corr.strip_prefix("external:")?;
-    let (proj, bead) = rest.split_once(':')?;
-    if proj.is_empty() || bead.is_empty() {
-        return None;
-    }
-    Some((proj.to_string(), bead.to_string()))
 }
 
 #[cfg(test)]
@@ -3440,67 +3387,6 @@ mod tests {
             Err(CrossScopeDeny::NoSubscription)
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn external_corr_parses() {
-        assert_eq!(
-            parse_external_corr("external:toron:bd-9"),
-            Some(("toron".to_string(), "bd-9".to_string()))
-        );
-        assert_eq!(parse_external_corr("captain:abc"), None);
-        assert_eq!(parse_external_corr("external:onlyproj"), None);
-        assert_eq!(parse_external_corr("external::bd-1"), None);
-    }
-
-    #[test]
-    fn external_rering_closed_resolves() {
-        // bd-asr2.18: foreign close -> resolve + one wake; open/non-external
-        // rows skipped; flag off -> empty.
-        use std::sync::{Arc, Mutex};
-        let resolved: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let r2 = resolved.clone();
-        let run = move |cmd: &str, args: &[&str], _dir: Option<&str>| -> Option<String> {
-            if cmd == "br" && args.get(1) == Some(&"--list") {
-                return Some(
-                    r#"{"holds":[{"corr":"external:fp:bd-1"},{"corr":"external:fp:bd-2"},{"corr":"local:xyz"}]}"#.to_string(),
-                );
-            }
-            if cmd == "br" && args.first() == Some(&"show") {
-                let st = if args.get(1) == Some(&"bd-1") {
-                    "closed"
-                } else {
-                    "open"
-                };
-                return Some(format!(r#"{{"id":"x","status":"{st}"}}"#));
-            }
-            if cmd == "br" && args.contains(&"--resolve") {
-                if let Some(pos) = args.iter().position(|a| *a == "--corr") {
-                    r2.lock().unwrap().push(args[pos + 1].to_string());
-                }
-                return Some("{}".to_string());
-            }
-            None
-        };
-        let mut paths = std::collections::HashMap::new();
-        paths.insert("fp".to_string(), "/tmp".to_string());
-        let proj = "xw-test-probe";
-        let got = check_external_unblocks_in(proj, &paths, &run, true);
-        assert_eq!(got, vec!["external:fp:bd-1".to_string()]);
-        assert_eq!(
-            *resolved.lock().unwrap(),
-            vec!["external:fp:bd-1".to_string()]
-        );
-        // One queued wake; clean up the probe's pending file.
-        let pend = crate::config::state_dir()
-            .join("facts")
-            .join(format!("{}-pending.jsonl", crate::state::state_key(proj)));
-        let body = std::fs::read_to_string(&pend).unwrap_or_default();
-        assert!(body.contains("external:fp:bd-1"), "one wake queued");
-        let _ = std::fs::remove_file(&pend);
-        // Flag off: silent empty, no runner calls matter.
-        let none = check_external_unblocks_in(proj, &paths, &run, false);
-        assert!(none.is_empty());
     }
 
     fn inject_cleanup(proj: &str) {

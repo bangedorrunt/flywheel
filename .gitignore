@@ -13,10 +13,8 @@ agents/
 .archive.lock
 
 # mailbox archive leaked into the source worktree (durable root is XDG)
-messages/
 .projected/
 .beads/beads.db-wal-cert*
-toron-data/
 
 # nightly rustc internal-compiler-error dumps (a compiler crash, not repo state)
 rustc-ice-*.txt
