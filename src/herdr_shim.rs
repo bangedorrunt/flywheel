@@ -1665,17 +1665,38 @@ mod herdr_env_tests {
 mod sanitize_pane_text_tests {
     use super::sanitize_pane_text;
 
+    /// One row per strip contract — CSI color/cursor/erase, OSC title,
+    /// one-shot escapes, glyph families, and the plain/empty/unterminated
+    /// edges. Same bytes in, same bytes out as the nine tests this replaces;
+    /// the row name is what a failure reports.
     #[test]
-    fn strips_csi_color_sequences() {
-        assert_eq!(
-            sanitize_pane_text("\u{1b}[31mred\u{1b}[0m and \u{1b}[1;32mbold green\u{1b}[m"),
-            "red and bold green"
-        );
-    }
-
-    #[test]
-    fn strips_csi_cursor_and_erase_sequences() {
-        assert_eq!(sanitize_pane_text("a\u{1b}[2Kb\u{1b}[1;1Hc"), "abc");
+    fn sanitize_pane_text_rows() {
+        let rows = [
+            (
+                "csi-color",
+                "\u{1b}[31mred\u{1b}[0m and \u{1b}[1;32mbold green\u{1b}[m",
+                "red and bold green",
+            ),
+            ("csi-cursor-erase", "a\u{1b}[2Kb\u{1b}[1;1Hc", "abc"),
+            (
+                "osc-title-bel",
+                "before\u{1b}]0;term-title\u{07}after",
+                "beforeafter",
+            ),
+            (
+                "one-shot-escapes",
+                "abc\u{1b}7def\u{1b}8ghi\u{1b}=j",
+                "abcdefghij",
+            ),
+            ("double-line-heavy-box", "╔═══╗ ║ ╠ ╣ ╦ ╩ ╬", "      "),
+            ("block-element-shade", "▀▄█░▒▓text", "text"),
+            ("plain-unchanged", "hello world", "hello world"),
+            ("empty-unchanged", "", ""),
+            ("unterminated-csi", "lead\u{1b}[31m", "lead"),
+        ];
+        for (name, input, expected) in rows {
+            assert_eq!(sanitize_pane_text(input), expected, "row {name}");
+        }
     }
 
     #[test]
@@ -1687,56 +1708,15 @@ mod sanitize_pane_text_tests {
     }
 
     #[test]
-    fn strips_osc_title_with_bel_terminator() {
-        assert_eq!(
-            sanitize_pane_text("before\u{1b}]0;term-title\u{07}after"),
-            "beforeafter"
-        );
-    }
-
-    #[test]
-    fn strips_one_shot_escapes() {
-        assert_eq!(
-            sanitize_pane_text("abc\u{1b}7def\u{1b}8ghi\u{1b}=j"),
-            "abcdefghij"
-        );
-    }
-
-    #[test]
     fn strips_box_drawing_border_glyphs() {
         let border = "┏━━━━━━┓\n┃ ok   ┃\n┗━━━━━━┛";
         assert_eq!(sanitize_pane_text(border), "\n ok   \n");
     }
 
     #[test]
-    fn strips_double_line_and_heavy_box_glyphs() {
-        assert_eq!(sanitize_pane_text("╔═══╗ ║ ╠ ╣ ╦ ╩ ╬"), "      ");
-    }
-
-    #[test]
-    fn strips_block_element_and_shade_glyphs() {
-        assert_eq!(sanitize_pane_text("▀▄█░▒▓text"), "text");
-    }
-
-    #[test]
     fn mixed_garbled_tui_output_becomes_readable() {
         let raw = "\u{1b}[2J\u{1b}[H╔═╗ \u{1b}[1;32mREADY\u{1b}[0m ═╝\u{1b}[?25l";
         assert_eq!(sanitize_pane_text(raw), " READY ");
-    }
-
-    #[test]
-    fn plain_content_unchanged() {
-        assert_eq!(sanitize_pane_text("hello world"), "hello world");
-    }
-
-    #[test]
-    fn empty_string_unchanged() {
-        assert_eq!(sanitize_pane_text(""), "");
-    }
-
-    #[test]
-    fn unterminated_csi_dropped() {
-        assert_eq!(sanitize_pane_text("lead\u{1b}[31m"), "lead");
     }
 }
 

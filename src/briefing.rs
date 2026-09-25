@@ -1021,63 +1021,49 @@ mod tests {
         );
     }
 
+    /// One row per briefing family: goal -> topology + workflow, plus the
+    /// crew/model questions and the family line in `alternatives`. The rows
+    /// are the six tests this replaces, byte-for-byte on the inputs.
     #[test]
-    fn briefing_covers_refactor_swarm() {
-        let b = assemble("refactor the auth module", &world_empty(), &[], 5);
-        assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.workflow, "refactoring");
-        assert!(has_crew_and_model_questions(&b));
-        assert_family_surfaced(&b, "refactoring");
-    }
-
-    #[test]
-    fn briefing_covers_cron_swarm() {
-        let b = assemble("cron nightly digest", &world_empty(), &[], 5);
-        assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.workflow, "cron-start");
-        assert!(has_crew_and_model_questions(&b));
-        assert_family_surfaced(&b, "cron-start");
-    }
-
-    #[test]
-    fn briefing_covers_coalition_swarm() {
-        let b = assemble("coalition shared-file contention", &world_empty(), &[], 5);
-        assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.workflow, "coalition-form");
-        assert!(has_crew_and_model_questions(&b));
-        assert_family_surfaced(&b, "coalition-form");
-    }
-
-    #[test]
-    fn briefing_covers_debate_swarm() {
-        let b = assemble("debate the api design", &world_empty(), &[], 5);
-        assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.workflow, "debate");
-        assert!(has_crew_and_model_questions(&b));
-        assert_family_surfaced(&b, "debate");
-    }
-
-    #[test]
-    fn briefing_covers_forensics_open() {
-        let b = assemble(
-            "diagnose the mailbox leak: spindump the idle cpu",
-            &world_empty(),
-            &[],
-            5,
-        );
-        assert_eq!(b.proposal.topology, "open");
-        assert_eq!(b.proposal.workflow, "forensics");
-        assert!(has_crew_and_model_questions(&b));
-        assert_family_surfaced(&b, "forensics");
-    }
-
-    #[test]
-    fn briefing_covers_single_lane_steer() {
-        let b = assemble("crew-steer the peer mention fix", &world_empty(), &[], 5);
-        assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.workflow, "steer");
-        assert!(has_crew_and_model_questions(&b));
-        assert_family_surfaced(&b, "steer");
+    fn briefing_covers_families() {
+        let rows = [
+            (
+                "refactor-swarm",
+                "refactor the auth module",
+                "swarm",
+                "refactoring",
+            ),
+            ("cron-swarm", "cron nightly digest", "swarm", "cron-start"),
+            (
+                "coalition-swarm",
+                "coalition shared-file contention",
+                "swarm",
+                "coalition-form",
+            ),
+            ("debate-swarm", "debate the api design", "swarm", "debate"),
+            (
+                "forensics-open",
+                "diagnose the mailbox leak: spindump the idle cpu",
+                "open",
+                "forensics",
+            ),
+            (
+                "single-lane-steer",
+                "crew-steer the peer mention fix",
+                "swarm",
+                "steer",
+            ),
+        ];
+        for (name, goal, topology, workflow) in rows {
+            let b = assemble(goal, &world_empty(), &[], 5);
+            assert_eq!(b.proposal.topology, topology, "row {name}: topology");
+            assert_eq!(b.proposal.workflow, workflow, "row {name}: workflow");
+            assert!(
+                has_crew_and_model_questions(&b),
+                "row {name}: crew + model questions"
+            );
+            assert_family_surfaced(&b, workflow);
+        }
     }
 
     #[test]

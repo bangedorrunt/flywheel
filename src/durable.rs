@@ -10365,45 +10365,32 @@ mod tests {
 
     // ---- adaptive poll interval (bd-adaptive-interval) ----
 
+    /// One row per cadence contract (base 300s, active 30s): settled states
+    /// ride the base cadence, working/blocked/unknown are unsettled, and a
+    /// dispatch forces the active cadence because states are PRE-action (an
+    /// idle agent that just received a queue item works during the sleep).
     #[test]
-    fn next_interval_working_is_active() {
-        let states = vec![st("a", "working")];
-        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 30);
-    }
-
-    #[test]
-    fn next_interval_blocked_is_active() {
-        let states = vec![st("a", "blocked")];
-        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 30);
-    }
-
-    #[test]
-    fn next_interval_all_idle_is_base() {
-        let states = vec![st("a", "idle"), st("b", "done")];
-        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 300);
-    }
-
-    #[test]
-    fn next_interval_dispatch_forces_active() {
-        // states are PRE-action: an idle agent that just received a queue item
-        // will be working during the sleep — a dispatch must force the active
-        // cadence or the swarm drains at base speed
-        let states = vec![st("a", "idle")];
-        assert_eq!(next_interval_secs(&states, true, false, 300, 30), 30);
-    }
-
-    #[test]
-    fn next_interval_all_done_is_base() {
-        let states = vec![st("a", "done")];
-        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 300);
-    }
-
-    #[test]
-    fn next_interval_unknown_is_active() {
-        // unknown counts as unsettled → active cadence, so pending repairs
-        // (bd-unknown-respawn) proceed promptly
-        let states = vec![st("a", "unknown")];
-        assert_eq!(next_interval_secs(&states, false, false, 300, 30), 30);
+    fn next_interval_rows() {
+        let rows = [
+            ("working-active", vec![st("a", "working")], false, 30),
+            ("blocked-active", vec![st("a", "blocked")], false, 30),
+            (
+                "all-idle-base",
+                vec![st("a", "idle"), st("b", "done")],
+                false,
+                300,
+            ),
+            ("dispatch-forces-active", vec![st("a", "idle")], true, 30),
+            ("all-done-base", vec![st("a", "done")], false, 300),
+            ("unknown-active", vec![st("a", "unknown")], false, 30),
+        ];
+        for (name, states, dispatched, expected) in rows {
+            assert_eq!(
+                next_interval_secs(&states, dispatched, false, 300, 30),
+                expected,
+                "row {name}"
+            );
+        }
     }
 
     #[test]

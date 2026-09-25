@@ -1146,36 +1146,36 @@ mod tests {
         assert_eq!(plan, VerifierPlan::NoneRequired);
     }
 
-    /// P0 (priority <= 1) with a second family: dispatch the different-family
-    /// verifier.
+    /// One row per P0 (priority <= 1) verifier plan: a second family
+    /// dispatches the different-family id, a single-family swarm degrades
+    /// (blocked verifier-family-missing, one captain mail, no respawn loop).
     #[test]
-    fn verifier_plan_dispatches_different_family_for_p0() {
-        let reg = reg_with_keys(&["deepseek/deepseek-v4", "anthropic/opus-5"]);
-        let b = bead(0, Blast::Normal, true);
-        let plan = reg.verifier_plan(
-            &b,
-            AcShape::Checkable,
-            "deepseek/deepseek-v4",
-            &["deepseek/deepseek-v4", "anthropic/opus-5"],
-            None,
-        );
-        assert_eq!(plan, VerifierPlan::Dispatch("anthropic/opus-5".into()));
-    }
-
-    /// Single-family swarm + P0: Degrade (blocked verifier-family-missing,
-    /// one captain mail, no respawn loop).
-    #[test]
-    fn verifier_plan_degrades_single_family_for_p0() {
-        let reg = reg_with_keys(&["deepseek/deepseek-v4", "deepseek/deepseek-v3"]);
-        let b = bead(0, Blast::Normal, true);
-        let plan = reg.verifier_plan(
-            &b,
-            AcShape::Checkable,
-            "deepseek/deepseek-v4",
-            &["deepseek/deepseek-v4", "deepseek/deepseek-v3"],
-            None,
-        );
-        assert_eq!(plan, VerifierPlan::Degrade);
+    fn verifier_plan_p0_rows() {
+        let rows = [
+            (
+                "second-family-dispatches",
+                reg_with_keys(&["deepseek/deepseek-v4", "anthropic/opus-5"]),
+                &["deepseek/deepseek-v4", "anthropic/opus-5"][..],
+                VerifierPlan::Dispatch("anthropic/opus-5".into()),
+            ),
+            (
+                "single-family-degrades",
+                reg_with_keys(&["deepseek/deepseek-v4", "deepseek/deepseek-v3"]),
+                &["deepseek/deepseek-v4", "deepseek/deepseek-v3"][..],
+                VerifierPlan::Degrade,
+            ),
+        ];
+        for (name, reg, candidates, expected) in rows {
+            let b = bead(0, Blast::Normal, true);
+            let plan = reg.verifier_plan(
+                &b,
+                AcShape::Checkable,
+                "deepseek/deepseek-v4",
+                candidates,
+                None,
+            );
+            assert_eq!(plan, expected, "row {name}");
+        }
     }
 
     /// Judgment AC always needs a verifier (ReviewerSigned); single-family +

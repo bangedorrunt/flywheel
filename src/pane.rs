@@ -3181,15 +3181,22 @@ mod bd_5yzp_tests {
         assert!(e.contains("WittyAnt"), "carries agent: {e}");
     }
 
+    /// One row per source preference: real stderr wins, a whitespace-only
+    /// stderr falls back to stdout (bd-5yzp: never error:'').
     #[test]
-    fn stderr_wins_over_stdout() {
-        let e = dispatch_failure_error("coder", "WittyAnt", "some stdout", "boom stderr");
-        assert_eq!(e, "boom stderr");
-    }
-
-    #[test]
-    fn stdout_used_when_stderr_empty() {
-        let e = dispatch_failure_error("coder", "WittyAnt", "some stdout", "  \n ");
-        assert_eq!(e, "some stdout");
+    fn dispatch_failure_error_prefers_real_stderr() {
+        let rows = [
+            ("stderr-wins", "some stdout", "boom stderr", "boom stderr"),
+            (
+                "stdout-when-stderr-blank",
+                "some stdout",
+                "  \n ",
+                "some stdout",
+            ),
+        ];
+        for (name, stdout, stderr, expected) in rows {
+            let e = dispatch_failure_error("coder", "WittyAnt", stdout, stderr);
+            assert_eq!(e, expected, "row {name}");
+        }
     }
 }
