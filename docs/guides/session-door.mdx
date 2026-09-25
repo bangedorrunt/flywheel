@@ -17,6 +17,14 @@ spawning. Non-TTY `briefing --commit` on a spawn-class topology refuses
 without `--yes`; TTY asks inline. Cron/loop dispatch never routes through
 briefing and is unattended by design.
 
+If it fails: `arrive` is refused because the pin is not registered in this
+project. Pins are per-project, so a pin that works in one repo misses in
+another until it is registered there. Register it once and reuse the same
+npub — `flywheel mail register <project> --name <pin> --from-project <other>`
+— rather than minting a second key for a name that already exists. A second
+key for a taken pin is a different identity wearing the same name, and the
+whois resolution will not agree with the ledger.
+
 ## What arrive does
 
 - Publishes presence (kind 20001) for the pin.

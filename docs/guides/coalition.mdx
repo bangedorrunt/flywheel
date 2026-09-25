@@ -24,6 +24,21 @@ flywheel coalition list
 flywheel coalition disband <id>    # beads-closed gate first; auto-fallback on run terminal/timeout
 ```
 
+```text
+beads-20260810002826-310488000 [active] goal beads members 2
+beads-20260810103343-941824000 [closed] goal beads members 1
+```
+
+Register before forming, always: a member must already be a registered agent in
+the coalition's toron project, and a profile is not an agent. `register` takes
+the name positionally and the project with `--project`, so the common mistake is
+reaching for `--as` and getting an argument error instead.
+
+If it fails: `coalition form` refuses because a member is not registered. That
+is a hard gate rather than a warning, because the channel's membership is its
+access control — an unregistered member would have no identity to be a member
+under. Register it, then form.
+
 Formation has two paths: captain-formed, or **auto-coalesce** (the detector merges two unaffiliated crews overlapping on non-trivial source paths; README/config/docs do not count).
 
 ## The intent protocol
@@ -50,5 +65,21 @@ flywheel coalition negotiate-respond <id> --as <holder>     # answer or defer
 flywheel coalition negotiate-status <id>                    # pending | responded | escalation-due
 flywheel coalition negotiate-escalate <id>                  # unanswered -> kind-14 DM to the captain
 ```
+
+```text
+pending           · request sent, holder has not answered
+responded         · holder answered (agreed | denied | deferred:<secs>)
+escalation-due    · SLA elapsed with no answer — escalate, do not wait
+```
+
+`negotiate-request` addresses a **reservation**, not a path: it takes
+`--reservation-id` and `--ask`, plus `--as` and `--target`. The request is a
+sealed 1:1, never a room post.
+
+If it fails: `escalation-due` is not a failure of the negotiation, it is the
+ladder telling you the holder is not answering. Escalate to the captain rather
+than resending the request or working around the lease. A granted release comes
+back as a `transfer`, and the target then commits under its own name — nobody
+commits on behalf of somebody else.
 
 `flywheel mail force-unlock` stays the operator's last resort. File overlap between two agents is always a reservation question; the intent tier exists so contention is negotiated before it becomes a block.
