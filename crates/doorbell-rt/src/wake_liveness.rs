@@ -449,7 +449,7 @@ mod tests {
                 silent_for_ms: 100_000
             }
         );
-        assert_eq!(winner.as_deref(), Some("deaf-ws"));
+        assert_eq!(winner, Some("deaf-ws"));
         assert_eq!(ev, None);
         assert_eq!(hb, Some(100_000));
     }

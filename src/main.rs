@@ -13347,7 +13347,18 @@ fn captain_presence_live(project: &str, pin: &str) -> bool {
     let Ok(rows) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
         return false;
     };
-    presence_pins(project).contains(pin)
+    presence_names(&rows).contains(pin)
+}
+
+/// bd-8pis: pin names in a `toron presence list --json` payload.
+fn presence_names(rows: &serde_json::Value) -> HashSet<String> {
+    rows.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// bd-8pis: pins with a presence row in `project` (heartbeats, any state).
@@ -13365,13 +13376,7 @@ fn presence_pins(project: &str) -> HashSet<String> {
     let Ok(rows) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
         return HashSet::new();
     };
-    rows.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|r| r.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    presence_names(&rows)
 }
 
 /// bd-8pis: the herdr pane bound to `pin` (toron whois `pane_id`), if any.
@@ -32176,10 +32181,10 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
 /// (`ensure_daemon_gen`) — not `{workspace}.gen`. Accept both:
 /// - `{slug}.daemon.gen` → label = strip `.daemon.gen`
 /// - `{slug}.gen` → label = file stem
-/// Then reject if the resulting slug still contains `.` (no-dot defense).
-/// Deduplicate so a fleet with both siblings yields one label. Skipping
-/// `.daemon.gen` blinded flywheel serve `/health` → empty hosted → permanent
-/// NeverStamped while watch stamps + doorbell wake were live.
+///   Then reject if the resulting slug still contains `.` (no-dot defense).
+///   Deduplicate so a fleet with both siblings yields one label. Skipping
+///   `.daemon.gen` blinded flywheel serve `/health` → empty hosted → permanent
+///   NeverStamped while watch stamps + doorbell wake were live.
 ///
 /// Alive partition (GS062-ADV-1/ADV-3): FileHost/doorbell write `.daemon.gen` +
 /// `owner-{ws}.json` lease, **not** `{slug}.pid`. Pid-only left stale
@@ -34740,7 +34745,6 @@ mod send_failure_log_tests {
 #[cfg(test)]
 mod first_dispatch_gate_tests {
     use super::*;
-    use crate::state::SentRecord;
 
     fn agent_row(booting: bool) -> AgentInfo {
         AgentInfo {
