@@ -1039,9 +1039,24 @@ msg = "legacy triage"
                 .iter()
                 .any(|row| row.name == "custom" && row.status == "custom")
         );
-        let seeded_stages = fs::read_to_string(dir.join("stages.toml")).unwrap();
+        let seeded_path = dir.join("stages.toml");
+        let seeded_stages = fs::read_to_string(&seeded_path).unwrap();
         assert!(seeded_stages.contains("[operator]"));
         assert!(seeded_stages.contains("keep = \"yes\""));
+        let parsed: toml::Table = toml::from_str(&seeded_stages).unwrap();
+        assert_eq!(
+            parsed["operator"]["keep"].as_str(),
+            Some("yes"),
+            "seeding must preserve unknown top-level user data"
+        );
+
+        let second_seed = seed_user_catalog(&dir).unwrap();
+        assert!(second_seed.created_stages.is_empty());
+        assert_eq!(
+            fs::read_to_string(&seeded_path).unwrap(),
+            seeded_stages,
+            "a no-op seed must not rewrite user stages.toml"
+        );
 
         let mut custom = crate::builtin_workflows::builtin_workflows()["goal"].clone();
         custom.description = Some("operator-owned copy".into());
