@@ -19,7 +19,7 @@ Plain `flywheel interrupt <project> --to <name>` sends Escape by default and ref
 
 ```bash
 flywheel watch <p> --until blocked        # stream state changes
-flywheel loop-mode run <p> --status
+flywheel loop-mode run <p> --robot-status # NOT --status; the loop's readout is a --robot-* door
 flywheel runs pending                     # runs dashboard: state, owner, per-run cost
 flywheel mail digest <p> --all            # at session start and each task boundary
 flywheel snapshot <p>                     # fleet snapshot contract (flywheel-snapshot.v1)
