@@ -68,6 +68,20 @@ flywheel toron setup-mcp --flywheel
 flywheel deps
 ```
 
+```text
+key generated · role=operator · npub=npub1…  (secret not printed)
+daemon installed · com.toron.serve
+daemon started · 127.0.0.1:18080
+project ensured · /path/to/project
+mail (toron): idle
+config: /Users/you/.config/flywheel/config.toml
+```
+
+If it fails: a `DRIFT` line rather than `idle` means flywheel and an installed
+harness disagree about a flag or agent name. `deps --ensure` installs what is
+missing but deliberately cannot resolve drift, because drift needs a decision
+about which side is right. The `WARNING` names the function to update.
+
 ## Start here, agent (every session)
 
 ```bash
@@ -75,6 +89,20 @@ export AGENT_NAME=ToronScribe   # your pin; register once with: toron agent boot
 flywheel arrive <project> --as "$AGENT_NAME"
 flywheel briefing "<goal>" --project <project> --json   # then run its argv
 ```
+
+```text
+ARRIVE  project=<project> dispatcher=absent pins=0 (no live fleet — not joining)
+UNREAD STATUS: all read — no mail owed, no unacked wakes, digest empty
+
+{ "proposal": { "topology": "open", "argv": [] },
+  "world": { "dispatcher": "absent", "pin_count": 1, "ready_beads": 0 } }
+```
+
+If it fails: `dispatcher` reads `present`, which means a fleet is already live.
+A live fleet is a join, never a second compose — starting your own is how two
+crews end up contending for the same files. `topology: none` with an empty
+`argv` is also a legitimate result rather than an error: it means no catalog
+route matched, so declare a trigger or author one with `compose --agent`.
 
 The door is not ceremony. `arrive` publishes presence, drains the session-start report (open decisions, unread status, divergence), and claims the captain alias first-come-first-served. The briefing classifier picks the vehicle: open, loop, swarm, or coalition. You run what it returns. The rulebook and its bypass ledger are in [integration](./integration).
 

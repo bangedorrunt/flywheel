@@ -16,6 +16,18 @@ flywheel workflow compose "<target>" --parts wave-swarm --run --crew 3
 flywheel workflow compose "<t>" --parts "role:coder:ce-execute" --parts "retry(2):each:lane" --run
 ```
 
+```text
+lint: ok · parts=2 · retry(2) wraps each:lane
+crew inferred: coder:1
+without --run this is a lint + preview only; no pane is spawned
+```
+
+If it fails: lint refuses and nothing dispatches. That is fail-stop by design —
+a grammar-valid part can still be rejected for a real contract requirement, for
+example `plan` without its declared input, `review` without a static fan-out, or
+`implement` without an acceptance command. Fix the part rather than reaching for
+a looser form.
+
 | Form | Meaning |
 |---|---|
 | bare stage | dispatch that stage through its declared role |

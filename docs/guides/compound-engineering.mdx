@@ -69,11 +69,35 @@ The integrity hash detects mutation. It is not a signature and does not turn wor
 Inspect a run's evidence with:
 
 ```bash
-flywheel artifacts stitch <run-id> --project <project>
-flywheel artifacts <run-id> --project <project> --json
+flywheel artifacts <run-id> --project <project> --json   # every record for the run
+flywheel artifacts stitch <run-id> --project <project>   # per-record detail
 ```
 
-A missing evaluation artifact is itself a failed gate. Warn mode continues with `gate-warnings`; block mode stops at the link.
+```text
+$ flywheel artifacts fw-composed-2026-09-25T23:14:49Z --project toron --json
+[
+  {
+    "error": "flywheel: agent crew-toro09252314491b-reviewer not found in toron",
+    "failed_step": "reviewer-ce-review-3",
+    "leaf_preview": "{…elided…}",
+    "status": "failed"
+  }
+]
+```
+
+That is a real record off a failed composed run: `failed_step` names the link,
+`leaf_preview` carries the effect's own state (`effect_state: failed`), and
+`status` is host-derived. The escaping in `leaf_preview` is literal — the leaf
+serializes its own JSON into a string field.
+
+If it fails: no records at all means the run never wrote an artifact dir (check
+`flywheel runs list` for the run's state before reading the record). `stitch`
+only reads per-record files: the dir for a composed run holds an outcome record
+(`terminal.json`) with no `path` field, so `stitch` on it stops with
+`flywheel: missing field \`path\`` — use the list form above for outcomes and
+`stitch` once the run has written real `ArtifactRecord`s. A missing evaluation
+artifact is itself a failed gate: warn mode continues with `gate-warnings`,
+block mode stops at the link.
 
 ### 5. Compound the learning
 

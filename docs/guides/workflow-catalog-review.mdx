@@ -102,3 +102,45 @@ flywheel workflow lint <name>
 flywheel workflow seed --json
 flywheel workflow drift --json
 ```
+
+```text
+$ flywheel workflow list --brief --json            # trimmed to the first entry
+{
+  "workflows": [
+    {
+      "compose_token": false,
+      "family": "design-space",
+      "name": "arena",
+      "run": "workflow run arena --execute",
+      "selection": "compare model arms; choose selection rule up front",
+      "topology": "swarm"
+    },
+    …
+  ]
+}
+
+$ flywheel workflow seed --json                    # trimmed
+{
+  "created_stages": [],
+  "created_workflows": [],
+  "kept_stages": ["baseline-measure", "bv-triage", "ce-brainstorm", …]
+}
+
+$ flywheel workflow lint wave-swarm ; echo $?      # clean lint is silent
+0
+$ flywheel workflow lint no-such-workflow-xyz ; echo $?
+flywheel: unknown workflow "no-such-workflow-xyz" (flywheel workflow list)
+1
+```
+
+`lint` printing nothing is the pass signal, so gate it on the exit code. `seed`
+reporting empty `created_*` arrays with populated `kept_*` means the catalog was
+already complete — the one state you want on a re-run.
+
+If it fails: `unknown workflow` from `lint`/`show` means the name you have is
+not in this host's catalog (stage names and workflow names come from the same
+catalog, so check which you are holding). `drift --json` rows carry one of three
+statuses per name — `current` (user tier matches the builtin byte for byte),
+`missing` (no user copy; the builtin resolves), `stale` (a user copy shadows the
+builtin and differs). `stale` is the one to stop on: a user copy always wins
+resolution, so the guide you would follow from the builtin is not what runs.
