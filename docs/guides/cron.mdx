@@ -40,6 +40,21 @@ flywheel cron pause / resume / history / remove weekly-upgrade
 flywheel cron start                   # start or resume the durable cron loops
 ```
 
+```text
+cron lint: ok · schedule "0 3 * * 0" · owner=devops · scope=host · mode=headless
+run  weekly-upgrade  dry-run (25s)  · pass --live to dispatch for real
+catalog: 1 project · 0 global · 7 builtin
+```
+
+`cron run` without `--live` is a dry arm: it performs no effect, so it writes no
+effect-journal row and mints no run. That is why a dry run looks like nothing
+happened — nothing did, on purpose.
+
+If it fails: `cron lint` refuses a schedule whose `owner` profile does not
+exist, because a cron with no owner has no diagnosis workflow to fall back on
+and would fail silently into human-in-the-loop. `lint` always runs first, before
+`start`.
+
 Sources and precedence: built-ins (compiled-in), global (`~/.config/flywheel/crons/`), per-project (`<project>/.flywheel/crons/`). Per-project wins over global wins over built-in.
 
 ## The self-reporting loop (never "self-healing")

@@ -114,8 +114,30 @@ the subscription at an HTTP endpoint instead — the endpoint *is* the human:
 export DOORBELL_WEBHOOK_ALLOWLIST=127.0.0.1   # the daemon's egress allowlist (D6)
 flywheel doorbell subscribe --workspace w1 --pin OperatorPin \
   --sink webhook --url http://127.0.0.1:18999/wake --project myproj
-doorbell restart        # the adapter registers at host start
+flywheel doorbell start myproj             # the adapter registers at host start
 ```
+
+```text
+subscribed: cli-w1-OperatorPin scope=One("w1") sink=webhook
+
+$ flywheel doorbell subscriptions | grep OperatorPin
+cli-w1-OperatorPin identity=Pin("OperatorPin") scope=One("w1") sink=Webhook
+```
+
+The row id is derived from scope + pin (`cli-<workspace>-<pin>`), so a repeat
+subscribe rewrites the same row instead of stacking a second one — a second
+`subscribe` for the same identity reported `subscribed:` again and the store
+still held exactly one matching row. The same id is the handle for
+`flywheel doorbell unsubscribe cli-w1-OperatorPin`. Adding `--extra <workspace>`
+widens the one row instead of adding another: the scope comes back as
+`Many(["w1", "w2"])`.
+
+If it fails: a wake that never arrives is usually the allowlist, not the row.
+Check the row first — `flywheel doorbell subscriptions | grep OperatorPin`
+empty means the subscribe never landed. With the row present but no POST, the
+host was not on `DOORBELL_WEBHOOK_ALLOWLIST`: the daemon refuses it at start and
+the wake stays digest-visible (the refusal line above), which is fail-closed on
+purpose — a wake with no reachable destination is never reported delivered.
 
 What each part buys:
 
