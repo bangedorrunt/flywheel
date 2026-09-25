@@ -2141,28 +2141,28 @@ PRINCIPLES: prove-it-works — ran the fixture suite before plumbing";
         verify_close_reason(reason).expect("legal close reason");
     }
 
-    /// No VERIFY tail → rejected, naming the missing tail.
+    /// One row per rejection, and the error must NAME what is missing: the
+    /// VERIFY tail, the principles citation, or the decision clause after the
+    /// em-dash (a cargo-cult name with nothing after the dash).
     #[test]
-    fn verify_close_reason_rejects_missing_verify_tail() {
-        let err =
-            verify_close_reason("PRINCIPLES: prove-it-works — ran it").expect_err("no VERIFY tail");
-        assert!(err.contains("VERIFY"), "{err}");
-    }
-
-    /// No principles citation → rejected.
-    #[test]
-    fn verify_close_reason_rejects_missing_citation() {
-        let err = verify_close_reason("VERIFY: cargo test -> ok").expect_err("no citation");
-        assert!(err.contains("principles"), "{err}");
-    }
-
-    /// A cargo-cult citation — a known name with NO decision clause after
-    /// the em-dash — is rejected and NAMES the clause.
-    #[test]
-    fn verify_close_reason_rejects_citation_without_decision() {
-        let reason = "VERIFY: cargo test -> ok\nPRINCIPLES: prove-it-works —";
-        let err = verify_close_reason(reason).expect_err("bare name, no decision");
-        assert!(err.contains("prove-it-works"), "must name it: {err}");
+    fn verify_close_reason_rejections() {
+        let rows = [
+            (
+                "missing-verify-tail",
+                "PRINCIPLES: prove-it-works — ran it",
+                "VERIFY",
+            ),
+            ("missing-citation", "VERIFY: cargo test -> ok", "principles"),
+            (
+                "citation-without-decision",
+                "VERIFY: cargo test -> ok\nPRINCIPLES: prove-it-works —",
+                "prove-it-works",
+            ),
+        ];
+        for (name, reason, needle) in rows {
+            let err = verify_close_reason(reason).expect_err(name);
+            assert!(err.contains(needle), "row {name}: {err}");
+        }
     }
 }
 

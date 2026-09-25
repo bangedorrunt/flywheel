@@ -2428,27 +2428,30 @@ mod tests {
         assert!(matches!(&mail.backend, BackendKind::InProcess));
     }
 
+    /// One row per config: an absent url and an empty url both mean the
+    /// embedded in-process backend (never a remote dial), and a configured
+    /// name is carried onto the facade.
     #[test]
-    fn from_config_without_url_is_in_process() {
-        let cfg = MailConfig {
-            url: None,
-            token: None,
-            name: Some("orchestrator".into()),
-        };
-        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
-        assert_eq!(mail.name, "orchestrator");
-        assert!(matches!(&mail.backend, BackendKind::InProcess));
-    }
-
-    #[test]
-    fn from_config_with_empty_url_is_in_process() {
-        let cfg = MailConfig {
-            url: Some(String::new()),
-            token: None,
-            name: None,
-        };
-        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
-        assert!(matches!(&mail.backend, BackendKind::InProcess));
+    fn from_config_without_or_empty_url_is_in_process() {
+        let rows = [
+            ("url-none", None, Some("orchestrator")),
+            ("url-empty", Some(String::new()), None),
+        ];
+        for (name, url, expect_name) in rows {
+            let cfg = MailConfig {
+                url,
+                token: None,
+                name: expect_name.map(str::to_string),
+            };
+            let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
+            assert!(
+                matches!(&mail.backend, BackendKind::InProcess),
+                "row {name}: in-process"
+            );
+            if let Some(n) = expect_name {
+                assert_eq!(mail.name, n, "row {name}: name carried");
+            }
+        }
     }
 
     #[test]

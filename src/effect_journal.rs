@@ -1453,68 +1453,50 @@ mod tests {
         }
     }
 
-    /// The engine's own lifecycle feed lands a run row: `Started` → `Running`
-    /// → terminal, one row, ending `succeeded`.
+    /// One row per run lifecycle, each on its own store: the engine's own
+    /// phase feed lands ONE row ending at the real terminal status, and a
+    /// replayed phase never moves a terminal row ("one ambiguity rule" would
+    /// be a lie if the tail could resurrect a finished run).
     #[tokio::test]
-    async fn run_journal_writes_started_running_succeeded() {
-        let (_dir, store) = test_store().await;
-        let journal = run_journal(store.clone());
-        for phase in [RunPhase::Started, RunPhase::Running, RunPhase::Succeeded] {
-            journal(&transition("run-life-1", "ship", phase));
+    async fn run_journal_rows() {
+        let rows = [
+            (
+                "started-running-succeeded",
+                "run-life-1",
+                vec![RunPhase::Started, RunPhase::Running, RunPhase::Succeeded],
+                RunStatus::Succeeded,
+            ),
+            (
+                "started-running-failed",
+                "run-life-fail-1",
+                vec![RunPhase::Started, RunPhase::Running, RunPhase::Failed],
+                RunStatus::Failed,
+            ),
+            (
+                "replay-never-moves-a-terminal-row",
+                "run-life-replay-1",
+                vec![
+                    RunPhase::Started,
+                    RunPhase::Running,
+                    RunPhase::Succeeded,
+                    // the replay
+                    RunPhase::Started,
+                    RunPhase::Running,
+                ],
+                RunStatus::Succeeded,
+            ),
+        ];
+        for (name, run_id, phases, expected) in rows {
+            let (_dir, store) = test_store().await;
+            let journal = run_journal(store.clone());
+            for phase in phases {
+                journal(&transition(run_id, "ship", phase));
+            }
+            let row = store.get_run(run_id).await.expect("get_run").expect("row");
+            assert_eq!(row.status, expected, "row {name}: {row:?}");
+            assert_eq!(row.workflow, "ship", "row {name}: workflow");
+            assert_eq!(row.workflow_digest, "digest-1", "row {name}: digest");
         }
-        let row = store
-            .get_run("run-life-1")
-            .await
-            .expect("get_run")
-            .expect("the engine-driven run has a row");
-        assert_eq!(row.status, RunStatus::Succeeded, "terminal row: {row:?}");
-        assert_eq!(row.workflow, "ship");
-        assert_eq!(row.workflow_digest, "digest-1");
-    }
-
-    /// A failed run's row is terminal `failed` — never left `running`.
-    #[tokio::test]
-    async fn run_journal_writes_a_failed_terminal() {
-        let (_dir, store) = test_store().await;
-        let journal = run_journal(store.clone());
-        for phase in [RunPhase::Started, RunPhase::Running, RunPhase::Failed] {
-            journal(&transition("run-life-fail-1", "ship", phase));
-        }
-        let row = store
-            .get_run("run-life-fail-1")
-            .await
-            .expect("get_run")
-            .expect("row");
-        assert_eq!(row.status, RunStatus::Failed, "{row:?}");
-    }
-
-    /// Replay safety: a durable run re-delivers phases, and a terminal row must
-    /// never move back ("one ambiguity rule" would be a lie if the tail could
-    /// resurrect a finished run).
-    #[tokio::test]
-    async fn run_journal_never_moves_a_terminal_row() {
-        let (_dir, store) = test_store().await;
-        let journal = run_journal(store.clone());
-        for phase in [
-            RunPhase::Started,
-            RunPhase::Running,
-            RunPhase::Succeeded,
-            // the replay
-            RunPhase::Started,
-            RunPhase::Running,
-        ] {
-            journal(&transition("run-life-replay-1", "ship", phase));
-        }
-        let row = store
-            .get_run("run-life-replay-1")
-            .await
-            .expect("get_run")
-            .expect("row");
-        assert_eq!(
-            row.status,
-            RunStatus::Succeeded,
-            "a replayed phase must not move a terminal row: {row:?}"
-        );
     }
 
     /// The run row and the effect rows agree on `run_id` — that agreement is
