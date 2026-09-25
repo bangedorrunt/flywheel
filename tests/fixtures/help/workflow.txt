@@ -10,6 +10,8 @@ Commands:
   run       Run a workflow by name through the unified engine (lint gate first). Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`. Compose tokens (`wave-swarm`, `repair-until-verified`, `beads-lifecycle`): prefer `workflow compose … --parts <token> --run`; `workflow run <token> --execute` is the legacy alias. Do NOT pass ordinary builtins as bare `--parts`. Interactive TTY briefing when `--execute` (bd-nmzk): same skip matrix as `steer` — shared prompt module (`source = workflow`)
   new       Scaffold a new workflow YAML in the config dir
   compose   Runtime workflow composition (bd-8xca): assemble a NEW workflow from existing parts — `role:stage` dispatch parts and `workflow:name` call_workflow parts — around a target, lint it, and (with --run) execute it durably. The deterministic arm (default) assembles from the parts spec; `--agent` lets a planner agent author the workflow from the target + catalog
+  seed      Seed compiled-in workflow and stage defaults into the user tier
+  drift     Report user-tier workflow/stage copies that are missing, stale, or custom
   history   Run history for a workflow (from the state log)
   crew      Preview the auto-crew a workflow would spawn (crew: auto)
   remove    Remove a catalog workflow (deletes ~/.config/flywheel/workflows/<name>.yaml). Built-in workflows cannot be removed — override via a catalog file of the same name (catalog shadows built-ins)

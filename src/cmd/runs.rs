@@ -44,6 +44,17 @@ pub(crate) enum RunsCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Terminalize an abandoned run as failed after operator evidence
+    Reconcile {
+        /// logical run id from the state log
+        run_id: String,
+        /// why the run is being reconciled; recorded in the terminal row
+        #[arg(long)]
+        reason: String,
+        /// required confirmation for this state-log mutation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show one run's step trace / outputs
     Show {
         /// run id (the log entry id)
@@ -92,7 +103,7 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
             }
         }
         out.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
-        Ok(out)
+        Ok(crate::latest_run_entries(out))
     }
 
     /// A run is pending when its payload carries a suspend/park marker.
@@ -102,6 +113,60 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
             .and_then(Value::as_str)
             .map(|s| matches!(s, "pending" | "awaiting_approval" | "parked"))
             .unwrap_or(false)
+    }
+
+    /// Append an operator-evidenced terminal row for a still-running logical run.
+    /// The latest state is checked immediately before the append, so a completed
+    /// run cannot be relabeled as failed by a stale reconciliation request.
+    fn reconcile_run(run_id: &str, reason: &str) -> Result<()> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            bail!("reconcile requires a non-empty --reason");
+        }
+        for project in projects_with_logs() {
+            let entries = crate::state::read_log(&project)?;
+            let latest = entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == EventKind::Workflow
+                        && entry.data.get("run_id").and_then(Value::as_str) == Some(run_id)
+                        && !crate::is_annotation_row(entry)
+                })
+                .max_by_key(|entry| entry.ts.as_str());
+            let Some(latest) = latest else {
+                continue;
+            };
+            let status = latest
+                .data
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if status != "running" {
+                bail!(
+                    "run {run_id} in project {project} is already {status}; refusing reconciliation"
+                );
+            }
+            crate::state::log_event(
+                &project,
+                EventKind::Workflow,
+                json!({
+                    "workflow": latest.data.get("workflow").cloned().unwrap_or(Value::Null),
+                    "status": "failed",
+                    "run_id": run_id,
+                    "mode": latest.data.get("mode").cloned().unwrap_or(Value::Null),
+                    "crew": latest.data.get("crew").cloned().unwrap_or_else(|| json!({})),
+                    "error": reason,
+                    "reconciled": true,
+                    "reconciliation": {
+                        "source": "operator",
+                        "reason": reason,
+                    },
+                }),
+            )?;
+            println!("reconciled {project}:{run_id} as failed (operator evidence recorded)");
+            return Ok(());
+        }
+        bail!("run not found: {run_id}")
     }
 
     match cmd {
@@ -151,6 +216,16 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(r)?);
             }
             Ok(())
+        }
+        RunsCmd::Reconcile {
+            run_id,
+            reason,
+            yes,
+        } => {
+            if !yes {
+                bail!("reconcile changes the run ledger; pass --yes after checking --reason");
+            }
+            reconcile_run(run_id, reason)
         }
         RunsCmd::Show { id } => {
             let runs = all_run_entries()?;
