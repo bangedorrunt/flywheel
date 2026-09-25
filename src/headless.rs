@@ -730,13 +730,18 @@ mod tests {
         let bogus_model = "bogus/model-flywheel-argcheck";
         let emitted = model_args("pi", bogus_model, Some("high"));
 
-        let output = match std::process::Command::new("pi")
+        let mut child = match std::process::Command::new("pi")
             .args(["--print"])
             .args(&emitted)
             .arg("x")
-            .output()
+            // stdout goes to null, NOT a pipe: this test asserts only on stderr,
+            // and an unread pipe fills its buffer and blocks the child, which
+            // would surface as a spurious timeout rather than a real failure.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
         {
-            Ok(o) => o,
+            Ok(c) => c,
             // pi is not installed here; the pure argv assertions still cover the
             // shape. Skipping loudly beats a green test that proved nothing.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -746,7 +751,33 @@ mod tests {
             Err(e) => panic!("spawn pi: {e}"),
         };
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // BOUNDED WAIT (effect-oriented principle 10). `output()` would block
+        // forever if pi hung — e.g. waiting on a credential prompt the
+        // non-interactive flag should prevent but does not guarantee. An
+        // unbounded wait in a test is a CI hang, not a failure.
+        const ARGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + ARGS_TIMEOUT;
+        let status = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("pi did not exit within {ARGS_TIMEOUT:?} — refusing to hang the suite");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(25)),
+            }
+        };
+
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        assert!(
+            status.success() || !stderr.is_empty(),
+            "pi produced neither an exit nor a diagnostic: {stderr:?}"
+        );
         assert!(
             !stderr.contains("Unknown option"),
             "pi rejected the argv flywheel emits: {emitted:?}\n{stderr}\n\

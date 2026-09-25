@@ -3038,8 +3038,17 @@ fn main() {
             )
         }),
         Some(Commands::Workflow { cmd }) => {
-            let needs_pf =
-                !cli.skip_preflight && matches!(cmd, WorkflowCmd::Run { execute: true, .. });
+            // bd-uona: compose ALLOCATES PANES, so it belongs behind the same
+            // gate as an executing run. It was missing here entirely, which made
+            // the door that materializes agents the one door with no
+            // prerequisite check. `--dry-run` and `--run` are mutually exclusive
+            // (compose bails on both), so gating on `run` covers exactly the
+            // dispatching case and leaves preview alone.
+            let needs_pf = !cli.skip_preflight
+                && matches!(
+                    cmd,
+                    WorkflowCmd::Run { execute: true, .. } | WorkflowCmd::Compose { run: true, .. }
+                );
             let pf = if needs_pf {
                 let (project, allow_wt) = match &cmd {
                     WorkflowCmd::Run {
@@ -3047,6 +3056,7 @@ fn main() {
                         allow_worktree,
                         ..
                     } => (project.as_deref(), *allow_worktree),
+                    WorkflowCmd::Compose { project, .. } => (project.as_deref(), false),
                     _ => (None, false),
                 };
                 let mut m = preflight::Mode::workflow();
