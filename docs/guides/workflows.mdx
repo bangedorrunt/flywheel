@@ -13,17 +13,26 @@ Every full `workflow list --json` row carries `description`, `family`, `selectio
 
 ```bash
 flywheel workflow compose "<target>" --parts wave-swarm --run --crew 3
-flywheel workflow compose "<t>" --parts "role:coder ce-execute" --parts "retry(2):each:lane" --run
+flywheel workflow compose "<t>" --parts "role:coder:ce-execute" --parts "retry(2):each:lane" --run
 ```
 
 | Form | Meaning |
 |---|---|
-| bare stage | dispatch that stage |
-| `role:stage` | dispatch to the agent with that role |
-| `phase:stage` | per-harness plan mechanics (omp `--plan-yolo`, opencode `--agent plan`); unknown phases degrade loud as `phase_degraded` |
-| `workflow:name` | splice a builtin's steps |
+| bare stage | dispatch that stage through its declared role |
+| `stage:<stage>` | explicit spelling of a bare stage |
+| `role:<role>:<stage>` | dispatch to the named agent role |
+| `<role>:<stage>` | compact role form, kept for compatibility |
+| `phase:<phase>:<stage>` | carry a lifecycle phase explicitly |
+| `<phase>:<stage>` | compact phase form, where `<phase>` is one of `resolve`, `plan`, `implement`, `review`, `verify`, `compound` |
+| `workflow:<name>` | splice a builtin's steps |
 | compose token | expand `wave-swarm`, `repair-until-verified`, or `beads-lifecycle` |
-| `each:` / `when:` / `retry(n):` / `parallel:` | operators over the parts |
+| `each:<param>:<part>` / `parallel:<param>:<part>` / `when:<guard>:<part>` / `retry(n):<part>` | operators over another part |
+
+Use the explicit `role:` and `phase:` forms when a role or phase name could be
+confused with another vocabulary word. Phase lints still apply after parsing:
+`plan` needs its declared input, `review` needs a static fan-out, and
+`implement` needs an acceptance command. A grammar-valid part can therefore
+still be refused by workflow lint for a real contract requirement.
 
 `--base` seeds steps from an existing workflow. `--role-model ROLE=PROVIDER/MODEL` (repeatable) pins a role through the same strict registry as spawn. `--from-yaml` runs full YAML from a file or stdin.
 
@@ -36,6 +45,20 @@ flywheel workflow compose "<t>" --parts "role:coder ce-execute" --parts "retry(2
 | `beads-lifecycle` | grill, create, review1, review2, integrate, implement, verify, outer SIGNOFF; nests builtins via `call_workflow`; `inputs.until` early-exits SUCCESS after any phase. After integrate, hand off to wave-swarm, never merge. |
 
 Legacy alias: `workflow run <token> --execute` still runs tokens; the preferred door is `workflow compose --parts <token> --run`.
+
+## Catalog overlays and coordination
+
+`flywheel workflow seed` copies compiled-in workflows and stages into
+`~/.config/flywheel/` without overwriting authored files. `flywheel workflow
+drift` reports `missing`, `current`, `stale`, and `custom` entries. Resolution
+stays built-ins < user < project, so a stale user copy remains authoritative
+but visible. See [workflow-catalog-review](./workflow-catalog-review).
+
+Choose the control plane by handoff: `flywheel send` is captain → crew,
+`toron channel` plus `toron job` is crew → crew, `toron mail` is private,
+`flywheel steer` owns one captain-driven lane, and `workflow compose --parts`
+owns an explicit multi-lane shape. Read back every load-bearing post; “sent”
+alone is not delivery evidence.
 
 ## The YAML DSL
 

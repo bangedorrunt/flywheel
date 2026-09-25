@@ -6,7 +6,7 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 |------|---------|
 | profile | `flywheel profile {list,show,create,edit,run,remove}` — 6 built-ins (oracle/planner/reviewer/coder/scout/housekeeper) |
 | squad | `flywheel squad {list,show,spawn,remove}` (`recipes list` alias) |
-| workflow | `flywheel workflow {list,show,lint,run,new,history,crew,compose,remove}` — every catalog verb takes `--project` and resolves built-ins < user < project tiers |
+| workflow | `flywheel workflow {list,show,lint,run,new,history,crew,compose,remove,seed,drift}` — catalog reads and runs take `--project` where applicable and resolve built-ins < user < project tiers; `seed` and `drift` inspect the user tier |
 | cron | `flywheel cron {lint,run,list,show,pause,resume,status,history,start,remove}` — distinct YAML type |
 | model | `flywheel model {list,show,add,remove}` |
 | runs | `flywheel runs {list,show,pending,digest}` |
@@ -90,10 +90,20 @@ workflow's steps, inline, at that position — one engine run, one artifact
 trail. Preferred door: `workflow compose … --parts <token> --run`.
 Legacy alias for compose tokens only: `workflow run <token> --execute`.
 Ordinary builtins (e.g. captain-audit): `workflow run <name> --execute`,
-NOT bare `--parts`. Other `--parts` forms: bare stage name, `role:stage`,
-`phase:stage`, `workflow:name`, and the grammar forms (`each:`, `when:`,
-`retry(n):`, `parallel:`). Stages referenced by spliced steps resolve
-from the stage catalog (`stage list`).
+NOT bare `--parts`. Other `--parts` forms: bare stage, `stage:<stage>`,
+`role:<role>:<stage>`, compact `<role>:<stage>`, `phase:<phase>:<stage>`,
+compact `<phase>:<stage>`, `workflow:<name>`, and the grammar forms (`each:`,
+`when:`, `retry(n):`, `parallel:`). A phase form names a lifecycle phase and
+still passes workflow lint, which may require phase inputs, fan-out, or an
+acceptance command. Stages referenced by spliced steps resolve from the stage
+catalog (`stage list`).
+
+`workflow seed` copies compiled-in workflows and stages into the user tier
+without overwriting; `workflow drift` reports `missing`, `current`, `stale`,
+and `custom` copies. The steering boundary is one lane for `flywheel steer`,
+one explicit multi-lane shape for `workflow compose --parts`, captain-to-crew
+for `flywheel send`, and crew-to-crew rooms/jobs for `toron`. Read back every
+load-bearing post; “sent” alone is not delivery evidence.
 
 ## Execution modes (ADR-0010)
 

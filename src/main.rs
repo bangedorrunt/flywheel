@@ -2524,6 +2524,7 @@ fn main() {
             "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
                 "coalition debate plan-review profile squad model slot catalog runs",
                 "workflow cron recipes workflows pipeline template stage ensemble",
+                "workflow seed/drift — copy builtin workflows+stages to user tier without overwrite; report missing/current/stale/custom",
                 "checkpoint timeline audit history changes resume analytics",
                 "backend safety guards policy deps integration config upgrade tutorial serve preflight"
             ],
@@ -2532,7 +2533,7 @@ fn main() {
             "daemon": "flywheel daemon start|stop|restart|status — supervised serve lifecycle (launchd/systemd/pidfile); restart verifies the new daemon answers; stop/refuse unmanaged port holders without --force",
             "stages": ["ce-brainstorm", "ce-plan", "ce-plan-review", "ce-execute", "ce-simplify", "ce-review", "ce-evaluate", "ce-compound", "commit-and-push"],
             "stage_params": "send --stage NAME --param k=v (repeatable) substitutes {{k}} slots in the stage template; per-stage required slots, missing one exits non-zero naming the slot; zero --param is byte-identical to the unparameterized prompt (ADR-0006 D1)",
-            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/evaluate/crew/run/compose — takes --project and layers the project tier): EVERY row of `workflow list --json` carries description + family + selection + run + compose_token + decide_trigger; `workflow list --brief` is the GS-052 HYBRID ONE contract: name + family + selection + run + topology + compose_token (sticky-open still sees topology); bare `workflow list --json` adds description + source/crew/inputs/decide_trigger (plus hybrid fields); `workflow show` emits name/source/description/run/compose_token/trigger/guard/crew/inputs/steps/graph/graph_nodes — not decide_trigger/family/selection/topology — select from brief, then bare list for decide_trigger or show for prose/graph detail, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
+            "workflows": "agent-native catalog (resolve order built-ins < user ~/.config/flywheel/workflows/*.yaml < project <p>/.flywheel/workflows/*.yaml; every catalog verb — list/show/lint/evaluate/crew/run/compose/seed/drift — takes --project where applicable and layers the project tier): EVERY row of `workflow list --json` carries description + family + selection + run + compose_token + decide_trigger; `workflow list --brief` is the GS-052 HYBRID ONE contract: name + family + selection + run + topology + compose_token (sticky-open still sees topology); bare `workflow list --json` adds description + source/crew/inputs/decide_trigger (plus hybrid fields); `workflow show` emits name/source/description/run/compose_token/trigger/guard/crew/inputs/steps/graph/graph_nodes — not decide_trigger/family/selection/topology — select from brief, then bare list for decide_trigger or show for prose/graph detail, then run the row's run form. Compose tokens: wave-swarm, repair-until-verified, beads-lifecycle (bare --parts). `workflow seed` copies every builtin workflow and stage into the user tier without overwriting; `workflow drift` reports missing/current/stale/custom. Capture: ce-compound (standalone learning capture, any topology), ce-sweep (learnings maintenance). decide routes: debate, brainstorm->ce-brainstorm, bead-ready plan->ce-plan, ship the chain->ship, convert to beads->beads, plus the playbook needles (repro/refactor/prototype/arena/perf/hillclimb/forensic/babysit/pickup/pause/interrogate/feature/goal/triage/weekly-review/reflect/onboard).",
             "catalog": {
                 "slots": "flywheel slot list/show/set/remove — cheap/standard/premium = harness+model; profiles alias @cheap/@standard/@premium (ADR-0007 D1)",
                 "models": "flywheel model list/show/add/set/remove — `set <id> --slot <s>` selects a model as a slot DEFAULT; registry ids are provider/model with tier cheap|standard|premium; compiled-ins are permanent",
@@ -26022,6 +26023,43 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             }
             Ok(())
         }
+        WorkflowCmd::Seed { json } => {
+            let report = workflow_catalog::seed_user_catalog(&config::config_dir())?;
+            if *json {
+                print_json(&serde_json::to_value(report)?);
+            } else {
+                println!(
+                    "seeded user catalog: {} workflow(s), {} stage(s) created; {} workflow(s), {} stage(s) kept",
+                    report.created_workflows.len(),
+                    report.created_stages.len(),
+                    report.kept_workflows.len(),
+                    report.kept_stages.len()
+                );
+                println!("next: `flywheel workflow drift` reports stale or missing copies");
+            }
+            Ok(())
+        }
+        WorkflowCmd::Drift { json } => {
+            let rows = workflow_catalog::catalog_drift(&config::config_dir())?;
+            if *json {
+                print_json(&json!({ "entries": rows }));
+            } else {
+                for row in &rows {
+                    println!(
+                        "{:<8} {:<32} {:<8} source={}",
+                        row.kind, row.name, row.status, row.source
+                    );
+                }
+                let stale = rows.iter().filter(|row| row.status == "stale").count();
+                let missing = rows.iter().filter(|row| row.status == "missing").count();
+                if stale == 0 && missing == 0 {
+                    println!("catalog drift clean");
+                } else {
+                    println!("catalog drift: {stale} stale, {missing} missing");
+                }
+            }
+            Ok(())
+        }
         WorkflowCmd::History { name } => {
             use state::EventKind;
             let dir = config::state_dir();
@@ -33080,7 +33118,10 @@ mod integration_tests {
         let robot_block_start = src
             .find("if cli.robot_capabilities")
             .expect("robot_capabilities arm");
-        let robot_block = &src[robot_block_start..robot_block_start + 4500];
+        let robot_end = src[robot_block_start..]
+            .find("\n    let cfg = match Config::load()")
+            .expect("robot capabilities arm ends before config load");
+        let robot_block = &src[robot_block_start..robot_block_start + robot_end];
         let count = robot_block.matches("\"workflows\":").count();
         assert_eq!(
             count, 1,

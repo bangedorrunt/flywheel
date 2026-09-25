@@ -161,14 +161,32 @@ flywheel workflow compose "<target>" --parts "..." --run --project <project>
 flywheel workflow compose "<target>" --agent
 ```
 
-Part grammar (today): `role:stage` → dispatch_job to `@role` running the
-named stage; `workflow:name` → `call_workflow`. Parts comma-separate.
+Part grammar (today): use an explicit tag when a role or phase name could be
+confused with another vocabulary word. `stage:<stage>` selects a stage through
+its declared role, `role:<role>:<stage>` pins a profile, and
+`phase:<phase>:<stage>` carries a lifecycle phase. The compact forms
+`<role>:<stage>` and `<phase>:<stage>`, `workflow:<name>`, and a bare stage
+remain valid. Parts comma-separate. Nested control forms are
+`each:<param>:<part>`, `parallel:<param>:<part>`, `when:<guard>:<part>`, and
+`retry(n):<part>`.
 
-SHIPPED (ADR-0022 waves, 2026-08-21/22): `phase:` in dispatch specs
-(registry: omp `--plan-yolo`, opencode `--agent plan`; others degrade
-loudly), stage-first bare-name parts (`--parts "fresh-eyes-explore,..."`
-picks each stage's default role), `--keep <name>` graduation after a
-GREEN run (refuses without), `cron run --live`.
+SHIPPED (ADR-0022 waves, 2026-08-21/22): phase metadata is carried on dispatch
+specs (omp `--plan-yolo`, opencode `--agent plan`; unsupported mechanics fail
+loudly), stage-first bare-name parts resolve through stage affinity, `--keep
+<name>` graduates only after a GREEN run, and `cron run --live` performs the
+real dispatch. A compose token is a named workflow fragment that expands at the
+part position; it is orthogonal to a stage and a squad.
+
+To make operator-owned copies of the built-in catalog:
+
+```bash
+flywheel workflow seed --json
+flywheel workflow drift --json
+```
+
+`seed` never overwrites a user file. `drift` is the freshness check: `missing`
+means no user copy, `current` means byte-equivalent semantics, `stale` means a
+user copy shadows a changed builtin, and `custom` means a user-only entry.
 
 SHIPPED (bd-adr22-t1-grammar-residual-zjk0): `each:`/`when:`/
 `retry(n)`/`parallel:` part forms, `--from-yaml -`, `--dry-run`
@@ -264,7 +282,27 @@ Mail steering (any harness): crews ack, read, and reply through the toron
 mailbox; replies must land in the thread before you claim a response
 (bd-debate-reply-routing lesson: verify delivery, do not assume).
 
----
+### 5a. Coordination and steering, by boundary
+
+Use one control plane for each handoff:
+
+- **Captain → crew:** `flywheel send --stage <stage>` carries a bounded brief;
+  use `flywheel collab` when the captain needs a blocking answer.
+- **Crew → crew:** join the project channel, post a one-line kind-9 update, and
+  claim the resulting job. Use `toron channel` for the room and `toron job` for
+  the work item. A private fact belongs in `toron mail`, not the room.
+- **Captain objective, one lane:** `flywheel steer "<objective>" --project <p>`.
+  It owns the objective-to-completion path; do not wrap it in a second compose.
+- **Explicit multi-lane shape:** `workflow compose "<objective>" --parts ... --run`
+  after briefing proposes it. The compose spec owns ordering, fan-out, and the
+  single artifact trail; the crew does not invent a second topology.
+- **Current pane, no delegation:** announce `vehicle: none (raw)` and work in
+  open mode. A stage or ordinary workflow may run in the pane, but it does not
+  silently authorize spawning.
+
+A steering request is complete when the recipient has acknowledged it, the
+work item or corr is durable, and the response is read back. “Sent” alone is
+not coordination evidence.
 
 ## 5b. Principles — the awareness contract (SHIPPED)
 
@@ -319,16 +357,13 @@ a from-zero graph is not.
 
 ---
 
-## 7. Phases (ADR-0022 — how this changes, PROPOSED)
+## 7. Phases (ADR-0022)
 
-Once W1–W5 land: every dispatch carries a typed `phase`
-(`resolve|plan|implement|review|verify`); the harness enforces phase
-mechanics (plan-mode flags); completion is evidence, not claims — plan ends
-when beads with acceptance exist, implement ends when a commit cites the bead
-and its gate exits 0. Until then: emulate the discipline manually. Post your
-goal statement before planning; create beads with acceptance before coding;
-cite bead ids in commits; post review verdicts. The ADR will mechanize what
-you practiced.
+Every dispatch may carry a typed phase
+(`resolve|plan|implement|review|verify|compound`); the harness applies the
+available phase mechanic and reports an unsupported mechanic loudly. The
+host `VerifySink` and phase evidence own completion, never a worker’s `done`
+claim.
 
 ---
 
@@ -371,6 +406,8 @@ you practiced.
 flywheel workflow list | show <n> | lint [--only <n>]
 flywheel workflow run <n> [--execute --mode headless|pane --project <p>] [--inputs '<json>']
 flywheel workflow compose "<target>" [--base <wf>] [--parts a,b] [--agent] [--run --project <p>]
+flywheel workflow seed [--json]       # copy built-ins into the user tier, never overwrite
+flywheel workflow drift [--json]      # report missing/current/stale/custom copies
 flywheel workflow new <n>
 flywheel runs list | show <id> | digest
 flywheel arrive <project> --as <pin>
