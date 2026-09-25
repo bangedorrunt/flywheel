@@ -92,6 +92,26 @@ function extractSurface(bin) {
       if (m[1]) shorts.set(m[1], takesValue);
     }
 
+    // Positional arguments, read off the clap usage line: `Usage: toron slot
+    // acquire [OPTIONS] --slot <SLOT> --project <PROJECT>` takes none, while
+    // `Usage: toron mail whois <PROJECT> <NAME>` takes two. Strip the flag/value
+    // pairs first, then count what is left. The reason this matters: a chain
+    // check sees `toron slot acquire cargo` as a legal leaf call, but clap
+    // rejects it at runtime, so a wrong literal positional shipped in the
+    // guides and nothing failed. `[OPTIONS]` / `[COMMAND]` are not positionals.
+    // A missing usage line reads as "unknown", and unknown is kept permissive:
+    // this rule must never manufacture drift out of a help text we cannot parse.
+    const usageLine = text.split("\n").find((l) => /^Usage:\s/.test(l));
+    let positionals = 1;
+    if (usageLine) {
+      // Drop `--flag <VALUE>` and `--flag=<VALUE>` pairs, then count what is
+      // left over: `<PROJECT>` and `[FILE]` are positionals, `[OPTIONS]` is not.
+      const tail = usageLine.replace(/--[a-z0-9-]+\s*[= ]\s*<[^>]+>/g, " ");
+      positionals = (tail.match(/<[^>]+>|\[[^\]]+\]/g) || []).filter(
+        (t) => !/^\[(OPTIONS|COMMAND|FLAGS?)\]$/i.test(t),
+      ).length;
+    }
+
     const children = new Set();
     const lines = text.split("\n");
     const start = lines.findIndex((l) => /^Commands:\s*$/.test(l));
@@ -107,7 +127,7 @@ function extractSurface(bin) {
       }
     }
 
-    commands.set(key, { flags, shorts, children });
+    commands.set(key, { flags, shorts, children, positionals });
     for (const child of children) queue.push([...path, child]);
   }
   return commands;
@@ -152,12 +172,13 @@ function commandLines(block) {
     // not a comment and survives, because it never starts its own token.
     const hash = tokens.findIndex((t) => t.startsWith("#"));
     if (hash !== -1) tokens = tokens.slice(0, hash);
-    // Drop synopsis placeholders (`[--check]`, `<thread-id>`, `<COMMAND>`). A
-    // guide that puts usage syntax in a bash fence is writing a manual, not a
-    // walkthrough, but it should not read as invented drift either.
-    tokens = tokens.filter(
-      (t) => !(t.startsWith("[") || t.endsWith("]") || (t.startsWith("<") && t.endsWith(">"))),
-    );
+    // Unwrap synopsis brackets (`[--check]`, `[--holder <Pin>]`) instead of
+    // dropping the tokens: dropping `[--path` would leave its value looking like
+    // a stray positional. Placeholders survive to verifyCommand, which knows the
+    // difference between `<thread-id>` (the reader's input) and a literal.
+    tokens = tokens
+      .map((t) => t.replace(/^\[+/, "").replace(/\]+$/, ""))
+      .filter((t) => t.length > 0);
     if (tokens.length === 0) continue;
     out.push({ text: line, tokens });
   }
@@ -201,6 +222,19 @@ function verifyCommand(tokens, surface) {
       continue;
     }
 
+    // A placeholder (`<run-id>`, `<file.yaml>`) is the reader's to fill in. It
+    // cannot be judged as a subcommand name, but it still needs a positional
+    // slot in the usage line to be legal here, so it is not a free pass: a
+    // synopsis line pasted into a bash fence still reads as a claim about what
+    // the command takes.
+    if (/^<[^>]+>$/.test(t)) {
+      if (node.positionals === 0) {
+        const where = `${OWN_BIN} ${path.join(" ")}`.trimEnd();
+        errors.push(`unexpected argument \`${t}\` on \`${where}\` (its usage takes none)`);
+      }
+      continue;
+    }
+
     if (node.children.size > 0) {
       if (node.children.has(t)) {
         path.push(t);
@@ -211,10 +245,21 @@ function verifyCommand(tokens, surface) {
           `unknown subcommand \`${t}\` under \`${where}\`` +
             ` (known: ${[...node.children].sort().join(", ")})`,
         );
+        // Stop here: the node is unresolved, so every remaining token would be
+        // judged against the wrong help text and pile cascade noise onto one
+        // real defect (`mail thread <thread-id>` reported two errors, not one).
+        break;
       }
       continue;
     }
-    // leaf: a positional argument, which is legal
+    // Leaf. A placeholder (`<file.yaml>`) is the reader's to fill in and is always
+    // fine. A literal is a claim about the real surface, so it is allowed only
+    // where the usage line shows a positional — this is the `slot acquire cargo`
+    // class, which clap rejects at runtime and a chain-only check cannot see.
+    if (node.positionals === 0 && !/^<[^>]+>$/.test(t)) {
+      const where = `${OWN_BIN} ${path.join(" ")}`.trimEnd();
+      errors.push(`unexpected positional \`${t}\` on \`${where}\` (its usage takes none)`);
+    }
   }
   return errors;
 }
@@ -340,6 +385,26 @@ if (process.env.GUIDES_SKIP_CLI === "1") {
         `     refuse to trust this run. Fix extractSurface/verifyCommand first.`,
     );
     process.exit(1);
+  }
+
+  // Second probe: a leaf whose usage takes no positional must reject a literal
+  // one. The chain check alone walks `slot acquire` happily and never looks at
+  // `cargo`, which is exactly how a wrong literal shipped green.
+  const bareLeaf = [...surface.entries()].find(
+    ([, n]) => n.children.size === 0 && n.positionals === 0,
+  );
+  if (!bareLeaf) {
+    console.error(`skip self-test: ${OWN_BIN} has no positional-free leaf to probe`);
+  } else {
+    const probePath = bareLeaf[0].split(" ").filter(Boolean);
+    const positionalProbe = verifyCommand([OWN_BIN, ...probePath, "bogus-positional"], surface);
+    if (!positionalProbe.some((e) => e.includes("unexpected positional"))) {
+      console.error(
+        `FAIL the positional rule is not biting: it accepted ${OWN_BIN} ${probePath.join(" ")} bogus-positional.\n` +
+          `     refuse to trust this run. Fix the usage-line parse in extractSurface first.`,
+      );
+      process.exit(1);
+    }
   }
   console.log(`surface  ${OWN_BIN}: ${surface.size} command paths (self-test ok)`);
 }
