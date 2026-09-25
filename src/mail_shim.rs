@@ -2868,38 +2868,34 @@ mod tests {
     /// se2.2: the remote edge is the toron daemon — a hex message id must be
     /// forwarded verbatim, never parsed. With a dead daemon the error is a
     /// transport failure; a "decimal"/"invalid digit" error would mean the
-    /// id was coerced before it ever left (the F3 bug).
+    /// id was coerced before it ever left (the F3 bug). Both id-taking remote
+    /// verbs owe the same pass-through honesty.
     #[test]
-    fn remote_ack_passes_hex_id_through() {
+    fn remote_id_verbs_pass_hex_id_through() {
         let cfg = MailConfig {
             url: Some("http://127.0.0.1:1".into()),
             token: None,
             name: Some("smoke".into()),
         };
         let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
-        let err = mail
-            .ack("proj", "smoke", "a1b2c3d4e5f60718293a4b5c6d7e8f90")
+        let hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        let ack = mail
+            .ack("proj", "smoke", hex)
             .expect_err("hex id forwarded; dead daemon must still fail the call");
-        let s = format!("{err:#}");
-        assert!(!s.contains("decimal"), "no id parse before dial: {s}");
-        assert!(!s.contains("invalid digit"), "no id parse before dial: {s}");
-    }
-
-    /// se2.2: mark_read's remote edge has the same pass-through honesty.
-    #[test]
-    fn remote_mark_read_passes_hex_id_through() {
-        let cfg = MailConfig {
-            url: Some("http://127.0.0.1:1".into()),
-            token: None,
-            name: Some("smoke".into()),
-        };
-        let mail = Mail::from_config(Some(&cfg)).expect("ok").expect("Some");
-        let err = mail
-            .mark_read("proj", "smoke", "a1b2c3d4e5f60718293a4b5c6d7e8f90")
+        let marked = mail
+            .mark_read("proj", "smoke", hex)
             .expect_err("hex id forwarded; dead daemon must still fail the call");
-        let s = format!("{err:#}");
-        assert!(!s.contains("decimal"), "no id parse before dial: {s}");
-        assert!(!s.contains("invalid digit"), "no id parse before dial: {s}");
+        for (verb, err) in [("ack", ack), ("mark_read", marked)] {
+            let s = format!("{err:#}");
+            assert!(
+                !s.contains("decimal"),
+                "{verb}: no id parse before dial: {s}"
+            );
+            assert!(
+                !s.contains("invalid digit"),
+                "{verb}: no id parse before dial: {s}"
+            );
+        }
     }
 
     /// Live remote-daemon smoke: with a `toron serve --mcp-http` daemon up and

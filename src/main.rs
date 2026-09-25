@@ -10811,48 +10811,34 @@ mod peer_encoding_tests {
         }
     }
 
-    /// bd-zq8u: a poisoned (non-ASCII) launch arg fails LOUD with an
-    /// actionable error naming the character and the fix.
+    /// bd-zq8u: a poisoned launch arg fails LOUD with an actionable error
+    /// naming the defect class, the character code, and the fix. The
+    /// control-char case is herdr's ACTUAL rejection criterion — the 2026-08-15
+    /// regression that burned 30 retries was the multi-line template's
+    /// newlines, not the non-ASCII glyphs.
     #[test]
-    fn launch_arg_guard_rejects_non_ascii_with_actionable_error() {
-        let err = ensure_ascii_launch_args(&["You are §9.3 -- ok -> done".to_string()])
-            .expect_err("non-ASCII arg must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("non-ASCII or control"),
-            "error must name the defect class: {msg}"
-        );
-        assert!(
-            msg.contains("U+00A7"),
-            "error must name the character code: {msg}"
-        );
-        assert!(
-            msg.contains("--no-peer-aware"),
-            "error must offer the opt-out: {msg}"
-        );
-    }
-
-    /// bd-zq8u: a control-char arg (tab/newline — herdr's ACTUAL rejection
-    /// criterion, `char::is_control`) fails fast too. This is the real
-    /// regression that burned 30 retries on 2026-08-15: the multi-line
-    /// template's newlines, not the non-ASCII glyphs.
-    #[test]
-    fn launch_arg_guard_rejects_control_chars() {
-        let err = ensure_ascii_launch_args(&["line one\nline two".to_string()])
-            .expect_err("control-char arg must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("non-ASCII or control"),
-            "error must name the defect class: {msg}"
-        );
-        assert!(
-            msg.contains("U+000A"),
-            "error must name the character code: {msg}"
-        );
-        assert!(
-            msg.contains("integrations/peer-aware.md.tpl"),
-            "error must point at the template: {msg}"
-        );
+    fn launch_arg_guard_rejects_poisoned_args_with_actionable_errors() {
+        let cases: &[(&str, &[&str])] = &[
+            ("You are §9.3 -- ok -> done", &["U+00A7", "--no-peer-aware"]),
+            (
+                "line one\nline two",
+                &["U+000A", "integrations/peer-aware.md.tpl"],
+            ),
+        ];
+        for (arg, needles) in cases {
+            let err = match ensure_ascii_launch_args(&[arg.to_string()]) {
+                Ok(ok) => panic!("{arg:?} must be rejected, got {ok:?}"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("non-ASCII or control"),
+                "error must name the defect class: {msg}"
+            );
+            for needle in *needles {
+                assert!(msg.contains(needle), "error must mention {needle}: {msg}");
+            }
+        }
     }
 
     /// bd-zq8u: the guard fires BEFORE agent.start — a poisoned arg must
@@ -32814,18 +32800,18 @@ mod wait_output_tests {
     }
 
     #[test]
-    fn resolve_pane_id_maps_agent_name_to_pane() {
+    fn resolve_pane_id_resolves_names_and_raw_ids() {
         let agents = vec![agent(Some("flywheel-x-oc"), "w1:p1")];
         assert_eq!(
             resolve_pane_id(&agents, "flywheel-x-oc"),
-            Some("w1:p1".to_string())
+            Some("w1:p1".to_string()),
+            "agent display name maps to its pane"
         );
-    }
-
-    #[test]
-    fn resolve_pane_id_accepts_raw_pane_id() {
-        let agents = vec![agent(Some("flywheel-x-oc"), "w1:p1")];
-        assert_eq!(resolve_pane_id(&agents, "w2:p3"), Some("w2:p3".to_string()));
+        assert_eq!(
+            resolve_pane_id(&agents, "w2:p3"),
+            Some("w2:p3".to_string()),
+            "a raw pane id passes through"
+        );
     }
 
     #[test]
@@ -33173,38 +33159,65 @@ mod integration_tests {
         assert!(template.ends_with(".tpl"), "template file referenced");
     }
 
-    /// bd-glup: a rendered orchestration command = frontmatter (with the
-    /// description) + the playbook template + stamps; no beads body.
+    /// bd-glup / bd-ug9z: a rendered orchestration command = frontmatter (with
+    /// the description) + the playbook template + stamps; no beads body. Each
+    /// playbook carries its own description and step vocabulary.
     #[test]
-    fn render_orchestration_prompt_has_frontmatter_and_focus() {
-        let out =
-            render_orchestration_prompt("opencode", "swarm-mode", "9.9.9", "2026-08-10T00:00:00Z")
-                .unwrap();
-        assert!(out.starts_with("---\n"), "frontmatter");
-        assert!(
-            out.contains("captain-led multi-crew execution"),
-            "description in frontmatter"
-        );
-        assert!(out.contains("# Orchestration: swarm-mode"));
-        for step in [
-            "CLASSIFY",
-            "GATE PREP",
-            "LANES",
-            "SPAWN",
-            "BRIEF",
-            "CONFLICT",
-            "WAVE GATE",
-            "TEARDOWN",
-        ] {
-            assert!(out.contains(step), "playbook step {step} present");
+    fn render_orchestration_prompt_has_frontmatter_and_steps() {
+        let cases: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "swarm-mode",
+                "captain-led multi-crew execution",
+                &[
+                    "CLASSIFY",
+                    "GATE PREP",
+                    "LANES",
+                    "SPAWN",
+                    "BRIEF",
+                    "CONFLICT",
+                    "WAVE GATE",
+                    "TEARDOWN",
+                ],
+                &[],
+            ),
+            (
+                "loop-mode",
+                "durable solo execution",
+                &[
+                    "SETUP",
+                    "EXECUTE",
+                    "IN-FLIGHT PEER CHECKPOINTS",
+                    "VERIFY",
+                    "CLOSE",
+                    "PROMOTE",
+                ],
+                &["flywheel collab <proj> --to <reviewer-pin>"],
+            ),
+        ];
+        for (mode, description, steps, extras) in cases {
+            let out =
+                render_orchestration_prompt("opencode", mode, "9.9.9", "2026-08-10T00:00:00Z")
+                    .unwrap_or_else(|e| panic!("render {mode}: {e:?}"));
+            assert!(out.starts_with("---\n"), "{mode}: frontmatter");
+            assert!(
+                out.contains(description),
+                "{mode}: description in frontmatter"
+            );
+            assert!(out.contains(&format!("# Orchestration: {mode}")));
+            for step in *steps {
+                assert!(out.contains(step), "{mode}: playbook step {step} present");
+            }
+            for extra in *extras {
+                assert!(out.contains(extra), "{mode}: content {extra} present");
+            }
+            assert!(out.contains("flywheel 9.9.9"));
+            assert!(out.contains("2026-08-10T00:00:00Z"));
+            assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
+            assert!(
+                !out.contains("{{BODY}}"),
+                "orchestration commands are standalone — no beads body"
+            );
         }
-        assert!(out.contains("flywheel 9.9.9"));
-        assert!(out.contains("2026-08-10T00:00:00Z"));
-        assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
-        assert!(
-            !out.contains("{{BODY}}"),
-            "orchestration commands are standalone — no beads body"
-        );
     }
 
     /// bd-glup: every kind (incl pa) renders every orchestration command.
@@ -33395,96 +33408,51 @@ mod integration_tests {
         );
     }
 
-    /// bd-glup: the swarm template is ASCII-only (the bd-zq8u peer-aware
-    /// "cannot be encoded safely" failure mode) and under 4 KiB.
+    /// bd-glup / bd-ug9z: both playbooks are ASCII-only (the bd-zq8u
+    /// peer-aware "cannot be encoded safely" failure mode) and under 4 KiB.
     #[test]
-    fn swarm_template_is_ascii_only_and_bounded() {
-        let tpl: &str = prompt_orchestration_template("swarm-mode").expect("swarm template");
-        assert!(tpl.is_ascii(), "swarm.md.tpl must be ASCII-only");
-        assert!(
-            tpl.len() < 4 * 1024,
-            "swarm.md.tpl must stay under 4 KiB ({} bytes)",
-            tpl.len()
-        );
-    }
-
-    /// bd-glup: the swarm playbook cites the governing principles by name
-    /// (ADR-0019 Spec 5 steering vocabulary).
-    #[test]
-    fn swarm_template_cites_principles() {
-        let tpl: &str = prompt_orchestration_template("swarm-mode").expect("swarm template");
-        for p in [
-            "prove-it-works",
-            "sequence-verifiable-units",
-            "guard-the-context-window",
-            "never-block-on-the-human",
-        ] {
-            assert!(tpl.contains(p), "cites principle {p}");
+    fn orchestration_templates_are_ascii_only_and_bounded() {
+        for (mode, tpl_name) in [("swarm-mode", "swarm.md.tpl"), ("loop-mode", "loop.md.tpl")] {
+            let tpl: &str = prompt_orchestration_template(mode).expect(mode);
+            assert!(tpl.is_ascii(), "{tpl_name} must be ASCII-only");
+            assert!(
+                tpl.len() < 4 * 1024,
+                "{tpl_name} must stay under 4 KiB ({} bytes)",
+                tpl.len()
+            );
         }
     }
 
-    /// bd-ug9z: the loop template is ASCII-only (the bd-zq8u peer-aware
-    /// "cannot be encoded safely" failure mode) and under 4 KiB.
+    /// bd-glup / bd-ug9z: each playbook cites its governing principles by name
+    /// (ADR-0019 Spec 5 steering vocabulary). Swarm steers a crew, loop runs
+    /// solo, so the context-window needle differs.
     #[test]
-    fn loop_template_is_ascii_only_and_bounded() {
-        let tpl: &str = prompt_orchestration_template("loop-mode").expect("loop template");
-        assert!(tpl.is_ascii(), "loop.md.tpl must be ASCII-only");
-        assert!(
-            tpl.len() < 4 * 1024,
-            "loop.md.tpl must stay under 4 KiB ({} bytes)",
-            tpl.len()
-        );
-    }
-
-    /// bd-ug9z: the loop playbook cites the governing principles by name
-    /// (ADR-0019 Spec 5 steering vocabulary) — prove-it-works,
-    /// fix-root-causes, never-block-on-the-human,
-    /// sequence-verifiable-units.
-    #[test]
-    fn loop_template_cites_principles() {
-        let tpl: &str = prompt_orchestration_template("loop-mode").expect("loop template");
-        for p in [
-            "prove-it-works",
-            "fix-root-causes",
-            "never-block-on-the-human",
-            "sequence-verifiable-units",
+    fn orchestration_templates_cite_principles() {
+        for (mode, principles) in [
+            (
+                "swarm-mode",
+                [
+                    "prove-it-works",
+                    "sequence-verifiable-units",
+                    "guard-the-context-window",
+                    "never-block-on-the-human",
+                ],
+            ),
+            (
+                "loop-mode",
+                [
+                    "prove-it-works",
+                    "fix-root-causes",
+                    "never-block-on-the-human",
+                    "sequence-verifiable-units",
+                ],
+            ),
         ] {
-            assert!(tpl.contains(p), "cites principle {p}");
+            let tpl: &str = prompt_orchestration_template(mode).expect(mode);
+            for p in principles {
+                assert!(tpl.contains(p), "{mode} cites principle {p}");
+            }
         }
-    }
-
-    /// bd-ug9z: the rendered /loop command carries the full playbook —
-    /// setup, execute, in-flight peer checkpoints, verify, close, promote —
-    /// plus the frontmatter description and stamps.
-    #[test]
-    fn render_loop_prompt_has_frontmatter_and_steps() {
-        let out =
-            render_orchestration_prompt("opencode", "loop-mode", "9.9.9", "2026-08-10T00:00:00Z")
-                .unwrap();
-        assert!(out.starts_with("---\n"), "frontmatter");
-        assert!(
-            out.contains("durable solo execution"),
-            "description in frontmatter"
-        );
-        assert!(out.contains("# Orchestration: loop-mode"));
-        for step in [
-            "SETUP",
-            "EXECUTE",
-            "IN-FLIGHT PEER CHECKPOINTS",
-            "VERIFY",
-            "CLOSE",
-            "PROMOTE",
-        ] {
-            assert!(out.contains(step), "playbook step {step} present");
-        }
-        assert!(out.contains("flywheel collab <proj> --to <reviewer-pin>"));
-        assert!(out.contains("flywheel 9.9.9"));
-        assert!(out.contains("2026-08-10T00:00:00Z"));
-        assert!(!out.contains("{{TOOL_FRONTMATTER}}"));
-        assert!(
-            !out.contains("{{BODY}}"),
-            "orchestration commands are standalone — no beads body"
-        );
     }
 
     #[test]
