@@ -79,10 +79,6 @@ impl LiveRegistry {
     pub fn len(&self) -> usize {
         self.0.len()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 /// bd-qx0z: dispatch-time registry for runners without a live client in
@@ -456,7 +452,6 @@ fn spawn_crew_into(
             eprintln!("flywheel: pruned {pruned} dead-pane registry row(s) for {project}");
         }
     }
-    let mut new_panes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     // pane-split chain: first agent on the root pane, rest split down.
     let mut prev: Option<String> = None;
@@ -1117,7 +1112,7 @@ pub fn pane_dispatch(
         // bd-5yzp: never error:'' — stderr, stdout, then scoped fallback.
         let err_str = dispatch_failure_error(profile_name, &entry.name, &raw, &err);
         let cf = crate::failure::classify(&err_str, None, None);
-        let mut out = json!({
+        let out = json!({
             "ok": false,
             "error": err_str,
             "profile": profile_name,
@@ -2310,7 +2305,6 @@ mod tests {
         LiveRegistry::prune(entries, &live)
     }
 
-    #[test]
     /// bd-rkx8 (red first): among same-profile rows the highest
     /// incarnation wins even when a stale row sorts first — names are
     /// stable across respawns, generations are not.

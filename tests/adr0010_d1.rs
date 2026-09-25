@@ -67,8 +67,10 @@ fn adr0010_d1_flat_digest_replaced_by_ladder() {
             && WORKSPACE.contains("ReringDecision::DigestUnknown"),
         "D1 (bd-w98c): workspace tick must escalate exhausted ladder entries (Dead→respawn, Unknown→digest)"
     );
+    // 7d36bf8 moved the ladder onto `WakeModel` (`next.rering` →
+    // `next.wake.ladders`); pin the beat and the step it must call.
     assert!(
-        WORKSPACE.contains("Msg::AckSlaTick") && WORKSPACE.contains("next.rering"),
+        WORKSPACE.contains("Msg::AckSlaTick") && WORKSPACE.contains("next.wake.ladder_step"),
         "D1 (bd-w98c): the AckSlaTick beat must advance ladder entries in workspace::tick"
     );
     let _ = DOORBELL;
