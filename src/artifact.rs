@@ -435,17 +435,25 @@ fn validate_evaluation_evidence(
 }
 
 /// Persist one host evaluation, returning its durable path.
+///
+/// The gate reads this file back (`artifacts stitch`,
+/// `read_evaluation_evidence`), so the write is atomic: a reader never sees a
+/// half-written record, and `fs_util::atomic_write` names the failing path in
+/// its error where a bare errno does not. A transient OS error gets ONE
+/// retry — the write is idempotent (same bytes, same destination) and a real
+/// failure still returns Err, so the gate still fails closed.
 pub fn write_evaluation_evidence(
     project: &str,
     evidence: &EvaluationEvidence,
 ) -> anyhow::Result<PathBuf> {
     validate_evaluation_evidence(evidence, None)?;
     let path = evaluation_artifact_path(project, &evidence.run_id, &evidence.link, &evidence.phase);
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("evaluation artifact has no parent directory"))?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(&path, serde_json::to_string_pretty(evidence)?)?;
+    let json = serde_json::to_string_pretty(evidence)?;
+    if let Err(first) = crate::fs_util::atomic_write(&path, json.as_bytes()) {
+        crate::fs_util::atomic_write(&path, json.as_bytes()).map_err(|retry| {
+            anyhow::anyhow!("evaluation evidence write failed: {first:#}; retry failed: {retry:#}")
+        })?;
+    }
     Ok(path)
 }
 

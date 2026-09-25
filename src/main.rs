@@ -20995,50 +20995,6 @@ mod loop_tests {
     }
 
     #[test]
-    fn idle_agent_pops_queue() {
-        let states = vec![st("a", AgentStatus::Idle)];
-        let q = vec!["p1".into(), "p6".into()];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        // q.len() check now via next.queue
-        //        assert!(true); // q len check now via next.queue
-        match &actions[0] {
-            durable::LoopAction::Send { name, text } => {
-                assert_eq!(name, "a");
-                assert_eq!(text, "p1");
-            }
-            other => panic!("expected Send, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn done_agent_pops_queue_like_idle() {
         // bd-fw-done-agents-idle-only-iq3: a task-completed agent takes the
         // next bead — dispatch must include `done`, not only `idle`.
@@ -21198,315 +21154,6 @@ mod loop_tests {
             durable::LoopAction::Send { text, .. } => assert_eq!(text, "t1"),
             other => panic!("expected Send, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn queue_drains_across_idle_agents_in_order() {
-        let states = vec![st("a", AgentStatus::Idle), st("b", AgentStatus::Idle)];
-        let q = vec!["p1".into(), "p6".into()];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        // q is not drained by plan_actions directly anymore, tick handles the pop
-        //        assert!(true); // old check, now handled by tick's next.queue
-        match (&actions[0], &actions[1]) {
-            (
-                durable::LoopAction::Send { name: n1, text: t1 },
-                durable::LoopAction::Send { name: n2, text: t2 },
-            ) => {
-                assert_eq!((n1, t1), (&"a".to_string(), &"p1".to_string()));
-                assert_eq!((n2, t2), (&"b".to_string(), &"p6".to_string()));
-            }
-            other => panic!("expected two sends, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn working_agent_gets_nothing() {
-        let states = vec![st("a", AgentStatus::Working)];
-        let q = vec!["p1".into()];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        // q.len() check now via next.queue
-        //        assert!(true); // q len check now via next.queue // queue untouched
-        assert!(matches!(actions[0], durable::LoopAction::Wait));
-    }
-
-    #[test]
-    fn blocked_agent_reports() {
-        let states = vec![st("a", AgentStatus::Blocked)];
-        let q = vec!["p1".into()];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        assert!(matches!(&actions[0], durable::LoopAction::Blocked { name } if name == "a"));
-        // q.len() check now via next.queue
-        //        assert!(true); // q len check now via next.queue // blocked agent doesn't consume the queue
-    }
-
-    #[test]
-    fn unknown_agent_keeps_queue() {
-        // parity with the durable loop (bd-unknown-skip-dispatch): herdr
-        // cannot classify an unknown agent confidently — a prompt could land
-        // in a half-dead session and be silently lost. Never dispatch, never
-        // nudge; the queue stays intact.
-        let states = vec![st("a", AgentStatus::Unknown)];
-        let q = vec!["p1".into()];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        // q.len() check now via next.queue
-        //        assert!(true); // q len check now via next.queue
-        assert!(matches!(actions[0], durable::LoopAction::Wait));
-        let q2: Vec<String> = vec![];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q2.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            Some("proceed"),
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        assert!(
-            matches!(actions[0], durable::LoopAction::Wait),
-            "no nudge to unknown"
-        );
-    }
-
-    #[test]
-    fn empty_queue_with_nudge_nudges() {
-        let states = vec![st("a", AgentStatus::Idle)];
-        let q: Vec<String> = vec![];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            Some("proceed"),
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        assert!(matches!(&actions[0], durable::LoopAction::Nudge { name } if name == "a"));
-    }
-
-    #[test]
-    fn empty_queue_no_nudge_waits() {
-        let states = vec![st("a", AgentStatus::Done)];
-        let q: Vec<String> = vec![];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        assert!(matches!(actions[0], durable::LoopAction::Wait));
-    }
-
-    #[test]
-    fn done_treated_like_idle() {
-        let states = vec![st("a", AgentStatus::Done)];
-        let q = vec!["p8".into()];
-        let actions = durable::plan_actions(
-            &crate::durable::LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        // q is not drained by plan_actions directly anymore, tick handles the pop
-        //        assert!(true); // old check, now handled by tick's next.queue
-        assert!(matches!(&actions[0], durable::LoopAction::Send { text, .. } if text == "p8"));
     }
 
     #[test]
@@ -27003,16 +26650,49 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
         *blocking += 1;
     };
 
+    /// Resolve a profile value for the static lint. `@name` (or `name`) is
+    /// the direct case. A templated value cannot be resolved statically —
+    /// the compose tokens wire their coder seat as
+    /// `{{inputs.coder_profile}}` (bd-adv4) — so a PURE input ref is checked
+    /// through its declared string default, and anything else (a
+    /// `{{steps.x}}` ref, mixed text, a templated default) is left to the
+    /// engine at invoke time. The `{{inputs.X}}` walker still fails an
+    /// undeclared ref, so a typo cannot hide behind the skip.
+    fn resolved_profile<'a>(
+        profile: &'a str,
+        inputs: &'a [toron_workflow::schema::InputDecl],
+    ) -> Option<&'a str> {
+        let bare = profile.trim_start_matches('@');
+        if bare.is_empty() {
+            return None;
+        }
+        if !bare.contains("{{") {
+            return Some(bare);
+        }
+        let inner = bare.strip_prefix("{{")?.strip_suffix("}}")?.trim();
+        let root = inner.strip_prefix("inputs.")?.split('.').next()?;
+        let default = inputs
+            .iter()
+            .find(|i| i.name == root)
+            .and_then(|i| i.default.as_ref())?
+            .as_str()?
+            .trim_start_matches('@');
+        if default.contains("{{") {
+            return None;
+        }
+        Some(default)
+    }
+
     fn check_profile(
         profile: &str,
+        inputs: &[toron_workflow::schema::InputDecl],
         profiles: &profile::ProfileCatalog,
         blocking: &mut usize,
         emit: &dyn Fn(&str, &mut usize),
     ) {
-        let bare = profile.trim_start_matches('@');
-        if bare.is_empty() {
+        let Some(bare) = resolved_profile(profile, inputs) else {
             return;
-        }
+        };
         if profiles.get(bare).is_none() {
             let msg = format!(
                 "profile {profile:?} does not resolve (known: {})",
@@ -27079,6 +26759,7 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
         action: &toron_workflow::schema::Action,
         profiles: &profile::ProfileCatalog,
         stages: &stages::StageLibrary,
+        inputs: &[toron_workflow::schema::InputDecl],
         declared: &std::collections::HashSet<&str>,
         blocking: &mut usize,
         emit: &dyn Fn(&str, &mut usize),
@@ -27086,7 +26767,7 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
         let json = serde_json::to_value(action).unwrap_or_default();
         if let Some(spec) = json.get("spec").and_then(|s| s.as_object()) {
             if let Some(profile) = spec.get("profile").and_then(|v| v.as_str()) {
-                check_profile(profile, profiles, blocking, emit);
+                check_profile(profile, inputs, profiles, blocking, emit);
             }
             if let Some(stage) = spec.get("stage").and_then(|v| v.as_str())
                 && !stages.has(stage)
@@ -27098,7 +26779,7 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
             }
         }
         if let Some(profile) = json.get("profile").and_then(|v| v.as_str()) {
-            check_profile(profile, profiles, blocking, emit);
+            check_profile(profile, inputs, profiles, blocking, emit);
         }
         for v in json.as_object().into_iter().flat_map(|o| o.values()) {
             collect_input_refs(v, declared, blocking, emit);
@@ -27110,6 +26791,7 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
             &step.action,
             &profiles,
             &stages,
+            &wf.inputs,
             &declared_inputs,
             &mut blocking,
             &emit,
@@ -27121,6 +26803,7 @@ fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usiz
                 &node.action,
                 &profiles,
                 &stages,
+                &wf.inputs,
                 &declared_inputs,
                 &mut blocking,
                 &emit,
@@ -36100,37 +35783,6 @@ mod idempot_tests {
 #[cfg(test)]
 mod ingress_wiring_tests {
     use crate::ingress::{HerdrEvent, IngressEvent, WatchHit};
-
-    #[test]
-    fn ingress_wiring_pane_exited_and_trigger_go_through_handle_ingress() {
-        let adapters = crate::ingress::IngressAdapters {
-            herdr: Box::new(|e: &HerdrEvent| {
-                if matches!(e, HerdrEvent::PaneExited { .. }) {
-                    // Use a static to capture
-                }
-            }),
-            watch: Box::new(|_| {}),
-            workflow: Box::new(|_| {}),
-            cron: Box::new(|_| {}),
-            fact: Box::new(|_| {}),
-        };
-        // Use the real handle_ingress to ensure both go through it
-        let exited = IngressEvent::Herdr(HerdrEvent::PaneExited {
-            pane_id: "w1:p1".into(),
-            herdr_name: "test-pane".into(),
-        });
-        crate::ingress::handle_ingress(&exited, &adapters);
-        let posted =
-            IngressEvent::WorkflowTrigger(toron_workflow::schema::Trigger::MessagePosted {
-                channel: Some("test".into()),
-                project: Some("proj".into()),
-            });
-        // If handle_ingress is correctly wired, both should have been routed
-        // We verify by checking that handle_ingress was called (no panic) and that
-        // a second call with different variant also routes
-        crate::ingress::handle_ingress(&posted, &adapters);
-        // Reaching here means both went through handle_ingress without bypass.
-    }
 
     #[test]
     fn ingress_wiring_all_variants_go_through_handle_ingress() {

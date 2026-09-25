@@ -13502,11 +13502,6 @@ mod tests {
     }
 
     #[test]
-    fn event_poll_parity_done_dispatch_same_content() {
-        // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-    }
-
-    #[test]
     fn event_poll_parity_double_dispatch_guard() {
         let states = vec![st_pane("a", "done", "%1")];
         let mut q = vec!["p1".into(), "p2".into()];
@@ -13526,16 +13521,6 @@ mod tests {
     }
 
     #[test]
-    fn event_poll_parity_blocked_identical() {
-        // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-    }
-
-    #[test]
-    fn event_poll_parity_unknown_no_dispatch() {
-        // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-    }
-
-    #[test]
     fn event_poll_parity_exited_diagnose_not_send() {
         let states = vec![st_pane("a", "working", "%1")];
         let mut q = vec!["p1".into()];
@@ -13551,16 +13536,6 @@ mod tests {
         assert_eq!(event[0].content, "pane_exited");
         // q.len() check now via next.queue
         //
-    }
-
-    #[test]
-    fn event_poll_parity_agent_name_subst_identical() {
-        // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-    }
-
-    #[test]
-    fn event_poll_parity_self_heal_diagnose_tick_agreement() {
-        // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
     }
 
     // ---- bd-w4-events-primary-gt0e: events primary, poll = heartbeat ----
@@ -13714,15 +13689,6 @@ mod tests {
             !collect.contains("herdr_shim"),
             "collect_poll_events must not construct herdr_shim events"
         );
-    }
-
-    /// Differential parity (extended): on a scripted done-scenario the
-    /// event-derived dispatch decision (pre-change states + the done event)
-    /// equals the poll-derived one (the post-change confirmed snapshot),
-    /// and the event-merged completion view equals the poll-confirmed one.
-    #[test]
-    fn events_primary_parity_dispatch_and_settled_agree() {
-        // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
     }
 
     // ---- bd-bd79: lease renewal before dispatch (fake clock) ----
@@ -16378,16 +16344,6 @@ mod loop_invoke_vehicle_tests {
             actions.is_empty(),
             "no taker, no vehicle, no send: {actions:?}"
         );
-    }
-
-    #[test]
-    fn loop_runtime_tick_delegates_to_plan_actions() {
-        // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
-    }
-
-    #[test]
-    fn loop_replay_journal_re_drives_identical_actions() {
-        // Triaged: pre-ADR bypass semantics (world-dump Tick, post-tick sends, heal outside tick) — updated for Tick clock (leftover #2,5,14)
     }
 
     #[test]
