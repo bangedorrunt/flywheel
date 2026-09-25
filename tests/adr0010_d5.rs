@@ -39,8 +39,11 @@ fn adr0010_d5_wake_classes_present() {
 /// first, bead ids kept, exact commands last.
 #[test]
 fn adr0010_d5_digest_path_present() {
+    // 7d36bf8 moved the digest queue into `WakeModel` (`wake.digests`); the
+    // tick still folds `Cmd::Digest` rows into `DigestEntry` and renders
+    // through `render_digest`.
     assert!(
-        WORKSPACE.contains("digest_queue") || WORKSPACE.contains("DigestQueue"),
+        WORKSPACE.contains(".digests") && WORKSPACE.contains("Cmd::Digest"),
         "D5 (bd-65he): tick must queue captain-relevant wakes for digest"
     );
     assert!(
