@@ -5455,81 +5455,87 @@ mod workspace_origin_tests {
     /// bd-627z.3 gate: every ownership signal in one table — base label,
     /// swarm label, flywheel-prefixed agents, recorded spawn meta, plain
     /// agents, unrelated workspaces, and the precedence pairs.
+    /// One row of the workspace-origin table, named rather than a five-tuple:
+    /// the fields read at the assertion sites, and clippy's `type_complexity`
+    /// stays quiet (same shape as `pane`'s `RouteRow`).
+    struct OriginRow {
+        case: &'static str,
+        w: WorkspaceInfo,
+        agents: Vec<AgentInfo>,
+        spawn_label: Option<&'static str>,
+        want: Option<WorkspaceOrigin>,
+    }
+
     #[test]
     fn classify_workspace_origin_rows() {
-        let cases: [(
-            &str,
-            WorkspaceInfo,
-            Vec<AgentInfo>,
-            Option<&str>,
-            Option<WorkspaceOrigin>,
-        ); 8] = [
+        let cases: [OriginRow; 8] = [
             // A foreign workspace (captain/omp session labeled like the
             // project) is NOT flywheel-owned — spawn must warn + proceed.
-            (
-                "base_label_alone_is_foreign",
-                ws("w17", "toron", 2),
-                vec![],
-                None,
-                Some(WorkspaceOrigin::Foreign),
-            ),
-            (
-                "swarm_label_is_owned",
-                ws("w2A", "flywheel-toron", 3),
-                vec![],
-                None,
-                Some(WorkspaceOrigin::Owned),
-            ),
-            (
-                "flywheel_prefixed_agents_mark_owned",
-                ws("w9", "custom-swarm-label", 1),
-                vec![agent("flywheel-toron-oc", "w9")],
-                None,
-                Some(WorkspaceOrigin::Owned),
-            ),
-            (
-                "recorded_spawn_meta_label_marks_owned",
-                ws("w9", "my-special-label", 1),
-                vec![],
-                Some("my-special-label"),
-                Some(WorkspaceOrigin::Owned),
-            ),
-            (
-                "unrelated_workspace_is_skipped",
-                ws("w1", "scratchpad", 1),
-                vec![],
-                None,
-                None,
-            ),
-            (
-                "base_label_with_plain_agent_stays_foreign",
-                ws("w17", "toron", 1),
-                vec![agent("oc", "w17")],
-                None,
-                Some(WorkspaceOrigin::Foreign),
-            ),
+            OriginRow {
+                case: "base_label_alone_is_foreign",
+                w: ws("w17", "toron", 2),
+                agents: vec![],
+                spawn_label: None,
+                want: Some(WorkspaceOrigin::Foreign),
+            },
+            OriginRow {
+                case: "swarm_label_is_owned",
+                w: ws("w2A", "flywheel-toron", 3),
+                agents: vec![],
+                spawn_label: None,
+                want: Some(WorkspaceOrigin::Owned),
+            },
+            OriginRow {
+                case: "flywheel_prefixed_agents_mark_owned",
+                w: ws("w9", "custom-swarm-label", 1),
+                agents: vec![agent("flywheel-toron-oc", "w9")],
+                spawn_label: None,
+                want: Some(WorkspaceOrigin::Owned),
+            },
+            OriginRow {
+                case: "recorded_spawn_meta_label_marks_owned",
+                w: ws("w9", "my-special-label", 1),
+                agents: vec![],
+                spawn_label: Some("my-special-label"),
+                want: Some(WorkspaceOrigin::Owned),
+            },
+            OriginRow {
+                case: "unrelated_workspace_is_skipped",
+                w: ws("w1", "scratchpad", 1),
+                agents: vec![],
+                spawn_label: None,
+                want: None,
+            },
+            OriginRow {
+                case: "base_label_with_plain_agent_stays_foreign",
+                w: ws("w17", "toron", 1),
+                agents: vec![agent("oc", "w17")],
+                spawn_label: None,
+                want: Some(WorkspaceOrigin::Foreign),
+            },
             // Recorded spawn meta and flywheel-prefixed agents both beat the
             // base label.
-            (
-                "spawn_meta_beats_base_label",
-                ws("w2B", "toron", 1),
-                vec![],
-                Some("toron"),
-                Some(WorkspaceOrigin::Owned),
-            ),
-            (
-                "flywheel_agents_beat_base_label",
-                ws("w17", "toron", 1),
-                vec![agent("flywheel-toron-oc", "w17")],
-                None,
-                Some(WorkspaceOrigin::Owned),
-            ),
+            OriginRow {
+                case: "spawn_meta_beats_base_label",
+                w: ws("w2B", "toron", 1),
+                agents: vec![],
+                spawn_label: Some("toron"),
+                want: Some(WorkspaceOrigin::Owned),
+            },
+            OriginRow {
+                case: "flywheel_agents_beat_base_label",
+                w: ws("w17", "toron", 1),
+                agents: vec![agent("flywheel-toron-oc", "w17")],
+                spawn_label: None,
+                want: Some(WorkspaceOrigin::Owned),
+            },
         ];
-        for (case, w, agents, spawn_label, want) in cases {
+        for row in cases {
             assert_eq!(
-                classify_workspace_origin("toron", &w, &agents, spawn_label),
-                want,
-                "{case}"
+                classify_workspace_origin("toron", &row.w, &row.agents, row.spawn_label),
+                row.want,
+                "{}",
+                row.case
             );
         }
     }
@@ -32175,9 +32181,7 @@ fn cmd_daemon(cmd: &DaemonCmd) -> Result<()> {
 /// Wake classify uses **alive only** (GS062 alive-empty WARNING): when
 /// `alive` is empty do **not** fall through to `other` (orphan stamps →
 /// false Quiet) — empty alive → NeverStamped.
-fn hosted_registry_partitions(
-    state_dir: &std::path::Path,
-) -> (Vec<String>, Vec<String>) {
+fn hosted_registry_partitions(state_dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
     let db = state_dir.join("doorbell");
     let mut alive = Vec::new();
     let mut other = Vec::new();
@@ -32309,10 +32313,7 @@ mod hosted_workspaces_from_registry_tests {
         );
         let zzz_pos = got.iter().position(|s| s == "zzz").expect("zzz present");
         let aaa_pos = got.iter().position(|s| s == "aaa").expect("aaa present");
-        assert!(
-            zzz_pos < aaa_pos,
-            "zzz (alive) before aaa (other): {got:?}"
-        );
+        assert!(zzz_pos < aaa_pos, "zzz (alive) before aaa (other): {got:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -32390,10 +32391,7 @@ mod hosted_workspaces_from_registry_tests {
         doorbell_rt::watchbeat::touch_heartbeat(&dir, "orphan");
 
         let alive = super::hosted_alive_workspaces_from_registry(&dir);
-        assert!(
-            alive.is_empty(),
-            "orphan must not be alive: {alive:?}"
-        );
+        assert!(alive.is_empty(), "orphan must not be alive: {alive:?}");
         let hosted = hosted_workspaces_from_registry(&dir);
         assert_eq!(hosted, vec!["orphan".to_string()]);
 
@@ -32512,10 +32510,7 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
         let (alive, hosted) = {
             let (a, o) = hosted_registry_partitions(&state_dir);
             let alive = doorbell_rt::wake_liveness::order_hosted_alive_first(a, Vec::new());
-            let hosted = doorbell_rt::wake_liveness::order_hosted_alive_first(
-                alive.clone(),
-                o,
-            );
+            let hosted = doorbell_rt::wake_liveness::order_hosted_alive_first(alive.clone(), o);
             let mut g = st
                 .hosted_workspaces
                 .lock()

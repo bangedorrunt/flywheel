@@ -57,7 +57,6 @@ pub enum AskReply {
     Digest(Vec<(String, String)>),
 }
 
-
 /// GS062-ADV-5: deliver [`BrainMsg::Died`] with `blocking_send` so a Full
 /// brain channel cannot drop restart_watch (try_send(Died) is lossy under
 /// Full; Watch stays try_send-only to avoid parking the reader on every line).
