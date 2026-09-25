@@ -654,8 +654,7 @@ pub(crate) fn cmd_doorbell_digest(
                             .and_then(|d| d.get("pin"))
                             .and_then(|p| p.as_str())
                             == Some(id)
-                            || v
-                                .get("Prompt")
+                            || v.get("Prompt")
                                 .and_then(|d| d.get("pin"))
                                 .and_then(|p| p.as_str())
                                 == Some(id)
