@@ -9053,23 +9053,23 @@ pub fn route_event(
 mod loop_doctor_tests {
     use super::is_loop_invocation;
 
+    /// One row per id shape: only a root `swarm-loop:`/`engine-loop:` promise
+    /// is a loop invocation — child promises (`:123.1`), other workflows and
+    /// bare / flywheel-loop ids never count.
     #[test]
-    fn root_loop_invocations_match() {
-        assert!(is_loop_invocation("swarm-loop:flywheel:123"));
-        assert!(is_loop_invocation("engine-loop:flywheel:456"));
-    }
-
-    #[test]
-    fn child_promises_never_match() {
-        assert!(!is_loop_invocation("swarm-loop:flywheel:123.1"));
-        assert!(!is_loop_invocation("engine-loop:flywheel:456.7.2"));
-    }
-
-    #[test]
-    fn foreign_ids_never_match() {
-        assert!(!is_loop_invocation("other-workflow:flywheel:123"));
-        assert!(!is_loop_invocation("swarm-loop"));
-        assert!(!is_loop_invocation("flywheel-loop:flywheel:123"));
+    fn is_loop_invocation_rows() {
+        let rows = [
+            ("swarm-loop-root", "swarm-loop:flywheel:123", true),
+            ("engine-loop-root", "engine-loop:flywheel:456", true),
+            ("swarm-loop-child", "swarm-loop:flywheel:123.1", false),
+            ("engine-loop-child", "engine-loop:flywheel:456.7.2", false),
+            ("foreign-workflow", "other-workflow:flywheel:123", false),
+            ("bare-prefix", "swarm-loop", false),
+            ("flywheel-loop", "flywheel-loop:flywheel:123", false),
+        ];
+        for (name, id, expected) in rows {
+            assert_eq!(is_loop_invocation(id), expected, "row {name}");
+        }
     }
 }
 
@@ -9088,37 +9088,54 @@ mod reply_verify_tests {
         verify_reply(head, newest, author, agent, reminded)
     }
 
-    /// bd-a7j: a NEW message from the asked agent satisfies the expectation —
-    /// even when the head (question id) was never recorded.
+    /// bd-a7j, one row per verdict: a NEW message from the asked agent
+    /// satisfies — even when the head (question id) was never recorded —
+    /// while the question's own id (the captain's message, not a reply) and
+    /// another agent's message only remind.
     #[test]
-    fn new_message_from_agent_satisfies() {
-        assert!(matches!(
-            v(Some("q1"), Some("r1"), Some("oc"), "oc", 0),
-            ReplyVerdict::Satisfied
-        ));
-        match v(None, Some("r1"), Some("oc"), "oc", 3) {
-            ReplyVerdict::Satisfied => {}
-            other => panic!("any agent message satisfies when head is unknown: {other:?}"),
+    fn reply_verdict_rows() {
+        let rows = [
+            (
+                "new-message-satisfies",
+                Some("q1"),
+                Some("r1"),
+                Some("oc"),
+                "oc",
+                0,
+                ReplyVerdict::Satisfied,
+            ),
+            (
+                "unrecorded-head-still-satisfies",
+                None,
+                Some("r1"),
+                Some("oc"),
+                "oc",
+                3,
+                ReplyVerdict::Satisfied,
+            ),
+            (
+                "question-itself-reminds",
+                Some("q1"),
+                Some("q1"),
+                Some("oc"),
+                "oc",
+                0,
+                ReplyVerdict::Reminded,
+            ),
+            (
+                "other-agent-reminds",
+                Some("q1"),
+                Some("r1"),
+                Some("pi"),
+                "oc",
+                0,
+                ReplyVerdict::Reminded,
+            ),
+        ];
+        for (name, head, newest, author, agent, reminded, expected) in rows {
+            let got = v(head, newest, author, agent, reminded);
+            assert_eq!(got, expected, "row {name}: {got:?}");
         }
-    }
-
-    /// bd-a7j: the question itself (same id) does NOT satisfy — that is the
-    /// captain's own message, not a reply.
-    #[test]
-    fn question_itself_does_not_satisfy() {
-        assert!(matches!(
-            v(Some("q1"), Some("q1"), Some("oc"), "oc", 0),
-            ReplyVerdict::Reminded
-        ));
-    }
-
-    /// bd-a7j: another agent's message does not satisfy (wrong sender).
-    #[test]
-    fn other_agents_message_does_not_satisfy() {
-        assert!(matches!(
-            v(Some("q1"), Some("r1"), Some("pi"), "oc", 0),
-            ReplyVerdict::Reminded
-        ));
     }
 
     /// bd-a7j: silence → first remind, second silence escalates.
@@ -9745,44 +9762,107 @@ mod tests {
         }
     }
 
-    #[test]
-    fn idle_agent_pops_queue() {
-        let states = vec![st("a", "idle")];
-        let q = vec!["p1".to_string(), "p6".to_string()];
-        let actions = plan_actions(
+    /// `plan_actions` fixture: one queue, everything else default (the eight
+    /// rows below each re-typed the full two-dozen-field literal).
+    fn plan(queue: &[&str], states: &[AgentState], nudge: Option<&str>) -> Vec<LoopAction> {
+        plan_actions(
             &LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
+                queue: queue.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
             },
-            &states,
-            None,
+            states,
+            nudge,
             &HashMap::new(),
             &std::collections::HashSet::new(),
-        );
-        // q.len() check now via next.queue
-        //
-        assert!(
-            matches!(&actions[0], LoopAction::Send { name, text } if name == "a" && text == "p1")
-        );
+        )
+    }
+
+    fn send(name: &str, text: &str) -> LoopAction {
+        LoopAction::Send {
+            name: name.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    /// One row per `plan_actions` contract. It emits exactly one action per
+    /// agent, in state order: idle/done pop the queue front (a nudge when the
+    /// queue is empty), working and unknown wait and never dispatch
+    /// (bd-unknown-skip-dispatch), blocked reports. Fixtures and expectations
+    /// are the eight tests this replaces.
+    #[test]
+    fn plan_actions_rows() {
+        let rows: [(
+            &str,
+            Vec<AgentState>,
+            &[&str],
+            Option<&str>,
+            Vec<LoopAction>,
+        ); 8] = [
+            (
+                "idle-pops-queue",
+                vec![st("a", "idle")],
+                &["p1", "p6"],
+                None,
+                vec![send("a", "p1")],
+            ),
+            (
+                "queue-drains-across-idle-agents-in-order",
+                vec![st("a", "idle"), st("b", "done")],
+                &["p1", "p6"],
+                None,
+                vec![send("a", "p1"), send("b", "p6")],
+            ),
+            (
+                "working-gets-nothing",
+                vec![st("a", "working")],
+                &["p1"],
+                None,
+                vec![LoopAction::Wait],
+            ),
+            (
+                "blocked-reports-and-keeps-queue",
+                vec![st("a", "blocked")],
+                &["p1"],
+                None,
+                vec![LoopAction::Blocked {
+                    name: "a".to_string(),
+                }],
+            ),
+            (
+                "empty-queue-with-nudge-nudges",
+                vec![st("a", "idle")],
+                &[],
+                Some("proceed"),
+                vec![LoopAction::Nudge {
+                    name: "a".to_string(),
+                }],
+            ),
+            (
+                "empty-queue-no-nudge-waits",
+                vec![st("a", "done")],
+                &[],
+                None,
+                vec![LoopAction::Wait],
+            ),
+            (
+                "unknown-keeps-queue",
+                vec![st("a", "unknown")],
+                &["p1"],
+                None,
+                vec![LoopAction::Wait],
+            ),
+            (
+                "unknown-with-nudge-no-send",
+                vec![st("a", "unknown")],
+                &[],
+                Some("proceed"),
+                vec![LoopAction::Wait],
+            ),
+        ];
+        for (name, states, queue, nudge, expected) in rows {
+            let got = plan(queue, &states, nudge);
+            assert_eq!(got, expected, "row {name}: {got:?}");
+        }
     }
 
     /// bd-context-limit-honor-luqg: a CONTEXT_LIMIT sender maps to the crew
@@ -9812,276 +9892,6 @@ mod tests {
         );
         assert_eq!(context_limit_target("StrangerPin", &states), None);
         assert_eq!(context_limit_target("", &states), None);
-    }
-
-    #[test]
-    fn queue_drains_across_idle_agents_in_order() {
-        let states = vec![st("a", "idle"), st("b", "done")];
-        let q = vec!["p1".to_string(), "p6".to_string()];
-        let actions = plan_actions(
-            &LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        // q is not drained by plan_actions directly anymore, tick handles the pop
-        //
-        match (&actions[0], &actions[1]) {
-            (LoopAction::Send { name: n1, text: t1 }, LoopAction::Send { name: n2, text: t2 }) => {
-                assert_eq!(n1, "a");
-                assert_eq!(t1, "p1");
-                assert_eq!(n2, "b");
-                assert_eq!(t2, "p6");
-            }
-            other => panic!("expected two sends, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn working_agent_gets_nothing() {
-        let states = vec![st("a", "working")];
-        let q = vec!["p1".to_string()];
-        let actions = plan_actions(
-            &LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        // q.len() check now via next.queue
-        //
-        assert!(matches!(actions[0], LoopAction::Wait));
-    }
-
-    #[test]
-    fn blocked_agent_reports_and_keeps_queue() {
-        let states = vec![st("a", "blocked")];
-        let q = vec!["p1".to_string()];
-        let actions = plan_actions(
-            &LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        assert!(matches!(&actions[0], LoopAction::Blocked { name } if name == "a"));
-        // q.len() check now via next.queue
-        //
-    }
-
-    #[test]
-    fn empty_queue_with_nudge_nudges() {
-        let states = vec![st("a", "idle")];
-        let q: Vec<String> = vec![];
-        let actions = plan_actions(
-            &LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            Some("proceed"),
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        assert!(matches!(&actions[0], LoopAction::Nudge { name } if name == "a"));
-    }
-
-    #[test]
-    fn empty_queue_no_nudge_waits() {
-        let states = vec![st("a", "done")];
-        let q: Vec<String> = vec![];
-        let actions = plan_actions(
-            &LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        assert!(matches!(actions[0], LoopAction::Wait));
-    }
-
-    // ---- unknown agents: never dispatch, never nudge (bd-unknown-skip-dispatch) ----
-
-    #[test]
-    fn unknown_agent_keeps_queue() {
-        let states = vec![st("a", "unknown")];
-        let q = vec!["p1".to_string()];
-        let actions = plan_actions(
-            &LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            None,
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        // q.len() check now via next.queue
-        //
-        assert!(matches!(actions[0], LoopAction::Wait));
-    }
-
-    #[test]
-    fn unknown_with_nudge_no_send() {
-        let states = vec![st("a", "unknown")];
-        let q: Vec<String> = vec![];
-        let actions = plan_actions(
-            &LoopModel {
-                queue: q.clone(),
-                per_bead_phase: Default::default(),
-                wake_suppression: Default::default(),
-                done_mailed: Default::default(),
-                event_cursor: None,
-                escalation: Default::default(),
-                respawn: Default::default(),
-                mail_health: Default::default(),
-                mail_degraded: false,
-                heal_states: Default::default(),
-
-                heal_grace: Default::default(),
-
-                heal_threshold: Default::default(),
-
-                heal_budget: Default::default(),
-
-                pending_events: Default::default(),
-                states: Default::default(),
-                dispatch_pending: Default::default(),
-                drain_pending: Default::default(),
-            },
-            &states,
-            Some("proceed"),
-            &HashMap::new(),
-            &std::collections::HashSet::new(),
-        );
-        assert!(matches!(actions[0], LoopAction::Wait)); // no Nudge, no Send
     }
 
     #[test]

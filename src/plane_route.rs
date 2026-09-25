@@ -188,31 +188,27 @@ pub fn plane_label(plane: Plane) -> &'static str {
 mod tests {
     use super::*;
 
+    /// One row per needle, case-insensitive: nsec / ncryptsec ids, the
+    /// passphrase env name (as prose or an assignment), and PEM private-key
+    /// headers are secrets; a certificate header is not.
     #[test]
-    fn plane_route_secret_pattern_nsec() {
-        assert!(is_secret_pattern("here is nsec1abc..."));
-        assert!(is_secret_pattern("NSEC1ABC"));
-        assert!(!is_secret_pattern("nothing secret here"));
-    }
-
-    #[test]
-    fn plane_route_secret_pattern_ncryptsec() {
-        assert!(is_secret_pattern("ncryptsec1..."));
-        assert!(is_secret_pattern("NCRYPTSEC1..."));
-    }
-
-    #[test]
-    fn plane_route_secret_pattern_toron_key_passphrase() {
-        assert!(is_secret_pattern("my TORON_KEY_PASSPHRASE is ..."));
-        assert!(is_secret_pattern("toron_key_passphrase=foo"));
-    }
-
-    #[test]
-    fn plane_route_secret_pattern_private_key() {
-        assert!(is_secret_pattern("-----BEGIN PRIVATE KEY----- abc"));
-        assert!(is_secret_pattern("-----BEGIN OPENSSH PRIVATE KEY-----"));
-        assert!(is_secret_pattern("-----BEGIN RSA PRIVATE KEY-----"));
-        assert!(!is_secret_pattern("-----BEGIN CERTIFICATE-----"));
+    fn plane_route_secret_pattern_rows() {
+        let rows = [
+            ("nsec-lower", "here is nsec1abc...", true),
+            ("nsec-upper", "NSEC1ABC", true),
+            ("plain-text", "nothing secret here", false),
+            ("ncryptsec-lower", "ncryptsec1...", true),
+            ("ncryptsec-upper", "NCRYPTSEC1...", true),
+            ("passphrase-prose", "my TORON_KEY_PASSPHRASE is ...", true),
+            ("passphrase-assignment", "toron_key_passphrase=foo", true),
+            ("pem-private-key", "-----BEGIN PRIVATE KEY----- abc", true),
+            ("pem-openssh", "-----BEGIN OPENSSH PRIVATE KEY-----", true),
+            ("pem-rsa", "-----BEGIN RSA PRIVATE KEY-----", true),
+            ("pem-certificate", "-----BEGIN CERTIFICATE-----", false),
+        ];
+        for (name, body, expected) in rows {
+            assert_eq!(is_secret_pattern(body), expected, "row {name}");
+        }
     }
 
     #[test]
