@@ -11,6 +11,11 @@
 //!   a `dispatch_job` step; `Wait{until}` → a wait step; a pipeline → a
 //!   workflow of `call_workflow` steps.
 //!
+//! User-tier seeds prefer one file per entry: workflows remain YAML because the
+//! workflow schema contains unit values, while stages use `stages/<name>.toml`.
+//! Existing `stages.toml` remains a compatibility input and per-entry stages
+//! win when both define the same name.
+//!
 //! **Honesty rule (P3.2):** if a legacy `WorkflowStep` variant does not map
 //! 1:1 to a unified step, [`absorb`] records a `MappingNote` — it is NEVER
 //! silently dropped. The current mapping:
@@ -68,41 +73,35 @@ pub fn seed_user_catalog(config_root: &Path) -> Result<CatalogSeedReport> {
         }
     }
 
-    let stage_path = config_root.join("stages.toml");
-    let mut file = if stage_path.is_file() {
-        let raw = std::fs::read_to_string(&stage_path)
-            .with_context(|| format!("read {}", stage_path.display()))?;
-        raw.parse::<toml::Table>()
-            .with_context(|| format!("parse {}", stage_path.display()))?
+    let legacy_stage_path = config_root.join("stages.toml");
+    let legacy = if legacy_stage_path.is_file() {
+        let raw = std::fs::read_to_string(&legacy_stage_path)
+            .with_context(|| format!("read {}", legacy_stage_path.display()))?;
+        toml::from_str::<UserStages>(&raw)
+            .with_context(|| format!("parse {}", legacy_stage_path.display()))?
     } else {
-        toml::Table::new()
+        UserStages::default()
     };
-    let stages = file
-        .entry("stages".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .context("stages.toml `stages` must be a table")?;
+    let stage_dir = config_root.join("stages");
     let compiled = crate::stages::StageLibrary::compiled_in();
     for name in compiled.list() {
         let stage = compiled
             .get_stage(name)
             .expect("compiled stage list and stage map agree");
-        if stages.contains_key(name) {
+        let path = stage_dir.join(format!("{name}.toml"));
+        if path.exists() {
+            report.kept_stages.push(name.to_string());
+        } else if legacy.stages.get(name).is_some_and(|user| user == stage) {
+            crate::stages::upsert_stage_entry(&path, stage)?;
+            report.created_stages.push(name.to_string());
+        } else if legacy.stages.contains_key(name) {
+            // An authored aggregate entry remains authoritative; do not shadow
+            // it with a generated per-entry copy.
             report.kept_stages.push(name.to_string());
         } else {
-            let value = toml::Value::try_from(stage.clone()).context("serialize compiled stage")?;
-            stages.insert(name.to_string(), value);
+            crate::stages::upsert_stage_entry(&path, stage)?;
             report.created_stages.push(name.to_string());
         }
-    }
-    if !report.created_stages.is_empty() || !stage_path.exists() {
-        if let Some(parent) = stage_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        let raw = toml::to_string(&file).context("serialize seeded stages.toml")?;
-        std::fs::write(&stage_path, raw)
-            .with_context(|| format!("write {}", stage_path.display()))?;
     }
     Ok(report)
 }
@@ -121,40 +120,81 @@ struct UserStages {
     stages: BTreeMap<String, crate::stages::Stage>,
 }
 
-fn load_user_workflows(config_root: &Path) -> Result<BTreeMap<String, (Workflow, String)>> {
+fn workflow_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?;
+    let mut yaml = Vec::new();
+    let mut toml = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+        match entry.extension().and_then(|ext| ext.to_str()) {
+            Some("yaml" | "yml") => yaml.push(entry),
+            Some("toml") => toml.push(entry),
+            _ => {}
+        }
+    }
+    yaml.sort();
+    toml.sort();
+    yaml.extend(toml);
+    Ok(yaml)
+}
+
+fn parse_workflow_path(path: &Path) -> Result<Workflow> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("toml") => {
+            toml::from_str(&raw).with_context(|| format!("parse workflow TOML {}", path.display()))
+        }
+        _ => parse_workflow(&raw).with_context(|| format!("parse workflow {}", path.display())),
+    }
+}
+
+fn load_user_workflows(config_root: &Path) -> Result<BTreeMap<String, (Workflow, String, bool)>> {
     let dir = config_root.join("workflows");
     if !dir.is_dir() {
         return Ok(BTreeMap::new());
     }
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .with_context(|| format!("read {}", dir.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        })
-        .collect();
-    paths.sort();
     let mut out = BTreeMap::new();
-    for path in paths {
+    for path in workflow_paths(&dir)? {
         let raw =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let workflow =
-            parse_workflow(&raw).with_context(|| format!("parse workflow {}", path.display()))?;
-        out.insert(workflow.name.clone(), (workflow, raw));
+        let is_toml = path.extension().is_some_and(|ext| ext == "toml");
+        let workflow = if is_toml {
+            toml::from_str(&raw)
+                .with_context(|| format!("parse workflow TOML {}", path.display()))?
+        } else {
+            parse_workflow(&raw).with_context(|| format!("parse workflow {}", path.display()))?
+        };
+        out.insert(workflow.name.clone(), (workflow, raw, is_toml));
     }
     Ok(out)
 }
 
 fn load_user_stages(config_root: &Path) -> Result<BTreeMap<String, crate::stages::Stage>> {
-    let path = config_root.join("stages.toml");
-    if !path.is_file() {
-        return Ok(BTreeMap::new());
+    let mut out = BTreeMap::new();
+    let aggregate = config_root.join("stages.toml");
+    if aggregate.is_file() {
+        let raw = std::fs::read_to_string(&aggregate)
+            .with_context(|| format!("read {}", aggregate.display()))?;
+        let file: UserStages =
+            toml::from_str(&raw).with_context(|| format!("parse {}", aggregate.display()))?;
+        out.extend(file.stages);
     }
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let file: UserStages =
-        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-    Ok(file.stages)
+    let entries = config_root.join("stages");
+    if entries.is_dir() {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&entries)
+            .with_context(|| format!("read {}", entries.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let stage: crate::stages::Stage = toml::from_str(&raw)
+                .with_context(|| format!("parse per-entry stage {}", path.display()))?;
+            out.insert(stage.name.clone(), stage);
+        }
+    }
+    Ok(out)
 }
 
 /// Compare the user tier with the compiled-in defaults. A user copy always
@@ -167,10 +207,19 @@ pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
         let builtin_yaml = serde_yaml::to_string(builtin).ok();
         let status = match user_workflows.get(name) {
             None => "missing",
-            Some((_, source))
-                if builtin_yaml
-                    .as_deref()
-                    .is_some_and(|yaml| yaml.trim_end() == source.trim_end()) =>
+            Some((user, source, is_toml))
+                if if *is_toml {
+                    serde_yaml::to_string(user)
+                        .ok()
+                        .zip(builtin_yaml.as_deref())
+                        .is_some_and(|(user_yaml, builtin_yaml)| {
+                            user_yaml.trim_end() == builtin_yaml.trim_end()
+                        })
+                } else {
+                    builtin_yaml
+                        .as_deref()
+                        .is_some_and(|yaml| yaml.trim_end() == source.trim_end())
+                } =>
             {
                 "current"
             }
@@ -422,19 +471,8 @@ impl WorkflowCatalog {
         if let Some(root) = project_root {
             let dir = root.join(".flywheel").join("workflows");
             if dir.is_dir() {
-                // Reuse the canonical loader shape against the project dir:
-                // parse each YAML and shadow same-named user entries.
-                let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-                    .with_context(|| format!("read {}", dir.display()))?
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
-                    .collect();
-                entries.sort();
-                for path in entries {
-                    let raw = std::fs::read_to_string(&path)
-                        .with_context(|| format!("read {}", path.display()))?;
-                    let wf = parse_workflow(&raw)
-                        .with_context(|| format!("parse workflow {}", path.display()))?;
+                for path in workflow_paths(&dir)? {
+                    let wf = parse_workflow_path(&path)?;
                     catalog.workflows.insert(wf.name.clone(), wf);
                 }
             }
@@ -455,23 +493,14 @@ impl WorkflowCatalog {
         Ok(catalog)
     }
 
-    /// Load canonical `workflows/*.yaml` (unified schema).
+    /// Load canonical `workflows/*.{toml,yaml,yml}` (unified schema).
     fn load_canonical(&mut self, config_root: &Path) -> Result<()> {
         let dir = config_root.join("workflows");
         if !dir.is_dir() {
             return Ok(());
         }
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .with_context(|| format!("read {}", dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
-            .collect();
-        entries.sort();
-        for path in entries {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("read {}", path.display()))?;
-            let wf = parse_workflow(&raw)
-                .with_context(|| format!("parse workflow {}", path.display()))?;
+        for path in workflow_paths(&dir)? {
+            let wf = parse_workflow_path(&path)?;
             self.workflows.insert(wf.name.clone(), wf);
         }
         Ok(())
@@ -1015,6 +1044,25 @@ msg = "legacy triage"
     }
 
     #[test]
+    fn clean_seed_uses_per_entry_toml_for_builtins() {
+        let dir = config_root("seed-entry-toml");
+        seed_user_catalog(&dir).unwrap();
+        assert!(dir.join("workflows/goal.yaml").is_file());
+        assert!(dir.join("stages/ce-execute.toml").is_file());
+        assert!(!dir.join("stages.toml").exists());
+        assert!(!dir.join("workflows/goal.toml").exists());
+
+        let catalog = WorkflowCatalog::load_from(dir.clone()).unwrap();
+        assert!(catalog.workflows.contains_key("goal"));
+        let stages = load_user_stages(&dir).unwrap();
+        assert_eq!(
+            stages.get("ce-execute").map(|stage| stage.prompt.as_str()),
+            crate::stages::StageLibrary::compiled_in().resolve("ce-execute")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn user_catalog_seed_is_non_destructive_and_drift_is_honest() {
         let dir = config_root("seed-drift");
         let before = catalog_drift(&dir).unwrap();
@@ -1066,7 +1114,7 @@ msg = "legacy triage"
             .unwrap()
             .clone();
         stage.prompt.push_str("\noperator override");
-        crate::stages::upsert_stage_in_file(&dir.join("stages.toml"), &stage).unwrap();
+        crate::stages::upsert_stage_entry(&dir.join("stages/ce-execute.toml"), &stage).unwrap();
 
         let after = catalog_drift(&dir).unwrap();
         assert!(

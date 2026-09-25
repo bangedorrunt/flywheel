@@ -170,8 +170,10 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
                     if tier == crate::stages::Tier::User {
                         bail!("stage {name:?} is already at the user tier");
                     }
-                    let dest = crate::config::config_dir().join("stages.toml");
-                    crate::stages::upsert_stage_in_file(&dest, &stage)?;
+                    let dest = crate::config::config_dir()
+                        .join("stages")
+                        .join(format!("{name}.toml"));
+                    crate::stages::upsert_stage_entry(&dest, &stage)?;
                     println!("promoted {name} → user tier ({})", dest.display());
                     Ok(())
                 }
