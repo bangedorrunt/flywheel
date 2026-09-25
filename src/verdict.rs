@@ -1127,73 +1127,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn verify_is_loop_runnable_predicate() {
-        assert!(verify_is_loop_runnable("cargo test -p flywheel verdict::"));
-        assert!(!verify_is_loop_runnable(""));
-        assert!(!verify_is_loop_runnable("   "));
-        assert!(!verify_is_loop_runnable("cargo test && sleep 3600"));
-        assert!(!verify_is_loop_runnable("cargo test || cargo build"));
-        assert!(!verify_is_loop_runnable("cargo test | tee out.txt"));
-        assert!(!verify_is_loop_runnable("cargo test; echo done"));
-        assert!(!verify_is_loop_runnable("cargo test\ncargo build"));
-        assert!(!verify_is_loop_runnable("cargo test `echo x`"));
-        assert!(!verify_is_loop_runnable("cargo test $(echo x)"));
-    }
-
     // ---- bd-w1-loop-run-verify-mbbe: loop-runnable classifier ----
 
-    /// Targeted, allowlisted checks are loop-runnable.
+    /// One row per input of the loop-runnable allowlist predicate. Targeted,
+    /// allowlisted checks (incl. a bounded `timeout` wrapper) pass;
+    /// whole-workspace matrices, unbounded shells, non-verification commands,
+    /// shell composition and empty VERIFY never do.
     #[test]
-    fn loop_run_verify_classifier_accepts_targeted_checks() {
-        assert!(verify_is_loop_runnable("cargo test -p flywheel verdict::"));
-        assert!(verify_is_loop_runnable(
-            "cargo test -p flywheel loop_run_verify"
-        ));
-        assert!(verify_is_loop_runnable(
-            "cargo test --package flywheel verifier"
-        ));
-        assert!(verify_is_loop_runnable("pytest tests/test_gate.py"));
-        assert!(verify_is_loop_runnable("python -m pytest tests/test_x.py"));
-        assert!(verify_is_loop_runnable(
-            "timeout 300 cargo test -p flywheel verifier"
-        ));
-        assert!(verify_is_loop_runnable(
-            "sh -c \"timeout 60 cargo test -p flywheel verifier\""
-        ));
-        assert!(verify_is_loop_runnable("test -f Cargo.toml"));
-    }
-
-    /// Whole-workspace matrices, unbounded shells, and non-verification
-    /// commands are NOT loop-runnable.
-    #[test]
-    fn loop_run_verify_classifier_rejects_heavy_and_unbounded() {
-        assert!(!verify_is_loop_runnable("cargo test --workspace"));
-        assert!(!verify_is_loop_runnable("cargo test --all-features"));
-        assert!(!verify_is_loop_runnable("cargo test --all-targets"));
-        assert!(!verify_is_loop_runnable("cargo test"));
-        assert!(!verify_is_loop_runnable("cargo test --lib"));
-        assert!(!verify_is_loop_runnable("cargo build"));
-        assert!(!verify_is_loop_runnable("bash scripts/verify-gates.sh"));
-        assert!(!verify_is_loop_runnable("sh -c 'cargo test --workspace'"));
-        assert!(!verify_is_loop_runnable("sleep 3600"));
-        assert!(!verify_is_loop_runnable("git push"));
-        assert!(!verify_is_loop_runnable("npm run e2e"));
-    }
-
-    /// Shell composition and empty VERIFY are never loop-runnable.
-    #[test]
-    fn loop_run_verify_classifier_rejects_composition() {
-        assert!(!verify_is_loop_runnable(""));
-        assert!(!verify_is_loop_runnable("   "));
-        assert!(!verify_is_loop_runnable(
-            "cargo test -p flywheel verifier && echo done"
-        ));
-        assert!(!verify_is_loop_runnable("cargo test | tee out.txt"));
-        assert!(!verify_is_loop_runnable("cargo test; echo done"));
-        assert!(!verify_is_loop_runnable("cargo test\ncargo build"));
-        assert!(!verify_is_loop_runnable("cargo test `echo x`"));
-        assert!(!verify_is_loop_runnable("cargo test $(echo x)"));
+    fn loop_run_verify_classifier_row_table() {
+        let accepts = [
+            "cargo test -p flywheel verdict::",
+            "cargo test -p flywheel loop_run_verify",
+            "cargo test --package flywheel verifier",
+            "pytest tests/test_gate.py",
+            "python -m pytest tests/test_x.py",
+            "timeout 300 cargo test -p flywheel verifier",
+            "sh -c \"timeout 60 cargo test -p flywheel verifier\"",
+            "test -f Cargo.toml",
+        ];
+        let rejects = [
+            "",
+            "   ",
+            "cargo test --workspace",
+            "cargo test --all-features",
+            "cargo test --all-targets",
+            "cargo test",
+            "cargo test --lib",
+            "cargo build",
+            "bash scripts/verify-gates.sh",
+            "sh -c 'cargo test --workspace'",
+            "sleep 3600",
+            "git push",
+            "npm run e2e",
+            "cargo test -p flywheel verifier && echo done",
+            "cargo test && sleep 3600",
+            "cargo test || cargo build",
+            "cargo test | tee out.txt",
+            "cargo test; echo done",
+            "cargo test\ncargo build",
+            "cargo test `echo x`",
+            "cargo test $(echo x)",
+        ];
+        for cmd in accepts {
+            assert!(
+                verify_is_loop_runnable(cmd),
+                "must be loop-runnable: {cmd:?}"
+            );
+        }
+        for cmd in rejects {
+            assert!(
+                !verify_is_loop_runnable(cmd),
+                "must NOT be loop-runnable: {cmd:?}"
+            );
+        }
     }
 
     /// TIMEBOX parse: minutes -> seconds; absent/malformed -> None.

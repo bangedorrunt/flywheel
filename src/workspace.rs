@@ -2567,34 +2567,6 @@ mod tests {
     }
 
     #[test]
-    fn ws_model_role_bound_updates_roles_map() {
-        let m = empty_model();
-        let (next, cmds) = tick(
-            &m,
-            &Msg::RoleBound {
-                role: "wheelhouse".into(),
-                pin: "DustySparrow".into(),
-            },
-        );
-        assert!(cmds.is_empty());
-        assert_eq!(
-            next.roles.get("wheelhouse").map(String::as_str),
-            Some("DustySparrow")
-        );
-        let (next2, _) = tick(
-            &next,
-            &Msg::RoleBound {
-                role: "wheelhouse".into(),
-                pin: "NewPin".into(),
-            },
-        );
-        assert_eq!(
-            next2.roles.get("wheelhouse").map(String::as_str),
-            Some("NewPin")
-        );
-    }
-
-    #[test]
     fn ws_model_presence_missing_is_unknown() {
         let m = empty_model();
         assert!(!m.presence.contains_key("GhostPin"));

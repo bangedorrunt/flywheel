@@ -293,11 +293,6 @@ mod tests {
         assert!(c.reroute_eligible);
     }
     #[test]
-    fn failure_classify_billing_payment_required() {
-        let c = classify("payment required — billing account empty", None, None);
-        assert_eq!(c.kind, FailureKind::Billing);
-    }
-    #[test]
     fn failure_classify_billing_body() {
         let c = classify(
             "harness failed",
@@ -313,50 +308,42 @@ mod tests {
         assert!(c.retryable);
         assert!(!c.reroute_eligible);
     }
+    /// The needle table: one row per classifier phrase. These were 11 separate
+    /// 4-line tests asserting the same thing (phrase -> kind); the table keeps
+    /// every phrase while making the needle set readable at a glance, and the
+    /// failure message names the offending input. Priority (billing over auth)
+    /// rides as its own multi-needle row.
     #[test]
-    fn failure_classify_rate_limit_quota() {
-        let c = classify("quota exceeded for model", None, None);
-        assert_eq!(c.kind, FailureKind::RateLimit);
-    }
-    #[test]
-    fn failure_classify_rate_limit_phrase() {
-        let c = classify("rate limit hit, retry after 60s", None, None);
-        assert_eq!(c.kind, FailureKind::RateLimit);
-    }
-    #[test]
-    fn failure_classify_auth_401() {
-        let c = classify("401 Unauthorized", None, None);
-        assert_eq!(c.kind, FailureKind::Auth);
-    }
-    #[test]
-    fn failure_classify_auth_invalid_api_key() {
-        let c = classify("invalid api key provided", None, None);
-        assert_eq!(c.kind, FailureKind::Auth);
-    }
-    #[test]
-    fn failure_classify_auth_403() {
-        let c = classify("403 forbidden authentication failed", None, None);
-        assert_eq!(c.kind, FailureKind::Auth);
-    }
-    #[test]
-    fn failure_classify_provider_unsupported_kind() {
-        let c = classify("unsupported_agent_kind: pa", None, None);
-        assert_eq!(c.kind, FailureKind::Provider);
-    }
-    #[test]
-    fn failure_classify_provider_harness_missing() {
-        let c = classify("harness binary missing: /usr/local/bin/pa", None, None);
-        assert_eq!(c.kind, FailureKind::Provider);
-    }
-    #[test]
-    fn failure_classify_timeout_deadline() {
-        let c = classify("spawn timed out after 45s deadline exceeded", None, None);
-        assert_eq!(c.kind, FailureKind::Timeout);
-    }
-    #[test]
-    fn failure_classify_timeout_keyword() {
-        let c = classify("operation timeout", None, None);
-        assert_eq!(c.kind, FailureKind::Timeout);
+    fn failure_classify_needle_table() {
+        let rows: &[(&str, FailureKind)] = &[
+            (
+                "payment required — billing account empty",
+                FailureKind::Billing,
+            ),
+            (
+                "402 billing and 401 unauthorized in same body",
+                FailureKind::Billing,
+            ),
+            ("quota exceeded for model", FailureKind::RateLimit),
+            ("rate limit hit, retry after 60s", FailureKind::RateLimit),
+            ("401 Unauthorized", FailureKind::Auth),
+            ("invalid api key provided", FailureKind::Auth),
+            ("403 forbidden authentication failed", FailureKind::Auth),
+            ("unsupported_agent_kind: pa", FailureKind::Provider),
+            (
+                "harness binary missing: /usr/local/bin/pa",
+                FailureKind::Provider,
+            ),
+            (
+                "spawn timed out after 45s deadline exceeded",
+                FailureKind::Timeout,
+            ),
+            ("operation timeout", FailureKind::Timeout),
+        ];
+        for (input, expected) in rows {
+            let c = classify(input, None, None);
+            assert_eq!(c.kind, *expected, "classify({input:?})");
+        }
     }
     #[test]
     fn failure_classify_blocked_reservation_conflict() {
@@ -404,11 +391,6 @@ mod tests {
         // not a cancellation — it must stay Unknown.
         let c = classify("connection interrupted", None, None);
         assert_eq!(c.kind, FailureKind::Unknown);
-    }
-    #[test]
-    fn failure_classify_priority_billing_over_auth() {
-        let c = classify("402 billing and 401 unauthorized in same body", None, None);
-        assert_eq!(c.kind, FailureKind::Billing);
     }
     #[test]
     fn failure_classify_chain_bound_second_same_class_terminal() {
