@@ -1488,81 +1488,72 @@ pub fn launch_spawn_job(
         ) {
             Ok(a) => a,
             Err(e) => {
-                let cf = crate::failure::classify_with_action_stage(
-                    &e.to_string(),
-                    None,
-                    None,
-                    Some(crate::kernel::ActionStage::Input),
-                );
-                if cf.kind == crate::failure::FailureKind::RateLimit {
-                    if let Ok(registry) = ModelRegistry::load_routing() {
-                        if let Ok(catalog) = crate::profile::ProfileCatalog::load() {
-                            if let Some(profile) = catalog.get(&plan.profile) {
-                                if let Some(fallback_id) = registry
-                                    .get(&profile.model)
-                                    .and_then(|m| m.fallback.clone())
-                                {
-                                    let fallback_harness =
-                                        if registry.family_of(&fallback_id) == "grok" {
-                                            "grok"
-                                        } else {
-                                            plan.harness.as_str()
-                                        };
-                                    let fallback_model =
-                                        registry.resolve(&fallback_id, fallback_harness);
-                                    let mut fallback_args = crate::headless::model_args(
-                                        fallback_harness,
-                                        &fallback_model,
-                                        None,
-                                    );
-                                    // GS-043 I4: journal before ModelEntry.fallback hop.
-                                    let evidence = e.to_string();
-                                    let intent = crate::agent_ref::RebindIntent::prepare(
-                                        crate::agent_ref::AgentRef::new(project, &name),
-                                        crate::agent_ref::AgentBinding {
-                                            profile_name: plan.profile.clone(),
-                                            model: profile.model.clone(),
-                                            harness: plan.harness.clone(),
-                                        },
-                                        crate::agent_ref::AgentBinding {
-                                            profile_name: plan.profile.clone(),
-                                            model: fallback_id.clone(),
-                                            harness: fallback_harness.to_string(),
-                                        },
-                                        crate::agent_ref::RebindReason::ModelFallback {
-                                            kind: "rate_limit".into(),
-                                            evidence,
-                                        },
-                                        0,
-                                    );
-                                    eprintln!(
-                                        "pane spawn: {} rate-limited — registry fallback {fallback_id}",
-                                        plan.profile
-                                    );
-                                    crate::agent_ref::commit_rebind(project, intent, |_| {
-                                        crate::start_agent_with_retry(
-                                            &mut c,
-                                            &name,
-                                            fallback_harness,
-                                            &split.pane_id,
-                                            &fallback_args,
-                                        )
-                                    })?
-                                } else {
-                                    return Err(e);
-                                }
-                            } else {
-                                return Err(e);
-                            }
-                        } else {
-                            return Err(e);
-                        }
-                    } else {
-                        return Err(e);
+                // The rung keys on the PROFILE's model id, which lives in the
+                // catalog, so the catalog is read here — once per failed
+                // spawn. The gate INSIDE `registry_fallback_route` still keeps
+                // `models.toml` off a failure that cannot hop. An unreadable
+                // catalog is loud: it means no rung, never a silently
+                // different launch.
+                let profile_model = match crate::profile::ProfileCatalog::load() {
+                    Ok(catalog) => catalog.get(&plan.profile).map(|p| p.model.clone()),
+                    Err(err) => {
+                        eprintln!(
+                            "pane spawn: profile catalog unreadable \
+                             — no rate-limit fallback: {err:#}"
+                        );
+                        None
                     }
-                } else {
+                };
+                // Carry the rung's key alongside the route: the row's `from`
+                // binding and the registry lookup must be one string.
+                let hop = profile_model.as_deref().and_then(|model| {
+                    registry_fallback_route(&e.to_string(), model, plan.harness.as_str(), || {
+                        match ModelRegistry::load_routing() {
+                            Ok(registry) => Some(registry),
+                            Err(err) => {
+                                eprintln!(
+                                    "pane spawn: model registry unreadable \
+                                     — no rate-limit fallback: {err:#}"
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .map(|route| (model.to_string(), route))
+                });
+                // Not a rate limit, no catalog, no registry, no rung (or a
+                // rung that is itself unroutable): all re-raise the original
+                // error untouched.
+                let Some((from_model, route)) = hop else {
                     return Err(e);
-                }
+                };
+                // argv shape preserved from the hand-rolled hop: no effort
+                // flag and no role flags, unlike the crew hop in
+                // `spawn_crew_into`.
+                let fallback_args = crate::headless::model_args(&route.harness, &route.model, None);
+                // GS-043 I4: journal before ModelEntry.fallback hop.
+                let intent = model_fallback_intent(
+                    project,
+                    &name,
+                    &plan.profile,
+                    &from_model,
+                    plan.harness.as_str(),
+                    &route,
+                    e.to_string(),
+                );
+                eprintln!(
+                    "pane spawn: {} rate-limited — registry fallback {}",
+                    plan.profile, route.model_id
+                );
+                crate::agent_ref::commit_rebind(project, intent, |_| {
+                    crate::start_agent_with_retry(
+                        &mut c,
+                        &name,
+                        &route.harness,
+                        &split.pane_id,
+                        &fallback_args,
+                    )
+                })?
             }
         };
         // bd-pin-public-plane-s-easy.2: bind the pane identity now that the
