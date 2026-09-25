@@ -393,10 +393,41 @@ impl StageLibrary {
         self.apply_toml(&raw, tier)
     }
 
-    /// Apply the user `stages.toml` override (field-level).
+    /// Apply one per-entry stage file. The file is a complete stage record;
+    /// unlike the aggregate tier format, its filename is only a locator.
+    fn apply_stage_entry_path(&mut self, path: &std::path::Path, tier: Tier) -> Result<()> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let stage: Stage = toml::from_str(&raw)
+            .with_context(|| format!("parse per-entry stage {}", path.display()))?;
+        self.tiers.insert(stage.name.clone(), tier);
+        self.stages.insert(stage.name.clone(), stage);
+        Ok(())
+    }
+
+    /// Apply the user `stages.toml` override, then per-entry user files.
+    /// Per-entry files are the preferred format and win over the legacy
+    /// aggregate when both contain the same stage.
     fn override_from_toml(&mut self) -> Result<()> {
-        let path = config_dir().join("stages.toml");
-        self.apply_toml_path(&path, Tier::User)
+        let config_root = config_dir();
+        self.apply_toml_path(&config_root.join("stages.toml"), Tier::User)?;
+        let entries = config_root.join("stages");
+        if !entries.is_dir() {
+            return Ok(());
+        }
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&entries)
+            .with_context(|| format!("read {}", entries.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            self.apply_stage_entry_path(&path, Tier::User)?;
+        }
+        Ok(())
     }
 
     /// The tier a resolved name came from (§3.8 tier tags).
@@ -446,10 +477,15 @@ impl StageLibrary {
     }
 }
 
-/// The user override path (`~/.config/flywheel/stages.toml`), if present.
+/// The user override path, preferring the per-entry directory.
 pub fn override_path() -> Option<PathBuf> {
-    let path = config_dir().join("stages.toml");
-    path.is_file().then_some(path)
+    let entries = config_dir().join("stages");
+    if entries.is_dir() {
+        Some(entries)
+    } else {
+        let path = config_dir().join("stages.toml");
+        path.is_file().then_some(path)
+    }
 }
 
 /// One `stage list` row (§3.8: tier-tagged, phase + role affinity).
@@ -498,6 +534,15 @@ pub fn upsert_stage_in_file(path: &std::path::Path, stage: &Stage) -> Result<()>
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let out = toml::to_string(&file).context("serialize stages.toml")?;
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))
+}
+
+/// Write one complete stage record to the preferred per-entry user format.
+pub fn upsert_stage_entry(path: &std::path::Path, stage: &Stage) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let out = toml::to_string(stage).context("serialize per-entry stage")?;
     std::fs::write(path, out).with_context(|| format!("write {}", path.display()))
 }
 
@@ -1468,6 +1513,28 @@ mod tests {
         .unwrap();
         assert_eq!(lib.get_stage("fresh").unwrap().prompt, "ONLY");
         assert_eq!(lib.get_stage("fresh").unwrap().role, None);
+    }
+
+    #[test]
+    fn per_entry_stage_overrides_legacy_aggregate() {
+        let mut lib = StageLibrary::compiled_in();
+        lib.apply_toml(
+            "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"legacy\"\n",
+            Tier::User,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("fw-stage-entry-{}", uuid::Uuid::new_v4()));
+        let mut stage = StageLibrary::compiled_in()
+            .get_stage("ce-execute")
+            .unwrap()
+            .clone();
+        stage.prompt = "per-entry".into();
+        let path = dir.join("ce-execute.toml");
+        upsert_stage_entry(&path, &stage).unwrap();
+        lib.apply_stage_entry_path(&path, Tier::User).unwrap();
+        assert_eq!(lib.resolve("ce-execute"), Some("per-entry"));
+        assert_eq!(lib.tier_of("ce-execute"), Some(Tier::User));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// W6: `stage lint` rejects bad affinity + phase names (and unknown
