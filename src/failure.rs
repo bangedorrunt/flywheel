@@ -434,4 +434,95 @@ mod tests {
         assert_eq!(cf.kind, FailureKind::RateLimit);
         assert_eq!(cf.stage, "effect");
     }
+
+    /// Every call site's classification rows in one table. cron, pane, and
+    /// headless all call `classify(err, None, None)` with identical arguments,
+    /// so their three module-local copies pinned one function three times: the
+    /// only thing that differed was vocabulary (`401 Unauthorized for cron
+    /// provider` vs `401 Unauthorized`). Nothing about the calling module
+    /// changes what runs, which is why the per-callsite pin is gone. The case
+    /// name still says which call sites used the row, so a failure reports the
+    /// origin as well as the expectation. The one thing that WAS genuinely
+    /// call-site local — headless's `is_rate_limited(HarnessOutcome)` — stayed
+    /// in `main.rs`.
+    #[test]
+    fn classify_rows_from_every_call_site() {
+        let rows: [(&str, &str, FailureKind, Option<bool>); 9] = [
+            // 429 carried the same expectation in all three modules.
+            (
+                "rate_limit (cron+pane+headless)",
+                "429 Too Many Requests",
+                FailureKind::RateLimit,
+                Some(true),
+            ),
+            (
+                "timeout_cron",
+                "deadline exceeded for cron tick",
+                FailureKind::Timeout,
+                Some(true),
+            ),
+            (
+                "timeout_pane+headless",
+                "operation timeout after 30s",
+                FailureKind::Timeout,
+                Some(true),
+            ),
+            (
+                "auth_cron",
+                "401 Unauthorized for cron provider",
+                FailureKind::Auth,
+                Some(false),
+            ),
+            (
+                "auth_pane+headless",
+                "401 Unauthorized",
+                FailureKind::Auth,
+                Some(false),
+            ),
+            (
+                "blocked_pane",
+                "reservation conflict: path held",
+                FailureKind::Blocked,
+                Some(false),
+            ),
+            // Unclassified stays Unknown, and the engine's on_error default is
+            // Continue: the runner surfaces the kind and lets the engine
+            // decide. Only pane ever asserted retryable here, so the other two
+            // rows leave it unpinned rather than inventing a value.
+            (
+                "unclassified_cron",
+                "cron succeeded but no error",
+                FailureKind::Unknown,
+                None,
+            ),
+            (
+                "unclassified_pane",
+                "some random error without kind",
+                FailureKind::Unknown,
+                Some(false),
+            ),
+            (
+                "unclassified_headless",
+                "some random error",
+                FailureKind::Unknown,
+                None,
+            ),
+        ];
+        for (case, err, kind, retryable) in rows {
+            let cf = classify(err, None, None);
+            assert_eq!(cf.kind, kind, "{case}");
+            if let Some(want) = retryable {
+                assert_eq!(cf.retryable, want, "{case}");
+            }
+        }
+        // The pane module's extra pins: the wire label and the reroute verdicts.
+        assert_eq!(
+            classify("429 Too Many Requests", None, None)
+                .kind
+                .to_string(),
+            "rate_limit"
+        );
+        assert!(classify("401 Unauthorized", None, None).reroute_eligible);
+        assert!(!classify("reservation conflict: path held", None, None).reroute_eligible);
+    }
 }
