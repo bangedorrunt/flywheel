@@ -1554,431 +1554,355 @@ mod tests {
     }
 
     // ===== ADR-0019 Spec 8 rows (bd-w2-decide-drgi) =====
+    //
+    // One table instead of the 29 tests that used to spell these out. Every
+    // target and every expectation is carried over verbatim; `row` keeps the
+    // ADR-0019 spec row in the failure message so a break still names the
+    // contract row rather than a test index, and `primitive` names the
+    // ROUTING_TABLE row the case pins. The argv pins stay per-row because the
+    // rows genuinely differ: bug-fix dispatches pane, forensics and
+    // interrogate add headless, pause takes no --mode, and figure-it-out goes
+    // through compose --agent. Rows 15-23 arrived later under bd-x6x4.
 
-    // Row 2 — repro/regression/bug-fix, and bug-shaped implement targets.
-    #[test]
-    fn row2_repro_and_bug_shaped_fix_go_to_bug_fix() {
-        for t in [
-            "repro the scroll drift",
-            "fix the repro",
-            "regression in dispatch",
-            "fix the memory leak",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "bug-fix", "target: {t}");
-            assert!(
-                d.argv.contains(&"bug-fix".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(
-                d.argv.contains(&"pane".to_string()),
-                "pane mode: {:?}",
-                d.argv
-            );
-        }
+    /// One Spec 8 routing case: targets that must resolve together, plus the
+    /// argv shape they must produce.
+    struct Spec8Case {
+        /// ADR-0019 spec row id, carried into every failure message.
+        row: &'static str,
+        /// The ROUTING_TABLE row these targets must resolve to. `None` only on
+        /// the row9 guard, which pinned what `babysit the server` is NOT
+        /// without ever claiming what it is.
+        primitive: Option<&'static str>,
+        targets: &'static [&'static str],
+        /// Primitives these targets must not resolve to (the guard rows).
+        not_primitive: &'static [&'static str],
+        argv_has: &'static [&'static str],
+        argv_lacks: &'static [&'static str],
     }
 
-    // Row 3 — refactor -> refactoring.
-    #[test]
-    fn row3_refactor_goes_to_refactoring() {
-        for t in ["refactor the auth layer", "refactoring the loop dispatch"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "refactoring", "target: {t}");
-            assert!(
-                d.argv.contains(&"refactoring".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    // Row 4 — prototype/sketch/mock -> prototype.
-    #[test]
-    fn row4_prototype_goes_to_prototype() {
-        for t in [
-            "prototype the data shape",
-            "sketch the state machine",
-            "mock it up before we build",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "prototype", "target: {t}");
-            assert!(
-                d.argv.contains(&"prototype".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    // Row 5 — arena -> arena.
-    #[test]
-    fn row5_arena_goes_to_arena() {
-        let d = decide("arena two models on this brief", &snap());
-        assert_eq!(d.primitive, "arena");
-        assert!(d.argv.contains(&"arena".to_string()), "argv: {:?}", d.argv);
-    }
-
-    // Row 6 — perf/p95/slow (not fix/implement) -> perf.
-    #[test]
-    fn row6_perf_goes_to_perf() {
-        for t in [
-            "profile the p95 latency",
-            "dispatch is slow",
-            "perf the ingest path",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "perf", "target: {t}");
-            assert!(d.argv.contains(&"perf".to_string()), "argv: {:?}", d.argv);
-        }
-    }
-
-    // Row 6 guard — implement + slow matches no diagnosis row and no
-    // explicit route: explicit none, never silent steer.
-    #[test]
-    fn row6_implement_slow_is_not_perf() {
-        let d = decide("fix the slow dispatch", &snap());
-        assert_ne!(d.primitive, "perf");
-        assert_eq!(
-            d.primitive, "none",
-            "implement without a declared trigger is explicit none: {:?}",
-            d
-        );
-    }
-
-    // Row 7 — hillclimb -> hillclimb.
-    #[test]
-    fn row7_hillclimb_goes_to_hillclimb() {
-        let d = decide("hillclimb the sharpe ratio", &snap());
-        assert_eq!(d.primitive, "hillclimb");
-        assert!(
-            d.argv.contains(&"hillclimb".to_string()),
-            "argv: {:?}",
-            d.argv
-        );
-    }
-
-    // Row 8 — forensic/leak/idle cpu/spindump (not fix/implement) -> forensics.
-    #[test]
-    fn row8_forensics_goes_to_forensics() {
-        for t in [
-            "profile the idle cpu spin",
-            "forensic trace of the crash",
-            "investigate the memory leak",
-            "spindump the hung pane",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "forensics", "target: {t}");
-            assert!(
-                d.argv.contains(&"forensics".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(
-                d.argv.contains(&"headless".to_string()),
-                "forensics is headless: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    // Row 8 guard — implement + leak -> bug-fix, NOT forensics (the
-    // pre-acceptance fix: `fix the memory leak` contains no bug/repro token,
-    // yet the captain said FIX).
-    #[test]
-    fn row8_fix_memory_leak_is_bug_fix_not_forensics() {
-        let d = decide("fix the memory leak", &snap());
-        assert_ne!(d.primitive, "forensics");
-        assert_eq!(d.primitive, "bug-fix", "the repro step IS the forensics");
-    }
-
-    // Row 9 — babysit + bead-ish -> babysit-bead.
-    #[test]
-    fn row9_babysit_bead_goes_to_babysit_bead() {
-        let d = decide("babysit the bd-w2-ops-szky bead", &snap());
-        assert_eq!(d.primitive, "babysit-bead");
-        assert!(
-            d.argv.contains(&"babysit-bead".to_string()),
-            "argv: {:?}",
-            d.argv
-        );
-        // not bead-ish -> no match.
-        let d2 = decide("babysit the server", &snap());
-        assert_ne!(d2.primitive, "babysit-bead");
-    }
-
-    // Row 10 — pickup / resume session -> pickup.
-    #[test]
-    fn row10_pickup_goes_to_pickup() {
-        for t in [
-            "pickup the stranded session",
-            "resume session after the reboot",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "pickup", "target: {t}");
-            assert!(d.argv.contains(&"pickup".to_string()), "argv: {:?}", d.argv);
-        }
-    }
-
-    // Row 11 — pause / going offline -> pause (argv has NO --mode).
-    #[test]
-    fn row11_pause_goes_to_pause() {
-        for t in ["pause the swarm", "going offline for the night"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "pause", "target: {t}");
-            assert!(d.argv.contains(&"pause".to_string()), "argv: {:?}", d.argv);
-            assert!(
-                !d.argv.contains(&"--mode".to_string()),
-                "pause takes no --mode: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    // Row 12 — interrogate / tear this apart / adversarial review -> interrogate.
-    #[test]
-    fn row12_interrogate_goes_to_interrogate() {
-        for t in [
-            "interrogate this diff",
-            "tear this apart",
-            "adversarial review of the patch",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "interrogate", "target: {t}");
-            assert!(
-                d.argv.contains(&"interrogate".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(
-                d.argv.contains(&"headless".to_string()),
-                "headless: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    // Row 13 — figure it out / no playbook -> figure-it-out (planner arm).
-    #[test]
-    fn row13_figure_it_out_goes_to_figure_it_out() {
-        for t in ["figure it out", "there's no playbook for this"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "figure-it-out", "target: {t}");
-            assert!(
-                d.argv.contains(&"compose".to_string()),
-                "compose: {:?}",
-                d.argv
-            );
-            assert!(
-                d.argv.contains(&"--agent".to_string()),
-                "planner arm: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    // Row 14 — ship beads / land the beads -> ship-beads.
-    #[test]
-    fn row14_ship_beads_goes_to_ship_beads() {
-        for t in ["ship beads now", "land the beads"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "ship-beads", "target: {t}");
-            assert!(
-                d.argv.contains(&"ship-beads".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    // ---- bd-x6x4: high-value unrouted builtins (feature, goal, triage, triage-deep,
-    //      weekly-review, autonomous-work, reflect, awareness-digest, onboard) ----
-
-    #[test]
-    fn row15_feature_goes_to_feature() {
-        for t in [
-            "feature: add domain type for ingest",
-            "implement the feature",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "feature", "target: {t}");
-            assert!(
-                d.argv.contains(&"feature".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-    }
-
-    #[test]
-    fn row16_goal_goes_to_goal() {
-        for t in ["goal: ship the onboarding flow", "run the goal workflow"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "goal", "target: {t}");
-            assert!(d.argv.contains(&"goal".to_string()), "argv: {:?}", d.argv);
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-    }
-
-    #[test]
-    fn row17_triage_deep_goes_to_triage_deep() {
-        for t in [
-            "triage-deep the backlog",
-            "triage deep across 50 beads",
-            "deep triage for the repo",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "triage-deep", "target: {t}");
-            assert!(
-                d.argv.contains(&"triage-deep".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-        // triage-deep must win over plain triage
-        let d = decide("triage-deep backlog", &snap());
-        assert_eq!(d.primitive, "triage-deep");
-    }
-
-    #[test]
-    fn row18_triage_goes_to_triage() {
-        for t in ["triage the support inbox", "triage inbound messages"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "triage", "target: {t}");
-            assert!(d.argv.contains(&"triage".to_string()), "argv: {:?}", d.argv);
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-    }
-
-    #[test]
-    fn row19_weekly_review_goes_to_weekly_review() {
-        for t in ["weekly-review the repo", "weekly review on Sunday"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "weekly-review", "target: {t}");
-            assert!(
-                d.argv.contains(&"weekly-review".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-    }
-
-    #[test]
-    fn row20_autonomous_work_goes_to_autonomous_work() {
-        for t in ["autonomous-work tonight", "autonomous work the backlog"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "autonomous-work", "target: {t}");
-            assert!(
-                d.argv.contains(&"autonomous-work".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-    }
+    static SPEC8_CASES: &[Spec8Case] = &[
+        Spec8Case {
+            row: "row2",
+            primitive: Some("bug-fix"),
+            targets: &[
+                "repro the scroll drift",
+                "fix the repro",
+                "regression in dispatch",
+                "fix the memory leak",
+            ],
+            not_primitive: &[],
+            argv_has: &["bug-fix", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row3",
+            primitive: Some("refactoring"),
+            targets: &["refactor the auth layer", "refactoring the loop dispatch"],
+            not_primitive: &[],
+            argv_has: &["refactoring"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row4",
+            primitive: Some("prototype"),
+            targets: &[
+                "prototype the data shape",
+                "sketch the state machine",
+                "mock it up before we build",
+            ],
+            not_primitive: &[],
+            argv_has: &["prototype"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row5",
+            primitive: Some("arena"),
+            targets: &["arena two models on this brief"],
+            not_primitive: &[],
+            argv_has: &["arena"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row6",
+            primitive: Some("perf"),
+            targets: &[
+                "profile the p95 latency",
+                "dispatch is slow",
+                "perf the ingest path",
+            ],
+            not_primitive: &[],
+            argv_has: &["perf"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row6-guard",
+            primitive: Some("none"),
+            targets: &["fix the slow dispatch"],
+            not_primitive: &["perf"],
+            argv_has: &[],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row7",
+            primitive: Some("hillclimb"),
+            targets: &["hillclimb the sharpe ratio"],
+            not_primitive: &[],
+            argv_has: &["hillclimb"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row8",
+            primitive: Some("forensics"),
+            targets: &[
+                "profile the idle cpu spin",
+                "forensic trace of the crash",
+                "investigate the memory leak",
+                "spindump the hung pane",
+            ],
+            not_primitive: &[],
+            argv_has: &["forensics", "headless"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row8-guard",
+            primitive: Some("bug-fix"),
+            targets: &["fix the memory leak"],
+            not_primitive: &["forensics"],
+            argv_has: &[],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row9",
+            primitive: Some("babysit-bead"),
+            targets: &["babysit the bd-w2-ops-szky bead"],
+            not_primitive: &[],
+            argv_has: &["babysit-bead"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row9-guard",
+            primitive: None,
+            targets: &["babysit the server"],
+            not_primitive: &["babysit-bead"],
+            argv_has: &[],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row10",
+            primitive: Some("pickup"),
+            targets: &[
+                "pickup the stranded session",
+                "resume session after the reboot",
+            ],
+            not_primitive: &[],
+            argv_has: &["pickup"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row11",
+            primitive: Some("pause"),
+            targets: &["pause the swarm", "going offline for the night"],
+            not_primitive: &[],
+            argv_has: &["pause"],
+            argv_lacks: &["--mode"],
+        },
+        Spec8Case {
+            row: "row12",
+            primitive: Some("interrogate"),
+            targets: &[
+                "interrogate this diff",
+                "tear this apart",
+                "adversarial review of the patch",
+            ],
+            not_primitive: &[],
+            argv_has: &["interrogate", "headless"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row13",
+            primitive: Some("figure-it-out"),
+            targets: &["figure it out", "there's no playbook for this"],
+            not_primitive: &[],
+            argv_has: &["compose", "--agent"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row14",
+            primitive: Some("ship-beads"),
+            targets: &["ship beads now", "land the beads"],
+            not_primitive: &[],
+            argv_has: &["ship-beads"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row15",
+            primitive: Some("feature"),
+            targets: &[
+                "feature: add domain type for ingest",
+                "implement the feature",
+            ],
+            not_primitive: &[],
+            argv_has: &["feature", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row16",
+            primitive: Some("goal"),
+            targets: &["goal: ship the onboarding flow", "run the goal workflow"],
+            not_primitive: &[],
+            argv_has: &["goal", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row17",
+            primitive: Some("triage-deep"),
+            targets: &[
+                "triage-deep the backlog",
+                "triage deep across 50 beads",
+                "deep triage for the repo",
+            ],
+            not_primitive: &[],
+            argv_has: &["triage-deep", "pane"],
+            argv_lacks: &[],
+        },
+        // triage-deep must win over plain triage.
+        Spec8Case {
+            row: "row17-guard",
+            primitive: Some("triage-deep"),
+            targets: &["triage-deep backlog"],
+            not_primitive: &[],
+            argv_has: &[],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row18",
+            primitive: Some("triage"),
+            targets: &["triage the support inbox", "triage inbound messages"],
+            not_primitive: &[],
+            argv_has: &["triage", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row19",
+            primitive: Some("weekly-review"),
+            targets: &["weekly-review the repo", "weekly review on Sunday"],
+            not_primitive: &[],
+            argv_has: &["weekly-review", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row20",
+            primitive: Some("autonomous-work"),
+            targets: &["autonomous-work tonight", "autonomous work the backlog"],
+            not_primitive: &[],
+            argv_has: &["autonomous-work", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row21",
+            primitive: Some("reflect"),
+            targets: &["reflect on standing orders", "run reflect for the project"],
+            not_primitive: &[],
+            argv_has: &["reflect", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row22",
+            primitive: Some("awareness-digest"),
+            targets: &["awareness-digest for flywheel", "awareness digest check"],
+            not_primitive: &[],
+            argv_has: &["awareness-digest", "headless"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row23",
+            primitive: Some("onboard"),
+            targets: &["onboard the newcomer", "run onboard for the repo"],
+            not_primitive: &[],
+            argv_has: &["onboard", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row24c",
+            primitive: Some("debate"),
+            targets: &["argue both sides of this", "play devil's advocate here"],
+            not_primitive: &[],
+            argv_has: &["debate", "pane"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row24d",
+            primitive: Some("ce-brainstorm"),
+            targets: &[
+                "brainstorm the retry design",
+                "sharpen the requirements first",
+            ],
+            not_primitive: &[],
+            argv_has: &["ce-brainstorm"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row24e",
+            primitive: Some("ce-plan"),
+            targets: &["break this down into beads", "make a bead-ready plan"],
+            not_primitive: &[],
+            argv_has: &["ce-plan"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row24f",
+            primitive: Some("ship"),
+            targets: &["ship the chain", "run the ship workflow"],
+            not_primitive: &[],
+            argv_has: &["ship"],
+            argv_lacks: &[],
+        },
+        Spec8Case {
+            row: "row24g",
+            primitive: Some("beads"),
+            targets: &["convert to beads", "file these as beads"],
+            not_primitive: &[],
+            argv_has: &["beads"],
+            argv_lacks: &[],
+        },
+    ];
 
     #[test]
-    fn row21_reflect_goes_to_reflect() {
-        for t in ["reflect on standing orders", "run reflect for the project"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "reflect", "target: {t}");
-            assert!(
-                d.argv.contains(&"reflect".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-    }
-
-    #[test]
-    fn row22_awareness_digest_goes_to_awareness_digest() {
-        for t in ["awareness-digest for flywheel", "awareness digest check"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "awareness-digest", "target: {t}");
-            assert!(
-                d.argv.contains(&"awareness-digest".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(
-                d.argv.contains(&"headless".to_string()),
-                "headless: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    #[test]
-    fn row23_onboard_goes_to_onboard() {
-        for t in ["onboard the newcomer", "run onboard for the repo"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "onboard", "target: {t}");
-            assert!(
-                d.argv.contains(&"onboard".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-    }
-    #[test]
-    fn row24c_debate_goes_to_debate() {
-        for t in ["argue both sides of this", "play devil's advocate here"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "debate", "target: {t}");
-            assert!(d.argv.contains(&"debate".to_string()), "argv: {:?}", d.argv);
-            assert!(d.argv.contains(&"pane".to_string()), "pane: {:?}", d.argv);
-        }
-    }
-
-    #[test]
-    fn row24d_brainstorm_goes_to_ce_brainstorm() {
-        for t in [
-            "brainstorm the retry design",
-            "sharpen the requirements first",
-        ] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "ce-brainstorm", "target: {t}");
-            assert!(
-                d.argv.contains(&"ce-brainstorm".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    #[test]
-    fn row24e_breakdown_goes_to_ce_plan() {
-        for t in ["break this down into beads", "make a bead-ready plan"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "ce-plan", "target: {t}");
-            assert!(
-                d.argv.contains(&"ce-plan".to_string()),
-                "argv: {:?}",
-                d.argv
-            );
-        }
-    }
-
-    #[test]
-    fn row24f_ship_chain_goes_to_ship() {
-        for t in ["ship the chain", "run the ship workflow"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "ship", "target: {t}");
-            assert!(d.argv.contains(&"ship".to_string()), "argv: {:?}", d.argv);
-        }
-    }
-
-    #[test]
-    fn row24g_convert_goes_to_beads() {
-        for t in ["convert to beads", "file these as beads"] {
-            let d = decide(t, &snap());
-            assert_eq!(d.primitive, "beads", "target: {t}");
-            assert!(d.argv.contains(&"beads".to_string()), "argv: {:?}", d.argv);
+    fn adr0019_spec8_rows_resolve_to_their_primitive() {
+        for case in SPEC8_CASES {
+            for target in case.targets {
+                let d = decide(target, &snap());
+                if let Some(want) = case.primitive {
+                    assert_eq!(
+                        d.primitive, want,
+                        "{} (target {target:?}) must route to the {want} row: {d:?}",
+                        case.row
+                    );
+                }
+                for banned in case.not_primitive {
+                    assert_ne!(
+                        d.primitive, *banned,
+                        "{} (target {target:?}) must not route to {banned}: {d:?}",
+                        case.row
+                    );
+                }
+                for want in case.argv_has {
+                    assert!(
+                        d.argv.contains(&want.to_string()),
+                        "{} (target {target:?}) argv must carry {want}: {:?}",
+                        case.row,
+                        d.argv
+                    );
+                }
+                for ban in case.argv_lacks {
+                    assert!(
+                        !d.argv.contains(&ban.to_string()),
+                        "{} (target {target:?}) argv must not carry {ban}: {:?}",
+                        case.row,
+                        d.argv
+                    );
+                }
+            }
         }
     }
 
