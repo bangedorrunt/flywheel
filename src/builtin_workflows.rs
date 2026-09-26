@@ -653,7 +653,7 @@ graph:
       workflow: repair-until-verified
       needs: [repro]
       inputs:
-        verify: "cargo test --offline --bin flywheel bug_fix_recipe"
+        verify: "{{inputs.verify}}"
         max_iterations: 3
       on_error: fail_run
     prove:
@@ -800,6 +800,7 @@ steps:
     on_error: fail_run
   - name: keep-or-discard
     action: branch
+    on_error: fail_run
     if: "{{steps.measure.improved}} == true"
     then:
       - name: keep
@@ -823,7 +824,7 @@ steps:
         "hillclimb",
         r#"
 name: hillclimb
-description: "Sustained measured-improvement loop (ADR-0019 Spec 7.2): capped retry — each attempt hypothesizes -> applies the smallest change -> measures -> KEEPS (ledger row + ONE commit per accepted win) or DISCARDS (a revert) and retries with a new hypothesis. The retry max_attempts is the iteration cap (max_iters)."
+description: "Sustained measured-improvement loop (ADR-0019 Spec 7.2): each pass hypothesizes, applies the smallest change, measures, KEEPS (ledger row + one commit) or DISCARDS (a revert). max_iters is the cap. The loop stops only when the reply's improved field is true. Exhaustion fails the run."
 trigger:
   type: webhook
 crew: auto
@@ -838,16 +839,19 @@ principles:
   - build-the-lever
 steps:
   - name: climb
-    action: retry
-    max_attempts: 10
-    step:
-      name: iteration
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@coder"
-        stage: "measure-keep-or-discard"
-        plan: "HILLCLIMB ITERATION (budget {{inputs.max_iters}} attempts; target {{inputs.target}} for {{inputs.metric}}): hypothesize -> apply the SMALLEST change -> measure with the same command. If improved: KEEP — record the ledger row (flywheel ledger / br gate, sha of this iteration's commit) + ONE commit per accepted win, return ok. If NOT improved: DISCARD — discard IS a revert, restore the baseline exactly, then return an ERROR so the loop retries with a new hypothesis. No unrelated work."
+    action: loop
+    max: "{{inputs.max_iters}}"
+    until: "steps_iteration_improved == true"
+    on_error: fail_run
+    body:
+      - name: iteration
+        action: dispatch_job
+        assignee: x
+        on_error: continue
+        spec:
+          profile: "@coder"
+          stage: "measure-keep-or-discard"
+          plan: "HILLCLIMB ITERATION (budget {{inputs.max_iters}} attempts; target {{inputs.target}} for {{inputs.metric}}): hypothesize -> apply the SMALLEST change -> measure with the same command. If improved: KEEP — record the ledger row (flywheel ledger / br gate, sha of this iteration's commit) + ONE commit per accepted win. If NOT improved: DISCARD — discard IS a revert, restore the baseline exactly. End the reply with one JSON object {\"improved\": true} or {\"improved\": false}. The loop stops only when improved is true. No unrelated work."
 "#,
     ),
     (
@@ -1250,7 +1254,7 @@ steps:
         "repair-until-verified",
         r#"
 name: repair-until-verified
-description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair → evaluate → VERIFY (3 iterations, continue on verify failure so verify-1 can fail and verify-2 can still run; final verify gates the run). Runs --mode pane only. GS-039 P0-3: explicit crew coder:1 reviewer:1 — remix with --crew role:n; --allow-crew-expand is a no-op (cap is crew.max)."
+description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair, evaluate, VERIFY. max_iterations caps the passes (default 3, hard cap 32). A passing verify stops the loop. Exhaustion fails the run. A failed verify continues to the next pass. GS-039 P0-3: explicit crew coder:1 reviewer:1 — remix with --crew role:n; --allow-crew-expand is a no-op (cap is crew.max)."
 trigger:
   type: webhook
 crew:
@@ -1277,97 +1281,35 @@ inputs:
     default: "(no ledger path supplied)"
   - name: coder_profile
     default: "@coder"
-graph:
-  nodes:
-    repair-1:
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "{{inputs.coder_profile}}"
-        context: fresh
-        task: "Repair iteration 1 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}} (read the file, do not trust prompt). VERIFY: {{inputs.verify}}"
-      on_error: fail_run
-    evaluate-1:
-      needs: [repair-1]
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@reviewer"
-        context: fresh
-        stage: ce-evaluate
-        plan: "Repair iteration 1 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}."
-        task: "Evaluate iteration 1 and return the ce-evaluate JSON contract."
-      on_error: fail_run
-    verify-1:
-      needs: [evaluate-1]
-      action: verify
-      command: "{{inputs.verify}}"
-      on_error: continue
-    repair-2:
-      needs: [verify-1]
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "{{inputs.coder_profile}}"
-        context: fresh
-        task: "Repair iteration 2 for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}}."
-      on_error: fail_run
-    evaluate-2:
-      needs: [repair-2]
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@reviewer"
-        context: fresh
-        stage: ce-evaluate
-        plan: "Repair iteration 2 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}. Prior evaluator report: {{steps.evaluate-1}}"
-        task: "Evaluate iteration 2 and return the ce-evaluate JSON contract."
-      on_error: fail_run
-    verify-2:
-      needs: [evaluate-2]
-      action: verify
-      command: "{{inputs.verify}}"
-      on_error: continue
-    repair-3:
-      needs: [verify-2]
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "{{inputs.coder_profile}}"
-        context: fresh
-        task: "Repair iteration 3 for {{inputs.bead_id}}."
-      on_error: fail_run
-    evaluate-3:
-      needs: [repair-3]
-      action: dispatch_job
-      assignee: x
-      spec:
-        profile: "@reviewer"
-        context: fresh
-        stage: ce-evaluate
-        plan: "Repair iteration 3 for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}. Prior evaluator report: {{steps.evaluate-2}}"
-        task: "Evaluate iteration 3 and return the ce-evaluate JSON contract."
-      on_error: fail_run
-    verify-3:
-      needs: [evaluate-3]
-      action: verify
-      command: "{{inputs.verify}}"
-      on_error: continue
-    # Branch early-exit (bd-rd4d): if any verify succeeded, the run succeeds
-    # without needing to re-verify. The guard sees step outputs via
-    # steps_<name>_<key> (e.g. steps_verify_1_ok) after the engine now
-    # exposes step_outputs to Branch. This is the true unroll: fail c1 can
-    # still reach green c2 and the run succeeds, and success skips remaining
-    # re-verification via the Branch's then/else.
-    decide:
-      needs: [verify-3]
-      action: branch
-      if: "steps_verify_1_ok == \"true\" || steps_verify_2_ok == \"true\" || steps_verify_3_ok == \"true\""
-      then: []
-      else:
-        - action: verify
-          command: "false 'no verify succeeded — repair loop exhausted without a passing VERIFY'"
-          on_error: fail_run
+steps:
+  - name: cycle
+    action: loop
+    max: "{{inputs.max_iterations}}"
+    until: "steps_verify_ok == true"
+    on_error: fail_run
+    body:
+      - name: repair
+        action: dispatch_job
+        assignee: x
+        spec:
+          profile: "{{inputs.coder_profile}}"
+          context: fresh
+          task: "Repair pass for {{inputs.bead_id}}: remaining work from ledger {{inputs.ledger_path}} (read the file, do not trust prompt). VERIFY: {{inputs.verify}}. Stop changing the tree once VERIFY passes."
+        on_error: fail_run
+      - name: evaluate
+        action: dispatch_job
+        assignee: x
+        spec:
+          profile: "@reviewer"
+          context: fresh
+          stage: ce-evaluate
+          plan: "Repair pass for {{inputs.bead_id}}. VERIFY: {{inputs.verify}}. Ledger/artifact path: {{inputs.ledger_path}}."
+          task: "Evaluate this pass and return the ce-evaluate JSON contract."
+        on_error: fail_run
+      - name: verify
+        action: verify
+        command: "{{inputs.verify}}"
+        on_error: continue
 "#,
     ),
     // ---- ADR-0008 §6.7 beads-lifecycle compose token (bd-adr0008-token-yaml-kimg) ------
@@ -3149,21 +3091,26 @@ mod tests {
             decl.default.as_ref().and_then(|v| v.as_str()),
             Some("@coder")
         );
-        let graph = rep.graph.as_ref().expect("repair graph");
-        for name in ["repair-1", "repair-2", "repair-3"] {
-            let node = graph
-                .nodes
-                .get(name)
-                .unwrap_or_else(|| panic!("{name} present"));
-            let Action::DispatchJob { spec, .. } = &node.action else {
-                panic!("{name} is a dispatch_job");
-            };
-            assert_eq!(
-                spec.profile.as_deref(),
-                Some("{{inputs.coder_profile}}"),
-                "{name}"
-            );
-        }
+        let cycle = rep
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("cycle"))
+            .expect("repair cycle");
+        let Action::Loop { body, .. } = &cycle.action else {
+            panic!("repair cycle is a loop");
+        };
+        let repair = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("repair"))
+            .expect("repair body step");
+        let Action::DispatchJob { spec, .. } = &repair.action else {
+            panic!("repair is a dispatch_job");
+        };
+        assert_eq!(
+            spec.profile.as_deref(),
+            Some("{{inputs.coder_profile}}"),
+            "repair rides coder_profile"
+        );
         let bl = &wfs["beads-lifecycle"];
         assert!(
             bl.inputs.iter().any(|d| d.name == "coder_profile"),
@@ -3455,85 +3402,38 @@ mod tests {
         );
     }
 
-    /// Repair loop is bounded and allows verify-1 failure to still reach
-    /// verify-2 (GS-009 / bd-s1yy: static fail_run would abort on first
-    /// verify failure, so c2 could never run after c1 failed).
+    /// A failed verify must not abort the pass, and a passing verify is the
+    /// stop condition. Exhaustion is the loop step's fail_run, not an OR of
+    /// every historical pass.
     #[test]
-    fn repair_unroll_allows_verify_1_failure_to_reach_verify_2() {
-        use toron_workflow::schema::StepOnError;
+    fn repair_loop_continues_after_verify_failure_and_stops_on_pass() {
+        use toron_workflow::schema::{Action, StepOnError};
         let wfs = builtin_workflows();
         let repair = &wfs["repair-until-verified"];
-        let graph = repair.graph.as_ref().expect("repair is a graph");
-        assert_eq!(
-            graph.nodes["verify-1"].on_error,
-            StepOnError::Continue,
-            "verify-1 must continue so c2 can run after c1 failure (was fail_run, blocked c2)"
-        );
-        assert_eq!(
-            graph.nodes["verify-2"].on_error,
-            StepOnError::Continue,
-            "verify-2 must continue so c3 can run after c2 failure"
-        );
-        assert_eq!(
-            graph.nodes["verify-3"].on_error,
-            StepOnError::Continue,
-            "verify-3 now continue — Branch decide gates the run (was FailRun, now early-exit Branch handles final failure)"
-        );
-        assert!(
-            graph.nodes.contains_key("decide"),
-            "repair must have decide Branch for early-exit"
-        );
-        let decide = &graph.nodes["decide"];
-        assert_eq!(decide.needs, vec!["verify-3".to_string()]);
-        match &decide.action {
-            toron_workflow::schema::Action::Branch { if_guard, .. } => {
-                assert!(
-                    if_guard.contains("steps_verify_1_ok"),
-                    "Branch guard must check step outputs, got: {if_guard}"
-                );
-            }
-            other => panic!("decide must be Branch, got {other:?}"),
-        }
+        let cycle = repair
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("cycle"))
+            .expect("cycle");
+        assert_eq!(cycle.on_error, StepOnError::FailRun);
+        let Action::Loop { max, until, body } = &cycle.action else {
+            panic!("cycle is a loop");
+        };
+        assert_eq!(max, "{{inputs.max_iterations}}");
+        assert_eq!(until.as_deref(), Some("steps_verify_ok == true"));
+        let verify = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("verify"))
+            .expect("verify");
+        assert_eq!(verify.on_error, StepOnError::Continue);
         assert!(
             repair
                 .description
                 .as_deref()
                 .unwrap_or("")
-                .contains("continue on verify failure"),
-            "description must be honest (was Unrolled claim)"
+                .contains("Exhaustion fails the run"),
+            "description must say exhaustion fails"
         );
-    }
-
-    /// bd-repair-quotes-double-z9vv (GS-028 NEW-3): the repair decide guard
-    /// must use DOUBLE-quoted string literals — evalexpr accepts only `"..."`,
-    /// so single-quoted `'true'` eval-errors to false and the run always takes
-    /// else. The compiled guard is also linted clean (toron lint rejects
-    /// single quotes at the authoring boundary).
-    #[test]
-    fn repair_decide_double_quotes() {
-        let wfs = builtin_workflows();
-        let repair = &wfs["repair-until-verified"];
-        let graph = repair.graph.as_ref().expect("repair is a graph");
-        let decide = &graph.nodes["decide"];
-        match &decide.action {
-            toron_workflow::schema::Action::Branch { if_guard, .. } => {
-                assert!(
-                    !if_guard.contains('\''),
-                    "decide guard must not contain single quotes, got: {if_guard}"
-                );
-                for step in [
-                    "steps_verify_1_ok",
-                    "steps_verify_2_ok",
-                    "steps_verify_3_ok",
-                ] {
-                    assert!(
-                        if_guard.contains(&format!("{step} == \"true\"")),
-                        "decide guard must compare {step} to double-quoted \"true\", got: {if_guard}"
-                    );
-                }
-            }
-            other => panic!("decide must be Branch, got {other:?}"),
-        }
         let report = toron_workflow::lint_workflow(repair);
         assert!(
             report
@@ -3687,14 +3587,18 @@ mod tests {
             Some("discard"),
             "discard arm"
         );
+        assert_eq!(
+            branch.on_error,
+            toron_workflow::schema::StepOnError::FailRun,
+            "a measure reply with no improved field fails the run"
+        );
     }
 
-    /// hillclimb's loop is a CAPPED retry — max_attempts is the iteration
-    /// cap (dry-run shows it); each attempt keeps (ledger row + commit) or
-    /// discards (revert) via the retry's success/failure split.
+    /// hillclimb's cap is the max_iters input, not a hardcoded retry count.
+    /// The loop stops when the reply's improved field is true. Exhaustion fails the run.
     #[test]
-    fn hillclimb_loop_is_capped_retry() {
-        use toron_workflow::schema::Action;
+    fn hillclimb_loop_is_capped_by_max_iters() {
+        use toron_workflow::schema::{Action, StepOnError};
         let wfs = builtin_workflows();
         let hc = &wfs["hillclimb"];
         let climb = hc
@@ -3702,16 +3606,19 @@ mod tests {
             .iter()
             .find(|s| s.name.as_deref() == Some("climb"))
             .expect("hillclimb has the climb step");
-        let Action::Retry {
-            max_attempts, step, ..
-        } = &climb.action
-        else {
-            panic!("climb is a capped retry");
+        assert_eq!(climb.on_error, StepOnError::FailRun);
+        let Action::Loop { max, until, body } = &climb.action else {
+            panic!("climb is a loop");
         };
-        assert!(
-            *max_attempts >= 1,
-            "retry carries the iteration cap: {max_attempts}"
-        );
+        assert_eq!(max, "{{inputs.max_iters}}");
+        // Dispatch `ok` means the attempt ran. The stop bit is the reply's
+        // `improved` field, published onto the step from the response JSON.
+        assert_eq!(until.as_deref(), Some("steps_iteration_improved == true"));
+        let step = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("iteration"))
+            .expect("iteration body");
+        assert_eq!(step.on_error, StepOnError::Continue);
         let Action::DispatchJob { spec, .. } = &step.action else {
             panic!("each attempt is a dispatch_job");
         };
@@ -3731,6 +3638,10 @@ mod tests {
         assert!(
             plan.contains("max_iters"),
             "budget binds to the max_iters input"
+        );
+        assert!(
+            plan.contains("\"improved\": true") && plan.contains("\"improved\": false"),
+            "the reply must name the stop bit the loop reads: {plan}"
         );
     }
 

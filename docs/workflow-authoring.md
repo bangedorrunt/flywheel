@@ -216,10 +216,20 @@ concurrently. Lint rejects cyclic graphs.
 
 **Actions:** `send_message`, `send_dm`, `dispatch_job`, `spawn`, `reduce` (bounded fold over a
 proper list: `all`/`any`/`count`/`sum`/`join`, one scalar), `request_approval`, `delay`,
-`call_workflow`, `parallel`, `branch`, `retry`, `foreach`. Two are **deprecated and
-fail-closed** (bd-i6kc): `react` and `call_webhook` still parse for migration, but the boundary
-rejects them with `unsupported_action` and nothing is posted or dispatched — do not author them
-into new workflows.
+`verify`, `call_workflow`, `parallel`, `branch`, `retry`, `foreach`, `loop`. Two are
+**deprecated and fail-closed** (bd-i6kc): `react` and `call_webhook` are lint errors, and the
+boundary rejects them with `unsupported_action`. Do not author them into new workflows.
+
+`loop` runs `body` up to `max` (a positive integer or `{{inputs.*}}`, cap 32). `until` stops
+when the guard is true. A field the attempt did not publish counts as not yet, so the loop
+continues until the cap, then returns `{ok:false}`. `parallel over` accepts `@crew.<role>`
+(flywheel resolves that to a count before invoke), a positive integer, or a template that
+renders to one. Success stays a JSON array. `call_workflow` copies parent `inputs` into the
+child, and explicit keys win. Compose `workflow:<name>` sets both `goal` and `objective`.
+`kind:<harness>:<stage>` and `kind:<harness>:<role>:<stage>` pin `spec.harness` on a composed
+dispatch. A JSON object in `response` (or one fenced block) is copied onto the step without
+replacing `ok`, which is how `steps.measure.improved` and `steps_iteration_improved` become
+visible. A step fails on `{ok:false}` or `{status:failed}`. `{skipped:true}` does not.
 
 **Step policies:** `on_error: continue` (default; backward compat) | `fail_run` (the step's
 error FAILS the run → kind-46012 `status=failed`, the signal smart-cron consumes). `await: true`

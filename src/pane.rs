@@ -921,6 +921,18 @@ pub fn select_empty_pane(
 /// profile's harness? Pane crews pre-spawn per profile, so an override that
 /// differs cannot be satisfied by an existing pane — the headless runner is
 /// the override surface. Pure + unit-tested.
+/// `__respawn` argv for a fresh dispatch. `--force` is required: a healthy
+/// idle agent is a no-op without it, and fresh means the old transcript goes.
+pub fn fresh_session_respawn_args(project: &str, name: &str, kind: &str) -> Vec<String> {
+    vec![
+        "__respawn".into(),
+        project.into(),
+        name.into(),
+        kind.into(),
+        "--force".into(),
+    ]
+}
+
 pub fn harness_override_conflicts(profile_harness: &str, spec_harness: Option<&str>) -> bool {
     match spec_harness {
         // An EMPTY profile harness (ADR-0007 slot-inherit) never conflicts:
@@ -1026,10 +1038,24 @@ pub fn pane_dispatch(
     // `__send --profile` (bd-gsvn.1) — the ONE conditioning site shared by
     // the pane runner and both loop paths. The runner passes the raw stage
     // prompt (or goal fallback) and the profile name.
-    let base = match headless::dispatch_spec_stage(spec) {
-        Some(s) => crate::stage_prompt(s)?,
-        None => headless::base_prompt_for(wf_name, inputs),
+    // Same prompt order as headless: an inline task is the mission. A stage
+    // is the fallback. Pane used to drop `spec.task`, so a repair pass ran
+    // the stage boilerplate instead of the iteration instructions.
+    let mut base = match headless::dispatch_spec_task(spec) {
+        Some(task) if !task.trim().is_empty() => task.to_string(),
+        _ => match headless::dispatch_spec_stage(spec) {
+            Some(s) => crate::stage_prompt(s)?,
+            None => headless::base_prompt_for(wf_name, inputs),
+        },
     };
+    for key in ["plan", "project"] {
+        if let Some(extra) = headless::spec_extra(spec, key, inputs) {
+            base.push_str("\n\n");
+            base.push_str(key);
+            base.push_str(": ");
+            base.push_str(&extra);
+        }
+    }
     let prompt = base;
     // @role -> running pane: a per-step harness override's matched pane
     // wins; otherwise profile column first, name fallback. bd-op8b: the
@@ -1052,6 +1078,32 @@ pub fn pane_dispatch(
         "flywheel: dispatch @{} → {} ({})",
         profile_name, entry.name, entry.pane_id
     );
+    // context: fresh means an empty transcript. Respawn with --force: a
+    // healthy idle agent would otherwise no-op and keep the old session.
+    if spec.context == Some(toron_workflow::schema::ContextMode::Fresh) {
+        let kind = entry
+            .harness
+            .clone()
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or_else(|| profile.harness.clone());
+        if kind.trim().is_empty() {
+            bail!(
+                "pane dispatch: context fresh for @{profile_name} but no harness is known to respawn"
+            );
+        }
+        let exe = std::env::current_exe()?;
+        let output = Command::new(exe)
+            .args(fresh_session_respawn_args(project, &entry.name, &kind))
+            .output()
+            .with_context(|| format!("fresh respawn of {}", entry.name))?;
+        if !output.status.success() {
+            bail!(
+                "pane dispatch: fresh session respawn of {} failed: {}",
+                entry.name,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     // Subprocess-reuse (Spec A): the `__send` leaf owns the confirmed send
     // (landing wait, last-sent dedup, auto-heal, Spec C conditioning) — no
@@ -1484,8 +1536,11 @@ pub fn spawn_launch_plan(
         .unwrap_or_default()
         .to_string();
     let workflow = spec["workflow"].as_str().map(str::to_string);
-    let harness = spec["resolved"]["spec"]["harness"]
+    // An explicit spawn `harness:` overrides the profile's resolved harness.
+    let harness = spec["harness"]
         .as_str()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| spec["resolved"]["spec"]["harness"].as_str())
         .unwrap_or_default()
         .to_string();
     // ADR-0022 W2: the step's lifecycle phase (typed spec, resolved copy).
@@ -2814,6 +2869,20 @@ mod tests {
         assert!(long.len() <= 32, "name too long: {long} ({})", long.len());
         let short = crew_agent_name("wf", "reviewer", 1);
         assert!(short.len() <= 32);
+    }
+
+    #[test]
+    fn fresh_respawn_args_force_a_new_session() {
+        assert_eq!(
+            fresh_session_respawn_args("flywheel", "crew-goal-coder", "pi"),
+            vec![
+                "__respawn".to_string(),
+                "flywheel".into(),
+                "crew-goal-coder".into(),
+                "pi".into(),
+                "--force".into(),
+            ]
+        );
     }
 
     /// bd-42fs step 5: a per-step harness override that differs from the

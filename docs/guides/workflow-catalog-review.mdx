@@ -39,11 +39,11 @@ Compound Engineering supplies the understand → plan → execute → review →
 | 16 | `forensics` | review | Keep diagnosis-only; hand accepted changes to `bug-fix` or `refactoring`. |
 | 17 | `goal` | delivery | Keep as the bead-backed canonical objective path. |
 | 18 | `goal-direct` | delivery | Keep as an explicit no-bead arm; never silently merge it into `goal`. |
-| 19 | `hillclimb` | measurement | Keep for capped repeated measurement; `perf` remains one-shot. |
+| 19 | `hillclimb` | measurement | Keep. One `loop` capped by `inputs.max_iters`. Stops only when the reply JSON has `improved: true`. |
 | 20 | `interrogate` | review | Keep for N-model adversarial review; it extends rather than replaces `debate`. |
 | 21 | `onboard` | operations | Keep as cold-start context seeding; pickup assumes an existing run. |
 | 22 | `pause` | operations | Keep: checkpoint and handoff without killing working panes. |
-| 23 | `perf` | measurement | Keep for one measured keep/discard decision. |
+| 23 | `perf` | measurement | Keep for one keep/discard branch on `steps.measure.improved`. A measure reply with no `improved` field fails the run. |
 | 24 | `phase-implement` | phase | Keep: host phase contract and acceptance evidence. |
 | 25 | `phase-plan` | phase | Keep: bead and dependency evidence. |
 | 26 | `phase-resolve` | phase | Keep: machine-checkable goal reduction. |

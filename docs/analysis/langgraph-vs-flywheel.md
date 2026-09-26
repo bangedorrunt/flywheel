@@ -428,6 +428,9 @@ alongside `bd-6si7` rather than racing it.
   `repair-until-verified` node `repair-1`. This is the SAME class commit
   `7f9e117` fixed for `{{inputs.coder_profile}}` (bd-adv4) — an input ref with
   no declared default. No open bead owns it.
+  Update (2026-09-26): that recipe is now one `loop` (`max` from
+  `inputs.max_iterations`, `until` on `steps_verify_ok`). The `repair-1` node
+  is gone. Do not reintroduce it.
 - `event_poll_parity_unit_suite_is_the_default_gate` was a stale static gate
   asserting seven `durable.rs` test names that commit `7f9e117`
   ("test-audit -25, no coverage loss") had deliberately triaged away. Gate

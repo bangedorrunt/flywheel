@@ -163,6 +163,9 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
         argv.push("--crew".into());
         argv.push(n.to_string());
     }
+    // workflow run/compose preflight requires a project. The classifier
+    // builds argv without one, so the printed command died on "no project".
+    splice_project(&mut argv, &world.project);
 
     let why = if topology == "join" {
         format!(
@@ -429,6 +432,19 @@ pub fn apply_answers(
         }
     }
     Ok(())
+}
+
+fn splice_project(argv: &mut Vec<String>, project: &str) {
+    if project.is_empty() || argv.iter().any(|a| a == "--project") {
+        return;
+    }
+    let workflow = argv.windows(2).any(|w| {
+        w[0] == "workflow" && (w[1] == "run" || w[1] == "compose")
+    });
+    if workflow {
+        argv.push("--project".into());
+        argv.push(project.to_string());
+    }
 }
 
 fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {

@@ -49,7 +49,7 @@ Invariants (each stated once): **preview ≠ started** — compose without `--ru
 
 Recursive `call_workflow` is durable Inception-style composition, but host-bounded: serialized lineage rejects cycles, depth beyond 8 (root included), and exhausted 32-child budget per lineage branch before `ctx.run` creates the child. The guard is an engine contract, not a prompt suggestion.
 
-Evaluation contract: `ce-evaluate` is a fresh-context, read-only reviewer stage used by `repair-until-verified`. It returns structured findings only; its `done` field is advisory. The host `VerifySink` and phase contract own pass/fail, and ship-chain evaluations are persisted as bounded, redacted `EvaluationEvidence` under the parent run. Inspect them with `flywheel artifacts stitch <run_id> --project <p>`; do not treat worker status fields as proof.
+Evaluation contract: `ce-evaluate` is a fresh-context, read-only reviewer stage used inside `repair-until-verified`. That token is one `loop` (`max` from `inputs.max_iterations`, cap 32, `until` `steps_verify_ok == true`): repair, then evaluate, then host `verify`. A red verify continues. Exhaustion fails the run. The evaluator returns structured findings only; its `done` field is advisory. The host `VerifySink` and phase contract own pass/fail, and ship-chain evaluations are persisted as bounded, redacted `EvaluationEvidence` under the parent run. Inspect them with `flywheel artifacts stitch <run_id> --project <p>`; do not treat worker status fields as proof.
 
 **beads-lifecycle** (third token): preferred `workflow compose "<objective>" --parts beads-lifecycle --run --project <p>`; legacy alias `workflow run beads-lifecycle --execute`. Nests ordinary builtins (phase-plan, beads, ce-plan-review, phase-implement, phase-verify) via call_workflow; `inputs.until` early-exits SUCCESS after any phase; SIGNOFF outer-only. Sibling of wave-swarm: after integrate, hand off with `until=integrate`, never merge.
 
@@ -166,9 +166,10 @@ confused with another vocabulary word. `stage:<stage>` selects a stage through
 its declared role, `role:<role>:<stage>` pins a profile, and
 `phase:<phase>:<stage>` carries a lifecycle phase. The compact forms
 `<role>:<stage>` and `<phase>:<stage>`, `workflow:<name>`, and a bare stage
-remain valid. Parts comma-separate. Nested control forms are
+remain valid. `kind:<harness>:<stage>` and `kind:<harness>:<role>:<stage>`
+pin that harness on the dispatch. Parts comma-separate. Nested control forms are
 `each:<param>:<part>`, `parallel:<param>:<part>`, `when:<guard>:<part>`, and
-`retry(n):<part>`.
+`retry(n):<part>`. Wrappers fail the run. A false `when` guard skips.
 
 SHIPPED (ADR-0022 waves, 2026-08-21/22): phase metadata is carried on dispatch
 specs (omp `--plan-yolo`, opencode `--agent plan`; unsupported mechanics fail
@@ -348,7 +349,7 @@ Phase affinities (guidance until ADR-0022 mechanizes injection): resolve →
 | unknown territory, need coverage before committing | scout fan-out (`scout:fresh-eyes-explore`, parallel) | N cheap readers beat 1 expensive reader |
 | risky change, want a tripwire | verify-fence pattern | explicit probe steps with `on_error: fail_run` |
 | contested decision | debate | N rounds + judge verdict; requires reply verification |
-| measured improvement loop | hillclimb | capped retry: hypothesize → smallest change → measure → keep (ledger + commit) or discard (revert) |
+| measured improvement loop | hillclimb | `loop` capped by `inputs.max_iters` (default 10, engine cap 32). Stops only when the reply JSON has `improved: true`. No such field spends the cap, then the run fails. Keep is a ledger row plus one commit. Discard is a revert. |
 | quality gate before merge/ship | review workflows | adversarial findings + verdict, n≥2 reviewers |
 
 When composing, START from an archetype and modify, rather than authoring
