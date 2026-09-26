@@ -1030,6 +1030,27 @@ fn spawn_host_loop(
         tx: tx.clone(),
     });
     let task = tokio::spawn(async move {
+        // bd-lmtu: START THE HEARTBEAT. `spawn_heartbeat_ticker` had NO caller
+        // anywhere outside its own module, so the 1s ticker was dead code: `.hb`
+        // was only ever touched incidentally by the wake-outcome arm in
+        // file_host, which is why the live state files were 596s and 57540s old
+        // rather than ~1s, and why `/health` reported
+        // `wake.pipe.class: "NeverStamped"` with `last_heartbeat_ms: null` for
+        // every workspace.
+        //
+        // That matters because the heartbeat is what lets wake-liveness tell a
+        // QUIET host from a DEAF one. With no stamp there is nothing to classify
+        // against, so liveness degrades to NeverStamped and a wake cannot be
+        // shown to have landed.
+        //
+        // Lifespan is the loop's: `_hb` is a Sender whose Drop ends the ticker
+        // thread, and an async block's locals are dropped on normal return AND
+        // on abort — so the ticker cannot outlive the hosted loop, and a retired
+        // loop (bd-mk60) stops stamping.
+        let _hb = doorbell_rt::watchbeat::spawn_heartbeat_ticker(
+            supervised_state.clone(),
+            w.clone(),
+        );
         // Await a child task so panic/abort is also a supervised completion:
         // the outer task still removes the hosted row and releases its lease.
         let child = tokio::spawn(host_workspace(fw, p, w, loop_tx, rx, supervised_liveness));

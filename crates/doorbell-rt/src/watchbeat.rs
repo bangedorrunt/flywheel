@@ -30,8 +30,18 @@ pub fn event_path(state_dir: &Path, workspace: &str) -> PathBuf {
         .join(format!("watch-{workspace}.event"))
 }
 
+/// Stamp a stamp-file with unix-now.
+///
+/// bd-lmtu: the mkdir is skipped once the parent exists. Now that the ticker is
+/// actually wired (it was dead code before), this runs once per second per
+/// hosted workspace, so an unconditional `create_dir_all` per stamp is a
+/// pointless stat+syscall on the hot path — 11 hosted workspaces is 11 of them
+/// a second, forever. Best-effort throughout: a stamp that cannot be written is
+/// not an error, it is a missing sample.
 fn stamp_file(p: &Path) {
-    if let Some(parent) = p.parent() {
+    if let Some(parent) = p.parent()
+        && !parent.is_dir()
+    {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(p, crate::lease::unix_now().to_string());
@@ -63,6 +73,20 @@ pub const STAMP_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// Touches heartbeat on the **calling thread** before `std::thread::spawn` so
 /// `/health` cannot observe a NeverStamped window from scheduler delay.
+/// Does the ticker keep running after this `recv_timeout` outcome?
+///
+/// bd-lmtu: extracted as a pure decision because the loop body is exactly where
+/// a leak hides, and a thread-level test cannot see it. Treating `Disconnected`
+/// as "keep going" does not fail in the obvious direction — it produces a **busy
+/// spin**: `recv_timeout` on a dead channel returns `Disconnected` immediately
+/// and forever, so the thread spins at full CPU while the stamp file correctly
+/// stops changing. A test that only watches the file sees nothing wrong, which
+/// is exactly how the first version of this test passed against a mutated
+/// build. So the rule is pinned directly, with all three cases.
+pub fn ticker_keeps_running(r: &std::sync::mpsc::RecvTimeoutError) -> bool {
+    matches!(r, std::sync::mpsc::RecvTimeoutError::Timeout)
+}
+
 pub fn spawn_heartbeat_ticker(
     state_dir: PathBuf,
     workspace: String,
@@ -74,8 +98,12 @@ pub fn spawn_heartbeat_ticker(
     std::thread::spawn(move || {
         loop {
             match stop_rx.recv_timeout(STAMP_INTERVAL) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // An explicit stop.
+                Ok(()) => break,
+                Err(e) => {
+                    if !ticker_keeps_running(&e) {
+                        break;
+                    }
                     touch_heartbeat(&state_dir, &workspace);
                 }
             }
@@ -272,5 +300,137 @@ mod tests {
         );
         let _ = stop.send(());
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod bd_lmtu_heartbeat_tests {
+    use super::{path as heartbeat_path, spawn_heartbeat_ticker, STAMP_INTERVAL};
+
+    /// bd-lmtu: the ticker must ACTUALLY stamp, repeatedly, for as long as it is
+    /// held. This is the behaviour that was missing entirely — the function had
+    /// no caller, so `.hb` was never a heartbeat and every workspace read as
+    /// NeverStamped, which is what leaves wake-liveness unable to tell a QUIET
+    /// host from a DEAF one.
+    #[test]
+    fn the_ticker_stamps_repeatedly_while_held() {
+        let dir = std::env::temp_dir().join(format!("hb-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = "wstamp";
+
+        let tx = spawn_heartbeat_ticker(dir.clone(), ws.into());
+        // `spawn` touches once on the CALLING thread, so the file must exist
+        // before we even wait for a tick.
+        let hb = super::path(&dir, ws);
+        assert!(hb.exists(), "spawn must stamp synchronously on the caller");
+
+        let first = std::fs::read_to_string(&hb).expect("stamp body");
+        std::thread::sleep(STAMP_INTERVAL + std::time::Duration::from_millis(400));
+        let second = std::fs::read_to_string(&hb).expect("stamp body");
+        assert_ne!(
+            first, second,
+            "the ticker must keep stamping while held — a single stamp is not a heartbeat"
+        );
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The thread must END when the sender drops, or every hosted loop that
+    /// restarts leaves a live ticker behind — which is the shape of the thread
+    /// leak in bd-lmtu. Prove the exit rather than assuming it: after the drop
+    /// the file must stop advancing.
+    #[test]
+    fn the_ticker_thread_exits_when_the_sender_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("hb-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = "wstop";
+
+        let tx = spawn_heartbeat_ticker(dir.clone(), ws.into());
+        let hb = super::path(&dir, ws);
+        std::thread::sleep(STAMP_INTERVAL + std::time::Duration::from_millis(300));
+        assert!(hb.exists(), "stamped while held");
+
+        drop(tx);
+        // Give a live ticker time to tick again; a dead one cannot.
+        std::thread::sleep(STAMP_INTERVAL + std::time::Duration::from_millis(600));
+        let after_drop = std::fs::read_to_string(&hb).expect("stamp body");
+        std::thread::sleep(STAMP_INTERVAL + std::time::Duration::from_millis(600));
+        let later = std::fs::read_to_string(&hb).expect("stamp body");
+        assert_eq!(
+            after_drop, later,
+            "the ticker kept running after its sender was dropped — that is a thread leak"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact defect, pinned at the source. The ticker was fully implemented
+    /// and never called, so nothing failed and nothing looked wrong. A behavioural
+    /// test cannot see an uncalled function, so pin the CALL SITE too.
+    ///
+    /// Anchored on the hosted loop's OWN child spawn, not on the first
+    /// `tokio::spawn` in the file. The first one is the reconcile task, so a
+    /// window opened there asserts nothing about the loop and passes VACUOUSLY —
+    /// which is not hypothetical: this test passed against a build with the
+    /// ticker call deleted, and only mutation-checking caught it.
+    #[test]
+    fn the_hosted_loop_actually_starts_a_ticker() {
+        let serve = include_str!("../../doorbell-cli/src/serve.rs");
+        let child = serve
+            .find("host_workspace(fw, p, w, loop_tx, rx,")
+            .expect("hosted loop child spawn");
+        let before = &serve[..child];
+        let task_start = before
+            .rfind("let task = tokio::spawn(async move {")
+            .expect("hosted loop task opener");
+        let body = &serve[task_start..child];
+        // Match the CALL, not the bare identifier. The first version of this
+        // assertion used `contains("spawn_heartbeat_ticker")` and PASSED against a
+        // build with the call deleted — because the explanatory comment beside the
+        // call site names the same function, so the test was matching its own
+        // documentation. Pin the qualified call, with its paren.
+        assert!(
+            body.contains("watchbeat::spawn_heartbeat_ticker("),
+            "the hosted loop must CALL watchbeat::spawn_heartbeat_ticker( before its child; \
+             without one every workspace stays NeverStamped and wake-liveness cannot classify \
+             QUIET vs DEAF"
+        );
+    }
+
+    /// The loop condition, pinned directly. `Disconnected` must TERMINATE. If it
+    /// only continued, the ticker would busy-spin at full CPU on a dead channel
+    /// while the stamp file correctly stopped changing — invisible to the
+    /// file-watching test above, and worse than the leak it replaced.
+    #[test]
+    fn only_timeout_keeps_the_ticker_running() {
+        use std::sync::mpsc::RecvTimeoutError as E;
+        assert!(
+            super::ticker_keeps_running(&E::Timeout),
+            "a timeout is the tick: stamp and continue"
+        );
+        assert!(
+            !super::ticker_keeps_running(&E::Disconnected),
+            "Disconnected is TERMINAL — continuing here busy-spins on a dead channel"
+        );
+    }
+
+    /// The stamp file must sit where the READER looks, or stamping is invisible.
+    /// Pinned because the two halves live in different modules and a future
+    /// refactor could move one without the other.
+    #[test]
+    fn the_stamp_lands_where_the_reader_expects() {
+        let dir = std::env::temp_dir().join(format!("hb-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tx = spawn_heartbeat_ticker(dir.clone(), "proj-ws".into());
+        let p = super::path(&dir, "proj-ws");
+        assert_eq!(
+            p,
+            dir.join("doorbell").join("watch-proj-ws.hb"),
+            "path shape is a contract with the liveness reader"
+        );
+        assert!(p.exists(), "the ticker must create the doorbell/ parent on demand");
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
