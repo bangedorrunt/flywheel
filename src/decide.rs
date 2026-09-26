@@ -238,7 +238,14 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         primitive: "hillclimb",
-        matchers: &["hillclimb"],
+        matchers: &[
+            "hillclimb",
+            "until it improves",
+            "keep only the wins",
+            "keep measuring",
+            "measured improvement",
+            "climb until",
+        ],
         topology: "swarm",
         gate: RouteGate::Always,
         argv: RouteArgv::WorkflowRun { mode: "pane" },
@@ -437,7 +444,16 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         primitive: "repair-until-verified",
-        matchers: &["repair-until-verified", "repair until verified"],
+        matchers: &[
+            "repair-until-verified",
+            "repair until verified",
+            "repair until",
+            "until green",
+            "until it passes",
+            "until the tests pass",
+            "until verified",
+            "keep repairing",
+        ],
         topology: "swarm",
         gate: RouteGate::Always,
         argv: RouteArgv::ComposeToken {
@@ -589,6 +605,25 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     },
 ];
 
+/// Phrases that mean "keep repairing until the check passes".
+const UNTIL_GREEN: &[&str] = &[
+    "until green",
+    "until it passes",
+    "until the tests pass",
+    "until verified",
+    "keep repairing",
+    "repair until",
+];
+
+/// Phrases that mean "repeat the measurement and keep only wins".
+const CLIMB: &[&str] = &[
+    "until it improves",
+    "keep only the wins",
+    "keep measuring",
+    "measured improvement",
+    "climb until",
+];
+
 /// Earliest match position, longest needle on ties: among the needles of
 /// one row that hit, the smallest index wins and the longest needle breaks
 /// index ties. Returns (pos, len).
@@ -604,6 +639,14 @@ impl RouteEntry {
     /// (empty goal, contention with no keyword) sort last so an explicit
     /// mention always beats world state.
     fn match_key(&self, t: &str, implement: bool, snap: &Snapshot) -> Option<(usize, usize)> {
+        // A goal that asks to keep going is the loop, even when a one-shot
+        // word ("failing", "slow") appears earlier in the sentence.
+        if self.primitive == "bug-fix" && has(t, UNTIL_GREEN) {
+            return None;
+        }
+        if self.primitive == "perf" && has(t, CLIMB) {
+            return None;
+        }
         match self.gate {
             RouteGate::Always => earliest_hit(self.matchers, t),
             RouteGate::NoImplement => (!implement)
@@ -2360,5 +2403,32 @@ mod decide_router_tests {
                 "{workflow} row leads with its trigger {trigger:?}"
             );
         }
+    }
+
+    /// Until-green beats a one-shot bug-fix even when "failing" comes first.
+    /// A repeated measurement beats one-shot perf even when "slow" comes first.
+    #[test]
+    fn loop_phrases_beat_the_one_shot_row() {
+        let until = decide("fix the failing test until it passes", &snap());
+        assert_eq!(until.primitive, "repair-until-verified", "{until:?}");
+        assert!(
+            until.argv.windows(2).any(|w| w == ["--parts", "repair-until-verified"]),
+            "{:?}",
+            until.argv
+        );
+        let plain = decide("keep going until the tests pass", &snap());
+        assert_eq!(plain.primitive, "repair-until-verified");
+
+        let climb = decide(
+            "the slow path should keep measuring until it improves",
+            &snap(),
+        );
+        assert_eq!(climb.primitive, "hillclimb", "{climb:?}");
+        assert_ne!(climb.primitive, "perf");
+
+        let one_shot = decide("dispatch is slow", &snap());
+        assert_eq!(one_shot.primitive, "perf");
+        let implement_slow = decide("fix the slow dispatch", &snap());
+        assert_eq!(implement_slow.primitive, "none");
     }
 }

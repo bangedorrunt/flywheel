@@ -116,6 +116,72 @@ fn default_n(unique: u32, cap: u32) -> u32 {
     unique.max(1).min(cap)
 }
 
+/// Inputs a routed workflow cannot default. A run without them fails at render.
+pub fn required_inputs(primitive: &str) -> &'static [&'static str] {
+    match primitive {
+        "bug-fix" => &["symptom", "repro", "verify"],
+        "repair-until-verified" => &["verify"],
+        "hillclimb" => &["metric", "target"],
+        "perf" => &["metric", "baseline_cmd", "budget"],
+        "prototype" | "arena" => &["question"],
+        "forensics" => &["symptom"],
+        _ => &[],
+    }
+}
+
+/// `name=value` or `name: value` in the objective. The goal prose is not a value.
+pub fn missing_required_inputs(primitive: &str, objective: &str) -> Vec<&'static str> {
+    let lower = objective.to_ascii_lowercase();
+    required_inputs(primitive)
+        .iter()
+        .copied()
+        .filter(|name| {
+            let name = name.to_ascii_lowercase();
+            !lower.contains(&format!("{name}=")) && !lower.contains(&format!("{name}:"))
+        })
+        .collect()
+}
+
+/// A harness named as its own word. `oc` and `gk` are the short aliases.
+pub fn named_harness(objective: &str) -> Option<&'static str> {
+    let lower = objective.to_ascii_lowercase();
+    for word in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        match word {
+            "opencode" | "oc" => return Some("opencode"),
+            "grok" | "gk" => return Some("grok"),
+            "omp" => return Some("omp"),
+            "pi" => return Some("pi"),
+            "pa" => return Some("pa"),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn splice_named_harness(argv: &mut Vec<String>, objective: &str) {
+    let Some(kind) = named_harness(objective) else {
+        return;
+    };
+    if argv.windows(2).any(|w| w[0] == "workflow" && w[1] == "compose") {
+        if !argv.iter().any(|a| a == "--harness") {
+            argv.push("--harness".into());
+            argv.push(kind.into());
+        }
+    } else if argv.windows(2).any(|w| w[0] == "workflow" && w[1] == "run")
+        && !argv.iter().any(|a| a == "--role-harness")
+    {
+        argv.push("--role-harness".into());
+        argv.push(format!("coder={kind}"));
+    }
+}
+
+fn has_diagnose_then_fix(objective: &str) -> bool {
+    let lower = objective.to_ascii_lowercase();
+    let diagnose = lower.contains("diagnose") || lower.contains("forensic");
+    let fix = lower.contains("fix") || lower.contains("implement");
+    diagnose && fix
+}
+
 /// Assemble a briefing. `unique_roles` is the packed-from inventory (may be empty).
 pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u32) -> Briefing {
     let cap = if cap == 0 { DEFAULT_CREW_MAX } else { cap };
@@ -166,7 +232,9 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
     // workflow run/compose preflight requires a project. The classifier
     // builds argv without one, so the printed command died on "no project".
     splice_project(&mut argv, &world.project);
+    splice_named_harness(&mut argv, objective);
 
+    let missing = missing_required_inputs(decision.primitive, objective);
     let why = if topology == "join" {
         format!(
             "live fleet on {} (pins={}, dispatcher={}) — join by default (ADR-0011 D5)",
@@ -174,6 +242,15 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
         )
     } else {
         decision.reason.clone()
+    };
+    let why = if missing.is_empty() || argv.is_empty() {
+        why
+    } else {
+        argv.clear();
+        format!(
+            "{why} Missing inputs: {}. Re-brief with name=value for each. The run is not dispatched.",
+            missing.join(", ")
+        )
     };
 
     let token = is_compose_token(decision.primitive).then(|| decision.primitive.to_string());
@@ -205,6 +282,15 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
             when: "live fleet — join instead of spawning".into(),
         });
     }
+    if has_diagnose_then_fix(objective)
+        && matches!(decision.primitive, "bug-fix" | "repair-until-verified")
+    {
+        alternatives.push(Alternative {
+            topology: "open".into(),
+            workflow: Some("forensics".into()),
+            when: "diagnosis first, then a second briefing for the fix".into(),
+        });
+    }
     if !matches!(decision.primitive, "loop-work" | "none" | "wave-swarm")
         && !alternatives
             .iter()
@@ -217,7 +303,7 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
         });
     }
 
-    Briefing {
+    let mut briefing = Briefing {
         schema: SCHEMA.into(),
         objective: objective.into(),
         world: world.clone(),
@@ -264,7 +350,15 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
                 default: "default".into(),
             },
         ],
+    };
+    if !missing.is_empty() {
+        briefing.questions.push(Question {
+            id: "inputs".into(),
+            options: missing.iter().map(|name| (*name).to_string()).collect(),
+            default: missing.join(","),
+        });
     }
+    briefing
 }
 
 /// GS-049: after sticky-open `[reclassify]` announce, briefing must not present
@@ -330,21 +424,22 @@ fn is_invent_spawn_under_open(workflow: &str) -> bool {
 fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
     match session {
         "open" => {
-            // Always clear invent spawn surfaces under sticky-held open.
-            // Open-safe non-invent workflows are not reachable via sticky_held
-            // (held only against classified loop|swarm|join|none) — so every
-            // sticky-held open path is invent-spawn and must fail-closed.
+            // Every sticky-held open path is cleared. A pane workflow such as
+            // hillclimb is an invent spawn the same way a compose token is.
+            // An input refusal may already have emptied argv. That is still
+            // an invent vehicle and must not panic the door.
             debug_assert!(
                 is_invent_spawn_under_open(&b.proposal.workflow)
-                    || b.proposal
-                        .argv
-                        .windows(2)
-                        .any(|w| w == ["loop-mode", "run"])
-                    || b.proposal.argv.iter().any(|a| a == "arrive"),
-                "sticky-held open expected invent spawn, got workflow={} argv={:?}",
+                    || !b.proposal.workflow.is_empty(),
+                "sticky-held open expected a classified vehicle, got workflow={} argv={:?}",
                 b.proposal.workflow,
                 b.proposal.argv
             );
+            let missing = b
+                .questions
+                .iter()
+                .find(|q| q.id == "inputs")
+                .map(|q| q.default.clone());
             b.proposal.workflow = "none".into();
             b.proposal.token = None;
             b.proposal.argv.clear();
@@ -352,6 +447,11 @@ fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
             b.proposal.crew_total = 0;
             b.proposal.add.clear();
             b.proposal.remove.clear();
+            if let Some(names) = missing {
+                b.proposal
+                    .why
+                    .push_str(&format!(" Missing inputs: {names}."));
+            }
         }
         "loop" => {
             // Hold loop against invent swarm: loop vehicle only (no wave-swarm).
@@ -1108,5 +1208,61 @@ mod tests {
         assert_eq!(b.proposal.workflow, "none");
         assert!(b.proposal.argv.is_empty(), "{:?}", b.proposal.argv);
         assert!(has_crew_and_model_questions(&b));
+    }
+
+    #[test]
+    fn until_green_refuses_until_verify_is_bound() {
+        let held = assemble("fix the failing test until it passes", &world_empty(), &[], 5);
+        assert_eq!(held.proposal.workflow, "repair-until-verified");
+        assert!(held.proposal.argv.is_empty(), "{:?}", held.proposal.argv);
+        assert!(held.proposal.why.contains("verify"), "{}", held.proposal.why);
+        assert!(held.questions.iter().any(|q| q.id == "inputs"));
+
+        let go = assemble(
+            "fix the failing test until it passes verify=cargo test",
+            &world_empty(),
+            &[],
+            5,
+        );
+        assert!(
+            go.proposal.argv.windows(2).any(|w| w == ["--parts", "repair-until-verified"]),
+            "{:?}",
+            go.proposal.argv
+        );
+        assert!(go.proposal.argv.windows(2).any(|w| w == ["--project", "toron"]));
+    }
+
+    #[test]
+    fn named_harness_lands_on_the_argv_and_diagnose_then_fix_is_an_alternative() {
+        let b = assemble(
+            "fix the failing test until it passes verify=cargo test with opencode, then we already diagnosed it",
+            &world_empty(),
+            &[],
+            5,
+        );
+        // "diagnosed" contains "diagnose"? "diagnosed".contains("diagnose") is true.
+        assert!(
+            b.proposal.argv.windows(2).any(|w| w == ["--harness", "opencode"]),
+            "{:?}",
+            b.proposal.argv
+        );
+        assert!(
+            b.alternatives.iter().any(|a| a.workflow.as_deref() == Some("forensics")),
+            "{:?}",
+            b.alternatives
+        );
+    }
+
+    #[test]
+    fn climb_refuses_without_metric_and_target() {
+        let held = assemble(
+            "the slow path should keep measuring until it improves",
+            &world_empty(),
+            &[],
+            5,
+        );
+        assert_eq!(held.proposal.workflow, "hillclimb");
+        assert!(held.proposal.argv.is_empty(), "{:?}", held.proposal.argv);
+        assert!(held.proposal.why.contains("metric"), "{}", held.proposal.why);
     }
 }
