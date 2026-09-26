@@ -546,10 +546,27 @@ fn summarize_run_outcome(value: &serde_json::Value) -> String {
     }
 }
 
+/// The default XDG data root the artifact tree hangs off.
+fn default_data_root() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// Stitcher: read records only, write stitched.md, flag Ungrounded loudly.
 pub fn stitch_artifacts(project: &str, run_id: &str) -> anyhow::Result<PathBuf> {
-    let base = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    stitch_artifacts_in(&default_data_root(), project, run_id)
+}
+
+/// bd-ww75: the ROOT-EXPLICIT stitcher.
+///
+/// This module is `#![forbid(unsafe_code)]`, so a test cannot pin
+/// `XDG_DATA_HOME` to make `dirs::data_local_dir()` deterministic — and it
+/// should not: reading the root from ambient env at call time is exactly what
+/// made the stitch tests order-dependent. They passed alone and failed in a
+/// full suite run because another test had swapped the env root between the
+/// fixture write and this read. Injecting the root removes the coupling
+/// instead of papering over it, and keeps the assertion about real behavior.
+fn stitch_artifacts_in(root: &std::path::Path, project: &str, run_id: &str) -> anyhow::Result<PathBuf> {
+    let base = root
         .join("flywheel")
         .join(project)
         .join("artifacts")
@@ -660,6 +677,16 @@ pub fn compute_sha256(path: &Path) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// bd-ww75: a per-test data root. The stitch tests used to resolve
+/// `dirs::data_local_dir()` at call time while other tests in this binary mutate
+/// XDG_DATA_HOME, so the read could land under a different root than the fixture
+/// was written to — passing alone, failing in a full suite run. This module is
+/// `#![forbid(unsafe_code)]`, so it cannot pin the env itself; injecting the
+/// root is both the only route and the sounder one.
+fn xdg_root() -> tempfile::TempDir {
+    tempfile::TempDir::new().expect("xdg temp dir")
 }
 
 #[cfg(test)]
@@ -999,8 +1026,12 @@ mod tests {
         // Simulates `flywheel artifacts <run_id> [--json]` + `stitch`
         let project = format!("artifacts-cli-test-{}", uuid::Uuid::new_v4());
         let run_id = "run-artifacts-cli-1";
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
+        // bd-ww75: injected data root, same reason as the other stitch tests —
+        // the ambient XDG root is mutable by other tests in this binary, and this
+        // module is #![forbid(unsafe_code)] so it cannot pin the env itself.
+        let xdg = xdg_root();
+        let base = xdg
+            .path()
             .join("flywheel")
             .join(&project)
             .join("artifacts")
@@ -1025,7 +1056,7 @@ mod tests {
         let p = base.join("node-artifacts-cli.json");
         std::fs::write(&p, serde_json::to_string_pretty(&rec).unwrap()).unwrap();
         assert!(p.exists());
-        let stitched = stitch_artifacts(&project, run_id).unwrap();
+        let stitched = stitch_artifacts_in(xdg.path(), &project, run_id).unwrap();
         assert!(stitched.exists());
         let md = std::fs::read_to_string(&stitched).unwrap();
         assert!(
@@ -1053,11 +1084,19 @@ mod tests {
     /// Stitch must report the outcome instead of dying on a serde field error.
     #[test]
     fn stitch_reports_a_terminal_only_run_instead_of_a_serde_error() {
+        // bd-ww75: an INJECTED data root, not the ambient one. This test used
+        // to resolve `dirs::data_local_dir()` at call time while other tests in
+        // this binary mutate XDG_DATA_HOME, so the read could land under a
+        // different root than the fixture was written to — it passed alone and
+        // failed in a full suite run. This module is #![forbid(unsafe_code)],
+        // so pinning the env here is not even an option; injection is both the
+        // only route and the better one.
+        let xdg = xdg_root();
         let project = format!("artifacts-terminal-test-{}", uuid::Uuid::new_v4());
         let _cleanup = ProjectCleanup(project.clone());
         let run_id = "fw-composed-test-terminal";
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
+        let base = xdg
+            .path()
             .join("flywheel")
             .join(&project)
             .join("artifacts")
@@ -1075,7 +1114,7 @@ mod tests {
         )
         .unwrap();
 
-        let stitched = stitch_artifacts(&project, run_id)
+        let stitched = stitch_artifacts_in(xdg.path(), &project, run_id)
             .expect("a terminal-only run must stitch, not serde-error");
         let md = std::fs::read_to_string(&stitched).unwrap();
         assert!(
@@ -1097,11 +1136,13 @@ mod tests {
     /// records list as before, the outcome in its own section.
     #[test]
     fn stitch_keeps_typed_records_alongside_a_terminal_outcome() {
+        // bd-ww75: same injected root as the terminal-only test above.
+        let xdg = xdg_root();
         let project = format!("artifacts-mixed-test-{}", uuid::Uuid::new_v4());
         let _cleanup = ProjectCleanup(project.clone());
         let run_id = "fw-composed-test-mixed";
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
+        let base = xdg
+            .path()
             .join("flywheel")
             .join(&project)
             .join("artifacts")
@@ -1134,7 +1175,7 @@ mod tests {
         )
         .unwrap();
 
-        let stitched = stitch_artifacts(&project, run_id).unwrap();
+        let stitched = stitch_artifacts_in(xdg.path(), &project, run_id).unwrap();
         let md = std::fs::read_to_string(&stitched).unwrap();
         assert!(
             md.contains(&rec.sha256[..12.min(rec.sha256.len())]),
