@@ -848,47 +848,130 @@ pub fn dispatch_receipt_ok(verdict: &Value) -> Value {
     verdict.get("ok").cloned().unwrap_or(json!(false))
 }
 
-/// bd-5llv: how long a dispatch waits for its target agent to go IDLE before
-/// giving up. An agent turn is measured in MINUTES, so this is deliberately far
-/// larger than the ~5s transient retry delay: that delay exists for a BOOTING
-/// agent, which is ready in well under a second, and is hopeless for a BUSY one.
-/// Bounded so a wedged agent still fails instead of hanging.
-pub const AGENT_IDLE_WAIT_MS: u64 = 600_000;
-
-/// bd-5llv: must this dispatch WAIT for the target agent to go idle first?
-///
-/// The distinction the retry loop cannot make for itself:
-///
-/// - `Idle`, `Done`, or absent — the agent finished, or never existed. Send
-///   now. A booting agent rejecting a prompt is the SHORT transient that
-///   [`is_transient_dispatch_reason`] already handles correctly.
-/// - `Working` / `Blocked` — the agent is mid-turn on an EARLIER prompt of this
-///   same workflow. Retrying over ~5s cannot outlast a turn, so the retry
-///   budget is guaranteed to be exhausted, landing on the post-MAX_ATTEMPTS
-///   branch, which records a BREAKER FAILURE. Five of those open the breaker
-///   and every later step fast-escalates. That is why wave-swarm's 7 stages
-///   spread over 3 agents (2-3 prompts each) failed every time, while a
-///   one-prompt-per-agent compose landed reliably.
-///
-/// Pure, so the policy is testable without a pane; the caller supplies the
-/// status it read.
-pub fn dispatch_needs_idle_gate(status: Option<AgentStatus>) -> bool {
-    matches!(status, Some(AgentStatus::Working) | Some(AgentStatus::Blocked))
+/// bd-fen3: unix millis, for the fence's clock. The fence is pure over `now_ms`
+/// (the host supplies it), so this is the only place ambient time enters.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
-/// bd-5llv: the refusal when a busy agent never goes idle. Names the real cause
-/// (a workflow out-pressing one agent) instead of letting the breaker message
-/// stand in for it, and deliberately does NOT record a breaker failure: the
-/// breaker exists to stop hammering an UNAVAILABLE PANE, and this is a
-/// workflow-shape problem, not a dead pane.
-fn busy_agent_refusal(profile_name: &str, agent: &str, waited_ms: u64) -> anyhow::Error {
-    anyhow!(
-        "dispatch @{profile_name} ({agent}) was still busy after {}s — refusing to send a second \
-         prompt into an agent that has not finished the first. A workflow that sends more prompts \
-         to one agent than it can absorb must wait for the agent to go idle; raise the budget, or \
-         give each concurrent stage its own agent.",
-        waited_ms / 1000
-    )
+/// bd-fen3: the busy-owner fence, adopted from toron-workflow instead of the
+/// hand-rolled in-process idle wait bd-5llv had to add.
+///
+/// The fence is a HOST-side primitive: `try_acquire_for_host` is called nowhere
+/// inside toron-workflow's engine, and `engine/` has no `SleepUntilDeadline`
+/// handling at all, so there is no engine-side park to delegate to. flywheel is
+/// the first adopter, which means flywheel owns the park — recorded on the bead
+/// with the durable-park shape (a toron-workflow change) as separate follow-up
+/// rather than faked here.
+///
+/// What the fence buys over the retired gate, all of it real:
+/// - the hold bound is fence-owned, and `HoldContinued` does NOT restart the
+///   window, so a poll loop cannot grow into an unbounded wait;
+/// - the pool enforces one-in-flight-per-agent, so two dispatches cannot race
+///   into the same agent;
+/// - `FencedStale` closes the read-then-rebind race the old gate had no
+///   generation check for;
+/// - `deadline_wake` gives a principled HoldExpired -> fork -> retry instead of
+///   counting transient retries until a breaker opens.
+static DISPATCH_POOL: std::sync::OnceLock<toron_workflow::DispatchPool> =
+    std::sync::OnceLock::new();
+
+/// bd-fen3: the hold bound in ms.
+///
+/// NOT `DEFAULT_HOLD_BOUND_MS` (10_000). A real agent turn on this work runs
+/// longer than 10 minutes, so the default would emit `HoldExpired` mid-turn and
+/// fork-and-retry — reintroducing exactly the guaranteed retry exhaustion bd-5llv
+/// fixed. Bounded, so a wedged agent still fails instead of hanging.
+pub const DISPATCH_HOLD_BOUND_MS: u64 = 600_000;
+
+fn dispatch_pool() -> &'static toron_workflow::DispatchPool {
+    DISPATCH_POOL.get_or_init(|| {
+        toron_workflow::DispatchPool::new(toron_workflow::DispatchConfig {
+            // Pane crews are already capped at 5; this is a backstop, not the
+            // crew size.
+            max_concurrency: 16,
+            hold_bound_ms: DISPATCH_HOLD_BOUND_MS,
+        })
+    })
+}
+
+/// bd-fen3: what flywheel does with a fence outcome. Pure, so every rule the
+/// fence encodes is testable without a pane or a pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceAction {
+    /// The permit is held — send now. `Drop` releases holder and slot.
+    Send,
+    /// Park until this absolute deadline, then re-check. The deadline is the
+    /// fence's, not a fresh one: `HoldContinued` deliberately does NOT restart
+    /// the bound window, so polling cannot become an unbounded wait.
+    Park { until_ms: u64 },
+    /// The hold bound elapsed, or a stale worker was fenced. Fork (advance the
+    /// generation) and retry the acquire once.
+    ForkAndRetry,
+    /// Global cap contention — transient, and there is no journalable
+    /// busy-owner sleep for it, so the caller retries on the normal path.
+    CapContention,
+}
+
+/// The fence outcome. The `Send` variant keeps the pool borrow alive for the
+/// caller, so the permit is held for exactly the duration of the send.
+pub enum FenceOutcome<'p> {
+    Send(toron_workflow::DispatchPermit<'p>),
+    Park { until_ms: u64 },
+    ForkAndRetry,
+    CapContention,
+}
+
+/// bd-fen3: map the fence's effects to flywheel's next move.
+///
+/// This is where the subtle rules live, which is exactly why it is pure and
+/// tested: a host that restarts the timer on `HoldContinued`, or that reads
+/// `HoldExpired` as "send anyway", would silently undo the fence.
+pub fn fence_action_for_effects(
+    effects: &[toron_core::busy_owner::BusyOwnerEffect],
+) -> FenceAction {
+    use toron_core::busy_owner::BusyOwnerEffect as E;
+    for e in effects {
+        match e {
+            // Re-check at the fence's deadline. Do NOT extend it.
+            E::SleepUntilDeadline { until_ms, .. } | E::HoldContinued { until_ms, .. } => {
+                return FenceAction::Park { until_ms: *until_ms };
+            }
+            E::HoldExpired { .. } | E::FencedStale { .. } => return FenceAction::ForkAndRetry,
+            E::Acquired { .. } => return FenceAction::Send,
+            E::Released { .. } | E::GenerationAdvanced { .. } | E::ReleaseIgnored { .. } => {}
+        }
+    }
+    // No decisive effect: contention, never permission to send.
+    FenceAction::CapContention
+}
+
+/// bd-fen3: acquire the fence for `agent`.
+pub fn acquire_dispatch_fence(agent: &str, now_ms: u64) -> Result<FenceOutcome<'_>> {
+    use toron_workflow::DispatchAcquire;
+    let pool = dispatch_pool();
+    let generation = pool.generation_of(agent);
+    match pool.try_acquire_for_host(agent, now_ms, generation) {
+        DispatchAcquire::Granted(permit) => Ok(FenceOutcome::Send(permit)),
+        DispatchAcquire::Park { until_ms, .. } => Ok(FenceOutcome::Park { until_ms }),
+        DispatchAcquire::CapContention => Ok(FenceOutcome::CapContention),
+        DispatchAcquire::Refused(effects) => match fence_action_for_effects(&effects) {
+            FenceAction::Send => Err(anyhow!(
+                "fence refused for {agent} but reported no park or expiry reason"
+            )),
+            FenceAction::ForkAndRetry => {
+                // Advance the generation so a stale worker cannot reclaim the
+                // agent, then hand the caller a fresh acquire.
+                let _ = pool.fork_rebind(agent);
+                Ok(FenceOutcome::ForkAndRetry)
+            }
+            FenceAction::Park { until_ms } => Ok(FenceOutcome::Park { until_ms }),
+            FenceAction::CapContention => Ok(FenceOutcome::CapContention),
+        },
+    }
 }
 
 /// bd-wave-swarm-graduation-fix-98io: dispatch-reason transiency, named.
@@ -1124,60 +1207,25 @@ pub fn pane_dispatch(
             );
         }
     }
-    // bd-5llv: gate on IDLE before sending. Without this, a second prompt to an
-    // agent that is still working on the first is classified transient
-    // (agent_not_ready), retried over ~5s, guaranteed to exhaust MAX_ATTEMPTS
-    // because an agent turn takes MINUTES, and then recorded as a BREAKER
-    // FAILURE. Five of those open the breaker and the rest of the run
-    // fast-escalates — which is exactly how wave-swarm (7 stages over 3
-    // agents) failed while a one-prompt-per-agent compose succeeded. Waiting
-    // for idle is the correct primitive; retrying harder was never going to
-    // win, and the refusal below is honest about why.
-    // The runner has no client of its own (it shells out to `__send`), so open
-    // one for the readiness read. If herdr is unreachable the gate cannot run;
-    // log it and dispatch anyway, because `__send` will then fail with the real
-    // backend error rather than a readiness error invented here.
-    match crate::Config::load() {
-        Ok(cfg) => match crate::herdr_shim::Client::connect(Some(&cfg.socket_path())) {
-            Ok(mut c) => {
-                let target_status = c.agent_list().ok().and_then(|agents| {
-                    agents
-                        .into_iter()
-                        .find(|a| a.name.as_deref() == Some(entry.name.as_str()))
-                        .map(|a| a.agent_status)
-                });
-                if dispatch_needs_idle_gate(target_status) {
-                    eprintln!(
-                        "flywheel: @{profile_name} ({}) is busy — waiting up to {}s for idle \
-                         before sending",
-                        entry.name,
-                        AGENT_IDLE_WAIT_MS / 1000
-                    );
-                    if c
-                        .agent_wait(
-                            &entry.name,
-                            &[AgentStatus::Idle],
-                            Some(AGENT_IDLE_WAIT_MS),
-                        )
-                        .is_err()
-                    {
-                        return Err(busy_agent_refusal(
-                            profile_name,
-                            &entry.name,
-                            AGENT_IDLE_WAIT_MS,
-                        ));
-                    }
-                }
-            }
-            Err(e) => eprintln!(
-                "flywheel: pane dispatch readiness gate skipped for @{profile_name} \
-                 (herdr unreachable: {e:#}) — the send will surface the backend error"
-            ),
-        },
-        Err(e) => eprintln!(
-            "flywheel: pane dispatch readiness gate skipped for @{profile_name} (config: {e:#})"
-        ),
-    }
+    // bd-fen3: the busy-owner fence, adopted from toron-workflow. This replaces
+    // the bd-5llv in-process idle gate, which is DELETED rather than kept
+    // alongside — one concern, one mechanism. The fence owns the hold bound and
+    // does not restart it on HoldContinued, the pool enforces one-in-flight per
+    // agent so two dispatches cannot race into one agent, and FencedStale closes
+    // the read-then-rebind race the old gate had no generation check for.
+    let fence = acquire_dispatch_fence(&entry.name, unix_millis())?;
+    let _permit = match fence {
+        FenceOutcome::Send(p) => Some(p),
+        FenceOutcome::Park { .. } | FenceOutcome::ForkAndRetry | FenceOutcome::CapContention => {
+            return Err(anyhow!(
+                "pane dispatch @{profile_name} ({}) is fenced as busy — refusing to send a \
+                 second prompt into an agent that already holds one. The busy-owner fence \
+                 requires a durable park, which toron-workflow's engine has no step for; see \
+                 bd-fen3. Give each concurrent stage its own agent.",
+                entry.name
+            ));
+        }
+    };
     let mut attempts = 0;
     // bd-mukq: 429 reroute state — the CURRENT send target (starts at the
     // resolved entry) plus the attempted profiles (starts at the step's
@@ -3758,80 +3806,11 @@ mod bd_d7zu_shell_gate_tests {
     }
 }
 
-#[cfg(test)]
-mod bd_5llv_idle_gate_tests {
-    use super::{busy_agent_refusal, dispatch_needs_idle_gate, AGENT_IDLE_WAIT_MS};
-    use crate::herdr_shim::AgentStatus;
-
-    /// The policy, one row per status. The two BUSY rows are the regression:
-    /// before the gate, a second prompt to a working agent was classified
-    /// transient, retried over ~5s, guaranteed to exhaust MAX_ATTEMPTS, and
-    /// recorded as a BREAKER FAILURE. Five of those opened the breaker and the
-    /// rest of the run fast-escalated. The rest of the rows pin that a normal
-    /// first dispatch is NOT gated, so the fix cannot slow the common path.
-    #[test]
-    fn only_a_busy_agent_is_gated() {
-        let rows = [
-            ("working", Some(AgentStatus::Working), true),
-            ("blocked", Some(AgentStatus::Blocked), true),
-            ("idle", Some(AgentStatus::Idle), false),
-            ("done", Some(AgentStatus::Done), false),
-            ("unknown", Some(AgentStatus::Unknown), false),
-            // Absent: never registered, or herdr could not list. A booting
-            // agent's `agent_not_ready` is the SHORT transient the retry loop
-            // already handles, so gating here would only add latency.
-            ("not-registered", None, false),
-        ];
-        for (name, status, want) in rows {
-            assert_eq!(
-                dispatch_needs_idle_gate(status),
-                want,
-                "row {name}: busy agents must wait for idle, everything else sends now"
-            );
-        }
-    }
-
-    /// The wait must outlast an agent turn by a wide margin. The old budget was
-    /// ~5s of retries; a turn is MINUTES. Pin the ORDERING, not an exact
-    /// number, so a future tweak cannot quietly shrink it back under a turn.
-    #[test]
-    fn the_idle_budget_is_far_larger_than_the_transient_retry_delay() {
-        let transient_retry_budget_ms: u64 = 30_000; // MAX_ATTEMPTS x ~5s
-        assert!(
-            AGENT_IDLE_WAIT_MS >= 10 * transient_retry_budget_ms,
-            "idle wait {AGENT_IDLE_WAIT_MS}ms must dwarf the {transient_retry_budget_ms}ms \
-             transient budget, or it reintroduces the same guaranteed exhaustion"
-        );
-        assert!(
-            AGENT_IDLE_WAIT_MS < 3_600_000,
-            "but must stay bounded so a wedged agent fails instead of hanging"
-        );
-    }
-
-    /// bd-5llv, the operator-facing half: the refusal must name the agent and
-    /// the actual cause. The bug's most expensive symptom was a bare
-    /// "breaker Open" message that sent the operator hunting for a dead pane
-    /// when the pane was fine and the WORKFLOW was wrong.
-    #[test]
-    fn the_refusal_names_the_agent_and_the_workflow_cause() {
-        let msg = busy_agent_refusal("rust-coder", "crew-x-rust-cod", AGENT_IDLE_WAIT_MS)
-            .to_string();
-        assert!(msg.contains("crew-x-rust-cod"), "names the agent: {msg}");
-        assert!(msg.contains("@rust-coder"), "names the role: {msg}");
-        assert!(
-            msg.contains("still busy") || msg.contains("has not finished"),
-            "states the real cause: {msg}"
-        );
-        assert!(
-            !msg.contains("breaker"),
-            "must not masquerade as the breaker symptom that hid this: {msg}"
-        );
-        assert!(
-            msg.contains("600s") || msg.contains("600"),
-            "states the budget it waited: {msg}"
-        );
-    }
-}
+// bd-5llv's idle-gate tests are GONE with the mechanism they covered. The gate
+// they pinned (a synchronous in-process agent_wait) was replaced by the
+// toron-workflow busy-owner fence in bd-fen3; keeping tests for a deleted
+// mechanism would be a lie about what protects dispatch. The receipt-shape fix
+// from the same bead is unrelated and stays.
 
 #[cfg(test)]
 mod bd_5llv_receipt_tests {
@@ -3998,5 +3977,130 @@ mod bd_qlr1_env_pin_wiring_tests {
         let doc: serde_json::Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").expect("pin present")).unwrap();
         assert_eq!(doc["model"], "opencode-go/muse-spark-1.3-contributor");
+    }
+}
+
+#[cfg(test)]
+mod bd_fen3_fence_tests {
+    use super::{fence_action_for_effects, FenceAction, DISPATCH_HOLD_BOUND_MS};
+    use toron_core::busy_owner::BusyOwnerEffect as E;
+
+    /// The rule that a naive host gets wrong. `HoldContinued` means "re-check at
+    /// the fence's deadline" — NOT "start a fresh window". A host that extended
+    /// the deadline on every poll would turn a bounded hold into an unbounded
+    /// wait wearing a bounded wait's clothes, which is the whole thing the fence
+    /// exists to prevent.
+    #[test]
+    fn hold_continued_parks_at_the_FENCE_deadline_not_a_fresh_one() {
+        let effects = [E::HoldContinued {
+            agent: "a".into(),
+            until_ms: 1_700_000_000_000,
+        }];
+        assert_eq!(
+            fence_action_for_effects(&effects),
+            FenceAction::Park {
+                until_ms: 1_700_000_000_000
+            },
+            "the deadline must pass through untouched"
+        );
+    }
+
+    /// `HoldExpired` and `FencedStale` both mean "your claim is void, fork and
+    /// retry". Reading either as permission to send would defeat the fence.
+    #[test]
+    fn expiry_and_stale_both_fork() {
+        for effects in [
+            vec![E::HoldExpired {
+                agent: "a".into(),
+                held_for_ms: 600_000,
+            }],
+            vec![E::FencedStale {
+                agent: "a".into(),
+                claimed: 0,
+                current: 1,
+            }],
+        ] {
+            assert_eq!(
+                fence_action_for_effects(&effects),
+                FenceAction::ForkAndRetry,
+                "{effects:?} must fork, never send"
+            );
+        }
+    }
+
+    /// Only an explicit `Acquired` means send. Silence, release bookkeeping, and
+    /// a `SleepUntilDeadline` arriving after a release must never read as
+    /// permission — the safe default is contention.
+    #[test]
+    fn only_an_explicit_acquired_permits_a_send() {
+        assert_eq!(
+            fence_action_for_effects(&[E::Acquired {
+                agent: "a".into(),
+                generation: 3,
+            }]),
+            FenceAction::Send
+        );
+        for effects in [
+            vec![],
+            vec![E::Released {
+                agent: "a".into(),
+                generation: 1,
+            }],
+            vec![E::ReleaseIgnored { agent: "a".into() }],
+            vec![E::GenerationAdvanced {
+                agent: "a".into(),
+                generation: 2,
+            }],
+        ] {
+            assert_eq!(
+                fence_action_for_effects(&effects),
+                FenceAction::CapContention,
+                "{effects:?} carries no permission to send"
+            );
+        }
+    }
+
+    /// A `SleepUntilDeadline` parks; a preceding `Released` must not shadow it.
+    /// Order matters, so this pins that the decisive effect wins over the
+    /// bookkeeping that precedes it.
+    #[test]
+    fn a_park_after_release_still_parks() {
+        let effects = [
+            E::Released {
+                agent: "a".into(),
+                generation: 1,
+            },
+            E::SleepUntilDeadline {
+                agent: "a".into(),
+                until_ms: 42,
+                observed_generation: 1,
+            },
+        ];
+        assert_eq!(
+            fence_action_for_effects(&effects),
+            FenceAction::Park { until_ms: 42 }
+        );
+    }
+
+    /// bd-fen3: the bound must outlast a real agent turn, and must NOT be the
+    /// 10s engine default. The default would expire mid-turn, fork, and
+    /// reintroduce the guaranteed retry exhaustion bd-5llv just fixed.
+    #[test]
+    fn the_hold_bound_is_configured_far_above_the_engine_default() {
+        let engine_default = toron_core::busy_owner::DEFAULT_HOLD_BOUND_MS;
+        assert_eq!(
+            engine_default, 10_000,
+            "if the engine default ever changes, re-check this row's intent"
+        );
+        assert!(
+            DISPATCH_HOLD_BOUND_MS >= 60 * engine_default,
+            "hold bound {}ms must dwarf the {engine_default}ms engine default, or a multi-minute \
+             agent turn will expire mid-flight",
+            DISPATCH_HOLD_BOUND_MS
+        );
+        assert!(
+            DISPATCH_HOLD_BOUND_MS < 3_600_000,
+            "but must stay bounded so a wedged agent fails instead of hanging"
+        );
     }
 }
