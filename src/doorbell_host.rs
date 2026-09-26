@@ -87,6 +87,19 @@ pub struct RtHost {
     /// The one live wake-socket consumer. Shared with the restart task so a
     /// replacement aborts its predecessor instead of littering watchers.
     wake_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    /// bd-b2b3: the run-state recorder, `None` unless explicitly attached.
+    /// The recorder is an EFFECT-layer component (it owns a store handle and a
+    /// clock) and is therefore held HERE, beside the model, and never touched
+    /// from a reducer. `None` means "no recorder", which is visible rather than
+    /// mistaken for "no boundaries recorded yet".
+    state_log: Option<crate::run_state_recorder::RunStateRecorder>,
+    /// The writer thread draining `state_log`. Held so the handle is not
+    /// dropped; the thread runs for the process lifetime.
+    // The field is never READ, and that is the point: holding the JoinHandle is
+    // what keeps the writer's result observable and prevents an accidental
+    // detach. The thread is intentionally not shut down per-host.
+    #[allow(dead_code)]
+    state_log_writer: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Map one wake-sock outcome onto `BrainMsg`. Single owner for the twin
@@ -138,6 +151,25 @@ impl RtHost {
         crate::seed_roles_from_binds(&mut model, project)?;
         crate::rebuild_assignment_from_receipts(&mut model);
         model.last_now = unix_now();
+        // bd-b2b3: opt-in. Recording a boundary per tick changes the
+        // dispatcher's storage and latency profile, so it is an explicit
+        // operator choice (FLYWHEEL_RUN_STATE_LOG=1) rather than a silent new
+        // default. `attach` returns None when no toron index is open, which is
+        // also visible rather than a silent no-op.
+        let state_log = match std::env::var("FLYWHEEL_RUN_STATE_LOG") {
+            Ok(v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("true") => {
+                crate::run_state_recorder::RunStateRecorder::attach(&format!("flywheel/{project}"))
+            }
+            _ => None,
+        };
+        // bd-b2b3: the writer task is what makes an enqueued boundary durable.
+        // Without it the queue fills to PENDING_CAP and then refuses loudly
+        // forever, so the recorder is only ever constructed together with its
+        // writer. Computed BEFORE the struct literal because the literal moves
+        // `state_log`.
+        let state_log_writer = state_log
+            .clone()
+            .map(crate::run_state_recorder::spawn_writer);
         let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
         let index = build_index(&cfg, project);
         let now = unix_now();
@@ -160,6 +192,13 @@ impl RtHost {
             index_refreshed_at: now,
             index_pins,
             wake_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            // bd-b2b3: opt-in. Recording a boundary per tick changes the
+            // dispatcher's storage and latency profile, so it is an explicit
+            // operator choice (`FLYWHEEL_RUN_STATE_LOG=1`) rather than a silent
+            // new default. Returns None when no toron index is open, which is
+            // also visible rather than a silent no-op.
+            state_log,
+            state_log_writer,
         })
     }
 
@@ -346,6 +385,25 @@ impl Host for RtHost {
             &self.cfg,
             drain_waits,
         );
+        // bd-b2b3: record the boundary HERE, AFTER the effect layer.
+        //
+        // This placement is load-bearing and easy to get wrong. `tick` is pure
+        // and returns at the fold boundary, but `handle_workspace_cmds` above
+        // MUTATES the model — so a snapshot taken when `tick` returned would
+        // record an incomplete model that cannot resume. The only correct point
+        // is after the effect layer has finished, because that is the state the
+        // NEXT tick will read.
+        //
+        // `enqueue`, not `record`: `Host::tick` is SYNCHRONOUS, so the store
+        // write cannot be awaited here. The boundary is serialized on this
+        // thread and handed to the bounded queue a writer task drains. A refusal
+        // is LOGGED, never swallowed: a silently skipped boundary would make a
+        // later replay look like it lost history for no reason.
+        if let Some(recorder) = self.state_log.as_ref()
+            && let Err(refusal) = recorder.enqueue(&self.model, &[])
+        {
+            eprintln!("flywheel: run-state boundary not recorded: {refusal}");
+        }
         cmds.into_iter()
             .filter_map(|c| match c {
                 workspace::Cmd::Prompt { pin, line } => Some(Effect::Prompt { pin, line }),

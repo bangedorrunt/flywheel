@@ -146,7 +146,10 @@ impl DoorbellQueue {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// bd-b2b3-serialize: `SelfIndex` is reachable from `WorkspaceModel`, which the
+/// run-state checkpoint log must serialize. Both maps are pin -> npub strings;
+/// npubs are public keys, so a local snapshot carries no secret.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SelfIndex {
     pins: BTreeMap<String, String>,
     npubs: BTreeMap<String, String>,
@@ -620,7 +623,11 @@ pub enum DoorbellAction {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// bd-b2b3-serialize: reachable from `WorkspaceModel`; see the run-state
+/// checkpoint log in toron-core. Serialization is a CAPABILITY here, not a
+/// behaviour change: every field is a plain map/set of primitives, so a
+/// round trip is exact. The reducer stays pure and untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoorbellModel {
     /// LWW queues per pin (working panes hold their wake here).
     pub queues: BTreeMap<String, Vec<String>>,
@@ -644,7 +651,7 @@ pub struct DoorbellModel {
 
 /// Per-pin 5/30/3 budget (D1 item 2, D4.5 home).
 /// Rolling token bucket: 3 prompts per 30-min window, refilled continuously.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinBudget {
     pub budget_minutes: u32,
     pub max_prompts: u32,

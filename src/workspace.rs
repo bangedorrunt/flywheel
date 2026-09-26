@@ -30,6 +30,11 @@ pub struct Receipt {
 /// never authority), "legacy" (pre-D3 snapshot), "endpoint" (death).
 /// Unknown is never promoted, never absorbs a wake, never prompts.
 /// Native herdr idle is never trusted.
+// bd-b2b3-serialize: NOT `#[derive(Deserialize)]` here, deliberately. The
+// hand-written impl below accepts BOTH the pre-D3 flat unit string and the
+// current map form, landing unknown words as `Unknown` (never authority). A
+// derive would compile-conflict with it, and replacing it would drop
+// snapshot-format compatibility that a live dispatcher depends on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub enum Presence {
     #[default]
@@ -250,7 +255,17 @@ pub fn render_divergence(rows: &[Divergence]) -> String {
 /// dispatcher seeds swarm resume. Two-process + one-RAM +
 /// seed-from-receipts is a slice toward one Model. The end-state is one RAM owner.
 /// `seq` is a per-process diagnostic counter, not shared truth.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// bd-b2b3-serialize: the run-state checkpoint log stores this model, so it
+/// must round trip. Every field is a map, set, integer, or string of owned data,
+/// so a round trip is EXACT — the log can reconstruct the model byte-for-byte
+/// rather than approximately.
+///
+/// This derive is a CAPABILITY, not a behaviour change. `tick` stays pure and
+/// keeps no I/O: the snapshot is written by the INTERPRETER (RtHost), after
+/// the effect layer has finished mutating the model, because
+/// `handle_workspace_cmds` mutates it after the fold returns. Snapshotting at
+/// the fold boundary would record an incomplete model that cannot resume.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkspaceModel {
     /// Host-resolved policy carried as model data so tick remains pure.
     pub policy: crate::workspace_policy::WorkspacePolicy,
