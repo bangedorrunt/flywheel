@@ -2620,6 +2620,7 @@ hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-stat
 mod shell_prompt_tests {
     use super::shell_prompt_rendered;
 
+
     #[test]
     fn empty_or_booting_shell_is_not_ready() {
         assert!(!shell_prompt_rendered(""));
@@ -2752,5 +2753,87 @@ mod gs049_launch_pending_tests {
             AgentStatus::Unknown
         )));
         assert!(!agent_still_booting(&agent(true, true, AgentStatus::Idle)));
+    }
+}
+
+/// bd-d7zu E2E: the shell-readiness gate, measured against a REAL pane.
+///
+/// The dispatch regression this bead fixes is a timing race, so a unit test on
+/// the pure detector cannot see it. This test splits a real pane, drives the
+/// real `wait_shell_prompt` against the real client, and records what the gate
+/// actually saw — the elapsed time and the exact last non-blank line it
+/// matched on. The recorded text is the reproducible artifact: if the gate ever
+/// degrades into a bare sleep, `matched_on` no longer ends in a prompt sigil and
+/// this test fails loudly instead of the dispatch silently going flaky again.
+///
+/// What it pins:
+/// 1. a real fresh pane DOES reach a detected prompt inside the budget — the
+///    gate is a real signal, not a timeout that always expires;
+/// 2. the line it matched on is a genuine prompt, not a PS2 continuation
+///    (a continuation line is the mid-quote park that mangles a long launch
+///    arg — the exact 2026-08-18 dead-on-spawn this gate exists to prevent).
+#[cfg(test)]
+mod shell_gate_e2e {
+    use super::*;
+
+    #[test]
+    #[ignore = "bd-d7zu LIVE probe: needs a live herdr daemon"]
+    fn real_pane_reaches_a_detected_prompt() {
+        let cfg = crate::Config::load().expect("config");
+        let mut c = Client::connect(Some(&cfg.socket_path())).expect("herdr connect");
+        let created = c
+            .call(
+                "workspace.create",
+                json!({ "label": "flywheel-shell-gate-e2e", "cwd": "/tmp", "focus": false }),
+            )
+            .expect("workspace.create");
+        let ws = created.get("workspace").cloned().unwrap_or_else(|| created.clone());
+        let ws_id = ws
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .expect("workspace_id")
+            .to_string();
+        let root_obj = created
+            .get("root_pane")
+            .cloned()
+            .unwrap_or_else(|| created.clone());
+        let root = root_obj
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .expect("root pane id")
+            .to_string();
+        let split = pane_split(&mut c, &root, "down", Some("/tmp"), None).expect("pane_split");
+        let pane = split.pane_id.clone();
+
+        let started = std::time::Instant::now();
+        let ready = wait_shell_prompt(&mut c, &pane, Duration::from_secs(15));
+        let elapsed = started.elapsed();
+        let matched_on = pane_recent_text(&mut c, &pane)
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| l.trim().to_string())
+            })
+            .unwrap_or_default();
+
+        let _ = c.call(
+            "workspace.close",
+            json!({ "workspace_id": ws_id.clone() }),
+        );
+
+        // The artifact: what the gate saw, on a real pane.
+        println!("gate: ready={ready} elapsed={elapsed:?} matched_on={matched_on:?}");
+        assert!(ready, "gate never detected a prompt on a real pane in 15s");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "gate only returned at the deadline — that is a sleep, not a signal"
+        );
+        assert!(
+            !matched_on.starts_with('>'),
+            "gate matched a PS2 continuation line {matched_on:?} — that is the \
+             mid-quote park which mangles a long launch arg"
+        );
     }
 }

@@ -27,6 +27,7 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -622,6 +623,28 @@ fn spawn_crew_into(
                         split.pane_id
                     }
                 };
+                // bd-d7zu: WAIT FOR THE SHELL BEFORE TYPING THE LAUNCH ARG.
+                // herdr types AGENT_ARG into the pane PTY the moment
+                // `agent.start` is called, and a fresh pane's shell is still
+                // booting (zsh running .zshrc, prompt not yet rendered, PTY in
+                // CANONICAL mode). The peer-aware template renders to a ~2.6KB
+                // single-quoted arg; typed into a booting shell it splits
+                // mid-quote and zsh parks at the PS2 continuation prompt with
+                // the agent never starting — herdr_shim.rs documents this as
+                // the 2026-08-18 "coder2/coder3 dead-on-spawn" incident.
+                //
+                // `cmd_crew_control` (the relaunch path) has always gated on
+                // `wait_shell_prompt`; this crew path did not, which is why
+                // `flywheel crew control relaunch` survives and
+                // `workflow compose --run` dead-on-spawns.
+                let shell_ready =
+                    crate::herdr_shim::wait_shell_prompt(c, &pane_id, Duration::from_secs(15));
+                if !shell_ready {
+                    eprintln!(
+                        "pane crew: shell for {name} ({pane_id}) did not render a prompt within \
+                         15s — the launch command may be mangled by the booting shell"
+                    );
+                }
                 // AGENT_ARG must honor Profile.provider via the same
                 // registry pin as cmd_spawn / spawn_launch_plan. Raw
                 // profile.model drops the provider half (ADR-0027 compose gap).
