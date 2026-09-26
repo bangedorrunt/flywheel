@@ -26422,20 +26422,102 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             }
             Ok(())
         }
-        WorkflowCmd::Seed { json } => {
-            let report = workflow_catalog::seed_user_catalog(&config::config_dir())?;
-            if *json {
-                print_json(&serde_json::to_value(report)?);
-            } else {
-                println!(
-                    "seeded user catalog: {} workflow(s), {} stage(s) created; {} workflow(s), {} stage(s) kept",
-                    report.created_workflows.len(),
-                    report.created_stages.len(),
-                    report.kept_workflows.len(),
-                    report.kept_stages.len()
-                );
-                println!("next: `flywheel workflow drift` reports stale or missing copies");
+        WorkflowCmd::Seed {
+            json,
+            overwrite,
+            dry_run,
+            yes,
+        } => {
+            use crate::workflow_catalog::OverwriteScope;
+            let scope = OverwriteScope::parse(overwrite)?;
+            let root = config::config_dir();
+            // Plan first, confirm against the PLAN, then execute. Confirming
+            // after acting would make --yes a lie.
+            let plan = workflow_catalog::seed_user_catalog_with(&root, scope, true)?;
+            let targets: Vec<String> = plan
+                .planned_overwrites
+                .iter()
+                .cloned()
+                .collect();
+            // A dry run is the REVIEW step; asking it to confirm defeats it.
+            if !*dry_run {
+                crate::output::confirm_destructive("overwrite", &targets, *yes, *json)?;
             }
+            let report = workflow_catalog::seed_user_catalog_with(&root, scope, *dry_run)?;
+            if *json {
+                print_json(&serde_json::to_value(&report)?);
+                return Ok(());
+            }
+            let verb = if *dry_run { "would seed" } else { "seeded" };
+            println!(
+                "{} {} {} user catalog  {}",
+                output::ok("\u{2705}"),
+                verb,
+                output::accent(&root.display().to_string()),
+                output::dim(&format!("(overwrite: {})", scope.as_str()))
+            );
+            let line = |n: usize, what: &str, paint: &dyn Fn(&str) -> String| {
+                println!("   {} {}", paint(&n.to_string()), output::dim(what));
+            };
+            if !report.created_workflows.is_empty() || !report.created_stages.is_empty() {
+                line(report.created_workflows.len(), "workflow(s) created", &|s| output::ok(s));
+                line(report.created_stages.len(), "stage(s) created", &|s| output::ok(s));
+            }
+            if !report.overwritten_workflows.is_empty() || !report.overwritten_stages.is_empty() {
+                line(
+                    report.overwritten_workflows.len(),
+                    "workflow(s) RESTORED from the builtin (old bytes kept as .bak)",
+                    &|s| output::warn(s),
+                );
+                line(
+                    report.overwritten_stages.len(),
+                    "stage(s) restored from the builtin (old bytes kept as .bak)",
+                    &|s| output::warn(s),
+                );
+            }
+            if !report.kept_workflows.is_empty() || !report.kept_stages.is_empty() {
+                line(
+                    report.kept_workflows.len() + report.kept_stages.len(),
+                    "existing file(s) left untouched (raise --overwrite to replace)",
+                    &|s| output::dim(s),
+                );
+            }
+            if *dry_run {
+                if !report.planned_overwrites.is_empty() {
+                    println!(
+                        "\n{} {}",
+                        output::warn("\u{26a0}\u{fe0f}"),
+                        output::warn(&format!(
+                            "would REPLACE {} builtin-named file(s):",
+                            report.planned_overwrites.len()
+                        ))
+                    );
+                    for name in report.planned_overwrites.iter().take(12) {
+                        println!("   {}", output::dim(name));
+                    }
+                    if report.planned_overwrites.len() > 12 {
+                        println!(
+                            "   {}",
+                            output::dim(&format!(
+                                "... and {} more (use --json for the full list)",
+                                report.planned_overwrites.len() - 12
+                            ))
+                        );
+                    }
+                    println!(
+                        "   {}",
+                        output::dim("each replaced file keeps its old bytes at <name>.bak")
+                    );
+                }
+                println!(
+                    "{}",
+                    output::dim("nothing was written. Re-run without --dry-run to apply.")
+                );
+            }
+            println!(
+                "{}",
+                output::dim("next: flywheel workflow drift  \u{2192}  flywheel workflow show <name>")
+            );
             Ok(())
         }
         WorkflowCmd::Drift { json } => {
@@ -26443,18 +26525,76 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             if *json {
                 print_json(&json!({ "entries": rows }));
             } else {
-                for row in &rows {
+                // Group by what the operator has to DO, not by catalog kind.
+                // A flat kind-sorted list buries 40 damaged workflows under 28
+                // healthy stages.
+                for want in ["stale", "missing", "custom"] {
+                    let group: Vec<_> = rows.iter().filter(|r| r.status == want).collect();
+                    if group.is_empty() {
+                        continue;
+                    }
                     println!(
-                        "{:<8} {:<32} {:<8} source={}",
-                        row.kind, row.name, row.status, row.source
+                        "\n{} {}",
+                        output::catalog_badge(want),
+                        output::dim(&format!("{} {}", group.len(), want))
                     );
+                    for row in group {
+                        println!(
+                            "   {:<8} {:<34} {}",
+                            output::dim(&row.kind),
+                            row.name,
+                            output::dim(&format!("from {}", row.source))
+                        );
+                    }
+                }
+                let clean: Vec<_> = rows.iter().filter(|r| r.status == "current").collect();
+                if !clean.is_empty() {
+                    println!(
+                        "\n{} {}",
+                        output::catalog_badge("current"),
+                        output::dim(&format!("{} match the builtin", clean.len()))
+                    );
+                    for row in &clean {
+                        println!(
+                            "   {:<8} {:<34} {}",
+                            output::dim(&row.kind),
+                            row.name,
+                            output::dim(&format!("from {}", row.source))
+                        );
+                    }
                 }
                 let stale = rows.iter().filter(|row| row.status == "stale").count();
                 let missing = rows.iter().filter(|row| row.status == "missing").count();
+                let custom = rows.iter().filter(|row| row.status == "custom").count();
+                println!();
                 if stale == 0 && missing == 0 {
-                    println!("catalog drift clean");
+                    println!(
+                        "{} {}",
+                        output::ok("\u{2705}"),
+                        output::ok("user catalog matches the binary")
+                    );
                 } else {
-                    println!("catalog drift: {stale} stale, {missing} missing");
+                    println!(
+                        "{} {}",
+                        output::warn(&format!("\u{26a0}\u{fe0f}")),
+                        output::warn(&format!(
+                            "{stale} stale, {missing} missing, {custom} custom"
+                        ))
+                    );
+                    if stale > 0 {
+                        println!(
+                            "   {}",
+                            output::accent(&format!(
+                                "fix: flywheel workflow seed --dry-run --overwrite stale"
+                            ))
+                        );
+                    }
+                    if missing > 0 {
+                        println!(
+                            "   {}",
+                            output::accent("fix: flywheel workflow seed")
+                        );
+                    }
                 }
             }
             Ok(())

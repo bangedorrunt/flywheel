@@ -201,6 +201,48 @@ pub fn print_json(v: &serde_json::Value) {
 }
 
 #[cfg(test)]
+mod bd_confirm_tests {
+    use super::confirm_destructive;
+
+    fn targets() -> Vec<String> {
+        vec!["a.yaml".into(), "b.yaml".into()]
+    }
+
+    /// Nothing to destroy must never block. An agent running `seed` on a
+    /// healthy catalog should not be asked to type a word.
+    #[test]
+    fn no_targets_never_prompts() {
+        confirm_destructive("overwrite", &[], false, false).expect("empty is allowed");
+    }
+
+    #[test]
+    fn yes_accepts_without_prompting() {
+        confirm_destructive("overwrite", &targets(), true, false).expect("--yes");
+    }
+
+    /// A prompt nobody can answer is not consent. Off a TTY this must REFUSE,
+    /// not silently proceed — that is the difference between a gate and a
+    /// suggestion.
+    #[test]
+    fn no_tty_without_yes_refuses() {
+        let err = confirm_destructive("overwrite", &targets(), false, false)
+            .expect_err("must refuse with no TTY");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no TTY"), "the reason must be legible: {msg}");
+        assert!(msg.contains("--yes"), "the refusal must name the fix: {msg}");
+    }
+
+    /// `--json` is the agent path. An agent gets a machine-readable refusal it
+    /// can branch on, never an interactive hang.
+    #[test]
+    fn json_mode_refuses_with_a_machine_readable_error() {
+        let err = confirm_destructive("overwrite", &targets(), false, true)
+            .expect_err("json must refuse without --yes");
+        assert!(format!("{err:#}").contains("--yes"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -217,4 +259,81 @@ mod tests {
         assert!(painted.contains("drift"));
         assert!(painted.contains("\x1b[33m") || !color_enabled());
     }
+}
+
+/// Emoji + color badge for a catalog state. Agent-native: the glyph survives
+/// `NO_COLOR` and a pipe, so `grep '⚠'` still finds the rows that need work.
+///
+/// The emoji is load-bearing, not decoration. bd-3o5t's drift printed
+/// "catalog drift clean" over 40 damaged files; a row that needs a human now
+/// looks different at a glance AND greps differently from a row that does not.
+pub fn catalog_badge(status: &str) -> String {
+    let (glyph, text) = match status {
+        "current" => ("✅", "current"),
+        "stale" => ("⚠️", "stale"),
+        "missing" => ("❌", "missing"),
+        "custom" => ("🧩", "custom"),
+        other => ("•", other),
+    };
+    match status {
+        "current" => ok(&format!("{glyph} {text}")),
+        "stale" => warn(&format!("{glyph} {text}")),
+        "missing" | "custom" => accent_lav(&format!("{glyph} {text}")),
+        _ => dim(&format!("{glyph} {text}")),
+    }
+}
+
+/// Fail-closed confirmation for an action that rewrites the operator's config.
+///
+/// bd-3o5t follow-on. Two rules, both learned the hard way:
+/// 1. **Off a TTY it refuses** unless `--yes`. A prompt nobody can answer must
+///    not read as consent; an unattended agent must pass `--yes` deliberately.
+/// 2. **It names the blast radius** — every file, listed — because "overwrite
+///    40 files?" is a question nobody can answer and "overwrite these 40?" is.
+pub fn confirm_destructive(what: &str, targets: &[String], yes: bool, json: bool) -> anyhow::Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    if !yes {
+        if json {
+            anyhow::bail!(
+                "refusing to {what} {} file(s) without --yes: {}",
+                targets.len(),
+                targets.join(", ")
+            );
+        }
+        if !std::io::stdin().is_terminal() {
+            // Forty filenames inline is a wall of text that hides the one fact
+            // that matters (it refused, and here is the fix). Print a few, point
+            // at --dry-run for the rest.
+            anyhow::bail!(
+                "refusing to {what} {} file(s): no TTY to confirm on. \
+                 Re-run with --yes to accept, or --dry-run to see the full list. \
+                 First few: {}",
+                targets.len(),
+                targets.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        eprintln!(
+            "{}",
+            warn(&format!(
+                "\n{} {} {} file(s) in your config directory:",
+                "⚠️",
+                what,
+                targets.len()
+            ))
+        );
+        for t in targets {
+            eprintln!("   {}", dim(t));
+        }
+        eprint!("{}", accent(&format!("\nType {} to proceed: ", what)));
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if answer.trim() != what {
+            anyhow::bail!("aborted: confirmation did not match {what:?}");
+        }
+    }
+    Ok(())
 }

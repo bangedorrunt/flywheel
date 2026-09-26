@@ -235,6 +235,24 @@ pub(crate) enum WorkflowCmd {
         /// JSON output for agent drivers
         #[arg(long)]
         json: bool,
+        /// How much of the user tier may be REPLACED.
+        ///
+        ///   none   fill gaps only; touch nothing that exists (DEFAULT)
+        ///   stale  repair builtin-named copies that `workflow drift` calls stale
+        ///   all    restore every builtin-named copy, stale or not
+        ///
+        /// A name the binary does not ship is never overwritten at any scope, so
+        /// an authored workflow is always safe. Every replaced file keeps its
+        /// old bytes at `<name>.bak`.
+        #[arg(long, value_name = "SCOPE", value_parser = ["none", "stale", "all"], default_value = "none")]
+        overwrite: String,
+        /// Report the plan and change nothing. Use before --overwrite.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accept a destructive overwrite without prompting. REQUIRED when there
+        /// is no TTY: a prompt nobody can answer is not consent.
+        #[arg(long)]
+        yes: bool,
     },
     /// Report user-tier workflow/stage copies that are missing, stale, or custom
     Drift {
