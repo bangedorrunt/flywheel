@@ -1322,18 +1322,11 @@ fn cron_status(mc: &MergedCron) -> CronStatus {
 
 /// Last terminal status + in-flight flag for a workflow from the state log.
 pub fn last_run_state(name: &str) -> (Option<String>, bool) {
-    let dir = crate::config::state_dir();
     let mut last_status: Option<String> = None;
     let mut in_flight = false;
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return (None, false);
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name().to_string_lossy().to_string();
-        if !fname.ends_with(".jsonl") {
-            continue;
-        }
-        let project = fname.trim_end_matches(".jsonl").to_string();
+    // One shared sweep (bd-2jyp): reserved bookkeeping logs (miss-ledger) use
+    // a different row schema and must never be parsed as projects.
+    for project in crate::state::project_logs() {
         let Ok(events) = crate::state::read_log(&project) else {
             continue;
         };
@@ -1357,17 +1350,8 @@ pub fn last_run_state(name: &str) -> (Option<String>, bool) {
 
 /// Run history for a workflow from the state log (+ failure beads).
 pub fn cron_history(name: &str) -> Vec<CronRun> {
-    let dir = crate::config::state_dir();
     let mut rows: Vec<CronRun> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return rows;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name().to_string_lossy().to_string();
-        if !fname.ends_with(".jsonl") {
-            continue;
-        }
-        let project = fname.trim_end_matches(".jsonl").to_string();
+    for project in crate::state::project_logs() {
         let Ok(events) = crate::state::read_log(&project) else {
             continue;
         };

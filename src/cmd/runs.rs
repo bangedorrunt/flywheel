@@ -7,33 +7,6 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::output::print_json;
 
-/// Reserved bookkeeping logs that live in the state dir but are NOT project
-/// run logs. Their row schema differs (e.g. `miss-ledger` rows are
-/// reclassify records: `ts`/`effect_key`/`goal`, with no `kind`/`project`/
-/// `data`). `runs list` sweeps `*.jsonl` by filename, so an unfiltered sweep
-/// parses these as projects and drops their rows as malformed (bd-… kind-less
-/// drop). Excluded by name so they never masquerade as a project.
-const RESERVED_NON_PROJECT_LOGS: &[&str] = &["miss-ledger"];
-
-/// Project names derived from state-dir `*.jsonl` filenames, minus the
-/// reserved bookkeeping logs. Pure: takes the raw filenames, returns the
-/// sorted, filtered project names. Test seam for the sweep.
-fn project_log_names(filenames: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut out: Vec<String> = filenames
-        .into_iter()
-        .filter_map(|name| {
-            let stem = name.strip_suffix(".jsonl")?;
-            if RESERVED_NON_PROJECT_LOGS.contains(&stem) {
-                return None;
-            }
-            Some(stem.to_string())
-        })
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// Runs view (ADR-0005 P6.3): the captain's daily dashboard over workflow /
 /// pipeline / loop runs recorded in the project log.
 #[derive(Subcommand)]
@@ -77,16 +50,9 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
     use crate::state::{EventKind, LogEntry};
 
     /// All projects with a log under the state dir (reserved bookkeeping logs
-    /// excluded — see [`project_log_names`]).
+    /// excluded — see [`crate::state::project_log_names`]).
     fn projects_with_logs() -> Vec<String> {
-        let dir = crate::config::state_dir();
-        let names: Vec<String> = std::fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        project_log_names(names)
+        crate::state::project_logs()
     }
 
     /// All run-kind log entries across projects, newest first.
@@ -387,40 +353,3 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod runs_sweep_tests {
-    use super::project_log_names;
-
-    /// The sweep must drop reserved bookkeeping logs (their rows are a
-    /// different schema and would be silently discarded as malformed) while
-    /// keeping every real project, sorted and deduped.
-    #[test]
-    fn reserved_bookkeeping_logs_are_excluded_from_the_project_sweep() {
-        let names = vec![
-            "flywheel.jsonl".to_string(),
-            "miss-ledger.jsonl".to_string(),
-            "bd-cvv9-test.jsonl".to_string(),
-            "notalog.txt".to_string(),    // no .jsonl suffix
-            "flywheel.jsonl".to_string(), // duplicate
-        ];
-        let got = project_log_names(names);
-        assert_eq!(
-            got,
-            vec!["bd-cvv9-test".to_string(), "flywheel".to_string()]
-        );
-        assert!(
-            !got.iter().any(|p| p == "miss-ledger"),
-            "miss-ledger must never be treated as a project"
-        );
-        assert!(
-            !got.iter().any(|p| p == "notalog"),
-            "non-jsonl files are not projects"
-        );
-    }
-
-    /// An empty sweep is empty — no phantom projects.
-    #[test]
-    fn empty_sweep_yields_no_projects() {
-        assert!(project_log_names(Vec::new()).is_empty());
-    }
-}

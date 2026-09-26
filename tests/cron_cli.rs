@@ -541,6 +541,35 @@ fn show_accepts_vixie_sunday_zero() {
     assert_eq!(v["status"], "due");
 }
 
+/// bd-2jyp: reserved bookkeeping logs (`miss-ledger`) hold a different row
+/// schema (reclassify records: no `kind`/`project`/`data`). The cron sweeps
+/// must skip them by name instead of parsing them as projects and spamming
+/// malformed-log-line warnings over a healthy state dir.
+#[test]
+fn reserved_bookkeeping_log_produces_no_malformed_warnings() {
+    let h = hermetic();
+    write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
+    let state = h.state_home.join("flywheel");
+    fs::create_dir_all(&state).expect("state dir");
+    fs::write(
+        state.join("miss-ledger.jsonl"),
+        "{\"ts\":\"2026-09-21T04:45:40Z\",\"effect_key\":\"reclassify:abc\",\"goal\":\"g\",\"table_primitive\":\"none\",\"table_topology\":\"none\",\"escalated\":false}\n",
+    )
+    .expect("miss-ledger fixture");
+
+    for args in [
+        vec!["cron", "list", "--project", "/nonexistent-proj"],
+        vec!["cron", "history", "alpha", "--json", "--project", "/nonexistent-proj"],
+    ] {
+        let out = run(&h, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("malformed log line"),
+            "{args:?} must not warn about a healthy reserved log: {stderr}"
+        );
+    }
+}
+
 /// Missing cron dirs are EMPTY tiers, never an error.
 #[test]
 fn empty_tiers_list_empty() {
