@@ -321,6 +321,11 @@ fn rewrite_action(action: &Action, aliases: &BTreeMap<String, String>) -> Action
             over: over.clone(),
             each: Box::new(rewrite_step(each, aliases)),
         },
+        Action::Loop { max, until, body } => Action::Loop {
+            max: max.clone(),
+            until: until.clone(),
+            body: rewrite_steps(body, aliases),
+        },
         other => other.clone(),
     }
 }
@@ -401,6 +406,11 @@ pub fn resolve_crew_fanouts(workflow: &Workflow, plan: &CrewPlan) -> Workflow {
                 over: over.clone(),
                 each: Box::new(resolve_step(each, plan)),
             },
+            Action::Loop { max, until, body } => Action::Loop {
+                max: max.clone(),
+                until: until.clone(),
+                body: resolve_steps(body, plan),
+            },
             other => other.clone(),
         }
     }
@@ -435,7 +445,7 @@ pub fn plan_crew(workflow: &Workflow) -> CrewPlan {
 /// — affinity-resolved + the §4 lifecycle phase, W3), or a workflow part
 /// (`workflow:name` — a `call_workflow` sub-run). Parsed from
 /// `flywheel workflow compose --parts`.
-pub const COMPOSE_PART_FORMS: &str = "bare <stage>, stage:<stage>, role:<role>:<stage>, <role>:<stage>, phase:<phase>:<stage>, <phase>:<stage>, workflow:<name>, each:<param>:<part>, parallel:<param>:<part>, when:<guard>:<part>, retry(n):<part>";
+pub const COMPOSE_PART_FORMS: &str = "bare <stage>, stage:<stage>, role:<role>:<stage>, <role>:<stage>, phase:<phase>:<stage>, <phase>:<stage>, workflow:<name>, kind:<harness>:<stage>, kind:<harness>:<role>:<stage>, each:<param>:<part>, parallel:<param>:<part>, when:<guard>:<part>, retry(n):<part>";
 
 fn compose_part_error(token: &str, detail: impl std::fmt::Display) -> String {
     format!("compose part {token:?}: {detail}; supported forms: {COMPOSE_PART_FORMS}")
@@ -463,6 +473,13 @@ pub enum ComposePart {
     /// `parallel:<over>:<part>` → elastic fan-out across N copies or a
     /// crew role (`@crew.<role>`). ADR-0022 §3.6 T1.
     Parallel { over: String, inner: Box<Self> },
+    /// `kind:<harness>:<stage>` uses the stage's role and pins the harness.
+    /// `kind:<harness>:<role>:<stage>` names the role. Headless honors the pin.
+    KindStage {
+        harness: String,
+        role: Option<String>,
+        stage: String,
+    },
     /// ADR-0006 D3 + ADR-0008 §6.7: a compose token (`wave-swarm`,
     /// `repair-until-verified`, `beads-lifecycle`) → its compiled-in
     /// multi-phase steps, expanded where the token sits.
@@ -540,6 +557,29 @@ pub fn parse_compose_part(token: &str) -> Result<ComposePart, String> {
             Ok(ComposePart::CallWorkflow {
                 name: name.to_string(),
             })
+        }
+        "kind" => {
+            let parts: Vec<&str> = value
+                .split(':')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            match parts.as_slice() {
+                [harness, stage] => Ok(ComposePart::KindStage {
+                    harness: (*harness).to_string(),
+                    role: None,
+                    stage: (*stage).to_string(),
+                }),
+                [harness, role, stage] => Ok(ComposePart::KindStage {
+                    harness: (*harness).to_string(),
+                    role: Some((*role).to_string()),
+                    stage: (*stage).to_string(),
+                }),
+                _ => Err(compose_part_error(
+                    token,
+                    "kind form is `kind:<harness>:<stage>` or `kind:<harness>:<role>:<stage>`",
+                )),
+            }
         }
         // §3.6 T1 structured forms: `each:` / `parallel:` take <over> +
         // inner part; `when:` takes a guard + inner part. Strict — missing
@@ -881,9 +921,40 @@ fn build_part_step(
                 format!("part-{ordinal}"),
                 Action::CallWorkflow {
                     workflow: sub.clone(),
-                    inputs: serde_json::json!({ "goal": objective }),
+                    // `goal` is the compose objective. The engine also copies
+                    // the parent run's inputs under this object, so a child
+                    // that needs `verify` or `symptom` receives them.
+                    inputs: serde_json::json!({ "goal": objective, "objective": objective }),
                 },
             ),
+            ComposePart::KindStage {
+                harness,
+                role,
+                stage,
+            } => {
+                let role = match role {
+                    Some(role) => role.clone(),
+                    None => affinity(stage).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "stage {stage:?} declares no role affinity — use kind:{harness}:<role>:{stage}"
+                        )
+                    })?,
+                };
+                base(
+                    format!("{}-{ordinal}", slugify(&format!("{role}-{stage}"))),
+                    Action::DispatchJob {
+                        assignee: "x".to_string(),
+                        spec: toron_workflow::schema::DispatchSpec {
+                            profile: Some(format!("@{role}")),
+                            stage: Some(stage.clone()),
+                            harness: Some(harness.clone()),
+                            task: Some(objective.to_string()),
+                            ..Default::default()
+                        },
+                        channel: None,
+                    },
+                )
+            }
             // A control form directly inside another control form wraps a
             // synthetic dispatch-less leaf — unreachable via the parser
             // (inner is always re-parsed to a concrete part), so treat it as
@@ -894,7 +965,9 @@ fn build_part_step(
     let wrapper = |action: Action| Step {
         name: Some(format!("part-{ordinal}")),
         guard: None,
-        on_error: StepOnError::Continue,
+        // A failed when/each/retry/parallel is a failed run. Continue here
+        // stored `{ok:false}` and the linear runner treated that as success.
+        on_error: StepOnError::FailRun,
         build_slot: false,
         action,
     };
@@ -928,7 +1001,8 @@ fn build_part_step(
         leaf_part @ (ComposePart::Dispatch { .. }
         | ComposePart::StageFirst { .. }
         | ComposePart::PhaseStage { .. }
-        | ComposePart::CallWorkflow { .. }) => leaf(leaf_part, ordinal, objective, affinity),
+        | ComposePart::CallWorkflow { .. }
+        | ComposePart::KindStage { .. }) => leaf(leaf_part, ordinal, objective, affinity),
     }
 }
 
@@ -954,6 +1028,11 @@ pub fn enforce_budget_caps(workflow: &Workflow) -> Result<()> {
                 then, else_steps, ..
             } => {
                 for s in then.iter().chain(else_steps.iter()) {
+                    walk(&s.action, depth + 1, dispatches, max_depth);
+                }
+            }
+            Action::Loop { body, .. } => {
+                for s in body {
                     walk(&s.action, depth + 1, dispatches, max_depth);
                 }
             }
@@ -1166,6 +1245,17 @@ pub fn render_dry_run(
                 collect(
                     &else_path,
                     else_steps,
+                    scope_fanout,
+                    plan,
+                    resolver,
+                    depth,
+                    out,
+                );
+            }
+            Action::Loop { body, .. } => {
+                collect(
+                    &format!("{path}/body"),
+                    body,
                     scope_fanout,
                     plan,
                     resolver,
@@ -1402,6 +1492,11 @@ fn infer_auto(
                 }
             }
             Action::Foreach { each, .. } => scan_action(&each.action, counts, resolve, visited),
+            Action::Loop { body, .. } => {
+                for s in body {
+                    scan_action(&s.action, counts, resolve, visited);
+                }
+            }
             _ => {}
         }
     }

@@ -29580,12 +29580,15 @@ pub(crate) fn headless_dispatch(
         .arg("--workflow")
         .arg(wf_name)
         .arg("--json");
-    // bd-42fs step 5: the per-step harness override (spec.harness) rides to
-    // the leaf — this step runs on that harness, not the profile default.
-    if let Some(h) = headless::dispatch_spec_harness(spec)
-        && !h.trim().is_empty()
-    {
-        cmd.arg("--harness").arg(h);
+    // The step pin wins. Otherwise the in-memory profile harness, which is
+    // where `--role-harness` was applied. The subprocess reloads disk and
+    // would ignore that overlay unless we pass `--harness`.
+    let harness = headless::effective_step_harness(
+        headless::dispatch_spec_harness(spec),
+        &profile.harness,
+    );
+    if !harness.is_empty() {
+        cmd.arg("--harness").arg(harness);
     }
     // ADR-0022 W2: the spec's lifecycle phase rides to the leaf, which
     // applies the per-harness phase registry (or degrades loudly).
@@ -35723,13 +35726,7 @@ graph:
 
 #[cfg(test)]
 mod repair_recipe_tests {
-
-    fn has_node(wf: &toron_workflow::schema::Workflow, name: &str) -> bool {
-        wf.graph
-            .as_ref()
-            .map(|g| g.nodes.contains_key(name))
-            .unwrap_or(false)
-    }
+    use toron_workflow::schema::Action;
 
     #[test]
     fn repair_recipe_is_registered_and_has_graph_nodes() {
@@ -35738,16 +35735,13 @@ mod repair_recipe_tests {
         ));
         let wf = crate::builtin_workflows::builtin_recipe("repair-until-verified")
             .expect("recipe exists");
-        assert!(has_node(&wf, "repair-1"));
-        assert!(has_node(&wf, "evaluate-1"));
-        assert!(has_node(&wf, "verify-1"));
-        let has_ledger = wf
-            .graph
-            .as_ref()
-            .unwrap()
-            .nodes
-            .values()
-            .any(|n| format!("{:?}", n.action).contains("ledger"));
+        let Action::Loop { body, .. } = &wf.steps[0].action else {
+            panic!("repair is a loop");
+        };
+        assert!(body.iter().any(|s| s.name.as_deref() == Some("repair")));
+        assert!(body.iter().any(|s| s.name.as_deref() == Some("evaluate")));
+        assert!(body.iter().any(|s| s.name.as_deref() == Some("verify")));
+        let has_ledger = format!("{:?}", wf.steps).contains("ledger");
         assert!(has_ledger || wf.inputs.iter().any(|i| i.name == "ledger_path"));
     }
 
@@ -35755,9 +35749,16 @@ mod repair_recipe_tests {
     fn repair_recipe_evaluator_stage_is_fresh_and_structured() {
         use toron_workflow::schema::{Action, ContextMode};
         let wf = crate::builtin_workflows::builtin_recipe("repair-until-verified").expect("recipe");
-        let graph = wf.graph.as_ref().expect("repair graph");
-        for name in ["evaluate-1", "evaluate-2", "evaluate-3"] {
-            let Action::DispatchJob { spec, .. } = &graph.nodes[name].action else {
+        let Action::Loop { body, .. } = &wf.steps[0].action else {
+            panic!("repair is a loop");
+        };
+        let evaluate = body
+            .iter()
+            .find(|s| s.name.as_deref() == Some("evaluate"))
+            .expect("evaluate");
+        {
+            let name = "evaluate";
+            let Action::DispatchJob { spec, .. } = &evaluate.action else {
                 panic!("{name} is a dispatch");
             };
             assert_eq!(spec.stage.as_deref(), Some("ce-evaluate"), "{name} stage");
@@ -35786,13 +35787,7 @@ mod repair_recipe_tests {
         let wf = crate::builtin_workflows::builtin_recipe("repair-until-verified").expect("recipe");
         let has_ledger_input = wf.inputs.iter().any(|i| i.name == "ledger_path");
         assert!(has_ledger_input, "ledger_path input must exist");
-        let has_ledger_in_task = wf
-            .graph
-            .as_ref()
-            .unwrap()
-            .nodes
-            .values()
-            .any(|n| format!("{:?}", n.action).contains("ledger_path"));
+        let has_ledger_in_task = format!("{:?}", wf.steps).contains("ledger_path");
         assert!(has_ledger_in_task);
     }
 }

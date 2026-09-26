@@ -348,6 +348,20 @@ pub fn dispatch_spec_harness(spec: &DispatchSpec) -> Option<&str> {
     spec.harness.as_deref()
 }
 
+/// The harness this step actually runs on. A non-empty `spec.harness` wins.
+/// Otherwise the catalog profile's harness, which is where `--role-harness`
+/// lands. The headless subprocess reloads profiles from disk, so the parent
+/// must pass this value as `--harness` or the overlay is dropped.
+pub fn effective_step_harness<'a>(
+    spec_harness: Option<&'a str>,
+    profile_harness: &'a str,
+) -> &'a str {
+    match spec_harness.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => h,
+        None => profile_harness,
+    }
+}
+
 /// The lifecycle phase in a dispatch spec (`spec.phase`, e.g. `plan` —
 /// ADR-0022 W2). Drives the phase registry ([`phase_launch_args`]) on both
 /// the headless and pane launch paths.
@@ -1116,6 +1130,14 @@ mod tests {
     fn strip_profile_ref_removes_at() {
         assert_eq!(strip_profile_ref("@planner"), "planner");
         assert_eq!(strip_profile_ref("planner"), "planner");
+    }
+
+    #[test]
+    fn effective_step_harness_prefers_spec_then_profile() {
+        assert_eq!(effective_step_harness(Some("opencode"), "pi"), "opencode");
+        assert_eq!(effective_step_harness(Some("  "), "pi"), "pi");
+        assert_eq!(effective_step_harness(None, "grok"), "grok");
+        assert_eq!(effective_step_harness(Some(""), "omp"), "omp");
     }
 
     /// bd-m7ac: `spec.task` (the inline mission) resolves from the dispatch
