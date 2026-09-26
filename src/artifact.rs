@@ -679,6 +679,10 @@ pub fn compute_sha256(path: &Path) -> anyhow::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
 /// bd-ww75: a per-test data root. The stitch tests used to resolve
 /// `dirs::data_local_dir()` at call time while other tests in this binary mutate
 /// XDG_DATA_HOME, so the read could land under a different root than the fixture
@@ -689,9 +693,7 @@ fn xdg_root() -> tempfile::TempDir {
     tempfile::TempDir::new().expect("xdg temp dir")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+
     use std::io::Write;
 
     /// Removes the temp project's data dir on drop: a panicking assertion
