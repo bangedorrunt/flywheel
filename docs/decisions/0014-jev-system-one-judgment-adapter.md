@@ -124,7 +124,7 @@ JudgmentAdapter.ask(state_slice, pack_id) -> Answers
 Caller code: weights, thresholds, Cmd construction — NEVER the model.
 ```
 
-**Pack contract (I5, normative):** packs are versioned YAML pure data in-repo at `.flywheel/judgment-packs/<id>.vN.yaml` (schema: pack id, version, model pin, questions with typed Choice/Score/Noul definitions). Model pin is `jev-1.13.0` — never `jev-latest` — until pack re-validation CI exists, so static packs cannot drift silently under a moving alias.
+**Pack contract (I5, normative):** packs are versioned YAML. The runtime source of truth is `$XDG_CONFIG_HOME/flywheel/judgment-packs` (`~/.config/flywheel/judgment-packs`). A project `.flywheel/judgment-packs` directory only supplies an id the XDG directory does not have. Schema: pack id, version, model, questions with typed Choice/Score/Noul definitions. Operator order 2026-09-26: packs send `jev-latest`. Live docs say that alias is the current stable release and today it resolves to `jev-1.13.0`. The response `model` field is the version that answered. The earlier "never the alias" line is superseded by that order. A moving alias can change answers without a code change.
 
 **State-slice builder (I5, normative):** the slice is built in code with a byte cap (8 KiB default) and a PII denylist (credentials, tokens, private keys, full mail bodies); truncation is head-cut with a `truncated=true` marker. This is the code-side filter the jev-1.13 jaggedness row mandates.
 
@@ -187,7 +187,7 @@ Caller code: weights, thresholds, Cmd construction — NEVER the model.
 2. Offline / deny policy — **locked (I4, revised bd-0glq P7 default-on):** key-absent = unconfigured loud-skip; key-present failure = hard-fail escalate on honesty path; loud table-decide fallback announce-only with `fallback_flag=true`.
 3. Confidence thresholds per action class — **locked provisional (I1):** 0.85 / 0.80 / 0.60 with re-validation duty; captain-tunable.
 4. Data egress — **locked (I5/I6):** code-side filter with byte cap + PII denylist before any POST; mikasa-only until Serve MCP.
-5. Model pin — **locked (I5):** pin `jev-1.13.0`; never `jev-latest` until pack re-validation CI exists.
+5. Model pin — **operator order 2026-09-26:** send `jev-latest`. It currently resolves to `jev-1.13.0`. Journal the response model id.
 6. Pack ownership — **locked (I5):** packs in-repo at `.flywheel/judgment-packs/<id>.vN.yaml` (pure data); shared vs chie split deferred to Shipwright's chie ADR.
 7. Honesty schema — **locked (I2):** new `JudgmentEffect` kind as child of `ReclassifyIntent` effect key (not an extension of the intent row).
 8. Interaction with GS-053 — **locked (I6):** builder-only until Serve MCP; any eren consumer Jev only after.
