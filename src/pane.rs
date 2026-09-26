@@ -842,6 +842,59 @@ fn spawn_crew_into(
     })
 }
 
+/// bd-5llv: the verdict's `ok` at the top level of a dispatch receipt.
+///
+/// Extracted so the contract is testable without a pane. The breaker decides
+/// success with `out["ok"] == Some(true)`; while `ok` was set only on the
+/// failure path, every SUCCESS read as a failure and the breaker opened after
+/// five dispatches no matter what happened.
+pub fn dispatch_receipt_ok(verdict: &Value) -> Value {
+    verdict.get("ok").cloned().unwrap_or(json!(false))
+}
+
+/// bd-5llv: how long a dispatch waits for its target agent to go IDLE before
+/// giving up. An agent turn is measured in MINUTES, so this is deliberately far
+/// larger than the ~5s transient retry delay: that delay exists for a BOOTING
+/// agent, which is ready in well under a second, and is hopeless for a BUSY one.
+/// Bounded so a wedged agent still fails instead of hanging.
+pub const AGENT_IDLE_WAIT_MS: u64 = 600_000;
+
+/// bd-5llv: must this dispatch WAIT for the target agent to go idle first?
+///
+/// The distinction the retry loop cannot make for itself:
+///
+/// - `Idle`, `Done`, or absent — the agent finished, or never existed. Send
+///   now. A booting agent rejecting a prompt is the SHORT transient that
+///   [`is_transient_dispatch_reason`] already handles correctly.
+/// - `Working` / `Blocked` — the agent is mid-turn on an EARLIER prompt of this
+///   same workflow. Retrying over ~5s cannot outlast a turn, so the retry
+///   budget is guaranteed to be exhausted, landing on the post-MAX_ATTEMPTS
+///   branch, which records a BREAKER FAILURE. Five of those open the breaker
+///   and every later step fast-escalates. That is why wave-swarm's 7 stages
+///   spread over 3 agents (2-3 prompts each) failed every time, while a
+///   one-prompt-per-agent compose landed reliably.
+///
+/// Pure, so the policy is testable without a pane; the caller supplies the
+/// status it read.
+pub fn dispatch_needs_idle_gate(status: Option<AgentStatus>) -> bool {
+    matches!(status, Some(AgentStatus::Working) | Some(AgentStatus::Blocked))
+}
+
+/// bd-5llv: the refusal when a busy agent never goes idle. Names the real cause
+/// (a workflow out-pressing one agent) instead of letting the breaker message
+/// stand in for it, and deliberately does NOT record a breaker failure: the
+/// breaker exists to stop hammering an UNAVAILABLE PANE, and this is a
+/// workflow-shape problem, not a dead pane.
+fn busy_agent_refusal(profile_name: &str, agent: &str, waited_ms: u64) -> anyhow::Error {
+    anyhow!(
+        "dispatch @{profile_name} ({agent}) was still busy after {}s — refusing to send a second \
+         prompt into an agent that has not finished the first. A workflow that sends more prompts \
+         to one agent than it can absorb must wait for the agent to go idle; raise the budget, or \
+         give each concurrent stage its own agent.",
+        waited_ms / 1000
+    )
+}
+
 /// bd-wave-swarm-graduation-fix-98io: dispatch-reason transiency, named.
 /// `agent_not_ready` (agent still booting) AND `agent_pane_busy` (pane not
 /// yet an available shell — the graduation run's boot race) are both
@@ -1023,6 +1076,60 @@ pub fn pane_dispatch(
             );
         }
     }
+    // bd-5llv: gate on IDLE before sending. Without this, a second prompt to an
+    // agent that is still working on the first is classified transient
+    // (agent_not_ready), retried over ~5s, guaranteed to exhaust MAX_ATTEMPTS
+    // because an agent turn takes MINUTES, and then recorded as a BREAKER
+    // FAILURE. Five of those open the breaker and the rest of the run
+    // fast-escalates — which is exactly how wave-swarm (7 stages over 3
+    // agents) failed while a one-prompt-per-agent compose succeeded. Waiting
+    // for idle is the correct primitive; retrying harder was never going to
+    // win, and the refusal below is honest about why.
+    // The runner has no client of its own (it shells out to `__send`), so open
+    // one for the readiness read. If herdr is unreachable the gate cannot run;
+    // log it and dispatch anyway, because `__send` will then fail with the real
+    // backend error rather than a readiness error invented here.
+    match crate::Config::load() {
+        Ok(cfg) => match crate::herdr_shim::Client::connect(Some(&cfg.socket_path())) {
+            Ok(mut c) => {
+                let target_status = c.agent_list().ok().and_then(|agents| {
+                    agents
+                        .into_iter()
+                        .find(|a| a.name.as_deref() == Some(entry.name.as_str()))
+                        .map(|a| a.agent_status)
+                });
+                if dispatch_needs_idle_gate(target_status) {
+                    eprintln!(
+                        "flywheel: @{profile_name} ({}) is busy — waiting up to {}s for idle \
+                         before sending",
+                        entry.name,
+                        AGENT_IDLE_WAIT_MS / 1000
+                    );
+                    if c
+                        .agent_wait(
+                            &entry.name,
+                            &[AgentStatus::Idle],
+                            Some(AGENT_IDLE_WAIT_MS),
+                        )
+                        .is_err()
+                    {
+                        return Err(busy_agent_refusal(
+                            profile_name,
+                            &entry.name,
+                            AGENT_IDLE_WAIT_MS,
+                        ));
+                    }
+                }
+            }
+            Err(e) => eprintln!(
+                "flywheel: pane dispatch readiness gate skipped for @{profile_name} \
+                 (herdr unreachable: {e:#}) — the send will surface the backend error"
+            ),
+        },
+        Err(e) => eprintln!(
+            "flywheel: pane dispatch readiness gate skipped for @{profile_name} (config: {e:#})"
+        ),
+    }
     let mut attempts = 0;
     // bd-mukq: 429 reroute state — the CURRENT send target (starts at the
     // resolved entry) plus the attempted profiles (starts at the step's
@@ -1095,9 +1202,22 @@ pub fn pane_dispatch(
                      warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
                 );
             }
+            // bd-5llv: carry the verdict's `ok` at the TOP level, always.
+            //
+            // It used to be set only on the failure path, which meant a
+            // SUCCESSFUL send produced a receipt with no top-level `ok` at
+            // all. The breaker branch below reads `out["ok"] == Some(true)`, so
+            // every success fell to the else and recorded a breaker FAILURE.
+            // The breaker therefore charged once per dispatch regardless of
+            // outcome and opened after 5 — so the dispatch COUNT predicted
+            // failure, not the result. That is why wave-swarm (6 dispatches)
+            // failed every single time while a 2-prompt compose always
+            // succeeded, and why the error blamed an "unavailable pane" when
+            // every prompt had in fact landed.
             let mut out = json!({
                 "profile": attempt_profile.clone(),
                 "agent": attempt_entry.name,
+                "ok": dispatch_receipt_ok(&v),
                 "send": v.clone(),
             });
             // ADR-0024 W1a: classify pane dispatch failures (rate_limit/timeout/auth)
@@ -3531,5 +3651,142 @@ mod bd_d7zu_shell_gate_tests {
             msg.contains("less loaded") || msg.contains("raise the budget"),
             "offers a remedy: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bd_5llv_idle_gate_tests {
+    use super::{busy_agent_refusal, dispatch_needs_idle_gate, AGENT_IDLE_WAIT_MS};
+    use crate::herdr_shim::AgentStatus;
+
+    /// The policy, one row per status. The two BUSY rows are the regression:
+    /// before the gate, a second prompt to a working agent was classified
+    /// transient, retried over ~5s, guaranteed to exhaust MAX_ATTEMPTS, and
+    /// recorded as a BREAKER FAILURE. Five of those opened the breaker and the
+    /// rest of the run fast-escalated. The rest of the rows pin that a normal
+    /// first dispatch is NOT gated, so the fix cannot slow the common path.
+    #[test]
+    fn only_a_busy_agent_is_gated() {
+        let rows = [
+            ("working", Some(AgentStatus::Working), true),
+            ("blocked", Some(AgentStatus::Blocked), true),
+            ("idle", Some(AgentStatus::Idle), false),
+            ("done", Some(AgentStatus::Done), false),
+            ("unknown", Some(AgentStatus::Unknown), false),
+            // Absent: never registered, or herdr could not list. A booting
+            // agent's `agent_not_ready` is the SHORT transient the retry loop
+            // already handles, so gating here would only add latency.
+            ("not-registered", None, false),
+        ];
+        for (name, status, want) in rows {
+            assert_eq!(
+                dispatch_needs_idle_gate(status),
+                want,
+                "row {name}: busy agents must wait for idle, everything else sends now"
+            );
+        }
+    }
+
+    /// The wait must outlast an agent turn by a wide margin. The old budget was
+    /// ~5s of retries; a turn is MINUTES. Pin the ORDERING, not an exact
+    /// number, so a future tweak cannot quietly shrink it back under a turn.
+    #[test]
+    fn the_idle_budget_is_far_larger_than_the_transient_retry_delay() {
+        let transient_retry_budget_ms: u64 = 30_000; // MAX_ATTEMPTS x ~5s
+        assert!(
+            AGENT_IDLE_WAIT_MS >= 10 * transient_retry_budget_ms,
+            "idle wait {AGENT_IDLE_WAIT_MS}ms must dwarf the {transient_retry_budget_ms}ms \
+             transient budget, or it reintroduces the same guaranteed exhaustion"
+        );
+        assert!(
+            AGENT_IDLE_WAIT_MS < 3_600_000,
+            "but must stay bounded so a wedged agent fails instead of hanging"
+        );
+    }
+
+    /// bd-5llv, the operator-facing half: the refusal must name the agent and
+    /// the actual cause. The bug's most expensive symptom was a bare
+    /// "breaker Open" message that sent the operator hunting for a dead pane
+    /// when the pane was fine and the WORKFLOW was wrong.
+    #[test]
+    fn the_refusal_names_the_agent_and_the_workflow_cause() {
+        let msg = busy_agent_refusal("rust-coder", "crew-x-rust-cod", AGENT_IDLE_WAIT_MS)
+            .to_string();
+        assert!(msg.contains("crew-x-rust-cod"), "names the agent: {msg}");
+        assert!(msg.contains("@rust-coder"), "names the role: {msg}");
+        assert!(
+            msg.contains("still busy") || msg.contains("has not finished"),
+            "states the real cause: {msg}"
+        );
+        assert!(
+            !msg.contains("breaker"),
+            "must not masquerade as the breaker symptom that hid this: {msg}"
+        );
+        assert!(
+            msg.contains("600s") || msg.contains("600"),
+            "states the budget it waited: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bd_5llv_receipt_tests {
+    use super::dispatch_receipt_ok;
+    use serde_json::json;
+
+    /// THE regression. A landed send must report `ok: true` at the top level,
+    /// because that is the exact field the breaker reads to decide whether the
+    /// dispatch succeeded. Before this, `ok` was written only on the failure
+    /// path, so every landed send read as a FAILURE and charged the breaker —
+    /// five successes opened it and the sixth dispatch fast-escalated with
+    /// "breaker Open" while every prompt had actually landed.
+    #[test]
+    fn a_landed_send_reports_ok_true() {
+        let verdict = json!({
+            "ok": true, "landed": true, "name": "crew-x-coder",
+            "status": "working", "reason": "landed",
+        });
+        assert_eq!(
+            dispatch_receipt_ok(&verdict),
+            json!(true),
+            "a landed send MUST surface ok:true — the breaker reads this field"
+        );
+    }
+
+    /// One row per real verdict `confirm_send_json` can emit. Every one of them
+    /// carries a top-level `ok`, so none may read as absent. The `stalled` and
+    /// `timeout` rows are the subtle ones: they are NOT landed, but the send
+    /// itself did not error, so the verdict still carries ok:true and the
+    /// breaker must record a success — a stall is not a dead pane.
+    #[test]
+    fn every_send_verdict_carries_a_usable_ok() {
+        for (name, verdict, want) in [
+            ("landed", json!({"ok": true, "landed": true, "reason": "landed"}), true),
+            ("stalled", json!({"ok": true, "landed": false, "reason": "stalled"}), true),
+            ("timeout", json!({"ok": true, "landed": null, "reason": "timeout"}), true),
+            ("coded", json!({"ok": true, "landed": false, "reason": "error:auth"}), true),
+            ("explicit-false", json!({"ok": false, "error": "boom"}), false),
+        ] {
+            assert_eq!(
+                dispatch_receipt_ok(&verdict),
+                json!(want),
+                "row {name}: the breaker reads this field, so it must never be ambiguous"
+            );
+        }
+    }
+
+    /// A verdict with no `ok` at all is a contract violation upstream, and
+    /// defaulting it to `false` charges the breaker rather than hiding it.
+    /// Fail toward "not a success" so an unexpected shape is visible as a
+    /// breaker failure instead of a silent pass.
+    #[test]
+    fn a_verdict_without_ok_reads_as_failure_not_success() {
+        for verdict in [json!({}), json!({"reason": "landed"}), json!(null)] {
+            assert_eq!(
+                dispatch_receipt_ok(&verdict),
+                json!(false),
+                "an unrecognised verdict must not be read as a success"
+            );
+        }
     }
 }
