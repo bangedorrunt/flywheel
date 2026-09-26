@@ -30,6 +30,13 @@ pub(crate) enum StageCmd {
         name: String,
     },
     /// Lint every tier: shape, size cap, role affinity, phase, principles
+    /// Delete a USER-tier stage file, so the compiled-in stage shows through
+    /// again. The mirror of `stage promote`: promote copies a project stage
+    /// up, remove drops that copy so the builtin takes back over.
+    Remove {
+        /// stage name
+        name: String,
+    },
     Lint,
     /// Promote a stage up the §3.8 permanence ladder (project → user → repo)
     Promote {
@@ -131,6 +138,37 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
             println!("scaffolded [stages.{name}] in {}", project_stages.display());
             println!(
                 "next: fill the prompt body + role/phase/principles, then `flywheel stage lint`"
+            );
+            Ok(())
+        }
+        StageCmd::Remove { name } => {
+            let path = crate::config::config_dir()
+                .join("stages")
+                .join(format!("{name}.toml"));
+            if !path.is_file() {
+                bail!(
+                    "no user-tier stage file for {name:?} at {}. Nothing to remove — the \
+                     compiled-in stage already resolves.",
+                    path.display()
+                );
+            }
+            // Back up first. This deletes a file the operator may have edited,
+            // and the compiled-in stage showing through afterwards is not
+            // obviously the state they wanted.
+            let bak = path.with_extension("toml.bak");
+            std::fs::copy(&path, &bak)
+                .map_err(|e| anyhow::anyhow!("backup {}: {e}", bak.display()))?;
+            std::fs::remove_file(&path)
+                .map_err(|e| anyhow::anyhow!("remove {}: {e}", path.display()))?;
+            println!(
+                "{} {} {}",
+                crate::output::ok("\u{1f5d1}\u{fe0f}"),
+                crate::output::accent(&format!("removed stage {name}")),
+                crate::output::dim(&format!("(backup: {})", bak.display()))
+            );
+            println!(
+                "{}",
+                crate::output::dim("the compiled-in stage resolves again — flywheel stage list shows the tier")
             );
             Ok(())
         }
