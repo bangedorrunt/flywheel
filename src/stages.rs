@@ -542,8 +542,18 @@ pub fn upsert_stage_entry(path: &std::path::Path, stage: &Stage) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let out = toml::to_string(stage).context("serialize per-entry stage")?;
-    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))
+    std::fs::write(path, render_stage_entry(stage)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// The one and only way a per-entry stage file is rendered.
+///
+/// bd-3o5t follow-on: `workflow seed --overwrite` rewrites these files in
+/// place, so the create path and the overwrite path must not be able to produce
+/// different bytes for the same stage — otherwise a fresh seed and a restored
+/// backup would disagree, and drift would call a correct file stale.
+pub fn render_stage_entry(stage: &Stage) -> Result<String> {
+    toml::to_string(stage).context("serialize per-entry stage")
 }
 
 /// Lint one stage against the §3.8 rules: shape, size cap, affinity validity
