@@ -166,7 +166,13 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 .get(profile)
                 .ok_or_else(|| anyhow!("unknown profile '{profile}' (flywheel profile list)"))?;
             let kind = old.harness.clone().unwrap_or_else(|| p.harness.clone());
-            let args = crate::profile_launch_args(&kind, p, None)?;
+            // bd-crlx: the PLAN form, not the argv-only view. A harness whose
+            // interactive entrypoint has no model flag (opencode's root
+            // command) delivers its pin through the pane env, and this relaunch
+            // creates a fresh pane — so it must resolve before the env map is
+            // built, exactly as the spawn and crew paths do.
+            let plan = crate::profile_launch_plan(&kind, p, None)?;
+            let args = plan.args.clone();
 
             // Journaled transaction: checkpoint → stop → launch → commit/rollback.
             crate::control::save_relaunch_journal(project, &old)?;
@@ -179,7 +185,11 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 .first()
                 .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?;
             let mail_identity = old.mail_identity.clone();
-            let pane_env = crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+            let mut pane_env =
+                crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+            if let Some(m) = &plan.env_model_pin {
+                crate::herdr_shim::apply_opencode_model_pin(&mut pane_env, m)?;
+            }
             let dir = crate::project_dir(cfg, project);
             let new_pane = crate::herdr_shim::pane_split(
                 &mut c,

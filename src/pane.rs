@@ -582,7 +582,6 @@ fn spawn_crew_into(
             // pane exists so the pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS
             // (herdr injects env only at split/create).
             let mail_identity = crate::pinned_mail_identity(cfg, project, &name, harness);
-            let pane_env = crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
             let (agent_pane_id, name, model_pin) = if let Some(e) = existing {
                 eprintln!(
                     "  crew {}: reusing {} ({}) @{}",
@@ -592,6 +591,34 @@ fn spawn_crew_into(
                 // recorded (ADR-0013 P1-7) — this path resolves no plan.
                 (e.pane_id.clone(), name.clone(), e.model_pin.clone())
             } else {
+                // bd-crlx: resolve the launch plan BEFORE the pane exists.
+                // herdr injects env only at split/create, and a pane's env is
+                // fixed for the life of the process it launches — so a model
+                // the harness cannot take as argv (opencode's root command has
+                // no `--model`) has to be pinned into the pane env at creation
+                // time. There is no "set it afterwards".
+                let (mut agent_args, model_pin, env_model_pin): (
+                    Vec<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = if profile.model.is_empty() && profile.provider.is_empty() {
+                    (vec![], None, None)
+                } else {
+                    let plan = crate::profile_launch_plan(harness, profile, None)
+                        .map_err(|e| anyhow!("pane crew @{role} model routing: {e}"))?;
+                    (plan.args, Some(plan.model), plan.env_model_pin)
+                };
+                agent_args.extend(headless::role_model_args(
+                    harness,
+                    &profile.smol,
+                    &profile.slow,
+                    &profile.plan,
+                ));
+                let mut pane_env =
+                    crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+                if let Some(m) = &env_model_pin {
+                    crate::herdr_shim::apply_opencode_model_pin(&mut pane_env, m)?;
+                }
                 let pane_id = match &prev {
                     None => {
                         // bd-lifecycle-occupied-pane-wedge-07tx: PROBE BEFORE
@@ -609,7 +636,19 @@ fn spawn_crew_into(
                             agents.iter().map(|a| a.pane_id.clone()).collect();
                         let pane_ids: Vec<String> =
                             panes.iter().map(|p| p.pane_id.clone()).collect();
-                        match select_empty_pane(&pane_ids, &occupied) {
+                        // bd-crlx: a seat whose model travels by env can never
+                        // reuse a pre-existing pane. Those panes were created by
+                        // `workspace_create` with a different env, and a
+                        // process's env is fixed at its start — reusing one
+                        // would launch the agent unpinned, which is exactly the
+                        // silent model downgrade this pin exists to prevent.
+                        // Always split a fresh pane so the pin is really there.
+                        let reusable = if env_model_pin.is_some() {
+                            None
+                        } else {
+                            select_empty_pane(&pane_ids, &occupied)
+                        };
+                        match reusable {
                             Some(pid) => pid,
                             None => {
                                 let root = pane_ids.first().cloned().ok_or_else(|| {
@@ -666,27 +705,12 @@ fn spawn_crew_into(
                 if !crate::herdr_shim::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
                     return Err(shell_gate_refusal(&name, &pane_id));
                 }
-                // AGENT_ARG must honor Profile.provider via the same
-                // registry pin as cmd_spawn / spawn_launch_plan. Raw
-                // profile.model drops the provider half (ADR-0027 compose gap).
-                // ADR-0013 P1-7: PLAN form (not the argv-only view) so the
-                // registry row below carries the same resolved Muse/slot pin
-                // the argv embeds. No model and no provider = no route to
-                // resolve → no pin (the bare-launch case).
-                let (mut agent_args, model_pin): (Vec<String>, Option<String>) =
-                    if profile.model.is_empty() && profile.provider.is_empty() {
-                        (vec![], None)
-                    } else {
-                        let (args, pin) = crate::profile_launch_plan(harness, profile, None)
-                            .map_err(|e| anyhow!("pane crew @{role} model routing: {e}"))?;
-                        (args, Some(pin))
-                    };
-                agent_args.extend(headless::role_model_args(
-                    harness,
-                    &profile.smol,
-                    &profile.slow,
-                    &profile.plan,
-                ));
+                // AGENT_ARG / the pane-env pin were resolved BEFORE the pane
+                // existed (bd-crlx): the plan form (not the argv-only view) so
+                // the registry row below carries the same resolved Muse/slot
+                // pin the launch actually carries, honoring Profile.provider
+                // through the same registry pin as cmd_spawn /
+                // spawn_launch_plan (ADR-0027 compose gap, ADR-0013 P1-7).
                 // ADR-0024 W1a: pane spawn one-shot registry-fallback for rate_limit (bd-42fs pattern)
                 let agent =
                     match crate::start_agent_with_retry(c, &name, harness, &pane_id, &agent_args) {
@@ -2330,7 +2354,15 @@ mod tests {
         let start = src
             .find("fn spawn_crew_into(")
             .expect("spawn_crew_into present");
-        let slice = &src[start..start.saturating_add(16000)];
+        // Scope the slice to the FUNCTION, not a fixed byte count. A magic
+        // window silently starts excluding the function's own tail as soon as
+        // the function grows (bd-crlx added the env-pin resolution ahead of the
+        // registry row and pushed the row out of a 16000-char window), which
+        // reads as "the row is missing" when it is merely further down.
+        let end = src[start..]
+            .find("\nfn ")
+            .map_or(start, |i| start + i);
+        let slice = &src[start..end];
         assert!(
             slice.contains("profile_launch_plan(harness, profile, None)"),
             "compose pre-spawn must honor Profile.provider via the launch PLAN"

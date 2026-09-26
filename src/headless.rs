@@ -1243,3 +1243,197 @@ mod tests {
         );
     }
 }
+
+/// How a pinned model reaches a harness's INTERACTIVE entrypoint — the one
+/// `herdr agent start --kind <harness>` launches, as opposed to the headless
+/// one-shot `build_argv_roles` uses.
+///
+/// bd-crlx: this distinction is load-bearing, not cosmetic. `opencode` v2 has
+/// two different entrypoints with DIFFERENT flags:
+///
+/// - `opencode run --model provider/model` — the headless one-shot. `--model`
+///   is a real flag (`opencode run --help`: `--model, -m string`).
+/// - `opencode` (the root/TUI command herdr actually launches) — flags are
+///   `--standalone --server --auto --continue/-c --session/-s --prompt`.
+///   There is **no `--model` and no `-m`**, and v2.0.16 rejects it outright:
+///   `Unrecognized flag: --model in command opencode`.
+///
+/// So reusing [`model_args`] on the pane path handed opencode a flag its own
+/// binary rejects. The process died on spawn, herdr's readiness wait reported
+/// `agent_not_running`, and the dispatch degraded into the permanent
+/// `agent <name> not found in toron` — every opencode pane seat, always.
+///
+/// The TUI's model is config, not argv: `opencode.json`'s `model` key, or
+/// in-session `/models` (https://opencode.ai/v2/docs/models/). opencode
+/// merges config sources rather than replacing them, so the pin travels as a
+/// per-pane `OPENCODE_CONFIG_CONTENT` document — see
+/// [`crate::herdr_shim::apply_opencode_model_pin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractiveModelPlan {
+    /// The harness takes the model as argv. `args` are appended to the launch.
+    Argv(Vec<String>),
+    /// The harness takes no model flag; the pin must travel by pane env.
+    PinnedByEnv { model: String },
+}
+
+impl InteractiveModelPlan {
+    /// The argv half, for callers that only splice flags.
+    pub fn args(&self) -> &[String] {
+        match self {
+            Self::Argv(a) => a,
+            Self::PinnedByEnv { .. } => &[],
+        }
+    }
+
+    /// The model to pin via pane env, when the harness needs one.
+    pub fn env_pin(&self) -> Option<&str> {
+        match self {
+            Self::Argv(_) => None,
+            Self::PinnedByEnv { model } => Some(model),
+        }
+    }
+}
+
+/// Resolve the interactive launch args for a pinned model.
+///
+/// Every harness except opencode takes `--model` (or its own spelling) on its
+/// interactive entrypoint, so they route to [`model_args`] unchanged. opencode
+/// takes no model flag at all, so it emits NO argv and the pin moves to env.
+pub fn interactive_model_plan(
+    harness: &str,
+    model: &str,
+    effort: Option<&str>,
+) -> InteractiveModelPlan {
+    if harness == "opencode" {
+        // Still warn about effort here, exactly as model_args does, so a
+        // profile asking for `effort = max` on opencode is told the pin is
+        // model-only rather than silently losing the request.
+        let effort = effort.filter(|e| !e.is_empty());
+        if let Some(e) = effort {
+            eprintln!(
+                "flywheel: effort {e:?} has no native flag on harness {harness:?} — degrading to model-only (profile default stands)"
+            );
+        }
+        return InteractiveModelPlan::PinnedByEnv {
+            model: model.to_string(),
+        };
+    }
+    InteractiveModelPlan::Argv(model_args(harness, model, effort))
+}
+
+#[cfg(test)]
+mod bd_crlx_interactive_model_tests {
+    use super::{interactive_model_plan, InteractiveModelPlan};
+
+    /// bd-crlx: the regression, pinned. `--model` on the opencode ROOT command
+    /// is rejected by opencode v2.0.16, so the interactive path must emit no
+    /// model argv for it and must carry the pin by env instead. If this ever
+    /// goes back to argv, every opencode pane seat dies on spawn again.
+    #[test]
+    fn opencode_interactive_emits_no_model_flag_and_pins_by_env() {
+        let plan = interactive_model_plan("opencode", "opencode-go/muse-spark-1.3-contributor", None);
+        assert_eq!(
+            plan,
+            InteractiveModelPlan::PinnedByEnv {
+                model: "opencode-go/muse-spark-1.3-contributor".into()
+            },
+            "opencode TUI has no --model; the pin must travel by pane env"
+        );
+        assert!(
+            plan.args().is_empty(),
+            "no argv may reach the opencode root command: {:?}",
+            plan.args()
+        );
+        assert!(!plan.args().iter().any(|a| a == "--model" || a == "-m"));
+    }
+
+    /// Every other harness must route to the EXISTING [`model_args`],
+    /// unchanged. That is the real invariant: the opencode carve-out must not
+    /// become a second arg builder that can drift from the headless one.
+    ///
+    /// `claude`/`codex` fall through `model_args`' `_ => vec![]` arm today, so
+    /// they pin nothing — pre-existing, recorded on bd-crlx rather than
+    /// silently changed here.
+    #[test]
+    fn other_harnesses_keep_argv_model_pins() {
+        for (harness, model) in [
+            ("pi", "opencode-go/muse-spark-1.3-contributor"),
+            ("grok", "grok-4"),
+            ("omp", "openai/gpt-5.2"),
+            ("jcode", "opencode-go/muse-spark-1.3-contributor"),
+            ("pa", "opencode-go/muse-spark-1.3-contributor"),
+            ("claude", "anthropic/opus-5"),
+            ("codex", "openai/gpt-5.2"),
+        ] {
+            let plan = interactive_model_plan(harness, model, None);
+            assert_eq!(
+                plan,
+                InteractiveModelPlan::Argv(super::model_args(harness, model, None)),
+                "row {harness} must be exactly model_args, not a second builder"
+            );
+            assert!(plan.env_pin().is_none(), "row {harness} must not need an env pin");
+        }
+    }
+
+    /// A harness that supports a model pin must still EMIT one. Equality with
+    /// `model_args` is proven above; this guards the other direction — that a
+    /// future edit cannot quietly empty the argv and lose the pin silently.
+    #[test]
+    fn argv_pinned_harnesses_still_emit_a_pin() {
+        for (harness, model) in [
+            ("pi", "opencode-go/muse-spark-1.3-contributor"),
+            ("grok", "grok-4"),
+            ("omp", "openai/gpt-5.2"),
+            ("jcode", "opencode-go/muse-spark-1.3-contributor"),
+            ("pa", "opencode-go/muse-spark-1.3-contributor"),
+        ] {
+            let plan = interactive_model_plan(harness, model, None);
+            assert_eq!(plan.args(), &super::model_args(harness, model, None)[..], "row {harness}");
+            assert!(!plan.args().is_empty(), "row {harness} lost its model pin entirely");
+        }
+    }
+
+    /// jcode is the one harness that SPLITS the composite key, so pin that
+    /// shape explicitly: `provider/model` becomes `-p provider -m bare`.
+    /// Checking it by substring would be wrong — the joined id never appears.
+    #[test]
+    fn jcode_interactive_splits_provider_and_model() {
+        let args = interactive_model_plan("jcode", "opencode-go/muse-spark-1.3-contributor", None);
+        assert_eq!(
+            args.args(),
+            &[
+                "-p".to_string(),
+                "opencode-go".to_string(),
+                "-m".to_string(),
+                "muse-spark-1.3-contributor".to_string()
+            ]
+        );
+    }
+
+    /// The pi effort spelling must survive the interactive path — the pi
+    /// `--thinking <level>` fix (bd-dcnx) is the other regression that lived
+    /// in this exact function, so pin it on the interactive route too.
+    #[test]
+    fn pi_interactive_keeps_the_space_form_effort_flag() {
+        let plan = interactive_model_plan("pi", "opencode-go/muse-spark-1.3-contributor", Some("high"));
+        let args = plan.args();
+        let i = args.iter().position(|a| a == "--thinking").expect("--thinking present");
+        assert_eq!(
+            args.get(i + 1).map(String::as_str),
+            Some("high"),
+            "effort must be its own argv entry, not --thinking=high: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("--thinking=")),
+            "equals form is rejected by pi 0.87.1: {args:?}"
+        );
+    }
+
+    /// An opencode profile asking for effort still gets told, on the
+    /// interactive route. Silence here would be a silent downgrade.
+    #[test]
+    fn opencode_interactive_still_reports_effort_degradation() {
+        let plan = interactive_model_plan("opencode", "opencode-go/muse-spark-1.3-contributor", Some("max"));
+        assert_eq!(plan.env_pin(), Some("opencode-go/muse-spark-1.3-contributor"));
+    }
+}
