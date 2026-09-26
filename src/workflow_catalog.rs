@@ -60,24 +60,81 @@ pub struct CatalogEntryStatus {
 /// Seed copies compiled-in defaults into the user tier without replacing an
 /// authored copy. Re-running is therefore safe and makes the user's override
 /// surface explicit.
-pub fn seed_user_catalog(config_root: &Path) -> Result<CatalogSeedReport> {
-    let mut report = CatalogSeedReport::default();
+/// Replace a builtin copy, keeping the old bytes recoverable.
+///
+/// bd-3o5t follow-on: this command can rewrite every file in the operator's
+/// real config dir, so a confirmation prompt over an irreversible action is not
+/// a confirmation, it is a formality. The previous content goes to `<name>.bak`
+/// FIRST, always, including on the overwrite path an operator did not ask for.
+fn overwrite_with_backup(path: &Path, contents: &str) -> Result<()> {
+    if let Ok(prev) = std::fs::read_to_string(path) {
+        let bak = path.with_extension(
+            path.extension()
+                .map(|e| format!("{}.bak", e.to_string_lossy()))
+                .unwrap_or_else(|| "bak".into()),
+        );
+        std::fs::write(&bak, prev).with_context(|| format!("backup {}", bak.display()))?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
+}
+
+/// Seed the user tier. `scope` decides what may be replaced; `dry_run` reports
+/// the plan without touching the disk.
+///
+/// "Stale" is read from [`catalog_drift`] rather than recomputed, deliberately:
+/// bd-3o5t was a bug where seed and drift each had their own comparison and
+/// agreed with each other while both were wrong. One source of truth, so
+/// `--overwrite stale` can only ever repair exactly what `workflow drift`
+/// reports.
+pub fn seed_user_catalog_with(
+    config_root: &Path,
+    scope: OverwriteScope,
+    dry_run: bool,
+) -> Result<CatalogSeedReport> {
+    let mut report = CatalogSeedReport {
+        dry_run,
+        overwrite_scope: scope,
+        ..Default::default()
+    };
+    let drift = catalog_drift(config_root)?;
+    let is_stale = |kind: &str, name: &str| {
+        drift
+            .iter()
+            .any(|r| r.kind == kind && r.name == name && r.status == "stale")
+    };
+    // `All` replaces a builtin-named copy whether or not drift calls it stale.
+    let may_replace = |kind: &str, name: &str| match scope {
+        OverwriteScope::None => false,
+        OverwriteScope::Stale => is_stale(kind, name),
+        OverwriteScope::All => true,
+    };
+
     let workflow_dir = config_root.join("workflows");
     for (name, yaml) in crate::builtin_workflows::builtin_workflows_yaml() {
         let path = workflow_dir.join(format!("{name}.yaml"));
-        if path.exists() {
-            report.kept_workflows.push(name.to_string());
-        } else {
-            // bd-3o5t: write the compiled-in SOURCE TEXT. Going through
-            // `serde_yaml::to_string(&Workflow)` is lossy — it emits
-            // `crew: null` for every workflow whose crew is `Some(..)`, so the
-            // seeded copy lost its crew, and the user tier wins over the
-            // builtin, so seeding silently made crew workflows headless.
-            std::fs::create_dir_all(&workflow_dir)
-                .with_context(|| format!("create {}", workflow_dir.display()))?;
-            std::fs::write(&path, yaml)
-                .with_context(|| format!("write {}", path.display()))?;
+        if !path.exists() {
+            if !dry_run {
+                std::fs::create_dir_all(&workflow_dir)
+                    .with_context(|| format!("create {}", workflow_dir.display()))?;
+                // bd-3o5t: write the compiled-in SOURCE TEXT. Going through
+                // `serde_yaml::to_string(&Workflow)` is lossy — `CrewSpec` is
+                // `#[serde(untagged)]` with a unit `Auto` variant, so serde
+                // emits `crew: null` and the copy lost its crew. The user tier
+                // wins over the builtin, so that silently made crew workflows
+                // headless.
+                std::fs::write(&path, yaml)
+                    .with_context(|| format!("write {}", path.display()))?;
+            }
             report.created_workflows.push(name.to_string());
+        } else if may_replace("workflow", name) {
+            if dry_run {
+                report.planned_overwrites.push(name.to_string());
+            } else {
+                overwrite_with_backup(&path, yaml)?;
+                report.overwritten_workflows.push(name.to_string());
+            }
+        } else {
+            report.kept_workflows.push(name.to_string());
         }
     }
 
@@ -98,20 +155,40 @@ pub fn seed_user_catalog(config_root: &Path) -> Result<CatalogSeedReport> {
             .expect("compiled stage list and stage map agree");
         let path = stage_dir.join(format!("{name}.toml"));
         if path.exists() {
-            report.kept_stages.push(name.to_string());
+            if may_replace("stage", name) {
+                let rendered = crate::stages::render_stage_entry(stage)?;
+                if dry_run {
+                    report.planned_overwrites.push(name.to_string());
+                } else {
+                    overwrite_with_backup(&path, &rendered)?;
+                    report.overwritten_stages.push(name.to_string());
+                }
+            } else {
+                report.kept_stages.push(name.to_string());
+            }
         } else if legacy.stages.get(name).is_some_and(|user| user == stage) {
-            crate::stages::upsert_stage_entry(&path, stage)?;
+            if !dry_run {
+                crate::stages::upsert_stage_entry(&path, stage)?;
+            }
             report.created_stages.push(name.to_string());
         } else if legacy.stages.contains_key(name) {
             // An authored aggregate entry remains authoritative; do not shadow
             // it with a generated per-entry copy.
             report.kept_stages.push(name.to_string());
         } else {
-            crate::stages::upsert_stage_entry(&path, stage)?;
+            if !dry_run {
+                crate::stages::upsert_stage_entry(&path, stage)?;
+            }
             report.created_stages.push(name.to_string());
         }
     }
     Ok(report)
+}
+
+/// Fill gaps only. Kept as the default entry point so existing callers are
+/// unchanged; `--overwrite` routes through [`seed_user_catalog_with`].
+pub fn seed_user_catalog(config_root: &Path) -> Result<CatalogSeedReport> {
+    seed_user_catalog_with(config_root, OverwriteScope::None, false)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -120,6 +197,56 @@ pub struct CatalogSeedReport {
     pub kept_workflows: Vec<String>,
     pub created_stages: Vec<String>,
     pub kept_stages: Vec<String>,
+    /// Builtin-named copies this run replaced, and the `.bak` written first.
+    pub overwritten_workflows: Vec<String>,
+    pub overwritten_stages: Vec<String>,
+    /// What a `--dry-run` WOULD have replaced. Populated even on a dry run,
+    /// because a plan you cannot see is not a plan.
+    pub planned_overwrites: Vec<String>,
+    pub dry_run: bool,
+    pub overwrite_scope: OverwriteScope,
+}
+
+/// How much `workflow seed` is allowed to replace in the user tier.
+///
+/// bd-3o5t follow-on. The default is [`None`] on purpose: seeding exists to
+/// FILL GAPS, and an agent may run it on any session start, so it must never be
+/// able to clobber local edits as a side effect. Replacing a file is a decision
+/// a human makes once, with a `--dry-run` first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum OverwriteScope {
+    /// Create what is missing; touch nothing that exists. The default.
+    #[default]
+    None,
+    /// Replace only builtin-named copies that drift reports as `stale` — the
+    /// exact repair for a user tier written by a lossy serializer.
+    Stale,
+    /// Replace every builtin-named copy, whether or not it is stale. Still never
+    /// touches a name the binary does not ship, so an authored workflow is safe
+    /// at any scope.
+    All,
+}
+
+impl OverwriteScope {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "none" => Ok(Self::None),
+            "stale" => Ok(Self::Stale),
+            "all" => Ok(Self::All),
+            other => anyhow::bail!(
+                "unknown --overwrite scope {other:?} (expected: none | stale | all). \
+                 `none` only fills gaps, `stale` repairs drifted builtin copies, \
+                 `all` restores every builtin-named copy"
+            ),
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Stale => "stale",
+            Self::All => "all",
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1307,5 +1434,115 @@ mod bd_3o5t_drift_truth {
         assert_eq!(row.status, "current", "a faithful copy must read as current");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod bd_sync_overwrite {
+    use super::*;
+
+    fn root(tag: &str) -> std::path::PathBuf {
+        let r = std::env::temp_dir().join(format!("sync-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&r);
+        std::fs::create_dir_all(r.join("workflows")).expect("mkdir");
+        r
+    }
+
+    const BUGFIX: &str = "name: bug-fix\ncrew: null\nsteps: []\n";
+
+    /// The default must change NOTHING that already exists. An agent that runs
+    /// `workflow seed` to "make sure I have the catalog" must not be able to
+    /// clobber local edits by accident.
+    #[test]
+    fn seed_by_default_never_overwrites() {
+        let r = root("default");
+        std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
+        let rep = seed_user_catalog_with(&r, OverwriteScope::None, false).expect("seed");
+        assert_eq!(
+            std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read"),
+            BUGFIX,
+            "seed with no --overwrite rewrote an existing file"
+        );
+        assert!(rep.overwritten_workflows.is_empty());
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// `--overwrite stale` replaces exactly the builtin-named copies that drift
+    /// disagrees with, and leaves everything else alone. This is the repair the
+    /// operator actually needs: 40 files lost their crew.
+    #[test]
+    fn overwrite_stale_repairs_a_stale_copy_and_leaves_others() {
+        let r = root("stale");
+        std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
+        // An authored file whose name is NOT a builtin: never touched, at any
+        // scope, because it is not a builtin copy.
+        std::fs::write(r.join("workflows/my-own.yaml"), "name: my-own\n").expect("write");
+
+        let rep = seed_user_catalog_with(&r, OverwriteScope::Stale, false).expect("seed");
+        let after = std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read");
+        assert_ne!(after, BUGFIX, "a stale builtin copy must be replaced");
+        assert!(after.contains("crew:"), "the replacement must be the real builtin");
+        assert_eq!(rep.overwritten_workflows, vec!["bug-fix".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(r.join("workflows/my-own.yaml")).expect("read"),
+            "name: my-own\n",
+            "a non-builtin file must never be overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// An overwrite must be RECOVERABLE. The operator is being asked to confirm
+    /// replacing 40 files in their real config dir; a copy with no way back is
+    /// not something to confirm, it is a hazard.
+    #[test]
+    fn an_overwritten_file_is_backed_up_first() {
+        let r = root("backup");
+        std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
+        seed_user_catalog_with(&r, OverwriteScope::Stale, false).expect("seed");
+        let bak = r.join("workflows/bug-fix.yaml.bak");
+        assert!(bak.exists(), "the previous content must be recoverable");
+        assert_eq!(std::fs::read_to_string(&bak).expect("read"), BUGFIX);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// `--dry-run` must be inert. It exists so an operator can SEE the blast
+    /// radius before confirming it.
+    #[test]
+    fn dry_run_changes_nothing_but_reports_the_plan() {
+        let r = root("dry");
+        std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
+        let rep = seed_user_catalog_with(&r, OverwriteScope::All, true).expect("seed");
+        assert_eq!(
+            std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read"),
+            BUGFIX,
+            "--dry-run wrote to disk"
+        );
+        assert!(
+            !r.join("workflows/bug-fix.yaml.bak").exists(),
+            "--dry-run left a backup behind"
+        );
+        assert_eq!(
+            rep.planned_overwrites,
+            vec!["bug-fix".to_string()],
+            "--dry-run must still name what it WOULD do, or it is useless for review"
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// Idempotence: a second identical seed is a no-op. An agent may run this
+    /// on every session start.
+    #[test]
+    fn seeding_twice_is_a_no_op() {
+        let r = root("idem");
+        seed_user_catalog_with(&r, OverwriteScope::None, false).expect("first");
+        let first = std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read");
+        let rep = seed_user_catalog_with(&r, OverwriteScope::None, false).expect("second");
+        assert_eq!(std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read"), first);
+        assert!(rep.created_workflows.is_empty(), "second seed created files");
+        assert!(
+            rep.overwritten_workflows.is_empty(),
+            "a second seed at scope `none` replaced files it had just written"
+        );
+        let _ = std::fs::remove_dir_all(&r);
     }
 }
