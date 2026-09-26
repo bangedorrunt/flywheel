@@ -108,6 +108,68 @@ pub fn apply_opencode_go_api_key_alias(env: &mut std::collections::BTreeMap<Stri
     }
 }
 
+/// bd-crlx: pin an opencode TUI agent's model for one pane.
+///
+/// opencode v2's ROOT command (the one `herdr agent start --kind opencode`
+/// launches) has no `--model` flag — the flag exists only on `opencode run`.
+/// The TUI's model is config, so the pin rides the pane env as
+/// `OPENCODE_CONFIG_CONTENT`.
+///
+/// Why this is safe: opencode MERGES config sources rather than replacing
+/// them. Measured on v2.0.16 via `opencode api --standalone GET /api/config`:
+/// with the var set, the resolved config gains a THIRD `document` source
+/// carrying `model`, while the global `opencode.json` keeps its
+/// `permissions`, `agents`, and `mcp` intact, and the pinned model wins
+/// (last document wins per key). So this never clobbers the operator's
+/// agents/mcp/permissions — the same pane-env channel
+/// [`apply_opencode_go_api_key_alias`] already uses for opencode-go auth.
+///
+/// Two refusals, both fail-closed:
+/// - a model that is not `provider/model` is rejected. opencode's own parser
+///   drops such a reference as an "unsupported legacy model reference", which
+///   would silently UNPIN the seat rather than error;
+/// - pre-existing `OPENCODE_CONFIG_CONTENT` is MERGED into, never replaced,
+///   and unparseable content is an error rather than an overwrite. An operator
+///   who set that var keeps their other settings.
+pub fn apply_opencode_model_pin(
+    env: &mut std::collections::BTreeMap<String, String>,
+    model: &str,
+) -> anyhow::Result<()> {
+    // opencode's model reference grammar: provider ends at the first `/`,
+    // model may contain `/`, neither may contain `#` in this position.
+    if crate::models::split_key(model).0.is_empty() {
+        anyhow::bail!(
+            "opencode model pin {model:?} is not in provider/model form — opencode drops \
+             such a reference instead of selecting it, which would leave the seat unpinned"
+        );
+    }
+    const KEY: &str = "OPENCODE_CONFIG_CONTENT";
+    let mut doc: serde_json::Map<String, serde_json::Value> = match env.get(KEY) {
+        Some(existing) if !existing.trim().is_empty() => {
+            let parsed: serde_json::Value = serde_json::from_str(existing).map_err(|e| {
+                anyhow::anyhow!(
+                    "pane env {KEY} is set but is not valid JSON ({e}) — refusing to overwrite \
+                     it to pin model {model:?}; fix or unset it for this shell"
+                )
+            })?;
+            match parsed {
+                serde_json::Value::Object(o) => o,
+                other => anyhow::bail!(
+                    "pane env {KEY} is set to a non-object JSON {other} — refusing to \
+                     overwrite it to pin model {model:?}"
+                ),
+            }
+        }
+        _ => serde_json::Map::new(),
+    };
+    doc.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+    env.insert(
+        KEY.to_string(),
+        serde_json::Value::Object(doc).to_string(),
+    );
+    Ok(())
+}
+
 /// GS-037 P1: herdr `integration.install` fails when parent config dirs are
 /// missing (pi/omp/opencode). Create the documented parent dirs before install
 /// so zero-touch spawn works on a cold box.
@@ -2835,5 +2897,128 @@ mod shell_gate_e2e {
             "gate matched a PS2 continuation line {matched_on:?} — that is the \
              mid-quote park which mangles a long launch arg"
         );
+    }
+}
+
+#[cfg(test)]
+mod bd_crlx_model_pin_tests {
+    use super::apply_opencode_model_pin;
+    use std::collections::BTreeMap;
+
+    fn env_with(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn pinned(kv: &[(&str, &str)], model: &str) -> BTreeMap<String, String> {
+        let mut env = env_with(kv);
+        apply_opencode_model_pin(&mut env, model).expect("pin must apply");
+        env
+    }
+
+    /// The pin IS the model, in the `provider/model` form opencode's parser
+    /// accepts. A bare id would be dropped by opencode, so the shape matters.
+    #[test]
+    fn pin_sets_the_model_in_provider_model_form() {
+        let env = pinned(&[], "opencode-go/muse-spark-1.3-contributor");
+        let doc: serde_json::Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").expect("var set")).unwrap();
+        assert_eq!(doc["model"], "opencode-go/muse-spark-1.3-contributor");
+    }
+
+    /// bd-crlx, the load-bearing one: the operator's other config must SURVIVE.
+    /// opencode merges sources, so the pin is a third document, not a
+    /// replacement — this row is what would catch a switch to a clobbering
+    /// channel (e.g. writing the operator's opencode.json).
+    #[test]
+    fn pin_preserves_existing_config_content_keys() {
+        let env = pinned(
+            &[(
+                "OPENCODE_CONFIG_CONTENT",
+                r#"{"permissions":[{"action":"shell","resource":"*","effect":"deny"}],"username":"alice"}"#,
+            )],
+            "opencode-go/muse-spark-1.3-contributor",
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(doc["model"], "opencode-go/muse-spark-1.3-contributor");
+        assert_eq!(doc["username"], "alice", "operator key preserved");
+        assert_eq!(
+            doc["permissions"][0]["effect"], "deny",
+            "operator permissions preserved"
+        );
+    }
+
+    /// A later pin replaces the earlier MODEL but keeps everything else — the
+    /// merge must be idempotent in the model key, not append a duplicate.
+    #[test]
+    fn a_second_pin_replaces_the_model_without_duplicating_it() {
+        let mut env = pinned(&[], "deepseek/deepseek-flash");
+        apply_opencode_model_pin(&mut env, "opencode-go/muse-spark-1.3-contributor").unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(doc["model"], "opencode-go/muse-spark-1.3-contributor");
+        assert_eq!(
+            doc.as_object().unwrap().len(),
+            1,
+            "exactly one model key: {doc}"
+        );
+    }
+
+    /// A bare model id has no provider half. opencode drops such a reference
+    /// as unsupported, which would leave the seat silently unpinned — so the
+    /// pin refuses instead (fail-closed).
+    #[test]
+    fn a_bare_model_id_is_refused_rather_than_silently_dropped() {
+        let mut env = BTreeMap::new();
+        let err = apply_opencode_model_pin(&mut env, "gpt-5.2").expect_err("must refuse");
+        assert!(
+            err.to_string().contains("provider/model"),
+            "names the required form: {err}"
+        );
+        assert!(
+            !env.contains_key("OPENCODE_CONFIG_CONTENT"),
+            "a refused pin must not write a half-configured document"
+        );
+    }
+
+    /// Unparseable pre-existing content is an ERROR, never an overwrite. The
+    /// operator's bytes are not ours to discard.
+    #[test]
+    fn unparseable_existing_content_is_refused_not_overwritten() {
+        let mut env = env_with(&[("OPENCODE_CONFIG_CONTENT", "{not json")]);
+        let err = apply_opencode_model_pin(&mut env, "deepseek/deepseek-flash")
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("OPENCODE_CONFIG_CONTENT"), "{err}");
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some("{not json"),
+            "the operator's bytes must be left exactly as they were"
+        );
+    }
+
+    /// A non-object document is also refused: merging a model key into an
+    /// array or a bare string would produce something opencode rejects.
+    #[test]
+    fn non_object_existing_content_is_refused() {
+        let mut env = env_with(&[("OPENCODE_CONFIG_CONTENT", "[1,2,3]")]);
+        assert!(apply_opencode_model_pin(&mut env, "deepseek/deepseek-flash").is_err());
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some("[1,2,3]")
+        );
+    }
+
+    /// Empty/whitespace existing content is treated as absent, not as a parse
+    /// failure — an exported-but-empty shell var must not wedge every pane.
+    #[test]
+    fn empty_existing_content_is_treated_as_absent() {
+        let mut env = env_with(&[("OPENCODE_CONFIG_CONTENT", "   ")]);
+        apply_opencode_model_pin(&mut env, "deepseek/deepseek-flash")
+            .expect("blank content must not wedge the pane");
+        let doc: serde_json::Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(doc["model"], "deepseek/deepseek-flash");
     }
 }

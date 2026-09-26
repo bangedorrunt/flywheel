@@ -3810,15 +3810,34 @@ fn resolve_role_flag(registry: &models::ModelRegistry, raw: &str, harness: &str)
     }
 }
 
-/// The resolved launch plan for one profile: the argv flags plus the Muse/slot
-/// pin the launch resolves (ADR-0013 P1-7). One resolution serves both, so the
-/// ledger records the same route the argv embeds (a mid-spawn reroute hop is
-/// audited by `record_reroute_audit`, not folded back into this plan).
+/// The resolved launch plan for one profile (ADR-0013 P1-7). One resolution
+/// serves argv, the ledger pin, AND the pane env, so the recorded route is the
+/// route the process actually gets (a mid-spawn reroute hop is audited by
+/// `record_reroute_audit`, not folded back into this plan).
+///
+/// bd-crlx: `env_model_pin` exists because `env_model_pin` being `Some` means
+/// the argv CANNOT carry the model. opencode v2's root command — the one herdr
+/// launches — has no `--model` flag (only `opencode run` does), so the TUI's
+/// model must be pinned through pane env instead. Making it a field on the plan
+/// rather than a silent omission means every pane-creating caller is forced by
+/// the type to decide what it does about it: apply the pin, or knowingly drop
+/// it. There is no third option where the seat silently loses its model.
+pub(crate) struct ProfileLaunchPlan {
+    /// argv to append to the harness launch command.
+    pub args: Vec<String>,
+    /// The resolved composite model id, recorded in the spawn registry.
+    pub model: String,
+    /// `Some(model)` when the harness's interactive entrypoint has no model
+    /// flag, so the pin must ALSO travel via pane env
+    /// (`herdr_shim::apply_opencode_model_pin`).
+    pub env_model_pin: Option<String>,
+}
+
 pub(crate) fn profile_launch_plan(
     harness: &str,
     p: &profile::Profile,
     phase: Option<&str>,
-) -> Result<(Vec<String>, String)> {
+) -> Result<ProfileLaunchPlan> {
     let registry = models::ModelRegistry::load_routing()?;
     // ADR-0007 D1 full ladder: rungs 3-5 (model_fallback / fallback_harness /
     // registry fallback) only detour when the primary route is caps-blocked.
@@ -3836,11 +3855,20 @@ pub(crate) fn profile_launch_plan(
         format!("{}/{}", p.provider, p.model)
     };
     let model = registry.resolve_strict(&lookup, &harness)?;
-    let mut args = headless::model_args(
+    // bd-crlx: the INTERACTIVE plan, not the headless `model_args`. Every
+    // caller of this function launches the agent through
+    // `herdr agent start --kind <harness>`, which runs the harness's
+    // interactive entrypoint. For most harnesses that is the same flag
+    // (`interactive_model_plan` routes them to `model_args` unchanged); for
+    // opencode it is NOT — the root command rejects `--model` outright, so the
+    // pin moves to `env_model_pin`.
+    let plan = headless::interactive_model_plan(
         &harness,
         &model,
         (!p.effort.is_empty()).then_some(p.effort.as_str()),
     );
+    let mut args = plan.args().to_vec();
+    let env_model_pin = plan.env_pin().map(str::to_string);
     args.extend(headless::role_model_args(
         &harness,
         &resolve_role_flag(&registry, &p.smol, &harness)?,
@@ -3856,17 +3884,34 @@ pub(crate) fn profile_launch_plan(
         }
         args.extend(extra);
     }
-    Ok((args, model))
+    Ok(ProfileLaunchPlan {
+        args,
+        model,
+        env_model_pin,
+    })
 }
 
-/// The argv-only view of [`profile_launch_plan`] — callers that do not journal
-/// the resolved pin.
+/// The argv-only view of [`profile_launch_plan`] — for callers that spawn no
+/// pane (and so cannot pin by env) and do not journal the resolved pin.
+///
+/// bd-crlx: if the returned plan carried an `env_model_pin`, this view would
+/// silently drop the model. Rather than let that happen quietly, refuse: a
+/// caller in that position has no way to honour the pin, and starting the seat
+/// on the wrong model is worse than not starting it.
 pub(crate) fn profile_launch_args(
     harness: &str,
     p: &profile::Profile,
     phase: Option<&str>,
 ) -> Result<Vec<String>> {
-    Ok(profile_launch_plan(harness, p, phase)?.0)
+    let plan = profile_launch_plan(harness, p, phase)?;
+    if let Some(m) = &plan.env_model_pin {
+        anyhow::bail!(
+            "harness {harness:?} takes no model flag on its interactive entrypoint, so the \
+             model {m:?} cannot be delivered as argv — resolve the plan and pin it via pane \
+             env (herdr_shim::apply_opencode_model_pin) instead of using the argv-only view"
+        );
+    }
+    Ok(plan.args)
 }
 
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
@@ -4124,8 +4169,20 @@ mod spawn_profile_plan_tests {
         // Compiled-in routing defaults apply zero-config (no models.toml).
         let p = profile("opencode", "deepseek-v4-flash");
         assert_eq!(
-            profile_launch_args("opencode", &p, None).expect("opencode"),
-            vec!["--model", "opencode-go/deepseek-v4-flash"]
+            // bd-crlx: opencode gets NO model argv. The root command herdr
+            // launches has no `--model` (only `opencode run` does) and v2.0.16
+            // rejects it outright. The pin travels by pane env instead.
+            profile_launch_plan("opencode", &p, None).expect("opencode").args,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            profile_launch_plan("opencode", &p, None).expect("opencode").env_model_pin.as_deref(),
+            Some("opencode-go/deepseek-v4-flash"),
+            "the pin must be delivered by pane env, not dropped"
+        );
+        assert!(
+            profile_launch_args("opencode", &p, None).is_err(),
+            "the argv-only view must refuse rather than silently drop the pin"
         );
         let pi = profile("pi", "glm-5.3");
         assert_eq!(
@@ -4163,7 +4220,8 @@ mod spawn_profile_plan_tests {
         // Compiled-in routing defaults apply zero-config (no models.toml).
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let slot = profile("pi", "@standard");
-        let (args, pin) = profile_launch_plan("pi", &slot, None).expect("standard slot plan");
+        let plan = profile_launch_plan("pi", &slot, None).expect("standard slot plan");
+        let (args, pin) = (&plan.args, &plan.model);
         assert!(
             !pin.starts_with('@'),
             "the pin is the resolved route, never the slot alias: {pin}"
@@ -4173,14 +4231,15 @@ mod spawn_profile_plan_tests {
             "the compiled-in `standard` slot resolves to its Muse pin"
         );
         assert!(
-            args.iter().any(|a| a.contains(&pin)),
+            args.iter().any(|a| a.contains(pin.as_str())),
             "the argv embeds the recorded pin: {args:?} vs {pin}"
         );
         // A concrete id takes the same one-resolution path.
-        let (args, pin) = profile_launch_plan("omp", &profile("omp", "glm-5.3"), None)
+        let plan = profile_launch_plan("omp", &profile("omp", "glm-5.3"), None)
             .expect("concrete model plan");
+        let (args, pin) = (&plan.args, &plan.model);
         assert_eq!(pin, "zai/glm-5.3");
-        assert_eq!(args, vec!["--model=zai/glm-5.3"]);
+        assert_eq!(*args, vec!["--model=zai/glm-5.3"]);
     }
 
     /// H2 (bd-harness-jcode): the coder profile's default model routes
@@ -4437,9 +4496,11 @@ mod spawn_profile_plan_tests {
         );
         // ...and routes on its capped harness.
         assert_eq!(
-            profile_launch_args("opencode", &profile("opencode", "big-pickle"), None)
-                .expect("capped harness ok"),
-            vec!["--model", "opencode/big-pickle"]
+            profile_launch_plan("opencode", &profile("opencode", "big-pickle"), None)
+                .expect("capped harness ok")
+                .env_model_pin
+                .as_deref(),
+            Some("opencode/big-pickle")
         );
         // A role model (smol) is held to the same standard.
         let mut role = profile("omp", "deepseek-v4-flash");
@@ -4452,12 +4513,18 @@ mod spawn_profile_plan_tests {
         let _g = lock_env();
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        // bd-crlx: the peer template is the ONLY launch arg opencode gets.
+        // Prepending a model flag here is what killed every opencode pane
+        // seat, so the launch text is now genuinely arg 0.
         let p = profile("opencode", "deepseek-v4-flash");
-        let mut args = profile_launch_args("opencode", &p, None).expect("launch args");
+        let plan = profile_launch_plan("opencode", &p, None).expect("launch args");
+        let mut args = plan.args.clone();
         args.extend(vec!["peer template".to_string()]);
+        assert_eq!(args, vec!["peer template"]);
         assert_eq!(
-            args,
-            vec!["--model", "opencode-go/deepseek-v4-flash", "peer template"]
+            plan.env_model_pin.as_deref(),
+            Some("opencode-go/deepseek-v4-flash"),
+            "the model still reaches the seat, by env"
         );
     }
 
@@ -6449,7 +6516,13 @@ mod spawn_boot_reliability_tests {
             "doorbell_note_observed_wake must fail-loud on save (no let _ =)"
         );
         let spawn = crate::tripwire::find_fn(src, "cmd_spawn");
-        let spawn_body = &src[spawn..spawn + 40000];
+        // Function-scoped, not a fixed byte count (bd-crlx grew cmd_spawn past
+        // a 40000-char window, which silently excluded the tail of the very
+        // function under assertion).
+        let spawn_end = src[spawn..]
+            .find("\nfn ")
+            .map_or(spawn + 40000, |i| spawn + i);
+        let spawn_body = &src[spawn..spawn_end];
         assert!(
             spawn_body.contains("presence_project") && spawn_body.contains("GS-037 P0-D"),
             "presence publish must use absolute project key (register-before-presence)"
@@ -7860,7 +7933,35 @@ projects available: {}",
         let kind = spawn_item_kind(cfg, item, &catalog, &model_reg).ok()?;
         pinned_mail_identity(cfg, project, &agent_name_n(project, &item.short, 1), &kind)
     });
-    let herdr_env = herdr_shim::herdr_integration_env(cfg, first_pin.as_deref());
+    // bd-crlx: the FIRST agent runs on the ROOT pane, whose env is fixed at
+    // workspace.create — and a pane's env is fixed for the life of the process
+    // it launches. So if that agent's harness cannot take the model as argv
+    // (opencode's root command has no `--model`; only `opencode run` does), the
+    // pin has to be in the WORKSPACE env, which means resolving the plan BEFORE
+    // create. The plan is then threaded into the loop below so the first agent
+    // resolves once and warns about effort degradation once.
+    // Resolved before the workspace exists, so a routing failure aborts the
+    // spawn BEFORE creating a workspace rather than after. The error is
+    // propagated, never swallowed into `None` — a swallowed failure would
+    // resurface later as a misleading "internal: plan no longer available".
+    let mut first_plan: Option<ProfileLaunchPlan> = match items.first() {
+        Some(item) => {
+            let kind = spawn_item_kind(cfg, item, &catalog, &model_reg)?;
+            match item.profile.as_deref().map(|pn| catalog.get(pn)) {
+                Some(Some(p)) => Some(profile_launch_plan(&kind, p, None)?),
+                // No profile (bare harness+model) or an unknown one: the loop
+                // resolves this item itself, so there is no root-pane pin to
+                // carry here. An unknown profile name still fails in the loop
+                // with the real reason.
+                _ => None,
+            }
+        }
+        None => None,
+    };
+    let mut herdr_env = herdr_shim::herdr_integration_env(cfg, first_pin.as_deref());
+    if let Some(m) = first_plan.as_ref().and_then(|p| p.env_model_pin.clone()) {
+        herdr_shim::apply_opencode_model_pin(&mut herdr_env, &m)?;
+    }
     // D9 (ADR-0013 Wave B): the spawn is an EFFECTFUL dispatch — the intent is
     // journaled before the workspace exists, so a crash or a dead pane can
     // never read as "exit 0 = employee ready" (I4/I5). `subject` is the
@@ -7954,7 +8055,46 @@ projects available: {}",
                 )?;
             }
             let identity = mail_identity.as_deref().unwrap_or(&name);
-            let pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+            // bd-crlx: resolve the launch plan BEFORE building the pane env.
+            // herdr injects env only at split/create, so a model that travels
+            // by env must be in the map that split receives. The first agent
+            // reuses the plan resolved before workspace.create (its pane is the
+            // root pane, so its pin went into the workspace env) — one
+            // resolution, one effort warning.
+            let (mut agent_args, model_pin, env_model_pin): (
+                Vec<String>,
+                Option<String>,
+                Option<String>,
+            ) = match &item.profile {
+                Some(pname) => {
+                    let p = catalog
+                        .get(pname)
+                        .expect("profile resolved at plan build (bd-eign.13)");
+                    let plan = if first {
+                        first_plan.take().ok_or_else(|| {
+                            anyhow!(
+                                "internal: the first agent's plan was resolved before \
+                                 workspace.create but is no longer available"
+                            )
+                        })?
+                    } else {
+                        profile_launch_plan(&kind, p, None)?
+                    };
+                    (plan.args, Some(plan.model), plan.env_model_pin)
+                }
+                // bd-j3so: bare harness+model override for kind/count spawns
+                // (no --profile) — lenient registry routing. No profile, so
+                // no pin to record (P1-7 is a profile-provenance row).
+                None => (
+                    bare_model_launch_args(&kind, &opts.bare_model, &opts.bare_provider)?,
+                    None,
+                    None,
+                ),
+            };
+            let mut pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+            if let Some(m) = &env_model_pin {
+                herdr_shim::apply_opencode_model_pin(&mut pane_env, m)?;
+            }
             let pane_id = if first {
                 first = false;
                 prev.clone()
@@ -7982,26 +8122,11 @@ projects available: {}",
                     )]
                 })
                 .unwrap_or_else(|| vec![doorbell::identity_prime(&name, identity)]);
-            // bd-eign.9: a profiled spawn launches with the profile's model —
-            // per-harness model args (headless::model_args) + omp role flags,
-            // then any launch text (peer template) LAST so a one-shot-capable
-            // harness does not swallow the flags as a prompt.
-            let (mut agent_args, model_pin): (Vec<String>, Option<String>) = match &item.profile {
-                Some(pname) => {
-                    let p = catalog
-                        .get(pname)
-                        .expect("profile resolved at plan build (bd-eign.13)");
-                    let (args, pin) = profile_launch_plan(&kind, p, None)?;
-                    (args, Some(pin))
-                }
-                // bd-j3so: bare harness+model override for kind/count spawns
-                // (no --profile) — lenient registry routing. No profile, so
-                // no pin to record (P1-7 is a profile-provenance row).
-                None => (
-                    bare_model_launch_args(&kind, &opts.bare_model, &opts.bare_provider)?,
-                    None,
-                ),
-            };
+            // bd-eign.9: a profiled spawn launches with the profile's model.
+            // The plan (argv + registry pin + any env-delivered model pin) was
+            // resolved above the pane env; launch text (peer template) goes
+            // LAST so a one-shot-capable harness does not swallow the flags as
+            // a prompt.
             // ADR-0013 P1-8: record the ATTACHED skill set as a bounded digest
             // (identity + count), never the list.
             let skills_digest = item
