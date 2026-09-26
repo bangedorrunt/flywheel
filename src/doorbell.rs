@@ -818,7 +818,12 @@ pub fn resolve_host(
             .map(|(_, lease)| lease)
     });
     let resolve_at = |url: &str, configured: bool| -> DoorbellHost {
-        let health = daemon_health_json(url);
+        // bd-2zqk: keep the failure so the warning can name the real cause.
+        // A busy-but-alive daemon must not be reported as unreachable.
+        let (health, health_err) = match daemon_health_probe(url) {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e)),
+        };
         let hosts_target = match (&health, target) {
             (Some(v), Some((p, w))) => daemon_hosts(v, p, w),
             (Some(_), None) => true,
@@ -840,8 +845,21 @@ pub fn resolve_host(
             },
             doorbell_rt::lease::Deference::TakeLease => {
                 if configured && health.is_none() {
+                    // bd-2zqk: say WHICH failure. "unreachable" plus "start a
+                    // daemon" was actively wrong for the two cases that matter
+                    // most — a busy daemon and a version mismatch — because the
+                    // daemon was already running.
+                    let cause = health_err.map_or("unknown", |e| e.reason());
+                    let remediation = match health_err {
+                        Some(HealthProbeFailure::NotListening) | None => {
+                            "remediation: doorbell start | doorbell install | flywheel daemon start"
+                        }
+                        // Already listening: starting another daemon is wrong.
+                        Some(_) => "no restart needed; re-probe, or check the daemon's version",
+                    };
                     eprintln!(
-                        "flywheel doorbell: WARNING configured daemon {url} unreachable (remediation: doorbell start | doorbell install | flywheel daemon start) — embedded degraded mode"
+                        "flywheel doorbell: WARNING configured daemon {url} health probe failed: \
+                         {cause} — {remediation} — embedded degraded mode"
                     );
                 }
                 DoorbellHost::Embedded
@@ -877,7 +895,63 @@ pub fn daemon_healthy(url: &str) -> bool {
 /// The parsed `/health` body, or `None` when nothing doorbell-shaped
 /// answers. Parsed (not substring-matched) so callers can ask WHAT the
 /// daemon hosts — "answers" and "does our work" are different questions.
-fn daemon_health_json(url: &str) -> Option<serde_json::Value> {
+/// bd-2zqk: why the health probe came back empty. Every arm used to collapse
+/// into a single `None`, which the caller reported as "unreachable" — so a
+/// healthy daemon under load, a drifted payload, and a protocol bump were all
+/// reported as "the daemon is not there", with a remediation that says to start
+/// a daemon which is already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthProbeFailure {
+    /// The URL had no host:port we could dial.
+    UnparseableUrl,
+    /// Nothing accepted the connection.
+    NotListening,
+    /// Accepted, then went quiet past the read budget.
+    ReadTimedOut,
+    /// Answered, but not with the JSON we asked for.
+    BadPayload,
+    /// Answered with valid JSON that is not doorbell.v1.
+    ProtocolMismatch,
+}
+
+impl HealthProbeFailure {
+    /// The operator-facing reason. Never say "unreachable" for a daemon that
+    /// answered — that sends them to start a second daemon.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnparseableUrl => "the configured url has no dialable host:port",
+            Self::NotListening => "nothing is listening on that address",
+            Self::ReadTimedOut => {
+                "the daemon accepted the connection but did not answer /health within the budget \
+                 (it is busy; this is NOT a dead daemon — re-probe, do not start a second one)"
+            }
+            Self::BadPayload => "the daemon answered /health with a non-JSON body",
+            Self::ProtocolMismatch => {
+                "the daemon answered but is not doorbell.v1 — a version mismatch, not an \
+                 unreachable daemon"
+            }
+        }
+    }
+}
+
+/// bd-2zqk: probe budgets.
+///
+/// The old 200ms connect / 500ms read looked generous and was not. MEASURED on
+/// the live daemon at `doorbell serve --port 18980`: /health returns a ~1.4KB
+/// JSON body with latency min 0.4ms, median 1.0ms, and a **506ms tail** — the
+/// tail sits right on the old 500ms read budget. Over 12 probes the old budgets
+/// reported **4 of 12 healthy daemons as "unreachable"** (a 33% false-negative
+/// rate, which also pushed the session into `embedded degraded mode` and printed
+/// a remediation to start a daemon that was already running). At 1s/2s the same
+/// 12 probes were 12/12 clean. The daemon is busy sweeping, so the tail is real
+/// and the budget has to clear it.
+const HEALTH_CONNECT_TIMEOUT_MS: u64 = 1_000;
+const HEALTH_READ_TIMEOUT_MS: u64 = 2_000;
+
+/// Probe the daemon's `/health`, distinguishing every failure mode.
+pub fn daemon_health_probe(
+    url: &str,
+) -> Result<serde_json::Value, HealthProbeFailure> {
     let health_url = format!("{url}/health");
     let addr = health_url
         .trim_start_matches("http://")
@@ -888,21 +962,38 @@ fn daemon_health_json(url: &str) -> Option<serde_json::Value> {
     let sock = addr
         .parse::<std::net::SocketAddr>()
         .or_else(|_| format!("{addr}:80").parse::<std::net::SocketAddr>())
-        .ok()?;
-    let mut stream =
-        std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(200)).ok()?;
+        .map_err(|_| HealthProbeFailure::UnparseableUrl)?;
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &sock,
+        std::time::Duration::from_millis(HEALTH_CONNECT_TIMEOUT_MS),
+    )
+    .map_err(|_| HealthProbeFailure::NotListening)?;
     use std::io::{Read, Write};
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(
+        HEALTH_READ_TIMEOUT_MS,
+    )));
     write!(
         stream,
         "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     )
-    .ok()?;
+    .map_err(|_| HealthProbeFailure::NotListening)?;
     let mut raw = String::new();
-    stream.read_to_string(&mut raw).ok()?;
+    // A read timeout here means the daemon IS there and busy. That is the whole
+    // point of the distinction: it must never be reported as unreachable.
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|_| HealthProbeFailure::ReadTimedOut)?;
     let payload = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(&raw);
-    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
-    (v.get("protocol").and_then(|p| p.as_str()) == Some("doorbell.v1")).then_some(v)
+    let v: serde_json::Value =
+        serde_json::from_str(payload).map_err(|_| HealthProbeFailure::BadPayload)?;
+    if v.get("protocol").and_then(|p| p.as_str()) != Some("doorbell.v1") {
+        return Err(HealthProbeFailure::ProtocolMismatch);
+    }
+    Ok(v)
+}
+
+fn daemon_health_json(url: &str) -> Option<serde_json::Value> {
+    daemon_health_probe(url).ok()
 }
 /// Fan-out: given classified rings and pane status, produce (pin, line)
 /// pairs that should be prompted now. Working pins are skipped (queued
@@ -3515,5 +3606,96 @@ mod tests {
             "live foreign lease refuses the second loop"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod bd_2zqk_health_probe_tests {
+    use super::{daemon_health_probe, HealthProbeFailure, HEALTH_CONNECT_TIMEOUT_MS,
+                HEALTH_READ_TIMEOUT_MS};
+
+    /// bd-2zqk: the budgets must clear the daemon's measured latency tail. The
+    /// old 200ms/500ms pair sat ON the tail (measured max 506ms on a ~1.4KB
+    /// body) and reported 4 of 12 healthy daemons as unreachable. This row pins
+    /// the ordering, not the exact numbers, so a future tweak cannot shrink the
+    /// budget back under the tail.
+    #[test]
+    fn the_probe_budget_clears_the_measured_daemon_tail() {
+        let measured_tail_ms: u64 = 506; // observed max latency of /health
+        // 3x the observed tail is the margin. Not 4x: this sits on the session
+        // door, so the worst case has to stay bounded for an operator waiting on
+        // `arrive`, and 2s already clears every latency we have actually
+        // measured. Do not shrink it, and do not inflate the production timeout
+        // just to satisfy a threshold — raise the bar here only with evidence.
+        assert!(
+            HEALTH_READ_TIMEOUT_MS >= 3 * measured_tail_ms,
+            "read budget {HEALTH_READ_TIMEOUT_MS}ms must clear 3x the measured {measured_tail_ms}ms \
+             tail, or a busy daemon reads as dead again"
+        );
+        assert!(
+            HEALTH_CONNECT_TIMEOUT_MS > measured_tail_ms,
+            "connect budget {HEALTH_CONNECT_TIMEOUT_MS}ms must clear the tail too"
+        );
+    }
+
+    /// The whole point of the enum: a daemon that is LISTENING but slow must not
+    /// be described as unreachable, because the remediation for unreachable
+    /// ("start a daemon") is actively wrong — one is already running.
+    #[test]
+    fn a_slow_but_live_daemon_is_never_reported_as_unreachable() {
+        let e = HealthProbeFailure::ReadTimedOut;
+        let reason = e.reason();
+        assert!(
+            reason.contains("NOT a dead daemon") && reason.contains("do not start a second one"),
+            "the reason must refuse the restart advice: {reason}"
+        );
+        assert!(
+            !reason.contains("unreachable"),
+            "must not use the word that sends the operator to start a second daemon: {reason}"
+        );
+    }
+
+    /// One row per failure mode. Each must be distinguishable in the message,
+    /// because the operator action differs: only NotListening means "start one".
+    #[test]
+    fn every_failure_mode_names_its_own_cause() {
+        let rows = [
+            (HealthProbeFailure::UnparseableUrl, "host:port"),
+            (HealthProbeFailure::NotListening, "nothing is listening"),
+            (HealthProbeFailure::ReadTimedOut, "accepted the connection"),
+            (HealthProbeFailure::BadPayload, "non-JSON"),
+            (HealthProbeFailure::ProtocolMismatch, "not doorbell.v1"),
+        ];
+        for (failure, must_contain) in rows {
+            let reason = failure.reason();
+            assert!(
+                reason.contains(must_contain),
+                "{failure:?} must mention {must_contain:?}: {reason}"
+            );
+        }
+    }
+
+    /// A wrong port must report NotListening (so "start one" is still correct),
+    /// and must not hang: the connect budget is bounded.
+    #[test]
+    fn a_dead_port_reports_not_listening_promptly() {
+        let started = std::time::Instant::now();
+        // Port 1 is reserved and nothing listens on it.
+        let err = daemon_health_probe("http://127.0.0.1:1").expect_err("must fail");
+        assert_eq!(err, HealthProbeFailure::NotListening);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(HEALTH_CONNECT_TIMEOUT_MS * 2),
+            "a refused connection must return fast, not burn the whole budget"
+        );
+    }
+
+    /// An unparseable url is its own mode, so it never masquerades as a dead
+    /// daemon (which would send the operator to start one).
+    #[test]
+    fn an_unparseable_url_is_its_own_failure_mode() {
+        assert_eq!(
+            daemon_health_probe("not-a-url").expect_err("must fail"),
+            HealthProbeFailure::UnparseableUrl
+        );
     }
 }
