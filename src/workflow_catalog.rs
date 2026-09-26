@@ -63,13 +63,21 @@ pub struct CatalogEntryStatus {
 pub fn seed_user_catalog(config_root: &Path) -> Result<CatalogSeedReport> {
     let mut report = CatalogSeedReport::default();
     let workflow_dir = config_root.join("workflows");
-    for (name, workflow) in crate::builtin_workflows::builtin_workflows() {
+    for (name, yaml) in crate::builtin_workflows::builtin_workflows_yaml() {
         let path = workflow_dir.join(format!("{name}.yaml"));
         if path.exists() {
-            report.kept_workflows.push(name);
+            report.kept_workflows.push(name.to_string());
         } else {
-            write_workflow_yaml(&workflow_dir, &workflow)?;
-            report.created_workflows.push(name);
+            // bd-3o5t: write the compiled-in SOURCE TEXT. Going through
+            // `serde_yaml::to_string(&Workflow)` is lossy — it emits
+            // `crew: null` for every workflow whose crew is `Some(..)`, so the
+            // seeded copy lost its crew, and the user tier wins over the
+            // builtin, so seeding silently made crew workflows headless.
+            std::fs::create_dir_all(&workflow_dir)
+                .with_context(|| format!("create {}", workflow_dir.display()))?;
+            std::fs::write(&path, yaml)
+                .with_context(|| format!("write {}", path.display()))?;
+            report.created_workflows.push(name.to_string());
         }
     }
 
@@ -204,17 +212,36 @@ pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
     let user_workflows = load_user_workflows(config_root)?;
     let mut rows = Vec::new();
     for (name, builtin) in &builtins {
-        let builtin_yaml = serde_yaml::to_string(builtin).ok();
+        // bd-3o5t: compare against the compiled-in SOURCE TEXT, the same bytes
+        // seed now writes. Comparing against a re-serialization made drift and
+        // seed agree with each other while both disagreed with the catalog, so
+        // a crew-stripped copy read as `current`. `current` now means exactly
+        // one thing: this file is the builtin's text, unmodified.
+        let builtin_yaml = crate::builtin_workflows::builtin_workflow_yaml(name).map(str::to_string);
         let status = match user_workflows.get(name) {
             None => "missing",
+            // bd-3o5t: the two tiers are compared two different ways ON PURPOSE.
+            // A `.yaml` copy is a verbatim dump of the builtin's source text, so
+            // byte equality is the right test and catches a hand-edit. A `.toml`
+            // copy is a re-encoding, so its text can never match the YAML dump;
+            // comparing it byte-wise would mark every TOML copy `stale` forever.
+            // For TOML the honest test is semantic: does it parse to the same
+            // Workflow the builtin parses to? That is the same notion the stage
+            // branch below already used, and it is the one that actually
+            // detects a dropped crew.
             Some((user, source, is_toml))
                 if if *is_toml {
-                    serde_yaml::to_string(user)
-                        .ok()
-                        .zip(builtin_yaml.as_deref())
-                        .is_some_and(|(user_yaml, builtin_yaml)| {
-                            user_yaml.trim_end() == builtin_yaml.trim_end()
-                        })
+                    // Compared through `Debug`, NOT through serde.
+                    // `CrewSpec` is `#[serde(untagged)]` with a unit `Auto`
+                    // variant, and serde emits `null` for a unit variant in an
+                    // untagged enum — so a serde round-trip reports a real
+                    // `crew: auto` as `crew: null`, and a copy that genuinely
+                    // lost its crew as identical to one that kept it. `Debug`
+                    // prints the actual typed value, so the comparison sees the
+                    // crew. (`Workflow` has no `PartialEq`; deriving one would
+                    // mean editing toron-workflow's schema, and the YAML branch
+                    // above is the one seed actually uses.)
+                    format!("{user:?}") == format!("{builtin:?}")
                 } else {
                     builtin_yaml
                         .as_deref()
@@ -1150,5 +1177,135 @@ msg = "legacy triage"
             pick_workflow(&merged, "sh"),
             Err(CatalogError::Ambiguous(..))
         ));
+    }
+}
+
+#[cfg(test)]
+mod bd_3o5t_seed_fidelity {
+    use super::*;
+
+    /// bd-3o5t: a workflow seeded from the compiled-in source must still have
+    /// its crew when the seeded FILE is read back. This walks the real path —
+    /// verbatim text out, parse back in — because the guarantee seed depends on
+    /// is about the bytes on disk, not about the in-memory struct.
+    ///
+    /// The bug this pins: seed used `serde_yaml::to_string(&Workflow)`, and
+    /// `CrewSpec` is `#[serde(untagged)]` with a unit `Auto` variant, so serde
+    /// emitted `crew: null` for EVERY crew workflow. Since the user tier wins
+    /// over the builtin, seeding a machine silently turned crew workflows into
+    /// headless ones, and drift reported the damage as `current`.
+    #[test]
+    fn a_seeded_file_reparses_with_its_crew_intact() {
+        for (name, yaml) in crate::builtin_workflows::builtin_workflows_yaml() {
+            let builtin = crate::builtin_workflows::builtin_workflows()
+                .remove(name)
+                .unwrap_or_else(|| panic!("{name} missing from the parsed map"));
+            if builtin.crew.is_none() {
+                continue;
+            }
+            // Exactly what seed writes.
+            let seeded: Workflow = parse_workflow(yaml)
+                .unwrap_or_else(|e| panic!("{name}: seeded text does not parse: {e}"));
+            assert!(
+                seeded.crew.is_some(),
+                "{name}: the SEEDED FILE lost its crew. The builtin declares one, so the \
+                 verbatim text must carry it. If this fails, the file on disk will run \
+                 headless while the builtin runs with agents."
+            );
+        }
+    }
+
+    /// The guard against reintroducing the serializer as the seed path. If
+    /// someone "simplifies" seed back to `to_string(&Workflow)`, the
+    /// round-trip test above starts failing — this names WHY, so the failure is
+    /// not mysterious.
+    #[test]
+    fn re_serializing_a_builtin_is_lossy_and_must_not_be_the_seed_path() {
+        let builtin = crate::builtin_workflows::builtin_workflows();
+        let wf = &builtin["arena"];
+        assert!(wf.crew.is_some(), "arena declares a crew");
+        let dumped = serde_yaml::to_string(wf).expect("serialize");
+        assert!(
+            !dumped.contains("crew: auto"),
+            "if serde ever round-trips CrewSpec::Auto correctly this guard is stale — \
+             re-check that seed still writes verbatim text before relaxing it"
+        );
+    }
+
+    /// The concrete regression: `bug-fix` declares `crew: auto` in the builtin
+    /// source, and that must still be true after the seed round-trip.
+    #[test]
+    fn bug_fix_keeps_its_crew_through_the_seed_round_trip() {
+        let builtins = crate::builtin_workflows::builtin_workflows();
+        let wf = builtins.get("bug-fix").expect("bug-fix is a builtin");
+        assert!(
+            wf.crew.is_some(),
+            "the builtin bug-fix yaml declares `crew: auto`, so the parsed builtin must carry it"
+        );
+        let dumped = serde_yaml::to_string(wf).expect("serialize");
+        assert!(
+            dumped.contains("crew:"),
+            "the seeded yaml must carry a crew key, got:\n{dumped}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bd_3o5t_drift_truth {
+    use super::*;
+
+    /// bd-3o5t: drift MUST report a user copy that differs from the builtin in a
+    /// behaviour-changing field as `stale`. The live proof that it does not: the
+    /// operator's `~/.config/flywheel/workflows/bug-fix.yaml` declares
+    /// `crew: null` while the builtin declares `crew: auto`, the user tier wins,
+    /// the run is headless — and `flywheel workflow drift` printed
+    /// "catalog drift clean".
+    #[test]
+    fn a_user_copy_that_drops_the_crew_is_reported_stale() {
+        let root = std::env::temp_dir().join(format!("drift-3o5t-{}", std::process::id()));
+        let wf_dir = root.join("workflows");
+        std::fs::create_dir_all(&wf_dir).expect("mkdir");
+        // The exact divergence: crew present on the builtin, null in the copy.
+        std::fs::write(
+            wf_dir.join("bug-fix.yaml"),
+            "name: bug-fix\ncrew: null\nsteps: []\n",
+        )
+        .expect("write");
+
+        let rows = catalog_drift(&root).expect("drift");
+        let row = rows
+            .iter()
+            .find(|r| r.name == "bug-fix" && r.kind == "workflow")
+            .expect("bug-fix row");
+        assert_eq!(
+            row.status, "stale",
+            "a user copy that drops the crew is NOT current — reporting it current is what \
+             let a headless run masquerade as a correct one"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The positive control: a byte-faithful copy IS current. Without this, a
+    /// drift that always says `stale` would pass the test above while being
+    /// useless in the other direction.
+    #[test]
+    fn a_faithful_copy_is_reported_current() {
+        let root = std::env::temp_dir().join(format!("drift-ok-{}", std::process::id()));
+        let wf_dir = root.join("workflows");
+        std::fs::create_dir_all(&wf_dir).expect("mkdir");
+        // Faithful == the builtin's own source text, byte for byte.
+        let faithful = crate::builtin_workflows::builtin_workflow_yaml("bug-fix")
+            .expect("bug-fix is a builtin");
+        std::fs::write(wf_dir.join("bug-fix.yaml"), faithful).expect("write");
+
+        let rows = catalog_drift(&root).expect("drift");
+        let row = rows
+            .iter()
+            .find(|r| r.name == "bug-fix" && r.kind == "workflow")
+            .expect("bug-fix row");
+        assert_eq!(row.status, "current", "a faithful copy must read as current");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

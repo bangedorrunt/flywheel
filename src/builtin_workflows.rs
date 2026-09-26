@@ -1506,6 +1506,32 @@ steps:
 ];
 
 /// Load the compiled-in built-in workflows as parsed `Workflow`s.
+/// The compiled-in YAML for a builtin, VERBATIM.
+///
+/// bd-3o5t: seed and drift must both read this text, never
+/// `serde_yaml::to_string(&builtin)`. The struct round-trip is LOSSY:
+/// `serde_yaml` emits `crew: null` for every workflow whose `crew` is
+/// `Some(..)` (measured across all 20+ crew workflows — arena, beads, bug-fix,
+/// debate, feature, ...), because `CrewSpec` does not survive
+/// serialize→deserialize. Seeding that text therefore wrote a user-tier copy
+/// with the crew stripped, and because the user tier WINS over the builtin, a
+/// freshly seeded machine turned every crew workflow into a headless,
+/// zero-agent one. drift then agreed with seed — same broken serializer on both
+/// sides — so it printed "clean" over the damage. Copying the source text is
+/// lossless by construction and makes the two commands share one truth.
+pub fn builtin_workflow_yaml(name: &str) -> Option<&'static str> {
+    BUILTIN_WORKFLOWS_YAML
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, yaml)| *yaml)
+}
+
+/// Every compiled-in workflow as `(name, verbatim yaml)`, for callers that need
+/// the source text rather than the parsed struct (seed, drift).
+pub fn builtin_workflows_yaml() -> impl Iterator<Item = (&'static str, &'static str)> {
+    BUILTIN_WORKFLOWS_YAML.iter().copied()
+}
+
 pub fn builtin_workflows() -> BTreeMap<String, Workflow> {
     let mut map = BTreeMap::new();
     for (name, yaml) in BUILTIN_WORKFLOWS_YAML {
