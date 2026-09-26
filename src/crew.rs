@@ -2138,12 +2138,22 @@ steps:
                         Action::DispatchJob { spec, .. }
                             if spec.profile.as_deref() == Some("@coder"))
         ));
-        // Outer wrappers stay Continue; inner leaves are FailRun (bd-gs005).
+        // Outer wrappers are FailRun; inner leaves are FailRun (bd-gs005).
+        //
+        // ADAPTED to toron-workflow 17b2eb4 ("make loop, failure, and guards
+        // composable"). That commit made a step fail on `ok:false` OR
+        // `status:failed`, so a wrapper left at `Continue` no longer stored a
+        // red part as a harmless `{ok:false}` — the run failed anyway, just
+        // without the deterministic `failed_step`. The compose builder's own
+        // comment now says exactly that ("Continue here stored {ok:false} and
+        // the linear runner treated that as success"), so FailRun on the
+        // wrapper is the correct spelling and this assertion was the stale
+        // half of that change.
         for step in &wf.steps {
             assert_eq!(
                 step.on_error,
-                StepOnError::Continue,
-                "outer T1 wrapper is Continue"
+                StepOnError::FailRun,
+                "outer T1 wrapper is FailRun since the engine fails a step on ok:false"
             );
             match &step.action {
                 Action::Foreach { each, .. } | Action::Parallel { each, .. } => {

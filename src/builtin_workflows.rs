@@ -2368,6 +2368,17 @@ mod tests {
                     }
                 }
                 Action::Foreach { each, .. } => scan_action(&each.action, name, found),
+                // toron-workflow 17b2eb4 added Action::Loop. Without this arm a
+                // dispatch nested in a loop body is INVISIBLE to this walker, so
+                // a stage-ref dispatch inside a loop silently escapes the
+                // invariant this scan exists to enforce. hillclimb is exactly
+                // that shape: one `loop` step whose body holds the stage-ref
+                // dispatch_job, so the scan under-counted by one.
+                Action::Loop { body, .. } => {
+                    for st in body.iter() {
+                        scan_action(&st.action, name, found);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2453,6 +2464,17 @@ mod tests {
                     }
                 }
                 Action::Foreach { each, .. } => scan_action(&each.action, name, checked),
+                // toron-workflow 17b2eb4 added Action::Loop. Without this arm a
+                // dispatch nested in a loop body is INVISIBLE to this walker, so
+                // a stage-ref dispatch inside a loop silently escapes the
+                // invariant this scan exists to enforce. hillclimb is exactly
+                // that shape: one `loop` step whose body holds the stage-ref
+                // dispatch_job, so the scan under-counted by one.
+                Action::Loop { body, .. } => {
+                    for st in body.iter() {
+                        scan_action(&st.action, name, checked);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2961,6 +2983,15 @@ mod tests {
                     }
                 }
                 Action::Foreach { each, .. } => scan_action(&each.action, wf, dead),
+                // toron-workflow 17b2eb4 added Action::Loop. Without this arm a
+                // dispatch nested in a loop body is INVISIBLE to this walker, so
+                // a stage-ref dispatch inside a loop would silently escape the
+                // invariant this scan exists to enforce.
+                Action::Loop { body, .. } => {
+                    for st in body.iter() {
+                        scan_action(&st.action, wf, dead);
+                    }
+                }
                 _ => {}
             }
         }

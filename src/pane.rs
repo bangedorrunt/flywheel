@@ -614,11 +614,7 @@ fn spawn_crew_into(
                     &profile.slow,
                     &profile.plan,
                 ));
-                let mut pane_env =
-                    crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
-                if let Some(m) = &env_model_pin {
-                    crate::herdr_shim::apply_opencode_model_pin(&mut pane_env, m)?;
-                }
+                let pane_env = pane_env_for_launch(cfg, mail_identity.as_deref(), env_model_pin.as_deref())?;
                 let pane_id = match &prev {
                     None => {
                         // bd-lifecycle-occupied-pane-wedge-07tx: PROBE BEFORE
@@ -1507,6 +1503,12 @@ pub struct SpawnJobLaunch {
     /// per-harness model/effort args (profile_launch_args — bd-eign.9);
     /// empty = bare launch (honest, never a silent skip)
     pub args: Vec<String>,
+    /// bd-crlx/bd-qlr1: `Some(model)` when the harness's interactive
+    /// entrypoint has NO model flag, so the pin must travel through the pane
+    /// env (`OPENCODE_CONFIG_CONTENT`) instead of argv. This launch path
+    /// creates its own pane, so it can honour the pin; `launch_spawn_job`
+    /// applies it to the env map it hands to `pane_split`.
+    pub env_model_pin: Option<String>,
     /// ADR-0022 W2: the lifecycle phase from the resolved spec, when the
     /// step carried one (drives the phase registry).
     pub phase: Option<String>,
@@ -1519,6 +1521,27 @@ pub struct SpawnJobLaunch {
     /// ADR-0024 Spec 2: execution context mode (inherit default, fresh = new session).
     pub context: Option<String>,
 }
+/// bd-qlr1: the pane env for a launch, with any env-delivered model pin
+/// already merged in.
+///
+/// herdr injects env ONLY at split/create, and a pane's env is fixed for the
+/// life of the process it launches — so the pin has to be in the map before the
+/// split, never applied afterwards. Every launch path that creates its own pane
+/// builds its env here, so the pin cannot be forgotten at a call site: if a
+/// path needs a pin it must pass it, and the refusal for an unhonourable pin
+/// comes from `profile_launch_args` refusing rather than from a silent drop.
+pub(crate) fn pane_env_for_launch(
+    cfg: &crate::Config,
+    mail_identity: Option<&str>,
+    env_model_pin: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut env = crate::herdr_shim::herdr_integration_env(cfg, mail_identity);
+    if let Some(model) = env_model_pin {
+        crate::herdr_shim::apply_opencode_model_pin(&mut env, model)?;
+    }
+    Ok(env)
+}
+
 
 /// bd-omwg: read one spawn side-channel promise spec into a launch plan.
 /// The profile name strips the `@`; the harness comes from the RESOLVED
@@ -1548,10 +1571,17 @@ pub fn spawn_launch_plan(
         .as_str()
         .filter(|p| !p.is_empty())
         .map(str::to_string);
-    let args = match catalog.get(&profile) {
-        Some(p) => crate::profile_launch_args(&harness, p, phase.as_deref())
-            .map_err(|e| anyhow::anyhow!("spawn plan '{profile}' model routing: {e}"))?,
-        None => Vec::new(),
+    // bd-qlr1: the PLAN form, not the argv-only view. The argv-only view
+    // REFUSES when the harness needs an env-delivered pin, and this path
+    // creates its own pane — so it must resolve the plan and carry the pin to
+    // the split rather than refusing a launch it can actually satisfy.
+    let (args, env_model_pin) = match catalog.get(&profile) {
+        Some(p) => {
+            let plan = crate::profile_launch_plan(&harness, p, phase.as_deref())
+                .map_err(|e| anyhow::anyhow!("spawn plan '{profile}' model routing: {e}"))?;
+            (plan.args, plan.env_model_pin)
+        }
+        None => (Vec::new(), None),
     };
     // Degradation is decided by the registry itself so the plan carries the
     // flag to the drainer (loud at launch, never silent).
@@ -1564,6 +1594,7 @@ pub fn spawn_launch_plan(
         .map(std::string::ToString::to_string);
     Ok(SpawnJobLaunch {
         promise_id: promise_id.to_string(),
+        env_model_pin,
         profile,
         workflow,
         harness,
@@ -1714,7 +1745,11 @@ pub fn launch_spawn_job(
         // bd-pin-public-plane-s-easy.2: draw the pin BEFORE the split so the
         // pane env carries AGENT_NAME/FLYWHEEL_MAIL_AS.
         let mail_identity = crate::pinned_mail_identity(cfg, project, &name, &plan.harness);
-        let pane_env = crate::herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+        // bd-qlr1: the pin must be in the map BEFORE the split, because
+        // herdr injects env only at split/create and a pane's env is fixed for
+        // the life of the process it launches.
+        let pane_env =
+            pane_env_for_launch(cfg, mail_identity.as_deref(), plan.env_model_pin.as_deref())?;
         let split = crate::herdr_shim::pane_split(
             &mut c,
             &prev,
@@ -3857,5 +3892,111 @@ mod bd_5llv_receipt_tests {
                 "an unrecognised verdict must not be read as a success"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bd_qlr1_env_pin_wiring_tests {
+    use super::{pane_env_for_launch, spawn_launch_plan};
+    use crate::profile::{Profile, ProfileCatalog};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn cfg() -> crate::Config {
+        crate::Config::load().expect("config")
+    }
+
+    fn catalog_with(harness: &str, model: &str) -> ProfileCatalog {
+        ProfileCatalog {
+            profiles: BTreeMap::from([(
+                "reviewer".into(),
+                Profile {
+                    harness: harness.into(),
+                    model: model.into(),
+                    ..Default::default()
+                },
+            )]),
+            harnesses: BTreeMap::new(),
+        }
+    }
+
+    fn spec(harness: &str) -> serde_json::Value {
+        json!({
+            "profile": "@reviewer",
+            "resolved": { "npub": "", "spec": { "harness": harness, "backend": "herdr", "role": "reviewer" } },
+            "await": false,
+        })
+    }
+
+    /// THE APPLICATION SITE. A plan carrying `env_model_pin` is worthless unless
+    /// the pin actually lands in the map handed to `pane_split` — the pane's env
+    /// is fixed at split, so a pin dropped here can never be applied later. This
+    /// is the row that catches a dropped `apply_opencode_model_pin` call, which
+    /// unit tests on the plan alone cannot see.
+    #[test]
+    fn the_env_helper_actually_applies_the_pin() {
+        let env = pane_env_for_launch(
+            &cfg(),
+            Some("SomeOwl"),
+            Some("opencode-go/muse-spark-1.3-contributor"),
+        )
+        .expect("env");
+        let doc: serde_json::Value = serde_json::from_str(
+            env.get("OPENCODE_CONFIG_CONTENT")
+                .expect("the pin must be in the map BEFORE the split"),
+        )
+        .expect("valid json");
+        assert_eq!(doc["model"], "opencode-go/muse-spark-1.3-contributor");
+        // The identity env must survive alongside the pin.
+        assert_eq!(env.get("AGENT_NAME").map(String::as_str), Some("SomeOwl"));
+    }
+
+    /// No pin means no config document. If the carve-out leaked, every harness
+    /// would silently grow a redundant OPENCODE_CONFIG_CONTENT.
+    #[test]
+    fn no_pin_means_no_config_document() {
+        let env = pane_env_for_launch(&cfg(), Some("SomeOwl"), None).expect("env");
+        assert!(
+            !env.contains_key("OPENCODE_CONFIG_CONTENT"),
+            "an argv-pinned harness must not get a config document: {env:?}"
+        );
+        assert_eq!(env.get("AGENT_NAME").map(String::as_str), Some("SomeOwl"));
+    }
+
+    /// An unhonourable pin is an ERROR at env-build time, not a silent bare
+    /// launch: a bad pin must stop the launch rather than start the seat on a
+    /// model nobody selected.
+    #[test]
+    fn an_unhonourable_pin_is_an_error_not_a_bare_launch() {
+        // A bare model id has no provider half; opencode would drop it.
+        let err = pane_env_for_launch(&cfg(), Some("SomeOwl"), Some("gpt-5.2"))
+            .expect_err("a bare model id must refuse");
+        assert!(
+            err.to_string().contains("provider/model"),
+            "names the required form: {err}"
+        );
+    }
+
+    /// End-to-end through the plan: an opencode launch plan's pin must survive
+    /// into the env map, and its argv must stay clean of the flag opencode
+    /// rejects.
+    #[test]
+    fn an_opencode_plan_pin_flows_all_the_way_into_the_pane_env() {
+        let plan = spawn_launch_plan(
+            "prom-e2e",
+            &spec("opencode"),
+            &catalog_with("opencode", "opencode-go/muse-spark-1.3-contributor"),
+        )
+        .expect("opencode plan");
+        assert!(
+            !plan.args.iter().any(|a| a == "--model" || a == "-m"),
+            "opencode's root command rejects --model: {:?}",
+            plan.args
+        );
+        let env =
+            pane_env_for_launch(&cfg(), Some("SomeOwl"), plan.env_model_pin.as_deref()).expect("env");
+        let doc: serde_json::Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").expect("pin present")).unwrap();
+        assert_eq!(doc["model"], "opencode-go/muse-spark-1.3-contributor");
     }
 }
