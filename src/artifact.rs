@@ -501,6 +501,51 @@ pub fn artifact_path(project: &str, run_id: &str, node_id: &str) -> PathBuf {
     base.join(format!("{}.json", node_id))
 }
 
+/// A `*.json` in a run dir that is not an `ArtifactRecord`. The composed-run
+/// path stores the run's own output as `terminal.json` (see
+/// `write_terminal_artifact`), so the stitcher has to name such records
+/// instead of dying on a serde field error (bd-mdp9).
+struct NonArtifactRecord {
+    file: String,
+    value: serde_json::Value,
+}
+
+/// Strip ANSI CSI escapes: the run's captured error strings carry color
+/// codes, and stitched.md is read as text.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for esc in chars.by_ref() {
+                if ('@'..='~').contains(&esc) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One-line summary of a run outcome record (status/failed_step/error when
+/// present). Fields the record does not carry are simply absent.
+fn summarize_run_outcome(value: &serde_json::Value) -> String {
+    let mut bits: Vec<String> = Vec::new();
+    for key in ["status", "failed_step", "error"] {
+        if let Some(v) = value.get(key).and_then(serde_json::Value::as_str) {
+            bits.push(format!("{key}={}", strip_ansi(v).trim()));
+        }
+    }
+    if bits.is_empty() {
+        "no status/error fields".to_string()
+    } else {
+        bits.join(" ")
+    }
+}
+
 /// Stitcher: read records only, write stitched.md, flag Ungrounded loudly.
 pub fn stitch_artifacts(project: &str, run_id: &str) -> anyhow::Result<PathBuf> {
     let base = dirs::data_local_dir()
@@ -510,23 +555,46 @@ pub fn stitch_artifacts(project: &str, run_id: &str) -> anyhow::Result<PathBuf> 
         .join("artifacts")
         .join(run_id);
     let mut records = Vec::new();
+    let mut non_artifacts: Vec<NonArtifactRecord> = Vec::new();
     if base.is_dir() {
         for entry in std::fs::read_dir(&base)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false) {
                 let content = std::fs::read_to_string(&path)?;
-                let rec: ArtifactRecord = serde_json::from_str(&content)?;
-                records.push(rec);
+                match serde_json::from_str::<ArtifactRecord>(&content) {
+                    Ok(rec) => records.push(rec),
+                    // Not every json in a run dir is a typed artifact: the
+                    // composed path stores the run's outcome as terminal.json.
+                    // Read it as plain JSON so stitch names what it found
+                    // instead of dying on a serde field error (bd-mdp9).
+                    Err(not_artifact) => match serde_json::from_str(&content) {
+                        Ok(value) => non_artifacts.push(NonArtifactRecord {
+                            file: path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default(),
+                            value,
+                        }),
+                        Err(bad_json) => eprintln!(
+                            "stitcher: WARNING: {} is neither an ArtifactRecord ({not_artifact}) nor JSON ({bad_json})",
+                            path.display()
+                        ),
+                    },
+                }
             }
         }
     }
     records.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    non_artifacts.sort_by(|a, b| a.file.cmp(&b.file));
     let evaluations = read_evaluation_evidence(project, run_id)?;
 
     let stitched_path = base.join("stitched.md");
     let mut md = String::new();
     md.push_str(&format!("# Stitched artifacts for run {}\n\n", run_id));
+    if records.is_empty() {
+        md.push_str("No typed ArtifactRecord for this run.\n\n");
+    }
     let mut has_ungrounded = false;
     for rec in &records {
         if matches!(rec.grounding_status, GroundingStatus::Ungrounded) {
@@ -550,6 +618,16 @@ pub fn stitch_artifacts(project: &str, run_id: &str) -> anyhow::Result<PathBuf> 
             rec.grounding_status,
             rec.claim_support_status
         ));
+    }
+    if !non_artifacts.is_empty() {
+        md.push_str("\n## Non-artifact records\n\n");
+        for other in &non_artifacts {
+            md.push_str(&format!(
+                "- {}: {}\n",
+                other.file,
+                summarize_run_outcome(&other.value)
+            ));
+        }
     }
     if has_ungrounded {
         md.push_str("\n> **WARNING: Some artifacts are Ungrounded**\n");
@@ -588,6 +666,21 @@ pub fn compute_sha256(path: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Removes the temp project's data dir on drop: a panicking assertion
+    /// must not leave fixture artifacts behind (the first red runs did).
+    struct ProjectCleanup(String);
+
+    impl Drop for ProjectCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join("flywheel")
+                    .join(&self.0),
+            );
+        }
+    }
 
     fn tmp_file(content: &str) -> (tempfile::NamedTempFile, PathBuf) {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -953,5 +1046,107 @@ mod tests {
         assert!(PathBuf::from("src/artifact.rs").exists());
         // Verify the function exists and is callable (compile check)
         let _ = stitch_artifacts as fn(&str, &str) -> anyhow::Result<PathBuf>;
+    }
+
+    /// bd-mdp9: a composed run's dir holds `terminal.json`, the raw run output
+    /// (status/error/failed_step/leaf_preview), not an `ArtifactRecord`.
+    /// Stitch must report the outcome instead of dying on a serde field error.
+    #[test]
+    fn stitch_reports_a_terminal_only_run_instead_of_a_serde_error() {
+        let project = format!("artifacts-terminal-test-{}", uuid::Uuid::new_v4());
+        let _cleanup = ProjectCleanup(project.clone());
+        let run_id = "fw-composed-test-terminal";
+        let base = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("flywheel")
+            .join(&project)
+            .join("artifacts")
+            .join(run_id);
+        std::fs::create_dir_all(&base).unwrap();
+        // The exact shape write_terminal_artifact stores, ANSI escapes included.
+        std::fs::write(
+            base.join("terminal.json"),
+            r#"{
+  "error": "\u001b[1mflywheel: agent crew-x-reviewer not found\u001b[0m\n",
+  "failed_step": "reviewer-ce-review-3",
+  "leaf_preview": "{\"effect_state\":\"failed\"}",
+  "status": "failed"
+}"#,
+        )
+        .unwrap();
+
+        let stitched = stitch_artifacts(&project, run_id)
+            .expect("a terminal-only run must stitch, not serde-error");
+        let md = std::fs::read_to_string(&stitched).unwrap();
+        assert!(
+            md.contains("No typed ArtifactRecord"),
+            "names the absence of typed records: {md}"
+        );
+        assert!(md.contains("status=failed"), "carries the outcome: {md}");
+        assert!(
+            md.contains("failed_step=reviewer-ce-review-3"),
+            "names the failed link: {md}"
+        );
+        assert!(
+            !md.contains('\u{1b}'),
+            "ANSI escapes are stripped from the report: {md:?}"
+        );
+    }
+
+    /// A run dir with real records AND a terminal outcome keeps both: the
+    /// records list as before, the outcome in its own section.
+    #[test]
+    fn stitch_keeps_typed_records_alongside_a_terminal_outcome() {
+        let project = format!("artifacts-mixed-test-{}", uuid::Uuid::new_v4());
+        let _cleanup = ProjectCleanup(project.clone());
+        let run_id = "fw-composed-test-mixed";
+        let base = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("flywheel")
+            .join(&project)
+            .join("artifacts")
+            .join(run_id);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("payload.txt");
+        std::fs::write(&file, "payload").unwrap();
+        let rec = ArtifactRecord::new(
+            file,
+            ArtifactKind::Finding,
+            ExecutionStatus::Completed,
+            CriterionStatus::Met,
+            GroundingStatus::Cited,
+            ClaimSupportStatus::IndependentlySupported,
+            None,
+            Some("bd-mdp9".into()),
+            run_id.into(),
+            Some("node-mixed".into()),
+            "PinMixed".into(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("node-mixed.json"),
+            serde_json::to_string_pretty(&rec).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("terminal.json"),
+            r#"{"error":"e","failed_step":"link-1","status":"failed"}"#,
+        )
+        .unwrap();
+
+        let stitched = stitch_artifacts(&project, run_id).unwrap();
+        let md = std::fs::read_to_string(&stitched).unwrap();
+        assert!(
+            md.contains(&rec.sha256[..12.min(rec.sha256.len())]),
+            "typed record still stitched: {md}"
+        );
+        assert!(
+            md.contains("failed_step=link-1"),
+            "outcome still reported: {md}"
+        );
+        assert!(
+            !md.contains("No typed ArtifactRecord"),
+            "typed records exist, so the absence line must not appear: {md}"
+        );
     }
 }

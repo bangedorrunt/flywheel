@@ -83,6 +83,9 @@ $ flywheel artifacts fw-composed-2026-09-25T23:14:49Z --project toron --json
     "status": "failed"
   }
 ]
+
+$ flywheel artifacts stitch fw-composed-2026-09-25T23:14:49Z --project toron
+/Users/you/Library/Application Support/flywheel/toron/artifacts/fw-composed-2026-09-25T23:14:49Z/stitched.md
 ```
 
 That is a real record off a failed composed run: `failed_step` names the link,
@@ -91,13 +94,13 @@ That is a real record off a failed composed run: `failed_step` names the link,
 serializes its own JSON into a string field.
 
 If it fails: no records at all means the run never wrote an artifact dir (check
-`flywheel runs list` for the run's state before reading the record). `stitch`
-only reads per-record files: the dir for a composed run holds an outcome record
-(`terminal.json`) with no `path` field, so `stitch` on it stops with
-`flywheel: missing field \`path\`` — use the list form above for outcomes and
-`stitch` once the run has written real `ArtifactRecord`s. A missing evaluation
-artifact is itself a failed gate: warn mode continues with `gate-warnings`,
-block mode stops at the link.
+`flywheel runs list` for the run's state before reading the record). A composed
+run that wrote only its outcome (`terminal.json`) stitches into
+`No typed ArtifactRecord for this run.` plus a `## Non-artifact records` line
+naming `status`, `failed_step` and the error, so an outcome-only run reads as
+an outcome rather than a parse error. A missing evaluation artifact is itself a
+failed gate: warn mode continues with `gate-warnings`, block mode stops at the
+link.
 
 ### 5. Compound the learning
 
