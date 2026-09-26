@@ -10577,6 +10577,41 @@ fn recipe_launch_command(recipe: &str, args: &[String]) -> String {
     cmd
 }
 
+/// bd-qlr1: what a reroute means for a model that must be pinned by PANE ENV.
+///
+/// A reroute launches into an EXISTING pane. That pane's environment was fixed
+/// by the split that created it, and a process's env cannot be changed after
+/// it starts — so an env-delivered pin (`OPENCODE_CONFIG_CONTENT`) can never be
+/// re-applied here. There are exactly two cases, and only one is safe:
+///
+/// - the reroute keeps the SAME model the pane is already pinned to: the pane
+///   env already carries it, so the hop is genuinely satisfied. This is the
+///   common case (a profile fallback that only changes harness) and it must
+///   keep working — refusing it would break a working recovery path.
+/// - the reroute CHANGES the model: the pane still carries the old pin, so the
+///   agent would silently run the PREVIOUS model while the ledger records the
+///   new one. That is unsatisfiable, and it is refused by name rather than
+///   silently downgraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RerouteEnvPin {
+    /// The pane's existing env pin already matches. Proceed.
+    AlreadyPinned,
+    /// The reroute wants a different model than the pane is pinned to.
+    ModelChanged,
+}
+
+/// Pure so the policy is testable without a pane. `current_model` is the model
+/// the pane was pinned with at split time (None when the pane carried no pin).
+pub(crate) fn reroute_env_pin_verdict(
+    current_model: Option<&str>,
+    reroute_pin: &str,
+) -> RerouteEnvPin {
+    match current_model {
+        Some(m) if m == reroute_pin => RerouteEnvPin::AlreadyPinned,
+        _ => RerouteEnvPin::ModelChanged,
+    }
+}
+
 #[cfg(test)]
 mod recipe_launch_tests {
     use super::{recipe_launch_command, shell_quote};
@@ -10700,7 +10735,45 @@ pub(crate) fn start_agent_with_retry_profile(
                                 } else {
                                     next_prof.harness.clone()
                                 };
-                                if let Ok(next_args) =
+                                // bd-qlr1: resolve the PLAN, because a harness
+                                // with no interactive model flag (opencode) needs
+                                // its pin by env and the argv-only view refuses.
+                                // The pane already exists, so the pin is only
+                                // honoured when it matches what that pane is
+                                // already pinned to; otherwise refuse by name.
+                                if let Ok(next_plan) = profile_launch_plan(&next_kind, next_prof, None)
+                                    && let Some(pin) = &next_plan.env_model_pin
+                                {
+                                    let pinned = current_profile
+                                        .as_deref()
+                                        .and_then(|cp| cat.get(cp))
+                                        .map(|p| format!("{}/{}", p.provider, p.model));
+                                    if reroute_env_pin_verdict(pinned.as_deref(), pin)
+                                        != RerouteEnvPin::AlreadyPinned
+                                    {
+                                        eprintln!(
+                                            "flywheel: pane reroute {} -> {} REFUSED: {} needs its \
+                                             model pinned by pane env, and pane {} was created \
+                                             with a different pin. A pane's env is fixed at \
+                                             split, so this hop would silently run the previous \
+                                             model. Respawn instead of rerouting.",
+                                            orig, next, next_kind, pane_id
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "flywheel: pane reroute {} -> {} (profile fallback, \
+                                             env pin already present on the pane)",
+                                            orig, next
+                                        );
+                                        current_kind = next_kind;
+                                        current_args = next_plan.args;
+                                        current_profile = Some(next.clone());
+                                        attempted_profiles.push(next);
+                                        already_rerouted = true;
+                                        std::thread::sleep(Duration::from_secs(1));
+                                        continue;
+                                    }
+                                } else if let Ok(next_args) =
                                     profile_launch_args(&next_kind, next_prof, None)
                                 {
                                     eprintln!(
@@ -10858,7 +10931,43 @@ fn start_agent_with_retry_dyn_profile(
                                 } else {
                                     next_prof.harness.clone()
                                 };
-                                if let Ok(next_args) =
+                                // bd-qlr1: same env-pin rule as the other
+                                // reroute site — an existing pane's env is fixed
+                                // at split, so an env-delivered model pin is only
+                                // honoured when it already matches the pane.
+                                if let Ok(next_plan) = profile_launch_plan(&next_kind, next_prof, None)
+                                    && let Some(pin) = &next_plan.env_model_pin
+                                {
+                                    let pinned = current_profile
+                                        .as_deref()
+                                        .and_then(|cp| cat.get(cp))
+                                        .map(|p| format!("{}/{}", p.provider, p.model));
+                                    if reroute_env_pin_verdict(pinned.as_deref(), pin)
+                                        != RerouteEnvPin::AlreadyPinned
+                                    {
+                                        eprintln!(
+                                            "flywheel: pane reroute {} -> {} REFUSED: {} needs its \
+                                             model pinned by pane env, and pane {} was created \
+                                             with a different pin. A pane's env is fixed at \
+                                             split, so this hop would silently run the previous \
+                                             model. Respawn instead of rerouting.",
+                                            orig, next, next_kind, pane_id
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "flywheel: pane reroute {} -> {} (profile fallback, \
+                                             env pin already present on the pane)",
+                                            orig, next
+                                        );
+                                        current_kind = next_kind;
+                                        current_args = next_plan.args;
+                                        current_profile = Some(next.clone());
+                                        attempted_profiles.push(next);
+                                        already_rerouted = true;
+                                        std::thread::sleep(Duration::from_secs(1));
+                                        continue;
+                                    }
+                                } else if let Ok(next_args) =
                                     profile_launch_args(&next_kind, next_prof, None)
                                 {
                                     eprintln!(
@@ -36768,5 +36877,65 @@ mod product_digest_tests {
             2,
             "the fold must probe the built mail root, not a fresh env resolution: {v}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bd_qlr1_reroute_env_pin_tests {
+    use super::{reroute_env_pin_verdict, RerouteEnvPin};
+
+    /// bd-qlr1: the distinction that keeps a working recovery path working.
+    /// A reroute launches into an EXISTING pane, so an env-delivered model pin
+    /// can never be re-applied. A reroute that keeps the SAME model is
+    /// genuinely satisfied — the pane already carries that pin — and must not
+    /// be refused, or a profile fallback that only changes harness would break.
+    #[test]
+    fn a_same_model_reroute_is_already_pinned_and_proceeds() {
+        assert_eq!(
+            reroute_env_pin_verdict(Some("opencode-go/muse-spark-1.3-contributor"),
+                "opencode-go/muse-spark-1.3-contributor"),
+            RerouteEnvPin::AlreadyPinned,
+            "the pane already carries this pin, so the hop is satisfied"
+        );
+    }
+
+    /// The unsatisfiable case, refused by name rather than silently downgraded.
+    /// If this were allowed, the pane would keep the OLD pin while the ledger
+    /// recorded the NEW model — the agent would run a model nobody selected.
+    #[test]
+    fn a_model_changing_reroute_is_refused() {
+        for (pinned, wants) in [
+            (
+                Some("opencode-go/muse-spark-1.3-contributor"),
+                "deepseek/deepseek-flash",
+            ),
+            // The pane carried no pin at all, so there is nothing to honour.
+            (None, "opencode-go/muse-spark-1.3-contributor"),
+        ] {
+            assert_eq!(
+                reroute_env_pin_verdict(pinned, wants),
+                RerouteEnvPin::ModelChanged,
+                "pinned={pinned:?} wants={wants}: a pane's env is fixed at split, so this hop \
+                 would silently run the previous model"
+            );
+        }
+    }
+
+    /// Pin the exact-equality requirement. A provider-only or model-only match
+    /// is NOT the same pin, and treating it as one would reintroduce the silent
+    /// downgrade this verdict exists to prevent.
+    #[test]
+    fn the_match_is_exact_not_a_prefix_or_suffix() {
+        for (pinned, wants) in [
+            (Some("opencode-go/muse-spark-1.3"), "opencode-go/muse-spark-1.3-contributor"),
+            (Some("opencode-go"), "opencode-go/muse-spark-1.3-contributor"),
+            (Some(""), "opencode-go/muse-spark-1.3-contributor"),
+        ] {
+            assert_eq!(
+                reroute_env_pin_verdict(pinned, wants),
+                RerouteEnvPin::ModelChanged,
+                "pinned={pinned:?} is not the same pin as {wants}"
+            );
+        }
     }
 }
