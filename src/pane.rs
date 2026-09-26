@@ -496,6 +496,20 @@ pub(crate) fn model_fallback_intent(
 /// fresh-spawn and --reuse paths). Returns the registry entries.
 #[allow(clippy::too_many_arguments)] // one param per caller mirror, mirrors cmd_spawn
 #[allow(unused_mut)]
+
+/// bd-d7zu: the fail-closed refusal when a freshly split crew pane never
+/// reaches its line editor. Pure so the wording and the refusal itself are
+/// testable without a pane — the operator has to be told the SHELL is the
+/// problem, not handed the downstream `agent not found in toron` that this
+/// very gate exists to prevent.
+fn shell_gate_refusal(name: &str, pane_id: &str) -> anyhow::Error {
+    anyhow!(
+        "pane crew: shell for {name} ({pane_id}) never rendered a prompt within 15s — refusing \
+         to type the launch arg into a shell that is not at its line editor (a ~2.6KB \
+         single-quoted arg would split mid-quote and leave the agent dead on spawn). Re-run once \
+         the host is less loaded, or raise the budget."
+    )
+}
 fn spawn_crew_into(
     cfg: &Config,
     project: &str,
@@ -637,13 +651,20 @@ fn spawn_crew_into(
                 // `wait_shell_prompt`; this crew path did not, which is why
                 // `flywheel crew control relaunch` survives and
                 // `workflow compose --run` dead-on-spawns.
-                let shell_ready =
-                    crate::herdr_shim::wait_shell_prompt(c, &pane_id, Duration::from_secs(15));
-                if !shell_ready {
-                    eprintln!(
-                        "pane crew: shell for {name} ({pane_id}) did not render a prompt within \
-                         15s — the launch command may be mangled by the booting shell"
-                    );
+                //
+                // Fail CLOSED, unlike the relaunch path's warn-and-continue.
+                // Typing the launch arg into a shell that never reached its
+                // line editor does not merely risk a bad spawn: herdr rejects
+                // it (`agent_pane_busy`), the readiness wait then reports
+                // `agent_not_running`, and the dispatch degrades to
+                // "dispatching anyway" — which surfaces as the permanent,
+                // unactionable `agent <name> not found in toron`. Proceeding
+                // past a failed gate is the defect (bd-d7zu principle
+                // `fail-closed`); refuse with the real reason instead. A
+                // measured fresh pane needs ~770ms, so a 15s budget that
+                // expires is a genuinely broken shell, not a slow one.
+                if !crate::herdr_shim::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
+                    return Err(shell_gate_refusal(&name, &pane_id));
                 }
                 // AGENT_ARG must honor Profile.provider via the same
                 // registry pin as cmd_spawn / spawn_launch_plan. Raw
@@ -3441,6 +3462,42 @@ mod pane_registry_fallback_tests {
         assert_eq!(
             got, inline_literal,
             "the shared builder must not move the headless rung's effect_key"
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod bd_d7zu_shell_gate_tests {
+    use super::shell_gate_refusal;
+
+    /// The gate is fail-CLOSED, so the refusal must name the agent, the pane,
+    /// and the real cause. The old failure chain ended in
+    /// `agent <name> not found in toron`, which points the operator at the
+    /// mailbox when the truth is a shell that never booted.
+    #[test]
+    fn refusal_names_the_agent_pane_and_the_real_cause() {
+        let e = shell_gate_refusal("crew-x-coder", "w1:p3");
+        let msg = e.to_string();
+        assert!(msg.contains("crew-x-coder"), "names the agent: {msg}");
+        assert!(msg.contains("w1:p3"), "names the pane: {msg}");
+        assert!(msg.contains("never rendered a prompt"), "states the cause: {msg}");
+        assert!(
+            !msg.contains("not found in toron"),
+            "must not launder a shell fault into the mailbox fault: {msg}"
+        );
+    }
+
+    /// One row per host condition. The budget is a number an operator has to
+    /// be able to read off the message, and a 15s budget on a fresh pane
+    /// (measured ~770ms) must be stated as a number, not a vibe.
+    #[test]
+    fn refusal_states_the_budget_and_the_remedy() {
+        let msg = shell_gate_refusal("a", "b").to_string();
+        assert!(msg.contains("15s"), "states the budget: {msg}");
+        assert!(
+            msg.contains("less loaded") || msg.contains("raise the budget"),
+            "offers a remedy: {msg}"
         );
     }
 }
