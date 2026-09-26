@@ -11,12 +11,17 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::path::{Path, PathBuf};
 
 use crate::authority::RuntimeAuthority;
 
-/// Pinned model id. Never `jev-latest` until pack re-validation CI exists
-/// (ADR-0014 §5.1 I5): a moving alias under static packs is silent drift.
-pub const JEV_MODEL_PIN: &str = "jev-1.13.0";
+/// Model sent on every pack. The operator ordered the `jev-latest` alias
+/// (2026-09-26). A moving alias can change answers without a code change.
+/// Journal the response model id when the API returns one.
+/// Operator order 2026-09-26: send the alias. Live docs say `jev-latest`
+/// is the current stable release. Today that alias resolves to `jev-1.13.0`.
+/// The response `model` field is the version that answered.
+pub const JEV_MODEL_PIN: &str = "jev-latest";
 
 /// System One request endpoint.
 pub const SYSTEMONE_URL: &str = "https://api.typesafe.ai/v1/systemone";
@@ -178,7 +183,10 @@ pub enum QuestionKind {
     Noul,
 }
 
-/// Versioned pack: pure data, lives at `.flywheel/judgment-packs/<id>.vN.yaml`.
+/// Versioned pack. The operator source of truth is
+/// `$XDG_CONFIG_HOME/flywheel/judgment-packs` (`~/.config/flywheel`).
+/// A project `.flywheel/judgment-packs` directory is a lower rung: it
+/// supplies an id the XDG directory does not have. It does not shadow XDG.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct QuestionPack {
     pub id: String,
@@ -190,7 +198,8 @@ pub struct QuestionPack {
 impl QuestionPack {
     /// Parse + validate: non-empty id, version >= 1, pinned model, at least
     /// one question, every question with an id and instructions, Choice with
-    /// >= 2 options. `jev-latest` is rejected (silent drift).
+    /// >= 2 options. The model must be non-empty. `jev-latest` is the
+    /// operator-ordered alias.
     pub fn parse_yaml(text: &str) -> Result<Self, String> {
         let pack: QuestionPack =
             serde_yaml::from_str(text).map_err(|e| format!("pack yaml: {e}"))?;
@@ -202,9 +211,6 @@ impl QuestionPack {
         }
         if pack.model.trim().is_empty() {
             return Err("pack model is empty".into());
-        }
-        if pack.model == "jev-latest" {
-            return Err("pack model must pin a version, never jev-latest".into());
         }
         if pack.questions.is_empty() {
             return Err("pack has no questions".into());
@@ -743,6 +749,12 @@ pub fn merge(
             .push("table undecided (none); jev suggestion attached, human confirms".into());
         escalate = true;
     }
+    if let Some(Answer::Choice(choice)) = answers.and_then(|a| a.by_question.get("scenario")) {
+        advisory_parts.push(format!(
+            "scenario {} is advisory; the table kept {}",
+            choice.choice, table.primitive
+        ));
+    }
     let sticky_violated = match (sticky_topology, explicit_topology) {
         (Some(sticky), None) => table.topology != sticky,
         _ => false,
@@ -859,23 +871,20 @@ pub fn active_thresholds() -> Thresholds {
     }
 }
 
-/// Best-effort pack discovery (B5): absolute project path first, then the cwd
-/// and its ancestors (flag-on outside a repo root no longer denies every
-/// reclassify). Picks the highest `<id>.vN.yaml` version in the first
-/// directory that holds any. Missing everywhere with the flag on is a loud
-/// deny (escalate + audit), never a silent skip.
-/// Newest `<id>.vN.yaml` pack for one id (`reclassify`, `doorbell-screen`,
-/// …) — same ancestor-walk discovery as before, generalized (bd-lpn6).
-/// `find_pack` stays the reclassify entry point.
+/// Pack discovery. XDG `~/.config/flywheel/judgment-packs` is the source of
+/// truth. A project `.flywheel/judgment-packs` (the project path, then cwd
+/// and its ancestors) fills an id XDG does not have. Within one directory
+/// the highest `<id>.vN.yaml` wins. Missing everywhere is a loud deny.
 pub fn find_pack_for(project: &str, id: &str) -> Result<QuestionPack, String> {
-    let mut bases: Vec<std::path::PathBuf> = Vec::new();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    dirs.push(crate::config::config_dir().join("judgment-packs"));
     let p = std::path::PathBuf::from(project);
     if p.is_absolute() {
-        bases.push(p);
+        dirs.push(p.join(PACK_DIR_REL));
     }
     let mut cursor = env::current_dir().ok();
     while let Some(dir) = cursor {
-        bases.push(dir.clone());
+        dirs.push(dir.join(PACK_DIR_REL));
         cursor = dir.parent().map(|q| q.to_path_buf());
     }
     // P3: pack loads ride a (dir, id) cache with mtime invalidation —
@@ -883,20 +892,20 @@ pub fn find_pack_for(project: &str, id: &str) -> Result<QuestionPack, String> {
     static PACK_CACHE: std::sync::OnceLock<std::sync::Mutex<PackCache>> =
         std::sync::OnceLock::new();
     let mut tried: Vec<std::path::PathBuf> = Vec::new();
-    for base in &bases {
-        let dir = base.join(PACK_DIR_REL);
+    for dir in &dirs {
         tried.push(dir.clone());
         let hit = PACK_CACHE
             .get_or_init(|| std::sync::Mutex::new(PackCache::default()))
             .lock()
             .expect("pack cache")
-            .get_or_load(&dir, id);
+            .get_or_load(dir, id);
         if let Some(pack) = hit {
             return pack;
         }
     }
     Err(format!(
-        "{id} pack not found (tried {tried:?}); add {PACK_DIR_REL}/{id}.vN.yaml or unset {FLAG_ENV}"
+        "{id} pack not found (tried {tried:?}); add it under {}/judgment-packs or {PACK_DIR_REL}, or unset {FLAG_ENV}",
+        crate::config::config_dir().display()
     ))
 }
 
@@ -2216,7 +2225,7 @@ mod tests {
     const PACK_YAML: &str = r#"
 id: reclassify
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: intent
     kind: choice
@@ -2311,18 +2320,18 @@ questions:
         assert!(seen >= 5, "reclassify + 4 lpn6 packs, got {seen}");
     }
 
-    /// Every malformed pack the parser must refuse in one table. The
-    /// jev-latest row is the shipped pack with only the model pin swapped.
+    /// Every malformed pack the parser must refuse in one table. A blank
+    /// model is refused. `jev-latest` itself is the operator-ordered alias.
     #[test]
     fn pack_rejects_malformed_yaml_rows() {
         let cases: [(&str, String); 3] = [
-            ("jev-latest", PACK_YAML.replace("jev-1.13.0", "jev-latest")),
+            ("blank-model", PACK_YAML.replace("jev-latest", "   ")),
             (
                 "misaligned_criteria",
                 r#"
 id: x
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: q
     kind: choice
@@ -2337,7 +2346,7 @@ questions:
                 r#"
 id: x
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: q
     kind: choice
@@ -2499,6 +2508,49 @@ questions:
         assert_eq!(m.primitive, "none");
         assert!(m.escalate);
         assert!(m.advisory.unwrap().contains("human confirms"));
+    }
+
+    #[test]
+    fn merge_scenario_choice_is_advisory_and_keeps_the_table() {
+        let t = table("perf", "swarm");
+        let answers = Answers {
+            model_id: "jev-1.13.0".into(),
+            pack_id: "reclassify".into(),
+            pack_version: 3,
+            by_question: BTreeMap::from([(
+                "scenario".into(),
+                Answer::Choice(ChoiceAnswer {
+                    choice: "climb".into(),
+                    probs: BTreeMap::from([
+                        ("climb".into(), 0.8),
+                        ("one-measure".into(), 0.2),
+                    ]),
+                }),
+            )]),
+            usage: "{}".into(),
+        };
+        let m = merge(
+            &t,
+            Some(&answers),
+            0.6,
+            ActionClass::AnnounceOnly,
+            &Thresholds::default(),
+            None,
+            None,
+            &effect_parent(),
+            "reclassify",
+            3,
+            JEV_MODEL_PIN,
+            "{}",
+            false,
+            0,
+            None,
+        );
+        assert_eq!(m.primitive, "perf");
+        assert_eq!(m.topology, "swarm");
+        let note = m.advisory.unwrap();
+        assert!(note.contains("scenario climb"), "{note}");
+        assert!(note.contains("table kept perf"), "{note}");
     }
 
     #[test]
@@ -2675,7 +2727,7 @@ questions:
         let bad = r#"
 id: x
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: q
     kind: score
@@ -2739,17 +2791,55 @@ questions:
 
     #[test]
     fn b5_find_pack_picks_highest_version() {
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
         let base = std::env::temp_dir().join(format!("jev-pack-{}", std::process::id()));
+        let xdg = base.join("xdg");
         let dir = base.join(".flywheel/judgment-packs");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(xdg.join("flywheel")).unwrap();
         std::fs::write(dir.join("reclassify.v1.yaml"), PACK_YAML).unwrap();
         std::fs::write(
             dir.join("reclassify.v2.yaml"),
             PACK_YAML.replace("version: 1", "version: 2"),
         )
         .unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         let found = find_pack(base.to_str().unwrap()).unwrap();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
         assert_eq!(found.version, 2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// XDG holds the pack the process loads. A project `.flywheel` copy of
+    /// the same id does not replace it, even at a higher version.
+    #[test]
+    fn xdg_pack_is_the_source_of_truth() {
+        let _g = crate::config::ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("jev-xdg-{}", std::process::id()));
+        let xdg = base.join("xdg");
+        let proj = base.join("proj");
+        let user = xdg.join("flywheel/judgment-packs");
+        let project = proj.join(".flywheel/judgment-packs");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(user.join("reclassify.v1.yaml"), PACK_YAML).unwrap();
+        std::fs::write(
+            project.join("reclassify.v9.yaml"),
+            PACK_YAML.replace("version: 1", "version: 9"),
+        )
+        .unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        let found = find_pack(proj.to_str().unwrap()).unwrap();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        assert_eq!(found.version, 1, "xdg wins over a project rung");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2836,7 +2926,7 @@ questions:
     const SCREEN_YAML: &str = r#"
 id: doorbell-screen
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: injection
     kind: noul
@@ -3006,7 +3096,7 @@ questions:
     #[test]
     fn annotate_folds_state_intent_plainly() {
         let pack = QuestionPack::parse_yaml(
-            "id: coalition-intent\nversion: 1\nmodel: jev-1.13.0\nquestions:\n  - id: intent\n    kind: choice\n    instructions: \"?\"\n    options: [joint-ownership, review-handoff, no-coalition, unclear]\n    criteria: [\"a\", \"b\", \"c\", \"d\"]\n",
+            "id: coalition-intent\nversion: 1\nmodel: jev-latest\nquestions:\n  - id: intent\n    kind: choice\n    instructions: \"?\"\n    options: [joint-ownership, review-handoff, no-coalition, unclear]\n    criteria: [\"a\", \"b\", \"c\", \"d\"]\n",
         )
         .unwrap();
         let answers = Answers {
@@ -3039,7 +3129,7 @@ questions:
             r#"
 id: profile-pick
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: profile_fit
     kind: score
@@ -3075,7 +3165,7 @@ questions:
             r#"
 id: tier-pick
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: reasoning_depth
     kind: score
@@ -3153,7 +3243,7 @@ questions:
             r#"
 id: profile-pick
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: profile_fit
     kind: score
@@ -3179,7 +3269,7 @@ questions:
             r#"
 id: profile-pick
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: profile_fit__coder
     kind: score
@@ -3278,7 +3368,7 @@ questions:
             r#"
 id: profile-pick
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: profile_fit
     kind: score
@@ -3295,7 +3385,7 @@ questions:
             r#"
 id: tier-pick
 version: 1
-model: jev-1.13.0
+model: jev-latest
 questions:
   - id: reasoning_depth
     kind: score
@@ -3645,5 +3735,323 @@ questions:
         assert!(out.audit.is_some());
         let reason = out.reason;
         assert!(reason.contains("jev"), "deny attaches advisory: {reason}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pack sync — the missing half of `workflow seed`
+// ---------------------------------------------------------------------------
+
+/// How much of the user-tier pack set `judgment pack seed` may replace.
+///
+/// Mirrors [`crate::workflow_catalog::OverwriteScope`] and for the same reason:
+/// the default fills gaps only, so an agent may run it unattended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackOverwrite {
+    #[default]
+    None,
+    Stale,
+    All,
+}
+
+impl PackOverwrite {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "none" => Ok(Self::None),
+            "stale" => Ok(Self::Stale),
+            "all" => Ok(Self::All),
+            other => anyhow::bail!("unknown --overwrite scope {other:?} (expected: none | stale | all)"),
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Stale => "stale",
+            Self::All => "all",
+        }
+    }
+}
+
+/// One pack id, compared across the two tiers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PackDriftRow {
+    pub id: String,
+    /// `identical` | `stale` | `missing` | `user-only`
+    pub status: String,
+    pub user_version: Option<u32>,
+    pub project_version: Option<u32>,
+}
+
+/// Every user-tier file for a pack id, highest version first.
+///
+/// `all_versions == false` yields only the winner, which is the file the loader
+/// would actually read — so `remove` without `--all-versions` cannot delete a
+/// version that was already shadowed and change nothing, which would read as a
+/// successful removal.
+pub fn pack_files_for(dir: &Path, id: &str, all_versions: bool) -> Vec<PathBuf> {
+    let mut found: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter_map(|p| pack_entry(&p).and_then(|(eid, v)| (eid == id).then_some((v, p))))
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    let take = if all_versions { found.len() } else { 1 };
+    found.into_iter().take(take).map(|(_, p)| p).collect()
+}
+
+/// Parse `<id>.vN.yaml` -> (id, version).
+fn pack_entry(path: &Path) -> Option<(String, u32)> {
+    let stem = path.file_stem()?.to_str()?;
+    let (id, v) = stem.rsplit_once(".v")?;
+    Some((id.to_string(), v.parse().ok()?))
+}
+
+/// Highest-versioned pack for an id in one directory — the loader's own rule,
+/// so drift and `find_pack_for` can never disagree about which file wins.
+fn highest_pack(dir: &Path, id: &str) -> Option<PathBuf> {
+    let mut best: Option<(u32, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some((eid, v)) = pack_entry(&path) else { continue };
+        if eid != id {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(bv, _)| v > *bv) {
+            best = Some((v, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn pack_ids(dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter_map(|p| pack_entry(&p))
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Compare the user-tier pack set against a project pack directory.
+///
+/// A pack the USER tier has at a higher version is `stale`-free on purpose: the
+/// loader takes the highest version, so calling that stale would invite a
+/// `--overwrite` that silently DOWNGRADES the operator's pack.
+pub fn pack_drift(user_dir: &Path, project_dir: &Path) -> Vec<PackDriftRow> {
+    let mut ids = pack_ids(project_dir);
+    for id in pack_ids(user_dir) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids.into_iter()
+        .map(|id| {
+            let user = highest_pack(user_dir, &id);
+            let project = highest_pack(project_dir, &id);
+            let uv = user.as_deref().and_then(|p| pack_entry(p)).map(|(_, v)| v);
+            let pv = project.as_deref().and_then(|p| pack_entry(p)).map(|(_, v)| v);
+            let status = match (&user, &project) {
+                (None, Some(_)) => "missing",
+                (Some(_), None) => "user-only",
+                // Both tiers claim the id but neither has a readable file:
+                // report it rather than panicking on an unhandled pair.
+                (None, None) => "unreadable",
+                (Some(u), Some(p)) => {
+                    let same = std::fs::read(u).ok() == std::fs::read(p).ok();
+                    if same {
+                        "identical"
+                    } else if uv > pv {
+                        // The user tier is ahead; replacing would downgrade.
+                        "newer-user"
+                    } else {
+                        "stale"
+                    }
+                }
+            };
+            PackDriftRow {
+                id,
+                status: status.to_string(),
+                user_version: uv,
+                project_version: pv,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PackSeedReport {
+    pub copied: Vec<String>,
+    pub kept: Vec<String>,
+    pub overwritten: Vec<String>,
+    pub planned_overwrites: Vec<String>,
+    pub dry_run: bool,
+}
+
+/// Copy project-tier packs UP into the user tier, which is the loader's source
+/// of truth. Same contract as `workflow seed`: fill gaps by default, replace
+/// only on request, back up before replacing.
+pub fn pack_seed(
+    user_dir: &Path,
+    project_dir: &Path,
+    scope: PackOverwrite,
+    dry_run: bool,
+) -> anyhow::Result<PackSeedReport> {
+    let mut rep = PackSeedReport {
+        dry_run,
+        ..Default::default()
+    };
+    let rows = pack_drift(user_dir, project_dir);
+    for row in rows {
+        if row.status == "user-only" || row.status == "newer-user" {
+            rep.kept.push(row.id);
+            continue;
+        }
+        let Some(src) = highest_pack(project_dir, &row.id) else {
+            continue;
+        };
+        let dst = user_dir.join(
+            src.file_name()
+                .expect("pack path has a file name"),
+        );
+        let replace = match scope {
+            PackOverwrite::None => false,
+            PackOverwrite::Stale => row.status == "stale",
+            PackOverwrite::All => dst.exists(),
+        };
+        // The dst EXISTING is the whole question. My first cut branched on
+        // `replace` alone, so a DIVERGED pack at the default scope fell into the
+        // copy branch and overwrote the operator's file anyway — the exact
+        // clobber this command exists to prevent. Branch on what is on disk.
+        if dst.exists() {
+            if !replace {
+                rep.kept.push(row.id);
+                continue;
+            }
+            if dry_run {
+                rep.planned_overwrites.push(row.id);
+                continue;
+            }
+            let bak = dst.with_extension("yaml.bak");
+            if let Ok(prev) = std::fs::read(&dst) {
+                std::fs::write(&bak, prev)?;
+            }
+            std::fs::create_dir_all(user_dir)?;
+            std::fs::copy(&src, &dst).map_err(|e| {
+                anyhow::anyhow!("copy {} -> {}: {e}", src.display(), dst.display())
+            })?;
+            rep.overwritten.push(row.id);
+        } else {
+            rep.copied.push(row.id);
+            if !dry_run {
+                std::fs::create_dir_all(user_dir)?;
+                std::fs::copy(&src, &dst).map_err(|e| {
+                    anyhow::anyhow!("copy {} -> {}: {e}", src.display(), dst.display())
+                })?;
+            }
+        }
+    }
+    Ok(rep)
+}
+
+#[cfg(test)]
+mod bd_pack_sync {
+    use super::*;
+
+    fn root(tag: &str) -> std::path::PathBuf {
+        let r = std::env::temp_dir().join(format!("packsync-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&r);
+        std::fs::create_dir_all(r.join("judgment-packs")).expect("mkdir user");
+        std::fs::create_dir_all(r.join("project/.flywheel/judgment-packs")).expect("mkdir proj");
+        r
+    }
+
+    const PACK: &str = "name: reclassify\nversion: 1\nquestions: []\n";
+
+    /// XDG is the source of truth; a project pack fills a gap. A project pack
+    /// the user tier does NOT have is the only thing seed should copy up.
+    #[test]
+    fn seed_promotes_only_packs_the_user_tier_lacks() {
+        let r = root("promote");
+        let proj = r.join("project/.flywheel/judgment-packs");
+        std::fs::write(proj.join("reclassify.v1.yaml"), PACK).expect("write proj pack");
+        // A user-tier pack the project also has — must be left alone.
+        std::fs::write(r.join("judgment-packs/reclassify.v1.yaml"), "name: reclassify\nversion: 1\nquestions: []\n# LOCAL\n").expect("write user pack");
+
+        let rep = pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::None, false).expect("seed");
+        assert_eq!(rep.copied.len() + rep.kept.len(), 1, "one pack id considered");
+        assert_eq!(rep.kept, vec!["reclassify".to_string()]);
+        assert!(
+            std::fs::read_to_string(r.join("judgment-packs/reclassify.v1.yaml"))
+                .expect("read")
+                .contains("# LOCAL"),
+            "an existing user pack must never be replaced without --overwrite"
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn seed_copies_a_missing_pack_up_and_drift_then_agrees() {
+        let r = root("copy");
+        let proj = r.join("project/.flywheel/judgment-packs");
+        std::fs::write(proj.join("doorbell-screen.v1.yaml"), PACK).expect("write");
+        let before = pack_drift(&r.join("judgment-packs"), &proj);
+        assert_eq!(before[0].status, "missing", "not yet in the user tier");
+
+        pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::None, false).expect("seed");
+        assert!(r.join("judgment-packs/doorbell-screen.v1.yaml").exists());
+        let after = pack_drift(&r.join("judgment-packs"), &proj);
+        assert_eq!(after[0].status, "identical", "drift must agree the copy landed");
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// A project pack that DIVERGED from the user copy is a decision, not a
+    /// merge. It must be visible, and replaceable only on request.
+    #[test]
+    fn a_diverged_pack_is_reported_and_replaced_only_on_overwrite() {
+        let r = root("diverge");
+        let proj = r.join("project/.flywheel/judgment-packs");
+        std::fs::write(proj.join("reclassify.v1.yaml"), PACK).expect("write");
+        std::fs::write(r.join("judgment-packs/reclassify.v1.yaml"), "name: reclassify\nversion: 1\nquestions: []\n# DIVERGED\n").expect("write");
+        assert_eq!(pack_drift(&r.join("judgment-packs"), &proj)[0].status, "stale");
+
+        pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::Stale, false).expect("seed");
+        assert_eq!(pack_drift(&r.join("judgment-packs"), &proj)[0].status, "identical");
+        assert!(r.join("judgment-packs/reclassify.v1.yaml.bak").exists(), "old bytes recoverable");
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// A pack the PROJECT has and the user tier has at a DIFFERENT version is
+    /// not automatically stale: the higher version wins by the loader's own
+    /// rule, so replacing it would be a DOWNGRADE.
+    #[test]
+    fn a_newer_user_pack_is_not_downgraded() {
+        let r = root("version");
+        let proj = r.join("project/.flywheel/judgment-packs");
+        std::fs::write(proj.join("reclassify.v1.yaml"), PACK).expect("write v1");
+        std::fs::write(r.join("judgment-packs/reclassify.v2.yaml"), "name: reclassify\nversion: 2\nquestions: []\n").expect("write v2");
+        let rows = pack_drift(&r.join("judgment-packs"), &proj);
+        assert_ne!(rows[0].status, "stale", "a newer user pack is not a stale copy");
+        pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::All, false).expect("seed");
+        assert!(
+            r.join("judgment-packs/reclassify.v2.yaml").exists(),
+            "--overwrite all must not silently downgrade the user's newer pack"
+        );
+        let _ = std::fs::remove_dir_all(&r);
     }
 }

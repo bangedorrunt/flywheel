@@ -2526,7 +2526,9 @@ fn main() {
             "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
                 "coalition debate plan-review profile squad model slot catalog runs list/show/pending/digest/reconcile",
                 "workflow cron recipes workflows pipeline template stage ensemble",
-                "workflow seed/drift — copy builtin workflows+stages to user tier without overwrite; report missing/current/stale/custom",
+                "workflow seed/drift — copy builtin workflows+stages to the user tier (--overwrite none|stale|all, default none; only builtin-named copies; --dry-run; fails closed with no TTY and no --yes; every replaced file kept as <name>.bak) and report missing/current/stale/custom grouped by action. Seeds from the compiled-in SOURCE TEXT, never a serde round-trip (bd-3o5t: that wrote crew: null and made every crew workflow headless while drift called it current)",
+            "judgment pack drift|seed|remove|list — compare and sync judgment packs across the user tier (source of truth) and the project tier; a user pack at a higher version is never downgraded",
+            "stage remove <name> — delete a user-tier stage file (backed up as <name>.toml.bak) so the compiled-in stage resolves again",
                 "checkpoint timeline audit history changes resume analytics",
                 "backend safety guards policy deps integration config upgrade tutorial serve preflight"
             ],
