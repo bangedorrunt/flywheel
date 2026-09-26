@@ -10,7 +10,10 @@ A coalition is a captain-formed, per-goal grouping of pane crews that coordinate
 - One agent, one task, you watch: `flywheel send` (no coalition).
 - A fixed daily stage sequence on a live swarm: `loop-mode run --work` (no coalition).
 - A reusable multi-step procedure: a workflow (no coalition).
-- Multi-crew, shared files, needs coordination: `coalition form`.
+- Multi-crew, shared files, needs coordination: `coalition form <GOAL> --crews <CREWS> --as <agent>`.
+
+The form verb takes the goal positionally and both `--crews` and `--as` as
+required flags; `--as` is the captain the coalition mails.
 
 Coalitions are **pane-crew-only**. Headless cron crews are a separate autonomous world.
 
@@ -60,11 +63,30 @@ When intents overlap, a detector (workflow-as-reaction on intent declaration) dr
 ## Disputes: the negotiation ladder
 
 ```bash
-flywheel coalition negotiate-request <id> --as <asker> --target <holder> --reservation-id <reservation> --ask "<question>"
-flywheel coalition negotiate-respond <id> --as <holder>     # answer or defer
-flywheel coalition negotiate-status <id>                    # pending | responded | escalation-due
-flywheel coalition negotiate-escalate <id>                  # unanswered -> kind-14 DM to the captain
+flywheel coalition negotiate-request <ID> --as <asker> --target <holder> \
+  --reservation-id <reservation> --ask "<question>"
+flywheel coalition negotiate-respond <ID> --as <holder> \
+  --request-message <request-id> --decision agreed|denied|deferred:<secs>
+flywheel coalition negotiate-status <ID> --as <agent> --request-message <request-id>
+flywheel coalition negotiate-escalate <ID> --as <agent> --request-message <request-id>
 ```
+
+```text
+$ flywheel coalition list
+beads-20260809231032-620210000 [closed] goal beads members 2
+beads-20260810002826-310488000 [active] goal beads members 2
+
+$ flywheel coalition status
+
+error: the following required arguments were not provided:
+  <ID>
+
+Usage: flywheel coalition status <ID>
+```
+
+Every verb after the request needs the request's own id: `--request-message`
+on respond/status/escalate, and `--decision` on respond. `status` addresses one
+coalition (`<ID>`), not the list — `coalition list` is the list.
 
 ```text
 pending           · request sent, holder has not answered

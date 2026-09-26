@@ -84,12 +84,16 @@ function extractSurface(bin) {
     // long flag → does it take a value? (`--project <PROJECT>` does)
     const flags = new Map();
     const shorts = new Map();
+    const shortLong = new Map();
     for (const line of text.split("\n")) {
       const m = line.match(/^\s+(?:-(\w),\s+)?--([a-z0-9][a-z0-9-]*)(.*)$/);
       if (!m) continue;
       const takesValue = /<[^>]+>/.test(m[3]);
       flags.set(m[2], takesValue);
-      if (m[1]) shorts.set(m[1], takesValue);
+      if (m[1]) {
+        shorts.set(m[1], takesValue);
+        shortLong.set(m[1], m[2]);
+      }
     }
 
     // Positional arguments, read off the clap usage line: `Usage: toron slot
@@ -101,15 +105,35 @@ function extractSurface(bin) {
     // guides and nothing failed. `[OPTIONS]` / `[COMMAND]` are not positionals.
     // A missing usage line reads as "unknown", and unknown is kept permissive:
     // this rule must never manufacture drift out of a help text we cannot parse.
+    // Two more facts off the same usage line: which flags are REQUIRED (clap
+    // prints optional ones bracketed: `[--holder <PIN>]`) and how many
+    // positionals are required. A guide that omits a required flag is a command
+    // the reader cannot run — `toron bench` with no CASE fails at runtime while
+    // every token in it resolves. Bracketed regions are dropped before the parse
+    // so `[--holder <PIN>]` cannot read as required.
     const usageLine = text.split("\n").find((l) => /^Usage:\s/.test(l));
     let positionals = 1;
+    let requiredPositionals = 0;
+    const requiredFlags = new Set();
     if (usageLine) {
-      // Drop `--flag <VALUE>` and `--flag=<VALUE>` pairs, then count what is
-      // left over: `<PROJECT>` and `[FILE]` are positionals, `[OPTIONS]` is not.
-      const tail = usageLine.replace(/--[a-z0-9-]+\s*[= ]\s*<[^>]+>/g, " ");
-      positionals = (tail.match(/<[^>]+>|\[[^\]]+\]/g) || []).filter(
-        (t) => !/^\[(OPTIONS|COMMAND|FLAGS?)\]$/i.test(t),
+      // Required half: drop the bracketed (optional) regions, then drop
+      // `--flag <VALUE>` pairs. What is left is what a caller MUST supply.
+      const required = usageLine.replace(/\[[^\]]*\]/g, " ");
+      requiredPositionals = (
+        required.replace(/--[a-z0-9-]+\s*[= ]\s*<[^>]+>/g, " ").match(/<[^>]+>/g) || []
       ).length;
+      for (const m of required.matchAll(/--([a-z0-9][a-z0-9-]*)\s*[= ]\s*<[^>]+>/g)) {
+        requiredFlags.add(m[1]);
+      }
+      // Optional half: a bracketed region that is not a flag and not the generic
+      // `[OPTIONS]`/`[COMMAND]` is an optional positional (`[PATH]`), which still
+      // makes the node accept one. That count is what the literal-positional rule
+      // and the missing-positional rule both need.
+      const optionalPositionals = (usageLine.match(/\[[^\]]*\]/g) || []).filter(
+        (seg) =>
+          !/^\[\s*-/.test(seg) && !/^\[(OPTIONS|COMMAND|FLAGS?)\]$/i.test(seg),
+      ).length;
+      positionals = requiredPositionals + optionalPositionals;
     }
 
     const children = new Set();
@@ -127,7 +151,15 @@ function extractSurface(bin) {
       }
     }
 
-    commands.set(key, { flags, shorts, children, positionals });
+    commands.set(key, {
+      flags,
+      shorts,
+      shortLong,
+      children,
+      positionals,
+      requiredFlags,
+      requiredPositionals,
+    });
     for (const child of children) queue.push([...path, child]);
   }
   return commands;
@@ -165,7 +197,13 @@ function commandLines(block) {
     let line = raw.trim();
     if (!line || line.startsWith("#") || line.startsWith("%%")) continue;
     line = line.replace(/^\$\s*/, "");
-    line = line.split(/\|\||&&|\||;/)[0].trim();
+    // Split off pipes/redirections, but a `|` inside a placeholder is part of the
+    // value, not a shell pipe: `--crews <squad|profile>` was being truncated at
+    // the pipe, which made the required `--as` that followed look missing.
+    line = line
+      .replace(/<[^>]*>/g, (m) => m.replace(/\|/g, "/"))
+      .split(/\|\||&&|\||;/)[0]
+      .trim();
     let tokens = tokenize(line);
     while (tokens.length > 0 && /^[A-Z_][A-Z0-9_]*=/.test(tokens[0])) tokens.shift();
     // Drop a trailing `# comment`. A `#` mid-token (inside a quoted value) is
@@ -193,6 +231,8 @@ function commandLines(block) {
 function verifyCommand(tokens, surface) {
   const errors = [];
   const path = [];
+  const seenFlags = new Set();
+  let positionalsSeen = 0;
   let node = surface.get("");
   if (!node) return errors;
 
@@ -210,12 +250,17 @@ function verifyCommand(tokens, surface) {
           errors.push(`unknown flag --${long[1]} on \`${where}\``);
         } else {
           takesValue = node.flags.get(long[1]);
+          seenFlags.add(long[1]);
         }
       } else if (short) {
         if (!node.shorts.has(short[1])) {
           errors.push(`unknown flag -${short[1]} on \`${where}\``);
         } else {
           takesValue = node.shorts.get(short[1]);
+          // A short spelling satisfies the required long flag it aliases.
+          seenFlags.add(short[1]);
+          const aliased = node.shortLong.get(short[1]);
+          if (aliased) seenFlags.add(aliased);
         }
       }
       if (takesValue && !t.includes("=")) i++;
@@ -232,6 +277,10 @@ function verifyCommand(tokens, surface) {
         const where = `${OWN_BIN} ${path.join(" ")}`.trimEnd();
         errors.push(`unexpected argument \`${t}\` on \`${where}\` (its usage takes none)`);
       }
+      // It fills a positional slot, so it counts toward the required ones:
+      // `mail whois <project> <name>` supplies the two the usage asks for even
+      // though neither token is a literal.
+      positionalsSeen++;
       continue;
     }
 
@@ -260,8 +309,62 @@ function verifyCommand(tokens, surface) {
       const where = `${OWN_BIN} ${path.join(" ")}`.trimEnd();
       errors.push(`unexpected positional \`${t}\` on \`${where}\` (its usage takes none)`);
     }
+    positionalsSeen++;
+  }
+
+  // Missing required arguments are drift too: every token resolves and the
+  // reader's copy still fails at runtime (`toron bench` with no CASE). Skipped
+  // when the walk already failed, so one defect reports one error instead of a
+  // cascade judged against the wrong help text.
+  if (errors.length === 0 && node) {
+    const where = `${OWN_BIN} ${path.join(" ")}`.trimEnd();
+    for (const f of node.requiredFlags || []) {
+      if (!seenFlags.has(f)) errors.push(`missing required flag --${f} for \`${where}\``);
+    }
+    const needed = (node.requiredPositionals || 0) - positionalsSeen;
+    if (needed > 0) {
+      errors.push(
+        `missing required argument(s) for \`${where}\` — its usage takes ${node.requiredPositionals}`,
+      );
+    }
   }
   return errors;
+}
+
+// Counts written in the guides are claims about the emitted catalog: "38 tools"
+// is only true until the binary changes. Read the catalog back and fail on any
+// number that no longer matches, so a hand-typed count cannot age silently.
+// Skipped loudly when the binary cannot emit the catalog.
+function catalogCountDrift(entries) {
+  const r = spawnSync(OWN_BIN, ["catalog", "--json"], { encoding: "utf8" });
+  if (r.status !== 0 || !r.stdout) {
+    console.error(`skip catalog counts: \`${OWN_BIN} catalog --json\` did not emit (exit ${r.status})`);
+    return;
+  }
+  let catalog;
+  try {
+    catalog = JSON.parse(r.stdout);
+  } catch {
+    console.error(`skip catalog counts: \`${OWN_BIN} catalog --json\` did not emit JSON`);
+    return;
+  }
+  const real = {
+    tools: catalog.tools?.length ?? 0,
+    resources: catalog.resources?.length ?? 0,
+  };
+  for (const { rel, body } of entries) {
+    for (const [n, line] of body.split("\n").entries()) {
+      for (const [what, want] of Object.entries(real)) {
+        const m = line.match(new RegExp(`(\\d+)\\s+${what}\\b`));
+        if (m && Number(m[1]) !== want) {
+          console.error(
+            `FAIL ${rel}: ${n + 1}: the guide says \`${m[0]}\` and \`${OWN_BIN} catalog --json\` emits ${want} — in \`${line.trim().slice(0, 100)}\``,
+          );
+          failed = 1;
+        }
+      }
+    }
+  }
 }
 
 // --------------------------------------------------------------- block walking
@@ -317,7 +420,14 @@ function check(file, surface) {
       continue;
     }
     if (/^#\s/.test(line)) errors.push(`${n}: body h1; titles live in frontmatter`);
-    if (/<[A-Z][A-Za-z]*[\s/>]/.test(line)) errors.push(`${n}: JSX component without an import surface`);
+    // JSX-looking prose is a defect in these repos (the guides render as plain
+    // markdown), but a placeholder is not JSX. `<Pin>`, `<ID>` and `<NAME>` are
+    // legitimate inside code spans and after flags, so those regions come out
+    // before the test; only a bare component name left in prose trips it.
+    const prose = line
+      .replace(/`[^`]*`/g, "")
+      .replace(/--[a-z0-9-]+\s+<[A-Za-z0-9_.-]+>/g, "");
+    if (/<[A-Z][A-Za-z]*[\s/>]/.test(prose)) errors.push(`${n}: JSX component without an import surface`);
   }
   if (fence !== 0) errors.push("unbalanced code fence");
 
@@ -413,11 +523,14 @@ if (files.length === 0) {
   console.error("no .mdx guides found");
   failed = 1;
 }
+const bodies = [];
 for (const f of files) {
   const rel = relative(root, f);
   const { errors, warns } = check(f, surface);
   for (const w of warns) console.error(`skip ${rel}: ${w}`);
   if (errors.length === 0) console.log(`ok   ${rel}`);
   else { failed = 1; for (const e of errors) console.error(`FAIL ${rel}: ${e}`); }
+  bodies.push({ rel, body: readFileSync(f, "utf8") });
 }
+if (surface) catalogCountDrift(bodies);
 process.exit(failed);
