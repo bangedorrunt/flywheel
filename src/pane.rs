@@ -236,6 +236,50 @@ pub fn resolve_pane_entry<'a>(entries: &'a LiveRegistry, profile: &str) -> Optio
     })
 }
 
+/// bd-0s0y: the `nth` DISTINCT live pane serving `profile`.
+///
+/// A `parallel`/`each` fan-out over a role runs N copies of the *same* step,
+/// and each copy needs its own agent: the busy-owner fence admits exactly
+/// one in-flight dispatch per agent (bd-fen3), so N copies that resolve to
+/// one pane is a guaranteed refusal for copies 2..N — not a race, a certainty.
+/// [`resolve_pane_entry`] is a single-entry lookup with no ordinal, so every
+/// copy got the same pane and the run died at the first fan-out. `ce-brainstorm`'s
+/// `diverge` is `over: "3"` over `@oracle`, and a crew sizes one pane per
+/// unique ROLE, so no crew size could ever satisfy it.
+///
+/// Ordering, and why it is safe: rows are grouped by agent NAME, the highest
+/// incarnation wins per name (a respawn is a newer generation of the SAME
+/// slot, never an extra copy), and the surviving names keep registry
+/// insertion order — which is spawn order, so `nth` is the nth pane the crew
+/// actually created. Panes are distinct because one name maps to one pane.
+pub fn resolve_pane_entry_nth<'a>(
+    entries: &'a LiveRegistry,
+    profile: &str,
+    nth: usize,
+) -> Option<&'a SpawnEntry> {
+    let serves = |e: &SpawnEntry| e.profile.as_deref() == Some(profile) || e.name == profile;
+    // First appearance of each name fixes the slot order; spawn order is the
+    // order the crew created the copies in, and it is what `nth` means.
+    let mut slots: Vec<&SpawnEntry> = Vec::new();
+    for e in entries.entries().iter().filter(|e| serves(e)) {
+        if !slots.iter().any(|s| s.name == e.name) {
+            slots.push(e);
+        }
+    }
+    slots
+        .iter()
+        .filter_map(|slot| {
+            best_generation(
+                entries
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, e)| e.name == slot.name),
+            )
+        })
+        .nth(nth)
+}
+
 /// bd-op8b: drop registry rows whose pane no longer exists anywhere.
 /// Loaded registries otherwise carry dead rows forever; the first
 /// profile-match then steals fresh-crew dispatches (and a stale
@@ -2978,6 +3022,158 @@ mod tests {
         assert_eq!(e.name, "plain-agent");
         assert_eq!(e.profile, None);
         assert!(resolve_pane_entry(&entries, "ghost").is_none());
+    }
+
+    /// bd-0s0y: a `parallel`/`each` fan-out over a role must be able to reach
+    /// N DIFFERENT agents. Before this, every copy resolved through the
+    /// single-entry lookup to one pane, so copies 2..N hit the busy-owner
+    /// fence and killed the run — the reason `steer --crew N` never completed
+    /// end to end, at any crew size.
+    #[test]
+    fn fanout_copies_resolve_to_distinct_panes() {
+        // The shape a real crew writes: ONE pane per unique role is what the
+        // packer spawns for `crew: auto`, and a role with copies gets
+        // `…-oracle`, `…-oracle2`, `…-oracle3` on separate panes.
+        let entries = as_live(vec![
+            SpawnEntry {
+                pane_id: "w2:p1".into(),
+                name: "crew-goal-oracle".into(),
+                profile: Some("oracle".into()),
+                harness: Some("omp".into()),
+                model: None,
+                model_pin: None,
+                skills_digest: None,
+                mail_identity: None,
+                skills_injected: false,
+                incarnation: 0,
+            },
+            SpawnEntry {
+                pane_id: "w2:p2".into(),
+                name: "crew-goal-oracle2".into(),
+                profile: Some("oracle".into()),
+                harness: Some("omp".into()),
+                model: None,
+                model_pin: None,
+                skills_digest: None,
+                mail_identity: None,
+                skills_injected: false,
+                incarnation: 0,
+            },
+            SpawnEntry {
+                pane_id: "w2:p3".into(),
+                name: "crew-goal-oracle3".into(),
+                profile: Some("oracle".into()),
+                harness: Some("omp".into()),
+                model: None,
+                model_pin: None,
+                skills_digest: None,
+                mail_identity: None,
+                skills_injected: false,
+                incarnation: 0,
+            },
+            SpawnEntry {
+                pane_id: "w2:p4".into(),
+                name: "crew-goal-coder".into(),
+                profile: Some("coder".into()),
+                harness: Some("omp".into()),
+                model: None,
+                model_pin: None,
+                skills_digest: None,
+                mail_identity: None,
+                skills_injected: false,
+                incarnation: 0,
+            },
+        ]);
+
+        // The defect, stated as an assertion: the single-entry lookup is
+        // ordinal-blind, so all three copies collapse onto one agent. This is
+        // what put "fenced as busy" on the second copy.
+        let first = resolve_pane_entry(&entries, "oracle").expect("profile hit");
+        let again = resolve_pane_entry(&entries, "oracle").expect("profile hit");
+        assert_eq!(
+            first.pane_id, again.pane_id,
+            "the single-entry lookup is ordinal-blind BY CONSTRUCTION — this equality \
+             is the defect, not an accident of these rows"
+        );
+
+        // The fix: copy i reaches copy i.
+        let picked: Vec<String> = (0..3)
+            .map(|i| {
+                resolve_pane_entry_nth(&entries, "oracle", i)
+                    .expect("copy exists")
+                    .pane_id
+                    .clone()
+            })
+            .collect();
+        assert_eq!(
+            picked,
+            vec!["w2:p1", "w2:p2", "w2:p3"],
+            "3 copies of `over: \"3\"` must reach 3 distinct panes, got {picked:?}"
+        );
+
+        // A 4th copy does not exist: the fence must fail loud on an
+        // over-count rather than silently reuse copy 0's pane.
+        assert!(
+            resolve_pane_entry_nth(&entries, "oracle", 3).is_none(),
+            "one more copy than the crew has panes must be None, never a reuse"
+        );
+
+        // A single-copy role is unchanged, so the working path cannot regress:
+        // nth 0 is exactly the entry the old lookup returned.
+        assert_eq!(
+            resolve_pane_entry_nth(&entries, "coder", 0)
+                .expect("coder")
+                .pane_id,
+            resolve_pane_entry(&entries, "coder")
+                .expect("coder")
+                .pane_id
+        );
+        assert!(resolve_pane_entry_nth(&entries, "coder", 1).is_none());
+    }
+
+    /// bd-0s0y: a respawn is a NEWER GENERATION of the same slot, not an extra
+    /// copy. Counting generations as copies would hand copy 1 a dead pane and
+    /// leave the live one unreachable.
+    #[test]
+    fn respawn_does_not_inflate_the_copy_count() {
+        let entries = as_live(vec![
+            SpawnEntry {
+                pane_id: "w3:p1".into(),
+                name: "crew-goal-oracle".into(),
+                profile: Some("oracle".into()),
+                harness: Some("omp".into()),
+                model: None,
+                model_pin: None,
+                skills_digest: None,
+                mail_identity: None,
+                skills_injected: false,
+                incarnation: 0,
+            },
+            // Same name, newer generation, different pane.
+            SpawnEntry {
+                pane_id: "w3:p9".into(),
+                name: "crew-goal-oracle".into(),
+                profile: Some("oracle".into()),
+                harness: Some("omp".into()),
+                model: None,
+                model_pin: None,
+                skills_digest: None,
+                mail_identity: None,
+                skills_injected: false,
+                incarnation: 1,
+            },
+        ]);
+        assert_eq!(
+            resolve_pane_entry_nth(&entries, "oracle", 0)
+                .expect("copy 0")
+                .pane_id,
+            "w3:p9",
+            "copy 0 must be the live generation, not the dead one"
+        );
+        assert!(
+            resolve_pane_entry_nth(&entries, "oracle", 1).is_none(),
+            "one name is one slot: a respawn must not read as a second copy"
+        );
     }
 
     /// bd-op8b (red first): loaded registry rows whose pane is gone must
