@@ -1101,6 +1101,10 @@ impl FileHost {
             use std::io::Write;
             let _ = writeln!(f, "{entry}");
         }
+        // bd-lorot: the audit log had NO rotation while the journal had a full
+        // retention discipline. See rotate_audit_if_oversized for why that is
+        // backwards: the audit log is the high-volume one.
+        rotate_audit_if_oversized(&path);
     }
 
     /// Presence prompt filter — mirrors `workspace::filter_prompts` over
@@ -2555,5 +2559,197 @@ mod tests {
         let host3 = FileHost::new(FileHostConfig::new(dir.clone(), "proj", "w"));
         assert!(!host3.inject_allowed("PinA"), "stale gen refuses");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bd-lorot: bounded audit log.
+//
+// The journal has a full retention discipline (512 KiB rotate gate,
+// RETENTION_LINES 5000, RETENTION_GENS 4, RETENTION_BYTES 5 MiB) and the AUDIT
+// log had NONE — it was a bare `OpenOptions::append` + `writeln!`. That is
+// exactly backwards: the audit log records every PER-ATTEMPT failure, so it is
+// the high-volume file, and it is what a repeating fault writes to. Measured
+// live (bd-kz54): one stale-socket respawn loop grew `flywheel-toron` to 14 GB
+// and the whole doorbell state dir to 26 GB — 65.5 M rows of one identical
+// failure, none of which said anything the first row did not.
+///
+/// The journal is allowed to keep generations because it is the run record. The
+/// audit log is diagnostics, so it is capped in place: keep the newest rows,
+/// drop the rest. Retention is by BYTES as well as rows, because a pathological
+/// row (a long error string) can blow a row budget on its own.
+// ---------------------------------------------------------------------------
+
+/// Hard cap on one workspace's audit log.
+pub const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Newest rows kept on rotation. Matches the journal's `KEEP_LINES` so both logs
+/// age out on the same scale.
+pub const AUDIT_KEEP_LINES: usize = 4000;
+
+/// Pure: the newest `keep` complete lines of an audit body, each newline
+/// terminated. A rotation must never leave a half-written row, because the next
+/// append concatenates onto it and corrupts one record.
+pub fn audit_tail_keep(body: &str, keep: usize) -> String {
+    if keep == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines.len().saturating_sub(keep);
+    let mut out = String::new();
+    for l in &lines[start..] {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+/// Cap the audit log, reading only its TAIL.
+///
+/// Reading the whole file would OOM the daemon — the file this exists to bound
+/// was measured at 14 GB. So seek to `len - AUDIT_MAX_BYTES`, drop the partial
+/// first line the seek landed inside, keep the newest rows, and swap via a temp
+/// file + rename so a crash mid-rotation leaves the original intact rather than
+/// a truncated one.
+fn rotate_audit_if_oversized(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(md) = std::fs::metadata(path) else {
+        return;
+    };
+    if md.len() <= AUDIT_MAX_BYTES {
+        return;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return;
+    };
+    let start = md.len().saturating_sub(AUDIT_MAX_BYTES);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return;
+    }
+    // The seek almost certainly landed mid-row; drop through the first newline.
+    let body = match buf.find('\n') {
+        Some(i) => &buf[i + 1..],
+        None => buf.as_str(),
+    };
+    let keep = audit_tail_keep(body, AUDIT_KEEP_LINES);
+    let tmp = path.with_extension("jsonl.rotating");
+    if std::fs::write(&tmp, keep).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod audit_rotation_tests {
+    use super::{AUDIT_KEEP_LINES, AUDIT_MAX_BYTES, audit_tail_keep, rotate_audit_if_oversized};
+    use std::io::Write;
+
+    /// The tail is the NEWEST rows, never the oldest — an audit log whose
+    /// rotation keeps the beginning is useless for diagnosing a live fault.
+    #[test]
+    fn rotation_keeps_the_newest_rows_and_terminates_every_line() {
+        let body: String = (0..100).map(|i| format!("{{\"n\":{i}}}\n")).collect();
+        let kept = audit_tail_keep(&body, 10);
+        let lines: Vec<&str> = kept.lines().collect();
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "{\"n\":90}");
+        assert_eq!(lines[9], "{\"n\":99}");
+        assert!(
+            kept.ends_with('\n'),
+            "a partial tail row corrupts the next append"
+        );
+    }
+
+    #[test]
+    fn keeping_more_than_exists_returns_everything() {
+        let body = "{\"n\":1}\n{\"n\":2}\n";
+        assert_eq!(audit_tail_keep(body, 500), body);
+    }
+
+    #[test]
+    fn keeping_nothing_returns_nothing() {
+        assert_eq!(audit_tail_keep("{\"n\":1}\n", 0), "");
+    }
+
+    /// The real defect, at real scale (past the 5 MiB cap) so the tail-only read
+    /// is the path that actually runs.
+    #[test]
+    fn an_oversized_audit_file_is_bounded_and_keeps_the_recent_tail() {
+        let dir = std::env::temp_dir().join(format!("audit-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("ws.audit.jsonl");
+
+        let mut f = std::fs::File::create(&path).expect("create");
+        for i in 0..40_000u64 {
+            let row = format!("{{\"n\":{i},\"pad\":\"{}\"}}\n", "x".repeat(120));
+            f.write_all(row.as_bytes()).expect("write");
+        }
+        f.flush().expect("flush");
+        drop(f);
+        let before = std::fs::metadata(&path).expect("meta").len();
+        assert!(
+            before > AUDIT_MAX_BYTES,
+            "premise: the fixture must exceed the cap, got {before}"
+        );
+
+        rotate_audit_if_oversized(&path);
+        let after = std::fs::metadata(&path).expect("meta").len();
+        assert!(
+            after <= AUDIT_MAX_BYTES,
+            "rotation must bound the file, got {after} (was {before})"
+        );
+        let body = std::fs::read_to_string(&path).expect("read back");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(!lines.is_empty(), "rotation must not empty the log");
+        assert!(
+            lines[0].starts_with("{\"n\":") && lines[0].contains("pad"),
+            "the first retained row must be a WHOLE row, not a fragment: {}",
+            &lines[0][..lines[0].len().min(60)]
+        );
+        assert!(
+            body.contains("\"n\":39999"),
+            "the newest row must survive — a rotation that keeps the oldest is useless"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{}.rotating", path.display())).exists(),
+            "the temp file must not be left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under the cap nothing happens — the cheap gate must not rewrite a healthy
+    /// log on every append.
+    #[test]
+    fn a_healthy_audit_file_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("audit-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("ws.audit.jsonl");
+        let body: String = (0..50).map(|i| format!("{{\"n\":{i}}}\n")).collect();
+        std::fs::write(&path, &body).expect("write");
+        rotate_audit_if_oversized(&path);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The keep-count is reachable and fits the cap. A fence on the constant
+    /// itself, because a keep-count that cannot fit inside the cap would make
+    /// every rotation a no-op that still pays the rewrite.
+    #[test]
+    fn the_keep_count_is_bounded_and_fits_the_cap() {
+        assert!(
+            AUDIT_KEEP_LINES > 0,
+            "rotation that keeps nothing erases the log"
+        );
+        assert!(
+            AUDIT_KEEP_LINES * 250 < AUDIT_MAX_BYTES as usize,
+            "keeping {AUDIT_KEEP_LINES} rows must fit inside {AUDIT_MAX_BYTES} bytes"
+        );
     }
 }
