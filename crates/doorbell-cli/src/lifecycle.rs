@@ -349,6 +349,44 @@ fn managed(self_cfg: &Config) -> Option<u32> {
     read_pid(&self_cfg.pid_file()).filter(|p| pid_alive(*p))
 }
 
+/// The daemon's own pid as it reports it in `/health.owner.pid`.
+fn owner_pid(health: &serde_json::Value) -> Option<u32> {
+    health
+        .get("owner")
+        .and_then(|o| o.get("pid"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok())
+}
+
+/// The status envelope's liveness view, as a pure fold so it is testable
+/// without a server.
+///
+/// bd-doorbell-status-alive-h9hb. `managed()` answers a real question — did WE
+/// start this, and is the pid we hold still running — but that is attribution,
+/// and it was being used as proof of service. The pid file is read from the
+/// *caller's* `--state-dir`, so a caller configured with a different one than
+/// the daemon's reports a null pid for a daemon that is up and answering. That
+/// is not hypothetical: `flywheel doorbell status` passes the FLYWHEEL state
+/// dir, and so printed `alive:false, pid:null` beside a full health body.
+///
+/// `alive` therefore comes from the probe that actually reached the daemon.
+/// `pid` still prefers the local pid file, because that is the pid we can
+/// signal, and falls back to the daemon's own report; `pid_source` names which
+/// one won so the two can never be silently confused.
+fn status_liveness(
+    local_pid: Option<u32>,
+    health: Option<&serde_json::Value>,
+) -> (bool, Option<u32>, Option<&'static str>) {
+    let alive = health.is_some();
+    if let Some(pid) = local_pid {
+        return (alive, Some(pid), Some("pid_file"));
+    }
+    match health.and_then(owner_pid) {
+        Some(pid) => (alive, Some(pid), Some("health")),
+        None => (alive, None, None),
+    }
+}
+
 fn health_get(cfg: &Config, path: &str) -> Option<String> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect_timeout(
@@ -1138,7 +1176,7 @@ pub fn restart(cfg: &Config) -> Result<()> {
 }
 
 pub fn status(cfg: &Config) -> Result<()> {
-    let pid = managed(cfg);
+    let local_pid = managed(cfg);
     let health = health_probe(cfg);
     // bd-enov (F17): a standby daemon with known workspaces is DEGRADED, not
     // green — it delivers no rings/digest wakes and every wake path silently
@@ -1154,9 +1192,11 @@ pub fn status(cfg: &Config) -> Result<()> {
             eprintln!("  {hint}");
         }
     }
+    let (alive, pid, pid_source) = status_liveness(local_pid, health.as_ref());
     let out = serde_json::json!({
-        "alive": pid.is_some() && health.is_some(),
+        "alive": alive,
         "pid": pid,
+        "pid_source": pid_source,
         "port": cfg.port,
         "socket": cfg.socket_path().display().to_string(),
         "health": health,
@@ -1796,6 +1836,57 @@ mod tests {
             flywheel_state: dir.join("flywheel"),
             hosts: Vec::new(),
         }
+    }
+
+    /// bd-doorbell-status-alive-h9hb. The two-caller mismatch, exactly as
+    /// reproduced live on 2026-09-28 against ONE daemon on port 18980: same
+    /// health body, opposite verdict, because `alive` was read off the
+    /// caller's pid file. The second caller is the production shape —
+    /// `flywheel doorbell status` passes the flywheel state dir, never the
+    /// doorbell's.
+    #[test]
+    fn status_liveness_comes_from_the_probe_not_the_callers_pid_file() {
+        let health = serde_json::json!({ "owner": { "pid": 7765 } });
+
+        // Caller pointed at the daemon's own state dir: its pid file is here.
+        let (alive, pid, source) = status_liveness(Some(7765), Some(&health));
+        assert!(alive);
+        assert_eq!(pid, Some(7765));
+        assert_eq!(source, Some("pid_file"));
+
+        // Caller pointed somewhere else, which is what flywheel does.
+        let (alive, pid, source) = status_liveness(None, Some(&health));
+        assert!(
+            alive,
+            "a daemon answering on the port is alive whatever the caller's pid file says"
+        );
+        assert_eq!(
+            pid,
+            Some(7765),
+            "with no local pid file the pid falls back to the daemon's own report"
+        );
+        assert_eq!(source, Some("health"));
+    }
+
+    #[test]
+    fn status_liveness_no_probe_means_not_alive_however_live_the_pid_file_looks() {
+        // A pid file naming a live process is attribution, not proof of
+        // service: we started something that is not answering.
+        let (alive, pid, source) = status_liveness(Some(4242), None);
+        assert!(!alive, "nothing answered, so nothing is alive");
+        assert_eq!(
+            pid,
+            Some(4242),
+            "the pid is still worth naming, because it is the one we can signal"
+        );
+        assert_eq!(source, Some("pid_file"));
+
+        assert_eq!(status_liveness(None, None), (false, None, None));
+
+        // A health body whose owner block carries no usable pid is still a
+        // live daemon; it just has no pid to name.
+        let bare = serde_json::json!({ "mode": "hosted" });
+        assert_eq!(status_liveness(None, Some(&bare)), (true, None, None));
     }
 
     /// Spawn a child whose corpse gets reaped in the background. Production
