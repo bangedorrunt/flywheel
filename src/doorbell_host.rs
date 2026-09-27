@@ -78,7 +78,11 @@ pub struct RtHost {
     exe_path: PathBuf,
     brain_tx: mpsc::Sender<BrainMsg>,
     covered_panes: HashSet<String>,
-    retry: doorbell_rt::WatchRetry,
+    /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
+    /// had exactly one caller in the whole tree — its own unit test — so four
+    /// failures anywhere in a host's life latched the 16s gate permanently and
+    /// the transport never regained a fast first retry.
+    retry: std::sync::Arc<std::sync::Mutex<doorbell_rt::WatchRetry>>,
     authority: crate::authority::RuntimeAuthority,
     // F7: cache the whois-backed index — rebuild at most every 60s or when
     // the registry pin set changes (was every 1s sweep: N whois RPCs/sec).
@@ -109,6 +113,7 @@ fn wake_outcome_to_brain(
     out: doorbell_rt::wake_sock::WakeOutcome,
     tx: &mpsc::Sender<BrainMsg>,
     workspace: &str,
+    retry: &std::sync::Mutex<doorbell_rt::WatchRetry>,
 ) {
     use doorbell_rt::wake_sock::WakeOutcome;
     // GS062-ADV-5 (ported onto wake-sock): try_send Watch; stamp .event only
@@ -117,6 +122,13 @@ fn wake_outcome_to_brain(
         WakeOutcome::Watch(l) => match tx.try_send(BrainMsg::Watch(l)) {
             Ok(()) => {
                 doorbell_rt::watchbeat::touch_event(&config::state_dir(), workspace);
+                // A delivered event is the only trustworthy evidence the socket
+                // is live again, so it is the only thing that may reopen the
+                // backoff gate. A heartbeat proves the ticker ran, not that the
+                // transport delivers — bd-kz54's whole lesson.
+                if let Ok(mut r) = retry.lock() {
+                    r.reset();
+                }
             }
             Err(_) => {
                 doorbell_rt::msg::deliver_died_blocking(tx);
@@ -187,7 +199,9 @@ impl RtHost {
             exe_path,
             brain_tx,
             covered_panes: HashSet::new(),
-            retry: doorbell_rt::WatchRetry::default(),
+            retry: std::sync::Arc::new(std::sync::Mutex::new(
+            doorbell_rt::WatchRetry::default(),
+        )),
             authority: crate::authority::RuntimeAuthority::resolve(),
             index_refreshed_at: now,
             index_pins,
@@ -545,11 +559,13 @@ impl Host for RtHost {
 
     fn restart_wake(&mut self) {
         // GS-007 never-deaf rule: burst in a task, gate across calls.
-        let backoff = self.retry.record_fail();
+        let backoff = self.retry.lock().map(|mut r| r.record_fail()).unwrap_or(16);
         let tx = self.brain_tx.clone();
         let project = self.project.clone();
         let workspace = self.workspace.clone();
         let slot = self.wake_task.clone();
+        // Hoisted out of the 'static future so no borrow of `self` escapes.
+        let retry = self.retry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Abort the predecessor first: one live consumer per host.
@@ -560,12 +576,13 @@ impl Host for RtHost {
             }
             let tx_g = tx.clone();
             let beat_workspace = workspace.clone();
+            let retry = retry.clone();
             let handle = crate::spawn_wake_consumer(
                 &project,
                 &workspace,
                 &config::state_dir(),
                 move |out| {
-                    wake_outcome_to_brain(out, &tx_g, &beat_workspace);
+                    wake_outcome_to_brain(out, &tx_g, &beat_workspace, &retry);
                 },
             );
             if let Ok(mut g) = slot.lock() {
@@ -725,9 +742,10 @@ async fn run_embedded_async(
         let tx_w = tx.clone();
         let project = project.to_string();
         let beat_workspace = workspace.to_string();
+        let retry_w = host.retry.clone();
         let handle =
             crate::spawn_wake_consumer(&project, workspace, &config::state_dir(), move |out| {
-                wake_outcome_to_brain(out, &tx_w, &beat_workspace);
+                wake_outcome_to_brain(out, &tx_w, &beat_workspace, &retry_w);
             });
         if let Ok(mut g) = watch_slot.lock() {
             *g = Some(handle);
