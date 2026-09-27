@@ -215,7 +215,7 @@ steps:
         "ce-brainstorm",
         r#"
 name: ce-brainstorm
-description: "Requirements-first divergent ideation (ADR-0009) — fan out oracles, the planner reduces to a requirements-only artifact via the ce-brainstorm stage."
+description: "Requirements-first divergent ideation (ADR-0009) — three independent lenses diverge in parallel, the planner reduces to a requirements-only artifact via the ce-brainstorm stage."
 trigger:
   type: webhook
 crew: auto
@@ -223,15 +223,23 @@ inputs:
   - name: question
 graph:
   nodes:
-    diverge:
-      action: parallel
-      over: "3"
-      each: { action: dispatch_job, assignee: x, spec: { profile: "@oracle", task: "Diverge on the question — surface ideas, angles, and options: {{inputs.question}}" } }
+    diverge_oracle:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@oracle", task: "Diverge on the question — surface ideas, angles, and options: {{inputs.question}}" }
+    diverge_structure:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@planner", task: "From a STRUCTURAL angle on the question, map what a solution must satisfy — the moving parts, the constraints, the shape of the work: {{inputs.question}}" }
+    diverge_risk:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@reviewer", task: "From a RISK angle on the question, attack it — what could go wrong, what would make this a bad idea, what would you refuse to sign off on: {{inputs.question}}" }
     reduce:
       action: dispatch_job
       assignee: x
-      spec: { profile: "@planner", stage: "ce-brainstorm", task: "Reduce these oracle outputs into ranked options for: {{inputs.question}}\n\nOracle outputs: {{steps.diverge}}" }
-      needs: [diverge]
+      spec: { profile: "@planner", stage: "ce-brainstorm", task: "Reduce these into ranked options for: {{inputs.question}}\n\nDivergent (oracle): {{steps.diverge_oracle}}\n\nStructural (planner): {{steps.diverge_structure}}\n\nRisk (reviewer): {{steps.diverge_risk}}" }
+      needs: [diverge_oracle, diverge_structure, diverge_risk]
       on_error: fail_run
 "#,
     ),
@@ -2889,31 +2897,45 @@ mod tests {
         }
     }
 
-    /// bd-oj9o #1: brainstorm/debate actually fan out (over > 1) — the dead
-    /// `breadth`/`panel` inputs were replaced by a real parallel fan-out.
+    /// bd-oj9o #1: brainstorm/debate actually fan out — the dead `breadth`/`panel`
+    /// inputs were replaced by real parallelism, and parallelism is the point.
+    ///
+    /// bd-0s0y: the two now fan out DIFFERENTLY and both are correct.
+    /// `debate` keeps a literal `parallel` over 2 reviewers. `ce-brainstorm`
+    /// spreads 3 divergers across 3 distinct ROLES, because a `parallel` over
+    /// one role with a one-pane-per-role crew is a guaranteed busy-fence
+    /// refusal. What must hold for both is the property, not the mechanism:
+    /// more than one agent works the question at the same time.
     #[test]
     fn brainstorm_and_debate_fan_out() {
         use toron_workflow::schema::Action;
         let wfs = builtin_workflows();
-        for (name, node) in [("ce-brainstorm", "diverge"), ("debate", "briefs")] {
-            let wf = &wfs[name];
-            let g = wf
-                .graph
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name} has a graph"));
-            let n = g
-                .nodes
-                .get(node)
-                .unwrap_or_else(|| panic!("{name}.{node} node exists"));
-            let Action::Parallel { over, .. } = &n.action else {
-                panic!("{name}.{node} is a parallel action");
-            };
-            let copies: usize = over.trim().parse().unwrap_or(1);
-            assert!(
-                copies > 1,
-                "{name} must fan out over {copies} (parallelism is the point)"
-            );
-        }
+
+        // ce-brainstorm: three concurrent divergers, and they must be three
+        // DIFFERENT roles or they are three sends at one agent.
+        let cb = crew::crew_demand(&wfs["ce-brainstorm"]);
+        assert_eq!(
+            cb.required_panes, 3,
+            "brainstorm must have 3 agents working the question at once: {cb:?}"
+        );
+        assert!(
+            cb.collisions.is_empty(),
+            "brainstorm's divergers must not share a role: {cb:?}"
+        );
+
+        // debate: unchanged, a literal parallel over 2.
+        let g = wfs["debate"]
+            .graph
+            .as_ref()
+            .unwrap_or_else(|| panic!("debate has a graph"));
+        let Action::Parallel { over, .. } = &g.nodes["briefs"].action else {
+            panic!("debate.briefs is a parallel action");
+        };
+        let copies: usize = over.trim().parse().unwrap_or(1);
+        assert!(
+            copies > 1,
+            "debate must fan out over {copies} (parallelism is the point)"
+        );
     }
 
     /// bd-oj9o #1: the beads workflow carries the plan into the dispatch
@@ -2968,9 +2990,21 @@ mod tests {
     fn fanout_outputs_reach_reducers() {
         use toron_workflow::schema::Action;
         let wfs = builtin_workflows();
-        for (name, node, token) in [
-            ("ce-brainstorm", "reduce", "{{steps.diverge}}"),
-            ("debate", "decide", "{{steps.briefs}}"),
+        // (workflow, reducer node, tokens the reducer must consume). bd-0s0y:
+        // ce-brainstorm's reduce consumes THREE named diverger outputs now,
+        // because the fan-out is three named nodes rather than one parallel
+        // step's array.
+        for (name, node, tokens) in [
+            (
+                "ce-brainstorm",
+                "reduce",
+                vec![
+                    "{{steps.diverge_oracle}}",
+                    "{{steps.diverge_structure}}",
+                    "{{steps.diverge_risk}}",
+                ],
+            ),
+            ("debate", "decide", vec!["{{steps.briefs}}"]),
         ] {
             let g = wfs[name].graph.as_ref().expect("graph present");
             let Action::DispatchJob { spec, .. } = &g.nodes[node].action else {
@@ -2980,10 +3014,12 @@ mod tests {
                 .task
                 .as_deref()
                 .unwrap_or_else(|| panic!("{name}.{node} has a task"));
-            assert!(
-                task.contains(token),
-                "{name}.{node} consumes the fan-out ({token}): {task}"
-            );
+            for token in tokens {
+                assert!(
+                    task.contains(&token[..]),
+                    "{name}.{node} must consume {token} or a diverger's work is dropped: {task}"
+                );
+            }
         }
     }
 

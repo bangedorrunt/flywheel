@@ -58,6 +58,158 @@ impl CrewPlan {
 /// Operator-owned pane cap (ADR-0011 D2). Repo config must not raise this.
 pub const DEFAULT_CREW_MAX: u32 = 5;
 
+/// bd-0s0y: what a workflow's steps actually cost in crew panes.
+///
+/// The busy-owner fence releases on PERMIT DROP, so once a dispatch returns
+/// the agent is free — verified by `fenced_permit_drop_releases_busy_holder`
+/// in toron-workflow's dispatch tests. Sequential reuse of a role is
+/// therefore FREE and needs no extra pane. CONCURRENCY is the only thing that
+/// costs a pane, because concurrent sends aimed at one agent are refused.
+///
+/// That makes the old `over: "3"` over `@oracle` a guaranteed run-killer: it
+/// is one node, one role, three concurrent copies, and a crew holds one pane
+/// per role. `required_panes` is the honest cost of the widest wave;
+/// `collisions` is the set of roles a single wave uses more than once, each of
+/// which is a busy-fence refusal waiting to happen.
+///
+/// `CallWorkflow` children are NOT traversed: they are only reachable through
+/// the injected `WorkflowResolver`, so a per-document answer is exact for its
+/// own document and silent about children. Callers that have the catalog in
+/// scope should check each builtin; that is how `goal`'s cost is pinned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrewDemand {
+    /// Distinct roles dispatched in the widest concurrent wave.
+    pub required_panes: u32,
+    /// (role, times-in-one-wave) where the count exceeds one.
+    pub collisions: Vec<(String, usize)>,
+    /// The crew SHAPE a correct packer would have to build: role → the most
+    /// copies of it any single wave dispatches to concurrently.
+    pub crew_shape: BTreeMap<String, u32>,
+    /// `crew_shape` summed. This — not `required_panes` — is what the cap has
+    /// to cover, and it is why a role needing 3 concurrent copies costs 3
+    /// panes even though it is one role.
+    pub crew_total: u32,
+}
+
+/// The roles one action dispatches, each with its concurrency width. A
+/// `parallel` over N contributes its inner roles N times over.
+fn role_uses(action: &Action, out: &mut Vec<String>) {
+    match action {
+        Action::DispatchJob { spec, .. } => {
+            if let Some(p) = spec.profile.as_deref() {
+                out.push(p.trim_start_matches('@').to_string());
+            }
+        }
+        Action::Parallel { over, each } => {
+            let n = over.trim().parse::<u32>().unwrap_or(1).max(1);
+            let mut inner = Vec::new();
+            role_uses(&each.action, &mut inner);
+            for r in inner {
+                for _ in 0..n {
+                    out.push(r.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// bd-0s0y: the crew a workflow needs, and every way it would self-collide.
+/// Pure — no registry, no panes, no herdr. The catalog-level test is what
+/// makes it worth having.
+pub fn crew_demand(wf: &Workflow) -> CrewDemand {
+    // (node, needs, roles, seed wave). `steps:` is strictly ordered, so each
+    // step is its own wave — two steps reusing a role there is sequential
+    // reuse, not concurrency, and must never be flagged.
+    let nodes: Vec<(String, Vec<String>, Vec<String>, u32)> = match &wf.graph {
+        Some(g) => g
+            .nodes
+            .iter()
+            .map(|(name, node)| {
+                let mut roles = Vec::new();
+                role_uses(&node.action, &mut roles);
+                (name.clone(), node.needs.clone(), roles, 0)
+            })
+            .collect(),
+        None => wf
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut roles = Vec::new();
+                role_uses(&s.action, &mut roles);
+                (
+                    s.name.clone().unwrap_or_default(),
+                    Vec::new(),
+                    roles,
+                    i as u32,
+                )
+            })
+            .collect(),
+    };
+
+    // Longest-path layering: a node's wave is one past its deepest dependency,
+    // so a node shares a wave with its peers and never with its ancestors. A
+    // `steps:` seed already separates them, and a step declares no `needs`, so
+    // the layering leaves the seed untouched.
+    let mut wave: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut pending: Vec<&(String, Vec<String>, Vec<String>, u32)> = nodes.iter().collect();
+    let mut guard = nodes.len() + 1;
+    while !pending.is_empty() && guard > 0 {
+        guard -= 1;
+        let (ready, waiting): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(_, needs, _, _)| needs.iter().all(|d| wave.contains_key(d.as_str())));
+        if ready.is_empty() {
+            break;
+        }
+        for (name, needs, _, seed) in ready {
+            let w = needs
+                .iter()
+                .filter_map(|d| wave.get(d.as_str()).copied())
+                .max()
+                .map_or(*seed, |m| m + 1);
+            wave.insert(name.as_str(), w);
+        }
+        pending = waiting;
+    }
+
+    let mut per_wave: BTreeMap<u32, BTreeMap<&str, usize>> = BTreeMap::new();
+    // A role's copy count is its busiest single wave, NOT its total uses:
+    // sequential reuse is free, so a role used 3 times in a chain needs 1 pane.
+    let mut shape: BTreeMap<String, u32> = BTreeMap::new();
+    for (name, _, roles, seed) in &nodes {
+        let w = wave.get(name.as_str()).copied().unwrap_or(*seed);
+        let bucket = per_wave.entry(w).or_default();
+        for r in roles {
+            *bucket.entry(r.as_str()).or_insert(0) += 1;
+        }
+    }
+    for bucket in per_wave.values() {
+        for (role, n) in bucket {
+            let n = *n as u32;
+            let slot = shape.entry((*role).to_string()).or_insert(0);
+            *slot = (*slot).max(n);
+        }
+    }
+    shape.retain(|_, n| *n > 0);
+
+    let required_panes = per_wave.values().map(|b| b.len() as u32).max().unwrap_or(0);
+    let mut collisions: Vec<(String, usize)> = shape
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(r, n)| (r.clone(), *n as usize))
+        .collect();
+    collisions.sort();
+    let crew_total = shape.values().sum();
+    CrewDemand {
+        required_panes,
+        collisions,
+        crew_shape: shape,
+        crew_total,
+    }
+}
+
 /// Packed spawn plan: members to spawn + overflow role aliases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackedCrew {
@@ -3380,5 +3532,223 @@ steps:
         assert_eq!(packed.total(), 5);
         assert_eq!(packed.unique, 6);
         assert_eq!(packed.aliases.len(), 1);
+    }
+
+    // ---- bd-0s0y: crew demand / self-collision ----
+
+    fn wf_from(yaml: &str) -> Workflow {
+        toron_workflow::schema::parse_workflow(yaml).expect("yaml parses")
+    }
+
+    /// The regression itself, in miniature. This is the shape that killed
+    /// every crew run: one node, one role, three concurrent copies, and a crew
+    /// that holds one pane per role.
+    #[test]
+    fn a_parallel_fanout_over_one_role_is_a_collision() {
+        let wf = wf_from(
+            r#"
+name: fanout-probe
+steps:
+  - name: diverge
+    action: parallel
+    over: "3"
+    each:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@oracle", task: "diverge" }
+"#,
+        );
+        let d = crew_demand(&wf);
+        assert_eq!(d.required_panes, 1, "one role, so one pane is the cost");
+        assert_eq!(
+            d.collisions,
+            vec![("oracle".to_string(), 3)],
+            "three concurrent copies of one role is exactly the refusal: {d:?}"
+        );
+    }
+
+    /// Sequential reuse of a role is FREE — the fence releases on permit drop
+    /// — so a chain that reuses a role must NOT be flagged. This is what makes
+    /// the lint usable rather than noise: flagging this would push authors to
+    /// invent panes they do not need.
+    #[test]
+    fn sequential_reuse_of_a_role_costs_nothing() {
+        let wf = wf_from(
+            r#"
+name: chain-probe
+steps:
+  - name: reduce
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", task: "a" }
+  - name: plan
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", task: "b" }
+  - name: build
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@coder", task: "c" }
+"#,
+        );
+        let d = crew_demand(&wf);
+        assert!(
+            d.collisions.is_empty(),
+            "sequential reuse is not a collision"
+        );
+    }
+
+    /// Concurrent nodes on DISTINCT roles are what a fan-out should look like:
+    /// three panes, no collision.
+    #[test]
+    fn concurrent_nodes_on_distinct_roles_cost_one_pane_each() {
+        let wf = wf_from(
+            r#"
+name: spread-probe
+graph:
+  nodes:
+    a:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@oracle", task: "diverge" }
+    b:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@planner", task: "structure" }
+    c:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@reviewer", task: "risk" }
+    reduce:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@planner", stage: "ce-brainstorm", task: "reduce" }
+      needs: [a, b, c]
+"#,
+        );
+        let d = crew_demand(&wf);
+        assert!(d.collisions.is_empty(), "{d:?}");
+        assert_eq!(
+            d.required_panes, 3,
+            "the three divergers share a wave; reduce is a later wave and reuses the planner"
+        );
+    }
+
+    /// THE fence. Every builtin's correct crew shape must fit the cap, and the
+    /// set of builtins that need a role to have MORE THAN ONE copy is pinned
+    /// exactly — that set is the remaining half-2c worklist, and letting it
+    /// grow silently would hide a new run-killer.
+    ///
+    /// `ce-brainstorm` is why this is a catalog test and not a per-file one:
+    /// the fatal fan-out lived in a CHILD of `goal`, so checking `goal`'s own
+    /// steps passed while the run still died on step one.
+    #[test]
+    fn every_builtin_fits_the_cap_and_the_2c_worklist_is_pinned() {
+        let catalog = crate::builtin_workflows::builtin_workflows();
+        let mut over_cap: Vec<String> = Vec::new();
+        let mut needs_copies: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+        for (name, wf) in &catalog {
+            let d = crew_demand(wf);
+            if d.crew_total > DEFAULT_CREW_MAX {
+                over_cap.push(format!(
+                    "{name}: needs {} panes ({:?}), cap is {DEFAULT_CREW_MAX}",
+                    d.crew_total, d.crew_shape
+                ));
+            }
+            if !d.collisions.is_empty() {
+                needs_copies.insert(name.clone(), d.crew_shape.clone());
+            }
+        }
+        assert!(
+            over_cap.is_empty(),
+            "no builtin may need more than {DEFAULT_CREW_MAX} panes:\n  {}",
+            over_cap.join("\n  ")
+        );
+
+        // bd-0s0y: `goal` and `goal-direct` are REMOVED from this list by
+        // spreading ce-brainstorm's 3-way fan-out across 3 distinct roles.
+        // The three left genuinely want a role with copies, which the packer
+        // does not yet build (half 2c) — pinned so the list cannot grow.
+        let expected: BTreeMap<String, BTreeMap<String, u32>> = [
+            ("debate", &[("oracle", 1u32), ("reviewer", 2u32)][..]),
+            ("phase-review", &[("reviewer", 2u32)][..]),
+            ("weekly-review", &[("oracle", 1u32), ("scout", 3u32)][..]),
+        ]
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                v.iter().map(|(a, b)| (a.to_string(), *b)).collect(),
+            )
+        })
+        .collect();
+        assert_eq!(
+            needs_copies, expected,
+            "the set of builtins needing a multi-copy role changed. A NEW entry is a workflow \
+             that will be refused by the busy-owner fence until the packer builds copies (half \
+             2c) — fix it by spreading the fan-out across roles, not by widening this list."
+        );
+    }
+
+    /// `goal` specifically: five panes, zero collisions, and full three-way
+    /// divergence. This is the analysis the request asked for, pinned so a
+    /// future edit cannot quietly re-break it.
+    #[test]
+    fn goal_fits_five_panes_with_three_way_divergence() {
+        let catalog = crate::builtin_workflows::builtin_workflows();
+
+        // The chain itself: 3 dispatch sites on 3 distinct roles, sequential.
+        let goal = catalog.get("goal").expect("goal builtin");
+        assert_eq!(
+            crew_demand(goal).required_panes,
+            1,
+            "goal's own steps are sequential"
+        );
+
+        // The child that actually costs panes, and it must be clean.
+        let cb = catalog.get("ce-brainstorm").expect("ce-brainstorm builtin");
+        let d = crew_demand(cb);
+        assert!(
+            d.collisions.is_empty(),
+            "ce-brainstorm self-collides: {d:?}"
+        );
+        assert_eq!(
+            d.required_panes, 3,
+            "three independent divergers, three panes"
+        );
+
+        // Divergence is preserved, not traded away: three distinct lenses.
+        let lenses: Vec<String> = ["diverge_oracle", "diverge_structure", "diverge_risk"]
+            .into_iter()
+            .filter(|n| cb.graph.as_ref().is_some_and(|g| g.nodes.contains_key(*n)))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lenses.len(),
+            3,
+            "the fan-out is still 3-way, just spread across roles: {lenses:?}"
+        );
+
+        // The union of roles across goal's whole call graph is the crew it
+        // needs, and it is 5 — the cap, not over it.
+        let mut roles: std::collections::BTreeSet<String> = Default::default();
+        for wf_name in ["goal", "ce-brainstorm", "phase-plan", "beads"] {
+            let wf = catalog.get(wf_name).expect("workflow in goal's call graph");
+            for action in wf
+                .graph
+                .iter()
+                .flat_map(|g| g.nodes.values().map(|n| &n.action))
+                .chain(wf.steps.iter().map(|s| &s.action))
+            {
+                let mut uses = Vec::new();
+                role_uses(action, &mut uses);
+                roles.extend(uses);
+            }
+        }
+        assert_eq!(
+            roles.len(),
+            5,
+            "goal's call graph needs exactly one pane per role, and that is 5: {roles:?}"
+        );
     }
 }
