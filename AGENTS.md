@@ -65,6 +65,12 @@ A change is unfinished until its tests show all of the following:
 - Retry wraps that one idempotent command and keeps the same effect key.
 - A terminal state emits no further command.
 
+**Then prove each of those tests can fail.** Delete the call, invert the condition, disable the wiring, and confirm the test goes red. A test never seen failing is not evidence, and the vacuous shapes do not look vacuous while you are writing them. All four of these shipped green in this repo: a source-scan asserting `contains("spawn_heartbeat_ticker")` that passed with the *call* deleted, because the adjacent comment named the function; a VERIFY fence matching ZERO tests, which exits 0 and is therefore unconditionally green; helpers-only tests that stayed green with the call site disabled; and a test whose proof was that a build artifact was fresh, so it passed on a cold cargo cache and failed on a warm one. A test that cannot be made to fail cannot be trusted to pass.
+
+**No test may depend on ambient state**, because it then fails on the wrong day and gets misread as a regression: cold-vs-warm build caches, the operator's real `~/.config` (`sc_bugfix_playbook` spawns the real binary, so it reports config state as code state), wall clock, a live daemon, machine-wide thread counts. Assert the *agreement* between what the code reports and what a reader can independently observe, never a property of the environment. The hermetic form of the build-stamp test reads the same file the resolver read and compares size and mtime; a cached binary satisfies that, a stale or fabricated stamp does not.
+
+**A narrow fence proves the feature, not the test, and not the blast radius.** `bd-ynef`'s fence was `cargo test -p toron-workflow park`: the park tests passed, the bead closed LEGAL, and the crate suite was red — because classifying `Action::Park` as `EngineControl` had made the shared boundary tripwire's count 9 → 10 and nothing in the fence could see a shared invariant move. Run the full suite before closing any bead that ships a test or touches a partition table, and fence the whole crate rather than a name filter when the change moves something existing.
+
 `ConsecutiveBreaker` clears its failure count when the cooldown elapses, then judges the next call as closed. A half-open probe is one trial that re-opens on failure. This breaker is the cooldown reset.
 
 ## Public API
