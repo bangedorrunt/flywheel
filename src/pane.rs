@@ -248,11 +248,19 @@ pub fn resolve_pane_entry<'a>(entries: &'a LiveRegistry, profile: &str) -> Optio
 /// `None` (a step that is not a fan-out copy) resolves exactly as before, so
 /// the whole existing path is untouched. `Some(i)` addresses the `i`th copy.
 ///
-/// A shortfall is a LOUD failure, never a silent reuse of copy 0: reusing
-/// copy 0's pane is the exact defect this fixes — copy 1 would be refused by
-/// the busy-owner fence and the run would die with a fence error that names
-/// the wrong cause. Naming the shortfall instead points at the real one, which
-/// is that the crew holds fewer copies of this role than the fan-out asks for.
+/// bd-07m2: a shortfall returns `Ok(None)` and does NOT bail. It used to
+/// `bail!` here, and the caller wrote `resolve_role_slot(...)?` — which made
+/// the `None` arm, the bd-ietv settle window, unreachable for EVERY fan-out
+/// copy. Cron Pane mode builds `entries` from `live_registry_for_dispatch`
+/// (load + prune against a fresh listing), so a pane created moments ago is
+/// absent and the operator was told "the crew holds 0 pane(s) for @reviewer"
+/// when the truth was a spawn/list race the settle window exists to absorb.
+/// The shortfall is raised by [`shortfall_error`], AFTER settling fails, so
+/// the two causes stay distinguishable.
+///
+/// A shortfall is still never a silent reuse of copy 0: that is the exact
+/// defect this fixes — copy 1 would be refused by the busy-owner fence and the
+/// run would die naming the wrong cause.
 fn resolve_role_slot<'a>(
     entries: &'a LiveRegistry,
     role: &str,
@@ -261,26 +269,31 @@ fn resolve_role_slot<'a>(
     let Some(i) = copy_index else {
         return Ok(resolve_pane_entry(entries, role));
     };
-    match resolve_pane_entry_nth(entries, role, i) {
-        Some(e) => Ok(Some(e)),
-        None => {
-            let have = resolve_pane_entry_nth(entries, role, 0)
-                .map(|_| {
-                    entries
-                        .entries()
-                        .iter()
-                        .filter(|e| e.profile.as_deref() == Some(role) || e.name == role)
-                        .count()
-                })
-                .unwrap_or(0);
-            bail!(
-                "pane dispatch: fan-out copy {i} of @{role} has no crew pane — the crew holds \
-                 {have} pane(s) for @{role} and this step asked for copy {i}. Give @{role} at \
-                 least {} copies (or lower the step's `over`), never reuse another copy's pane.",
-                i + 1
-            )
-        }
-    }
+    Ok(resolve_pane_entry_nth(entries, role, i))
+}
+
+/// bd-07m2: the shortfall verdict, counted in SLOTS rather than rows.
+///
+/// `resolve_pane_entry_nth` groups by agent name and keeps the highest
+/// incarnation, so a respawn is a newer generation of the SAME slot and never
+/// an extra copy. Counting rows here (the old code) told an operator to grow a
+/// crew that was already the right size whenever one slot had two generations
+/// on record — the bd-rkx8 invariant, violated in the message.
+fn shortfall_error(entries: &LiveRegistry, role: &str, i: usize) -> anyhow::Error {
+    let have = entries
+        .entries()
+        .iter()
+        .filter(|e| e.profile.as_deref() == Some(role) || e.name == role)
+        .map(|e| e.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    anyhow!(
+        "pane dispatch: fan-out copy {i} of @{role} has no crew pane — the crew holds {have} \
+         slot(s) for @{role} and this step asked for copy {i}, so @{role} needs {needed} \
+         copies. Give @{role} {needed} panes (or lower the step's fan-out). Another copy's pane \
+         is never reused: the busy-owner fence would refuse this send and name the wrong cause.",
+        needed = i + 1
+    )
 }
 
 /// bd-0s0y: the `nth` DISTINCT live pane serving `profile`.
@@ -1318,15 +1331,23 @@ pub fn pane_dispatch(
                 );
                 entry
             }
-            None => bail!(
-                "pane dispatch: no crew pane for @{profile_name} (spawned: {})",
-                entries
-                    .entries()
-                    .iter()
-                    .map(|e| e.profile.as_deref().unwrap_or(&e.name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            // bd-07m2: settling failed, so now the cause is knowable. A fan-out
+            // copy that is short gets the slot-counted shortfall (the crew
+            // genuinely lacks copies); anything else keeps the original
+            // "no crew pane" wording, which is the honest verdict when the role
+            // was never spawned at all.
+            None => match copy_index {
+                Some(i) => return Err(shortfall_error(entries, profile_name, i)),
+                None => bail!(
+                    "pane dispatch: no crew pane for @{profile_name} (spawned: {})",
+                    entries
+                        .entries()
+                        .iter()
+                        .map(|e| e.profile.as_deref().unwrap_or(&e.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
         },
     };
     eprintln!(
@@ -3226,10 +3247,17 @@ mod tests {
         }
     }
 
-    /// bd-0s0y: too many copies for the crew is a LOUD shortfall, never a
+    /// bd-07m2: too many copies for the crew is a LOUD shortfall, never a
     /// silent reuse of copy 0. Reuse is the exact defect: copy 1 would be
     /// refused by the busy-owner fence and the run would die blaming the fence
     /// instead of the crew that never grew.
+    ///
+    /// The shortfall now comes from `shortfall_error`, AFTER the settle window
+    /// has run. `resolve_role_slot` must return `Ok(None)` for an over-count —
+    /// when it bailed, the caller's `?` made the bd-ietv settle arm
+    /// unreachable for every fan-out copy, and cron Pane mode (which prunes
+    /// against a fresh listing) turned a spawn/list race into "the crew holds
+    /// 0 panes". Asserting `Ok(None)` here IS the settle-reachability fence.
     #[test]
     fn too_many_copies_names_the_shortfall_instead_of_reusing_copy_zero() {
         let entries = as_live(vec![SpawnEntry {
@@ -3244,14 +3272,52 @@ mod tests {
             skills_injected: false,
             incarnation: 0,
         }]);
-        let err = resolve_role_slot(&entries, "oracle", Some(1))
-            .expect_err("copy 1 of a 1-pane role must fail loud");
-        let msg = err.to_string();
+        // Must NOT be an error: the settle arm has to be reachable.
+        let got = resolve_role_slot(&entries, "oracle", Some(1))
+            .expect("an over-count is not an error, it is a settle candidate");
+        assert!(
+            got.is_none(),
+            "an absent copy must resolve to None so the settle window runs, never to copy 0"
+        );
+        let msg = shortfall_error(&entries, "oracle", 1).to_string();
         assert!(msg.contains("copy 1"), "must name the copy: {msg}");
-        assert!(msg.contains("1 pane(s)"), "must name the shortfall: {msg}");
+        assert!(
+            msg.contains("1 slot(s)"),
+            "must name the shortfall in SLOTS, not rows: {msg}"
+        );
         assert!(
             !msg.contains("w5:p1"),
             "must not hand back copy 0's pane as if it were copy 1's: {msg}"
+        );
+    }
+
+    /// bd-07m2: the shortfall counts SLOTS. A respawn is a newer generation of
+    /// the same slot (the bd-rkx8 invariant `resolve_pane_entry_nth` already
+    /// honors), so a two-generation registry must NOT be reported as a crew of
+    /// two — that told the operator to grow a crew that was already correct.
+    #[test]
+    fn the_shortfall_counts_one_respawned_slot_as_one_pane() {
+        let row = |pane: &str, name: &str, inc: u64| SpawnEntry {
+            pane_id: pane.into(),
+            name: name.into(),
+            profile: Some("oracle".into()),
+            harness: Some("omp".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: inc,
+        };
+        let entries = as_live(vec![
+            row("w7:p1", "crew-goal-oracle", 0),
+            // Same name, newer generation, different pane.
+            row("w7:p9", "crew-goal-oracle", 1),
+        ]);
+        let msg = shortfall_error(&entries, "oracle", 1).to_string();
+        assert!(
+            msg.contains("1 slot(s)"),
+            "two generations of one name is ONE slot, not two panes: {msg}"
         );
     }
 
