@@ -216,9 +216,42 @@ concurrently. Lint rejects cyclic graphs.
 
 **Actions:** `send_message`, `send_dm`, `dispatch_job`, `spawn`, `reduce` (bounded fold over a
 proper list: `all`/`any`/`count`/`sum`/`join`, one scalar), `request_approval`, `delay`,
-`verify`, `call_workflow`, `parallel`, `branch`, `retry`, `foreach`, `loop`. Two are
+`park`, `verify`, `call_workflow`, `parallel`, `branch`, `retry`, `foreach`, `loop`. Two are
 **deprecated and fail-closed** (bd-i6kc): `react` and `call_webhook` are lint errors, and the
 boundary rejects them with `unsupported_action`. Do not author them into new workflows.
+
+**`park` (bd-ynef) is `delay`'s durable sibling, and the difference matters.** `delay { secs }`
+sleeps for a *relative* span inside one process. `park { until_ms, max_wait_secs, reason }`
+waits until an *absolute* wake time and is re-drivable: the engine journals the intent before
+waiting, so a crash mid-park leaves a `Parked` journal row that a later run resumes from
+instead of a wait that vanished. Use `delay` inside a single run; use `park` when the wait must
+survive the process.
+
+```yaml
+- name: wait_for_slot
+  action: park
+  until_ms: "1780000000000"        # absolute unix millis, or "{{inputs.wake_at}}"
+  max_wait_secs: 300                # REQUIRED: caps ONE wait, not the total
+  reason: "busy-owner fence held"
+```
+
+Three rules the engine enforces, all of which fail loudly rather than quietly:
+
+1. **`max_wait_secs` is required.** An uncapped park is an unbounded wait. Lint rejects
+   `0`; the engine refuses a request longer than the 24h hard cap. A truncated park would
+   resume early and read as a successful step, which is worse than a refusal. Within the cap,
+   one wait is clamped to `max_wait_secs` and the remainder resumes in another park.
+2. **`until_ms` is DATA, never a duration.** It is an absolute time (templatable), not "sleep
+   this long". The engine compares it against a clock the *host* supplies; a leaf never reads
+   one. A re-driven park whose `T` has already passed resumes immediately rather than
+   sleeping again.
+3. **A park is INTERRUPTION, not a typed failure and not a completed step.** The step's value
+   carries `parked`, `resumed`, and `redrive_key` so you can tell the three apart; `ok:true`
+   alongside `parked:true` is the shape, not a contradiction. `EffectState::Parked` is
+   non-terminal, so the run's `on_error` does not fire on it.
+
+The re-drive key is `park:<run_id>:<node>:<until_ms>`, derived from the step's own data, so
+parking the same step to the same `T` twice is **one** resume.
 
 `loop` runs `body` up to `max` (a positive integer or `{{inputs.*}}`, cap 32). `until` stops
 when the guard is true. A field the attempt did not publish counts as not yet, so the loop
