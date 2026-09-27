@@ -48,6 +48,7 @@ mod durable_transition;
 mod effect_journal;
 mod failure;
 mod fs_util;
+mod harness_registry;
 mod headless;
 mod herdr_shim;
 mod ingress;

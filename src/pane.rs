@@ -662,11 +662,6 @@ pub(crate) fn model_fallback_intent(
     )
 }
 
-/// The actual pane splits + agent starts for one workspace (shared by the
-/// fresh-spawn and --reuse paths). Returns the registry entries.
-#[allow(clippy::too_many_arguments)] // one param per caller mirror, mirrors cmd_spawn
-#[allow(unused_mut)]
-
 /// bd-d7zu: the fail-closed refusal when a freshly split crew pane never
 /// reaches its line editor. Pure so the wording and the refusal itself are
 /// testable without a pane — the operator has to be told the SHELL is the
@@ -680,6 +675,7 @@ fn shell_gate_refusal(name: &str, pane_id: &str) -> anyhow::Error {
          the host is less loaded, or raise the budget."
     )
 }
+#[allow(clippy::too_many_arguments)] // one param per caller mirror, mirrors cmd_spawn
 fn spawn_crew_into(
     cfg: &Config,
     project: &str,

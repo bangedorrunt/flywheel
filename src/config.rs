@@ -600,12 +600,10 @@ impl Config {
         {
             return k.clone();
         }
-        match short {
-            "oc" => "opencode".into(),
-            "pi" => "pi".into(),
-            "gk" => "grok".into(),
-            other => other.into(),
-        }
+        // bd-drlm: this was a fifth private table. A project's `kinds` map
+        // above still wins — config may rename a kind — and the registry only
+        // answers the built-in spellings.
+        crate::harness_registry::canonical(short)
     }
 }
 

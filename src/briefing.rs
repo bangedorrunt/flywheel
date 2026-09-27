@@ -143,16 +143,17 @@ pub fn missing_required_inputs(primitive: &str, objective: &str) -> Vec<&'static
 }
 
 /// A harness named as its own word. `oc` and `gk` are the short aliases.
+/// A harness named as its own word. Every canonical name and every alias in
+/// `harness_registry` is findable here, which is what lets briefing pin a
+/// harness the registry knows. bd-drlm: the word list USED to be a fourth
+/// private table that knew neither `codex`, `claude` nor `fx`.
 pub fn named_harness(objective: &str) -> Option<&'static str> {
     let lower = objective.to_ascii_lowercase();
     for word in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
-        match word {
-            "opencode" | "oc" => return Some("opencode"),
-            "grok" | "gk" => return Some("grok"),
-            "omp" => return Some("omp"),
-            "pi" => return Some("pi"),
-            "pa" => return Some("pa"),
-            _ => {}
+        // No longest-first pass is needed: a word is already split, so `oc`
+        // can never shadow `opencode`. Resolution is exact, and fenced as such.
+        if let Some(spec) = crate::harness_registry::spec(word) {
+            return Some(spec.canonical);
         }
     }
     None
