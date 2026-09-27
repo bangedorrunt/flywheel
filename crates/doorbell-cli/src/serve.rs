@@ -241,6 +241,11 @@ fn inbox_path_down(ages: &[Option<u64>], fresh_secs: u64) -> bool {
 /// independently — only the *frequency* separates thrash (live: every 16s)
 /// from health. Allowance is ~2x the healthy cadence.
 const WATCH_WINDOW_SECS: u64 = 300;
+/// bd-lorot: a journal for a workspace this daemon does not host is only
+/// abandoned after this long. Generous on purpose — deleting a journal is not
+/// reversible, and the failure mode of being too eager is a live crew losing its
+/// wake record, while being too late only costs a file.
+const UNHOSTED_JOURNAL_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const WATCH_RESTARTS_ALLOWED_PER_WS: usize = 6;
 
 fn workspace_audit_path(fw_state: &std::path::Path, ws: &str) -> std::path::PathBuf {
@@ -751,11 +756,38 @@ pub async fn run(cfg: &Config) -> Result<()> {
     for (project, workspace) in &cfg.hosts {
         spawn_host_loop(cfg, &hosted, &loops, &owned, &health, project, workspace);
     }
+    // bd-lorot: the workspaces this daemon actually hosts, captured BEFORE the
+    // tick moves `cfg`. The prune may only touch workspaces outside this set.
+    let prune_live: std::collections::BTreeSet<String> =
+        cfg.hosts.iter().map(|(_, ws)| ws.clone()).collect();
+    let prune_state = cfg.flywheel_state.clone();
     let rotate_tick = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
             copy_truncate_over(&log_path, LOGROTATE_BYTES);
+            // bd-lorot: journals are one file per workspace the plane has EVER
+            // served and nothing removed them, so known_workspaces only grew —
+            // 913 files / 20 MB measured, and it is the input to the standby
+            // wake-blind signal. Prune the ones this daemon does not host AND
+            // has not touched for a week; a just-spawned crew is never a
+            // candidate, so a live workspace's journal cannot be deleted.
+            let store = doorbell_rt::FileStore::new(prune_state.clone());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let report = store.prune_unhosted_workspace_logs(
+                &prune_live,
+                UNHOSTED_JOURNAL_MAX_AGE_SECS,
+                now,
+            );
+            if report.journals_removed > 0 {
+                eprintln!(
+                    "doorbell: pruned {} journal file(s) for unhosted workspaces, freed {} byte(s) ({} left: too young)",
+                    report.journals_removed, report.bytes_freed, report.skipped_young
+                );
+            }
         }
     });
     let app = AppState {
