@@ -126,6 +126,72 @@ pub fn crew_agent_name(wf_name: &str, role: &str, ordinal: u32) -> String {
     }
 }
 
+/// Wait for a spawned role's pane to appear in `live_panes`, bounded.
+///
+/// A row in the spawn registry is proof the pane was created, so its absence
+/// from herdr's listing is a spawn/list race rather than a dead pane — and
+/// [`live_registry_for_dispatch`]'s prune cannot tell those apart, because it
+/// drops every row whose `pane_id` herdr did not return. Without this, a crew
+/// that spawned correctly loses the whole run to a missing-role bail.
+///
+/// `live_panes` returns `None` when the probe is unavailable, which is treated
+/// as "cannot confirm" and keeps polling until the window closes — the same
+/// fail-open posture the prune already takes for an unreachable herdr.
+///
+/// The wait is bounded on purpose: an unbounded poll would hang the run on a
+/// genuinely dead pane. `None` means the window closed without the pane, and
+/// the caller bails loud exactly as before (bd-ietv).
+pub fn settle_role_with<F>(
+    rows: &[SpawnEntry],
+    role: &str,
+    mut live_panes: F,
+    window_ms: u64,
+    poll_ms: u64,
+) -> Option<SpawnEntry>
+where
+    F: FnMut() -> Option<std::collections::HashSet<String>>,
+{
+    // No row for the role means it was never spawned: nothing to settle.
+    let want = resolve_pane_entry(&LiveRegistry(rows.to_vec()), role)?
+        .pane_id
+        .clone();
+    let mut waited = 0u64;
+    loop {
+        if let Some(live) = live_panes()
+            && live.contains(&want)
+        {
+            return rows.iter().find(|e| e.pane_id == want).cloned();
+        }
+        if waited >= window_ms {
+            return None;
+        }
+        if poll_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+        }
+        waited = waited.saturating_add(poll_ms);
+    }
+}
+
+/// Production [`settle_role_with`]: loads the project's registry rows and probes
+/// the real herdr.
+pub fn settle_for_role(project: &str, role: &str) -> Option<SpawnEntry> {
+    const WINDOW_MS: u64 = 5_000;
+    const POLL_MS: u64 = 250;
+    let rows = crate::state::load_spawn_registry(project);
+    settle_role_with(
+        &rows,
+        role,
+        || {
+            Client::connect(None)
+                .ok()
+                .and_then(|mut c| c.pane_list(None).ok())
+                .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
+        },
+        WINDOW_MS,
+        POLL_MS,
+    )
+}
+
 /// Resolve which registry entry serves a dispatch target: first the entry
 /// whose PROFILE matches `@role`, else an entry whose NAME matches. Pure —
 /// the runner's `@role -> running pane` mapping (ADR-0010 Spec A pane row).
@@ -614,7 +680,8 @@ fn spawn_crew_into(
                     &profile.slow,
                     &profile.plan,
                 ));
-                let pane_env = pane_env_for_launch(cfg, mail_identity.as_deref(), env_model_pin.as_deref())?;
+                let pane_env =
+                    pane_env_for_launch(cfg, mail_identity.as_deref(), env_model_pin.as_deref())?;
                 let pane_id = match &prev {
                     None => {
                         // bd-lifecycle-occupied-pane-wedge-07tx: PROBE BEFORE
@@ -938,7 +1005,9 @@ pub fn fence_action_for_effects(
         match e {
             // Re-check at the fence's deadline. Do NOT extend it.
             E::SleepUntilDeadline { until_ms, .. } | E::HoldContinued { until_ms, .. } => {
-                return FenceAction::Park { until_ms: *until_ms };
+                return FenceAction::Park {
+                    until_ms: *until_ms,
+                };
             }
             E::HoldExpired { .. } | E::FencedStale { .. } => return FenceAction::ForkAndRetry,
             E::Acquired { .. } => return FenceAction::Send,
@@ -1140,10 +1209,23 @@ pub fn pane_dispatch(
     // wins; otherwise profile column first, name fallback. bd-op8b: the
     // resolved target is logged — dispatching into a dead pane used to be
     // silent until the bare leaf downstream.
-    let entry = override_entry
+    let entry: SpawnEntry = match override_entry
         .or_else(|| resolve_pane_entry(entries, profile_name))
-        .ok_or_else(|| {
-            anyhow!(
+        .cloned()
+    {
+        Some(e) => e,
+        // A registry row means the pane WAS spawned; the prune only knows
+        // herdr's listing, so a pane listed moments later looks absent.
+        // Settle for it before failing the whole run (bd-ietv).
+        None => match settle_for_role(project, profile_name) {
+            Some(entry) => {
+                eprintln!(
+                    "flywheel: WARNING @{profile_name} pane {} was absent from herdr's listing at dispatch; settled and using it",
+                    entry.pane_id
+                );
+                entry
+            }
+            None => bail!(
                 "pane dispatch: no crew pane for @{profile_name} (spawned: {})",
                 entries
                     .entries()
@@ -1151,8 +1233,9 @@ pub fn pane_dispatch(
                     .map(|e| e.profile.as_deref().unwrap_or(&e.name))
                     .collect::<Vec<_>>()
                     .join(", ")
-            )
-        })?;
+            ),
+        },
+    };
     eprintln!(
         "flywheel: dispatch @{} → {} ({})",
         profile_name, entry.name, entry.pane_id
@@ -1232,7 +1315,7 @@ pub fn pane_dispatch(
     // own). A 429 swaps the target to a live fallback-profile pane and
     // re-drives the same loop ONCE; the second 429 fails loud with a
     // trail instead of redriving the exhausted route.
-    let mut attempt_entry: &SpawnEntry = entry;
+    let mut attempt_entry: &SpawnEntry = &entry;
     let mut attempt_profile = profile_name.to_string();
     let mut attempted: Vec<String> = vec![profile_name.to_string()];
     let mut reroute_trail: Vec<Value> = Vec::new();
@@ -1589,7 +1672,6 @@ pub(crate) fn pane_env_for_launch(
     }
     Ok(env)
 }
-
 
 /// bd-omwg: read one spawn side-channel promise spec into a launch plan.
 /// The profile name strips the `@`; the harness comes from the RESOLVED
@@ -2395,6 +2477,150 @@ pub fn start_spawn_drainer(
 mod tests {
     use super::*;
 
+    /// bd-ietv: a role whose registry row exists but whose pane is missing
+    /// from herdr's listing at dispatch time is the spawn/list race, not a
+    /// dead pane. The prune drops the row, so without settling the whole run
+    /// bails `no crew pane for @oracle` even though the crew spawned it.
+    #[test]
+    fn settle_role_waits_out_a_pane_herdr_has_not_listed_yet() {
+        use std::collections::HashSet;
+        let rows = vec![SpawnEntry {
+            pane_id: "w1:p1".into(),
+            name: "crew-goal-planner".into(),
+            profile: Some("planner".into()),
+            harness: Some("omp".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        }];
+        // First two probes report the pane absent (the race), third sees it.
+        let mut probe = 0u32;
+        let got = settle_role_with(
+            &rows,
+            "planner",
+            || {
+                probe += 1;
+                if probe < 3 {
+                    Some(HashSet::new())
+                } else {
+                    Some(HashSet::from(["w1:p1".to_string()]))
+                }
+            },
+            1_000,
+            0,
+        )
+        .expect("settles once the pane is listed");
+        assert_eq!(got.pane_id, "w1:p1", "settled the SPAWNED pane");
+        assert_eq!(probe, 3, "polled until listed, did not give up early");
+    }
+
+    /// bd-ietv: the settle is bounded. A genuinely dead pane still returns
+    /// None so the caller bails loud — an unbounded poll would hang the run.
+    #[test]
+    fn settle_role_gives_up_on_a_pane_that_never_appears() {
+        use std::collections::HashSet;
+        let rows = vec![SpawnEntry {
+            pane_id: "w1:p9".into(),
+            name: "crew-goal-oracle".into(),
+            profile: Some("oracle".into()),
+            harness: Some("omp".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        }];
+        let mut probes = 0u32;
+        let got = settle_role_with(
+            &rows,
+            "oracle",
+            || {
+                probes += 1;
+                Some(HashSet::new())
+            },
+            500,
+            100,
+        );
+        assert!(got.is_none(), "a never-listed pane must not be invented");
+        assert!(
+            probes <= 6,
+            "the wait is bounded, gave up after {probes} probes"
+        );
+    }
+
+    /// bd-ietv: a role with NO registry row was never spawned, so there is
+    /// nothing to settle and the caller must keep failing loud.
+    #[test]
+    fn settle_role_declines_a_role_that_was_never_spawned() {
+        use std::collections::HashSet;
+        let rows = vec![SpawnEntry {
+            pane_id: "w1:p1".into(),
+            name: "crew-goal-coder".into(),
+            profile: Some("coder".into()),
+            harness: Some("omp".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        }];
+        let mut probes = 0u32;
+        let got = settle_role_with(
+            &rows,
+            "oracle",
+            || {
+                probes += 1;
+                Some(HashSet::from(["w1:p1".to_string()]))
+            },
+            1_000,
+            100,
+        );
+        assert!(got.is_none(), "unknown role stays unknown");
+        assert_eq!(probes, 0, "never polled: there was no row to wait for");
+    }
+
+    /// bd-ietv: an unavailable probe is treated as cannot-confirm, not as
+    /// dead — the same fail-open posture the registry prune already takes for
+    /// an unreachable herdr.
+    #[test]
+    fn settle_role_treats_an_unavailable_probe_as_not_confirmed() {
+        use std::collections::HashSet;
+        let rows = vec![SpawnEntry {
+            pane_id: "w1:p5".into(),
+            name: "crew-goal-reviewer".into(),
+            profile: Some("reviewer".into()),
+            harness: Some("omp".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        }];
+        let mut probe = 0u32;
+        let got = settle_role_with(
+            &rows,
+            "reviewer",
+            || {
+                probe += 1;
+                if probe < 2 {
+                    None // herdr unreachable
+                } else {
+                    Some(HashSet::from(["w1:p5".to_string()]))
+                }
+            },
+            1_000,
+            0,
+        )
+        .expect("recovers once the probe answers");
+        assert_eq!(got.pane_id, "w1:p5");
+    }
+
     /// bd-gkwu: the dispatch retry schedule is pure policy data —
     /// deterministic per attempt, bounded by the cap, no sleep inside.
     /// (The sleep lives at the single call site in the interpreter.)
@@ -2617,9 +2843,7 @@ mod tests {
         // the function grows (bd-crlx added the env-pin resolution ahead of the
         // registry row and pushed the row out of a 16000-char window), which
         // reads as "the row is missing" when it is merely further down.
-        let end = src[start..]
-            .find("\nfn ")
-            .map_or(start, |i| start + i);
+        let end = src[start..].find("\nfn ").map_or(start, |i| start + i);
         let slice = &src[start..end];
         assert!(
             slice.contains("profile_launch_plan(harness, profile, None)"),
@@ -3770,7 +3994,6 @@ mod pane_registry_fallback_tests {
     }
 }
 
-
 #[cfg(test)]
 mod bd_d7zu_shell_gate_tests {
     use super::shell_gate_refusal;
@@ -3785,7 +4008,10 @@ mod bd_d7zu_shell_gate_tests {
         let msg = e.to_string();
         assert!(msg.contains("crew-x-coder"), "names the agent: {msg}");
         assert!(msg.contains("w1:p3"), "names the pane: {msg}");
-        assert!(msg.contains("never rendered a prompt"), "states the cause: {msg}");
+        assert!(
+            msg.contains("never rendered a prompt"),
+            "states the cause: {msg}"
+        );
         assert!(
             !msg.contains("not found in toron"),
             "must not launder a shell fault into the mailbox fault: {msg}"
@@ -3844,11 +4070,31 @@ mod bd_5llv_receipt_tests {
     #[test]
     fn every_send_verdict_carries_a_usable_ok() {
         for (name, verdict, want) in [
-            ("landed", json!({"ok": true, "landed": true, "reason": "landed"}), true),
-            ("stalled", json!({"ok": true, "landed": false, "reason": "stalled"}), true),
-            ("timeout", json!({"ok": true, "landed": null, "reason": "timeout"}), true),
-            ("coded", json!({"ok": true, "landed": false, "reason": "error:auth"}), true),
-            ("explicit-false", json!({"ok": false, "error": "boom"}), false),
+            (
+                "landed",
+                json!({"ok": true, "landed": true, "reason": "landed"}),
+                true,
+            ),
+            (
+                "stalled",
+                json!({"ok": true, "landed": false, "reason": "stalled"}),
+                true,
+            ),
+            (
+                "timeout",
+                json!({"ok": true, "landed": null, "reason": "timeout"}),
+                true,
+            ),
+            (
+                "coded",
+                json!({"ok": true, "landed": false, "reason": "error:auth"}),
+                true,
+            ),
+            (
+                "explicit-false",
+                json!({"ok": false, "error": "boom"}),
+                false,
+            ),
         ] {
             assert_eq!(
                 dispatch_receipt_ok(&verdict),
@@ -3972,8 +4218,8 @@ mod bd_qlr1_env_pin_wiring_tests {
             "opencode's root command rejects --model: {:?}",
             plan.args
         );
-        let env =
-            pane_env_for_launch(&cfg(), Some("SomeOwl"), plan.env_model_pin.as_deref()).expect("env");
+        let env = pane_env_for_launch(&cfg(), Some("SomeOwl"), plan.env_model_pin.as_deref())
+            .expect("env");
         let doc: serde_json::Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").expect("pin present")).unwrap();
         assert_eq!(doc["model"], "opencode-go/muse-spark-1.3-contributor");
@@ -3982,7 +4228,7 @@ mod bd_qlr1_env_pin_wiring_tests {
 
 #[cfg(test)]
 mod bd_fen3_fence_tests {
-    use super::{fence_action_for_effects, FenceAction, DISPATCH_HOLD_BOUND_MS};
+    use super::{DISPATCH_HOLD_BOUND_MS, FenceAction, fence_action_for_effects};
     use toron_core::busy_owner::BusyOwnerEffect as E;
 
     /// The rule that a naive host gets wrong. `HoldContinued` means "re-check at
