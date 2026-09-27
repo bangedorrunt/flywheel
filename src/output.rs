@@ -229,7 +229,10 @@ mod bd_confirm_tests {
             .expect_err("must refuse with no TTY");
         let msg = format!("{err:#}");
         assert!(msg.contains("no TTY"), "the reason must be legible: {msg}");
-        assert!(msg.contains("--yes"), "the refusal must name the fix: {msg}");
+        assert!(
+            msg.contains("--yes"),
+            "the refusal must name the fix: {msg}"
+        );
     }
 
     /// `--json` is the agent path. An agent gets a machine-readable refusal it
@@ -290,7 +293,12 @@ pub fn catalog_badge(status: &str) -> String {
 ///    not read as consent; an unattended agent must pass `--yes` deliberately.
 /// 2. **It names the blast radius** — every file, listed — because "overwrite
 ///    40 files?" is a question nobody can answer and "overwrite these 40?" is.
-pub fn confirm_destructive(what: &str, targets: &[String], yes: bool, json: bool) -> anyhow::Result<()> {
+pub fn confirm_destructive(
+    what: &str,
+    targets: &[String],
+    yes: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     if targets.is_empty() {
         return Ok(());
     }
@@ -311,7 +319,12 @@ pub fn confirm_destructive(what: &str, targets: &[String], yes: bool, json: bool
                  Re-run with --yes to accept, or --dry-run to see the full list. \
                  First few: {}",
                 targets.len(),
-                targets.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                targets
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         eprintln!(

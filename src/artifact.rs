@@ -565,7 +565,11 @@ pub fn stitch_artifacts(project: &str, run_id: &str) -> anyhow::Result<PathBuf> 
 /// full suite run because another test had swapped the env root between the
 /// fixture write and this read. Injecting the root removes the coupling
 /// instead of papering over it, and keeps the assertion about real behavior.
-fn stitch_artifacts_in(root: &std::path::Path, project: &str, run_id: &str) -> anyhow::Result<PathBuf> {
+fn stitch_artifacts_in(
+    root: &std::path::Path,
+    project: &str,
+    run_id: &str,
+) -> anyhow::Result<PathBuf> {
     let base = root
         .join("flywheel")
         .join(project)
@@ -683,16 +687,15 @@ pub fn compute_sha256(path: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
-/// bd-ww75: a per-test data root. The stitch tests used to resolve
-/// `dirs::data_local_dir()` at call time while other tests in this binary mutate
-/// XDG_DATA_HOME, so the read could land under a different root than the fixture
-/// was written to — passing alone, failing in a full suite run. This module is
-/// `#![forbid(unsafe_code)]`, so it cannot pin the env itself; injecting the
-/// root is both the only route and the sounder one.
-fn xdg_root() -> tempfile::TempDir {
-    tempfile::TempDir::new().expect("xdg temp dir")
-}
-
+    /// bd-ww75: a per-test data root. The stitch tests used to resolve
+    /// `dirs::data_local_dir()` at call time while other tests in this binary mutate
+    /// XDG_DATA_HOME, so the read could land under a different root than the fixture
+    /// was written to — passing alone, failing in a full suite run. This module is
+    /// `#![forbid(unsafe_code)]`, so it cannot pin the env itself; injecting the
+    /// root is both the only route and the sounder one.
+    fn xdg_root() -> tempfile::TempDir {
+        tempfile::TempDir::new().expect("xdg temp dir")
+    }
 
     use std::io::Write;
 

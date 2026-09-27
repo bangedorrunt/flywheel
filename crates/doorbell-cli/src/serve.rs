@@ -1047,10 +1047,8 @@ fn spawn_host_loop(
         // thread, and an async block's locals are dropped on normal return AND
         // on abort — so the ticker cannot outlive the hosted loop, and a retired
         // loop (bd-mk60) stops stamping.
-        let _hb = doorbell_rt::watchbeat::spawn_heartbeat_ticker(
-            supervised_state.clone(),
-            w.clone(),
-        );
+        let _hb =
+            doorbell_rt::watchbeat::spawn_heartbeat_ticker(supervised_state.clone(), w.clone());
         // Await a child task so panic/abort is also a supervised completion:
         // the outer task still removes the hosted row and releases its lease.
         let child = tokio::spawn(host_workspace(fw, p, w, loop_tx, rx, supervised_liveness));

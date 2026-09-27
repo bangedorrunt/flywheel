@@ -559,7 +559,14 @@ fn reserved_bookkeeping_log_produces_no_malformed_warnings() {
 
     for args in [
         vec!["cron", "list", "--project", "/nonexistent-proj"],
-        vec!["cron", "history", "alpha", "--json", "--project", "/nonexistent-proj"],
+        vec![
+            "cron",
+            "history",
+            "alpha",
+            "--json",
+            "--project",
+            "/nonexistent-proj",
+        ],
     ] {
         let out = run(&h, &args);
         let stderr = String::from_utf8_lossy(&out.stderr);

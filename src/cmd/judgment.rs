@@ -164,7 +164,11 @@ fn cmd_pack(cmd: &PackCmd) -> Result<()> {
                     "missing" => "\u{274c}",
                     _ => "\u{1f9e9}",
                 };
-                println!("\n{} {}", glyph, out::dim(&format!("{} {}", group.len(), want)));
+                println!(
+                    "\n{} {}",
+                    glyph,
+                    out::dim(&format!("{} {}", group.len(), want))
+                );
                 for row in group {
                     let v = match (row.user_version, row.project_version) {
                         (Some(u), Some(p)) => format!("user v{u} / project v{p}"),
@@ -178,7 +182,11 @@ fn cmd_pack(cmd: &PackCmd) -> Result<()> {
             let stale = rows.iter().filter(|r| r.status == "stale").count();
             println!();
             if stale == 0 {
-                println!("{} {}", out::ok("\u{2705}"), out::dim("user packs match the project tier"));
+                println!(
+                    "{} {}",
+                    out::ok("\u{2705}"),
+                    out::dim("user packs match the project tier")
+                );
             } else {
                 println!(
                     "{} {}",
@@ -221,13 +229,25 @@ fn cmd_pack(cmd: &PackCmd) -> Result<()> {
                 out::dim(&format!("(overwrite: {})", scope.as_str()))
             );
             if !rep.copied.is_empty() {
-                println!("   {} {}", out::ok(&rep.copied.len().to_string()), out::dim("pack(s) promoted from the project tier"));
+                println!(
+                    "   {} {}",
+                    out::ok(&rep.copied.len().to_string()),
+                    out::dim("pack(s) promoted from the project tier")
+                );
             }
             if !rep.overwritten.is_empty() {
-                println!("   {} {}", out::warn(&rep.overwritten.len().to_string()), out::dim("pack(s) RESTORED from the project tier (old bytes kept as .bak)"));
+                println!(
+                    "   {} {}",
+                    out::warn(&rep.overwritten.len().to_string()),
+                    out::dim("pack(s) RESTORED from the project tier (old bytes kept as .bak)")
+                );
             }
             if !rep.kept.is_empty() {
-                println!("   {} {}", out::dim(&rep.kept.len().to_string()), out::dim("pack(s) left untouched (raise --overwrite to replace)"));
+                println!(
+                    "   {} {}",
+                    out::dim(&rep.kept.len().to_string()),
+                    out::dim("pack(s) left untouched (raise --overwrite to replace)")
+                );
             }
             if *dry_run && !rep.planned_overwrites.is_empty() {
                 println!(
@@ -235,7 +255,10 @@ fn cmd_pack(cmd: &PackCmd) -> Result<()> {
                     out::warn("\u{26a0}\u{fe0f}"),
                     rep.planned_overwrites.join(", ")
                 );
-                println!("{}", out::dim("nothing was written. Re-run without --dry-run to apply."));
+                println!(
+                    "{}",
+                    out::dim("nothing was written. Re-run without --dry-run to apply.")
+                );
             }
             Ok(())
         }
@@ -247,7 +270,10 @@ fn cmd_pack(cmd: &PackCmd) -> Result<()> {
                 removed.push(path.display().to_string());
             }
             if removed.is_empty() {
-                bail!("no user-tier pack file for id {id:?} in {}", user_dir.display());
+                bail!(
+                    "no user-tier pack file for id {id:?} in {}",
+                    user_dir.display()
+                );
             }
             println!(
                 "{} {}",
@@ -270,13 +296,12 @@ fn cmd_pack(cmd: &PackCmd) -> Result<()> {
                 return Ok(());
             }
             for row in &rows {
-                let tier = if row.user_version.is_some() { "user" } else { "project" };
-                println!(
-                    "{:<24} {:<8} {}",
-                    row.id,
-                    tier,
-                    out::dim(&row.status)
-                );
+                let tier = if row.user_version.is_some() {
+                    "user"
+                } else {
+                    "project"
+                };
+                println!("{:<24} {:<8} {}", row.id, tier, out::dim(&row.status));
             }
             Ok(())
         }

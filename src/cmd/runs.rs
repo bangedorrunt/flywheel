@@ -352,4 +352,3 @@ pub(crate) fn cmd_runs(_cfg: &Config, cmd: &RunsCmd) -> Result<()> {
         }
     }
 }
-

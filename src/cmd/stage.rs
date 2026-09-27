@@ -168,7 +168,9 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
             );
             println!(
                 "{}",
-                crate::output::dim("the compiled-in stage resolves again — flywheel stage list shows the tier")
+                crate::output::dim(
+                    "the compiled-in stage resolves again — flywheel stage list shows the tier"
+                )
             );
             Ok(())
         }
