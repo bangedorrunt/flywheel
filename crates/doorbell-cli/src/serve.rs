@@ -1655,7 +1655,10 @@ fn health_body(app: &AppState) -> String {
     // D4.4: a torn journal tail degrades loudly here (bd-asr2.4).
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut degraded = Vec::new();
-    if store.any_torn_tail() {
+    // bd-lorot: scoped to what we HOST. Scanning every journal let an abandoned
+    // workspace hold `degraded` red forever.
+    let hosted_ws: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
+    if store.any_torn_tail_among(&hosted_ws) {
         degraded.push("journal_torn_tail".to_string());
     }
     let mode = if hosted.is_empty() {
@@ -1889,6 +1892,9 @@ fn events_body(state_dir: &std::path::Path, since: Option<u64>) -> String {
 /// flywheel state dir; per-loop runtime counters stay in RunReports).
 fn stats_body(app: &AppState) -> String {
     let hosted = hosted_keys(&app.hosted.lock());
+    // bd-lorot: hoisted because `hosted` is MOVED into the json body below,
+    // and the torn-tail check must be scoped to what we host.
+    let hosted_ws: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
     let store = doorbell_rt::FileStore::new(&app.fw_state);
     let mut journal_rows = 0u64;
     let mut workspaces = 0u64;
@@ -1918,7 +1924,7 @@ fn stats_body(app: &AppState) -> String {
         "build": running_build_stamp(doorbell_rt::lease::unix_now()),
         "workspaces": workspaces,
         "journal_rows": journal_rows,
-        "torn_tail": store.any_torn_tail(),
+        "torn_tail": store.any_torn_tail_among(&hosted_ws),
         "rings_by_class": {},
         "injects": 0,
         "drops": 0,
