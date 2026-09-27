@@ -184,10 +184,10 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     // 4b. bd-uona: the panes this project allocated can still host an agent.
     //     `check_herdr` only pings the socket, so a reaped crew workspace
     //     read PASS while every dispatched agent died on the readiness wait.
-    if mode.needs_project {
-        if let Some(p) = project {
-            checks.push(check_pane_materializable(cfg, p));
-        }
+    if mode.needs_project
+        && let Some(p) = project
+    {
+        checks.push(check_pane_materializable(cfg, p));
     }
 
     // 5. .beads/ exists (--work mode only)

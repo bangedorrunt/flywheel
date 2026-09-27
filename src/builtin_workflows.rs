@@ -3016,7 +3016,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}.{node} has a task"));
             for token in tokens {
                 assert!(
-                    task.contains(&token[..]),
+                    task.contains(token),
                     "{name}.{node} must consume {token} or a diverger's work is dropped: {task}"
                 );
             }

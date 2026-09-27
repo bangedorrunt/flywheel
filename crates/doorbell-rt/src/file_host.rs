@@ -682,9 +682,7 @@ impl FileHost {
             unroutable_pins: Vec::new(),
             captain_routed_pins: Vec::new(),
             index_refreshed_at: 0,
-            retry: std::sync::Arc::new(std::sync::Mutex::new(
-            crate::policy::WatchRetry::default(),
-        )),
+            retry: std::sync::Arc::new(std::sync::Mutex::new(crate::policy::WatchRetry::default())),
             restart_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             absent_rows: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             daemon_exe,
@@ -1522,11 +1520,7 @@ impl Host for FileHost {
         // The 16s cap is deliberate (GS-007 never-deaf: probing forever beats
         // going wake-blind), so the loop itself is not the bug. What was broken
         // is that the gate never opened again — see the `retry` field.
-        let backoff = self
-            .retry
-            .lock()
-            .map(|mut r| r.record_fail())
-            .unwrap_or(16);
+        let backoff = self.retry.lock().map(|mut r| r.record_fail()).unwrap_or(16);
         let tx = self.tx.clone();
         let project = self.cfg.project.clone();
         let fw_state = self.cfg.flywheel_state.clone();
@@ -1577,9 +1571,7 @@ impl Host for FileHost {
                     // cause 1,613 times is a spin loop, and one a peer service
                     // can induce is a denial-of-service surface.
                     if kind == crate::wake_sock::AUDIT_SOCK_ABSENT
-                        && absent_for_audit
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            > 0
+                        && absent_for_audit.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
                     {
                         return;
                     }
@@ -2925,5 +2917,4 @@ mod audit_rotation_tests {
             "keeping {AUDIT_KEEP_LINES} rows must fit inside {AUDIT_MAX_BYTES} bytes"
         );
     }
-
 }
