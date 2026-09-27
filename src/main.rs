@@ -4202,11 +4202,16 @@ mod spawn_profile_plan_tests {
             // bd-crlx: opencode gets NO model argv. The root command herdr
             // launches has no `--model` (only `opencode run` does) and v2.0.16
             // rejects it outright. The pin travels by pane env instead.
-            profile_launch_plan("opencode", &p, None).expect("opencode").args,
+            profile_launch_plan("opencode", &p, None)
+                .expect("opencode")
+                .args,
             Vec::<String>::new()
         );
         assert_eq!(
-            profile_launch_plan("opencode", &p, None).expect("opencode").env_model_pin.as_deref(),
+            profile_launch_plan("opencode", &p, None)
+                .expect("opencode")
+                .env_model_pin
+                .as_deref(),
             Some("opencode-go/deepseek-v4-flash"),
             "the pin must be delivered by pane env, not dropped"
         );
@@ -10771,7 +10776,8 @@ pub(crate) fn start_agent_with_retry_profile(
                                 // The pane already exists, so the pin is only
                                 // honoured when it matches what that pane is
                                 // already pinned to; otherwise refuse by name.
-                                if let Ok(next_plan) = profile_launch_plan(&next_kind, next_prof, None)
+                                if let Ok(next_plan) =
+                                    profile_launch_plan(&next_kind, next_prof, None)
                                     && let Some(pin) = &next_plan.env_model_pin
                                 {
                                     let pinned = current_profile
@@ -10965,7 +10971,8 @@ fn start_agent_with_retry_dyn_profile(
                                 // reroute site — an existing pane's env is fixed
                                 // at split, so an env-delivered model pin is only
                                 // honoured when it already matches the pane.
-                                if let Ok(next_plan) = profile_launch_plan(&next_kind, next_prof, None)
+                                if let Ok(next_plan) =
+                                    profile_launch_plan(&next_kind, next_prof, None)
                                     && let Some(pin) = &next_plan.env_model_pin
                                 {
                                     let pinned = current_profile
@@ -25737,6 +25744,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                                 &inputs_c,
                                 &entries,
                                 &inv.action,
+                                // bd-0s0y: a `parallel` copy addresses its own
+                                // pane via the ordinal in its iteration_key.
+                                toron_workflow::identity::copy_ordinal(
+                                    inv.run.iteration_key.as_deref(),
+                                ),
                             )
                         })
                     }
@@ -26347,6 +26359,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         &inputs_c,
                         &entries,
                         &inv.action,
+                        // bd-0s0y: a `parallel` copy addresses its own pane
+                        // via the ordinal in its iteration_key.
+                        toron_workflow::identity::copy_ordinal(inv.run.iteration_key.as_deref()),
                     )
                 })
             };
@@ -26564,11 +26579,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // Plan first, confirm against the PLAN, then execute. Confirming
             // after acting would make --yes a lie.
             let plan = workflow_catalog::seed_user_catalog_with(&root, scope, true)?;
-            let targets: Vec<String> = plan
-                .planned_overwrites
-                .iter()
-                .cloned()
-                .collect();
+            let targets: Vec<String> = plan.planned_overwrites.iter().cloned().collect();
             // A dry run is the REVIEW step; asking it to confirm defeats it.
             if !*dry_run {
                 crate::output::confirm_destructive("overwrite", &targets, *yes, *json)?;
@@ -26590,8 +26601,14 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 println!("   {} {}", paint(&n.to_string()), output::dim(what));
             };
             if !report.created_workflows.is_empty() || !report.created_stages.is_empty() {
-                line(report.created_workflows.len(), "workflow(s) created", &|s| output::ok(s));
-                line(report.created_stages.len(), "stage(s) created", &|s| output::ok(s));
+                line(
+                    report.created_workflows.len(),
+                    "workflow(s) created",
+                    &|s| output::ok(s),
+                );
+                line(report.created_stages.len(), "stage(s) created", &|s| {
+                    output::ok(s)
+                });
             }
             if !report.overwritten_workflows.is_empty() || !report.overwritten_stages.is_empty() {
                 line(
@@ -26646,7 +26663,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             }
             println!(
                 "{}",
-                output::dim("next: flywheel workflow drift  \u{2192}  flywheel workflow show <name>")
+                output::dim(
+                    "next: flywheel workflow drift  \u{2192}  flywheel workflow show <name>"
+                )
             );
             Ok(())
         }
@@ -26720,10 +26739,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         );
                     }
                     if missing > 0 {
-                        println!(
-                            "   {}",
-                            output::accent("fix: flywheel workflow seed")
-                        );
+                        println!("   {}", output::accent("fix: flywheel workflow seed"));
                     }
                 }
             }
@@ -29962,10 +29978,8 @@ pub(crate) fn headless_dispatch(
     // The step pin wins. Otherwise the in-memory profile harness, which is
     // where `--role-harness` was applied. The subprocess reloads disk and
     // would ignore that overlay unless we pass `--harness`.
-    let harness = headless::effective_step_harness(
-        headless::dispatch_spec_harness(spec),
-        &profile.harness,
-    );
+    let harness =
+        headless::effective_step_harness(headless::dispatch_spec_harness(spec), &profile.harness);
     if !harness.is_empty() {
         cmd.arg("--harness").arg(harness);
     }
@@ -37152,7 +37166,7 @@ mod product_digest_tests {
 
 #[cfg(test)]
 mod bd_qlr1_reroute_env_pin_tests {
-    use super::{reroute_env_pin_verdict, RerouteEnvPin};
+    use super::{RerouteEnvPin, reroute_env_pin_verdict};
 
     /// bd-qlr1: the distinction that keeps a working recovery path working.
     /// A reroute launches into an EXISTING pane, so an env-delivered model pin
@@ -37162,8 +37176,10 @@ mod bd_qlr1_reroute_env_pin_tests {
     #[test]
     fn a_same_model_reroute_is_already_pinned_and_proceeds() {
         assert_eq!(
-            reroute_env_pin_verdict(Some("opencode-go/muse-spark-1.3-contributor"),
-                "opencode-go/muse-spark-1.3-contributor"),
+            reroute_env_pin_verdict(
+                Some("opencode-go/muse-spark-1.3-contributor"),
+                "opencode-go/muse-spark-1.3-contributor"
+            ),
             RerouteEnvPin::AlreadyPinned,
             "the pane already carries this pin, so the hop is satisfied"
         );
@@ -37197,8 +37213,14 @@ mod bd_qlr1_reroute_env_pin_tests {
     #[test]
     fn the_match_is_exact_not_a_prefix_or_suffix() {
         for (pinned, wants) in [
-            (Some("opencode-go/muse-spark-1.3"), "opencode-go/muse-spark-1.3-contributor"),
-            (Some("opencode-go"), "opencode-go/muse-spark-1.3-contributor"),
+            (
+                Some("opencode-go/muse-spark-1.3"),
+                "opencode-go/muse-spark-1.3-contributor",
+            ),
+            (
+                Some("opencode-go"),
+                "opencode-go/muse-spark-1.3-contributor",
+            ),
             (Some(""), "opencode-go/muse-spark-1.3-contributor"),
         ] {
             assert_eq!(

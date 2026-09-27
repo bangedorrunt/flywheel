@@ -742,7 +742,15 @@ pub fn cron_runner(entry: &CronEntry) -> toron_workflow::engine::EffectRunner {
             let name = entry.name.clone();
             let inputs = Value::Null;
             std::sync::Arc::new(move |inv: &ActionInvocation| {
-                crate::pane::pane_dispatch(&catalog, project, &name, &inputs, &entries, &inv.action)
+                crate::pane::pane_dispatch(
+                    &catalog,
+                    project,
+                    &name,
+                    &inputs,
+                    &entries,
+                    &inv.action,
+                    toron_workflow::identity::copy_ordinal(inv.run.iteration_key.as_deref()),
+                )
             })
         }
         CronMode::Headless => {
@@ -830,7 +838,15 @@ pub fn spec_runner(spec: &CronSpec) -> toron_workflow::engine::EffectRunner {
             let name = spec.name.clone();
             let inputs = Value::Null;
             std::sync::Arc::new(move |inv: &ActionInvocation| {
-                crate::pane::pane_dispatch(&catalog, project, &name, &inputs, &entries, &inv.action)
+                crate::pane::pane_dispatch(
+                    &catalog,
+                    project,
+                    &name,
+                    &inputs,
+                    &entries,
+                    &inv.action,
+                    toron_workflow::identity::copy_ordinal(inv.run.iteration_key.as_deref()),
+                )
             })
         }
     }
