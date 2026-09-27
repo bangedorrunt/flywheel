@@ -16566,8 +16566,26 @@ fn cmd_kill(
 // ---- work / assign ----
 
 /// bd-p4oc helpers: non-vacuous VERIFY gate for cargo test filters.
+///
+/// bd-s913: the shape test, not the literal spelling. This used to require the
+/// fence to start with `cargo test`, so every `mbx +nightly-... test` fence —
+/// 148 of the 353 in the ledger, including bd-uona's own — was silently exempt
+/// from the strict gate and reported `0 passed; 68 filtered out` as a pass.
+/// A green light wired to nothing is worse than a red fence, because a red
+/// fence at least produces a signal.
 pub(crate) fn is_cargo_test_verify(verify: &str) -> bool {
-    verify.trim_start().starts_with("cargo test")
+    let v = verify.trim_start();
+    // Direct cargo, or a wrapper (mbx/rtx/mise/cargo-nextest) that eventually
+    // invokes `cargo test`. Requiring the literal prefix `cargo test` used to
+    // exempt every wrapped fence from the vacuity gate.
+    let is_direct = v.starts_with("cargo test")
+        || v.starts_with("cargo nextest run")
+        || v.starts_with("nextest run");
+    let is_wrapped = v.split_whitespace().any(|tok| {
+        let tok = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+        matches!(tok, "mbx" | "rtx" | "mise") && v.contains(" test")
+    });
+    is_direct || is_wrapped
 }
 
 pub(crate) fn parse_count_before(output: &str, needle: &str) -> Option<u32> {
@@ -16648,6 +16666,88 @@ mod verify_gate_tests {
         assert!(!is_cargo_test_verify("cargo build"));
         assert!(!is_cargo_test_verify("pytest tests/test_x.py"));
         assert!(!is_cargo_test_verify("cargo build --tests"));
+    }
+
+    /// bd-s913: the wrapper shapes this repo's fences actually use. Every one
+    /// of these was silently exempt from the strict vacuous gate before,
+    /// which is how a zero-match filter reported itself as a pass.
+    #[test]
+    fn vacuous_verify_detects_wrapped_cargo_test_fences() {
+        for verify in [
+            // bd-uona's own fence, verbatim from the ledger.
+            "mbx +nightly-aarch64-apple-darwin test preflight",
+            "mbx +nightly-aarch64-apple-darwin test note_has_sha",
+            "mbx +nightly-aarch64-apple-darwin test -p flywheel --bins foo",
+            "cargo test -p toron-workflow park",
+            "cargo test --workspace",
+            "rtx test bar",
+        ] {
+            assert!(
+                is_cargo_test_verify(verify),
+                "must be checked for vacuity: {verify}"
+            );
+        }
+    }
+
+    /// bd-s913 unhappy path: the widened matcher must NOT swallow
+    /// non-test-shaped fences. A `cargo build` or a bare `flywheel` command
+    /// has no pass count to parse, so treating it as cargo-shaped would make
+    /// the gate report nonsense.
+    #[test]
+    fn vacuous_verify_leaves_non_test_shapes_alone() {
+        for verify in [
+            "cargo build",
+            "cargo build --tests",
+            "pytest tests/test_x.py",
+            "bash scripts/verify-doorbell-daemon.sh",
+            "doorbell ping",
+            "flywheel kill --force && sleep 2",
+            "br show bd-x --json | grep -q closed",
+        ] {
+            assert!(
+                !is_cargo_test_verify(verify),
+                "not a cargo test shape: {verify}"
+            );
+        }
+    }
+
+    /// bd-s913: the decision itself. A zero-match filter is VACUOUS (must be
+    /// refused under strict); a real match is not. This is the pair the brief
+    /// asks for, asserted on the parsed counts the gate actually uses.
+    #[test]
+    fn vacuous_verify_classifies_zero_match_as_vacuous_and_real_match_as_not() {
+        let zero = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s";
+        let (passed, filtered) = parse_cargo_test_counts(zero);
+        assert_eq!(passed, Some(0), "the zero-match shape parses to 0");
+        assert_eq!(filtered, Some(68));
+        assert!(
+            passed == Some(0),
+            "0 passed must read as vacuous, matching the gate's condition"
+        );
+
+        let real = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1941 filtered out; finished in 0.00s";
+        let (passed, filtered) = parse_cargo_test_counts(real);
+        assert_eq!(passed, Some(2), "a real match is not vacuous");
+        assert_eq!(filtered, Some(1941));
+        assert!(
+            passed != Some(0),
+            "a matching filter must NOT be refused as vacuous"
+        );
+    }
+
+    /// bd-s913: the fence bd-uona actually shipped, end to end through both
+    /// halves of the decision. Before the fix `is_cargo_test_verify` was
+    /// false for it, so `is_vacuous` was false and the row read as a pass.
+    #[test]
+    fn vacuous_verify_bd_uona_fence_is_now_detected_as_vacuous() {
+        let verify = "mbx +nightly-aarch64-apple-darwin test preflight";
+        let output = "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.00s";
+        let is_cargo = is_cargo_test_verify(verify);
+        let (passed, _) = parse_cargo_test_counts(output);
+        // The exact expression src/durable.rs:1569 computes.
+        let is_vacuous = is_cargo && passed == Some(0);
+        assert!(is_cargo, "the fence is now in scope for the gate");
+        assert!(is_vacuous, "a zero-match fence reads as vacuous");
     }
 
     /// Table-driven cargo-test count parsing: (output, passed, filtered).
