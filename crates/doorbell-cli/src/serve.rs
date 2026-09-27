@@ -1966,14 +1966,38 @@ mod tests {
             !stamp.version.is_empty(),
             "a stamp with no version names no build: {stamp:?}"
         );
-        // This test binary was linked seconds ago, so the age must be present
-        // and small. A missing age here means the IO half is not resolving.
-        let age = stamp.age_s.expect("the live exe reports an age");
-        assert!(
-            age < 60 * 60,
-            "a just-linked test binary is not hours old: {age}s"
+        // Assert the IO half is WIRED and SELF-CONSISTENT, not that the binary
+        // is fresh. The first version of this test asserted `age < 3600` on the
+        // reasoning that "this test binary was linked seconds ago" — which is
+        // true only on a cold build. On a warm cargo cache the binary is hours
+        // old and the test went red (observed: 8037s) with nothing wrong in the
+        // code. A test that passes only when the build cache is cold is not
+        // hermetic; it is the same class as a test that reads ambient state.
+        //
+        // What actually needs proving is that the reported numbers describe the
+        // SAME file the test can see. So read that file and compare.
+        let exe = stamp.exe.clone().expect("stamp names an exe");
+        let meta = std::fs::metadata(&exe)
+            .unwrap_or_else(|e| panic!("the named exe must exist and be readable: {exe}: {e}"));
+        let mtime = meta
+            .modified()
+            .expect("exe mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch mtime")
+            .as_secs();
+        assert_eq!(
+            stamp.exe_len,
+            Some(meta.len()),
+            "the reported size must be the named file's size"
         );
-        assert!(stamp.exe_len.is_some_and(|l| l > 0), "size is reported");
+        let age = stamp.age_s.expect("a readable exe reports an age");
+        let expected = now.saturating_sub(mtime);
+        assert!(
+            age.abs_diff(expected) <= 2,
+            "the reported age must describe the named file: reported {age}s, \
+             file is {expected}s old at the sampled `now` (2s tolerance for the \
+             clock moving between the two reads)"
+        );
     }
 
     /// bd-k0p7: the staleness rule keys off `age_s`, so a stamp with no age
