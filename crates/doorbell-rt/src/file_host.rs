@@ -604,6 +604,33 @@ pub struct FileHost {
     /// permanently, so a host that had one bad afternoon probed its bus three
     /// times a minute forever and never regained a fast first retry.
     retry: std::sync::Arc<std::sync::Mutex<crate::policy::WatchRetry>>,
+    /// bd-lorot: at most ONE restart may be outstanding.
+    ///
+    /// bd-kz54's `Died` path had no single-flight guard, so every death
+    /// scheduled its own restart task: `run_wake_loop` audits a failed connect
+    /// and returns `Died`, that `Died` schedules another task, and the cycle
+    /// feeds itself. Measured live on 2026-09-27: **1,613 audit rows in ONE
+    /// second** against a 16s backoff — the backoff was never in the path,
+    /// because 1,613 tasks each slept their own 16s and then all connected
+    /// anyway.
+    ///
+    /// This is the difference between a backoff and a rate limit. A backoff
+    /// spaces ONE retry; without single-flight, nothing stops a burst of
+    /// failures from scheduling a burst of retries that all fire together after
+    /// the sleep. The observed consequence was worse than CPU: the doorbell's
+    /// own retry storm drove the toron daemon to **EMFILE** (`accept error: Too
+    /// many open files`, 234 fds on `wake.sock`), which killed the very socket
+    /// the doorbell was polling. The two services took each other down.
+    restart_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Rows already written for the absence currently in progress.
+    ///
+    /// bd-lorot: the CAUSE is audited ONCE per outage, not once per attempt.
+    /// 1,613 identical `wake_sock_absent` rows per second is 169 KB/s, which
+    /// tripped the 5 MiB rotation into rewriting the file continuously — most
+    /// of the 239% CPU and the 629 MB RSS. A writer that a peer service can
+    /// make spin is a denial-of-service surface, not diagnostics. Reset to 0 on
+    /// a real delivery so the NEXT outage is audited again.
+    absent_rows: std::sync::Arc<std::sync::atomic::AtomicU64>,
     daemon_exe: PathBuf,
     generation: Option<GenRecord>,
     /// Status-change outbox: the poll loop `tell`s `HerdrStatus` back
@@ -658,6 +685,8 @@ impl FileHost {
             retry: std::sync::Arc::new(std::sync::Mutex::new(
             crate::policy::WatchRetry::default(),
         )),
+            restart_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            absent_rows: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             daemon_exe,
             generation,
             tx: None,
@@ -1482,6 +1511,14 @@ impl Host for FileHost {
     }
 
     fn restart_wake(&mut self) {
+        // SINGLE-FLIGHT, before anything else. A burst of `Died` collapses to
+        // one scheduled restart. Without this the backoff spaces nothing: every
+        // death brings its own timer, and they all fire together after the
+        // sleep — which is exactly how 1,613 connects landed in one second.
+        use std::sync::atomic::Ordering;
+        if self.restart_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
         // The 16s cap is deliberate (GS-007 never-deaf: probing forever beats
         // going wake-blind), so the loop itself is not the bug. What was broken
         // is that the gate never opened again — see the `retry` field.
@@ -1500,8 +1537,16 @@ impl Host for FileHost {
         // Hoisted OUT of the spawned future: the future is 'static, so reading
         // a field off `&mut self` inside it would let the borrow escape.
         let retry = self.retry.clone();
+        // Hoisted out of the 'static future so no borrow of `self` escapes.
+        let pending = self.restart_pending.clone();
+        let absent = self.absent_rows.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            // The slot frees the moment we are about to ACT, so the next death
+            // schedules its own restart instead of being dropped. Clearing it
+            // after the sleep is what makes this a rate limit rather than a
+            // one-shot: during the sleep deaths coalesce, after it they queue.
+            pending.store(false, std::sync::atomic::Ordering::SeqCst);
             let Some(tx) = tx else { return };
             if let Ok(mut g) = slot.lock()
                 && let Some(h) = g.take()
@@ -1517,9 +1562,27 @@ impl Host for FileHost {
             let audit_workspace = workspace.clone();
             let beat_state = fw_state.clone();
             let beat_workspace = workspace.clone();
+            // `retry` is hoisted before the spawn; re-reading `self` here would
+            // let the borrow escape the 'static future.
+            let absent_rows = absent.clone();
+            let absent_for_audit = absent.clone();
             let handle = crate::wake_sock::spawn_wake_task(
                 opts,
                 move |kind, detail| {
+                    // bd-lorot: ONE row per outage for a repeated absence.
+                    // Measured live before this: 1,613 identical
+                    // `wake_sock_absent` rows in ONE second = 169 KB/s, which
+                    // tripped the 5 MiB rotation into rewriting the file
+                    // continuously. The cause is worth recording once; the same
+                    // cause 1,613 times is a spin loop, and one a peer service
+                    // can induce is a denial-of-service surface.
+                    if kind == crate::wake_sock::AUDIT_SOCK_ABSENT
+                        && absent_for_audit
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            > 0
+                    {
+                        return;
+                    }
                     FileHost::append_audit_row(&audit_state, &audit_workspace, kind, detail);
                 },
                 move |out| {
@@ -1539,6 +1602,10 @@ impl Host for FileHost {
                                 if let Ok(mut r) = retry.lock() {
                                     r.reset();
                                 }
+                                // The outage is over, so the NEXT absence must be
+                                // audited again rather than swallowed by a counter
+                                // the last outage left high.
+                                absent_rows.fetch_and(0, std::sync::atomic::Ordering::SeqCst);
                             }
                             Err(_) => {
                                 crate::msg::deliver_died_blocking(&tx);
@@ -2586,6 +2653,86 @@ mod tests {
         assert!(!host3.inject_allowed("PinA"), "stale gen refuses");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// bd-lorot: a burst of deaths must schedule ONE restart.
+    ///
+    /// This is the fence for the live incident of 2026-09-27, where the
+    /// doorbell wrote 1,613 `wake_sock_absent` audit rows in one second against
+    /// a 16s backoff. The cause was not a slow backoff — it was that a backoff
+    /// spaces ONE retry, and nothing stopped a burst of `Died` from each
+    /// scheduling its own timer. 1,613 timers fired together, connected 1,613
+    /// times, and drove the toron daemon to EMFILE, killing the socket the
+    /// doorbell was polling.
+    ///
+    /// `retry.fails` is the witness: `restart_wake` calls `record_fail()` only
+    /// when a restart is actually SCHEDULED, so the counter is a direct read on
+    /// how many got past the guard. Neuter `restart_pending` and this asserts
+    /// 1 while the code produces 51.
+    #[test]
+    fn a_burst_of_deaths_schedules_exactly_one_restart() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = tmp_state("burst");
+        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
+        cfg.toron_bin = "true".into();
+        cfg.herdr_bin = "true".into();
+        let mut host = FileHost::new(cfg);
+        host.tx = Some(tokio::sync::mpsc::channel(64).0);
+
+        rt.block_on(async {
+            host.restart_wake();
+            for _ in 0..50 {
+                host.restart_wake();
+            }
+            // Let the single scheduled task reach its sleep; the burst is
+            // coalesced during the sleep, which is the window that matters.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        let fails = host.retry.lock().expect("gate").fails();
+        assert_eq!(
+            fails, 1,
+            "51 deaths scheduled {fails} restarts: without single-flight every death brings \
+             its own timer and they all fire together after the sleep, which is how 1,613 \
+             connects landed in one second"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-lorot: and the gate must REOPEN, or single-flight would become a
+    /// one-shot and a later outage would never be retried at all. The flag is
+    /// cleared when the scheduled task is about to act.
+    #[test]
+    fn the_single_flight_flag_reopens_after_the_task_fires() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = tmp_state("reopen");
+        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
+        cfg.toron_bin = "true".into();
+        cfg.herdr_bin = "true".into();
+        let mut host = FileHost::new(cfg);
+        host.tx = Some(tokio::sync::mpsc::channel(64).0);
+
+        rt.block_on(async {
+            host.restart_wake();
+            // The first backoff is 1s, so wait past it: the flag clears as the
+            // task wakes, and the NEXT death must be schedulable again.
+            tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+            host.restart_wake();
+        });
+
+        let fails = host.retry.lock().expect("gate").fails();
+        assert!(
+            fails >= 2,
+            "a death after the first task fired scheduled nothing (fails={fails}): the flag \
+             never reopened, so this would be a one-shot and the second outage would be \
+             never retried — silence instead of a storm"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2778,4 +2925,5 @@ mod audit_rotation_tests {
             "keeping {AUDIT_KEEP_LINES} rows must fit inside {AUDIT_MAX_BYTES} bytes"
         );
     }
+
 }
