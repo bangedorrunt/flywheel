@@ -4230,16 +4230,17 @@ where
 /// Internal: emit a fact to journal + handle_ingress (captain surface).
 /// Best-effort: journal failures are ignored (facts are at-least-once), and
 /// handle_ingress failures never kill the loop.
-fn emit_fact(project: &str, event: IngressEvent) {
+fn emit_fact(state_dir: &std::path::Path, project: &str, event: IngressEvent) {
     // route through ingress (captain doorbell + status) — the adapter
     // handles journaling (same file main.rs status reads), so we don't
     // double-append here.
-    let adapters = crate::ingress_adapters_for_project(project);
+    let adapters = crate::ingress_adapters_for_project(state_dir, project);
     crate::ingress::handle_ingress(&event, &adapters);
 }
 
-fn emit_ledger_fact(project: &str, bead_id: &str, event: LedgerEvent) {
+fn emit_ledger_fact(state_dir: &std::path::Path, project: &str, bead_id: &str, event: LedgerEvent) {
     emit_fact(
+        state_dir,
         project,
         IngressEvent::LedgerFact {
             bead_id: bead_id.to_string(),
@@ -4248,8 +4249,14 @@ fn emit_ledger_fact(project: &str, bead_id: &str, event: LedgerEvent) {
     );
 }
 
-fn emit_lease_lapsed(project: &str, path: &str, bead_id: Option<&str>) {
+fn emit_lease_lapsed(
+    state_dir: &std::path::Path,
+    project: &str,
+    path: &str,
+    bead_id: Option<&str>,
+) {
     emit_fact(
+        state_dir,
         project,
         IngressEvent::LeaseLapsed {
             path: path.to_string(),
@@ -6952,6 +6959,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             "flywheel: close of {bead_id} verified (legal verdict bound to sha)"
                                         );
                                         emit_ledger_fact(
+                                            &crate::config::state_dir(),
                                             &params.project,
                                             &bead_id,
                                             LedgerEvent::Closed,
@@ -6980,6 +6988,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                     "no-commit" => {
                                         close_grace_ticks.remove(&bead_id);
                                         emit_ledger_fact(
+                                            &crate::config::state_dir(),
                                             &params.project,
                                             &bead_id,
                                             LedgerEvent::Reopened,
@@ -7063,6 +7072,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             } else {
                                                 close_grace_ticks.remove(&bead_id);
                                                 emit_ledger_fact(
+                                                    &crate::config::state_dir(),
                                                     &params.project,
                                                     &bead_id,
                                                     LedgerEvent::Reopened,
@@ -7087,6 +7097,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             // the bead — not in verdict limbo.
                                             close_grace_ticks.remove(&bead_id);
                                             emit_ledger_fact(
+                                                &crate::config::state_dir(),
                                                 &params.project,
                                                 &bead_id,
                                                 LedgerEvent::Closed,
@@ -7239,7 +7250,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         );
                         record_renew_failure("batch", "batch", &err_str);
                         for (path, bead_id) in &to_renew {
-                            emit_lease_lapsed(&params.project, path, Some(bead_id));
+                            emit_lease_lapsed(
+                                &crate::config::state_dir(),
+                                &params.project,
+                                path,
+                                Some(bead_id),
+                            );
                         }
                         update_mail_health(
                             &params.project,
@@ -7272,7 +7288,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             let stalled = detect_stalled_panes(&inprog_for_stall, &states, now_secs, threshold);
             for ev in stalled {
                 // emit fact (journal + doorbell) — feeds Diagnose, not auto-reclaim
-                emit_fact(&params.project, ev);
+                emit_fact(&crate::config::state_dir(), &params.project, ev);
             }
         }
         // ADR-0026 Spec 4: mail-health dispatch-hold at N. ADR-0016: the
@@ -13625,12 +13641,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        // ensure clean
-        let path = crate::facts_journal_path(&proj);
-        let _ = std::fs::remove_file(&path);
+        let root = crate::temp_state_root("facts-close");
 
-        emit_ledger_fact(&proj, "bd-test-close", LedgerEvent::Closed);
-        let facts = crate::load_facts(&proj);
+        emit_ledger_fact(&root, &proj, "bd-test-close", LedgerEvent::Closed);
+        let facts = crate::load_facts(&root, &proj);
         assert_eq!(facts.len(), 1);
         match &facts[0] {
             IngressEvent::LedgerFact { bead_id, event } => {
@@ -13639,23 +13653,14 @@ mod tests {
             }
             other => panic!("expected LedgerFact, got {other:?}"),
         }
+        crate::assert_live_root_untouched(&proj);
+        let _ = std::fs::remove_dir_all(&root);
         // also routes through handle_ingress — fact_summary must be Some
         assert!(crate::ingress::fact_summary(&facts[0]).is_some());
         assert!(
             crate::ingress::fact_summary(&facts[0])
                 .unwrap()
                 .contains("ledger bd-test-close closed")
-        );
-        let _ = std::fs::remove_file(&path);
-
-        // bd-lorot: remove the journal this test caused, AT THE END. The
-        // cleanup has to come after emit_* — the fact reaches the real ingress
-        // seam, which writes {state}/journals/doorbell-journal-<proj>.jsonl,
-        // and with a unique proj per run that is a new permanent file every
-        // run. 244 had accumulated, and known_workspaces counts every one, so
-        // the suite was inflating the doorbell's wake-blind alarm and the disk.
-        let _ = std::fs::remove_file(
-            doorbell_rt::FileStore::new(crate::config::state_dir()).journal_file(&proj),
         );
     }
 
@@ -13751,11 +13756,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let path = crate::facts_journal_path(&proj);
-        let _ = std::fs::remove_file(&path);
-        emit_lease_lapsed(&proj, "src/durable.rs", Some("bd-lapsed-1"));
+        let root = crate::temp_state_root("facts-lapsed");
+        emit_lease_lapsed(&root, &proj, "src/durable.rs", Some("bd-lapsed-1"));
 
-        let facts = crate::load_facts(&proj);
+        let facts = crate::load_facts(&root, &proj);
         assert_eq!(facts.len(), 1);
         match &facts[0] {
             IngressEvent::LeaseLapsed { path, bead_id } => {
@@ -13764,21 +13768,12 @@ mod tests {
             }
             other => panic!("expected LeaseLapsed, got {other:?}"),
         }
+        crate::assert_live_root_untouched(&proj);
+        let _ = std::fs::remove_dir_all(&root);
         assert!(
             crate::ingress::fact_summary(&facts[0])
                 .unwrap()
                 .contains("lease lapsed src/durable.rs")
-        );
-        let _ = std::fs::remove_file(&path);
-
-        // bd-lorot: remove the journal this test caused, AT THE END. The
-        // cleanup has to come after emit_* — the fact reaches the real ingress
-        // seam, which writes {state}/journals/doorbell-journal-<proj>.jsonl,
-        // and with a unique proj per run that is a new permanent file every
-        // run. 244 had accumulated, and known_workspaces counts every one, so
-        // the suite was inflating the doorbell's wake-blind alarm and the disk.
-        let _ = std::fs::remove_file(
-            doorbell_rt::FileStore::new(crate::config::state_dir()).journal_file(&proj),
         );
     }
 

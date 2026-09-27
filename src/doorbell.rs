@@ -519,7 +519,7 @@ pub fn cron_tick_wake_in(state_dir: &Path, project: &str, summary: &str) {
         serde_json::json!({ "stage": "cron_tick", "summary": summary, "workspace": project, "corr": None::<String> }),
         None,
     );
-    if let Err(e) = crate::append_pending_fact(project, summary) {
+    if let Err(e) = crate::append_pending_fact(&crate::config::state_dir(), project, summary) {
         eprintln!("flywheel: cron doorbell sink: pending queue failed: {e:#}");
     }
 }
@@ -575,7 +575,7 @@ pub fn service_emit_wake_in(state_dir: &Path, project: &str, service: &str, to: 
         serde_json::json!({ "stage": "emit", "service": service, "to": to, "workspace": project, "corr": None::<String> }),
         None,
     );
-    if let Err(e) = crate::append_pending_fact(project, &summary) {
+    if let Err(e) = crate::append_pending_fact(&crate::config::state_dir(), project, &summary) {
         eprintln!("flywheel: service emit: pending queue failed: {e:#}");
     }
 }
@@ -675,7 +675,7 @@ pub fn inject_wake_in(
         serde_json::json!({ "stage": "inject", "pin": pin, "workspace": workspace, "inject_ts": now_unix }),
         None,
     );
-    let _ = crate::append_pending_fact(project, &summary);
+    let _ = crate::append_pending_fact(&crate::config::state_dir(), project, &summary);
     Ok(summary)
 }
 

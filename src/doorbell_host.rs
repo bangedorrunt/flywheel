@@ -540,7 +540,7 @@ impl Host for RtHost {
     }
 
     fn drain_facts(&mut self) -> Vec<String> {
-        crate::drain_pending_facts(&self.project)
+        crate::drain_pending_facts(&crate::config::state_dir(), &self.project)
     }
 
     fn restart_wake(&mut self) {

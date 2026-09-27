@@ -12912,21 +12912,66 @@ fn cmd_decide(
 
 // ---- bd-cy0s: event-driven facts (captain surface) ----
 
+/// bd-lorot: a throwaway state root for a test that reaches the real ingress
+/// seam. The seam is the only writer in this plane and it writes wherever it is
+/// TOLD to, which is the entire point: the live root is now reachable only by
+/// naming it out loud, so a test cannot leak into it by omission. Before this,
+/// `config::state_dir()` was read from inside the seam, every test inherited
+/// `~/.local/state/flywheel`, and 244 uniquely-named journal files had piled up
+/// there — which `known_journal_workspaces` then counted, so the suite was
+/// manufacturing a permanent wake-blind false alarm for a fleet that never
+/// existed.
+#[cfg(test)]
+pub(crate) fn temp_state_root(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("flywheel-state-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["journals", "doorbell", "facts"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("temp state root");
+    }
+    dir
+}
+
+/// bd-lorot: the fence half of the fix — prove the LIVE root gained nothing.
+/// `proj` is unique per run, so if the seam wrote to the live root at all this
+/// file would exist. Cheap, exact, and it goes red the moment someone re-adds
+/// an ambient `config::state_dir()` to the fact path.
+#[cfg(test)]
+pub(crate) fn assert_live_root_untouched(project: &str) {
+    let live = config::state_dir();
+    for leaked in [
+        live.join("journals")
+            .join(format!("doorbell-journal-{project}.jsonl")),
+        live.join("facts")
+            .join(format!("{}.jsonl", state::state_key(project))),
+        live.join("facts")
+            .join(format!("{}-pending.jsonl", state::state_key(project))),
+    ] {
+        assert!(
+            !leaked.exists(),
+            "the test suite wrote into the LIVE state root at {} — a test must name a \
+             throwaway root, never inherit the ambient one",
+            leaked.display()
+        );
+    }
+}
+
 #[must_use]
-pub fn facts_journal_path(project: &str) -> std::path::PathBuf {
-    config::state_dir()
+pub fn facts_journal_path(state_dir: &std::path::Path, project: &str) -> std::path::PathBuf {
+    state_dir
+        .to_path_buf()
         .join("facts")
         .join(format!("{}.jsonl", state::state_key(project)))
 }
 
-fn pending_facts_path(project: &str) -> std::path::PathBuf {
-    config::state_dir()
+fn pending_facts_path(state_dir: &std::path::Path, project: &str) -> std::path::PathBuf {
+    state_dir
+        .to_path_buf()
         .join("facts")
         .join(format!("{}-pending.jsonl", state::state_key(project)))
 }
 
-fn append_pending_fact(project: &str, summary: &str) -> Result<()> {
-    let path = pending_facts_path(project);
+fn append_pending_fact(state_dir: &std::path::Path, project: &str, summary: &str) -> Result<()> {
+    let path = pending_facts_path(state_dir, project);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -12939,8 +12984,8 @@ fn append_pending_fact(project: &str, summary: &str) -> Result<()> {
     Ok(())
 }
 
-fn drain_pending_facts(project: &str) -> Vec<String> {
-    let path = pending_facts_path(project);
+fn drain_pending_facts(state_dir: &std::path::Path, project: &str) -> Vec<String> {
+    let path = pending_facts_path(state_dir, project);
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -12950,11 +12995,15 @@ fn drain_pending_facts(project: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn append_fact(project: &str, event: &ingress::IngressEvent) -> Result<()> {
+pub fn append_fact(
+    state_dir: &std::path::Path,
+    project: &str,
+    event: &ingress::IngressEvent,
+) -> Result<()> {
     if !ingress::is_fact(event) {
         return Ok(());
     }
-    let path = facts_journal_path(project);
+    let path = facts_journal_path(state_dir, project);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -12969,8 +13018,8 @@ pub fn append_fact(project: &str, event: &ingress::IngressEvent) -> Result<()> {
 }
 
 #[must_use]
-pub fn load_facts(project: &str) -> Vec<ingress::IngressEvent> {
-    let path = facts_journal_path(project);
+pub fn load_facts(state_dir: &std::path::Path, project: &str) -> Vec<ingress::IngressEvent> {
+    let path = facts_journal_path(state_dir, project);
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -12979,8 +13028,8 @@ pub fn load_facts(project: &str) -> Vec<ingress::IngressEvent> {
         .collect()
 }
 
-pub fn facts_count_and_last(project: &str) -> (usize, Option<String>) {
-    let facts = load_facts(project);
+pub fn facts_count_and_last(state_dir: &std::path::Path, project: &str) -> (usize, Option<String>) {
+    let facts = load_facts(state_dir, project);
     let count = facts.len();
     let last = facts
         .last()
@@ -12994,11 +13043,15 @@ pub fn facts_count_and_last(project: &str) -> (usize, Option<String>) {
 /// path (herdr `agent_prompt` with pane fallback). No new Nostr kinds.
 /// GS-006: NO alias or alias not in registry is a loud miss (FactMiss), not
 /// silent Ok(()), and never falls back to registry.first() (crew[0] misroute).
-pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Result<()> {
+pub fn captain_fact_inject(
+    state_dir: &std::path::Path,
+    project: &str,
+    event: &ingress::IngressEvent,
+) -> Result<()> {
     let Some(line) = ingress::fact_doorbell_line(event) else {
         return Ok(());
     };
-    let _ = append_fact(project, event);
+    let _ = append_fact(state_dir, project, event);
     if state::load_captain_alias(project).is_none() {
         eprintln!(
             "flywheel: [FactMiss] no captain alias for project {project}: fact not injected (loud)"
@@ -13007,12 +13060,20 @@ pub fn captain_fact_inject(project: &str, event: &ingress::IngressEvent) -> Resu
     }
     // Queue for the live dispatcher. workspace::tick owns Prompt/FactMiss.
     // Never herdr-inject here (Tick Law).
-    append_pending_fact(project, &line)
+    append_pending_fact(state_dir, project, &line)
 }
 
 /// Adapter wiring for `handle_ingress`: facts → journal + captain doorbell.
 #[must_use]
-pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
+pub fn ingress_adapters_for_project(
+    state_dir: &std::path::Path,
+    project: &str,
+) -> ingress::IngressAdapters {
+    // The returned closures outlive this borrow, so the root is owned, not
+    // borrowed. bd-lorot: it is a PARAMETER, not config::state_dir() read
+    // here — that was the whole leak. A test that could not name a root could
+    // not reach the filesystem at all, and the compile error says so.
+    let root = state_dir.to_path_buf();
     let proj = project.to_string();
     ingress::IngressAdapters {
         // herdr/watch/cron reach the loop and doorbell through their own
@@ -13032,7 +13093,7 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
                 summary: summary.clone(),
             };
             crate::doorbell::journal_append_workspace(
-                &crate::config::state_dir(),
+                &root,
                 &proj,
                 &msg,
                 &[],
@@ -13043,7 +13104,7 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
             // facts_count_and_last read this file — the pending queue below is
             // only the wake. Dropping this writer orphaned the surface (empty
             // reads; facts_close/lapsed tests red). Append, never wake-only.
-            let ledger = facts_journal_path(&proj);
+            let ledger = facts_journal_path(&root, &proj);
             let wrote = match ledger.parent() {
                 Some(dir) => std::fs::create_dir_all(dir).and_then(|()| {
                     std::fs::OpenOptions::new()
@@ -13060,7 +13121,7 @@ pub fn ingress_adapters_for_project(project: &str) -> ingress::IngressAdapters {
             if let Err(e) = wrote {
                 eprintln!("flywheel: [FactMiss] could not append facts ledger: {e:#}");
             }
-            if let Err(e) = append_pending_fact(&proj, &summary) {
+            if let Err(e) = append_pending_fact(&root, &proj, &summary) {
                 eprintln!("flywheel: [FactMiss] could not queue fact for dispatcher: {e:#}");
             }
         }),
@@ -13913,7 +13974,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             project,
         );
     }
-    let (facts_count, last_fact) = facts_count_and_last(project);
+    let (facts_count, last_fact) = facts_count_and_last(&config::state_dir(), project);
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
@@ -24853,7 +24914,7 @@ fn cmd_steer(
     // live doorbell Fact drain so Host::tick emits Msg::MaterialContext (not a
     // parallel classifier plane).
     let summary = format!("AUTHORITATIVE OPERATOR OBJECTIVE: {objective}");
-    if let Err(e) = append_pending_fact(&project_owned, &summary) {
+    if let Err(e) = append_pending_fact(&crate::config::state_dir(), &project_owned, &summary) {
         bail!(
             "steer: could not queue material MaterialContext fact for project {project_owned}: {e:#}"
         );
@@ -36653,32 +36714,32 @@ mod ingress_wiring_tests {
         );
         // status helper: append fact and count
         let proj = format!("facts-test-{}", uuid::Uuid::new_v4());
+        let root = crate::temp_state_root("facts-captain");
 
         let ev = crate::ingress::IngressEvent::LeaseLapsed {
             path: "src/lib.rs".into(),
             bead_id: Some("bd-99".into()),
         };
-        let (c0, _) = crate::facts_count_and_last(&proj);
+        let (c0, _) = crate::facts_count_and_last(&root, &proj);
         assert_eq!(c0, 0);
-        crate::append_fact(&proj, &ev).unwrap();
-        let (c1, last) = crate::facts_count_and_last(&proj);
+        crate::append_fact(&root, &proj, &ev).unwrap();
+        let (c1, last) = crate::facts_count_and_last(&root, &proj);
         assert_eq!(c1, 1);
         assert!(last.unwrap().contains("lease lapsed src/lib.rs"));
         // non-fact does not increment
         let non = crate::ingress::IngressEvent::CronTick {
             name: "tick".into(),
         };
-        crate::append_fact(&proj, &non).unwrap();
-        let (c2, _) = crate::facts_count_and_last(&proj);
+        crate::append_fact(&root, &proj, &non).unwrap();
+        let (c2, _) = crate::facts_count_and_last(&root, &proj);
         assert_eq!(c2, 1, "non-fact must not be journaled");
 
-        // bd-lorot: remove the journal this test caused, AT THE END — the fact
-        // reaches the real ingress seam, which writes
-        // {state}/journals/doorbell-journal-<proj>.jsonl, and with a unique
-        // proj per run that is a new permanent file every run.
-        let _ = std::fs::remove_file(
-            doorbell_rt::FileStore::new(crate::config::state_dir()).journal_file(&proj),
-        );
+        // bd-lorot: the fence. This test used to append into ~/.local/state
+        // and then delete one of the two files it made, which is how 244 of
+        // them survived. Now it names a throwaway root and the live root is
+        // asserted untouched.
+        crate::assert_live_root_untouched(&proj);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
