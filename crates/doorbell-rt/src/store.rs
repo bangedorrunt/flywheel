@@ -78,6 +78,20 @@ pub const RETENTION_BYTES: u64 = 5 * 1024 * 1024;
 /// Generations kept besides the active file.
 pub const RETENTION_GENS: usize = 4;
 
+/// bd-lorot: what a prune pass did. Counted so the hourly tick can be honest
+/// about it rather than deleting silently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Journal files removed.
+    pub journals_removed: usize,
+    /// Bytes reclaimed.
+    pub bytes_freed: u64,
+    /// Files left alone because they were too young to be abandoned.
+    pub skipped_young: usize,
+    /// Files this process could not remove (permissions, a race with a writer).
+    pub remove_failed: usize,
+}
+
 pub struct FileStore {
     state_dir: PathBuf,
 }
@@ -108,6 +122,74 @@ impl FileStore {
         self.state_dir
             .join("doorbell")
             .join(format!("{workspace}.audit.jsonl"))
+    }
+
+    /// bd-lorot: delete per-workspace logs for workspaces this daemon no longer
+    /// hosts AND has not touched recently.
+    ///
+    /// Both file kinds accumulate one-per-workspace and nothing ever removed
+    /// them, so the set only grew. `known_journal_workspaces` reads the journals
+    /// directory and reports one entry per file, which is the input to
+    /// `known_workspaces` and therefore to the standby wake-blind signal: a
+    /// workspace the plane served once, months ago, kept the daemon reporting
+    /// "a fleet expects rings I will not deliver" forever. Measured: 913 journal
+    /// files, 20 MB, `known_workspaces` 858.
+    ///
+    /// Two conditions, both required, and the second is what makes this safe:
+    /// - the workspace is not in `live` (not currently hosted), AND
+    /// - its newest log mtime is older than `max_age_secs`.
+    ///
+    /// A brand-new workspace whose host loop has not written yet is therefore
+    /// never a candidate, so a just-spawned crew cannot have its journal deleted
+    /// out from under it. Deleting live state is not reversible, so the age gate
+    /// is deliberately generous; the caller passes the policy.
+    pub fn prune_unhosted_workspace_logs(
+        &self,
+        live: &std::collections::BTreeSet<String>,
+        max_age_secs: u64,
+        now_secs: u64,
+    ) -> PruneReport {
+        let mut report = PruneReport::default();
+        let age_ok = |mtime: u64| now_secs.saturating_sub(mtime) >= max_age_secs;
+
+        if let Ok(entries) = std::fs::read_dir(self.state_dir.join("journals")) {
+            for entry in entries.filter_map(std::result::Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(ws) = name
+                    .strip_prefix("doorbell-journal-")
+                    .and_then(|n| n.strip_suffix(".jsonl"))
+                else {
+                    continue;
+                };
+                // A generation file (`…<ws>.1.jsonl`) is covered by the same
+                // workspace name, so pruning the active file's siblings is safe
+                // once the workspace itself is gone.
+                if live.contains(ws) {
+                    continue;
+                }
+                let Ok(md) = entry.metadata() else { continue };
+                let Some(mtime) = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                else {
+                    continue;
+                };
+                if !age_ok(mtime) {
+                    report.skipped_young += 1;
+                    continue;
+                }
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => {
+                        report.journals_removed += 1;
+                        report.bytes_freed += md.len();
+                    }
+                    Err(_) => report.remove_failed += 1,
+                }
+            }
+        }
+        report
     }
 
     pub fn wake_file(&self, workspace: &str) -> PathBuf {
@@ -710,5 +792,125 @@ mod tests {
         assert_eq!(FileStore::entry_version(&fold.rows[0]), 1);
         assert_eq!(FileStore::entry_version(&fold.rows[1]), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn ws_file(dir: &Path, ws: &str) -> PathBuf {
+        dir.join("journals")
+            .join(format!("doorbell-journal-{ws}.jsonl"))
+    }
+
+    /// bd-lorot: an unhosted, old journal goes; a hosted one and a young one
+    /// stay. All three conditions in one fence, because the dangerous case is
+    /// deleting a LIVE crew's wake record.
+    #[test]
+    fn prune_takes_unhosted_and_old_and_spares_the_rest() {
+        let dir = std::env::temp_dir().join(format!("prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).expect("dirs");
+        let store = FileStore::new(&dir);
+        // Real current time: a logical future `now` would make a file written
+        // just now look decades old, which is a broken fixture, not a finding.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        const OLD: u64 = 30 * 24 * 60 * 60;
+
+        for ws in ["gone-old", "live-old", "gone-young"] {
+            std::fs::write(ws_file(&dir, ws), "row\n").expect("write");
+        }
+        // gone-old: unhosted and a month old. live-old: a month old but HOSTED.
+        // gone-young: unhosted but written an hour ago.
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - OLD);
+        std::fs::File::open(ws_file(&dir, "gone-old"))
+            .and_then(|f| f.set_modified(old))
+            .expect("age gone-old");
+        std::fs::File::open(ws_file(&dir, "live-old"))
+            .and_then(|f| f.set_modified(old))
+            .expect("age live-old");
+
+        let live: BTreeSet<String> = BTreeSet::from(["live-old".to_string()]);
+        let report = store.prune_unhosted_workspace_logs(&live, 7 * 24 * 60 * 60, now);
+
+        assert_eq!(
+            report.journals_removed, 1,
+            "exactly one should go: {report:?}"
+        );
+        assert!(
+            !ws_file(&dir, "gone-old").exists(),
+            "the unhosted old journal must be gone"
+        );
+        assert!(
+            ws_file(&dir, "live-old").exists(),
+            "a HOSTED workspace's journal must never be pruned — that is a live crew's wake record"
+        );
+        assert!(
+            ws_file(&dir, "gone-young").exists(),
+            "a young journal is a just-started workspace, not an abandoned one"
+        );
+        assert_eq!(
+            report.skipped_young, 1,
+            "the young one is reported, not silently kept"
+        );
+        assert_eq!(report.remove_failed, 0);
+        assert!(report.bytes_freed > 0, "freed bytes are reported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fence that matters most: pruning twice is idempotent, and a second
+    /// pass over an already-clean directory does not error or under-report.
+    #[test]
+    fn pruning_is_idempotent_and_reports_cleanly_when_there_is_nothing_to_do() {
+        let dir = std::env::temp_dir().join(format!("prune-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).expect("dirs");
+        let store = FileStore::new(&dir);
+        let now = 2_000_000_000u64;
+        let live = BTreeSet::new();
+
+        let first = store.prune_unhosted_workspace_logs(&live, 0, now);
+        assert_eq!(first.journals_removed, 0, "empty dir: {first:?}");
+        assert_eq!(first.remove_failed, 0);
+
+        std::fs::write(ws_file(&dir, "a"), "x\n").expect("write");
+        let a = store.prune_unhosted_workspace_logs(&live, 0, now);
+        assert_eq!(a.journals_removed, 1);
+        let b = store.prune_unhosted_workspace_logs(&live, 0, now);
+        assert_eq!(
+            b.journals_removed, 0,
+            "second pass must find nothing: {b:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-journal files in the journals directory are never touched — the prune
+    /// matches the exact `doorbell-journal-<ws>.jsonl` shape and ignores the
+    /// rest, so it cannot delete something it does not understand.
+    #[test]
+    fn the_prune_only_touches_journal_files_it_recognises() {
+        let dir = std::env::temp_dir().join(format!("prune-narrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).expect("dirs");
+        let store = FileStore::new(&dir);
+        let now = 2_000_000_000u64;
+
+        let bystander = dir.join("journals").join("notes.jsonl");
+        std::fs::write(&bystander, "keep me\n").expect("write");
+        std::fs::write(ws_file(&dir, "gone"), "x\n").expect("write");
+
+        let report = store.prune_unhosted_workspace_logs(&BTreeSet::new(), 0, now);
+        assert_eq!(report.journals_removed, 1);
+        assert!(
+            bystander.exists(),
+            "a file the prune does not recognise must survive: it matches no journal shape"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
