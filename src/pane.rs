@@ -141,9 +141,12 @@ pub fn crew_agent_name(wf_name: &str, role: &str, ordinal: u32) -> String {
 /// The wait is bounded on purpose: an unbounded poll would hang the run on a
 /// genuinely dead pane. `None` means the window closed without the pane, and
 /// the caller bails loud exactly as before (bd-ietv).
-pub fn settle_role_with<F>(
+/// bd-0s0y: settle for the `nth` copy of a role, so a fan-out copy settles for
+/// ITS OWN pane instead of copy 0's. `None` is the single-pane case.
+pub fn settle_role_slot_with<F>(
     rows: &[SpawnEntry],
     role: &str,
+    nth: Option<usize>,
     mut live_panes: F,
     window_ms: u64,
     poll_ms: u64,
@@ -151,10 +154,14 @@ pub fn settle_role_with<F>(
 where
     F: FnMut() -> Option<std::collections::HashSet<String>>,
 {
+    let registry = LiveRegistry(rows.to_vec());
     // No row for the role means it was never spawned: nothing to settle.
-    let want = resolve_pane_entry(&LiveRegistry(rows.to_vec()), role)?
-        .pane_id
-        .clone();
+    let want = match nth {
+        Some(i) => resolve_pane_entry_nth(&registry, role, i)?,
+        None => resolve_pane_entry(&registry, role)?,
+    }
+    .pane_id
+    .clone();
     let mut waited = 0u64;
     loop {
         if let Some(live) = live_panes()
@@ -172,15 +179,15 @@ where
     }
 }
 
-/// Production [`settle_role_with`]: loads the project's registry rows and probes
-/// the real herdr.
-pub fn settle_for_role(project: &str, role: &str) -> Option<SpawnEntry> {
+/// bd-0s0y: production settle for the `nth` copy of a role.
+pub fn settle_for_role_slot(project: &str, role: &str, nth: Option<usize>) -> Option<SpawnEntry> {
     const WINDOW_MS: u64 = 5_000;
     const POLL_MS: u64 = 250;
     let rows = crate::state::load_spawn_registry(project);
-    settle_role_with(
+    settle_role_slot_with(
         &rows,
         role,
+        nth,
         || {
             Client::connect(None)
                 .ok()
@@ -234,6 +241,46 @@ pub fn resolve_pane_entry<'a>(entries: &'a LiveRegistry, profile: &str) -> Optio
                 .filter(|(_, e)| e.name == profile),
         )
     })
+}
+
+/// bd-0s0y: resolve the pane that serves `role` for the copy at `copy_index`.
+///
+/// `None` (a step that is not a fan-out copy) resolves exactly as before, so
+/// the whole existing path is untouched. `Some(i)` addresses the `i`th copy.
+///
+/// A shortfall is a LOUD failure, never a silent reuse of copy 0: reusing
+/// copy 0's pane is the exact defect this fixes — copy 1 would be refused by
+/// the busy-owner fence and the run would die with a fence error that names
+/// the wrong cause. Naming the shortfall instead points at the real one, which
+/// is that the crew holds fewer copies of this role than the fan-out asks for.
+fn resolve_role_slot<'a>(
+    entries: &'a LiveRegistry,
+    role: &str,
+    copy_index: Option<usize>,
+) -> Result<Option<&'a SpawnEntry>> {
+    let Some(i) = copy_index else {
+        return Ok(resolve_pane_entry(entries, role));
+    };
+    match resolve_pane_entry_nth(entries, role, i) {
+        Some(e) => Ok(Some(e)),
+        None => {
+            let have = resolve_pane_entry_nth(entries, role, 0)
+                .map(|_| {
+                    entries
+                        .entries()
+                        .iter()
+                        .filter(|e| e.profile.as_deref() == Some(role) || e.name == role)
+                        .count()
+                })
+                .unwrap_or(0);
+            bail!(
+                "pane dispatch: fan-out copy {i} of @{role} has no crew pane — the crew holds \
+                 {have} pane(s) for @{role} and this step asked for copy {i}. Give @{role} at \
+                 least {} copies (or lower the step's `over`), never reuse another copy's pane.",
+                i + 1
+            )
+        }
+    }
 }
 
 /// bd-0s0y: the `nth` DISTINCT live pane serving `profile`.
@@ -1151,6 +1198,7 @@ pub fn pane_dispatch(
     inputs: &Value,
     entries: &LiveRegistry,
     action: &Action,
+    copy_index: Option<usize>,
 ) -> Result<Value> {
     let Action::DispatchJob { spec, .. } = action else {
         // bd-omwg: a Spawn reaching the runner is an engine-routing bug —
@@ -1205,7 +1253,7 @@ pub fn pane_dispatch(
                 // models.toml defaults short-circuit slot aliases the pin can
                 // name a harness no pane runs. Fall back to the step's @role
                 // pane if one exists; only bail when neither exists.
-                if let Some(role_entry) = resolve_pane_entry(entries, profile_name) {
+                if let Some(role_entry) = resolve_role_slot(entries, profile_name, copy_index)? {
                     eprintln!(
                         "flywheel: WARNING step @{profile_name} pins harness={override_h} but no {override_h} pane exists; dispatching to @{profile_name} pane {} (harness={})",
                         role_entry.name,
@@ -1254,14 +1302,15 @@ pub fn pane_dispatch(
     // resolved target is logged — dispatching into a dead pane used to be
     // silent until the bare leaf downstream.
     let entry: SpawnEntry = match override_entry
-        .or_else(|| resolve_pane_entry(entries, profile_name))
+        .or(resolve_role_slot(entries, profile_name, copy_index)?)
         .cloned()
     {
         Some(e) => e,
         // A registry row means the pane WAS spawned; the prune only knows
         // herdr's listing, so a pane listed moments later looks absent.
-        // Settle for it before failing the whole run (bd-ietv).
-        None => match settle_for_role(project, profile_name) {
+        // Settle for it before failing the whole run (bd-ietv). bd-0s0y: settle
+        // for THIS copy's pane, or copy 1 would settle onto copy 0's.
+        None => match settle_for_role_slot(project, profile_name, copy_index) {
             Some(entry) => {
                 eprintln!(
                     "flywheel: WARNING @{profile_name} pane {} was absent from herdr's listing at dispatch; settled and using it",
@@ -2542,9 +2591,10 @@ mod tests {
         }];
         // First two probes report the pane absent (the race), third sees it.
         let mut probe = 0u32;
-        let got = settle_role_with(
+        let got = settle_role_slot_with(
             &rows,
             "planner",
+            None,
             || {
                 probe += 1;
                 if probe < 3 {
@@ -2579,9 +2629,10 @@ mod tests {
             incarnation: 0,
         }];
         let mut probes = 0u32;
-        let got = settle_role_with(
+        let got = settle_role_slot_with(
             &rows,
             "oracle",
+            None,
             || {
                 probes += 1;
                 Some(HashSet::new())
@@ -2614,9 +2665,10 @@ mod tests {
             incarnation: 0,
         }];
         let mut probes = 0u32;
-        let got = settle_role_with(
+        let got = settle_role_slot_with(
             &rows,
             "oracle",
+            None,
             || {
                 probes += 1;
                 Some(HashSet::from(["w1:p1".to_string()]))
@@ -2647,9 +2699,10 @@ mod tests {
             incarnation: 0,
         }];
         let mut probe = 0u32;
-        let got = settle_role_with(
+        let got = settle_role_slot_with(
             &rows,
             "reviewer",
+            None,
             || {
                 probe += 1;
                 if probe < 2 {
@@ -3131,6 +3184,105 @@ mod tests {
         assert!(resolve_pane_entry_nth(&entries, "coder", 1).is_none());
     }
 
+    /// bd-0s0y: THE fence for the whole chain — the copy's `iteration_key`
+    /// becomes an ordinal, and the ordinal reaches a DIFFERENT pane.
+    ///
+    /// This is the production path end to end, at unit speed: `run_parallel`
+    /// mints `p{i}`, the sink reads the ordinal off it, and the ordinal picks
+    /// the pane. Before the fix the middle step did not exist, so all three
+    /// copies resolved to `w2:p1` and copies 2 and 3 were refused by the
+    /// busy-owner fence — which is how `steer --crew` died on step one.
+    #[test]
+    fn a_fanout_copy_reaches_its_own_pane() {
+        let entries = as_live(
+            (1..=3)
+                .map(|i| SpawnEntry {
+                    pane_id: format!("w4:p{i}"),
+                    name: if i == 1 {
+                        "crew-goal-oracle".to_string()
+                    } else {
+                        format!("crew-goal-oracle{i}")
+                    },
+                    profile: Some("oracle".into()),
+                    harness: Some("omp".into()),
+                    model: None,
+                    model_pin: None,
+                    skills_digest: None,
+                    mail_identity: None,
+                    skills_injected: false,
+                    incarnation: 0,
+                })
+                .collect(),
+        );
+
+        // `over: "3"` over `@oracle`: three copies, three panes.
+        for (key, want) in [("p0", "w4:p1"), ("p1", "w4:p2"), ("p2", "w4:p3")] {
+            let ordinal =
+                toron_workflow::identity::copy_ordinal(Some(key)).expect("a copy key parses");
+            let entry = resolve_role_slot(&entries, "oracle", Some(ordinal))
+                .expect("a copy resolves")
+                .expect("an entry exists");
+            assert_eq!(entry.pane_id, want, "{key} must reach its own pane");
+        }
+    }
+
+    /// bd-0s0y: too many copies for the crew is a LOUD shortfall, never a
+    /// silent reuse of copy 0. Reuse is the exact defect: copy 1 would be
+    /// refused by the busy-owner fence and the run would die blaming the fence
+    /// instead of the crew that never grew.
+    #[test]
+    fn too_many_copies_names_the_shortfall_instead_of_reusing_copy_zero() {
+        let entries = as_live(vec![SpawnEntry {
+            pane_id: "w5:p1".into(),
+            name: "crew-goal-oracle".into(),
+            profile: Some("oracle".into()),
+            harness: Some("omp".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        }]);
+        let err = resolve_role_slot(&entries, "oracle", Some(1))
+            .expect_err("copy 1 of a 1-pane role must fail loud");
+        let msg = err.to_string();
+        assert!(msg.contains("copy 1"), "must name the copy: {msg}");
+        assert!(msg.contains("1 pane(s)"), "must name the shortfall: {msg}");
+        assert!(
+            !msg.contains("w5:p1"),
+            "must not hand back copy 0's pane as if it were copy 1's: {msg}"
+        );
+    }
+
+    /// bd-0s0y: a step that is NOT a fan-out copy resolves exactly as it always
+    /// did. The whole fix is additive for the 99% of steps that carry no
+    /// iteration_key, so this is the no-regression half of the fence.
+    #[test]
+    fn a_step_outside_a_fanout_is_unaffected() {
+        let entries = as_live(vec![SpawnEntry {
+            pane_id: "w6:p1".into(),
+            name: "crew-goal-oracle".into(),
+            profile: Some("oracle".into()),
+            harness: Some("omp".into()),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: None,
+            skills_injected: false,
+            incarnation: 0,
+        }]);
+        assert_eq!(
+            resolve_role_slot(&entries, "oracle", None)
+                .expect("no ordinal never fails")
+                .expect("entry")
+                .pane_id,
+            resolve_pane_entry(&entries, "oracle")
+                .expect("old lookup")
+                .pane_id
+        );
+    }
+
     /// bd-0s0y: a respawn is a NEWER GENERATION of the same slot, not an extra
     /// copy. Counting generations as copies would hand copy 1 a dead pane and
     /// leave the live one unreachable.
@@ -3441,7 +3593,7 @@ mod tests {
             },
             channel: None,
         };
-        let out = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action)
+        let out = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action, None)
             .expect("fallback must dispatch, not bail");
         assert_eq!(
             out["agent"], "crew-goal-reviewer",
@@ -3476,7 +3628,7 @@ mod tests {
             },
             channel: None,
         };
-        let err = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action)
+        let err = pane_dispatch(&catalog, "proj", "wf", &json!({}), &entries, &action, None)
             .expect_err("no opencode pane and no reviewer pane must bail");
         let msg = err.to_string();
         assert!(
