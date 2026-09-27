@@ -789,11 +789,10 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
 /// (herdr's kind is `opencode`). Pure; unknown values pass through untouched
 /// so the caller can reject them loudly.
 pub fn normalize_harness_alias(kind: &str) -> String {
-    match kind {
-        "oc" => "opencode".to_string(),
-        "gk" => "grok".to_string(),
-        other => other.to_string(),
-    }
+    // bd-drlm: the alias table moved to `harness_registry`. This used to be one
+    // of seven independent `match` statements that each knew a different subset
+    // of the harness names, which is how `codex` ended up unreachable.
+    crate::harness_registry::canonical(kind)
 }
 
 /// Compiled-in harness recipes (empty today — the default backends spawn

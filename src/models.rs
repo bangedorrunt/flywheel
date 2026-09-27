@@ -137,15 +137,10 @@ pub const SLOT_PREMIUM: &str = "premium";
 /// Split out so consumers that resolve through [`ModelRegistry::effective_slot_model`]
 /// (defaults-aware) share the exact mapping instead of re-matching kinds.
 pub fn implied_slot_name_for_harness(kind: &str) -> Option<&'static str> {
-    match kind {
-        "opencode" | "oc" => Some(SLOT_CHEAP),
-        "pi" => Some(SLOT_STANDARD),
-        // bd-88m4: omp IS the premium harness (ADR-0007: premium =
-        // omp/zai/glm-5.3) — a bare omp spawn rides the premium slot
-        // instead of launching model-less.
-        "grok" | "gk" | "omp" => Some(SLOT_PREMIUM),
-        _ => None,
-    }
+    // bd-drlm: the slot table moved to `harness_registry` with every other
+    // naming fact, so a harness's name, aliases, tier and slot cannot drift
+    // apart across files.
+    crate::harness_registry::implied_slot(kind)
 }
 
 /// Map `@cheap` / `free` / `smol` / … onto a canonical slot name.
@@ -751,7 +746,20 @@ impl ModelRegistry {
     /// go through [`Self::coupled_default_model`] (route) or fail loud, never
     /// imply this slot's model onto that harness.
     #[cfg(test)]
+    /// The slot whose model stands in when a profile names none.
+    ///
+    /// bd-drlm: the tier gate lives HERE, at the one chokepoint every
+    /// model-substitution path goes through. A Closed harness returns `None`
+    /// even when it carries an implied slot name, because the slot's entire
+    /// job is to supply the model a frontier CLI must never be handed. The
+    /// slot NAME is kept in the registry for config compatibility; what is
+    /// withheld is the substitution. `slots.premium.fallback_harness` is a
+    /// different mechanism and is untouched — a fallback names which harness
+    /// to try, it does not hand one a model.
     pub fn implied_slot_for_harness(&self, kind: &str) -> Option<&SlotSpec> {
+        if !crate::harness_registry::tier_of(kind)?.may_be_asked_for_a_model() {
+            return None;
+        }
         let name = implied_slot_name_for_harness(kind)?;
         self.slots.get(name)
     }
@@ -1726,11 +1734,24 @@ model = "opencode/big-pickle"
                 .map(|s| s.harness.as_str()),
             Some("pi")
         );
+        // bd-drlm: grok is a CLOSED tier (a frontier CLI with its own model), so
+        // the tier gate withholds the slot's MODEL even though the registry still
+        // records that grok belongs to premium. Before the gate this resolved to
+        // the premium slot, which meant a bare `grok` spawn was handed a model —
+        // precisely what "never asked" forbids. `slots.premium.fallback_harness`
+        // is a different mechanism and still names grok; assert THAT, so the
+        // assertion still says something true about grok instead of going away.
         assert_eq!(
-            reg.implied_slot_for_harness("grok")
+            reg.implied_slot_for_harness("grok"),
+            None,
+            "a closed harness must not be handed a model, even though it implies premium"
+        );
+        assert_eq!(
+            reg.slots
+                .get("premium")
                 .and_then(|s| s.fallback_harness.as_deref()),
             Some("grok"),
-            "grok implies premium, whose fallback_harness is grok"
+            "premium's fallback_harness is a separate mechanism and still names grok"
         );
         // bd-88m4: omp IS the premium harness — a bare omp spawn rides
         // the premium slot instead of launching model-less.
