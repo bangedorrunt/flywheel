@@ -93,7 +93,7 @@ pub struct CrewDemand {
 
 /// The roles one action dispatches, each with its concurrency width. A
 /// `parallel` over N contributes its inner roles N times over.
-fn role_uses(action: &Action, out: &mut Vec<String>) {
+fn role_uses(action: &Action, inputs: &BTreeMap<String, String>, out: &mut Vec<String>) {
     match action {
         Action::DispatchJob { spec, .. } => {
             if let Some(p) = spec.profile.as_deref() {
@@ -101,24 +101,103 @@ fn role_uses(action: &Action, out: &mut Vec<String>) {
             }
         }
         Action::Parallel { over, each } => {
-            let n = over.trim().parse::<u32>().unwrap_or(1).max(1);
+            let n = resolve_over(over, inputs);
             let mut inner = Vec::new();
-            role_uses(&each.action, &mut inner);
+            role_uses(&each.action, inputs, &mut inner);
             for r in inner {
                 for _ in 0..n {
                     out.push(r.clone());
                 }
             }
         }
+        // bd-q2gw: a `parallel` nested in a control-flow arm is still a
+        // fan-out. `Branch` arms are exclusive, so the honest number is the
+        // WORST arm, not their sum — a `parallel` in `then` and a different
+        // role in `else` never need two panes at once. Retry/Foreach/Loop
+        // bodies are not concurrent with anything, so they contribute their
+        // own roles at their own width.
+        Action::Branch {
+            then, else_steps, ..
+        } => {
+            let mut worst: Vec<String> = Vec::new();
+            let mut arm: Vec<String> = Vec::new();
+            for s in then {
+                arm.clear();
+                role_uses(&s.action, inputs, &mut arm);
+                if arm.len() > worst.len() {
+                    worst = arm.clone();
+                }
+            }
+            for s in else_steps {
+                arm.clear();
+                role_uses(&s.action, inputs, &mut arm);
+                if arm.len() > worst.len() {
+                    worst = arm.clone();
+                }
+            }
+            out.extend(worst);
+        }
+        Action::Retry { step, .. } => role_uses(&step.action, inputs, out),
+        Action::Foreach { each, .. } => role_uses(&each.action, inputs, out),
+        Action::Loop { body, .. } => {
+            for s in body {
+                role_uses(&s.action, inputs, out);
+            }
+        }
         _ => {}
     }
 }
+
+/// bd-q2gw: how many copies a `parallel` really runs.
+///
+/// `over` is not always a literal. `over: "{{inputs.reviewers}}"` with
+/// `reviewers` declared `default: "2"` genuinely runs TWO concurrent copies —
+/// the engine binds the default and resolves the template — but parsing the
+/// raw string as a number yields 1, so the packer seated one pane and the
+/// busy-owner fence refused copy 1. That killed `interrogate`, `prototype` and
+/// `arena` while the catalog fence reported them clean.
+///
+/// Unresolvable stays 1: a width we cannot read must not be guessed upward,
+/// because over-seating wastes panes against a hard cap of 5.
+fn resolve_over(over: &str, inputs: &BTreeMap<String, String>) -> u32 {
+    let raw = over.trim();
+    let templated = raw
+        .strip_prefix("{{inputs.")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .map(|name| name.trim());
+    let n = match templated {
+        Some(name) => inputs.get(name).and_then(|d| d.trim().parse::<u32>().ok()),
+        None => raw.parse::<u32>().ok(),
+    };
+    n.unwrap_or(1).max(1)
+}
+
+
 
 /// bd-0s0y: the crew a workflow needs, and every way it would self-collide.
 /// Pure — no registry, no panes, no herdr. The catalog-level test is what
 /// makes it worth having.
 pub fn crew_demand(wf: &Workflow) -> CrewDemand {
-    // (node, needs, roles, seed wave). `steps:` is strictly ordered, so each
+    // Declared input defaults, so a templated `over: "{{inputs.reviewers}}"`
+    // resolves to the width the engine will really run (bd-q2gw).
+    let inputs: BTreeMap<String, String> = wf
+        .inputs
+        .iter()
+        .map(|d| {
+            (
+                d.name.clone(),
+                d.default
+                    .as_ref()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+
+
     // step is its own wave — two steps reusing a role there is sequential
     // reuse, not concurrency, and must never be flagged.
     let nodes: Vec<(String, Vec<String>, Vec<String>, u32)> = match &wf.graph {
@@ -127,7 +206,7 @@ pub fn crew_demand(wf: &Workflow) -> CrewDemand {
             .iter()
             .map(|(name, node)| {
                 let mut roles = Vec::new();
-                role_uses(&node.action, &mut roles);
+                role_uses(&node.action, &inputs, &mut roles);
                 (name.clone(), node.needs.clone(), roles, 0)
             })
             .collect(),
@@ -137,7 +216,7 @@ pub fn crew_demand(wf: &Workflow) -> CrewDemand {
             .enumerate()
             .map(|(i, s)| {
                 let mut roles = Vec::new();
-                role_uses(&s.action, &mut roles);
+                role_uses(&s.action, &inputs, &mut roles);
                 (
                     s.name.clone().unwrap_or_default(),
                     Vec::new(),
@@ -3845,6 +3924,88 @@ graph:
             "{} builtin workflow(s) cannot be crewed:\n  {}",
             broken.len(),
             broken.join("\n  ")
+        );
+    }
+
+    /// bd-q2gw: a TEMPLATED `over` must resolve to the width the engine really
+    /// runs. `over: "{{inputs.reviewers}}"` with `reviewers` defaulted to "2"
+    /// genuinely runs two concurrent copies — the engine binds the default and
+    /// resolves the template — but parsing the raw string as a number yields 1.
+    /// That seated one pane for a 2-wide fan-out and the busy-owner fence
+    /// refused copy 1, killing `interrogate`, `prototype` and `arena` while this
+    /// very catalog fence reported them clean.
+    #[test]
+    fn a_templated_fanout_resolves_to_its_declared_default() {
+        let wf = wf_from(
+            r#"
+name: templated-probe
+inputs:
+  - name: reviewers
+    default: "2"
+steps:
+  - name: fan
+    action: parallel
+    over: "{{inputs.reviewers}}"
+    each:
+      action: dispatch_job
+      assignee: x
+      spec: { profile: "@reviewer", task: "review" }
+"#,
+        );
+        let d = crew_demand(&wf);
+        assert_eq!(
+            d.collisions,
+            vec![("reviewer".to_string(), 2)],
+            "a templated width must not degrade to 1: {d:?}"
+        );
+        assert_eq!(d.crew_shape.get("reviewer").copied(), Some(2));
+    }
+
+    /// bd-q2gw: the three builtins that were invisible. Named explicitly, so a
+    /// future edit that re-templates one of them fails here rather than at
+    /// dispatch time with a fence error that names the wrong cause.
+    #[test]
+    fn the_templated_fanout_builtins_are_seated_with_copies() {
+        let catalog = crate::builtin_workflows::builtin_workflows();
+        for (name, role, copies) in [
+            ("interrogate", "reviewer", 2u32),
+            ("prototype", "coder", 2),
+            ("arena", "coder", 2),
+        ] {
+            let shape = crew_demand(&catalog[name]).crew_shape;
+            assert_eq!(
+                shape.get(role).copied(),
+                Some(copies),
+                "{name}: @{role} must be seated with {copies} copies, got {shape:?}"
+            );
+            let packed =
+                pack_crew_shape(&shape, shape.values().sum(), DEFAULT_CREW_MAX).expect("packs");
+            assert_eq!(packed.members.get(role).copied(), Some(copies));
+        }
+    }
+
+    /// bd-q2gw: an UNRESOLVABLE width must stay 1, never be guessed upward.
+    /// Over-seating wastes panes against a hard cap of 5, so a width we cannot
+    /// read has to fail toward the existing behaviour, not invent panes.
+    #[test]
+    fn an_unresolvable_fanout_width_stays_one() {
+        let none: BTreeMap<String, String> = BTreeMap::new();
+        assert_eq!(resolve_over("{{inputs.missing}}", &none), 1);
+        assert_eq!(
+            resolve_over(
+                "{{inputs.missing}}",
+                &BTreeMap::from([("missing".to_string(), "not-a-number".to_string())])
+            ),
+            1
+        );
+        assert_eq!(resolve_over("2", &none), 2);
+        assert_eq!(resolve_over("0", &none), 1, "zero is not a fan-out");
+        assert_eq!(
+            resolve_over(
+                "{{inputs.n}}",
+                &BTreeMap::from([("n".to_string(), "3".to_string())])
+            ),
+            3
         );
     }
 
