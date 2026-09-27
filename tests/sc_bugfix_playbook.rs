@@ -146,22 +146,69 @@ graph:
     );
 }
 
+/// Every global root the binary reads, pointed at one temp tree.
+///
+/// `XDG_CONFIG_HOME` is the catalog door: a user-tier `workflows/` copy WINS
+/// over the compiled-in builtin, so an inheriting spawn resolves whatever the
+/// operator last seeded. `XDG_STATE_HOME` holds loops/leases/sidecars, and
+/// `HOME` is the only lever on the legacy macOS `~/Library/Application
+/// Support/flywheel` config fallback (`Config::load` dual-reads it) plus every
+/// `dirs::home_dir()` fallback. Redirection of all three is what makes the run
+/// below report CODE state instead of machine state (bd-hcfk).
+struct HermeticRoots {
+    dir: tempfile::TempDir,
+}
+
+impl HermeticRoots {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        for sub in ["config", "state", "home"] {
+            std::fs::create_dir_all(dir.path().join(sub)).expect("create hermetic root");
+        }
+        Self { dir }
+    }
+
+    /// A spawn whose ambient roots are this tree, NOT the operator's.
+    fn cmd(&self, args: &[&str]) -> std::process::Command {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_flywheel"));
+        c.args(args)
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            .env("XDG_STATE_HOME", self.dir.path().join("state"))
+            .env("HOME", self.dir.path().join("home"));
+        c
+    }
+}
+
+/// The control-flow argv, shared so the hermeticity test below drives the
+/// IDENTICAL command the coverage test does — a hermeticity proof that runs
+/// different argv proves nothing.
+const BUG_FIX_ARGV: &[&str] = &[
+    "workflow",
+    "run",
+    "bug-fix",
+    "--inputs",
+    r#"{"symptom":"the leak","repro":"exit 1","verify":"cargo test --offline --bin flywheel bug_fix_recipe"}"#,
+    "--json",
+];
+
+/// Serializes this file's binary spawns. `env` is process-global, so the
+/// ambient-poisoning test below must not interleave with a sibling spawn that
+/// still inherits the environment.
+fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// CLI control-flow: `flywheel workflow run bug-fix` (recording mode, no
 /// --execute) exits 0, resolves the expanded crew (scout + recipe coders/reviewers),
 /// and reports repro + fix (recipe) + prove.
 #[test]
 fn bug_fix_cli_control_flow_reports_all_nodes() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_flywheel"))
-        .args([
-            "workflow",
-            "run",
-            "bug-fix",
-            "--inputs",
-            r#"{"symptom":"the leak","repro":"exit 1","verify":"cargo test --offline --bin flywheel bug_fix_recipe"}"#,
-            "--json",
-        ])
-        .output()
-        .expect("workflow run");
+    let _env = spawn_lock();
+    let roots = HermeticRoots::new();
+    let out = roots.cmd(BUG_FIX_ARGV).output().expect("workflow run");
     assert!(
         out.status.success(),
         "control-flow run must exit 0: {}",
@@ -185,4 +232,63 @@ fn bug_fix_cli_control_flow_reports_all_nodes() {
     // fix output is the recipe's result — in recording mode it may be call_workflow or the child's result
     assert!(output["fix"].is_object(), "fix output present: {v}");
     assert_eq!(output["prove"]["action"], "dispatch_job", "prove action");
+}
+
+/// Hermeticity, as an executable assertion (bd-hcfk).
+///
+/// The defect this pins: a user-tier `bug-fix.yaml` SHADOWS the compiled-in
+/// builtin, so an inheriting spawn's verdict is decided by whatever the
+/// operator last seeded into `~/.config/flywheel/workflows/`. Observed on this
+/// host: the coverage test above was the last failing workspace target purely
+/// because the user tier held 40 corrupted copies, and went green the moment
+/// they were repaired, with no code change at all.
+///
+/// So: poison the AMBIENT config home with a user-tier `bug-fix` that cannot
+/// parse, then drive the same argv. The run must still succeed, because the
+/// hermetic roots, not the ambient tier, are what the binary resolves. Without
+/// the redirect this test fails with the parser error naming the poisoned
+/// path — the exact ambient dependency this bead removes.
+#[test]
+fn cli_control_flow_ignores_a_corrupted_ambient_user_tier() {
+    let _env = spawn_lock();
+
+    let poisoned = tempfile::TempDir::new().expect("poison temp dir");
+    let tier = poisoned.path().join("flywheel/workflows");
+    std::fs::create_dir_all(&tier).expect("create poisoned tier");
+    std::fs::write(
+        tier.join("bug-fix.yaml"),
+        "name: bug-fix\nthis is not: [valid yaml\n  - broken\n",
+    )
+    .expect("write poisoned user-tier copy");
+
+    let prev = std::env::var_os("XDG_CONFIG_HOME");
+    // SAFETY: guarded by `spawn_lock`, the only env mutation in this file, and
+    // restored below on every path (the assert! below can panic, so the guard
+    // `Drop` restores rather than relying on fallthrough).
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+        }
+    }
+    let _restore = Restore(prev.clone());
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", poisoned.path()) };
+
+    let roots = HermeticRoots::new();
+    let out = roots.cmd(BUG_FIX_ARGV).output().expect("workflow run");
+
+    assert!(
+        out.status.success(),
+        "a corrupted AMBIENT user tier must not decide this verdict: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json stdout");
+    assert_eq!(v["crew"]["coder"], 1, "compiled-in builtin still expands: {v}");
+    let output = v["output"].as_object().expect("output object");
+    for node in ["repro", "fix", "prove"] {
+        assert!(output.contains_key(node), "{node} in CLI output: {v}");
+    }
 }
