@@ -21952,6 +21952,34 @@ pub fn prompts_dir(kind: &str) -> Option<std::path::PathBuf> {
     })
 }
 
+/// bd-9z1d: a command description is PROSE and routinely contains `": "`, which
+/// is invalid in an unquoted YAML scalar. `peer-aware-mode`'s description
+/// ("Retro-prime a running pane: attach to …") made flywheel emit an
+/// unparseable `peer-aware-mode` prompt, `pi` refused it with "Nested mappings
+/// are not allowed in compact mappings at line 3", and the pane's agent never
+/// booted — while `dispatch_job` still reported the send as `landed`, so the
+/// run went green with a dead agent.
+///
+/// Quoting at substitution is the whole fix: the value is data, so it must not
+/// be able to change the shape of the document. The alternative — trusting every
+/// description to stay colon-free — is a landmine under a prose edit.
+fn yaml_double_quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Render one orchestration command (/open-mode, /swarm-mode, /loop-mode, /peer-aware-mode) for one agent kind.
 /// Pure (deterministic tests): frontmatter (with the command's description)
 /// + the playbook template + version/generated stamps.
@@ -21973,7 +22001,8 @@ fn render_orchestration_prompt(
         .expect("orchestration command in table");
     let (frontmatter, body) = apply_argument_adapter(
         kind,
-        &frontmatter.replace("{{PHASE_DESCRIPTION}}", description),
+        // bd-9z1d: quoted, so prose containing ": " cannot break the document.
+        &frontmatter.replace("{{PHASE_DESCRIPTION}}", &yaml_double_quoted(description)),
         tpl,
     );
     let mut out = body
@@ -33939,6 +33968,65 @@ mod integration_tests {
                 );
             }
         }
+    }
+
+    /// bd-9z1d: EVERY rendered prompt's frontmatter must PARSE as YAML.
+    ///
+    /// `render_all_orchestration_commands_per_kind` only asserted the output
+    /// starts with `---`, which an unparseable document also does — so a
+    /// description containing `": "` sailed through and `pi` refused the
+    /// generated `peer-aware-mode` prompt, leaving that pane's agent dead while
+    /// the run reported success. The bug lives in the SHARED substitution, so
+    /// the fence has to cover the whole cross-product, not one template: a
+    /// per-command snapshot cannot see it.
+    #[test]
+    fn every_rendered_prompt_frontmatter_is_valid_yaml() {
+        for kind in ["opencode", "pi", "grok", "omp", "pa"] {
+            for (name, _, _) in ORCHESTRATION_COMMANDS {
+                let out = render_orchestration_prompt(kind, name, "0.1.0", "ts")
+                    .unwrap_or_else(|e| panic!("{kind}/{name} renders: {e}"));
+                let body = out
+                    .strip_prefix("---\n")
+                    .unwrap_or_else(|| panic!("{kind}/{name} opens its frontmatter"));
+                let fm = body
+                    .split_once("\n---")
+                    .map(|(fm, _)| fm)
+                    .unwrap_or_else(|| panic!("{kind}/{name} closes its frontmatter"));
+                serde_yaml::from_str::<serde_yaml::Value>(fm).unwrap_or_else(|e| {
+                    panic!("{kind}/{name} frontmatter is not valid YAML: {e}\n---\n{fm}\n---")
+                });
+            }
+        }
+    }
+
+    /// bd-9z1d: the regression itself. `peer-aware-mode`'s real description
+    /// contains `": "`, so an UNQUOTED substitution is invalid YAML. If this
+    /// ever passes with the quoting removed, the fix is gone.
+    #[test]
+    fn a_description_containing_a_colon_stays_valid_yaml() {
+        let (_, description, _) = ORCHESTRATION_COMMANDS
+            .iter()
+            .find(|(n, _, _)| *n == "peer-aware-mode")
+            .expect("peer-aware-mode is in the table");
+        assert!(
+            description.contains(": "),
+            "the premise: this description is what broke the generated prompt"
+        );
+        let quoted = yaml_double_quoted(description);
+        let doc = format!("description: {quoted}\n");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&doc).expect("quoted description parses");
+        assert_eq!(
+            parsed["description"].as_str(),
+            Some(*description),
+            "quoting must preserve the description verbatim"
+        );
+        // And the unquoted form is what used to fail — stated, not assumed.
+        assert!(
+            serde_yaml::from_str::<serde_yaml::Value>(&format!("description: {description}\n"))
+                .is_err(),
+            "an unquoted description with ': ' must be invalid, or the bug was never this"
+        );
     }
 
     /// GS-010: playbook compose lines must be clap-parseable (not SPAWN substring) — the
