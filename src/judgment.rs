@@ -4091,8 +4091,7 @@ pub fn seed_default_packs_with(
         if status == "missing" {
             rep.copied.push((*name).to_string());
             if !dry_run {
-                std::fs::write(&dst, body)
-                    .map_err(|e| anyhow::anyhow!("write {}: {e}", dst.display()))?;
+                write_pack_file(&dst, body)?;
             }
             continue;
         }
@@ -4114,11 +4113,24 @@ pub fn seed_default_packs_with(
         if let Ok(prev) = std::fs::read(&dst) {
             std::fs::write(&bak, prev)?;
         }
-        std::fs::write(&dst, body)
-            .map_err(|e| anyhow::anyhow!("write {}: {e}", dst.display()))?;
+        // Write beside the file, then rename. A failed write must not
+        // truncate the pack the backup was taken from.
+        write_pack_file(&dst, body)?;
         rep.overwritten.push((*name).to_string());
     }
     Ok(rep)
+}
+
+fn write_pack_file(dst: &Path, body: &str) -> anyhow::Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = dst.with_extension("yaml.tmp");
+    std::fs::write(&tmp, body)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dst)
+        .map_err(|e| anyhow::anyhow!("rename {} -> {}: {e}", tmp.display(), dst.display()))?;
+    Ok(())
 }
 
 /// Fill gaps only.

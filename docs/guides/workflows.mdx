@@ -60,11 +60,18 @@ Legacy alias: `workflow run <token> --execute` still runs tokens; the preferred 
 
 ## Catalog overlays and coordination
 
-`flywheel workflow seed` copies compiled-in workflows and stages into
-`~/.config/flywheel/` without overwriting authored files. `flywheel workflow
-drift` reports `missing`, `current`, `stale`, and `custom` entries. Resolution
-stays built-ins < user < project, so a stale user copy remains authoritative
-but visible. See [workflow-catalog-review](./workflow-catalog-review).
+`flywheel config seed` is the user-config door. It writes missing compiled-in
+workflows, stages, and judgment packs into `~/.config/flywheel`, and writes
+`config.toml` from `config.sample.toml` only when that file is absent.
+`--overwrite none` (the default) does not replace an existing file.
+`--overwrite stale` replaces a shipped file whose bytes differ, after a
+`.bak` and a confirm. `--dry-run` prints the plan. `flywheel config drift`
+only reports `missing`, `stale`, `current`, and `custom`. It does not write.
+`workflow seed` is the same contract for workflows and stages alone.
+Resolution stays built-ins, then the user directory. A project `.flywheel`
+workflow or stage can still add a name the user tier does not have. A
+judgment pack in the project directory does not replace the user pack.
+See [workflow-catalog-review](./workflow-catalog-review).
 
 Choose the control plane by handoff: `flywheel send` is captain → crew,
 `toron channel` plus `toron job` is crew → crew, `toron mail` is private,
