@@ -4055,15 +4055,6 @@ graph:
         );
     }
 
-    /// THE fence. Every builtin's correct crew shape must fit the cap, and the
-    /// set of builtins that need a role to have MORE THAN ONE copy is pinned
-    /// exactly — that set is the remaining half-2c worklist, and letting it
-    /// grow silently would hide a new run-killer.
-    ///
-    /// `ce-brainstorm` is why this is a catalog test and not a per-file one:
-    /// the fatal fan-out lived in a CHILD of `goal`, so checking `goal`'s own
-    /// steps passed while the run still died on step one.
-    #[test]
     /// THE fence. Every builtin must PACK on a cap-sized crew: the shape its
     /// widest wave needs has to fit, and no role that needs copies may end up
     /// aliased onto another agent — that is the busy-fence refusal.
@@ -4073,6 +4064,13 @@ graph:
     /// passed while the run still died on step one. And "packs" rather than
     /// "fits", because a shape that fits on paper but cannot be packed is still
     /// a dead run.
+    ///
+    /// bd-07m2: this used to pack at `budget = crew_total.min(cap)`, which makes
+    /// `n == total`, so the fold loop never ran, `aliases` stayed empty and
+    /// BOTH collision assertions were dead — the test could not fail on the
+    /// aliasing defect its own text claimed to catch. It now also packs at a
+    /// budget one pane SHORT of the shape, which is what forces the fold path,
+    /// so the aliasing branch is reachable and is actually exercised.
     #[test]
     fn every_builtin_packs_on_a_cap_sized_crew() {
         let catalog = crate::builtin_workflows::builtin_workflows();
@@ -4082,24 +4080,39 @@ graph:
             if d.crew_total == 0 {
                 continue;
             }
-            let budget = d.crew_total.min(DEFAULT_CREW_MAX);
-            match pack_crew_shape(&d.crew_shape, budget, DEFAULT_CREW_MAX) {
-                Ok(p) => {
-                    for (role, copies) in &d.collisions {
-                        let seated = p.members.get(role).copied().unwrap_or(0);
-                        if p.aliases.contains_key(role) || seated < *copies as u32 {
-                            broken.push(format!(
-                                "{name}: @{role} needs {copies} concurrent pane(s) but packed \
-                                 {seated} (aliased: {}) — copies 2..{copies} will be refused by \
-                                 the busy-owner fence",
-                                p.aliases.contains_key(role)
-                            ));
+            // Two budgets on purpose: the natural one (shape fits, no fold) and
+            // a fold-forcing one (one pane short, so single-copy roles fold and
+            // a multi-copy role must survive intact).
+            let budgets = [
+                d.crew_total.min(DEFAULT_CREW_MAX),
+                d.crew_total.saturating_sub(1).max(1),
+            ];
+            for (i, budget) in budgets.into_iter().enumerate() {
+                match pack_crew_shape(&d.crew_shape, budget, DEFAULT_CREW_MAX) {
+                    Ok(p) => {
+                        for (role, copies) in &d.collisions {
+                            let seated = p.members.get(role).copied().unwrap_or(0);
+                            let aliased = p.aliases.contains_key(role);
+                            if aliased || seated < *copies as u32 {
+                                broken.push(format!(
+                                    "{name} @{role} (budget {budget}): needs {copies} concurrent \
+                                     pane(s) but packed {seated} (aliased: {aliased}) — copies \
+                                     2..{copies} will be refused by the busy-owner fence"
+                                ));
+                            }
                         }
                     }
+                    // At the NATURAL budget an Err means the shape is over the
+                    // cap with nothing left to fold — a real defect. At the
+                    // SHORT budget folding is the point, so an Err there is
+                    // expected and must not be reported.
+                    Err(e) if i == 0 => broken.push(format!("{name}: {e}")),
+                    Err(_) => {}
                 }
-                Err(e) => broken.push(format!("{name}: {e}")),
             }
         }
+        broken.sort();
+        broken.dedup();
         assert!(
             broken.is_empty(),
             "{} builtin workflow(s) cannot be crewed:\n  {}",
