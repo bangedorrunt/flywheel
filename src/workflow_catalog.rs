@@ -122,8 +122,7 @@ pub fn seed_user_catalog_with(
                 // emits `crew: null` and the copy lost its crew. The user tier
                 // wins over the builtin, so that silently made crew workflows
                 // headless.
-                std::fs::write(&path, yaml)
-                    .with_context(|| format!("write {}", path.display()))?;
+                std::fs::write(&path, yaml).with_context(|| format!("write {}", path.display()))?;
             }
             report.created_workflows.push(name.to_string());
         } else if may_replace("workflow", name) {
@@ -344,7 +343,8 @@ pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
         // seed agree with each other while both disagreed with the catalog, so
         // a crew-stripped copy read as `current`. `current` now means exactly
         // one thing: this file is the builtin's text, unmodified.
-        let builtin_yaml = crate::builtin_workflows::builtin_workflow_yaml(name).map(str::to_string);
+        let builtin_yaml =
+            crate::builtin_workflows::builtin_workflow_yaml(name).map(str::to_string);
         let status = match user_workflows.get(name) {
             None => "missing",
             // bd-3o5t: the two tiers are compared two different ways ON PURPOSE.
@@ -1431,7 +1431,10 @@ mod bd_3o5t_drift_truth {
             .iter()
             .find(|r| r.name == "bug-fix" && r.kind == "workflow")
             .expect("bug-fix row");
-        assert_eq!(row.status, "current", "a faithful copy must read as current");
+        assert_eq!(
+            row.status, "current",
+            "a faithful copy must read as current"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1481,7 +1484,10 @@ mod bd_sync_overwrite {
         let rep = seed_user_catalog_with(&r, OverwriteScope::Stale, false).expect("seed");
         let after = std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read");
         assert_ne!(after, BUGFIX, "a stale builtin copy must be replaced");
-        assert!(after.contains("crew:"), "the replacement must be the real builtin");
+        assert!(
+            after.contains("crew:"),
+            "the replacement must be the real builtin"
+        );
         assert_eq!(rep.overwritten_workflows, vec!["bug-fix".to_string()]);
         assert_eq!(
             std::fs::read_to_string(r.join("workflows/my-own.yaml")).expect("read"),
@@ -1537,12 +1543,82 @@ mod bd_sync_overwrite {
         seed_user_catalog_with(&r, OverwriteScope::None, false).expect("first");
         let first = std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read");
         let rep = seed_user_catalog_with(&r, OverwriteScope::None, false).expect("second");
-        assert_eq!(std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read"), first);
-        assert!(rep.created_workflows.is_empty(), "second seed created files");
+        assert_eq!(
+            std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read"),
+            first
+        );
+        assert!(
+            rep.created_workflows.is_empty(),
+            "second seed created files"
+        );
         assert!(
             rep.overwritten_workflows.is_empty(),
             "a second seed at scope `none` replaced files it had just written"
         );
         let _ = std::fs::remove_dir_all(&r);
+    }
+}
+
+#[cfg(test)]
+mod bd_mvy4_stage_drift {
+    use super::*;
+
+    /// bd-mvy4: drift must report a user-tier STAGE whose prompt diverged from
+    /// the compiled-in one as `stale`.
+    ///
+    /// Found while fixing bd-mvy4's own live effect: the compiled-in wave-gate
+    /// prompt was corrected to pass `--project` to preflight, the user-tier copy
+    /// at `~/.config/flywheel/stages/wave-gate.toml` still lacked it, and
+    /// `flywheel stage show wave-gate` returned the STALE prompt — so the fix was
+    /// inert in production. `workflow drift` reported that file `current`.
+    ///
+    /// The workflow tier does not have this problem: it compares VERBATIM SOURCE
+    /// TEXT. The stage tier compares parsed structs, and something in that path
+    /// treats a diverged prompt as equal.
+    #[test]
+    fn a_user_stage_whose_prompt_diverged_is_reported_stale() {
+        let root = std::env::temp_dir().join(format!("sdrift-{}", std::process::id()));
+        let dir = root.join("stages");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let compiled = crate::stages::StageLibrary::compiled_in();
+        let real = compiled
+            .get_stage("wave-gate")
+            .expect("wave-gate is compiled in");
+        // A faithful copy of the compiled-in stage must be `current`.
+        std::fs::write(
+            dir.join("wave-gate.toml"),
+            crate::stages::render_stage_entry(real).expect("render"),
+        )
+        .expect("write faithful");
+        let rows = catalog_drift(&root).expect("drift");
+        let faithful = rows
+            .iter()
+            .find(|r| r.kind == "stage" && r.name == "wave-gate")
+            .expect("row");
+        assert_eq!(
+            faithful.status, "current",
+            "a faithful copy must read as current, or drift is useless in the other direction"
+        );
+
+        // Now diverge ONLY the prompt, the way a stale seed copy does.
+        let mut diverged = real.clone();
+        diverged.prompt = format!("{} --but-diverged", diverged.prompt);
+        std::fs::write(
+            dir.join("wave-gate.toml"),
+            crate::stages::render_stage_entry(&diverged).expect("render"),
+        )
+        .expect("write diverged");
+        let rows = catalog_drift(&root).expect("drift");
+        let stale = rows
+            .iter()
+            .find(|r| r.kind == "stage" && r.name == "wave-gate")
+            .expect("row");
+        assert_eq!(
+            stale.status, "stale",
+            "a user stage whose PROMPT diverged is not current — reporting it current is what \
+             let a corrected compiled-in stage read as deployed while the shadowing copy served \
+             the old prompt"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
