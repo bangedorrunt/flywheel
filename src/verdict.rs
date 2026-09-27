@@ -619,17 +619,127 @@ fn load_bead(cwd: &Path, bead_id: &str, require_verify: bool) -> anyhow::Result<
 
 /// `note` key=value token helpers (ADR-0019 Spec 1: sha + receipt ride in the
 /// report `--note`).
-fn note_token<'a>(note: &'a str, key: &str) -> Option<&'a str> {
-    note.split_whitespace()
-        .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+/// A note is a LEADING run of `key=value` pairs. Parsing stops at the first
+/// token that is not one, so prose can never contribute a binding token
+/// (bd-0z00): `supersedes sha=<old> because the work is at sha=<new>` binds
+/// nothing, instead of silently binding whichever revision the prose named
+/// first. `report_pass` writes `sha=<sha> receipt=<path>`, so the ceremony's
+/// own note is a two-pair run and stays legal.
+fn note_tokens(note: &str) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    for tok in note.split_whitespace() {
+        match tok.split_once('=') {
+            Some((k, v)) if !k.is_empty() => out.push((k, v)),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// A full git object name: exactly 40 hex digits. A short prefix is not a
+/// binding, because `derive_head_sha` resolves full shas only.
+fn is_full_sha(v: &str) -> bool {
+    v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// What a note binds to, and why not when it binds nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoteBinding {
+    /// The note leads with `sha=<40 hex>`: the verdict binds here.
+    Bound(String),
+    /// The note leads with prose, or with a key that is not `sha`.
+    NoLeadingBinding,
+    /// The note leads with `sha=` but the value is not a full 40-hex sha.
+    /// A trailing comma lands here: the comma is captured with the value.
+    MalformedSha(String),
+}
+
+pub(crate) fn note_binding(note: &str) -> NoteBinding {
+    match note_tokens(note).first() {
+        None => NoteBinding::NoLeadingBinding,
+        Some((k, _)) if *k != "sha" => NoteBinding::NoLeadingBinding,
+        Some((_, v)) if !is_full_sha(v) => NoteBinding::MalformedSha((*v).to_string()),
+        Some((_, v)) => NoteBinding::Bound((*v).to_string()),
+    }
+}
+
+#[cfg(test)]
+mod note_binding_tests {
+    use super::*;
+
+    /// MUTATION 1: restore the prose scan `note_tokens` replaced. The
+    /// prose-mention test must fail, proving it detects the regression.
+    #[test]
+    fn mutation_prose_scan_is_caught() {
+        fn unanchored(note: &str) -> Option<&str> {
+            note.split_whitespace()
+                .find_map(|tok| tok.strip_prefix("sha")?.strip_prefix('='))
+        }
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let note = format!("supersedes sha={a} because the new work is at sha={b}");
+        // The old behavior: the first prose mention wins and binds.
+        assert_eq!(unanchored(&note), Some(a.as_str()));
+        // The fixed behavior refuses it.
+        assert_eq!(note_binding(&note), NoteBinding::NoLeadingBinding);
+        assert!(!note_has_sha(&note, &a));
+    }
+
+    /// MUTATION 2: drop the 40-hex check. The comma test must fail.
+    #[test]
+    fn mutation_missing_hex_length_check_is_caught() {
+        fn unvalidated(note: &str) -> Option<&str> {
+            note.split_whitespace()
+                .find_map(|tok| tok.strip_prefix("sha="))
+        }
+        let sha = "c".repeat(40);
+        let note = format!("sha={sha},");
+        // Without the length/hex check the comma rides along and matches a
+        // prefix comparison, which is exactly the silent mis-bind.
+        assert_eq!(unvalidated(&note), Some(format!("{sha},").as_str()));
+        // The real validator rejects it.
+        assert!(matches!(note_binding(&note), NoteBinding::MalformedSha(_)));
+        assert!(!note_has_sha(&note, &sha));
+    }
 }
 
 fn note_has_sha(note: &str, sha: &str) -> bool {
-    note_token(note, "sha").is_some_and(|v| v == sha)
+    matches!(note_binding(note), NoteBinding::Bound(v) if v == sha)
 }
 
 fn note_receipt_path(note: &str) -> Option<PathBuf> {
-    note_token(note, "receipt").map(PathBuf::from)
+    note_tokens(note)
+        .into_iter()
+        .find(|(k, _)| *k == "receipt")
+        .map(|(_, v)| PathBuf::from(v))
+}
+
+/// Why `note` does not bind `sha`, naming every `sha=` token the note carries
+/// so the author sees the competing candidates instead of a bare "no legal
+/// verdict" (bd-0z00). `None` when the note does bind `sha`.
+pub(crate) fn note_binding_reason(note: &str, sha: &str) -> Option<String> {
+    if note_has_sha(note, sha) {
+        return None;
+    }
+    let candidates: Vec<&str> = note
+        .split_whitespace()
+        .filter(|t| t.starts_with("sha="))
+        .collect();
+    let found = if candidates.is_empty() {
+        "no sha= token in the note".to_string()
+    } else {
+        format!("found {}", candidates.join(", "))
+    };
+    let why = match note_binding(note) {
+        NoteBinding::Bound(v) => format!("note binds sha {v}, not the revision {sha}"),
+        NoteBinding::MalformedSha(v) => {
+            format!("the note's leading sha= value is not a full 40-hex sha (got {v:?})")
+        }
+        NoteBinding::NoLeadingBinding => {
+            "the note does not lead with a sha=<40-hex> binding token".to_string()
+        }
+    };
+    Some(format!("{why}; {found}"))
 }
 
 /// Parse a gate row's `recorded_at` (RFC3339 or the br human format
@@ -820,6 +930,32 @@ pub fn ledger_check(cwd: &Path, bead: &BeadUnit, ac: AcShape, sha: &str) -> anyh
         }
     }
     Ok(false)
+}
+
+/// Why no gate row legalized `sha`: one line per pass row whose note carries a
+/// `sha=` token that does not bind. `flywheel ledger check` reports this on
+/// the failure path so an author sees the competing candidates instead of a
+/// bare "no legal verdict" (bd-0z00). Only called when `ledger_check` is
+/// false, so a legal check pays nothing for it.
+pub(crate) fn ledger_check_diagnostics(
+    cwd: &Path,
+    bead: &BeadUnit,
+    sha: &str,
+) -> anyhow::Result<Vec<String>> {
+    let list = list_gates(cwd, &bead.id)?;
+    let mut out = Vec::new();
+    for row in &list.history {
+        if !row.passed || VerdictKind::from_gate_name(&row.gate).is_none() {
+            continue;
+        }
+        let Some(note) = row.note.as_deref() else {
+            continue;
+        };
+        if let Some(why) = note_binding_reason(note, sha) {
+            out.push(format!("gate {}: {why}", row.gate));
+        }
+    }
+    Ok(out)
 }
 
 /// Worker helper: write ONLY the receipt file
@@ -1604,14 +1740,84 @@ mod tests {
 
     #[test]
     fn note_key_value_tokens_parse_sha_and_receipt() {
-        let note = "sha=deadbeef receipt=/tmp/r.txt";
-        assert!(note_has_sha(note, "deadbeef"));
-        assert!(!note_has_sha(note, "beef"));
+        // bd-0z00: a binding is a FULL 40-hex object name, not a short
+        // prefix, so this note uses a real-shaped sha.
+        let sha = "d".repeat(40);
+        let note = format!("sha={sha} receipt=/tmp/r.txt");
+        assert!(note_has_sha(&note, &sha));
+        assert!(!note_has_sha(&note, "beef"));
         assert_eq!(
-            note_receipt_path(note).unwrap(),
+            note_receipt_path(&note).unwrap(),
             PathBuf::from("/tmp/r.txt")
         );
         assert_eq!(note_receipt_path("no tokens"), None);
+    }
+
+    /// bd-0z00: a note binds at its START. Prose that mentions a revision
+    /// must never win the bind — a witness that binds the first prose match
+    /// renders a verdict about something other than what it claims to check.
+    #[test]
+    fn note_has_sha_anchors_to_the_note_start_not_a_prose_mention() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        // The prose mentions A first; B is the revision actually under test.
+        let note = format!("supersedes sha={a} because the new work is at sha={b}");
+        // RED today: `note_token` scans the whole prose and returns A, so
+        // this wrongly binds and legalizes a verdict about revision A.
+        assert!(
+            !note_has_sha(&note, &a),
+            "a prose mention must never bind a revision"
+        );
+        assert!(
+            !note_has_sha(&note, &b),
+            "a later prose mention must not bind either"
+        );
+        assert_eq!(note_binding(&note), NoteBinding::NoLeadingBinding);
+        // The reason NAMES both competing tokens, so the author can see that
+        // the note carried a sha and that it was not in the binding position.
+        let why = note_binding_reason(&note, &b).expect("an unbound note has a reason");
+        assert!(why.contains(&a), "names the first candidate: {why}");
+        assert!(why.contains(&b), "names the second candidate: {why}");
+    }
+
+    /// bd-0z00: a trailing comma is captured WITH the value, so a note that
+    /// carries the correct sha still binds nothing — silently, until now.
+    #[test]
+    fn note_has_sha_rejects_a_sha_value_followed_by_a_comma() {
+        let sha = "c".repeat(40);
+        let note = format!("sha={sha}, and the suite was green");
+        assert!(
+            !note_has_sha(&note, &sha),
+            "a comma is captured with the value and must not bind"
+        );
+        assert_eq!(
+            note_binding(&note),
+            NoteBinding::MalformedSha(format!("{sha},"))
+        );
+        // The reason names the offending token verbatim, comma included.
+        let why = note_binding_reason(&note, &sha).expect("an unbound note has a reason");
+        assert!(
+            why.contains(&format!("sha={sha},")),
+            "names the comma-bearing token: {why}"
+        );
+        // The well-formed sibling still binds, so the strictness is scoped
+        // to the malformed value and not to notes in general.
+        assert!(note_has_sha(&format!("sha={sha} receipt=/tmp/r.txt"), &sha));
+    }
+
+    /// bd-0z00: a short prefix is not a binding, and prose before the
+    /// binding is not a binding. Both fail closed with a reason.
+    #[test]
+    fn note_binding_reason_reports_a_bound_but_different_revision() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        // Well-formed, leads with sha=, but binds A while B is under test.
+        let note = format!("sha={a} receipt=/tmp/r.txt");
+        assert!(!note_has_sha(&note, &b));
+        let why = note_binding_reason(&note, &b).expect("a reason is reported");
+        assert!(why.contains(&a), "names the bound revision: {why}");
+        // A binding note has no reason to give.
+        assert_eq!(note_binding_reason(&note, &a), None);
     }
 
     /// bd-u5yr: worker-recorded gate rows carry no `note` key (br only

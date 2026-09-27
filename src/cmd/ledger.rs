@@ -83,9 +83,17 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                 println!("ledger check {bead_id}: LEGAL (sha {sha})");
                 Ok(())
             } else {
+                // bd-0z00: name the competing `sha=` candidates so the
+                // failure is actionable, not just "no legal verdict".
+                let why = crate::verdict::ledger_check_diagnostics(&cwd, &bead, &sha)?;
+                let detail = if why.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  {}", why.join("\n  "))
+                };
                 anyhow::bail!(
                     "ledger check {bead_id}: no legal verdict bound to sha {sha} \
-                     (legal-close table, ADR-0019 Spec 1)"
+                     (legal-close table, ADR-0019 Spec 1){detail}"
                 );
             }
         }
