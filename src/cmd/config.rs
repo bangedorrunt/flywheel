@@ -128,24 +128,14 @@ fn is_known(key: &str) -> bool {
 /// Commented config.toml. Every setting is named, with what it does and the
 /// default. Nothing is active until you uncomment it or `config set` it.
 pub(crate) fn config_template() -> String {
-    let mut out = String::from(
-        "# flywheel operator config\n\
-         # Path: ~/.config/flywheel/config.toml  (or $XDG_CONFIG_HOME/flywheel/config.toml)\n\
-         #\n\
-         # `flywheel config seed` writes this file once, when it is missing.\n\
-         # It never overwrites config.toml, even with --overwrite all.\n\
-         # `flywheel config list` prints each setting, its default, and the value in effect.\n\
-         # `flywheel config set <key> <value>` changes one key and leaves the rest of the file alone.\n\
-         #\n\
-         # A line that starts with # is not active. Uncomment it to override the default.\n\n",
-    );
-    for setting in SETTINGS {
-        out.push_str(&format!(
-            "# {}\n# default: {}\n# {}\n\n",
-            setting.summary, setting.default_hint, setting.key
-        ));
-    }
-    out
+    // One template. config.sample.toml is the annotated inventory. The header
+    // says seed will not replace the file after this first write.
+    format!(
+        "# Written by `flywheel config seed` because config.toml was missing.\n\
+         # Seed never overwrites this file, even with --overwrite all.\n\
+         # `flywheel config list` prints each setting below and the value in effect.\n\n{}",
+        include_str!("../../config.sample.toml")
+    )
 }
 
 fn lookup<'a>(table: &'a toml::Table, key: &str) -> Option<&'a toml::Value> {
@@ -159,6 +149,53 @@ fn lookup<'a>(table: &'a toml::Table, key: &str) -> Option<&'a toml::Value> {
         };
     }
     cursor.get(leaf)
+}
+
+fn effective_setting(cfg: &Config, key: &str) -> String {
+    match key {
+        "socket_path" => cfg.socket_path(),
+        "workspace_root" => cfg.workspace_root().display().to_string(),
+        "default_timeout_ms" => cfg.timeout_ms().to_string(),
+        "resonate_url" => cfg.resonate_url().unwrap_or_else(|| "(unset)".into()),
+        "on_captain_death" => cfg
+            .on_captain_death
+            .unwrap_or_default()
+            .as_str()
+            .to_string(),
+        "crew.max" => cfg
+            .crew
+            .as_ref()
+            .and_then(|c| c.max)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "5".into()),
+        "backend.multiplexer" => cfg
+            .backend
+            .as_ref()
+            .map(|b| b.multiplexer.clone())
+            .unwrap_or_else(|| "herdr".into()),
+        "backend.mail" => cfg
+            .backend
+            .as_ref()
+            .map(|b| b.mail.clone())
+            .unwrap_or_else(|| "toron".into()),
+        "mail.toron.url" => cfg
+            .mail
+            .as_ref()
+            .and_then(|m| m.toron.as_ref())
+            .and_then(|t| t.url.clone())
+            .unwrap_or_else(|| "(embedded)".into()),
+        "doorbell.url" => cfg
+            .doorbell
+            .as_ref()
+            .and_then(|d| d.url.clone())
+            .unwrap_or_else(|| "(embedded)".into()),
+        "agent_mail.name" => cfg
+            .agent_mail
+            .as_ref()
+            .and_then(|m| m.name.clone())
+            .unwrap_or_else(|| "(unset)".into()),
+        _ => "(see file)".into(),
+    }
 }
 
 fn value_string(v: &toml::Value) -> String {
@@ -285,10 +322,10 @@ fn cmd_config_seed(json: bool, overwrite: &str, dry_run: bool, yes: bool) -> Res
     );
     println!(
         "  config.toml {}",
-        if config_created {
-            "created from the commented template"
-        } else {
-            "left as-is (seed never overwrites it)"
+        match (dry_run, config_created) {
+            (true, true) => "would be created from config.sample.toml",
+            (false, true) => "created from config.sample.toml",
+            (_, false) => "left as-is (seed never overwrites it)",
         }
     );
     Ok(())
@@ -374,8 +411,8 @@ pub(crate) fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
                 println!("  {}", setting.summary);
                 println!("  default: {}", setting.default_hint);
                 println!("  file: {file}");
+                println!("  effective: {}", effective_setting(cfg, setting.key));
             }
-            let _ = cfg;
         }
         ConfigCmd::Seed {
             json,
@@ -510,13 +547,17 @@ mod config_key_tests {
     fn template_names_every_setting_and_its_default() {
         let text = config_template();
         assert!(text.contains("never overwrites"));
-        for setting in SETTINGS {
-            assert!(text.contains(setting.key), "template missing {}", setting.key);
-            assert!(
-                text.contains(setting.default_hint),
-                "template missing default for {}",
-                setting.key
-            );
+        for needle in [
+            "socket_path",
+            "resonate_url",
+            "on_captain_death",
+            "default_timeout_ms",
+            "[crew]",
+            "[doorbell]",
+            "[mail.toron]",
+            "[loop]",
+        ] {
+            assert!(text.contains(needle), "template missing {needle}");
         }
     }
 

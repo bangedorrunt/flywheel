@@ -28,8 +28,9 @@ or leave it; there is no "disable builtin" flag. Exact merge points:
 | flywheel core | `config.rs` defaults | `config.toml` | — (no project tier) | `FLYWHEEL_*` (below) | flags per command |
 | models | `models.rs` 6 models + 3 slots | `models.toml` | — | — | `model add/set-default`, `--model/--provider` |
 | profiles | `profile.rs` 6 profiles + 4 squads | `profiles.toml` | — | — | `profile set`, `binding-rebind` (live panes) |
-| workflows | `builtin_workflows.rs` (40) | `workflows/*.yaml` | `.flywheel/workflows/*.yaml` | — | `workflow new/lint` |
-| stages | `stages.rs` seed (30) | `stages.toml` (supported, usually absent) | `.flywheel/stages.toml` | — | `stage new`, `--stage` |
+| workflows | `builtin_workflows.rs` (40) | `workflows/*.yaml` | `.flywheel/workflows/*.yaml` adds a name the user tier lacks | — | `config seed`, `workflow seed` |
+| stages | `stages.rs` seed | `stages/*.toml` | `.flywheel/stages.toml` adds project stages | — | `config seed`, `stage new` |
+| judgment packs | `defaults/judgment-packs` in the binary | `judgment-packs/*.yaml` (this copy wins) | `.flywheel/judgment-packs` only if the user tier has no file for that id | `FLYWHEEL_JEV`, `TYPESAFE_API_KEY` | `config seed`, `config drift` |
 | crons | `cron.rs` builtins | `crons/*.yaml` | `.flywheel/crons/*.yaml` | — | `cron lint/start/run` |
 | standing orders | principle registry | `standing-orders.md` (generated, `regen`) | `.flywheel/standing-orders.md` (authored, regen never touches) | — | — |
 | doorbell | budgets 5/30/3, digest 300s/10, TTLs (code) | `[doorbell]` in `config.toml` | — | `DOORBELL_*` | `doorbell …` verbs |
