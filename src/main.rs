@@ -36653,6 +36653,7 @@ mod ingress_wiring_tests {
         );
         // status helper: append fact and count
         let proj = format!("facts-test-{}", uuid::Uuid::new_v4());
+
         let ev = crate::ingress::IngressEvent::LeaseLapsed {
             path: "src/lib.rs".into(),
             bead_id: Some("bd-99".into()),
@@ -36670,6 +36671,14 @@ mod ingress_wiring_tests {
         crate::append_fact(&proj, &non).unwrap();
         let (c2, _) = crate::facts_count_and_last(&proj);
         assert_eq!(c2, 1, "non-fact must not be journaled");
+
+        // bd-lorot: remove the journal this test caused, AT THE END — the fact
+        // reaches the real ingress seam, which writes
+        // {state}/journals/doorbell-journal-<proj>.jsonl, and with a unique
+        // proj per run that is a new permanent file every run.
+        let _ = std::fs::remove_file(
+            doorbell_rt::FileStore::new(crate::config::state_dir()).journal_file(&proj),
+        );
     }
 }
 

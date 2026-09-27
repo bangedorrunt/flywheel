@@ -13628,6 +13628,7 @@ mod tests {
         // ensure clean
         let path = crate::facts_journal_path(&proj);
         let _ = std::fs::remove_file(&path);
+
         emit_ledger_fact(&proj, "bd-test-close", LedgerEvent::Closed);
         let facts = crate::load_facts(&proj);
         assert_eq!(facts.len(), 1);
@@ -13646,6 +13647,16 @@ mod tests {
                 .contains("ledger bd-test-close closed")
         );
         let _ = std::fs::remove_file(&path);
+
+        // bd-lorot: remove the journal this test caused, AT THE END. The
+        // cleanup has to come after emit_* — the fact reaches the real ingress
+        // seam, which writes {state}/journals/doorbell-journal-<proj>.jsonl,
+        // and with a unique proj per run that is a new permanent file every
+        // run. 244 had accumulated, and known_workspaces counts every one, so
+        // the suite was inflating the doorbell's wake-blind alarm and the disk.
+        let _ = std::fs::remove_file(
+            doorbell_rt::FileStore::new(crate::config::state_dir()).journal_file(&proj),
+        );
     }
 
     #[test]
@@ -13743,6 +13754,7 @@ mod tests {
         let path = crate::facts_journal_path(&proj);
         let _ = std::fs::remove_file(&path);
         emit_lease_lapsed(&proj, "src/durable.rs", Some("bd-lapsed-1"));
+
         let facts = crate::load_facts(&proj);
         assert_eq!(facts.len(), 1);
         match &facts[0] {
@@ -13758,6 +13770,16 @@ mod tests {
                 .contains("lease lapsed src/durable.rs")
         );
         let _ = std::fs::remove_file(&path);
+
+        // bd-lorot: remove the journal this test caused, AT THE END. The
+        // cleanup has to come after emit_* — the fact reaches the real ingress
+        // seam, which writes {state}/journals/doorbell-journal-<proj>.jsonl,
+        // and with a unique proj per run that is a new permanent file every
+        // run. 244 had accumulated, and known_workspaces counts every one, so
+        // the suite was inflating the doorbell's wake-blind alarm and the disk.
+        let _ = std::fs::remove_file(
+            doorbell_rt::FileStore::new(crate::config::state_dir()).journal_file(&proj),
+        );
     }
 
     #[test]
