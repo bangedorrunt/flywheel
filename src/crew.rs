@@ -323,6 +323,39 @@ fn sort_roles(roles: &mut [String]) {
 
 /// Pack unique roles into total N (ADR-0011 D2). Fails closed when N > max.
 pub fn pack_crew(unique: &[String], n: u32, max: u32) -> Result<PackedCrew, String> {
+    // Every role gets exactly one pane — the pre-bd-0s0y shape, kept as the
+    // general entry point so its callers and tests are unchanged.
+    let counts: BTreeMap<String, u32> = unique
+        .iter()
+        .map(|r| r.trim_start_matches('@').to_string())
+        .filter(|r| !r.is_empty())
+        .map(|r| (r, 1u32))
+        .collect();
+    pack_crew_shape(&counts, n, max)
+}
+
+/// bd-0s0y: pack a crew from the SHAPE a workflow actually needs — role → the
+/// most copies of it any single concurrent wave dispatches to.
+///
+/// `pack_crew` only ever received role NAMES, so a role dispatched
+/// concurrently three times (`parallel over: "3"` over `@oracle`) was packed to
+/// one pane and the busy-owner fence refused copies 2..3 at run time. The count
+/// was known — [`crew_demand`] computes it — it was just thrown away here.
+///
+/// Folding rules, and the asymmetry that matters:
+/// - A role needing ONE pane can be aliased onto a host for free, because
+///   sequential reuse costs nothing (the fence releases on permit drop). This
+///   is the pre-existing behaviour and it is preserved exactly.
+/// - A role needing SEVERAL panes must NOT be folded: two concurrent copies
+///   aimed at one agent is the refusal this whole change exists to prevent.
+///   So when the shape needs more panes than the budget, single-copy roles are
+///   folded first and, if that is not enough, the run fails LOUD naming the
+///   role and the shortfall rather than collapsing it onto a busy pane.
+pub fn pack_crew_shape(
+    counts: &BTreeMap<String, u32>,
+    n: u32,
+    max: u32,
+) -> Result<PackedCrew, String> {
     if n == 0 {
         return Err("crew budget must be >= 1".into());
     }
@@ -331,11 +364,7 @@ pub fn pack_crew(unique: &[String], n: u32, max: u32) -> Result<PackedCrew, Stri
             "crew budget {n} exceeds crew.max={max} (set FLYWHEEL_CREW_MAX or ~/.config/flywheel [crew].max)"
         ));
     }
-    let mut roles: Vec<String> = unique
-        .iter()
-        .map(|r| r.trim_start_matches('@').to_string())
-        .filter(|r| !r.is_empty())
-        .collect();
+    let mut roles: Vec<String> = counts.keys().cloned().collect();
     roles.sort();
     roles.dedup();
     if roles.is_empty() {
@@ -349,26 +378,52 @@ pub fn pack_crew(unique: &[String], n: u32, max: u32) -> Result<PackedCrew, Stri
     }
     sort_roles(&mut roles);
     let unique_n = roles.len() as u32;
-    let keep_n = (n as usize).min(roles.len());
-    let kept = &roles[..keep_n];
-    let overflow = &roles[keep_n..];
-    let host = kept.first().cloned().unwrap_or_else(|| "coder".to_string());
-    let mut members = BTreeMap::new();
-    for r in kept {
-        members.insert(r.clone(), 1u32);
+    let host = roles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "coder".to_string());
+
+    let mut members: BTreeMap<String, u32> = counts.clone();
+    let mut aliases = BTreeMap::new();
+
+    // Fold single-copy roles, last first, until the crew fits the budget.
+    // A role that needs more than one pane is never a fold candidate.
+    let mut total: u32 = members.values().sum();
+    while total > n {
+        let mut ordered = roles.clone();
+        sort_roles(&mut ordered);
+        let victim = ordered
+            .into_iter()
+            .rev()
+            .find(|r| members.get(r).copied().unwrap_or(0) == 1);
+        let Some(victim) = victim else {
+            return Err(format!(
+                "crew needs {total} panes but the budget is {n} and every remaining role is \
+                 needed concurrently (a role dispatched N times at once needs N panes, and \
+                 folding it onto another agent is refused by the busy-owner fence). Raise the \
+                 crew budget, lower the fan-out, or split the workflow."
+            ));
+        };
+        roles.retain(|r| r != &victim);
+        members.remove(&victim);
+        total -= 1;
+        aliases.insert(victim, host.clone());
     }
-    if n > unique_n {
-        let extra = n - unique_n;
+    if total > max {
+        return Err(format!(
+            "crew needs {total} panes, over crew.max={max} (a role dispatched concurrently needs \
+             one pane per copy). Lower the fan-out or raise FLYWHEEL_CREW_MAX."
+        ));
+    }
+    // Spare capacity goes to the worker, as before.
+    if n > total {
+        let extra = n - total;
         let worker = if members.contains_key("coder") {
             "coder"
         } else {
             host.as_str()
         };
         *members.entry(worker.to_string()).or_insert(1) += extra;
-    }
-    let mut aliases = BTreeMap::new();
-    for r in overflow {
-        aliases.insert(r.clone(), host.clone());
     }
     Ok(PackedCrew {
         members,
@@ -381,16 +436,22 @@ pub fn pack_crew(unique: &[String], n: u32, max: u32) -> Result<PackedCrew, Stri
 
 /// Pack an inferred unique-role plan with a request.
 pub fn pack_inferred(inferred: &CrewPlan, req: &CrewFlag, max: u32) -> Result<PackedCrew, String> {
+    // bd-0s0y: the inferred plan already carries per-role COPY counts
+    // (crew_demand raises them), so pack the counts. Passing only the keys —
+    // the old behavior — silently reset every role to one pane, which is how a
+    // `parallel over: 3` role ended up sharing one agent with its own copies.
     let unique: Vec<String> = inferred.members.keys().cloned().collect();
+    // bd-0s0y: the budget a default crew gets is what the workflow NEEDS —
+    // the sum of its per-role copy counts — not the number of distinct roles.
+    let needed: u32 = inferred.members.values().sum();
     match req {
         CrewFlag::Default | CrewFlag::Named(_) => {
-            let n = (unique.len() as u32).max(1).min(max);
             if unique.is_empty() {
-                return pack_crew(&unique, 1, max);
+                return pack_crew_shape(&inferred.members, 1, max);
             }
-            pack_crew(&unique, n, max)
+            pack_crew_shape(&inferred.members, needed.max(1).min(max), max)
         }
-        CrewFlag::Total(n) => pack_crew(&unique, *n, max),
+        CrewFlag::Total(n) => pack_crew_shape(&inferred.members, *n, max),
         CrewFlag::Map(map) => {
             let n: u32 = map.values().copied().sum();
             if n == 0 {
@@ -1660,6 +1721,15 @@ fn infer_auto(
         for node in graph.nodes.values() {
             scan_action(&node.action, &mut counts, resolve, visited);
         }
+    }
+
+    // bd-0s0y: the scan above SEES roles and seats one pane each, which is
+    // right for a sequential chain and wrong for a role dispatched
+    // concurrently. crew_demand adds the per-role copy count for the busiest
+    // wave; merged with max so a child's demand and this document's both hold.
+    for (role, copies) in crew_demand(workflow).crew_shape {
+        let slot = counts.entry(role).or_insert(1);
+        *slot = (*slot).max(copies);
     }
 
     CrewPlan { members: counts }
@@ -3540,6 +3610,97 @@ steps:
         toron_workflow::schema::parse_workflow(yaml).expect("yaml parses")
     }
 
+    /// bd-0s0y: the three builtins the shape fence flagged must now PACK — each
+    /// role gets the copies its widest wave needs, with no aliasing. This is
+    /// half 2c: before it, `pack_inferred` passed only the role KEYS, so every
+    /// count was reset to 1 and each of these runs was refused at dispatch.
+    #[test]
+    fn the_multi_copy_worklist_now_packs_with_real_copies() {
+        let catalog = crate::builtin_workflows::builtin_workflows();
+        for (name, expected) in [
+            ("debate", [("oracle", 1u32), ("reviewer", 2u32)].as_slice()),
+            ("phase-review", [("reviewer", 2u32)].as_slice()),
+            (
+                "weekly-review",
+                [("oracle", 1u32), ("scout", 3u32)].as_slice(),
+            ),
+        ] {
+            let shape = crew_demand(&catalog[name]).crew_shape;
+            let got: Vec<(String, u32)> = shape.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            let want: Vec<(String, u32)> =
+                expected.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+            assert_eq!(got, want, "{name} shape");
+
+            let needed: u32 = shape.values().sum();
+            assert!(needed <= DEFAULT_CREW_MAX, "{name} must fit the cap");
+            let packed = pack_crew_shape(&shape, needed, DEFAULT_CREW_MAX)
+                .unwrap_or_else(|e| panic!("{name} must pack: {e}"));
+            assert!(
+                packed.aliases.is_empty(),
+                "{name} must not alias: a multi-copy role folded onto a host is the collision \
+                 this change exists to prevent, got {:?}",
+                packed.aliases
+            );
+            for (role, copies) in &shape {
+                assert_eq!(
+                    packed.members.get(role).copied(),
+                    Some(*copies),
+                    "{name} must seat {copies} pane(s) for @{role}, got {:?}",
+                    packed.members
+                );
+            }
+        }
+    }
+
+    /// bd-0s0y: a role that genuinely needs more panes than the cap allows
+    /// fails LOUD, naming the role. It must never be folded onto a host — that
+    /// is the collision — and it must never be silently truncated to one pane,
+    /// which is the original defect.
+    #[test]
+    fn a_shape_over_the_cap_fails_loud_and_never_folds_a_multi_copy_role() {
+        // 3 oracles + 3 planners = 6 > cap 5. Every role is multi-copy, so
+        // there is nothing safe to fold.
+        let shape: BTreeMap<String, u32> = [("oracle", 3u32), ("planner", 3u32)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let err = pack_crew_shape(&shape, 6, DEFAULT_CREW_MAX)
+            .expect_err("6 panes cannot fit a cap of 5");
+        assert!(
+            err.contains("6 panes") || err.contains("crew.max=5"),
+            "the error must state the shortfall: {err}"
+        );
+
+        // With foldable roles it packs by folding ONLY single-copy ones: 6
+        // panes of demand, budget/cap 5, and the surplus comes out of `scout`
+        // (and then `reviewer`) — never out of the 3-way oracle.
+        let shape: BTreeMap<String, u32> = [
+            ("oracle", 3u32),
+            ("planner", 1u32),
+            ("scout", 1u32),
+            ("reviewer", 1u32),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let packed = pack_crew_shape(&shape, 5, DEFAULT_CREW_MAX)
+            .expect("6 panes of demand, 2 foldable, budget 5");
+        assert_eq!(
+            packed.members.get("oracle").copied(),
+            Some(3),
+            "a multi-copy role is never the fold: {members:?}",
+            members = packed.members
+        );
+        assert_eq!(packed.members.get("planner").copied(), Some(1));
+        assert_eq!(packed.members.values().sum::<u32>(), 5);
+        assert_eq!(
+            packed.aliases.len(),
+            1,
+            "exactly one single-copy role folded: {:?}",
+            packed.aliases
+        );
+    }
+
     /// The regression itself, in miniature. This is the shape that killed
     /// every crew run: one node, one role, three concurrent copies, and a crew
     /// that holds one pane per role.
@@ -3643,50 +3804,47 @@ graph:
     /// the fatal fan-out lived in a CHILD of `goal`, so checking `goal`'s own
     /// steps passed while the run still died on step one.
     #[test]
-    fn every_builtin_fits_the_cap_and_the_2c_worklist_is_pinned() {
+    /// THE fence. Every builtin must PACK on a cap-sized crew: the shape its
+    /// widest wave needs has to fit, and no role that needs copies may end up
+    /// aliased onto another agent — that is the busy-fence refusal.
+    ///
+    /// `ce-brainstorm` is why this walks the catalog and not one file: the
+    /// fatal fan-out lived in a CHILD of `goal`, so checking `goal`'s own steps
+    /// passed while the run still died on step one. And "packs" rather than
+    /// "fits", because a shape that fits on paper but cannot be packed is still
+    /// a dead run.
+    #[test]
+    fn every_builtin_packs_on_a_cap_sized_crew() {
         let catalog = crate::builtin_workflows::builtin_workflows();
-        let mut over_cap: Vec<String> = Vec::new();
-        let mut needs_copies: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+        let mut broken: Vec<String> = Vec::new();
         for (name, wf) in &catalog {
             let d = crew_demand(wf);
-            if d.crew_total > DEFAULT_CREW_MAX {
-                over_cap.push(format!(
-                    "{name}: needs {} panes ({:?}), cap is {DEFAULT_CREW_MAX}",
-                    d.crew_total, d.crew_shape
-                ));
+            if d.crew_total == 0 {
+                continue;
             }
-            if !d.collisions.is_empty() {
-                needs_copies.insert(name.clone(), d.crew_shape.clone());
+            let budget = d.crew_total.min(DEFAULT_CREW_MAX);
+            match pack_crew_shape(&d.crew_shape, budget, DEFAULT_CREW_MAX) {
+                Ok(p) => {
+                    for (role, copies) in &d.collisions {
+                        let seated = p.members.get(role).copied().unwrap_or(0);
+                        if p.aliases.contains_key(role) || seated < *copies as u32 {
+                            broken.push(format!(
+                                "{name}: @{role} needs {copies} concurrent pane(s) but packed \
+                                 {seated} (aliased: {}) — copies 2..{copies} will be refused by \
+                                 the busy-owner fence",
+                                p.aliases.contains_key(role)
+                            ));
+                        }
+                    }
+                }
+                Err(e) => broken.push(format!("{name}: {e}")),
             }
         }
         assert!(
-            over_cap.is_empty(),
-            "no builtin may need more than {DEFAULT_CREW_MAX} panes:\n  {}",
-            over_cap.join("\n  ")
-        );
-
-        // bd-0s0y: `goal` and `goal-direct` are REMOVED from this list by
-        // spreading ce-brainstorm's 3-way fan-out across 3 distinct roles.
-        // The three left genuinely want a role with copies, which the packer
-        // does not yet build (half 2c) — pinned so the list cannot grow.
-        let expected: BTreeMap<String, BTreeMap<String, u32>> = [
-            ("debate", &[("oracle", 1u32), ("reviewer", 2u32)][..]),
-            ("phase-review", &[("reviewer", 2u32)][..]),
-            ("weekly-review", &[("oracle", 1u32), ("scout", 3u32)][..]),
-        ]
-        .into_iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                v.iter().map(|(a, b)| (a.to_string(), *b)).collect(),
-            )
-        })
-        .collect();
-        assert_eq!(
-            needs_copies, expected,
-            "the set of builtins needing a multi-copy role changed. A NEW entry is a workflow \
-             that will be refused by the busy-owner fence until the packer builds copies (half \
-             2c) — fix it by spreading the fan-out across roles, not by widening this list."
+            broken.is_empty(),
+            "{} builtin workflow(s) cannot be crewed:\n  {}",
+            broken.len(),
+            broken.join("\n  ")
         );
     }
 
