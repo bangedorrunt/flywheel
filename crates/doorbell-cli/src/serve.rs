@@ -1561,6 +1561,39 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
     }
     (min_age.filter(|a| *a != u64::MAX), max_seq)
 }
+/// bd-k0p7: a build older than this is worth degrading on. Chosen to sit
+/// above a normal rebuild-and-restart cycle (minutes) and well below the 11h
+/// the last incident actually ran, so a daemon nobody rebuilt cannot read as
+/// fresh.
+pub(super) const BUILD_STALE_SECS: u64 = 6 * 60 * 60;
+
+/// The build identity of the RUNNING executable. The IO half of bd-k0p7: it
+/// resolves `current_exe` and stats it, then hands the observation to the
+/// pure [`doorbell_rt::api::resolve_build_stamp`]. Never trusts the source
+/// tree or a compile-time constant for the age — the running binary is the
+/// artifact under test.
+pub(super) fn running_build_stamp(now_unix: u64) -> doorbell_rt::api::BuildStamp {
+    let Ok(exe) = std::env::current_exe() else {
+        // Cannot name the exe: the compiled-in version still stands, and the
+        // observed fields stay absent rather than reporting a fake zero.
+        return doorbell_rt::api::resolve_build_stamp(None, now_unix);
+    };
+    let observed = std::fs::metadata(&exe).ok().and_then(|md| {
+        let mtime = md
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some((mtime, md.len()))
+    });
+    let mut stamp = doorbell_rt::api::resolve_build_stamp(observed, now_unix);
+    // Set the path AFTER resolving: the resolver owns the observed fields, and
+    // reading `current_exe` is the only step that can fail.
+    stamp.exe = Some(exe.display().to_string());
+    stamp
+}
+
 /// bd-enov (F17): workspaces the plane has EVER served — one journal file per
 /// workspace, written by the hosted loop. Their presence while `mode=standby`
 /// is the wake-blind signature: a fleet exists that expects rings/digests, and
@@ -1624,6 +1657,19 @@ fn health_body(app: &AppState) -> String {
         degraded.push("cli_unresolved".to_string());
     }
     let now = doorbell_rt::lease::unix_now();
+    // bd-k0p7: name the build that is ANSWERING, next to `core_v`. Without
+    // this a stale installed binary is indistinguishable from a fresh one:
+    // a committed doorbell-cli fix sat unrun for 11h because flywheel was
+    // rebuilt and doorbell was not, and only an 8.9h-old stamp file gave it
+    // away. The stamp is measured from the running exe, not the source tree.
+    let build = running_build_stamp(now);
+    // bd-k0p7: a build old enough to be suspect is DEGRADED, not merely
+    // reported. The 11h incident is the reason this is not advisory: an
+    // operator reading /health needs the daemon to say so, not to make the
+    // subtraction themselves.
+    if build.age_s.is_some_and(|age| age > BUILD_STALE_SECS) {
+        degraded.push("stale_build".to_string());
+    }
     let ws_names: Vec<String> = hosted
         .iter()
         .filter_map(|h| hosted_workspace(h).map(str::to_string))
@@ -1679,6 +1725,11 @@ fn health_body(app: &AppState) -> String {
         "uptime_s": app.started.elapsed().as_secs(),
         "mode": mode,
         "hosted": hosted,
+        // bd-k0p7: the build identity of the RUNNING binary. `core_v` is a
+        // compiled-in constant every build shares, so on its own it cannot
+        // tell a stale installed binary from a fresh one; this names the build
+        // that is actually answering.
+        "build": build,
         // The CLIs actually exec'd. An operator reading `/health` after a
         // silent ring can see the resolved paths instead of guessing which
         // `toron`/`herdr` a launchd daemon found.
@@ -1832,6 +1883,9 @@ fn stats_body(app: &AppState) -> String {
         "uptime_s": app.started.elapsed().as_secs(),
         "mode": if hosted.is_empty() { "standby" } else { "hosted" },
         "hosted": hosted,
+        // bd-k0p7: same stamp on the compact body, so neither /health shape
+        // can be the one that hides a stale build.
+        "build": running_build_stamp(doorbell_rt::lease::unix_now()),
         "workspaces": workspaces,
         "journal_rows": journal_rows,
         "torn_tail": store.any_torn_tail(),
@@ -1898,6 +1952,47 @@ mod tests {
             "no wake across the window: {}",
             report.verdicts[0].1
         );
+    }
+
+    /// bd-k0p7: the REAL resolver must produce a stamp with a real age. The
+    /// pure resolver's tests would pass even if the IO half never called it,
+    /// which is precisely the "correct helper, absent from the payload" trap.
+    #[test]
+    fn doorbell_health_running_build_stamp_reads_the_live_exe() {
+        let now = doorbell_rt::lease::unix_now();
+        let stamp = super::running_build_stamp(now);
+        assert!(stamp.exe.is_some(), "the running exe is named: {stamp:?}");
+        assert!(
+            !stamp.version.is_empty(),
+            "a stamp with no version names no build: {stamp:?}"
+        );
+        // This test binary was linked seconds ago, so the age must be present
+        // and small. A missing age here means the IO half is not resolving.
+        let age = stamp.age_s.expect("the live exe reports an age");
+        assert!(
+            age < 60 * 60,
+            "a just-linked test binary is not hours old: {age}s"
+        );
+        assert!(stamp.exe_len.is_some_and(|l| l > 0), "size is reported");
+    }
+
+    /// bd-k0p7: the staleness rule keys off `age_s`, so a stamp with no age
+    /// (unreadable exe) must NOT be treated as fresh AND must not be treated
+    /// as stale — it is unknown, and the degrade check is written to say so.
+    #[test]
+    fn doorbell_health_unknown_age_is_neither_fresh_nor_stale() {
+        let unknown = doorbell_rt::api::resolve_build_stamp(None, 1_000_000);
+        assert_eq!(unknown.age_s, None);
+        assert!(
+            !unknown.age_s.is_some_and(|a| a > super::BUILD_STALE_SECS),
+            "unknown must not read as stale"
+        );
+        // And a build inside the window is fresh.
+        let fresh = doorbell_rt::api::resolve_build_stamp(Some((1_000_000 - 60, 1)), 1_000_000);
+        assert!(!fresh.age_s.is_some_and(|a| a > super::BUILD_STALE_SECS));
+        // The 11h incident shape IS stale.
+        let stale = doorbell_rt::api::resolve_build_stamp(Some((1_000_000 - 39_600, 1)), 1_000_000);
+        assert!(stale.age_s.is_some_and(|a| a > super::BUILD_STALE_SECS));
     }
 
     /// bd-pf3b: the probe must cost ONE sample window for ALL stragglers —
