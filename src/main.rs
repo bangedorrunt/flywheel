@@ -25705,6 +25705,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             )?;
             eprintln!("flywheel: {}", packed.announce(name));
             let wf = crew::apply_role_aliases(&wf, &packed.aliases);
+            // bd-8c5h: the parent rewrite above only reaches roles the PARENT
+            // dispatches. A role dispatched inside a `call_workflow` child is
+            // invisible to it, so the child keeps asking for a pane the packer
+            // folded away and the run bails. The fold rides the resolver, which
+            // is the only thing that ever sees a child.
+            let workflow_resolver =
+                crew::aliasing_resolver(workflow_resolver, packed.aliases.clone());
             let crew_plan = packed.as_plan();
             // A recording action runner: flywheel's CLI run exercises the
             // engine (delays, approvals park durably, graph scheduling,
@@ -26405,6 +26412,12 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 // entries resolve).
                 workflow_catalog::subworkflow_resolver(Some(&resolver_root))(sub)
             });
+            // bd-8c5h: same gap as the workflow-run arm — a folded role
+            // dispatched inside a composed part's `call_workflow` child is
+            // invisible to the parent rewrite above, so the child keeps asking
+            // for a pane that was never spawned.
+            let workflow_resolver =
+                crew::aliasing_resolver(workflow_resolver, packed.aliases.clone());
             let profile_resolver = profile::ProfileCatalog::catalog_profile_resolver();
             // bd-omwg: the SpawnSink drainer — pane mode keeps the engine
             // alive across invoke so the drainer thread can launch a real

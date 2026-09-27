@@ -172,8 +172,6 @@ fn resolve_over(over: &str, inputs: &BTreeMap<String, String>) -> u32 {
     n.unwrap_or(1).max(1)
 }
 
-
-
 /// bd-0s0y: the crew a workflow needs, and every way it would self-collide.
 /// Pure — no registry, no panes, no herdr. The catalog-level test is what
 /// makes it worth having.
@@ -197,7 +195,7 @@ pub fn crew_demand(wf: &Workflow) -> CrewDemand {
         })
         .collect();
 
-
+    // (node, needs, roles, seed wave). `steps:` is strictly ordered, so each
     // step is its own wave — two steps reusing a role there is sequential
     // reuse, not concurrency, and must never be flagged.
     let nodes: Vec<(String, Vec<String>, Vec<String>, u32)> = match &wf.graph {
@@ -645,6 +643,33 @@ pub fn apply_role_aliases(workflow: &Workflow, aliases: &BTreeMap<String, String
         }
     }
     wf
+}
+
+/// bd-8c5h: carry a decided fold into every CHILD the engine resolves.
+///
+/// [`apply_role_aliases`] can only rewrite the document it is handed, so it
+/// reaches a folded role only when the parent dispatches that role itself.
+/// When the parent delegates (`call_workflow`), the dispatch lives in the
+/// child, the rewrite lands in a document that dispatches nothing, and the
+/// fold the packer announced in its pack line never happens — the original
+/// bd-8c5h bail, one indirection deeper than the fix that already existed.
+///
+/// The resolver is the only thing that ever sees a child, so the fold rides
+/// it. Composition, not duplication: the rewrite logic is still
+/// [`apply_role_aliases`], applied one document deeper.
+///
+/// A child the base cannot resolve stays unresolvable — inventing an empty
+/// document would let a missing sub-workflow run and report success.
+pub fn aliasing_resolver(
+    base: toron_workflow::WorkflowResolver,
+    aliases: BTreeMap<String, String>,
+) -> toron_workflow::WorkflowResolver {
+    if aliases.is_empty() {
+        return base;
+    }
+    std::sync::Arc::new(move |name: &str| {
+        base(name).map(|child| apply_role_aliases(&child, &aliases))
+    })
 }
 
 /// Resolve a workflow's elastic fan-out refs (`parallel over: "@crew.<role>"`)
@@ -3663,6 +3688,162 @@ steps:
         }
     }
 
+    /// bd-8c5h: every `profile: "@role"` a workflow reaches, through its own
+    /// steps AND its graph nodes, at any control-flow depth.
+    fn dispatch_profiles(wf: &Workflow) -> Vec<String> {
+        fn walk(action: &Action, out: &mut Vec<String>) {
+            match action {
+                Action::DispatchJob { spec, .. } => {
+                    if let Some(p) = spec.profile.as_deref() {
+                        out.push(p.trim_start_matches('@').to_string());
+                    }
+                }
+                // bd-8c5h: a fan-out or a branch arm is still a dispatch site.
+                // Walking only the top level would miss a folded role nested in
+                // one — which is the half of the document nobody checked.
+                Action::Parallel { each, .. } | Action::Foreach { each, .. } => {
+                    walk(&each.action, out)
+                }
+                Action::Retry { step, .. } => walk(&step.action, out),
+                Action::Loop { body, .. } => {
+                    for s in body {
+                        walk(&s.action, out);
+                    }
+                }
+                Action::Branch {
+                    then, else_steps, ..
+                } => {
+                    for s in then.iter().chain(else_steps.iter()) {
+                        walk(&s.action, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for s in &wf.steps {
+            walk(&s.action, &mut out);
+        }
+        if let Some(g) = &wf.graph {
+            for node in g.nodes.values() {
+                walk(&node.action, &mut out);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// bd-8c5h: THE remaining gap. `apply_role_aliases` rewrites the document
+    /// it is handed, so a fold only lands when the PARENT dispatches the role
+    /// itself. `goal` dispatches nothing (every node is a `call_workflow`) and
+    /// the role it needs is dispatched by the CHILD — so the rewrite is a
+    /// no-op and the fold the packer just announced never happens.
+    ///
+    /// The fold therefore has to travel with the RESOLVER, which is the only
+    /// thing that ever sees a child. This pins that against the REAL builtins:
+    /// if `goal` ever starts dispatching a role itself, or `ce-brainstorm`
+    /// stops dispatching the folded one, the preconditions fail loudly instead
+    /// of the test quietly asserting nothing.
+    #[test]
+    fn the_fold_reaches_the_child_that_dispatches_the_role() {
+        let catalog = crate::builtin_workflows::builtin_workflows();
+        let goal = catalog.get("goal").expect("goal builtin");
+        let child = catalog.get("ce-brainstorm").expect("ce-brainstorm builtin");
+
+        // Precondition 1: the parent dispatches roles, but NOT the folded one.
+        // That is the whole gap — a rewrite of the parent can only ever reach
+        // what the parent dispatches, so a role only the child dispatches is
+        // unreachable no matter how many times the parent is rewritten.
+        let parent_roles = dispatch_profiles(goal);
+        assert!(
+            !parent_roles.is_empty(),
+            "goal dispatches nothing itself — re-check whether the child gap still exists"
+        );
+        assert!(
+            !parent_roles.contains(&"oracle".to_string()),
+            "goal now dispatches @oracle itself, so the child gap is gone: {parent_roles:?}"
+        );
+        // Precondition 2: the child is the one that dispatches the folded role.
+        assert!(
+            dispatch_profiles(child).contains(&"oracle".to_string()),
+            "ce-brainstorm no longer dispatches @oracle: {:?}",
+            dispatch_profiles(child)
+        );
+
+        let aliases: BTreeMap<String, String> =
+            BTreeMap::from([("oracle".to_string(), "coder".to_string())]);
+
+        // The bug, as an assertion: the existing rewrite cannot touch a role
+        // the parent never dispatches, so rewriting the parent changes nothing
+        // and @oracle survives in the child untouched.
+        let rewritten_parent = apply_role_aliases(goal, &aliases);
+        let parent_after = dispatch_profiles(&rewritten_parent);
+        assert_eq!(
+            parent_after, parent_roles,
+            "the parent rewrite changed a role the parent never dispatches — \
+             that would mean the gap closed some other way: {parent_roles:?} vs {parent_after:?}"
+        );
+
+        // The fix: the fold rides the resolver, so the child is rewritten
+        // before the engine ever sees it.
+        let raw = std::sync::Arc::new(child.clone());
+        let base: toron_workflow::WorkflowResolver = std::sync::Arc::new(move |name: &str| {
+            (name == "ce-brainstorm").then(|| (*raw).clone())
+        });
+        let resolver = aliasing_resolver(base, aliases);
+
+        let folded = resolver("ce-brainstorm").expect("the child still resolves");
+        let after = dispatch_profiles(&folded);
+        assert!(
+            !after.contains(&"oracle".to_string()),
+            "the fold never reached the child document: {after:?}"
+        );
+        assert!(
+            after.contains(&"coder".to_string()),
+            "the host role is missing from the rewritten child: {after:?}"
+        );
+        // A fold rewrites ONE role, not the document: an unfurled role in the
+        // same child must survive.
+        assert!(
+            after.contains(&"reviewer".to_string()),
+            "an unfurled role was rewritten too: {after:?}"
+        );
+    }
+
+    /// The wrapper must be a no-op when the packer folded nothing, so every
+    /// crew that fits its budget is byte-identical to the pre-bd-8c5h path.
+    #[test]
+    fn aliasing_resolver_with_no_fold_is_the_identity() {
+        let raw = std::sync::Arc::new(
+            parse_workflow(
+                "name: solo\ntrigger: { type: webhook }\nsteps:\n  - name: a\n    action: dispatch_job\n    assignee: x\n    spec: { profile: \"@oracle\" }\n",
+            )
+            .expect("parses"),
+        );
+        let base: toron_workflow::WorkflowResolver =
+            std::sync::Arc::new(move |_: &str| Some((*raw).clone()));
+        let resolver = aliasing_resolver(base, BTreeMap::new());
+        let got = resolver("anything").expect("resolves");
+        assert_eq!(dispatch_profiles(&got), vec!["oracle".to_string()]);
+    }
+
+    /// Wrapping must not invent a document for a child the base could not
+    /// resolve: the engine's own "no such sub-workflow" error is the honest
+    /// one, and a synthesized empty child would run and report success.
+    #[test]
+    fn aliasing_resolver_preserves_an_unresolvable_child() {
+        let base: toron_workflow::WorkflowResolver = std::sync::Arc::new(|_: &str| None);
+        let resolver = aliasing_resolver(
+            base,
+            BTreeMap::from([("oracle".to_string(), "coder".to_string())]),
+        );
+        assert!(
+            resolver("nope").is_none(),
+            "wrapping invented a document for an unresolvable child"
+        );
+    }
+
     #[test]
     fn pack_inferred_default_caps_at_max() {
         let mut members = BTreeMap::new();
@@ -4060,7 +4241,7 @@ steps:
                 .chain(wf.steps.iter().map(|s| &s.action))
             {
                 let mut uses = Vec::new();
-                role_uses(action, &mut uses);
+                role_uses(action, &BTreeMap::new(), &mut uses);
                 roles.extend(uses);
             }
         }
