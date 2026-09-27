@@ -1,0 +1,15 @@
+# Coalition intent annotator (bd-lpn6). Advisory only: which coordination
+# shape a goal wants, for the captain to confirm. Never forms anything.
+id: coalition-intent
+version: 1
+model: jev-latest
+questions:
+  - id: intent
+    kind: choice
+    instructions: "What coordination shape does `goal.text` ask for: crews jointly owning files, a review handoff between lanes, or no coalition at all?"
+    options: [joint-ownership, review-handoff, no-coalition, unclear]
+    criteria:
+      - "joint-ownership: two or more crews must edit overlapping paths or shared state."
+      - "review-handoff: one lane produces, another reviews; no shared writes."
+      - "no-coalition: a single lane owns the whole goal."
+      - "unclear: no coordination signal either way; ask before forming."

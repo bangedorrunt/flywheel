@@ -3969,9 +3969,204 @@ pub fn pack_seed(
     Ok(rep)
 }
 
+/// Compiled-in pack files. These are the defaults `config seed` writes into
+/// `~/.config/flywheel/judgment-packs`. The project `.flywheel` copy is not
+/// the source.
+pub fn default_judgment_packs() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "coalition-intent.v1.yaml",
+            include_str!("../defaults/judgment-packs/coalition-intent.v1.yaml"),
+        ),
+        (
+            "doorbell-screen.v1.yaml",
+            include_str!("../defaults/judgment-packs/doorbell-screen.v1.yaml"),
+        ),
+        (
+            "profile-pick.v1.yaml",
+            include_str!("../defaults/judgment-packs/profile-pick.v1.yaml"),
+        ),
+        (
+            "reclassify.v1.yaml",
+            include_str!("../defaults/judgment-packs/reclassify.v1.yaml"),
+        ),
+        (
+            "reclassify.v2.yaml",
+            include_str!("../defaults/judgment-packs/reclassify.v2.yaml"),
+        ),
+        (
+            "reclassify.v3.yaml",
+            include_str!("../defaults/judgment-packs/reclassify.v3.yaml"),
+        ),
+        (
+            "reviewer-rank.v1.yaml",
+            include_str!("../defaults/judgment-packs/reviewer-rank.v1.yaml"),
+        ),
+        (
+            "tier-pick.v1.yaml",
+            include_str!("../defaults/judgment-packs/tier-pick.v1.yaml"),
+        ),
+        (
+            "verify-prescreen.v1.yaml",
+            include_str!("../defaults/judgment-packs/verify-prescreen.v1.yaml"),
+        ),
+        (
+            "wave-readiness.v1.yaml",
+            include_str!("../defaults/judgment-packs/wave-readiness.v1.yaml"),
+        ),
+    ]
+}
+
+/// One compiled-in pack compared with the user file of the same name.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DefaultPackDrift {
+    pub name: String,
+    /// `current` | `stale` | `missing` | `custom`
+    pub status: String,
+}
+
+/// Compare user pack files with the compiled-in defaults. Does not write.
+/// A file whose name is not shipped is `custom` and is never a seed target.
+pub fn default_pack_drift(user_dir: &Path) -> Vec<DefaultPackDrift> {
+    let shipped: std::collections::BTreeSet<&str> =
+        default_judgment_packs().iter().map(|(n, _)| *n).collect();
+    let mut rows = Vec::new();
+    for (name, body) in default_judgment_packs() {
+        let dst = user_dir.join(name);
+        let status = match std::fs::read_to_string(&dst) {
+            Err(_) => "missing",
+            Ok(text) if text.trim_end() == body.trim_end() => "current",
+            Ok(_) => "stale",
+        };
+        rows.push(DefaultPackDrift {
+            name: (*name).to_string(),
+            status: status.to_string(),
+        });
+    }
+    if let Ok(entries) = std::fs::read_dir(user_dir) {
+        let mut extra: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".yaml") && !shipped.contains(n.as_str()))
+            .collect();
+        extra.sort();
+        for name in extra {
+            rows.push(DefaultPackDrift {
+                name,
+                status: "custom".into(),
+            });
+        }
+    }
+    rows
+}
+
+/// Write compiled-in packs into `user_dir`.
+///
+/// `None` creates missing files and leaves every existing file alone.
+/// `Stale` also replaces a shipped name whose bytes differ, after a `.yaml.bak`.
+/// `All` replaces every shipped name that exists. A custom file is never touched.
+pub fn seed_default_packs_with(
+    user_dir: &Path,
+    scope: PackOverwrite,
+    dry_run: bool,
+) -> anyhow::Result<PackSeedReport> {
+    let mut rep = PackSeedReport {
+        dry_run,
+        ..Default::default()
+    };
+    if !dry_run {
+        std::fs::create_dir_all(user_dir)?;
+    }
+    let drift = default_pack_drift(user_dir);
+    let status_of = |name: &str| {
+        drift
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.status.as_str())
+            .unwrap_or("missing")
+    };
+    for (name, body) in default_judgment_packs() {
+        let dst = user_dir.join(name);
+        let status = status_of(name);
+        if status == "missing" {
+            rep.copied.push((*name).to_string());
+            if !dry_run {
+                std::fs::write(&dst, body)
+                    .map_err(|e| anyhow::anyhow!("write {}: {e}", dst.display()))?;
+            }
+            continue;
+        }
+        let replace = match scope {
+            PackOverwrite::None => false,
+            PackOverwrite::Stale => status == "stale",
+            // File exists. `All` restores every shipped name, even a current one.
+            PackOverwrite::All => true,
+        };
+        if !replace {
+            rep.kept.push((*name).to_string());
+            continue;
+        }
+        if dry_run {
+            rep.planned_overwrites.push((*name).to_string());
+            continue;
+        }
+        let bak = dst.with_extension("yaml.bak");
+        if let Ok(prev) = std::fs::read(&dst) {
+            std::fs::write(&bak, prev)?;
+        }
+        std::fs::write(&dst, body)
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", dst.display()))?;
+        rep.overwritten.push((*name).to_string());
+    }
+    Ok(rep)
+}
+
+/// Fill gaps only.
+pub fn seed_default_packs(user_dir: &Path) -> anyhow::Result<PackSeedReport> {
+    seed_default_packs_with(user_dir, PackOverwrite::None, false)
+}
+
 #[cfg(test)]
 mod bd_pack_sync {
     use super::*;
+
+    #[test]
+    fn default_pack_seed_fills_gaps_and_keeps_a_diverged_file() {
+        let dir = root("defaults").join("judgment-packs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let diverged = dir.join("reclassify.v3.yaml");
+        std::fs::write(&diverged, "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n")
+            .unwrap();
+        let rep = seed_default_packs(&dir).unwrap();
+        assert!(rep.copied.iter().any(|n| n == "reclassify.v1.yaml"));
+        assert!(rep.kept.iter().any(|n| n == "reclassify.v3.yaml"));
+        assert!(
+            std::fs::read_to_string(&diverged).unwrap().contains("# LOCAL"),
+            "existing pack bytes stay"
+        );
+        let again = seed_default_packs(&dir).unwrap();
+        assert!(again.copied.is_empty(), "second seed creates nothing");
+        assert_eq!(again.kept.len(), default_judgment_packs().len());
+    }
+
+    #[test]
+    fn default_pack_seed_stale_replaces_and_dry_run_writes_nothing() {
+        let dir = root("pack-stale").join("judgment-packs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reclassify.v3.yaml");
+        std::fs::write(&path, "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n").unwrap();
+        let plan = seed_default_packs_with(&dir, PackOverwrite::Stale, true).unwrap();
+        assert!(plan.planned_overwrites.iter().any(|n| n == "reclassify.v3.yaml"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# LOCAL"));
+        seed_default_packs_with(&dir, PackOverwrite::Stale, false).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("# LOCAL"), "stale pack restored from the default");
+        assert!(dir.join("reclassify.v3.yaml.bak").exists());
+        let custom = dir.join("mine.v1.yaml");
+        std::fs::write(&custom, "id: mine\nversion: 1\n").unwrap();
+        seed_default_packs_with(&dir, PackOverwrite::All, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&custom).unwrap(), "id: mine\nversion: 1\n");
+    }
 
     fn root(tag: &str) -> std::path::PathBuf {
         let r = std::env::temp_dir().join(format!("packsync-{tag}-{}", std::process::id()));

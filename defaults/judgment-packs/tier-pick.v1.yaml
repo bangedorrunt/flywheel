@@ -1,0 +1,22 @@
+# Model+harness tier suggestion (bd-88m4). Advisory only: reasoning depth
+# picks the cost band, harness coupling flags proprietary-harness tasks;
+# code suggests a tier, the user decides. Never dispatches anyone.
+id: tier-pick
+version: 1
+model: jev-latest
+questions:
+  - id: reasoning_depth
+    kind: score
+    instructions: "How much reasoning does `goal.text` need: routine (cheap band), substantial (standard band), or frontier (premium band)? Score carries extremity confidence — edges are sure, the middle is unsure."
+    options: [routine, substantial, frontier]
+    criteria:
+      - "routine: typo-class, rename, docs, single-file mechanical change — a cheap model proves it."
+      - "substantial: multi-file feature, refactor, fresh tests — needs the standard band."
+      - "frontier: architecture, novel design, security-critical, perf budget — needs the premium band."
+  - id: harness_coupling
+    kind: choice
+    instructions: "Does `goal.text` couple to a proprietary harness (grok/claude/codex run only their own models) or run on any harness?"
+    options: [open, coupled]
+    criteria:
+      - "open: harness-agnostic work — any crew harness can run it."
+      - "coupled: needs a proprietary harness's own model (auth, provider hop, harness-native tooling)."
