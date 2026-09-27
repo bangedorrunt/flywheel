@@ -520,18 +520,29 @@ impl FileStore {
             }
         }
         if let Some(t) = &torn {
-            self.append_audit(
-                workspace,
-                serde_json::json!({
-                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    "workspace": workspace,
-                    "kind": "LoudMiss",
-                    "detail": "journal_torn_tail",
-                    "file": t.file,
-                    "at_line": t.at_line,
-                    "reason": t.reason,
-                }),
-            );
+            // bd-lorot: this fired on EVERY fold, and a health probe folds, so a
+            // workspace left torn wrote a LoudMiss row every few seconds forever
+            // (observed 13:06:55, 13:07:20, 13:07:26, 13:07:27). The row is a
+            // REPORT, and a report that repeats unchanged is noise that trains
+            // a reader to skip the field. One row per distinct tear.
+            let fingerprint = format!("{}:{}:{}", t.file, t.at_line, t.reason);
+            let already = std::fs::read_to_string(self.audit_file(workspace))
+                .is_ok_and(|raw| raw.contains(&fingerprint));
+            if !already {
+                self.append_audit(
+                    workspace,
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "workspace": workspace,
+                        "kind": "LoudMiss",
+                        "detail": "journal_torn_tail",
+                        "file": t.file,
+                        "at_line": t.at_line,
+                        "reason": t.reason,
+                        "fingerprint": fingerprint,
+                    }),
+                );
+            }
         }
         Fold {
             rows,
@@ -542,32 +553,23 @@ impl FileStore {
 
     /// Cheap tail probe for `/health`: true when any workspace journal ends
     /// torn (unparseable tail row or trailing seq gap).
-    pub fn any_torn_tail(&self) -> bool {
-        let Ok(entries) = std::fs::read_dir(self.state_dir.join("journals")) else {
-            return false;
-        };
-        let mut seen = std::collections::HashSet::new();
-        for entry in entries.filter_map(|e| e.ok()) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Active files only (`doorbell-journal-{ws}.jsonl`); generation
-            // files (`.N.jsonl`) fold with their workspace — probe once.
-            let Some(rest) = name
-                .strip_prefix("doorbell-journal-")
-                .and_then(|n| n.strip_suffix(".jsonl"))
-            else {
-                continue;
-            };
-            if rest.contains('.') || rest.is_empty() {
-                continue;
-            }
-            if !seen.insert(rest.to_string()) {
-                continue;
-            }
-            if self.fold_workspace(rest).torn.is_some() {
-                return true;
-            }
-        }
-        false
+    /// Is any HOSTED workspace's journal torn?
+    ///
+    /// bd-lorot: this used to scan EVERY journal on disk, so an unhosted,
+    /// abandoned workspace could hold a live daemon's `degraded` red forever.
+    /// Measured live: workspace `flywheel` — not one of the two hosted — carried
+    /// a frozen `seq gap: 366803 -> 366807` at line 3440, and
+    /// `journal_torn_tail` never cleared, for a workspace nobody delivers to.
+    /// An unhosted journal cannot affect delivery, so it cannot be evidence of
+    /// a delivery fault.
+    ///
+    /// This is bd-gpj0.4's rule applied to the tail: one local miss is not a
+    /// dead path. A tear on a workspace we HOST is degraded; a tear on one we
+    /// abandoned is history.
+    pub fn any_torn_tail_among(&self, hosted: &[&str]) -> bool {
+        hosted
+            .iter()
+            .any(|ws| self.fold_workspace(ws).torn.is_some())
     }
 
     /// fsync the active journal (D4.2: before Prompt-intent delivery).
@@ -780,7 +782,39 @@ mod tests {
         // Loud: a LoudMiss audit row names the tear.
         let audit = std::fs::read_to_string(st.audit_file("w")).unwrap();
         assert!(audit.contains("journal_torn_tail"), "{audit}");
-        assert!(st.any_torn_tail(), "health probe sees the tear");
+        assert!(
+            st.any_torn_tail_among(&["w"]),
+            "health probe sees the tear on a HOSTED workspace"
+        );
+        // bd-lorot: the same tear on a workspace we do NOT host must degrade
+        // nothing. An unhosted journal cannot affect delivery, so it is history,
+        // not a fault — and it held `degraded` red for hours here.
+        assert!(
+            !st.any_torn_tail_among(&["other"]),
+            "an unhosted torn workspace degraded the daemon"
+        );
+        // bd-lorot: and the LoudMiss REPORT is emitted once, not once per fold.
+        // A health probe folds on every call, so an un-deduped report repeats
+        // every few seconds forever.
+        let rows_before = std::fs::read_to_string(st.audit_file("w"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("journal_torn_tail"))
+            .count();
+        for _ in 0..5 {
+            let _ = st.fold_workspace("w");
+            let _ = st.any_torn_tail_among(&["w"]);
+        }
+        let rows_after = std::fs::read_to_string(st.audit_file("w"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("journal_torn_tail"))
+            .count();
+        assert_eq!(
+            rows_before, rows_after,
+            "six folds of an unchanged tear wrote {rows_before} -> {rows_after} LoudMiss rows: \
+             a report that repeats unchanged is noise that trains a reader to skip the field"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
