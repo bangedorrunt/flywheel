@@ -1,0 +1,14 @@
+# Reviewer fit annotator (bd-lpn6). Advisory only: per-candidate fit Scores
+# over `state.candidates`; code ranks by score. Never assigns anyone.
+id: reviewer-rank
+version: 1
+model: jev-latest
+questions:
+  - id: reviewer_fit
+    kind: score
+    instructions: "How fit is `candidate` (pin, profile, recent lane) to review `goal.text`: poor, adequate, or strong?"
+    options: [poor, adequate, strong]
+    criteria:
+      - "poor: wrong domain or no adjacent lane history."
+      - "adequate: adjacent domain, can check the diff with guidance."
+      - "strong: owns the lane or reviewed it recently."

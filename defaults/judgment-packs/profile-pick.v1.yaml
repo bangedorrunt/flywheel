@@ -1,0 +1,15 @@
+# Smart profile pickup (bd-adv4). Advisory only: per-candidate fit Scores
+# over coder-family profiles; code ranks by score, the user decides.
+# Never assigns anyone.
+id: profile-pick
+version: 1
+model: jev-latest
+questions:
+  - id: profile_fit
+    kind: score
+    instructions: "How fit is `candidate` (coder-family profile: coder, rust-coder, ts-coder, zig-coder) to implement `goal.text` (language + task fit): poor, adequate, or strong?"
+    options: [poor, adequate, strong]
+    criteria:
+      - "poor: wrong language or task outside the profile's when-scope."
+      - "adequate: adjacent language, or a generic task the profile covers with guidance."
+      - "strong: language and task both inside the profile's when-scope."

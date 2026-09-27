@@ -1,0 +1,21 @@
+# Verify prescreen (bd-lpn6). Advisory input to ce-evaluate, never a verdict:
+# candidates stay uncommitted, `workflow run --execute` remains authoritative.
+id: verify-prescreen
+version: 1
+model: jev-latest
+questions:
+  - id: safe_shape
+    kind: choice
+    instructions: "What shape is `verify.cmd`: a single runnable command, one needing a timeout wrapper, unprovable as stated, or destructive?"
+    options: [single-command, needs-timeout, unprovable, destructive]
+    criteria:
+      - "single-command: one line, bounded, side-effect free (tests, list, show)."
+      - "needs-timeout: network, watch, or unbounded runs that need an explicit timeout token."
+      - "unprovable: claims no command can check (feelings, external humans, future events)."
+      - "destructive: deletes data, exfiltrates, or alters systems beyond the repo."
+  - id: destructive_risk
+    kind: noul
+    instructions: "Would running `verify.cmd` delete data, exfiltrate anything, or alter systems beyond the repo checkout?"
+    criteria:
+      - "Read-only commands (test, list, show, status, diff) do not count."
+      - "Any rm -rf outside temp, credential transmission, or production mutation counts."

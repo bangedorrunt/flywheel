@@ -1,4 +1,10 @@
-Multi-agent swarm orchestrator on the herdr backend
+Agent swarm orchestrator over herdr, toron mail, and the br bead ledger.
+
+Session door: `flywheel arrive <project> --as <pin>`, then `flywheel briefing "<goal>" --project <p> --json`. Run the argv it prints. `decide` is the classifier inside briefing, not a second door.
+
+User config is `~/.config/flywheel`, or `$XDG_CONFIG_HOME/flywheel`. That directory is the source of truth for workflows, stages, and judgment packs. A project `.flywheel` directory is a lower rung: it can add a name the user tier does not have, and it does not replace a user file.
+
+`flywheel config seed` writes the compiled-in workflows, stages, and judgment packs that are missing. It never overwrites an existing file. `workflow drift` and `judgment pack drift` only report. They do not rewrite.
 
 Usage: flywheel [OPTIONS] [COMMAND]
 
@@ -57,7 +63,7 @@ Commands:
   policy           Destructive-command policy management
   deps             Environment + toolchain health check
   integration      Generate orchestration slash commands for an agent kind. Writes {open,swarm,loop,peer-aware}-mode.md into the tool's prompts dir and removes leftover /beads-* and /workflow-* files (catalog + br own those verbs). Kinds: opencode|pi|grok|omp|pa (shorts oc|pi|gk accepted); omit to list kinds. Re-run after a flywheel rebuild to refresh
-  config           Configuration management
+  config           XDG user config (~/.config/flywheel). `config seed` fills missing workflows, stages, and judgment packs from compiled-in defaults and never overwrites. `config path` prints the directory
   backend          Backend discovery + selection (ADR-0002 pluggable backends)
   profile          Agent profiles (ADR-0005 Spec 1/1b) — catalog + spawn
   squad            Squads (ADR-0005 P6) — named groups of profiles = spawn shapes. Vocabulary: say "squad" here. A compose token (`wave-swarm`, `repair-until-verified`, `beads-lifecycle`) is a bare `--parts` name on `workflow compose … --parts <token> --run` — not a squad. `recipes`/`template` stay as legacy aliases of this surface
@@ -80,13 +86,35 @@ Commands:
   help             Print this message or the help of the given subcommand(s)
 
 Options:
-      --robot-snapshot      Full JSON state snapshot of all flywheel swarms (scripts/agents)
-      --robot-capabilities  List flywheel's machine-readable capabilities as JSON
-      --skip-preflight      Skip preflight checks (steer/loop/workflow auto-verify before dispatch)
-      --robot-status        Compact JSON status of all flywheel swarms
-  -h, --help                Print help
-  -V, --version             Print version
+      --robot-snapshot
+          Full JSON state snapshot of all flywheel swarms (scripts/agents)
+
+      --robot-capabilities
+          List flywheel's machine-readable capabilities as JSON
+
+      --skip-preflight
+          Skip preflight checks (steer/loop/workflow auto-verify before dispatch)
+
+      --robot-status
+          Compact JSON status of all flywheel swarms
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+	flywheel config path
+	flywheel config seed
+	flywheel config seed --json
+	flywheel workflow list --brief --json
+	flywheel arrive flywheel --as <pin>
+	flywheel briefing "until the tests pass" --project flywheel --json
 
 Exit codes: 0 ok · 1 herdr/server error · 2 usage error.
-Machine output: --json on list/status/view; --robot-snapshot for full state.
+Machine output: --json on list/status/view; --robot-snapshot for full state;
+--robot-capabilities for the agent command map.
+User config: ~/.config/flywheel  (flywheel config path)
+Fill missing defaults, never overwrite: flywheel config seed
 Feedback: https://github.com/bangedorrunt/flywheel/issues

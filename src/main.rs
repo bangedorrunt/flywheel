@@ -642,13 +642,38 @@ mod inbox_filter_tests {
 
 // ---- CLI surface ----
 
+/// Agent swarm orchestrator over herdr, toron mail, and the br bead ledger.
+///
+/// Session door: `flywheel arrive <project> --as <pin>`, then
+/// `flywheel briefing "<goal>" --project <p> --json`. Run the argv it prints.
+/// `decide` is the classifier inside briefing, not a second door.
+///
+/// User config is `~/.config/flywheel`, or `$XDG_CONFIG_HOME/flywheel`.
+/// That directory is the source of truth for workflows, stages, and judgment
+/// packs. A project `.flywheel` directory is a lower rung: it can add a name
+/// the user tier does not have, and it does not replace a user file.
+///
+/// `flywheel config seed` writes the compiled-in workflows, stages, and
+/// judgment packs that are missing. It never overwrites an existing file.
+/// `workflow drift` and `judgment pack drift` only report. They do not rewrite.
 #[derive(Parser)]
 #[command(
     name = "flywheel",
     version = VERSION,
-    about = "Multi-agent swarm orchestrator on the herdr backend",
-    after_help = "Exit codes: 0 ok · 1 herdr/server error · 2 usage error.\n\
-                  Machine output: --json on list/status/view; --robot-snapshot for full state.\n\
+    about,
+    after_help = "Examples:\n\
+                  \tflywheel config path\n\
+                  \tflywheel config seed\n\
+                  \tflywheel config seed --json\n\
+                  \tflywheel workflow list --brief --json\n\
+                  \tflywheel arrive flywheel --as <pin>\n\
+                  \tflywheel briefing \"until the tests pass\" --project flywheel --json\n\
+                  \n\
+                  Exit codes: 0 ok · 1 herdr/server error · 2 usage error.\n\
+                  Machine output: --json on list/status/view; --robot-snapshot for full state;\n\
+                  --robot-capabilities for the agent command map.\n\
+                  User config: ~/.config/flywheel  (flywheel config path)\n\
+                  Fill missing defaults, never overwrite: flywheel config seed\n\
                   Feedback: https://github.com/bangedorrunt/flywheel/issues"
 )]
 struct Cli {
@@ -1265,7 +1290,9 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Configuration management
+    /// XDG user config (~/.config/flywheel). `config seed` fills missing
+    /// workflows, stages, and judgment packs from compiled-in defaults and
+    /// never overwrites. `config path` prints the directory.
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
@@ -2527,6 +2554,7 @@ fn main() {
                 "coalition debate plan-review profile squad model slot catalog runs list/show/pending/digest/reconcile",
                 "workflow cron recipes workflows pipeline template stage ensemble",
                 "workflow seed/drift — copy builtin workflows+stages to the user tier (--overwrite none|stale|all, default none; only builtin-named copies; --dry-run; fails closed with no TTY and no --yes; every replaced file kept as <name>.bak) and report missing/current/stale/custom grouped by action. Seeds from the compiled-in SOURCE TEXT, never a serde round-trip (bd-3o5t: that wrote crew: null and made every crew workflow headless while drift called it current)",
+            "config seed|drift — XDG ~/.config/flywheel. seed fills missing workflows, stages, judgment packs, and a commented config.toml. --overwrite none|stale|all (default none). --dry-run. --yes required off a TTY to replace. config.toml is never overwritten. drift only reports. config list prints every setting with its default",
             "judgment pack drift|seed|remove|list — compare and sync judgment packs across the user tier (source of truth) and the project tier; a user pack at a higher version is never downgraded",
             "stage remove <name> — delete a user-tier stage file (backed up as <name>.toml.bak) so the compiled-in stage resolves again",
                 "checkpoint timeline audit history changes resume analytics",

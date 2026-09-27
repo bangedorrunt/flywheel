@@ -1,0 +1,12 @@
+# Wave readiness annotator (bd-lpn6). Advisory only: the wave gate itself
+# (code) holds beads; this Noul is a second opinion for the captain.
+id: wave-readiness
+version: 1
+model: jev-latest
+questions:
+  - id: ready_to_release
+    kind: noul
+    instructions: "Given `state.held` (wave-held beads) and `state.blockers` (open lower-wave beads): is releasing the held set safe now, or must lower waves drain first?"
+    criteria:
+      - "Any open lower-wave blocker means not ready, regardless of held-set size."
+      - "Empty blockers with held beads means ready; the gate, not this judgment, releases."
