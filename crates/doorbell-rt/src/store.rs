@@ -88,6 +88,8 @@ pub struct PruneReport {
     pub bytes_freed: u64,
     /// Files left alone because they were too young to be abandoned.
     pub skipped_young: usize,
+    /// Liveness stamp files removed (`watch-<ws>.hb` / `.event`).
+    pub stamps_removed: usize,
     /// Files this process could not remove (permissions, a race with a writer).
     pub remove_failed: usize,
 }
@@ -183,6 +185,49 @@ impl FileStore {
                 match std::fs::remove_file(entry.path()) {
                     Ok(()) => {
                         report.journals_removed += 1;
+                        report.bytes_freed += md.len();
+                    }
+                    Err(_) => report.remove_failed += 1,
+                }
+            }
+        }
+        // bd-lorot: the LIVENESS stamps get the same two guards, and they matter
+        // more than the journals. `watch-<ws>.hb` is a heartbeat that exists to
+        // say "this workspace's bus is delivering". One left behind for a
+        // workspace nobody hosts is a liveness artifact vouching for nothing,
+        // and a reader who trusts a file over the hosted set is worse off than
+        // one with no file. Measured 10 stale, the oldest 14.4 days.
+        for (prefix, suffix) in [("watch-", ".hb"), ("watch-", ".event")] {
+            let Ok(entries) = std::fs::read_dir(self.state_dir.join("doorbell")) else {
+                continue;
+            };
+            for entry in entries.filter_map(std::result::Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(ws) = name
+                    .strip_prefix(prefix)
+                    .and_then(|n| n.strip_suffix(suffix))
+                else {
+                    continue;
+                };
+                if ws.is_empty() || live.contains(ws) {
+                    continue;
+                }
+                let Ok(md) = entry.metadata() else { continue };
+                let Some(mtime) = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                else {
+                    continue;
+                };
+                if !age_ok(mtime) {
+                    report.skipped_young += 1;
+                    continue;
+                }
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => {
+                        report.stamps_removed += 1;
                         report.bytes_freed += md.len();
                     }
                     Err(_) => report.remove_failed += 1,
@@ -910,6 +955,73 @@ mod prune_tests {
         assert!(
             bystander.exists(),
             "a file the prune does not recognise must survive: it matches no journal shape"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// bd-lorot: the LIVENESS stamps obey the same two guards as the journals,
+    /// and the hosted one is the one that must never be touched — a live
+    /// workspace's heartbeat is how /health knows its bus is delivering.
+    #[test]
+    fn prune_takes_unhosted_stale_stamps_and_spares_a_live_heartbeat() {
+        let dir = std::env::temp_dir().join(format!("stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).expect("dirs");
+        std::fs::create_dir_all(dir.join("doorbell")).expect("dirs");
+        let store = FileStore::new(&dir);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let old_t = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(now.saturating_sub(30 * 24 * 60 * 60));
+
+        for ws in ["dead", "live", "young"] {
+            std::fs::write(dir.join("doorbell").join(format!("watch-{ws}.hb")), "x").expect("hb");
+            std::fs::write(dir.join("doorbell").join(format!("watch-{ws}.event")), "y")
+                .expect("ev");
+        }
+        // BOTH the dead AND the live workspace are aged. This is the point: if
+        // only the dead one is old, the live one is protected by the AGE gate
+        // and the hosted guard is never exercised — a fence that passes for the
+        // wrong reason is worse than no fence, because it reads as coverage.
+        // `young` is deliberately NOT aged; that is what makes the age gate
+        // falsifiable in this path instead of only in the journal path.
+        for ws in ["dead", "live"] {
+            for suffix in ["hb", "event"] {
+                std::fs::File::open(dir.join("doorbell").join(format!("watch-{ws}.{suffix}")))
+                    .and_then(|f| f.set_modified(old_t))
+                    .expect("age stamp");
+            }
+        }
+        let live = BTreeSet::from(["live".to_string()]);
+        let report = store.prune_unhosted_workspace_logs(&live, 7 * 24 * 60 * 60, now);
+
+        assert_eq!(
+            report.stamps_removed, 2,
+            "the dead workspace's .hb AND .event both go: {report:?}"
+        );
+        assert!(
+            !dir.join("doorbell").join("watch-dead.hb").exists(),
+            "an unhosted stale heartbeat must be removed — it vouches for a workspace nobody watches"
+        );
+        assert!(
+            dir.join("doorbell").join("watch-live.hb").exists(),
+            "a HOSTED workspace's heartbeat is how /health knows its bus delivers; never prune it"
+        );
+        assert!(
+            dir.join("doorbell").join("watch-live.event").exists(),
+            "and its .event survives on the same ground"
+        );
+        assert_eq!(
+            report.stamps_removed, 2,
+            "exactly the dead workspace's two files: the live pair is held by the hosted guard \
+             ALONE, since both were aged past the threshold"
+        );
+        assert!(
+            dir.join("doorbell").join("watch-young.hb").exists(),
+            "a YOUNG unhosted stamp is a workspace that just started, not an abandoned one — \
+             deleting it on the unhosted guard alone would kill a live crew's liveness signal \
+             during its first week"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
