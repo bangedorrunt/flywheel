@@ -1624,6 +1624,76 @@ pub(super) fn running_build_stamp(now_unix: u64) -> doorbell_rt::api::BuildStamp
     stamp
 }
 
+/// Is the running build actually BEHIND a source change?
+///
+/// bd-k0p7 built this field to catch a real incident: a committed doorbell-cli
+/// fix sat unrun for 11h because flywheel was rebuilt and doorbell was not. But
+/// it implemented the catch as a WALL-CLOCK AGE test (`age_s > BUILD_STALE_SECS`),
+/// and age is a proxy for staleness, not staleness. Measured 2026-09-28 on this
+/// host: the only doorbell source change in the preceding 4.5h was a
+/// rustfmt-only commit (3 insertions, 12 deletions, all line rewrapping), so the
+/// running daemon was byte-for-byte equivalent to the tree — and reported
+/// `degraded: [stale_build]`, because it had been up longer than the window.
+///
+/// A field that fires on a healthy daemon is worse than no field: an operator
+/// learns to skip it, and then it is also skipped when it is true. So the
+/// question is the real one: is there SOURCE newer than the running exe?
+///
+/// The 11h incident is still caught, because its source genuinely was newer.
+/// `age_s` stays published as ADVISORY, since uptime is real context.
+///
+/// Unknown means unknown, never stale — a stamp with no exe mtime cannot be
+/// behind anything, and a deployed binary with no source tree present cannot be
+/// compared, so it must not cry wolf.
+pub(super) fn is_build_behind_source(
+    exe_mtime: Option<u64>,
+    newest_source_mtime: Option<u64>,
+) -> bool {
+    match (exe_mtime, newest_source_mtime) {
+        (Some(exe), Some(src)) => src > exe,
+        // No exe stamp, or no source to compare against: unanswerable, and an
+        // unanswerable check must not read as a fault.
+        _ => false,
+    }
+}
+
+/// Newest mtime under the doorbell source crates, or `None` when the tree is
+/// not where this binary was built (a deployed copy). Best-effort by design:
+/// its only job is to make `is_build_behind_source` answerable, and a miss is
+/// the safe direction.
+fn newest_doorbell_source_mtime() -> Option<u64> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)?;
+    let mut newest: Option<u64> = None;
+    // A work-list rather than a recursive closure: recursion needs a named fn,
+    // and this stays a plain loop with no helper to unit test separately.
+    let mut stack: Vec<std::path::PathBuf> = ["doorbell-cli", "doorbell-rt"]
+        .iter()
+        .map(|d| root.join("crates").join(d).join("src"))
+        .collect();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let Ok(m) = e.metadata().and_then(|m| m.modified()) else {
+                    continue;
+                };
+                if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                    let secs = d.as_secs();
+                    newest = Some(newest.map_or(secs, |n: u64| n.max(secs)));
+                }
+            }
+        }
+    }
+    newest
+}
+
 /// bd-enov (F17): workspaces the plane has EVER served — one journal file per
 /// workspace, written by the hosted loop. Their presence while `mode=standby`
 /// is the wake-blind signature: a fleet exists that expects rings/digests, and
@@ -1700,7 +1770,13 @@ fn health_body(app: &AppState) -> String {
     // reported. The 11h incident is the reason this is not advisory: an
     // operator reading /health needs the daemon to say so, not to make the
     // subtraction themselves.
-    if build.age_s.is_some_and(|age| age > BUILD_STALE_SECS) {
+    let exe_mtime = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    if is_build_behind_source(exe_mtime, newest_doorbell_source_mtime()) {
         degraded.push("stale_build".to_string());
     }
     let ws_names: Vec<String> = hosted
@@ -2033,6 +2109,57 @@ mod tests {
             "the reported age must describe the named file: reported {age}s, \
              file is {expected}s old at the sampled `now` (2s tolerance for the \
              clock moving between the two reads)"
+        );
+    }
+
+    /// bd-v7uu: `stale_build` must answer "is the build BEHIND a source change",
+    /// not "has the build been up a long time".
+    ///
+    /// The old rule was `age_s > BUILD_STALE_SECS`, which is a proxy. Measured
+    /// here: the only doorbell source change in the preceding 4.5h was a
+    /// rustfmt-only commit, so the running daemon was equivalent to the tree and
+    /// still reported `stale_build`. A field that fires on a healthy daemon
+    /// trains the reader to skip it, and then it is skipped when it is true.
+    ///
+    /// Each case is falsifiable on its own, and the incident that motivated the
+    /// field is still caught.
+    #[test]
+    fn stale_build_compares_source_not_the_clock() {
+        use super::is_build_behind_source;
+
+        // The shape that made this field exist: a committed fix sat unrun. Its
+        // source IS newer than the exe, so it is still caught.
+        assert!(
+            is_build_behind_source(Some(1_000_000 - 39_600), Some(1_000_000)),
+            "source newer than the exe IS a real staleness and must stay degraded"
+        );
+
+        // The false positive this replaces: a long-running daemon with NO newer
+        // source. Under the old age rule this was degraded; it is not now.
+        assert!(
+            !is_build_behind_source(Some(1_000_000 - 39_600), Some(1_000_000 - 39_601)),
+            "an 11h-old build with no source delta is UP TO DATE and must not degrade"
+        );
+
+        // Source exactly equal to the exe is not "behind".
+        assert!(!is_build_behind_source(Some(1_000_000), Some(1_000_000)));
+
+        // Unanswerable is not a fault: an unreadable exe, and a deployed binary
+        // with no source tree beside it, must both stay quiet rather than cry wolf.
+        assert!(!is_build_behind_source(None, Some(1_000_000)));
+        assert!(!is_build_behind_source(Some(1_000_000), None));
+        assert!(!is_build_behind_source(None, None));
+    }
+
+    /// The age is still published as ADVISORY, so the 11h incident's context
+    /// survives — the fix changed what is DEGRADED, not what is visible.
+    #[test]
+    fn age_is_still_published_just_no_longer_degrading_on_its_own() {
+        let old = doorbell_rt::api::resolve_build_stamp(Some((1_000_000 - 39_600, 1)), 1_000_000);
+        assert_eq!(old.age_s, Some(39_600), "uptime stays visible");
+        assert!(
+            old.age_s.is_some_and(|a| a > super::BUILD_STALE_SECS),
+            "and it still exceeds the advisory window, so the context is unchanged"
         );
     }
 
