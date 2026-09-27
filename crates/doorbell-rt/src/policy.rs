@@ -64,6 +64,15 @@ impl WatchRetry {
     pub fn reset(&mut self) {
         self.fails = 0;
     }
+
+    /// Consecutive failures recorded, i.e. how many restarts have been
+    /// SCHEDULED. bd-lorot: this is the witness a fence reads to tell a
+    /// coalesced burst from a scheduled one — `record_fail` is only reached
+    /// when a restart actually gets past the single-flight guard.
+    #[must_use]
+    pub fn fails(&self) -> u32 {
+        self.fails
+    }
 }
 
 #[cfg(test)]
