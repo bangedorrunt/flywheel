@@ -7,6 +7,7 @@
 //!
 //! governed-by: ADR-0005, ADR-0010, ADR-0026
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -177,6 +178,15 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
             checks.push(check_project_dir(cfg, p));
         } else {
             checks.push(Check::skip("project-dir", "no project specified"));
+        }
+    }
+
+    // 4b. bd-uona: the panes this project allocated can still host an agent.
+    //     `check_herdr` only pings the socket, so a reaped crew workspace
+    //     read PASS while every dispatched agent died on the readiness wait.
+    if mode.needs_project {
+        if let Some(p) = project {
+            checks.push(check_pane_materializable(cfg, p));
         }
     }
 
@@ -372,6 +382,101 @@ fn check_project_dir(cfg: &Config, project: &str) -> Check {
     } else {
         Check::fail("project-dir", format!("{project} does not exist"))
     }
+}
+
+// ─── pane materialization (bd-uona) ──────────────────────────────────────────
+
+/// A registry PIN is an entry that CLAIMED a pane at spawn — a bound
+/// `mail_identity`. A legacy name-only row binds a name to a pane id without
+/// claiming the pane for dispatch, so it is not a pin and can never fail this
+/// check.
+pub fn registry_pin_panes(entries: &[crate::state::SpawnEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| {
+            e.mail_identity
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+        })
+        .map(|e| e.pane_id.clone())
+        .collect()
+}
+
+/// How many of `pins` herdr actually hosts. A pure set intersection on pane id:
+/// herdr knows a pane by id whatever its agent is doing, and a pin may live in
+/// ANY workspace (a project whose crew got re-hosted elsewhere is still
+/// materializable, so this never scopes to one workspace).
+pub fn hosted_pin_count(pins: &[String], herdr_panes: &BTreeSet<String>) -> usize {
+    pins.iter().filter(|p| herdr_panes.contains(*p)).count()
+}
+
+/// bd-uona: can this project's allocated panes host a dispatch at all?
+///
+/// `preflight --mode workflow --project toron` returned 12/12 PASS while
+/// dispatch was impossible — agents started then died on the readiness wait
+/// with `agent_not_running`, the crew workspace was reaped, herdr had no
+/// workspace matching the allocated id, and `doorbell status` read
+/// injectable=0 / panes_missing=12. `check_herdr` only pings the socket, so
+/// nothing in preflight could see any of that.
+///
+/// Pins present with ZERO of them hosted is the only failing shape. A fleet
+/// whose panes are all `working` is HEALTHY (a durable queue holds the wake),
+/// so this is a COUNT, never a status. Zero pins means nothing was allocated —
+/// no claim, so nothing to fail on (the caller SKIPs).
+pub fn pane_materializable(pins: usize, hosted: usize) -> bool {
+    pins == 0 || hosted > 0
+}
+
+/// bd-uona: the pane-materializability check — can the panes this project
+/// allocated still host an agent? A pin whose pane herdr no longer lists is
+/// a pin the dispatcher will target and never find, so agents start and die on
+/// the readiness wait. Fails loud and names the remediation, per the bead.
+fn check_pane_materializable(cfg: &Config, project: &str) -> Check {
+    let pins = registry_pin_panes(&crate::state::load_spawn_registry(project));
+    if pins.is_empty() {
+        return Check::skip(
+            "pane-materializable",
+            "no registry pins — nothing allocated to host",
+        );
+    }
+    let mut c = match Client::connect(Some(&cfg.socket_path())) {
+        Ok(c) => c,
+        Err(e) => {
+            return Check::fail(
+                "pane-materializable",
+                format!("herdr connect failed: {e:#} — is herdr running?"),
+            );
+        }
+    };
+    let herdr_panes: BTreeSet<String> = match c.pane_list(None) {
+        Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
+        Err(e) => {
+            return Check::fail("pane-materializable", format!("pane.list failed: {e:#}"));
+        }
+    };
+    let hosted = hosted_pin_count(&pins, &herdr_panes);
+    if pane_materializable(pins.len(), hosted) {
+        return Check::pass("pane-materializable");
+    }
+    // "herdr knows no workspace for the allocated id" was the reported shape,
+    // so name which half of it holds — the workspace, or the panes in it.
+    let workspace = match crate::find_workspace(&mut c, project) {
+        Ok(id) => format!("workspace {id} exists but hosts none of them"),
+        Err(_) => format!(
+            "herdr has no workspace matching `{}`",
+            crate::swarm_label(project)
+        ),
+    };
+    Check::fail(
+        "pane-materializable",
+        format!(
+            "{project} has {} registry pin(s) but herdr hosts 0 of them ({workspace}) — \
+             dispatch would start agents that die on the readiness wait with \
+             agent_not_running; remediation: respawn the crew \
+             (`flywheel spawn {project}`) or clear the stale pins, or pass --skip-preflight",
+            pins.len()
+        ),
+    )
 }
 
 fn check_beads(cfg: &Config, project: &str) -> Check {
@@ -731,6 +836,7 @@ pub fn check_loop_identity(_cfg: &Config, project: Option<&str>) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn all_pass_with_passes_and_skips() {
@@ -1209,5 +1315,105 @@ mod tests {
             "staged add still flagged: {bad:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- bd-uona: the compose door and the pane it materializes ----
+
+    /// bd-uona (1): `workflow compose --run` ALLOCATES herdr panes, so it must
+    /// sit behind the same preflight gate as an executing run. It was the one
+    /// dispatching door with no prerequisite check. The arm lives in `main`'s
+    /// match (a binary crate seam with no callable entry), so the witness is
+    /// the arm's own text: the gate call and the `Compose { run: true }` gate
+    /// condition must be co-located in it. Deleting either breaks this.
+    #[test]
+    fn preflight_gate_covers_the_compose_run_door() {
+        let src = include_str!("main.rs");
+        let arm = src
+            .split_once("Some(Commands::Workflow { cmd }) => {")
+            .expect("the Commands::Workflow arm exists")
+            .1;
+        let arm = arm
+            .split_once("Some(Commands::Model")
+            .expect("the arm ends before the next arm")
+            .0;
+        assert!(
+            arm.contains("preflight_gate"),
+            "the compose/run arm must call preflight_gate"
+        );
+        assert!(
+            arm.contains("WorkflowCmd::Compose { run: true, .. }"),
+            "compose --run must be in the gate condition — it is the pane-allocating door"
+        );
+    }
+
+    /// bd-uona (2): a registry pin is an entry that CLAIMED a pane at spawn
+    /// (a bound `mail_identity`). A legacy name-only row is not a pin, so a
+    /// project holding only those is nothing-to-check, not a failure.
+    #[test]
+    fn preflight_gate_pane_registry_pins_are_the_identity_bound_entries() {
+        use crate::state::SpawnEntry;
+        let registry = vec![
+            SpawnEntry::with_mail_identity("w1:p1", "flywheel-x-crew-oc", "DustyReef"),
+            SpawnEntry::legacy("w1:p2", "flywheel-x-crew-oc2"),
+            SpawnEntry::with_mail_identity("w1:p3", "flywheel-x-crew-oc3", "PlumGoose"),
+        ];
+        assert_eq!(
+            registry_pin_panes(&registry),
+            vec!["w1:p1".to_string(), "w1:p3".to_string()],
+            "only identity-bound entries claim a pane"
+        );
+        assert!(
+            registry_pin_panes(&[]).is_empty(),
+            "an empty registry has no pins — nothing to check, not a failure"
+        );
+    }
+
+    /// bd-uona (2): the shape that actually failed — `preflight --mode workflow
+    /// --project toron` returned 12/12 PASS while agents died on the readiness
+    /// wait, herdr had no workspace for the allocated id, and `doorbell status`
+    /// reported injectable=0, panes_missing=12. Pins present and ZERO of them
+    /// hosted is the only failing shape.
+    #[test]
+    fn preflight_gate_pane_materializable_fails_only_on_zero_hosted_pins() {
+        // The live failure: 12 pins, herdr hosts none of them.
+        assert!(
+            !pane_materializable(12, 0),
+            "pins with zero hosted panes is dispatch-impossible and must fail"
+        );
+        // The healthy fleet caught mid-work: every pane busy is HEALTHY, a
+        // durable queue holds the wake. One hosted pane clears the gate.
+        assert!(
+            pane_materializable(12, 1),
+            "one hosted pin is materializable — a busy fleet is not a failure"
+        );
+        assert!(pane_materializable(12, 12), "the whole fleet is up");
+        // Partial reaping: one of three survived — dispatch can still land.
+        assert!(
+            pane_materializable(3, 1),
+            "a partially reaped fleet can still host a dispatch"
+        );
+        // Nothing allocated: there is no pane to materialize, so the check
+        // has no evidence to fail on (the caller SKIPs, it does not FAIL).
+        assert!(
+            pane_materializable(0, 0),
+            "no pins means no claim, not a broken claim"
+        );
+    }
+
+    /// bd-uona (2): hosted-pane counting is a set intersection over pane ids,
+    /// never a status filter. herdr knows a pane by id regardless of whether
+    /// its agent is working, idle, or absent.
+    #[test]
+    fn preflight_gate_pane_hosting_counts_by_id_across_every_workspace() {
+        let pins = vec!["w1Z:p1".to_string(), "w1Z:p2".to_string(), "w1W:p9".into()];
+        let herdr: BTreeSet<String> = ["w1Z:p1".to_string(), "w1Z:p2".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            hosted_pin_count(&pins, &herdr),
+            2,
+            "the reaped pin's pane is simply not in herdr's set"
+        );
+        assert_eq!(hosted_pin_count(&[], &herdr), 0, "no pins hosts nothing");
     }
 }
