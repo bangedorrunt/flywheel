@@ -37,6 +37,12 @@ pub enum WakeOutcome {
 /// Loud-degradation audit kinds (never silent).
 pub const AUDIT_SOCK_ABSENT: &str = "wake_sock_absent";
 pub const AUDIT_SOCK_FRAME: &str = "wake_sock_frame";
+/// bd-kz54: the stream ended — and WHICH way. EOF, a read error and
+/// deaf-silence are different faults and were one wildcard arm, so a restart
+/// loop over a quiet bus journaled nothing at all.
+pub const AUDIT_SOCK_IDLE: &str = "wake_sock_idle";
+/// bd-kz54: the subscribe handshake could not be written.
+pub const AUDIT_SOCK_HANDSHAKE: &str = "wake_sock_handshake";
 /// bd-gdfe: a consumer that ended without its terminal outcome (worker
 /// panic or abort) journals this instead of dying silently — the gap that
 /// left hosted workspaces wake-blind with no backoff explanation.
@@ -273,10 +279,27 @@ async fn run_wake_loop(
             .await
             .is_err()
         {
+            // bd-kz54: this path used to return Died with NO audit row, so a
+            // handshake that could not be written looked identical to a quiet
+            // bus in the journal.
+            audit(
+                AUDIT_SOCK_HANDSHAKE,
+                serde_json::json!({
+                    "reason": "subscribe handshake write timed out or failed",
+                    "timeout_ms": opts.handshake_timeout.as_millis() as u64,
+                }),
+            );
             send(WakeOutcome::Died);
             return;
         }
         let mut lines = BufReader::new(rd).lines();
+        // bd-kz54: name WHY the stream ended. These three were one wildcard
+        // arm, so EOF, a read error, and a legitimately QUIET bus all produced a
+        // bare Died with no record — which is how a restart loop could run for
+        // hours naming nothing. The distinction matters: AUDIT_SOCK_ABSENT
+        // already says "absent, not a quiet bus", and deaf-silence is the case
+        // that is genuinely NOT a dead socket.
+        let mut cause = String::from("eof: sidecar closed the stream");
         let exit = loop {
             match tokio::time::timeout(opts.idle_timeout, lines.next_line()).await {
                 Ok(Ok(Some(l))) => match frame_action(&l) {
@@ -291,10 +314,27 @@ async fn run_wake_loop(
                         audit(AUDIT_SOCK_FRAME, serde_json::json!({ "detail": detail }));
                     }
                 },
-                _ => break false, // EOF, error, or deaf-silence: Died, brain restarts
+                Ok(Ok(None)) => break false, // cause already names eof
+                Ok(Err(e)) => {
+                    cause = format!("read error: {e}");
+                    break false;
+                }
+                Err(_) => {
+                    cause = String::from(
+                        "deaf-silence: no frame within idle_timeout (a quiet bus is not a dead socket)",
+                    );
+                    break false;
+                }
             }
         };
         if !exit {
+            audit(
+                AUDIT_SOCK_IDLE,
+                serde_json::json!({
+                    "reason": cause,
+                    "idle_timeout_ms": opts.idle_timeout.as_millis() as u64,
+                }),
+            );
             send(WakeOutcome::Died);
             return;
         }
@@ -435,6 +475,87 @@ mod tests {
         assert!(matches!(got[1], WakeOutcome::Heartbeat));
         assert!(matches!(got[2], WakeOutcome::Died));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// bd-kz54: a QUIET bus must be audited, not silent.
+    ///
+    /// Observed live 2026-09-27: `flywheel-toron` logged a bare
+    /// `{"rt_kind":"Died"} -> RestartWatch` roughly every 90 seconds for hours,
+    /// with **zero** audit rows in its entire journal, while `/health` showed a
+    /// fresh heartbeat — the 1s ticker keeps `.hb` fresh even when the socket
+    /// delivers nothing. `IDLE_TIMEOUT` is 90s, so a workspace with no traffic
+    /// is declared dead, restarted, and declares itself dead again forever, and
+    /// nothing in the record says why.
+    ///
+    /// EOF, a read error, and deaf-silence are three different faults. The
+    /// fence pins the third, because it is the one that is NOT a dead socket:
+    /// the audit row must name it so the loop can be read instead of guessed at.
+    #[test]
+    fn a_quiet_bus_is_audited_as_deaf_silence_not_silently_died() {
+        use std::sync::{Arc, Mutex};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = std::env::temp_dir().join(format!("wake-quiet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("bus.sock");
+
+        // A sidecar that accepts the subscription and then says nothing, ever.
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                if let Ok(mut s) = stream {
+                    use std::io::Read;
+                    let mut buf = [0u8; 512];
+                    let _ = s.read(&mut buf); // consume the subscribe line
+                    // then hold the connection open, silent
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                }
+            }
+        });
+
+        let rows: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+        let sink = rows.clone();
+        let audit = Arc::new(move |kind: &str, detail: serde_json::Value| {
+            sink.lock().unwrap().push((kind.to_string(), detail));
+        });
+
+        let opts = WakeOpts {
+            sock_path: path.clone(),
+            kinds: vec![9],
+            project: None,
+            handshake_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_millis(400),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.block_on(run_wake_loop(opts, &tx, &audit));
+
+        let mut saw_died = false;
+        while let Ok(o) = rx.try_recv() {
+            if matches!(o, WakeOutcome::Died) {
+                saw_died = true;
+            }
+        }
+        assert!(saw_died, "a silent stream still ends the watch");
+
+        let rows = rows.lock().unwrap().clone();
+        let idle = rows.iter().find(|(k, _)| k == AUDIT_SOCK_IDLE);
+        assert!(
+            idle.is_some(),
+            "deaf-silence must be AUDITED, not silent. rows={rows:?}"
+        );
+        let reason = idle.unwrap().1["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("deaf-silence"),
+            "the audit must name deaf-silence specifically, got {reason:?}"
+        );
+        assert!(
+            idle.unwrap().1.get("idle_timeout_ms").is_some(),
+            "the audit carries the timeout it waited, so the number is checkable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-gdfe: the silent wake gap. When the worker task dies WITHOUT a
