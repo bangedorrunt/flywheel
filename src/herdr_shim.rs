@@ -162,11 +162,11 @@ pub fn apply_opencode_model_pin(
         }
         _ => serde_json::Map::new(),
     };
-    doc.insert("model".to_string(), serde_json::Value::String(model.to_string()));
-    env.insert(
-        KEY.to_string(),
-        serde_json::Value::Object(doc).to_string(),
+    doc.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.to_string()),
     );
+    env.insert(KEY.to_string(), serde_json::Value::Object(doc).to_string());
     Ok(())
 }
 
@@ -2682,7 +2682,6 @@ hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-stat
 mod shell_prompt_tests {
     use super::shell_prompt_rendered;
 
-
     #[test]
     fn empty_or_booting_shell_is_not_ready() {
         assert!(!shell_prompt_rendered(""));
@@ -2849,7 +2848,10 @@ mod shell_gate_e2e {
                 json!({ "label": "flywheel-shell-gate-e2e", "cwd": "/tmp", "focus": false }),
             )
             .expect("workspace.create");
-        let ws = created.get("workspace").cloned().unwrap_or_else(|| created.clone());
+        let ws = created
+            .get("workspace")
+            .cloned()
+            .unwrap_or_else(|| created.clone());
         let ws_id = ws
             .get("workspace_id")
             .and_then(|v| v.as_str())
@@ -2880,10 +2882,7 @@ mod shell_gate_e2e {
             })
             .unwrap_or_default();
 
-        let _ = c.call(
-            "workspace.close",
-            json!({ "workspace_id": ws_id.clone() }),
-        );
+        let _ = c.call("workspace.close", json!({ "workspace_id": ws_id.clone() }));
 
         // The artifact: what the gate saw, on a real pane.
         println!("gate: ready={ready} elapsed={elapsed:?} matched_on={matched_on:?}");
@@ -2988,8 +2987,8 @@ mod bd_crlx_model_pin_tests {
     #[test]
     fn unparseable_existing_content_is_refused_not_overwritten() {
         let mut env = env_with(&[("OPENCODE_CONFIG_CONTENT", "{not json")]);
-        let err = apply_opencode_model_pin(&mut env, "deepseek/deepseek-flash")
-            .expect_err("must refuse");
+        let err =
+            apply_opencode_model_pin(&mut env, "deepseek/deepseek-flash").expect_err("must refuse");
         assert!(err.to_string().contains("OPENCODE_CONFIG_CONTENT"), "{err}");
         assert_eq!(
             env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),

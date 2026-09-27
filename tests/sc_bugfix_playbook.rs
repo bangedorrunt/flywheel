@@ -286,7 +286,10 @@ fn cli_control_flow_ignores_a_corrupted_ambient_user_tier() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json stdout");
-    assert_eq!(v["crew"]["coder"], 1, "compiled-in builtin still expands: {v}");
+    assert_eq!(
+        v["crew"]["coder"], 1,
+        "compiled-in builtin still expands: {v}"
+    );
     let output = v["output"].as_object().expect("output object");
     for node in ["repro", "fix", "prove"] {
         assert!(output.contains_key(node), "{node} in CLI output: {v}");

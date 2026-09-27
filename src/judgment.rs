@@ -2521,10 +2521,7 @@ questions:
                 "scenario".into(),
                 Answer::Choice(ChoiceAnswer {
                     choice: "climb".into(),
-                    probs: BTreeMap::from([
-                        ("climb".into(), 0.8),
-                        ("one-measure".into(), 0.2),
-                    ]),
+                    probs: BTreeMap::from([("climb".into(), 0.8), ("one-measure".into(), 0.2)]),
                 }),
             )]),
             usage: "{}".into(),
@@ -3760,7 +3757,9 @@ impl PackOverwrite {
             "none" => Ok(Self::None),
             "stale" => Ok(Self::Stale),
             "all" => Ok(Self::All),
-            other => anyhow::bail!("unknown --overwrite scope {other:?} (expected: none | stale | all)"),
+            other => {
+                anyhow::bail!("unknown --overwrite scope {other:?} (expected: none | stale | all)")
+            }
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -3819,7 +3818,9 @@ fn highest_pack(dir: &Path, id: &str) -> Option<PathBuf> {
         if !path.is_file() {
             continue;
         }
-        let Some((eid, v)) = pack_entry(&path) else { continue };
+        let Some((eid, v)) = pack_entry(&path) else {
+            continue;
+        };
         if eid != id {
             continue;
         }
@@ -3865,7 +3866,10 @@ pub fn pack_drift(user_dir: &Path, project_dir: &Path) -> Vec<PackDriftRow> {
             let user = highest_pack(user_dir, &id);
             let project = highest_pack(project_dir, &id);
             let uv = user.as_deref().and_then(|p| pack_entry(p)).map(|(_, v)| v);
-            let pv = project.as_deref().and_then(|p| pack_entry(p)).map(|(_, v)| v);
+            let pv = project
+                .as_deref()
+                .and_then(|p| pack_entry(p))
+                .map(|(_, v)| v);
             let status = match (&user, &project) {
                 (None, Some(_)) => "missing",
                 (Some(_), None) => "user-only",
@@ -3925,10 +3929,7 @@ pub fn pack_seed(
         let Some(src) = highest_pack(project_dir, &row.id) else {
             continue;
         };
-        let dst = user_dir.join(
-            src.file_name()
-                .expect("pack path has a file name"),
-        );
+        let dst = user_dir.join(src.file_name().expect("pack path has a file name"));
         let replace = match scope {
             PackOverwrite::None => false,
             PackOverwrite::Stale => row.status == "stale",
@@ -3952,9 +3953,8 @@ pub fn pack_seed(
                 std::fs::write(&bak, prev)?;
             }
             std::fs::create_dir_all(user_dir)?;
-            std::fs::copy(&src, &dst).map_err(|e| {
-                anyhow::anyhow!("copy {} -> {}: {e}", src.display(), dst.display())
-            })?;
+            std::fs::copy(&src, &dst)
+                .map_err(|e| anyhow::anyhow!("copy {} -> {}: {e}", src.display(), dst.display()))?;
             rep.overwritten.push(row.id);
         } else {
             rep.copied.push(row.id);
@@ -4126,8 +4126,7 @@ fn write_pack_file(dst: &Path, body: &str) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = dst.with_extension("yaml.tmp");
-    std::fs::write(&tmp, body)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, body).map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, dst)
         .map_err(|e| anyhow::anyhow!("rename {} -> {}: {e}", tmp.display(), dst.display()))?;
     Ok(())
@@ -4147,13 +4146,18 @@ mod bd_pack_sync {
         let dir = root("defaults").join("judgment-packs");
         std::fs::create_dir_all(&dir).unwrap();
         let diverged = dir.join("reclassify.v3.yaml");
-        std::fs::write(&diverged, "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n")
-            .unwrap();
+        std::fs::write(
+            &diverged,
+            "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n",
+        )
+        .unwrap();
         let rep = seed_default_packs(&dir).unwrap();
         assert!(rep.copied.iter().any(|n| n == "reclassify.v1.yaml"));
         assert!(rep.kept.iter().any(|n| n == "reclassify.v3.yaml"));
         assert!(
-            std::fs::read_to_string(&diverged).unwrap().contains("# LOCAL"),
+            std::fs::read_to_string(&diverged)
+                .unwrap()
+                .contains("# LOCAL"),
             "existing pack bytes stay"
         );
         let again = seed_default_packs(&dir).unwrap();
@@ -4166,18 +4170,32 @@ mod bd_pack_sync {
         let dir = root("pack-stale").join("judgment-packs");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("reclassify.v3.yaml");
-        std::fs::write(&path, "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n").unwrap();
+        std::fs::write(
+            &path,
+            "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n",
+        )
+        .unwrap();
         let plan = seed_default_packs_with(&dir, PackOverwrite::Stale, true).unwrap();
-        assert!(plan.planned_overwrites.iter().any(|n| n == "reclassify.v3.yaml"));
+        assert!(
+            plan.planned_overwrites
+                .iter()
+                .any(|n| n == "reclassify.v3.yaml")
+        );
         assert!(std::fs::read_to_string(&path).unwrap().contains("# LOCAL"));
         seed_default_packs_with(&dir, PackOverwrite::Stale, false).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(!after.contains("# LOCAL"), "stale pack restored from the default");
+        assert!(
+            !after.contains("# LOCAL"),
+            "stale pack restored from the default"
+        );
         assert!(dir.join("reclassify.v3.yaml.bak").exists());
         let custom = dir.join("mine.v1.yaml");
         std::fs::write(&custom, "id: mine\nversion: 1\n").unwrap();
         seed_default_packs_with(&dir, PackOverwrite::All, false).unwrap();
-        assert_eq!(std::fs::read_to_string(&custom).unwrap(), "id: mine\nversion: 1\n");
+        assert_eq!(
+            std::fs::read_to_string(&custom).unwrap(),
+            "id: mine\nversion: 1\n"
+        );
     }
 
     fn root(tag: &str) -> std::path::PathBuf {
@@ -4198,10 +4216,19 @@ mod bd_pack_sync {
         let proj = r.join("project/.flywheel/judgment-packs");
         std::fs::write(proj.join("reclassify.v1.yaml"), PACK).expect("write proj pack");
         // A user-tier pack the project also has — must be left alone.
-        std::fs::write(r.join("judgment-packs/reclassify.v1.yaml"), "name: reclassify\nversion: 1\nquestions: []\n# LOCAL\n").expect("write user pack");
+        std::fs::write(
+            r.join("judgment-packs/reclassify.v1.yaml"),
+            "name: reclassify\nversion: 1\nquestions: []\n# LOCAL\n",
+        )
+        .expect("write user pack");
 
-        let rep = pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::None, false).expect("seed");
-        assert_eq!(rep.copied.len() + rep.kept.len(), 1, "one pack id considered");
+        let rep =
+            pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::None, false).expect("seed");
+        assert_eq!(
+            rep.copied.len() + rep.kept.len(),
+            1,
+            "one pack id considered"
+        );
         assert_eq!(rep.kept, vec!["reclassify".to_string()]);
         assert!(
             std::fs::read_to_string(r.join("judgment-packs/reclassify.v1.yaml"))
@@ -4223,7 +4250,10 @@ mod bd_pack_sync {
         pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::None, false).expect("seed");
         assert!(r.join("judgment-packs/doorbell-screen.v1.yaml").exists());
         let after = pack_drift(&r.join("judgment-packs"), &proj);
-        assert_eq!(after[0].status, "identical", "drift must agree the copy landed");
+        assert_eq!(
+            after[0].status, "identical",
+            "drift must agree the copy landed"
+        );
         let _ = std::fs::remove_dir_all(&r);
     }
 
@@ -4234,12 +4264,31 @@ mod bd_pack_sync {
         let r = root("diverge");
         let proj = r.join("project/.flywheel/judgment-packs");
         std::fs::write(proj.join("reclassify.v1.yaml"), PACK).expect("write");
-        std::fs::write(r.join("judgment-packs/reclassify.v1.yaml"), "name: reclassify\nversion: 1\nquestions: []\n# DIVERGED\n").expect("write");
-        assert_eq!(pack_drift(&r.join("judgment-packs"), &proj)[0].status, "stale");
+        std::fs::write(
+            r.join("judgment-packs/reclassify.v1.yaml"),
+            "name: reclassify\nversion: 1\nquestions: []\n# DIVERGED\n",
+        )
+        .expect("write");
+        assert_eq!(
+            pack_drift(&r.join("judgment-packs"), &proj)[0].status,
+            "stale"
+        );
 
-        pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::Stale, false).expect("seed");
-        assert_eq!(pack_drift(&r.join("judgment-packs"), &proj)[0].status, "identical");
-        assert!(r.join("judgment-packs/reclassify.v1.yaml.bak").exists(), "old bytes recoverable");
+        pack_seed(
+            &r.join("judgment-packs"),
+            &proj,
+            PackOverwrite::Stale,
+            false,
+        )
+        .expect("seed");
+        assert_eq!(
+            pack_drift(&r.join("judgment-packs"), &proj)[0].status,
+            "identical"
+        );
+        assert!(
+            r.join("judgment-packs/reclassify.v1.yaml.bak").exists(),
+            "old bytes recoverable"
+        );
         let _ = std::fs::remove_dir_all(&r);
     }
 
@@ -4251,9 +4300,16 @@ mod bd_pack_sync {
         let r = root("version");
         let proj = r.join("project/.flywheel/judgment-packs");
         std::fs::write(proj.join("reclassify.v1.yaml"), PACK).expect("write v1");
-        std::fs::write(r.join("judgment-packs/reclassify.v2.yaml"), "name: reclassify\nversion: 2\nquestions: []\n").expect("write v2");
+        std::fs::write(
+            r.join("judgment-packs/reclassify.v2.yaml"),
+            "name: reclassify\nversion: 2\nquestions: []\n",
+        )
+        .expect("write v2");
         let rows = pack_drift(&r.join("judgment-packs"), &proj);
-        assert_ne!(rows[0].status, "stale", "a newer user pack is not a stale copy");
+        assert_ne!(
+            rows[0].status, "stale",
+            "a newer user pack is not a stale copy"
+        );
         pack_seed(&r.join("judgment-packs"), &proj, PackOverwrite::All, false).expect("seed");
         assert!(
             r.join("judgment-packs/reclassify.v2.yaml").exists(),

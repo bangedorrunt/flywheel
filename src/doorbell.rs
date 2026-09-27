@@ -949,9 +949,7 @@ const HEALTH_CONNECT_TIMEOUT_MS: u64 = 1_000;
 const HEALTH_READ_TIMEOUT_MS: u64 = 2_000;
 
 /// Probe the daemon's `/health`, distinguishing every failure mode.
-pub fn daemon_health_probe(
-    url: &str,
-) -> Result<serde_json::Value, HealthProbeFailure> {
+pub fn daemon_health_probe(url: &str) -> Result<serde_json::Value, HealthProbeFailure> {
     let health_url = format!("{url}/health");
     let addr = health_url
         .trim_start_matches("http://")
@@ -3611,8 +3609,9 @@ mod tests {
 
 #[cfg(test)]
 mod bd_2zqk_health_probe_tests {
-    use super::{daemon_health_probe, HealthProbeFailure, HEALTH_CONNECT_TIMEOUT_MS,
-                HEALTH_READ_TIMEOUT_MS};
+    use super::{
+        HEALTH_CONNECT_TIMEOUT_MS, HEALTH_READ_TIMEOUT_MS, HealthProbeFailure, daemon_health_probe,
+    };
 
     /// bd-2zqk: the budgets must clear the daemon's measured latency tail. The
     /// old 200ms/500ms pair sat ON the tail (measured max 506ms on a ~1.4KB

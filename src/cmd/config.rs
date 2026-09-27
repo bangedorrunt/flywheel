@@ -8,8 +8,13 @@ use crate::config::Config;
 #[derive(Subcommand)]
 pub(crate) enum ConfigCmd {
     List,
-    Get { key: String },
-    Set { key: String, value: String },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
     Path,
     /// Fill ~/.config/flywheel from compiled-in defaults: workflows, stages,
     /// and judgment packs.
@@ -114,11 +119,7 @@ pub(crate) const SETTINGS: &[Setting] = &[
 ];
 
 fn known_keys() -> String {
-    SETTINGS
-        .iter()
-        .map(|s| s.key)
-        .collect::<Vec<_>>()
-        .join("|")
+    SETTINGS.iter().map(|s| s.key).collect::<Vec<_>>().join("|")
 }
 
 fn is_known(key: &str) -> bool {
@@ -225,9 +226,11 @@ pub(crate) fn apply_key(table: &mut toml::Table, key: &str, value: &str) -> Resu
         bail!("{key} must be stop, continue, or adopt, got {value:?}");
     }
     let parsed = if key == "default_timeout_ms" || key == "crew.max" {
-        toml::Value::Integer(value.parse::<i64>().map_err(|e| {
-            anyhow::anyhow!("{key} must be an integer, got {value:?}: {e}")
-        })?)
+        toml::Value::Integer(
+            value
+                .parse::<i64>()
+                .map_err(|e| anyhow::anyhow!("{key} must be an integer, got {value:?}: {e}"))?,
+        )
     } else {
         toml::Value::String(value.to_string())
     };
@@ -297,11 +300,7 @@ fn cmd_config_seed(json: bool, overwrite: &str, dry_run: bool, yes: bool) -> Res
         return Ok(());
     }
     let verb = if dry_run { "would seed" } else { "seeded" };
-    println!(
-        "{verb} {} (overwrite: {})",
-        root.display(),
-        scope.as_str()
-    );
+    println!("{verb} {} (overwrite: {})", root.display(), scope.as_str());
     println!(
         "  workflows created {} kept {} overwritten {}",
         catalog.created_workflows.len(),
@@ -433,9 +432,7 @@ pub(crate) fn cmd_config(cfg: &Config, cmd: &ConfigCmd) -> Result<()> {
             let table: toml::Table = toml::from_str(&raw).unwrap_or_default();
             println!(
                 "{}",
-                lookup(&table, key)
-                    .map(value_string)
-                    .unwrap_or_default()
+                lookup(&table, key).map(value_string).unwrap_or_default()
             );
         }
         ConfigCmd::Set { key, value } => {

@@ -305,7 +305,7 @@ mod tests {
 
 #[cfg(test)]
 mod bd_lmtu_heartbeat_tests {
-    use super::{path as heartbeat_path, spawn_heartbeat_ticker, STAMP_INTERVAL};
+    use super::{STAMP_INTERVAL, path as heartbeat_path, spawn_heartbeat_ticker};
 
     /// bd-lmtu: the ticker must ACTUALLY stamp, repeatedly, for as long as it is
     /// held. This is the behaviour that was missing entirely — the function had
@@ -429,7 +429,10 @@ mod bd_lmtu_heartbeat_tests {
             dir.join("doorbell").join("watch-proj-ws.hb"),
             "path shape is a contract with the liveness reader"
         );
-        assert!(p.exists(), "the ticker must create the doorbell/ parent on demand");
+        assert!(
+            p.exists(),
+            "the ticker must create the doorbell/ parent on demand"
+        );
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);
     }

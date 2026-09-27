@@ -2412,7 +2412,10 @@ mod decide_router_tests {
         let until = decide("fix the failing test until it passes", &snap());
         assert_eq!(until.primitive, "repair-until-verified", "{until:?}");
         assert!(
-            until.argv.windows(2).any(|w| w == ["--parts", "repair-until-verified"]),
+            until
+                .argv
+                .windows(2)
+                .any(|w| w == ["--parts", "repair-until-verified"]),
             "{:?}",
             until.argv
         );

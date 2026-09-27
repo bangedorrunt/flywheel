@@ -1345,7 +1345,7 @@ pub fn interactive_model_plan(
 
 #[cfg(test)]
 mod bd_crlx_interactive_model_tests {
-    use super::{interactive_model_plan, InteractiveModelPlan};
+    use super::{InteractiveModelPlan, interactive_model_plan};
 
     /// bd-crlx: the regression, pinned. `--model` on the opencode ROOT command
     /// is rejected by opencode v2.0.16, so the interactive path must emit no
@@ -1353,7 +1353,8 @@ mod bd_crlx_interactive_model_tests {
     /// goes back to argv, every opencode pane seat dies on spawn again.
     #[test]
     fn opencode_interactive_emits_no_model_flag_and_pins_by_env() {
-        let plan = interactive_model_plan("opencode", "opencode-go/muse-spark-1.3-contributor", None);
+        let plan =
+            interactive_model_plan("opencode", "opencode-go/muse-spark-1.3-contributor", None);
         assert_eq!(
             plan,
             InteractiveModelPlan::PinnedByEnv {
@@ -1393,7 +1394,10 @@ mod bd_crlx_interactive_model_tests {
                 InteractiveModelPlan::Argv(super::model_args(harness, model, None)),
                 "row {harness} must be exactly model_args, not a second builder"
             );
-            assert!(plan.env_pin().is_none(), "row {harness} must not need an env pin");
+            assert!(
+                plan.env_pin().is_none(),
+                "row {harness} must not need an env pin"
+            );
         }
     }
 
@@ -1410,8 +1414,15 @@ mod bd_crlx_interactive_model_tests {
             ("pa", "opencode-go/muse-spark-1.3-contributor"),
         ] {
             let plan = interactive_model_plan(harness, model, None);
-            assert_eq!(plan.args(), &super::model_args(harness, model, None)[..], "row {harness}");
-            assert!(!plan.args().is_empty(), "row {harness} lost its model pin entirely");
+            assert_eq!(
+                plan.args(),
+                &super::model_args(harness, model, None)[..],
+                "row {harness}"
+            );
+            assert!(
+                !plan.args().is_empty(),
+                "row {harness} lost its model pin entirely"
+            );
         }
     }
 
@@ -1437,9 +1448,13 @@ mod bd_crlx_interactive_model_tests {
     /// in this exact function, so pin it on the interactive route too.
     #[test]
     fn pi_interactive_keeps_the_space_form_effort_flag() {
-        let plan = interactive_model_plan("pi", "opencode-go/muse-spark-1.3-contributor", Some("high"));
+        let plan =
+            interactive_model_plan("pi", "opencode-go/muse-spark-1.3-contributor", Some("high"));
         let args = plan.args();
-        let i = args.iter().position(|a| a == "--thinking").expect("--thinking present");
+        let i = args
+            .iter()
+            .position(|a| a == "--thinking")
+            .expect("--thinking present");
         assert_eq!(
             args.get(i + 1).map(String::as_str),
             Some("high"),
@@ -1455,7 +1470,14 @@ mod bd_crlx_interactive_model_tests {
     /// interactive route. Silence here would be a silent downgrade.
     #[test]
     fn opencode_interactive_still_reports_effort_degradation() {
-        let plan = interactive_model_plan("opencode", "opencode-go/muse-spark-1.3-contributor", Some("max"));
-        assert_eq!(plan.env_pin(), Some("opencode-go/muse-spark-1.3-contributor"));
+        let plan = interactive_model_plan(
+            "opencode",
+            "opencode-go/muse-spark-1.3-contributor",
+            Some("max"),
+        );
+        assert_eq!(
+            plan.env_pin(),
+            Some("opencode-go/muse-spark-1.3-contributor")
+        );
     }
 }

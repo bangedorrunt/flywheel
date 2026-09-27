@@ -162,7 +162,10 @@ fn splice_named_harness(argv: &mut Vec<String>, objective: &str) {
     let Some(kind) = named_harness(objective) else {
         return;
     };
-    if argv.windows(2).any(|w| w[0] == "workflow" && w[1] == "compose") {
+    if argv
+        .windows(2)
+        .any(|w| w[0] == "workflow" && w[1] == "compose")
+    {
         if !argv.iter().any(|a| a == "--harness") {
             argv.push("--harness".into());
             argv.push(kind.into());
@@ -429,8 +432,7 @@ fn rewrite_sticky_held_argv(b: &mut Briefing, session: &str) {
             // An input refusal may already have emptied argv. That is still
             // an invent vehicle and must not panic the door.
             debug_assert!(
-                is_invent_spawn_under_open(&b.proposal.workflow)
-                    || !b.proposal.workflow.is_empty(),
+                is_invent_spawn_under_open(&b.proposal.workflow) || !b.proposal.workflow.is_empty(),
                 "sticky-held open expected a classified vehicle, got workflow={} argv={:?}",
                 b.proposal.workflow,
                 b.proposal.argv
@@ -538,9 +540,9 @@ fn splice_project(argv: &mut Vec<String>, project: &str) {
     if project.is_empty() || argv.iter().any(|a| a == "--project") {
         return;
     }
-    let workflow = argv.windows(2).any(|w| {
-        w[0] == "workflow" && (w[1] == "run" || w[1] == "compose")
-    });
+    let workflow = argv
+        .windows(2)
+        .any(|w| w[0] == "workflow" && (w[1] == "run" || w[1] == "compose"));
     if workflow {
         argv.push("--project".into());
         argv.push(project.to_string());
@@ -1212,10 +1214,19 @@ mod tests {
 
     #[test]
     fn until_green_refuses_until_verify_is_bound() {
-        let held = assemble("fix the failing test until it passes", &world_empty(), &[], 5);
+        let held = assemble(
+            "fix the failing test until it passes",
+            &world_empty(),
+            &[],
+            5,
+        );
         assert_eq!(held.proposal.workflow, "repair-until-verified");
         assert!(held.proposal.argv.is_empty(), "{:?}", held.proposal.argv);
-        assert!(held.proposal.why.contains("verify"), "{}", held.proposal.why);
+        assert!(
+            held.proposal.why.contains("verify"),
+            "{}",
+            held.proposal.why
+        );
         assert!(held.questions.iter().any(|q| q.id == "inputs"));
 
         let go = assemble(
@@ -1225,11 +1236,19 @@ mod tests {
             5,
         );
         assert!(
-            go.proposal.argv.windows(2).any(|w| w == ["--parts", "repair-until-verified"]),
+            go.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["--parts", "repair-until-verified"]),
             "{:?}",
             go.proposal.argv
         );
-        assert!(go.proposal.argv.windows(2).any(|w| w == ["--project", "toron"]));
+        assert!(
+            go.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["--project", "toron"])
+        );
     }
 
     #[test]
@@ -1242,12 +1261,17 @@ mod tests {
         );
         // "diagnosed" contains "diagnose"? "diagnosed".contains("diagnose") is true.
         assert!(
-            b.proposal.argv.windows(2).any(|w| w == ["--harness", "opencode"]),
+            b.proposal
+                .argv
+                .windows(2)
+                .any(|w| w == ["--harness", "opencode"]),
             "{:?}",
             b.proposal.argv
         );
         assert!(
-            b.alternatives.iter().any(|a| a.workflow.as_deref() == Some("forensics")),
+            b.alternatives
+                .iter()
+                .any(|a| a.workflow.as_deref() == Some("forensics")),
             "{:?}",
             b.alternatives
         );
@@ -1263,6 +1287,10 @@ mod tests {
         );
         assert_eq!(held.proposal.workflow, "hillclimb");
         assert!(held.proposal.argv.is_empty(), "{:?}", held.proposal.argv);
-        assert!(held.proposal.why.contains("metric"), "{}", held.proposal.why);
+        assert!(
+            held.proposal.why.contains("metric"),
+            "{}",
+            held.proposal.why
+        );
     }
 }
