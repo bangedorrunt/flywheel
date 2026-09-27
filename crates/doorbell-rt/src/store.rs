@@ -474,6 +474,47 @@ impl FileStore {
         chain
     }
 
+    /// bd-v7uu: the "have I already reported this tear?" memory, kept OUT of the
+    /// audit on purpose.
+    ///
+    /// It used to be a `raw.contains(&fingerprint)` scan of the audit file — but
+    /// the audit is pruned to `AUDIT_KEEP_LINES` / `AUDIT_MAX_BYTES`, so the
+    /// memory had the same lifetime as the report it was suppressing. Measured on
+    /// this host: `flywheel-toron.audit.jsonl` sat at 3965 of 4000 lines, so a
+    /// tear reported before the next prune would be re-reported afterwards. The
+    /// general shape is the receipt-tombstone one: a bounded store cannot hold
+    /// dedup state for itself, because the state disappears exactly when it is
+    /// still needed.
+    ///
+    /// One fingerprint per line, append-only, never pruned: the size is bounded by
+    /// the number of DISTINCT tears, which is a handful, not by the traffic that
+    /// produces reports.
+    fn loudmiss_file(&self, workspace: &str) -> std::path::PathBuf {
+        let dir = self.audit_file(workspace);
+        let stem = dir.file_stem().and_then(|s| s.to_str()).unwrap_or("audit");
+        dir.with_file_name(format!("{stem}.loudmiss"))
+    }
+
+    fn tear_already_reported(&self, workspace: &str, fingerprint: &str) -> bool {
+        std::fs::read_to_string(self.loudmiss_file(workspace))
+            .is_ok_and(|raw| raw.lines().any(|l| l == fingerprint))
+    }
+
+    fn mark_tear_reported(&self, workspace: &str, fingerprint: &str) {
+        let path = self.loudmiss_file(workspace);
+        if let Some(parent) = path.parent() {
+            let _ = private_dir(parent);
+        }
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{fingerprint}");
+        }
+    }
+
     /// Fold one workspace loud (D4.4): entries in order until the first
     /// unparseable line or seq gap, then stop. Missing `seq` reads as
     /// legacy (tolerated, no contiguity check). Every torn fold appends a
@@ -526,9 +567,12 @@ impl FileStore {
             // REPORT, and a report that repeats unchanged is noise that trains
             // a reader to skip the field. One row per distinct tear.
             let fingerprint = format!("{}:{}:{}", t.file, t.at_line, t.reason);
-            let already = std::fs::read_to_string(self.audit_file(workspace))
-                .is_ok_and(|raw| raw.contains(&fingerprint));
+            let already = self.tear_already_reported(workspace, &fingerprint);
             if !already {
+                // Mark BEFORE the append, and separately: the marker has to exist
+                // even if the audit write fails, or a failed report becomes a
+                // permanently re-firing one.
+                self.mark_tear_reported(workspace, &fingerprint);
                 self.append_audit(
                     workspace,
                     serde_json::json!({
@@ -696,8 +740,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// bd-v7uu: a store root unique per CALL, not per name.
+    ///
+    /// It was `dbrt-{name}-{pid}`, so two tests sharing a name shared a
+    /// directory — and `test_store` REMOVES that directory on entry. Observed as
+    /// a ~1-in-5 flake: the compiled binary registered
+    /// `a_tear_is_reported_once_even_after_the_audit_is_emptied` twice (one
+    /// definition in the source, two in `--list`, i.e. a stale build), the two
+    /// instances ran in parallel, one wiped the other's journal, and the fold came
+    /// back with zero rows and no tear.
+    ///
+    /// The pid does not save you. It makes roots unique across PROCESSES, and the
+    /// hazard is two tests inside ONE process — which is exactly what parallel
+    /// test threads are. And a name collision can be introduced by nothing more
+    /// than a copy-pasted test, with no compile error to notice it.
+    ///
+    /// A per-call counter makes the root unique within the process, so the
+    /// harness cannot be broken by duplication, by a stale binary, or by a
+    /// future test reusing a name.
     fn test_store(name: &str) -> (FileStore, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("dbrt-{name}-{}", std::process::id()));
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("dbrt-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (FileStore::new(&dir), dir)
     }
@@ -759,6 +823,83 @@ mod tests {
         assert_eq!(mode(&dir.join("journals")), 0o700, "journals dir");
         assert_eq!(mode(&dir.join("doorbell")), 0o700, "doorbell dir");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    /// bd-v7uu: one row per distinct tear must survive the AUDIT's own retention.
+    ///
+    /// The dedup used to be `raw.contains(&fingerprint)` over the audit file — and
+    /// the audit is pruned to `AUDIT_KEEP_LINES` / `AUDIT_MAX_BYTES`. So the memory
+    /// had the same lifetime as the report it suppresses: measured on this host,
+    /// `flywheel-toron.audit.jsonl` sat at 3965 of 4000 lines, so one prune and
+    /// every previously-reported tear became reportable again, forever, at the
+    /// re-detection rate. A bounded store cannot hold dedup state for itself; the
+    /// state vanishes exactly when it is still needed.
+    ///
+    /// The audit is emptied here rather than pruned to the cap, which is the
+    /// strongest form of the same failure.
+    #[test]
+    fn a_tear_is_reported_once_even_after_the_audit_is_emptied() {
+        let (st, _dir) = test_store("torn-dedup-rot");
+        for seq in 1..=3u64 {
+            append_seq(&st, "w", seq);
+        }
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(st.journal_file("w"))
+            .unwrap();
+        writeln!(f, "{{\"v\": 1, \"seq\": 4, BROKEN").unwrap();
+        drop(f);
+
+        // SPLIT the two halves so a failure names WHICH one is flaky: detection
+        // (the fold saw a tear) and the report (the audit row landed).
+        let fold = st.fold_workspace("w");
+        assert_eq!(
+            fold.rows.len(),
+            3,
+            "fold must stop at the tear; if this is the failure the tear was never \
+             detected, and if it is the count below then detection was fine"
+        );
+        assert!(
+            fold.torn.is_some(),
+            "the torn line must be detected; rows={} torn={:?}",
+            fold.rows.len(),
+            fold.torn.as_ref().map(|t| (t.at_line, t.reason.clone()))
+        );
+        let count = |st: &FileStore| {
+            std::fs::read_to_string(st.audit_file("w"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("journal_torn_tail"))
+                .count()
+        };
+        assert_eq!(count(&st), 1, "the first fold reports the tear");
+
+        // Fold again with the audit intact: still one (the pre-existing dedup).
+        st.fold_workspace("w");
+        assert_eq!(count(&st), 1, "an un-deduped report repeats on every fold");
+
+        // Now the audit loses everything. The MARKER must still remember.
+        std::fs::write(st.audit_file("w"), "").unwrap();
+        st.fold_workspace("w");
+        assert_eq!(
+            count(&st),
+            0,
+            "an emptied audit must not resurrect a reported tear — the old \
+             dedup read the audit, so pruning it made every old tear reportable again"
+        );
+        assert!(
+            st.loudmiss_file("w").exists(),
+            "the dedup memory must live OUTSIDE the rotating audit"
+        );
+        let marker = std::fs::read_to_string(st.loudmiss_file("w")).unwrap_or_default();
+        assert!(
+            marker
+                .lines()
+                .any(|l| l.contains("journal_torn_tail") || l.contains(".jsonl")),
+            "the marker must name the tear, not just exist: {marker:?}"
+        );
     }
 
     #[test]
