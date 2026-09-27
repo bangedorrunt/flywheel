@@ -73,6 +73,12 @@ pub struct Briefing {
     pub proposal: Proposal,
     pub alternatives: Vec<Alternative>,
     pub questions: Vec<Question>,
+    /// bd-drlm: the tier-aware harness menu for this crew, DERIVED from the
+    /// resolved profile catalog. Additive and optional: a briefing that could
+    /// not load a catalog still renders, it just carries no menu, because a
+    /// missing menu must never be a reason a captain cannot see the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_menu: Option<crate::crew_menu::HarnessMenu>,
 }
 
 fn held_summary(paths: &[String]) -> String {
@@ -187,7 +193,13 @@ fn has_diagnose_then_fix(objective: &str) -> bool {
 }
 
 /// Assemble a briefing. `unique_roles` is the packed-from inventory (may be empty).
-pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u32) -> Briefing {
+pub fn assemble(
+    objective: &str,
+    world: &World,
+    unique_roles: &[String],
+    cap: u32,
+    catalog: Option<&crate::profile::ProfileCatalog>,
+) -> Briefing {
     let cap = if cap == 0 { DEFAULT_CREW_MAX } else { cap };
     let snap = decide::Snapshot {
         ready_bead_count: world.ready_beads,
@@ -212,6 +224,10 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
         unique: unique_roles.len() as u32,
         cap,
     });
+    // bd-drlm: the menu is built from the same `n` the crew is packed to, so
+    // "varied by number of crews" is a function of the real budget rather than
+    // a separate guess.
+    let harness_menu = catalog.map(|c| crate::crew_menu::harness_menu(c, n));
     let mut remove = Vec::new();
     for (from, to) in &packed.aliases {
         remove.push(format!("{from} → {to} (packed under N={n})"));
@@ -325,6 +341,7 @@ pub fn assemble(objective: &str, world: &World, unique_roles: &[String], cap: u3
             role: None,
         },
         alternatives,
+        harness_menu,
         questions: vec![
             Question {
                 id: "topology".into(),
@@ -673,7 +690,7 @@ mod tests {
             coalition_id: Some("coal-1".into()),
             ..World::default()
         };
-        let b = assemble("wave-swarm 3 crews", &world, &["coder".into()], 5);
+        let b = assemble("wave-swarm 3 crews", &world, &["coder".into()], 5, None);
         assert_eq!(b.schema, SCHEMA);
         assert_eq!(b.proposal.topology, "join");
         assert_eq!(b.proposal.argv[1], "arrive");
@@ -707,7 +724,7 @@ mod tests {
             "reviewer".into(),
             "housekeeper".into(),
         ];
-        let b = assemble("wave-swarm the auth lanes", &world_empty(), &roles, 5);
+        let b = assemble("wave-swarm the auth lanes", &world_empty(), &roles, 5, None);
         assert_eq!(b.proposal.topology, "swarm");
         assert_eq!(b.proposal.workflow, "wave-swarm");
         assert!(b.proposal.argv.iter().any(|a| a == "--crew"));
@@ -729,14 +746,14 @@ mod tests {
             dispatcher: "absent".into(),
             ..World::default()
         };
-        let b = assemble("work the ready beads", &world, &["coder".into()], 5);
+        let b = assemble("work the ready beads", &world, &["coder".into()], 5, None);
         assert_eq!(b.proposal.workflow, "loop-work");
         assert_eq!(b.proposal.topology, "loop");
     }
 
     #[test]
     fn two_crews_packs_n_2_not_default_5() {
-        let b = assemble("wave-swarm with 2 crews", &world_empty(), &[], 5);
+        let b = assemble("wave-swarm with 2 crews", &world_empty(), &[], 5, None);
         assert_eq!(b.proposal.topology, "swarm");
         assert_eq!(b.proposal.workflow, "wave-swarm");
         assert_eq!(b.proposal.crew_total, 2);
@@ -745,7 +762,7 @@ mod tests {
 
     #[test]
     fn empty_unique_on_swarm_defaults_wave_roles() {
-        let b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5);
+        let b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5, None);
         assert_eq!(b.proposal.topology, "swarm");
         assert_eq!(b.proposal.crew_total, 3);
         assert!(b.proposal.argv.iter().any(|a| a == "--crew"));
@@ -768,6 +785,7 @@ mod tests {
             &world,
             &[],
             5,
+            None,
         );
         assert_eq!(b.proposal.workflow, "forensics");
         assert_eq!(b.proposal.topology, "open");
@@ -782,7 +800,13 @@ mod tests {
             dispatcher: "absent".into(),
             ..World::default()
         };
-        let b = assemble("babysit the bd-xyz bead", &world, &["coder".into()], 5);
+        let b = assemble(
+            "babysit the bd-xyz bead",
+            &world,
+            &["coder".into()],
+            5,
+            None,
+        );
         let d = decide::decide("babysit the bd-xyz bead", &decide::Snapshot::default());
         assert_eq!(d.primitive, "babysit-bead");
         assert_eq!(b.proposal.topology, d.topology);
@@ -792,7 +816,13 @@ mod tests {
     #[test]
     fn sticky_held_suppresses_conflicting_swarm_proposal() {
         let world = world_empty();
-        let mut b = assemble("wave-swarm the auth lanes", &world, &["coder".into()], 5);
+        let mut b = assemble(
+            "wave-swarm the auth lanes",
+            &world,
+            &["coder".into()],
+            5,
+            None,
+        );
         assert_eq!(b.proposal.topology, "swarm");
         align_with_session_topology(&mut b, "open", true);
         assert_eq!(b.proposal.topology, "open");
@@ -851,7 +881,7 @@ mod tests {
             dispatcher: "absent".into(),
             ..World::default()
         };
-        let mut b = assemble("work the ready beads", &world, &["coder".into()], 5);
+        let mut b = assemble("work the ready beads", &world, &["coder".into()], 5, None);
         assert_eq!(b.proposal.topology, "loop", "precondition: loop classify");
         assert!(
             b.proposal
@@ -891,7 +921,7 @@ mod tests {
     #[test]
     fn sticky_held_open_x_none_clears_spawn_argv() {
         let world = world_empty();
-        let mut b = assemble("zzzz-unmatched-objective-qqq", &world, &[], 5);
+        let mut b = assemble("zzzz-unmatched-objective-qqq", &world, &[], 5, None);
         assert_eq!(b.proposal.topology, "none", "precondition: none classify");
         align_with_session_topology(&mut b, "open", true);
         assert_eq!(b.proposal.topology, "open");
@@ -924,7 +954,13 @@ mod tests {
             coalition_id: Some("coal-1".into()),
             ..World::default()
         };
-        let mut b = assemble("wave-swarm the auth lanes", &world, &["coder".into()], 5);
+        let mut b = assemble(
+            "wave-swarm the auth lanes",
+            &world,
+            &["coder".into()],
+            5,
+            None,
+        );
         assert_eq!(b.proposal.topology, "join", "precondition: join");
         assert_eq!(b.proposal.argv[1], "arrive");
         align_with_session_topology(&mut b, "open", true);
@@ -972,7 +1008,13 @@ mod tests {
                 },
             ),
         ] {
-            let mut b = assemble("wave-swarm the auth lanes", &world, &["coder".into()], 5);
+            let mut b = assemble(
+                "wave-swarm the auth lanes",
+                &world,
+                &["coder".into()],
+                5,
+                None,
+            );
             assert!(
                 matches!(b.proposal.topology.as_str(), "swarm" | "join"),
                 "{label}: precondition topology={}",
@@ -1016,7 +1058,13 @@ mod tests {
     #[test]
     fn sticky_held_loop_x_swarm_rewrites_to_loop_not_wave_swarm() {
         let world = world_empty();
-        let mut b = assemble("wave-swarm the auth lanes", &world, &["coder".into()], 5);
+        let mut b = assemble(
+            "wave-swarm the auth lanes",
+            &world,
+            &["coder".into()],
+            5,
+            None,
+        );
         assert_eq!(b.proposal.topology, "swarm");
         assert_eq!(b.proposal.workflow, "wave-swarm");
         align_with_session_topology(&mut b, "loop", true);
@@ -1049,7 +1097,7 @@ mod tests {
 
     #[test]
     fn apply_answers_topology_swarm_rebuilds_compose_argv() {
-        let mut b = assemble("diagnose the mailbox", &world_empty(), &[], 5);
+        let mut b = assemble("diagnose the mailbox", &world_empty(), &[], 5, None);
         assert_eq!(b.proposal.topology, "open");
         apply_answers(&mut b, Some("swarm"), Some("3"), Some("@cheap")).unwrap();
         assert_eq!(b.proposal.topology, "swarm");
@@ -1079,7 +1127,7 @@ mod tests {
 
     #[test]
     fn apply_answers_topology_open_clears_swarm_argv() {
-        let mut b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5);
+        let mut b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5, None);
         apply_answers(&mut b, Some("open"), None, None).unwrap();
         assert_eq!(b.proposal.topology, "open");
         assert_eq!(b.proposal.workflow, "none");
@@ -1088,7 +1136,7 @@ mod tests {
 
     #[test]
     fn apply_answers_rejects_unknown() {
-        let mut b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5);
+        let mut b = assemble("wave-swarm the auth lanes", &world_empty(), &[], 5, None);
         assert!(apply_answers(&mut b, Some("banana"), None, None).is_err());
         assert!(apply_answers(&mut b, None, None, Some("gpt-x")).is_err());
     }
@@ -1100,6 +1148,7 @@ mod tests {
             &world_empty(),
             &[],
             5,
+            None,
         );
         assert_eq!(b.proposal.workflow, "beads-lifecycle");
         apply_answers(&mut b, Some("swarm"), Some("planner:1,coder:1"), None).unwrap();
@@ -1174,7 +1223,7 @@ mod tests {
             ),
         ];
         for (name, goal, topology, workflow) in rows {
-            let b = assemble(goal, &world_empty(), &[], 5);
+            let b = assemble(goal, &world_empty(), &[], 5, None);
             assert_eq!(b.proposal.topology, topology, "row {name}: topology");
             assert_eq!(b.proposal.workflow, workflow, "row {name}: workflow");
             assert!(
@@ -1194,7 +1243,7 @@ mod tests {
             pin_count: 3,
             ..World::default()
         };
-        let b = assemble("refactor the auth module", &world, &[], 5);
+        let b = assemble("refactor the auth module", &world, &[], 5, None);
         assert_eq!(b.proposal.topology, "join");
         assert!(has_crew_and_model_questions(&b));
         assert!(
@@ -1206,7 +1255,7 @@ mod tests {
 
     #[test]
     fn briefing_multi_lane_without_trigger_is_explicit_none_not_open() {
-        let b = assemble("two lanes auth and billing", &world_empty(), &[], 5);
+        let b = assemble("two lanes auth and billing", &world_empty(), &[], 5, None);
         assert_eq!(b.proposal.topology, "none");
         assert_eq!(b.proposal.workflow, "none");
         assert!(b.proposal.argv.is_empty(), "{:?}", b.proposal.argv);
@@ -1220,6 +1269,7 @@ mod tests {
             &world_empty(),
             &[],
             5,
+            None,
         );
         assert_eq!(held.proposal.workflow, "repair-until-verified");
         assert!(held.proposal.argv.is_empty(), "{:?}", held.proposal.argv);
@@ -1235,6 +1285,7 @@ mod tests {
             &world_empty(),
             &[],
             5,
+            None,
         );
         assert!(
             go.proposal
@@ -1259,6 +1310,7 @@ mod tests {
             &world_empty(),
             &[],
             5,
+            None,
         );
         // "diagnosed" contains "diagnose"? "diagnosed".contains("diagnose") is true.
         assert!(
@@ -1285,6 +1337,7 @@ mod tests {
             &world_empty(),
             &[],
             5,
+            None,
         );
         assert_eq!(held.proposal.workflow, "hillclimb");
         assert!(held.proposal.argv.is_empty(), "{:?}", held.proposal.argv);

@@ -35,6 +35,7 @@ mod coalition;
 mod config;
 mod control;
 mod crew;
+mod crew_menu;
 mod cron;
 mod daemon;
 mod decide;
@@ -13294,7 +13295,17 @@ fn cmd_briefing(
         );
     }
     let unique: Vec<String> = Vec::new();
-    let mut b = briefing::assemble(objective, &world, &unique, cfg.crew_max());
+    // bd-drlm: the catalog is read once here so the briefing can carry the
+    // tier-aware harness menu. A read failure is NOT fatal: the briefing still
+    // renders, it just has no menu to offer.
+    let catalog_for_menu = profile::ProfileCatalog::load().ok();
+    let mut b = briefing::assemble(
+        objective,
+        &world,
+        &unique,
+        cfg.crew_max(),
+        catalog_for_menu.as_ref(),
+    );
     // bd-2o1v P0-5 (a): name the proposed row's profile affinity (read from
     // the workflow's steps, never re-declared) so the crew-confirm gate
     // above and the captain see the same dispatch relation.
