@@ -597,7 +597,13 @@ pub struct FileHost {
     /// notices a pin gaining/losing its route without the pin set changing.
     unroutable_pins: Vec<String>,
     index_refreshed_at: u64,
-    retry: crate::policy::WatchRetry,
+    /// Shared with the watch delivery closure. bd-kz54 follow-up: the backoff
+    /// used to be owned only by `restart_wake`, so NOTHING could clear it —
+    /// `WatchRetry::reset()` had exactly one caller, its own unit test. Four
+    /// failures anywhere in a workspace's life latched it at the 16s gate
+    /// permanently, so a host that had one bad afternoon probed its bus three
+    /// times a minute forever and never regained a fast first retry.
+    retry: std::sync::Arc<std::sync::Mutex<crate::policy::WatchRetry>>,
     daemon_exe: PathBuf,
     generation: Option<GenRecord>,
     /// Status-change outbox: the poll loop `tell`s `HerdrStatus` back
@@ -649,7 +655,9 @@ impl FileHost {
             unroutable_pins: Vec::new(),
             captain_routed_pins: Vec::new(),
             index_refreshed_at: 0,
-            retry: crate::policy::WatchRetry::default(),
+            retry: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::policy::WatchRetry::default(),
+        )),
             daemon_exe,
             generation,
             tx: None,
@@ -1474,7 +1482,14 @@ impl Host for FileHost {
     }
 
     fn restart_wake(&mut self) {
-        let backoff = self.retry.record_fail();
+        // The 16s cap is deliberate (GS-007 never-deaf: probing forever beats
+        // going wake-blind), so the loop itself is not the bug. What was broken
+        // is that the gate never opened again — see the `retry` field.
+        let backoff = self
+            .retry
+            .lock()
+            .map(|mut r| r.record_fail())
+            .unwrap_or(16);
         let tx = self.tx.clone();
         let project = self.cfg.project.clone();
         let fw_state = self.cfg.flywheel_state.clone();
@@ -1482,6 +1497,9 @@ impl Host for FileHost {
         // One live consumer per host, never a litter. The slot aborts the
         // previous task before the replacement subscribes.
         let slot = self.wake_task.clone();
+        // Hoisted OUT of the spawned future: the future is 'static, so reading
+        // a field off `&mut self` inside it would let the borrow escape.
+        let retry = self.retry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
             let Some(tx) = tx else { return };
@@ -1513,6 +1531,14 @@ impl Host for FileHost {
                         WakeOutcome::Watch(l) => match tx.try_send(BrainMsg::Watch(l)) {
                             Ok(()) => {
                                 crate::watchbeat::touch_event(&beat_state, &beat_workspace);
+                                // A delivered event is the only trustworthy
+                                // evidence the socket is live again, so it is
+                                // what reopens the gate. Nothing else may:
+                                // a heartbeat proves the ticker ran, not that
+                                // the transport delivers.
+                                if let Ok(mut r) = retry.lock() {
+                                    r.reset();
+                                }
                             }
                             Err(_) => {
                                 crate::msg::deliver_died_blocking(&tx);
