@@ -304,7 +304,7 @@ impl StageLibrary {
             // gate.
             (
                 "wave-gate",
-                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow` — a failed check STOPS the wave (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report.",
+                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow --project <this project slug>` — a failed check STOPS the wave. bd-mvy4: the `--project` is REQUIRED, not a nicety: `worktree` and `playbook-files` are project-scoped checks and both FAIL when no project is given, so omitting it made the gate hold every wave while naming a blocker that was the gate's own omission (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report.",
             ),
             (
                 "wave-dispatch",
@@ -1655,5 +1655,57 @@ mod tests {
         for stage in ["wave-gate", "wave-dispatch", "wave-observe", "wave-verify"] {
             assert!(lib.has(stage), "compiled-in stage {stage} resolves");
         }
+    }
+}
+
+#[cfg(test)]
+mod bd_mvy4_wave_gate {
+    /// bd-mvy4: the wave-gate prompt ran `flywheel preflight --mode workflow`
+    /// with NO `--project`. `worktree` and `playbook-files` are project-scoped
+    /// and fail without one, so the gate held EVERY wave for a reason that was
+    /// the gate's own omission. Verified live: those are exactly the two checks
+    /// that fail bare and pass with `--project flywheel` (12/12).
+    ///
+    /// A prompt is not code, so this pins the prompt. That is normally a weak
+    /// assertion — except the failure it prevents is precisely a prompt
+    /// omitting a flag, so the prompt IS the thing under test. Mutation-checked:
+    /// deleting the flag must fail this test.
+    #[test]
+    fn the_wave_gate_passes_project_to_preflight() {
+        // compiled_in(), NOT load(): `load` layers the user tier over this, and
+        // a stale user copy shadows the prompt under test. That shadowing is
+        // bd-3o5t's mechanism and has its own bead; here we pin the source of
+        // truth that this change edits.
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let prompt = lib
+            .get_stage("wave-gate")
+            .expect("wave-gate is a compiled-in stage")
+            .prompt
+            .clone();
+        assert!(
+            prompt.contains("preflight --mode workflow --project"),
+            "the wave gate must pass --project to preflight. `worktree` and `playbook-files` \
+             are project-scoped, so without it the gate holds every wave and names a blocker \
+             that is its own omission."
+        );
+    }
+
+    /// The gate's hold has to be visible to a human reading a live artifact, and
+    /// the artifact is what the dispatch prompt reads. If the prompt stops
+    /// naming the binding artifact, the contract between the two halves is gone
+    /// and the dispatch half falls back to guessing.
+    #[test]
+    fn the_wave_gate_still_writes_the_binding_artifact() {
+        let lib = crate::stages::StageLibrary::load().expect("load stages");
+        let prompt = lib
+            .get_stage("wave-gate")
+            .expect("wave-gate")
+            .prompt
+            .clone();
+        assert!(
+            prompt.contains("ready.json") && prompt.contains("\"held\""),
+            "the gate must keep writing the binding artifact with an explicit `held` field — \
+             it is the only channel between the gate and the dispatch half"
+        );
     }
 }
