@@ -198,7 +198,7 @@ pub struct QuestionPack {
 impl QuestionPack {
     /// Parse + validate: non-empty id, version >= 1, pinned model, at least
     /// one question, every question with an id and instructions, Choice with
-    /// >= 2 options. The model must be non-empty. `jev-latest` is the
+    /// at least 2 options. The model must be non-empty. `jev-latest` is the
     /// operator-ordered alias.
     pub fn parse_yaml(text: &str) -> Result<Self, String> {
         let pack: QuestionPack =
@@ -3797,7 +3797,7 @@ pub fn pack_files_for(dir: &Path, id: &str, all_versions: bool) -> Vec<PathBuf> 
         .filter(|p| p.is_file())
         .filter_map(|p| pack_entry(&p).and_then(|(eid, v)| (eid == id).then_some((v, p))))
         .collect();
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|x| std::cmp::Reverse(x.0));
     let take = if all_versions { found.len() } else { 1 };
     found.into_iter().take(take).map(|(_, p)| p).collect()
 }

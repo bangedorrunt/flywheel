@@ -26694,7 +26694,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // Plan first, confirm against the PLAN, then execute. Confirming
             // after acting would make --yes a lie.
             let plan = workflow_catalog::seed_user_catalog_with(&root, scope, true)?;
-            let targets: Vec<String> = plan.planned_overwrites.iter().cloned().collect();
+            let targets: Vec<String> = plan.planned_overwrites.to_vec();
             // A dry run is the REVIEW step; asking it to confirm defeats it.
             if !*dry_run {
                 crate::output::confirm_destructive("overwrite", &targets, *yes, *json)?;
@@ -26840,7 +26840,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 } else {
                     println!(
                         "{} {}",
-                        output::warn(&format!("\u{26a0}\u{fe0f}")),
+                        output::warn("\u{26a0}\u{fe0f}"),
                         output::warn(&format!(
                             "{stale} stale, {missing} missing, {custom} custom"
                         ))
@@ -26848,9 +26848,9 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     if stale > 0 {
                         println!(
                             "   {}",
-                            output::accent(&format!(
-                                "fix: flywheel workflow seed --dry-run --overwrite stale"
-                            ))
+                            output::accent(
+                                "fix: flywheel workflow seed --dry-run --overwrite stale",
+                            )
                         );
                     }
                     if missing > 0 {

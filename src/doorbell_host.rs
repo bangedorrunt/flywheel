@@ -199,9 +199,7 @@ impl RtHost {
             exe_path,
             brain_tx,
             covered_panes: HashSet::new(),
-            retry: std::sync::Arc::new(std::sync::Mutex::new(
-            doorbell_rt::WatchRetry::default(),
-        )),
+            retry: std::sync::Arc::new(std::sync::Mutex::new(doorbell_rt::WatchRetry::default())),
             authority: crate::authority::RuntimeAuthority::resolve(),
             index_refreshed_at: now,
             index_pins,
