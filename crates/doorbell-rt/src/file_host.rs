@@ -358,6 +358,21 @@ fn herdr_agent_statuses(herdr_bin: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// What the prompt sink hands `herdr agent prompt` for one routed pin.
+///
+/// herdr resolves an agent by its herdr LABEL or by PANE ID, and a pane
+/// nobody started with `herdr agent start` — every operator pane — has only
+/// the second: live, `herdr agent get w6:p1` answers with the captain's pane
+/// while `herdr agent get AmberQuill` answers `agent_not_found`, which is the
+/// last recorded delivery failure on this host (`delivery failed: herdr
+/// prompt failed: agent target BlackOrchid not found`). The pane id resolves
+/// for BOTH shapes (a crew pane has one too), so it is the target; a row with
+/// no pane keeps its label rather than becoming an empty target that reads
+/// like a route (bd-523f).
+fn prompt_target<'a>(pane: &'a str, name: &'a str) -> &'a str {
+    if pane.is_empty() { name } else { pane }
+}
+
 /// (pane_id, agent_status, toron_pin token) rows from one
 /// `herdr agent list`. Empty vec = herdr did not answer (same guard as
 /// the status/pane readers): callers keep prior state, never clear it.
@@ -854,11 +869,12 @@ impl FileHost {
             .collect();
         if let Ok(mut targets) = self.targets.lock() {
             targets.clear();
-            targets.extend(
-                reap.live
-                    .iter()
-                    .map(|(pin, _, name)| (pin.clone(), name.clone())),
-            );
+            targets.extend(reap.live.iter().map(|(pin, pane, name)| {
+                // bd-523f: the value is a herdr PROMPT TARGET, not a name —
+                // the sink passes it to `agent prompt` verbatim, and only the
+                // pane id resolves for an operator pane.
+                (pin.clone(), prompt_target(pane, name).to_string())
+            }));
             // bd-3vr9: union herdr-known captain panes (same resolver, no
             // second table). A subscribed pin whose pane was never spawned
             // carries its pin in the herdr `toron_pin` token; bind it so
@@ -1631,6 +1647,53 @@ mod tests {
         // digest-bound, never queued into a table that cannot drain it.
         let empty: std::collections::HashSet<String> = Default::default();
         assert!(captain_pane_targets(&roster, &["Gone".to_string()], &empty).is_empty());
+    }
+
+    /// bd-523f: the LAST hop dies on the TARGET SPELLING, not on the route.
+    /// The routing table's value is handed verbatim to `herdr agent prompt`,
+    /// and herdr resolves an agent by its herdr LABEL or by PANE ID. A pane
+    /// nobody started with `herdr agent start` — every operator pane — has no
+    /// label: on this host `herdr agent get w6:p1` resolves the captain's pane
+    /// while `herdr agent get AmberQuill` answers `agent_not_found`, and the
+    /// last recorded delivery attempt is
+    /// `degraded: delivery failed: herdr prompt failed: agent target
+    /// BlackOrchid not found`. The captain union already stores pane ids
+    /// (bd-3vr9); the registry half stored the label, so one fleet, one
+    /// routing table, two unresolvable spellings.
+    #[test]
+    fn prompt_hop_routes_a_registry_row_by_pane_id_not_by_label() {
+        let (mut host, dir) = host_with_registry("prompt-hop-target", entries());
+        host.refresh_index();
+        let targets = host.targets.lock().expect("targets lock");
+        assert_eq!(
+            targets.get("PinA").map(String::as_str),
+            Some("pane-a"),
+            "the sink must be handed the pane id herdr resolves, not the label"
+        );
+        assert_eq!(targets.get("PinB").map(String::as_str), Some("pane-b"));
+        drop(targets);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The unhappy path of the same rule: a registry row with NO pane has
+    /// nothing to prompt. Falling back to the label keeps the one shape herdr
+    /// can still resolve (a crew row written before panes were recorded)
+    /// instead of handing the sink an empty target that reads as a route.
+    #[test]
+    fn prompt_hop_keeps_the_label_when_the_row_has_no_pane() {
+        let (mut host, dir) = host_with_registry(
+            "prompt-hop-nopane",
+            serde_json::json!([{"pane_id": "", "name": "herdr-c", "mail_identity": "PinC"}]),
+        );
+        host.refresh_index();
+        let targets = host.targets.lock().expect("targets lock");
+        assert_eq!(
+            targets.get("PinC").map(String::as_str),
+            Some("herdr-c"),
+            "a pane-less row keeps the label it has"
+        );
+        drop(targets);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
