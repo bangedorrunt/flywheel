@@ -160,8 +160,19 @@ struct GenRecord {
 
 /// Bounded CLI run (bd-ene2): a hung child must wedge neither the brain
 /// sweep nor shutdown. Polls `try_wait`; kills past the deadline; reaps.
-/// Pipe backpressure bound: outputs stay small (50-row inbox caps);
-/// anything bigger is killed, never awaited.
+///
+/// bd-239z: both pipes are drained ON READER THREADS for the child's whole
+/// life. Reading after exit — the `wait_with_output` shape this replaced — is
+/// a deadlock, not a bound: a pipe holds a finite buffer (65536 bytes measured
+/// on this host), the child blocks in `write` once it is full, never exits,
+/// and gets killed at the deadline with its output discarded. The daemon then
+/// audits "toron spawn/timeout failed" for a fetch that had already
+/// succeeded. Cold `mail inbox --limit 50` is 88925 bytes, so one pin's first
+/// page was past the buffer and that pin could never be fetched at all.
+///
+/// The deadline is still the only thing that ends the wait: on timeout the
+/// readers are detached, not joined, because an orphaned grandchild can hold
+/// the write end open long past the child we killed.
 pub fn run_cli(bin: &str, args: &[&str], timeout_secs: u64) -> Option<std::process::Output> {
     let mut child = std::process::Command::new(bin)
         .args(args)
@@ -170,20 +181,54 @@ pub fn run_cli(bin: &str, args: &[&str], timeout_secs: u64) -> Option<std::proce
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
+    let out_reader = drain_pipe(child.stdout.take());
+    let err_reader = drain_pipe(child.stderr.take());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => break Some(status),
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            _ => break None,
+        }
+    };
+    match status {
+        Some(status) => {
+            // The child is reaped and its write ends are closed, so both
+            // readers see EOF. This join is what actually delivers the bytes.
+            let stdout = out_reader.join().unwrap_or_default();
+            let stderr = err_reader.join().unwrap_or_default();
+            Some(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Detach: nobody is reading these, and joining would wait on
+            // whatever else inherited the pipe.
+            drop(out_reader);
+            drop(err_reader);
+            None
         }
     }
+}
+
+/// One reader thread per pipe, started before the first poll so the child
+/// never has a full pipe to block on.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
 }
 
 /// Per-call ceiling for brain-task CLIs (inbox, list, whois).
@@ -1997,6 +2042,83 @@ mod tests {
         assert!(
             body.contains("\"kind\":\"probe\"") && body.contains("\"n\":1"),
             "and keeps the row shape the callers pass: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-239z: `run_cli` piped both streams but read them only AFTER the
+    /// child exited. A pipe is a finite buffer (65536 bytes measured on this
+    /// host), so a child writing past it blocked inside `write`, never exited,
+    /// and was killed at the deadline with every byte it had produced thrown
+    /// away. The daemon read that as "toron spawn/timeout failed" — the
+    /// opposite of the truth, and a cold 50-row `mail inbox` page (88925 bytes)
+    /// is enough to trigger it, so the pin's first fetch was the last one that
+    /// could ever work and the retry was equally cold. Self-reinforcing.
+    #[cfg(unix)]
+    #[test]
+    fn run_cli_collects_output_larger_than_the_pipe_capacity() {
+        let dir = std::env::temp_dir().join(format!("dbrt-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let script = dir.join("loud.sh");
+        // 4 x 64 KiB on stdout (three pipe-buffer loads past the first) and a
+        // tail on stderr, so the test proves BOTH pipes drained, not just one.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ndd if=/dev/zero bs=65536 count=4 2>/dev/null\necho marker-on-stderr >&2\n",
+        )
+        .expect("script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let out = run_cli(script.to_str().expect("utf-8 path"), &[], 10)
+            .expect("a child that exits on its own is collected, not killed and discarded");
+        assert!(
+            out.status.success(),
+            "the script is not the thing under test"
+        );
+        assert_eq!(
+            out.stdout.len(),
+            4 * 65536,
+            "every byte past the pipe capacity is collected"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("marker-on-stderr"),
+            "and stderr is drained too, or it fills its own pipe the same way"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-239z, the other half: draining must not turn the deadline into a lie.
+    /// `sleep` inherits the pipe write end, so a reader thread joined AFTER the
+    /// kill would sit there for the sleep's full duration — the timeout would
+    /// silently become 30s and a hung sweep would pile up behind it. The
+    /// deadline has to end the wait whether or not the output was ever wanted.
+    #[cfg(unix)]
+    #[test]
+    fn run_cli_deadline_still_bounds_a_child_that_never_exits() {
+        let dir = std::env::temp_dir().join(format!("dbrt-hang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let script = dir.join("hang.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let started = std::time::Instant::now();
+        let out = run_cli(script.to_str().expect("utf-8 path"), &[], 1);
+        assert!(
+            out.is_none(),
+            "past the deadline the run is refused, not awaited"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "and the wait ends at the deadline, not when the orphaned writer does: {:?}",
+            started.elapsed()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
