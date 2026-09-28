@@ -105,18 +105,29 @@ pub fn count_matches_within(path: &Path, needle: &str, now: u64, window_secs: u6
 /// bd-sfvq: an audit row is a line of JSON, and a line that is not JSON is a
 /// row that no reader can ever see. Every other probe here works by SUBSTRING
 /// on the raw text, so a spliced line does not merely undercount one probe, it
-/// disappears from all of them at once — and `ts_of` cannot date it either, so
-/// it cannot even be reported as stale.
+/// disappears from all of them at once — and `ts_of` cannot date it either
+/// (measured: of six real torn rows, one had a recoverable stamp and the quote
+/// before it was mangled to `ts":`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditTear {
     /// Lines in the examined tail that do not parse as a JSON object.
     pub torn: usize,
     /// Parseable lines seen, so `torn` reads as a share of something.
     pub scanned: usize,
-    /// Unix seconds of the newest PARSEABLE row. A torn line carries no usable
-    /// `ts`, so this bounds it from above: a fresh newest row means the file is
-    /// still being written, so a torn line among them is a tear happening NOW.
+    /// Unix seconds of the newest parseable row.
     pub newest_row: Option<u64>,
+    /// Unix seconds of the newest DATABLE row that PRECEDES a torn line.
+    ///
+    /// This is the only honest way to say when a tear happened. A torn line
+    /// carries no usable `ts`, so it cannot be dated directly; the last row
+    /// before it that CAN be dated bounds the tear from below — the tear
+    /// happened at or after that moment, and no earlier.
+    ///
+    /// It is deliberately not `newest_row`. Using the newest row would say "the
+    /// tear is live" whenever the FILE is being written, which is forever on a
+    /// healthy daemon, and 513 historical rows would pin `degraded` red
+    /// permanently — the fastest way to teach an operator to ignore the field.
+    pub tear_after: Option<u64>,
 }
 
 /// Read the tail once and report what is unreadable in it. `None` when the file
@@ -132,12 +143,16 @@ pub fn audit_tear(path: &Path) -> Option<AuditTear> {
         torn: 0,
         scanned: 0,
         newest_row: None,
+        tear_after: None,
     };
     // A window that starts mid-file begins in the MIDDLE of a row, so its
     // first line is a fragment that is torn by construction. Counting it would
     // report a fault on every healthy file larger than the window, which is the
     // one way a truth-telling field teaches an operator to ignore it.
     let mid_file = start > 0;
+    // The last datable row seen, carried forward so a torn line can be bounded
+    // by the row in front of it.
+    let mut last_dated: Option<u64> = None;
     for (n, line) in buf.lines().enumerate() {
         if mid_file && n == 0 {
             continue;
@@ -149,11 +164,15 @@ pub fn audit_tear(path: &Path) -> Option<AuditTear> {
             Ok(serde_json::Value::Object(_)) => {
                 tear.scanned += 1;
                 if let Some(ts) = ts_of(line) {
+                    last_dated = Some(ts);
                     tear.newest_row = Some(tear.newest_row.map_or(ts, |cur: u64| cur.max(ts)));
                 }
             }
             // A bare string/number parses but is not a row either.
-            _ => tear.torn += 1,
+            _ => {
+                tear.torn += 1;
+                tear.tear_after = last_dated;
+            }
         }
     }
     Some(tear)
