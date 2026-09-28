@@ -440,6 +440,11 @@ pub struct StateSlice {
 ///   model `jev-latest`; state "A crew of three coding agents must refactor a Rust
 ///   workspace so the build passes."; one `score` question over four fit levels,
 ///   one `noul`, and one `choice` with a criteria MAP.
+///
+/// Tests only, so it is `cfg(test)`: a ~2 KB wire fixture has no business in the
+/// shipped binary, and keeping it out of the bin build is what stops the next
+/// reader from wondering which live path reads it.
+#[cfg(test)]
 const JEV_V1_REAL_RESPONSE: &str = r#"{
   "model": "jev-1.13.0",
   "answers": {
@@ -4598,11 +4603,6 @@ fn write_pack_file(dst: &Path, body: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fill gaps only.
-pub fn seed_default_packs(user_dir: &Path) -> anyhow::Result<PackSeedReport> {
-    seed_default_packs_with(user_dir, PackOverwrite::None, false)
-}
-
 #[cfg(test)]
 mod bd_pack_sync {
     use super::*;
@@ -4617,7 +4617,7 @@ mod bd_pack_sync {
             "id: reclassify\nversion: 3\nmodel: jev-latest\n# LOCAL\n",
         )
         .unwrap();
-        let rep = seed_default_packs(&dir).unwrap();
+        let rep = seed_default_packs_with(&dir, PackOverwrite::None, false).unwrap();
         assert!(rep.copied.iter().any(|n| n == "reclassify.v1.yaml"));
         assert!(rep.kept.iter().any(|n| n == "reclassify.v3.yaml"));
         assert!(
@@ -4626,7 +4626,7 @@ mod bd_pack_sync {
                 .contains("# LOCAL"),
             "existing pack bytes stay"
         );
-        let again = seed_default_packs(&dir).unwrap();
+        let again = seed_default_packs_with(&dir, PackOverwrite::None, false).unwrap();
         assert!(again.copied.is_empty(), "second seed creates nothing");
         assert_eq!(again.kept.len(), default_judgment_packs().len());
     }
