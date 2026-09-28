@@ -58,6 +58,15 @@ use doorbell_core::{PresenceVerdict, registry_key};
 /// journal filled with fabricated deaths.
 pub const AUDIT_BRAIN_FULL: &str = "wake_brain_full";
 
+/// A consumer death relayed to the brain, counted so a STORM reads as a rate.
+///
+/// The relay used to be the quietest place in the process: one death in, one
+/// `deliver_died_blocking` out, no counter and no row, however many arrived. So
+/// the 2026-09-28 burst wrote 9,741 `Died` journal rows and not one audit row
+/// that named the rate — the loudest event in the journal had the quietest
+/// trail, and the only way to measure it afterwards was to count rows by hand.
+pub const AUDIT_DIED_RELAYED: &str = "wake_died_relayed";
+
 /// What one un-enqueueable watch line does.
 #[derive(Debug, PartialEq, Eq)]
 enum FullChannelAction {
@@ -84,8 +93,32 @@ fn full_channel_action(reported: &std::sync::atomic::AtomicBool) -> FullChannelA
 /// Which of the counted drops also carry an audit row: the first, and then
 /// every power of two. Bounded (a 10,000-line flood leaves ~13 rows) and never
 /// silent, which is the whole point — the flood this replaces was invisible.
-fn should_audit_drop(prior_drops: usize) -> bool {
-    prior_drops == 0 || prior_drops.is_power_of_two()
+///
+/// Shared by the drop counter and the death-relay counter: both are repeats of
+/// one fault, and a repeat is a COUNT with a sampled row, not a row each.
+fn should_audit_count(prior_count: usize) -> bool {
+    prior_count == 0 || prior_count.is_power_of_two()
+}
+
+/// What one relayed consumer death does besides reaching the brain.
+#[derive(Debug, PartialEq, Eq)]
+enum DiedRelayAction {
+    /// Audit it as well: the first death, then every power of two. The payload
+    /// is how many deaths this row stands for, so a storm's row count is
+    /// bounded while its true size stays readable.
+    RelayAndAudit(usize),
+    /// Count only. Same fault, same host — and the delivery is NOT optional:
+    /// the arm always relays, because the restart depends on the death
+    /// arriving. Only the audit is sampled.
+    RelayOnly,
+}
+
+fn died_relay_action(prior_relays: usize) -> DiedRelayAction {
+    if should_audit_count(prior_relays) {
+        DiedRelayAction::RelayAndAudit(prior_relays + 1)
+    } else {
+        DiedRelayAction::RelayOnly
+    }
 }
 
 /// Minimal generation record — same JSON shape as flywheel's
@@ -667,6 +700,13 @@ pub struct FileHost {
     /// make spin is a denial-of-service surface, not diagnostics. Reset to 0 on
     /// a real delivery so the NEXT outage is audited again.
     absent_rows: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Deaths relayed to the brain for this host, across every consumer.
+    ///
+    /// Host-wide on purpose: a death storm is many consumers dying in turn, so a
+    /// per-consumer counter would reset on each re-arm and report every restart
+    /// as "death #1" — one row each, unbounded, which is the very shape this
+    /// guards against.
+    died_relayed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     daemon_exe: PathBuf,
     generation: Option<GenRecord>,
     /// Status-change outbox: the poll loop `tell`s `HerdrStatus` back
@@ -736,6 +776,7 @@ impl FileHost {
             retry: std::sync::Arc::new(std::sync::Mutex::new(crate::policy::WatchRetry::default())),
             restart_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             absent_rows: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            died_relayed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             daemon_exe,
             generation,
             tx: None,
@@ -1593,6 +1634,9 @@ impl Host for FileHost {
         let project = self.cfg.project.clone();
         let fw_state = self.cfg.flywheel_state.clone();
         let workspace = self.cfg.workspace.clone();
+        // Host-wide, so a storm across consumers reads as one rate. Hoisted for
+        // the same 'static reason as the clones above.
+        let died_relayed = self.died_relayed.clone();
         // One live consumer per host, never a litter. The slot aborts the
         // previous task before the replacement subscribes.
         let slot = self.wake_task.clone();
@@ -1705,7 +1749,7 @@ impl Host for FileHost {
                                     FullChannelAction::CountDropped => {
                                         let prior = dropped
                                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                        if should_audit_drop(prior) {
+                                        if should_audit_count(prior) {
                                             FileHost::append_audit_row(
                                                 &full_state,
                                                 &full_workspace,
@@ -1724,6 +1768,26 @@ impl Host for FileHost {
                             crate::watchbeat::touch_heartbeat(&beat_state, &beat_workspace);
                         }
                         WakeOutcome::Died => {
+                            // The relay is where a death storm was previously
+                            // invisible, so it is where the rate gets named.
+                            // Delivery stays unconditional: the restart depends
+                            // on the death arriving, so only the audit is
+                            // sampled, never the relay.
+                            let prior =
+                                died_relayed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if let DiedRelayAction::RelayAndAudit(relayed) =
+                                died_relay_action(prior)
+                            {
+                                FileHost::append_audit_row(
+                                    &full_state,
+                                    &full_workspace,
+                                    AUDIT_DIED_RELAYED,
+                                    serde_json::json!({
+                                        "reason": "consumer deaths relayed to the brain",
+                                        "relayed": relayed,
+                                    }),
+                                );
+                            }
                             crate::msg::deliver_died_blocking(&tx);
                         }
                     }
@@ -2832,11 +2896,41 @@ mod tests {
     /// flood this replaces wrote no audit row at all.
     #[test]
     fn the_drop_audit_is_geometric_not_silent() {
-        let audited: Vec<usize> = (0..17).filter(|n| should_audit_drop(*n)).collect();
+        let audited: Vec<usize> = (0..17).filter(|n| should_audit_count(*n)).collect();
         assert_eq!(
             audited,
             vec![0, 1, 2, 4, 8, 16],
             "a flood must leave a bounded trace: not zero rows, and not one per drop"
+        );
+    }
+
+    /// The twin arm's hole: the relay had no counter and no row, so a death
+    /// STORM was invisible exactly where it could have been named. 9,741 `Died`
+    /// journal rows across three storms, and not one audit row about the rate.
+    ///
+    /// A storm is 600 deaths here, the order the live 04:32Z minute reached.
+    /// The row count must stay bounded, the rows must name how many deaths they
+    /// stand for, and the delivery must never become conditional — the restart
+    /// depends on the death arriving, so only the audit is sampled.
+    #[test]
+    fn a_death_storm_leaves_a_bounded_audit_naming_its_size() {
+        const DEATHS: usize = 600;
+        let relayed: Vec<usize> = (0..DEATHS)
+            .filter_map(|prior| match died_relay_action(prior) {
+                DiedRelayAction::RelayAndAudit(n) => Some(n),
+                DiedRelayAction::RelayOnly => None,
+            })
+            .collect();
+        assert_eq!(
+            relayed,
+            vec![1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513],
+            "600 deaths must leave ~log2 rows, the first naming itself and each row \
+             naming the deaths it stands for"
+        );
+        assert_eq!(
+            relayed.last(),
+            Some(&513),
+            "the newest row must account for the run, not just say 'a death happened'"
         );
     }
 
