@@ -152,6 +152,12 @@ pub struct Brain<H: Host> {
     /// Next journal seq (D4.4): resumed from the tail so rows stay
     /// monotonic per workspace across restarts.
     next_seq: u64,
+    /// Deaths since the last restart that decided NOTHING (single-flight
+    /// `restart_wake` suppressed them). Journaled at 1, 2, 4, 8 ... so a storm
+    /// costs log2(deaths) rows instead of one per death, and the row states how
+    /// many deaths it stands for. Reset on a real restart. Same shape as
+    /// `dedup_high_us`: bounded sampling of a repeat, never silence.
+    inert_died: u64,
     /// Consecutive unanswered expiries per pin (S3 deaf digest names
     /// subscriber + attempts; corr binds in bd-asr2.11 with receipts).
     deaf_attempts: BTreeMap<String, u32>,
@@ -243,6 +249,7 @@ impl<H: Host> Brain<H> {
             stats: Stats::default(),
             sweep_last: None,
             next_seq,
+            inert_died: 0,
             deaf_attempts: BTreeMap::new(),
             dedup_high_us: None,
             sla_seen: std::collections::BTreeSet::new(),
@@ -595,12 +602,32 @@ impl<H: Host> Brain<H> {
                 .filter(|effect| !matches!(effect, Effect::RestartWatch))
                 .collect()
         };
-        self.journal(
-            &serde_json::json!({"rt_kind": "Died"}),
-            &decided,
-            serde_json::json!({"stage": "executed", "restarted": restarted}),
-            &[],
-        );
+        // A death that decided nothing is a COUNT, not a row. Live 2026-09-28
+        // 04:32Z: one minute wrote 2,120 rows for 8 real restarts, 2,112 of
+        // them inert — 265 rows of noise per restart of truth, and a journal
+        // too swollen to measure the incident it was describing. Journal the
+        // inert ones at 1, 2, 4, 8 ... (cost log2(N), the row naming the deaths
+        // it stands for, so nothing is dropped). A real restart always gets its
+        // row and resets the count.
+        if !restarted {
+            self.inert_died += 1;
+        }
+        let quiet = !restarted && !self.inert_died.is_power_of_two();
+        if !quiet {
+            let mut executed = serde_json::json!({"stage": "executed", "restarted": restarted});
+            if !restarted {
+                executed["coalesced_deaths"] = serde_json::json!(self.inert_died);
+            }
+            self.journal(
+                &serde_json::json!({"rt_kind": "Died"}),
+                &decided,
+                executed,
+                &[],
+            );
+        }
+        if restarted {
+            self.inert_died = 0;
+        }
         let _ = self
             .hear
             .expire(self.host.now_unix(), doorbell_core::UNANSWERED_SECS);
@@ -1665,10 +1692,64 @@ mod tests {
             "the journal carries one RestartWatch row per ACTUAL restart; counting deaths \
              instead is the defect. got {rows} rows:\n{journal}"
         );
-        assert_eq!(
-            journal.matches("\"restarted\":false").count(),
-            49,
-            "a coalesced death must say it did not restart, not claim one: {journal}"
+        // The 49 coalesced deaths are counted, not journaled one row each: at
+        // 1, 2, 4, 8, 16, 32 that is 6 rows, and the last one has to own up to
+        // the deaths it stands for.
+        let inert_rows = journal.matches("\"restarted\":false").count();
+        assert!(
+            inert_rows <= 8,
+            "49 coalesced deaths wrote {inert_rows} rows; they are counted, not logged: {journal}"
+        );
+        assert!(
+            journal.contains("\"coalesced_deaths\":32"),
+            "a coalesced death must say it did not restart AND how many deaths it stands \
+             for, or the count is lost: {journal}"
+        );
+    }
+
+    /// The other half of the same defect: the metric was fixed, the AMPLIFIER
+    /// was not. A `Died` that decided nothing still wrote a full row, so a
+    /// storm of coalesced deaths cost one row each. Measured live on
+    /// 2026-09-28 (04:32Z): one minute wrote 2,120 rows for 8 real restarts,
+    /// 2,112 of them `restarted: false` with `actions: []` — 265 rows of noise
+    /// per restart of truth. A journal that grows with the storm cannot be used
+    /// to measure the storm.
+    ///
+    /// An inert death is a COUNT, not a row: it is journaled at 1, 2, 4, 8 ...
+    /// so the cost is log2(deaths), and the row states how many deaths it
+    /// stands for, so nothing is silent. The trade is a bounded count
+    /// (a row stands for at most 2x the deaths since the previous row), which
+    /// is the price of keeping the journal readable during the incident it
+    /// is supposed to describe.
+    #[tokio::test]
+    async fn inert_deaths_are_counted_not_journaled_one_row_each() {
+        const DEATHS: usize = 4096;
+        let (mut brain, _rx, _tx) = test_brain("inert-died", vec![vec![]; DEATHS]);
+        for _ in 0..DEATHS {
+            brain.dispatch(BrainMsg::Died).await;
+        }
+        let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        let rows = journal.matches("\"rt_kind\":\"Died\"").count();
+        assert!(
+            rows <= 16,
+            "{DEATHS} inert deaths wrote {rows} rows; the geometric count caps at \
+             log2({DEATHS}) = 12. One row per death is the amplifier that made a \
+             2,120-row minute out of 8 restarts"
+        );
+        // Not silent: the rows that ARE written carry the deaths they cover, so
+        // the true total is recoverable by summing instead of counting.
+        let covered: usize = journal
+            .lines()
+            .filter_map(|l| l.split("\"coalesced_deaths\":").nth(1))
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<usize>().ok()
+            })
+            .sum();
+        assert!(
+            covered >= DEATHS / 2,
+            "the rows must account for the deaths they stand for: {covered} of {DEATHS} 
+             (a geometric cap can undershoot by at most one doubling)"
         );
     }
 
