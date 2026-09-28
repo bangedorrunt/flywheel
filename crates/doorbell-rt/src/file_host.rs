@@ -37,7 +37,25 @@ pub const INDEX_TTL_SECS: u64 = 60;
 /// repos cannot share a constant, so this is a pinned literal. toron's
 /// `index::schema::STORE_SKEW_MARKER` is the producer and its own test pins the
 /// spelling; the test below pins that we match it.
-const TORON_STORE_SKEW_MARKER: &str = "toron-error=store_skew";
+///
+/// Public because `/health` probes for it too: the marker is a property of the
+/// refusal TEXT, so it can be matched in any audit row whatever kind wrote it.
+pub const TORON_STORE_SKEW_MARKER: &str = "toron-error=store_skew";
+
+/// The sentence toron's refusal has always carried, kept as a second needle so
+/// the probe keeps working against a toron that predates the marker. During an
+/// upgrade window the marker is exactly what is missing, and a probe that only
+/// knew the marker would go blind precisely when skew is live.
+pub const TORON_STORE_SKEW_PROSE: &str = "resolves at most";
+
+/// True when a refusal is the store-skew fault. One predicate for every arm
+/// that opens the store, so "is this skew" is decided in one place: the inbox
+/// arm, the ack-SLA arm, and the `/health` probe all answer the same question
+/// about different text.
+pub fn is_store_skew_refusal(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains(TORON_STORE_SKEW_MARKER) || s.contains(TORON_STORE_SKEW_PROSE)
+}
 
 /// Classify a failed inbox fetch. (The store-skew class itself landed earlier;
 /// bd-ogzg is the declared-code change on top of it. The id of the earlier
@@ -59,7 +77,7 @@ const TORON_STORE_SKEW_MARKER: &str = "toron-error=store_skew";
 /// the contract: it names the store, the binary's ceiling, and the fix.
 fn inbox_fail_kind(stderr: &str) -> &'static str {
     let s = stderr.to_ascii_lowercase();
-    if s.contains(TORON_STORE_SKEW_MARKER) || s.contains("resolves at most") {
+    if is_store_skew_refusal(&s) {
         "inbox_store_skew"
     } else if s.contains("no local key")
         || s.contains("register first")
@@ -1730,10 +1748,19 @@ impl Host for FileHost {
             return Vec::new();
         };
         if !out.status.success() {
+            let error = String::from_utf8_lossy(&out.stderr).to_string();
+            // bd-r39p: name the skew here too. This arm opens the SAME shared
+            // store as the inbox arm, so it refuses for the same reason, but it
+            // wrote `ack_sla_error` and the fault was invisible under a probe
+            // keyed on the inbox kind.
             self.audit_file(
-                "ack_sla_error",
+                if is_store_skew_refusal(&error) {
+                    "ack_sla_store_skew"
+                } else {
+                    "ack_sla_error"
+                },
                 serde_json::json!({
-                    "error": String::from_utf8_lossy(&out.stderr).to_string(),
+                    "error": error,
                 }),
             );
             return Vec::new();
@@ -2119,6 +2146,65 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(10),
             "and the wait ends at the deadline, not when the orphaned writer does: {:?}",
             started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-r39p: the ack-SLA arm opens the SAME shared store as the inbox arm, so
+    /// it refuses for the same reason — but it wrote `ack_sla_error` and a
+    /// `/health` probe keyed on the inbox kind never saw it. Live 2026-09-28:
+    /// the store refused every minute and the health body read `degraded: []`.
+    /// The row kind is what an operator reads, so it has to name the fault.
+    #[cfg(unix)]
+    #[test]
+    fn ack_sla_refusal_names_the_store_skew_it_shared_with_the_inbox_arm() {
+        let dir = std::env::temp_dir().join(format!("dbrt-acksla-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let script = dir.join("skewed-toron.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'toron refuses this store: the store is at migration 14 \
+             and this binary resolves at most 13 [toron-error=store_skew]' >&2\nexit 1\n",
+        )
+        .expect("script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "ws-a");
+        cfg.toron_bin = script.to_string_lossy().into_owned();
+        let mut host = FileHost::new(cfg);
+        assert!(
+            host.scan_ack_sla().is_empty(),
+            "a refusing scan yields no overdue ids — it never invents them"
+        );
+        let body =
+            std::fs::read_to_string(dir.join("doorbell/ws-a.audit.jsonl")).expect("audit row");
+        assert!(
+            body.contains("\"kind\":\"ack_sla_store_skew\""),
+            "the refusal is named, not filed under a kind that says nothing: {body}"
+        );
+        assert!(
+            body.contains(TORON_STORE_SKEW_MARKER),
+            "and the row carries the marker, so a kind-independent probe finds it: {body}"
+        );
+        // A different refusal keeps its own kind: this arm is not a skew oracle.
+        std::fs::write(&script, "#!/bin/sh\necho 'no such flag' >&2\nexit 2\n").expect("script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let mut host = FileHost::new(FileHostConfig::new(dir.clone(), "proj", "ws-b"));
+        host.cfg.toron_bin = script.to_string_lossy().into_owned();
+        assert!(host.scan_ack_sla().is_empty());
+        let body =
+            std::fs::read_to_string(dir.join("doorbell/ws-b.audit.jsonl")).expect("audit row");
+        assert!(
+            body.contains("\"kind\":\"ack_sla_error\""),
+            "an unrelated failure stays an ack_sla_error: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
