@@ -33,12 +33,25 @@ pub const PRESENCE_FRESH_SECS: u64 = 30;
 /// Index rebuild cadence — mirrors the embedded 60s TTL + pin-set change.
 pub const INDEX_TTL_SECS: u64 = 60;
 
-/// Split pin-identity failures from fetch-path failures (bd-gpj0.1).
-/// `/health` greps `inbox_error` as "the inbox PATH is down"; a missing
-/// agent key is a pin problem and must not paint the whole daemon.
+/// Classify a failed inbox fetch (bd-xkte).
+///
+/// `/health` greps `inbox_error` as "the inbox PATH is down"; a missing agent
+/// key is a pin problem and must not paint the whole daemon. A store SKEW is
+/// neither, and buries a whole outage under a kind that says nothing about it.
+///
+/// The store (`$XDG_DATA_HOME/toron/index.sqlite`) is shared, so a binary that
+/// resolves fewer migrations than the store carries refuses EVERY workspace at
+/// once — live on 2026-09-28 the daemon was degraded for real and `/health`
+/// reported `degraded: []`, because the all-workspaces rule the generic kind
+/// feeds could never be satisfied by a fault that is never per-workspace.
+///
+/// Matched on toron's own wording (`resolves at most`) because that message is
+/// the contract: it names the store, the binary's ceiling, and the fix.
 fn inbox_fail_kind(stderr: &str) -> &'static str {
     let s = stderr.to_ascii_lowercase();
-    if s.contains("no local key")
+    if s.contains("resolves at most") {
+        "inbox_store_skew"
+    } else if s.contains("no local key")
         || s.contains("register first")
         || s.contains("create_agent_identity")
         || s.contains("unknown agent")
@@ -2783,6 +2796,19 @@ mod tests {
                 "toron: error: daemon connect (is `toron serve --mcp-http` running?)"
             ),
             "inbox_error"
+        );
+        // bd-xkte: the store is AHEAD of the binary the daemon shells, so
+        // every fetch refuses. The pin is fine and the fetch path is fine;
+        // the reason is actionable and must not dissolve into `inbox_error`.
+        assert_eq!(
+            super::inbox_fail_kind(
+                "toron: error: migrate: migration 14 is applied in \
+                 /Users/x/.local/share/toron/index.sqlite but this toron build resolves at most \
+                 13, so this binary is older than the store. Fix: rebuild or upgrade toron from \
+                 the source that wrote the store (cargo install --path crates/toron-cli), or \
+                 point --data-dir at a store this binary can open."
+            ),
+            "inbox_store_skew"
         );
     }
 
