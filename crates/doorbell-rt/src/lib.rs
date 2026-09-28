@@ -16,6 +16,7 @@ pub mod lease;
 pub mod msg;
 pub mod policy;
 pub mod pollers;
+pub mod registry_prune;
 pub mod sensors;
 pub mod sinks;
 pub mod store;
