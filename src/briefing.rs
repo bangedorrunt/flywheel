@@ -79,6 +79,18 @@ pub struct Briefing {
     /// missing menu must never be a reason a captain cannot see the plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_menu: Option<crate::crew_menu::HarnessMenu>,
+    /// bd-drlm: what the Jev pass actually did to the menu above, in one
+    /// operator-readable line. Additive and optional for the same reason the menu
+    /// is.
+    ///
+    /// It exists so a ranked menu is never a MYSTERY. Without it an operator
+    /// cannot tell "Jev ranked this" from "the deterministic order happened to
+    /// look considered", which is the exact ambiguity a ranking feature creates
+    /// and the reason it needs an audit trail. `None` means no pass was made
+    /// (unconfigured, off, or a single-option menu) — a different thing from a
+    /// pass that was made and declined, and the line says which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_ranking: Option<String>,
 }
 
 fn held_summary(paths: &[String]) -> String {
@@ -342,6 +354,10 @@ pub fn assemble(
         },
         alternatives,
         harness_menu,
+        // bd-drlm: `assemble` is PURE and stays that way — no network, no clock.
+        // The Jev pass runs in the CALLER (cmd_briefing) and writes this line, so
+        // the ranking cannot leak into the pure core that derives the menu.
+        harness_ranking: None,
         questions: vec![
             Question {
                 id: "topology".into(),

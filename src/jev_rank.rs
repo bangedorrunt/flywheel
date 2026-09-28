@@ -28,7 +28,7 @@
 //! untouched because they are tier facts, not opinions.
 
 use crate::crew_menu::{HarnessMenu, HarnessOption};
-use crate::judgment::{Answer, Answers, QuestionDef, QuestionKind, QuestionPack};
+use crate::judgment::{Answer, Answers, QuestionDef, QuestionKind, QuestionPack, Transport};
 use std::collections::{BTreeMap, HashMap};
 
 /// The fit rubric, low to high. This is a rubric about FIT, never a list of
@@ -202,6 +202,123 @@ pub fn fit_state(objective: &str) -> BTreeMap<String, String> {
     BTreeMap::from([("objective".to_string(), objective.to_string())])
 }
 
+/// `crew-fit` as a [`crate::stage::Stage`]: the first real Jev stage, and the
+/// worked example of the shape the registry exists for.
+///
+/// Preflight, because it decides who gets dispatched and so has to happen before
+/// anything is. It is a COMPOSE of two children under `All`:
+///
+/// 1. `menu-contested` — a [`crate::stage::Stage::Code`] check. A menu with one
+///    option is not a ranking, and that is decidable in Rust for free. Making it a
+///    code stage rather than a short-circuit inside the model stage means the saved
+///    round trip is a property of the COMPOSITION, visible in one place, instead of
+///    an `if` buried in a function that also does the ranking.
+/// 2. `crew-fit:rank` — the [`crate::stage::Stage::Jev`] ranking itself.
+///
+/// So a single-option menu never reaches the network, and the reason is stated by
+/// the tree rather than by a comment.
+///
+pub fn crew_fit_stage() -> crate::stage::Stage {
+    use crate::stage::{Placement, Rule, Signal, Stage, StageCtx};
+    Stage::Compose {
+        id: "crew-fit",
+        stages: vec![
+            Stage::Code {
+                id: "menu-contested",
+                placement: Placement::Preflight,
+                check: |ctx: &StageCtx| {
+                    let n = ctx.menu.options.len();
+                    if n < 2 {
+                        (
+                            Signal::Fails,
+                            format!("the menu has {n} option(s), so there is nothing to rank"),
+                        )
+                    } else {
+                        (Signal::Holds, format!("{n} candidates to rank"))
+                    }
+                },
+            },
+            Stage::Jev {
+                id: "crew-fit:rank",
+                placement: Placement::Preflight,
+                pack: |ctx: &StageCtx| fit_pack(ctx.objective, &ctx.menu.options),
+                read: |answers: &Answers, ctx: &mut StageCtx| {
+                    // Same borrow order as everywhere else: score against the roster
+                    // first, then take the mutable borrow to apply.
+                    let scores = scores_from_answers(&ctx.menu.options, answers);
+                    match apply_scores(ctx.menu, &scores) {
+                        Ranking::Reordered { moved } => {
+                            (Signal::Holds, format!("reordered {moved} option(s)"))
+                        }
+                        // A DECLINE is not a failure, and this is the live bug that
+                        // proved it. The first cut mapped `Declined` to
+                        // `Signal::Fails`, and the live briefing duly reported
+                        //     jev declined: menu-contested=Holds, crew-fit:rank=Fails
+                        // Under `Rule::All` one `Fails` makes the parent `Fails`, and
+                        // `verdict_of` turns that into `Verdict::Reject`. Nothing
+                        // gates on it today so nothing broke — but the moment
+                        // anything does, a shrug would become a DISPATCH REFUSAL.
+                        // A shrug is "no signal", which is exactly what `Unknown`
+                        // means, so that is what it maps to.
+                        Ranking::Declined { why } => (Signal::Unknown, why),
+                    }
+                },
+            },
+        ],
+        rule: Rule::All,
+    }
+}
+
+/// Rank `menu` in place with one Jev pass. The EFFECTFUL seam — the only
+/// function in this module that performs I/O, and the only reason this module
+/// needs a transport at all.
+///
+/// Everything above it is pure: the menu comes from [`crate::crew_menu`], the
+/// pack and the state are derived, and [`apply_scores`] does the reordering. So
+/// the whole judgement surface is testable with a fake transport, and this
+/// wrapper is the only part that needs a real network to exercise.
+///
+/// NEVER FAILS. A transport error, an unconfigured host, a rejected answer or a
+/// shrug all leave the menu's deterministic order exactly as it was and return
+/// `Ranking::Declined { why }` naming the reason. A crew cannot fail to be built
+/// because a model was slow, and the briefing cannot fail to render because a
+/// ranking pass errored — the door must not depend on a network call.
+///
+/// Generic over [`Transport`] precisely so the failure paths are testable: the
+/// "offline" case is the one that matters most and the one a real network makes
+/// hardest to reach on demand.
+pub fn rank_menu_with<T: Transport>(
+    objective: &str,
+    menu: &mut HarnessMenu,
+    transport: &T,
+) -> Ranking {
+    // One option is not a ranking. Asking the model to score a single harness
+    // spends a network round trip to learn something already known.
+    if menu.options.len() < 2 {
+        return Ranking::Declined {
+            why: format!(
+                "the menu has {} option(s), so there is nothing to rank",
+                menu.options.len()
+            ),
+        };
+    }
+    let pack = fit_pack(objective, &menu.options);
+    let slice = crate::judgment::build_state_slice(fit_state(objective));
+    match transport.ask(&slice, &pack) {
+        // Scores are computed BEFORE the mutable borrow: `apply_scores` takes
+        // `&mut menu`, and the roster it scored against IS `menu.options`. The
+        // borrow checker is what keeps those two in step, so the coupling lives
+        // in the order of these statements rather than in a comment.
+        Ok(answers) => {
+            let scores = scores_from_answers(&menu.options, &answers);
+            apply_scores(menu, &scores)
+        }
+        Err(e) => Ranking::Declined {
+            why: format!("Jev was unreachable, so the deterministic order stands: {e}"),
+        },
+    }
+}
+
 /// Map the pack's answers back onto candidates. PURE.
 ///
 /// A missing or non-finite number becomes confidence 0.0 rather than being skipped,
@@ -235,6 +352,7 @@ pub fn scores_from_answers(candidates: &[HarnessOption], answers: &Answers) -> V
 mod tests {
     use super::*;
     use crate::harness_registry::HarnessTier;
+    use crate::judgment::JevError;
     use std::collections::BTreeSet;
 
     fn opt(harness: &str, roles: &[&str]) -> HarnessOption {
@@ -262,6 +380,224 @@ mod tests {
             score: s,
             confidence: c,
         }
+    }
+
+    /// A transport that answers from a script, so the effectful seam is testable
+    /// without a network. `calls` counts invocations, which is how the
+    /// one-option test proves the round trip was skipped rather than merely
+    /// ignored.
+    /// What the scripted transport replies with. An enum rather than a boxed
+    /// closure so the fixture stays inspectable and `Clone` does the work.
+    #[derive(Clone)]
+    enum Reply {
+        Ok(Answers),
+        Err(JevError),
+    }
+
+    struct Scripted {
+        reply: Reply,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl Scripted {
+        fn ok(answers: Answers) -> Self {
+            Self {
+                reply: Reply::Ok(answers),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+        fn err(e: JevError) -> Self {
+            Self {
+                reply: Reply::Err(e),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Transport for Scripted {
+        fn ask(
+            &self,
+            _slice: &crate::judgment::StateSlice,
+            _pack: &QuestionPack,
+        ) -> Result<Answers, JevError> {
+            self.calls.set(self.calls.get() + 1);
+            match &self.reply {
+                Reply::Ok(a) => Ok(a.clone()),
+                Reply::Err(e) => Err(e.clone()),
+            }
+        }
+    }
+
+    /// `answers()` builds the real `Answers` shape (model_id, pack_id, version,
+    /// usage) rather than a `Default`, so a fixture that drifts from the struct
+    /// is a compile error rather than a silently-wrong test.
+    fn answers(pairs: &[(&str, f64, f64)]) -> Answers {
+        let mut by_question = BTreeMap::new();
+        for (id, position, confidence) in pairs {
+            by_question.insert(
+                (*id).to_string(),
+                Answer::Score(crate::judgment::ScoreAnswer {
+                    position: *position,
+                    levels: FIT_LEVELS.len(),
+                    confidence: *confidence,
+                }),
+            );
+        }
+        Answers {
+            model_id: "jev-test".into(),
+            pack_id: "crew-menu-fit".into(),
+            pack_version: 1,
+            by_question,
+            usage: String::new(),
+        }
+    }
+
+    /// The seam's whole contract: a transport error leaves the menu EXACTLY as it
+    /// was and names the reason. This is the case that matters most — the door
+    /// must render when the network does not — and it is the one a real network
+    /// makes hardest to reach on demand, which is why it is scripted here.
+    #[test]
+    fn an_unreachable_jev_leaves_the_menu_exactly_as_it_was() {
+        let mut m = menu(
+            3,
+            vec![opt("opencode", &["coder"]), opt("pi", &["planner"])],
+        );
+        let before: Vec<String> = m.options.iter().map(|o| o.harness.clone()).collect();
+        let t = Scripted::err(JevError::Offline("connection refused".into()));
+        let out = rank_menu_with("ship the thing", &mut m, &t);
+        assert_eq!(
+            t.calls.get(),
+            1,
+            "the pass must actually have been attempted"
+        );
+        let after: Vec<String> = m.options.iter().map(|o| o.harness.clone()).collect();
+        assert_eq!(after, before, "an offline Jev must not reorder anything");
+        match out {
+            Ranking::Declined { why } => {
+                assert!(
+                    why.contains("deterministic order stands"),
+                    "must say the order stands: {why}"
+                );
+                assert!(!why.is_empty(), "a decline must name a reason");
+            }
+            other => panic!("an unreachable Jev must decline, got {other:?}"),
+        }
+    }
+
+    /// A single-option menu has nothing to rank. The fence is on the CALL COUNT,
+    /// not the outcome: a decline for the right reason is also what a shrug
+    /// produces, so asserting the reason alone would pass even if the round trip
+    /// happened. The network call is the cost being avoided.
+    #[test]
+    fn a_single_option_menu_is_never_sent_to_jev() {
+        let mut m = menu(1, vec![opt("opencode", &["coder"])]);
+        let before: Vec<String> = m.options.iter().map(|o| o.harness.clone()).collect();
+        let t = Scripted::ok(answers(&[]));
+        let out = rank_menu_with("ship the thing", &mut m, &t);
+        assert_eq!(
+            t.calls.get(),
+            0,
+            "one option is not a ranking; the round trip must be skipped entirely"
+        );
+        let after: Vec<String> = m.options.iter().map(|o| o.harness.clone()).collect();
+        assert_eq!(after, before);
+        assert!(matches!(out, Ranking::Declined { .. }), "got {out:?}");
+    }
+
+    /// The happy path, and the reason the seam exists: a confident model moves the
+    /// order. Scored the OTHER way round on purpose — `fit_1` high, `fit_0` low — so
+    /// the pass genuinely flips the menu. The first version of this test scored
+    /// `fit_0` high, which happened to AGREE with the deterministic order, and the
+    /// ranker correctly answered "Jev agreed" — so the test went red while
+    /// proving the opposite of what it claimed. It also pins the positional
+    /// coupling: the pack's `fit_<i>` ids must line up with `menu.options`, or the
+    /// promotion lands on the wrong harness.
+    #[test]
+    fn a_confident_pass_reorders_through_the_seam() {
+        let mut m = menu(
+            2,
+            vec![opt("opencode", &["coder"]), opt("pi", &["planner"])],
+        );
+        let t = Scripted::ok(answers(&[("fit_0", 0.0, 0.95), ("fit_1", 3.0, 0.95)]));
+        let out = rank_menu_with("a hard refactor", &mut m, &t);
+        assert_eq!(t.calls.get(), 1);
+        assert!(
+            matches!(out, Ranking::Reordered { moved } if moved >= 1),
+            "a confident DISAGREEING pass must reorder, got {out:?}"
+        );
+        let after: Vec<String> = m.options.iter().map(|o| o.harness.clone()).collect();
+        assert_eq!(
+            after,
+            vec!["pi".to_string(), "opencode".to_string()],
+            "fit_1 scored 3.0, so the SECOND option must be promoted"
+        );
+    }
+
+    /// The live bug, pinned. A decline must never be able to become a `Fails`,
+    /// because under `Rule::All` that reaches `verdict_of` as `Verdict::Reject` —
+    /// and a shrug would then REFUSE A DISPATCH. The first cut mapped `Declined` to
+    /// `Fails` and the live briefing reported `crew-fit:rank=Fails`; nothing gated on
+    /// it yet, so it was a latent refusal rather than an observed one.
+    ///
+    /// The fence is on the SIGNAL, not on the wording, because the wording was never
+    /// the problem.
+    #[test]
+    fn a_decline_is_never_a_failure_so_a_shrug_can_never_refuse_a_dispatch() {
+        let mut m = menu(
+            2,
+            vec![opt("opencode", &["coder"]), opt("pi", &["planner"])],
+        );
+        // A shrug through the stage: both candidates answered below the floor.
+        let t = Scripted::ok(answers(&[("fit_0", 3.0, 0.01), ("fit_1", 0.0, 0.01)]));
+        let mut c = crate::stage::StageCtx {
+            objective: "a hard refactor",
+            menu: &mut m,
+        };
+        let report = crew_fit_stage().run(&mut c, &t);
+        assert_ne!(
+            report.signal,
+            crate::stage::Signal::Fails,
+            "a decline must not be Fails: that is one step from Verdict::Reject"
+        );
+        assert_eq!(
+            report.signal,
+            crate::stage::Signal::Unknown,
+            "no usable signal IS Unknown; got {report:?}"
+        );
+        assert!(
+            !report.detail.is_empty(),
+            "even a shrug must name its reason: {}",
+            report.detail
+        );
+        let verdict = crate::stage::verdict_of(&[report], crate::stage::Placement::Preflight);
+        assert_ne!(
+            verdict,
+            crate::stage::Verdict::Reject,
+            "and therefore must never reach Reject, got {verdict}"
+        );
+    }
+
+    /// A shrug through the SEAM (not through `apply_scores` directly): a model that
+    /// answers every question at zero confidence must leave the order alone. The
+    /// floor is the only thing standing between "the model had an opinion" and "the
+    /// model moved the menu", and this is the path a real shrug takes.
+    #[test]
+    fn a_shrug_through_the_seam_does_not_reorder() {
+        let mut m = menu(
+            2,
+            vec![opt("pi", &["planner"]), opt("opencode", &["coder"])],
+        );
+        let before: Vec<String> = m.options.iter().map(|o| o.harness.clone()).collect();
+        let t = Scripted::ok(answers(&[("fit_0", 3.0, 0.01), ("fit_1", 0.0, 0.01)]));
+        let out = rank_menu_with("a hard refactor", &mut m, &t);
+        assert_eq!(
+            t.calls.get(),
+            1,
+            "the pass was made; the ANSWER was a shrug"
+        );
+        let after: Vec<String> = m.options.iter().map(|o| o.harness.clone()).collect();
+        assert_eq!(after, before, "a shrug must not reorder, got {out:?}");
+        assert!(matches!(out, Ranking::Declined { .. }), "got {out:?}");
     }
 
     /// Jev may change the ORDER and nothing else. A ranker that can drop or add a

@@ -62,6 +62,7 @@ mod intent;
 #[allow(dead_code)]
 mod jev_rank;
 mod judgment;
+mod stage;
 // Kernel contracts are introduced incrementally; unused variants remain
 // intentionally available for the next interpreter migrations.
 #[allow(dead_code)]
@@ -13312,6 +13313,42 @@ fn cmd_briefing(
         cfg.crew_max(),
         catalog_for_menu.as_ref(),
     );
+    // bd-drlm: rank the derived menu through the STAGE, not by calling the ranker
+    // directly. `assemble` stays pure; the model call lives in a named, skippable
+    // stage so the menu's origin stays auditable, and adding a second judgment
+    // later is a matter of composing stages rather than growing this function.
+    //
+    // The gates, in order, each leaving the deterministic order standing and saying
+    // so: Jev off/unconfigured -> no pass attempted; no menu or a single-option
+    // menu -> nothing to rank; the transport (5s timeout, never retried) -> any
+    // error is Unknown. Nothing here can fail the briefing: the door must not
+    // depend on a network.
+    b.harness_ranking = Some(match judgment::jev_gate() {
+        judgment::JevGate::Off => "jev off (FLYWHEEL_JEV off) — deterministic order".to_string(),
+        judgment::JevGate::Unconfigured => {
+            "jev unconfigured (set TYPESAFE_API_KEY) — deterministic order".to_string()
+        }
+        judgment::JevGate::On => match b.harness_menu.as_mut() {
+            None => "no harness menu (no profile catalog) — nothing to rank".to_string(),
+            Some(menu) => {
+                let authority = crate::authority::RuntimeAuthority::resolve();
+                match judgment::UreqTransport::from_authority(&authority) {
+                    Err(e) => format!("jev has no usable key ({e}) — deterministic order"),
+                    Ok(transport) => {
+                        let mut ctx = stage::StageCtx { objective, menu };
+                        let report = jev_rank::crew_fit_stage().run(&mut ctx, &transport);
+                        match report.signal {
+                            stage::Signal::Holds => format!("jev {}", report.detail),
+                            stage::Signal::Fails => format!("jev declined: {}", report.detail),
+                            stage::Signal::Unknown => {
+                                format!("jev unavailable ({}): deterministic order", report.detail)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    });
     // bd-2o1v P0-5 (a): name the proposed row's profile affinity (read from
     // the workflow's steps, never re-declared) so the crew-confirm gate
     // above and the captain see the same dispatch relation.
