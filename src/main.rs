@@ -7072,11 +7072,39 @@ mod spawn_boot_reliability_tests {
         // Poll/sweep/watch/status: loud warn on observed-wake save Err.
         // bd-asr2.5 topology: the saver lives in the Brain with the arm
         // name as context (no let _ = swallow).
-        assert!(
-            brain_rt.contains("refuse silent drop (GS-039)")
-                && brain_rt.contains("observed-wake stamp FAILED on"),
-            "brain wake saves must loud-warn with arm context on failure"
-        );
+        //
+        // bd-fkfi: this asserted a string brain.rs stopped printing in
+        // e0a1871, so the bin suite has been red since and the tripwire proved
+        // nothing. The intent is not the wording, it is that a failed wake save
+        // is LOUD and says WHICH arm lost it — a loud warn without the context
+        // is what GS-039 was filed about.
+        //
+        // Scoped to `flush_wake` on purpose: `({ctx})`, `refuse silent drop` and
+        // `(GS-039)` all also appear in the journal-flush message 30 lines
+        // above, so a whole-file scan is satisfied by the WRONG message and
+        // proves nothing about the wake save. That is the same rot as the
+        // string it replaced. The four needles are the four parts of the one
+        // message, split so none straddles the line continuation rustfmt puts
+        // in the middle of the format string.
+        let wake_start = brain_rt
+            .find("\n    fn flush_wake(")
+            .expect("brain still has a flush_wake");
+        let wake_end = brain_rt[wake_start + 1..]
+            .find("\n    fn ")
+            .map(|i| wake_start + 1 + i)
+            .unwrap_or(brain_rt.len());
+        let wake_save = &brain_rt[wake_start..wake_end];
+        for needle in [
+            "wake state write FAILED on",
+            "({ctx})",
+            "refuse silent drop",
+            "(GS-039)",
+        ] {
+            assert!(
+                wake_save.contains(needle),
+                "flush_wake must print {needle:?} so a lost wake save is loud and names its arm"
+            );
+        }
         let note = crate::tripwire::find_fn(src, "doorbell_note_observed_wake");
         let note_end = crate::tripwire::find_fn(src, "upsert_workspace_receipt");
         let note_body = &src[note..note_end];
