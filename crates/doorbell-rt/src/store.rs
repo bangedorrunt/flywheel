@@ -824,6 +824,30 @@ pub struct TornTail {
     pub explained_by_drop: Option<String>,
 }
 
+impl TornTail {
+    /// One line for `doorbell why` — the surface whose whole job is to explain
+    /// the journal, and the one an operator reads before `/health`.
+    ///
+    /// The numbers come from the FIELDS, never from `reason`, and stay greppable
+    /// (`missing=`, `range=`, `withheld=`). Rendered out of `reason` they were
+    /// prose: carried only by the seq-gap case, absent for an unparseable row,
+    /// and silent about `rows_withheld` in every case — so a 16-row hole and the
+    /// 5,175-row one in flywheel-chiebukuro read identically. The reason stays
+    /// as the explanation, not as the carrier of the size.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let range = match (self.missing_from, self.missing_to) {
+            (Some(lo), Some(hi)) => format!("{lo}..={hi}"),
+            _ => "none".to_string(),
+        };
+        format!(
+            "fold stopped at {} line {}: missing={} range={} withheld={} — {}; nothing folds \
+             past the tear, so those rows are unreachable from this command too",
+            self.file, self.at_line, self.missing_seqs, range, self.rows_withheld, self.reason
+        )
+    }
+}
+
 /// One recorded retention drop: rows `rotate()` removed on purpose.
 ///
 /// The audit row already existed; what it lacked was a LINK to the seq stream,
@@ -960,6 +984,52 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    /// bd-swad: the `why` line renders from the FIELDS, so BOTH tear shapes
+    /// carry their numbers.
+    ///
+    /// The seq gap is the shape with a size; an unparseable row is the shape
+    /// without one, and it is the case the old prose line said nothing numeric
+    /// about at all. `missing=0 range=none` is the honest reading there — no
+    /// SEQ is missing, the row is — and `reason` is what names the fault.
+    #[test]
+    fn a_tear_line_names_its_size_range_and_withheld_rows() {
+        let (st, _dir) = test_store("tear-describe");
+        for seq in 1..=3u64 {
+            append_seq(&st, "w", seq);
+        }
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(st.journal_file("w"))
+                .unwrap();
+            writeln!(f, "{{not json").unwrap();
+        }
+        for seq in 4..=5u64 {
+            append_seq(&st, "w", seq);
+        }
+
+        let t = st
+            .fold_workspace("w")
+            .torn
+            .expect("a corrupt row is a tear, and silence is the bug");
+        let line = t.describe();
+        assert!(
+            line.contains("missing=0") && line.contains("range=none"),
+            "an unparseable row has no missing seqs and must say so rather than \
+             borrow a number from somewhere: {line}"
+        );
+        assert_eq!(t.rows_withheld, 3, "the corrupt row and the two after it");
+        assert!(
+            line.contains("withheld=3"),
+            "the count that the old line never carried: {line}"
+        );
+        assert!(
+            line.contains("unparseable row"),
+            "and the reason still names the fault: {line}"
+        );
     }
     #[test]
     fn rotation_keeps_generations_and_audits_drops() {

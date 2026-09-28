@@ -1284,17 +1284,16 @@ pub fn journal_read_all(state_dir: &Path) -> Vec<(String, serde_json::Value)> {
 }
 
 /// Loud fold status for `why` and `/health` (bd-asr2.4 D4.4): torn tail
-/// (file, line, reason) and the first foldable seq for retention-honest
-/// queries. `None` torn + `None` first_seq = empty journal, not an error.
+/// (file, line, size, range, rows withheld) and the first foldable seq for
+/// retention-honest queries. `None` torn + `None` first_seq = empty journal,
+/// not an error.
+///
+/// bd-swad: the tear renders through `TornTail::describe`, so the SIZE travels
+/// with the report instead of living only inside the reason sentence.
 pub fn journal_fold_status(state_dir: &Path, workspace: &str) -> (Option<String>, Option<u64>) {
     let store = doorbell_rt::FileStore::new(state_dir);
     let fold = store.fold_workspace(workspace);
-    let torn = fold.torn.map(|t| {
-        format!(
-            "fold stopped at {} line {} ({}); nothing folds past the gap",
-            t.file, t.at_line, t.reason
-        )
-    });
+    let torn = fold.torn.map(|t| t.describe());
     (torn, fold.first_seq)
 }
 
@@ -3159,6 +3158,49 @@ mod tests {
         assert_eq!(all.len(), 2, "two good entries survive the corrupt line");
         assert_eq!(all[0].0, "w1");
         assert_eq!(all[1].1["msg"]["HerdrStatus"]["pin"], "BlueRidge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-swad: `why` is the trust surface, so the tear line it prints has to
+    /// answer "how bad" without a second command.
+    ///
+    /// The numbers existed in the LoudMiss audit row (bd-9ase) and in
+    /// /health's torn_tails (bd-5qyt), and neither is the line an operator
+    /// reads first. Rendered through `reason` alone they were prose, present
+    /// only for the seq-gap case, and silent about rows_withheld in every case
+    /// — so a 16-row hole and the 5,175-row one in flywheel-chiebukuro read the
+    /// same.
+    #[test]
+    fn why_names_the_tear_size_and_what_it_hid() {
+        let dir = std::env::temp_dir().join(format!("dblwhy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("journals"));
+        // Contiguous through 3, then 10: six values (4..=9) never written, and
+        // the row AT the tear plus everything after it is unreachable from here.
+        let mut body = String::new();
+        for seq in [1u64, 2, 3, 10, 11] {
+            body.push_str(&format!(
+                "{{\"v\":2,\"seq\":{seq},\"actions\":[],\"executed\":{{}}}}\n"
+            ));
+        }
+        std::fs::write(journal_file(&dir, "probe"), body).expect("write journal");
+
+        let (torn, first_seq) = journal_fold_status(&dir, "probe");
+        let line = torn.expect("a six-seq hole is a tear, and silence is the bug");
+        assert!(
+            line.contains("missing=6"),
+            "the line must carry the hole's SIZE, not just that one exists: {line}"
+        );
+        assert!(
+            line.contains("range=4..=9"),
+            "and WHICH seqs are gone, so another surface is not needed: {line}"
+        );
+        assert!(
+            line.contains("withheld=2"),
+            "and how much history the stop makes unreachable (the row at the tear \
+             plus the one after it): {line}"
+        );
+        assert_eq!(first_seq, Some(1), "the foldable head is unchanged");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
