@@ -515,12 +515,30 @@ fn commit_is_bookkeeping_only(cwd: &Path, sha: &str) -> anyhow::Result<bool> {
 /// once the bead is closed). The bound revision is the newest commit that
 /// carries the id AND carries work.
 ///
+/// Candidates are ranked with the SUBJECT before a body mention (bd-y98h).
+/// A work commit carries the id in its subject (bracketed in the subject line);
+/// the pre-commit guard's citation duty is what puts a SIBLING lane's id in the
+/// BODY, because a hunk beside that lane's work must cite their bead id to
+/// commit at all. Live 2026-09-28: a lane's body said "file_host.rs is reserved
+/// CopperWren/bd-xkte and carries their in-flight work, so the call site is not
+/// mine to add" one minute after the work commit, became the newest candidate,
+/// and `ledger check` demanded a verdict at THEIR sha for MY bead — a reopen of
+/// finished, gated work. Preferring the subject keeps every honest close bound
+/// where it was; the body mention is only consulted when NO commit carries the
+/// id in its subject.
+///
 /// Fail-closed: when EVERY candidate is bookkeeping-only, the newest one is
 /// still returned — the id is attributable and "no commit carries the id"
 /// would be a lie that reopens a legal close.
 pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
+    // The subject rides along so the ranking is decided from ONE git call.
     let out = StdCommand::new("git")
-        .args(["log", "--all", &format!("--grep={bead_id}"), "--format=%H"])
+        .args([
+            "log",
+            "--all",
+            &format!("--grep={bead_id}"),
+            "--format=%H%x1f%s",
+        ])
         .current_dir(cwd)
         .output()
         .map_err(|e| anyhow::anyhow!("git not found: {e}"))?;
@@ -531,12 +549,16 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
         );
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let candidates: Vec<&str> = stdout
+    let parsed: Vec<(String, bool)> = stdout
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .map(|l| match l.split_once('\u{1f}') {
+            Some((sha, subject)) => (sha.to_string(), subject.contains(bead_id)),
+            None => (l.to_string(), false),
+        })
         .collect();
-    if candidates.is_empty() {
+    if parsed.is_empty() {
         anyhow::bail!(
             "SHA rule: no commit carries the bead id {bead_id} (git log --all --grep) — \
              close is illegal regardless of verdicts"
@@ -547,8 +569,9 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     // `commit_is_bookkeeping_only` answers "not bookkeeping" for it, so on its
     // own it used to be handed out as the bound revision — a LEGAL close for a
     // commit that proves nothing. Refuse instead of certifying.
-    let candidates: Vec<&str> = candidates
-        .into_iter()
+    let candidates: Vec<&str> = parsed
+        .iter()
+        .map(|(sha, _)| sha.as_str())
         .filter(|sha| !commit_changes_nothing(cwd, sha).unwrap_or(false))
         .collect();
     if candidates.is_empty() {
@@ -557,14 +580,27 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
              so none of them can prove it — close against the commit that carries the work"
         );
     }
-    for sha in &candidates {
+    // Ranked: subject-carrying non-empty commits first, in git's newest-first
+    // order; the full non-empty set only when no commit carries the id in its
+    // subject (a pre-marker shape, still attributable).
+    let ranked: Vec<&str> = parsed
+        .iter()
+        .filter(|(sha, subject)| *subject && candidates.contains(&sha.as_str()))
+        .map(|(sha, _)| sha.as_str())
+        .collect();
+    let ranked = if ranked.is_empty() {
+        candidates
+    } else {
+        ranked
+    };
+    for sha in &ranked {
         if !commit_is_bookkeeping_only(cwd, sha)? {
             return Ok((*sha).to_string());
         }
     }
     // Every candidate is bookkeeping-only: the id is still attributable and
     // "no commit carries the id" would be a lie that reopens a legal close.
-    Ok(candidates[0].to_string())
+    Ok(ranked[0].to_string())
 }
 
 /// Git stdout for `args` in `cwd`, trimmed of the trailing newline.
@@ -1944,6 +1980,45 @@ mod tests {
     // ---- bd-w1-sha-xyhd: SHA invariant at close-detect ----
 
     /// Stage everything and commit `msg` in `dir`.
+    /// bd-y98h: a later commit that only MENTIONS the id in its BODY must not
+    /// steal the bound revision from the work commit that carries it in its
+    /// SUBJECT.
+    ///
+    /// Live on 2026-09-28: a lane's commit body said "crates/...\/file_host.rs
+    /// is reserved CopperWren/bd-xkte and carries their in-flight work, so the
+    /// call site is not mine to add". It landed one minute after my work commit
+    /// and became the newest candidate, so `flywheel ledger check` demanded a
+    /// verdict at THEIR sha for MY bead — and the close-detect loop turns that
+    /// into a reopen of finished, gated work.
+    ///
+    /// The guard makes this happen on its own: it REQUIRES every bd-* token in
+    /// added diff lines to appear in the commit message, so a commit touching
+    /// code beside another lane's work must cite that lane's id. Honoring the
+    /// guard must not move someone else's binding.
+    #[test]
+    fn derive_head_sha_prefers_the_subject_and_ignores_a_body_mention() {
+        let (dir, bead_id) = scratch_workspace("sha-subject-wins");
+        // The work commit: the id rides the SUBJECT, as every real one does.
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/fix.rs"), "// fix\n").unwrap();
+        let work = derive_head_sha(&dir, &bead_id).unwrap();
+        // A later lane's commit that only MENTIONS the id, in prose, in the body.
+        std::fs::write(dir.join("src/other.rs"), "// other lane\n").unwrap();
+        commit_all(
+            &dir,
+            &format!(
+                "feat: another lane\n\nNot touching that file: it is reserved another pin/{bead_id} \
+                 and carries their in-flight work, so the call site is not mine to add.\n"
+            ),
+        );
+        assert_ne!(work, head_sha(&dir), "HEAD moved past the work commit");
+        assert_eq!(
+            derive_head_sha(&dir, &bead_id).unwrap(),
+            work,
+            "a body mention must not move the bound revision off the work commit"
+        );
+    }
+
     fn commit_all(dir: &Path, msg: &str) {
         let add = StdCommand::new("git")
             .args(["add", "-A"])
