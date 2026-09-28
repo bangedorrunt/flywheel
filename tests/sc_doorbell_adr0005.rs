@@ -638,3 +638,53 @@ async fn sc_d1_live_kind9_channel_post_rings() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// bd-swad: `doorbell why` is the trust surface, so a tear has to arrive with
+/// its SIZE on the line an operator reads.
+///
+/// Unit tests pin `journal_fold_status`; this one pins the command — argv, the
+/// real XDG state-dir layout, and the string that actually reaches stderr. It
+/// runs with a bare HOME and CONFIG on purpose: the tear has to be readable in
+/// an environment that has no user config at all, which is the state a fresh
+/// machine and a CI runner are both in.
+#[test]
+fn doorbell_why_names_the_tear_size_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("fw-why-tear-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let state = dir.join("state");
+    fs::create_dir_all(state.join("flywheel/journals")).expect("journals dir");
+    // Contiguous through seq 3, then 10: six values (4..=9) were never
+    // written, and the row at the tear plus everything after it is withheld.
+    let mut body = String::new();
+    for seq in [1u64, 2, 3, 10, 11] {
+        body.push_str(&format!(
+            "{{\"v\":2,\"seq\":{seq},\"actions\":[],\"executed\":{{}}}}\n"
+        ));
+    }
+    fs::write(
+        state.join("flywheel/journals/doorbell-journal-probe.jsonl"),
+        body,
+    )
+    .expect("write torn journal");
+
+    let out = Command::new(flywheel())
+        .args(["doorbell", "why", "probe", "SomePin"])
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("HOME", &dir)
+        .output()
+        .expect("flywheel doorbell why runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a torn journal is a reportable fact, not a fatal error: {stderr}"
+    );
+    assert!(
+        stderr.contains("missing=6")
+            && stderr.contains("range=4..=9")
+            && stderr.contains("withheld=2"),
+        "the tear line must carry its size, its range and the rows it hides, \
+         not just that a tear exists: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
