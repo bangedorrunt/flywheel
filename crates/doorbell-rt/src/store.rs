@@ -1730,6 +1730,81 @@ mod prune_tests {
         }
     }
 
+    /// bd-3uqz item D: the `.unanswered` file is what gate P2b reads to decide
+    /// whether a crew is INVISIBLE, and it had no test at all. The bead asked for a
+    /// row-retention policy; the measurement says retention is already structural,
+    /// and this is the fence that proves it rather than a comment that claims it.
+    ///
+    /// `Hear::heard` and the late-pubkey path both `unanswered.remove(pin)`, and
+    /// `persist_hear` REWRITES the whole file from the live set on every sweep. So a
+    /// row exists if and only if the pin is unanswered right now. An unanswered pin
+    /// from three weeks ago is not "stale data needing a window" — if it were still
+    /// unanswered it would be re-written every sweep, and if it is not in the file
+    /// it is already answered. There is nothing for an age policy to reclaim, and
+    /// building one would add a SECOND mechanism for a job the daemon already does
+    /// correctly, in the one file whose loss disarms a gate.
+    #[test]
+    fn unanswered_retention_is_structural_a_rewrite_drops_the_answered_pins() {
+        let dir = std::env::temp_dir().join(format!("unans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = FileStore::new(&dir);
+
+        // The daemon's first sweep finds three pins it could not wake.
+        st.save_unanswered(
+            "w",
+            &[
+                "EmberOtter".into(),
+                "TealMarlin".into(),
+                "IvoryRidge".into(),
+            ],
+        );
+        // Compared as a SET, not a sequence. `load_unanswered` returns file order
+        // and the order is not a contract: `save_unanswered` writes whatever the
+        // caller passed, and `Hear::seed_unanswered` feeds a BTreeSet, which
+        // normalizes. Asserting an order here would pin a property nothing relies
+        // on and would fail on a harmless reordering.
+        let mut round_trip = st.load_unanswered("w");
+        round_trip.sort();
+        assert_eq!(
+            round_trip,
+            vec!["EmberOtter", "IvoryRidge", "TealMarlin"],
+            "a round trip must preserve every pin: this file IS the P2b signal"
+        );
+
+        // EmberOtter is answered, so `heard` removed it and the next persist_hear
+        // rewrites the file without it. No window, no clock, no policy.
+        st.save_unanswered("w", &["TealMarlin".into(), "IvoryRidge".into()]);
+        let mut after = st.load_unanswered("w");
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["IvoryRidge", "TealMarlin"],
+            "a pin that stopped being unanswered must LEAVE, with no age policy involved"
+        );
+
+        // And the file keeps existing even with nothing in it. P2b reads this path,
+        // so a future "skip writing when the list is empty" optimisation would turn
+        // "no invisible pins" into "the file is gone" — indistinguishable from a
+        // daemon that never looked. The file must stay, and stay empty.
+        st.save_unanswered("w", &[]);
+        assert!(
+            st.unanswered_file("w").exists(),
+            "the file must EXIST even with zero pins: P2b reads it by path, and a \
+             missing file is indistinguishable from one that was never written"
+        );
+        assert!(
+            st.load_unanswered("w").is_empty(),
+            "and must read as no pins rather than as a phantom row"
+        );
+
+        // A workspace never seen reads as empty rather than failing.
+        assert!(
+            st.load_unanswered("never-seen").is_empty(),
+            "an absent file is an empty signal, not an error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// bd-3uqz item E: `seq_holes` on its own, because every case here encodes a
     /// different real event and a percentage alone is easy to agree with by
     /// accident.
