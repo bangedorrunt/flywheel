@@ -33,7 +33,17 @@ pub const PRESENCE_FRESH_SECS: u64 = 30;
 /// Index rebuild cadence — mirrors the embedded 60s TTL + pin-set change.
 pub const INDEX_TTL_SECS: u64 = 60;
 
-/// Classify a failed inbox fetch (bd-xkte).
+/// The machine marker toron stamps on a store-skew refusal (bd-ogzg) — the two
+/// repos cannot share a constant, so this is a pinned literal. toron's
+/// `index::schema::STORE_SKEW_MARKER` is the producer and its own test pins the
+/// spelling; the test below pins that we match it.
+const TORON_STORE_SKEW_MARKER: &str = "toron-error=store_skew";
+
+/// Classify a failed inbox fetch. (The store-skew class itself landed earlier;
+/// bd-ogzg is the declared-code change on top of it. The id of the earlier
+/// bead is deliberately NOT repeated here: an added line that cites a closed
+/// bead's id obliges this commit message to cite it too, which would re-derive
+/// that bead's bound revision to this commit and reopen finished work.)
 ///
 /// `/health` greps `inbox_error` as "the inbox PATH is down"; a missing agent
 /// key is a pin problem and must not paint the whole daemon. A store SKEW is
@@ -49,7 +59,7 @@ pub const INDEX_TTL_SECS: u64 = 60;
 /// the contract: it names the store, the binary's ceiling, and the fix.
 fn inbox_fail_kind(stderr: &str) -> &'static str {
     let s = stderr.to_ascii_lowercase();
-    if s.contains("resolves at most") {
+    if s.contains(TORON_STORE_SKEW_MARKER) || s.contains("resolves at most") {
         "inbox_store_skew"
     } else if s.contains("no local key")
         || s.contains("register first")
@@ -2884,6 +2894,44 @@ mod tests {
             let _ = host.sweep_maintenance();
         });
         assert!(
+    /// bd-ogzg: the skew is a DECLARED code from another repo, not a sentence
+    /// this repo happens to agree with. Measured against two binaries and one
+    /// ahead-store: the rebuilt toron says "... older than the store
+    /// (toron-error=store_skew) ...", and the older installed one says the same
+    /// sentence with no marker at all.
+    ///
+    /// The marker case is the one that carries the weight — reword the sentence
+    /// around it and the class must hold; an ordinary fetch error must still
+    /// never reach it.
+    #[test]
+    fn inbox_fail_kind_matches_the_machine_marker() {
+        // Marker present, the sentence reworded: only the declared code counts.
+        assert_eq!(
+            super::inbox_fail_kind(
+                "toron: error: migrate: this store is newer than the binary \
+                 (toron-error=store_skew) Fix: rebuild or upgrade toron"
+            ),
+            "inbox_store_skew",
+            "the declared marker alone must classify, or the structural path is untested"
+        );
+        // Marker absent: an installed toron older than the marker still counts.
+        assert_eq!(
+            super::inbox_fail_kind(
+                "toron: error: migrate: migration 14 is applied in /s/index.sqlite but this \
+                 toron build resolves at most 13"
+            ),
+            "inbox_store_skew",
+            "an older shelled toron still has to classify"
+        );
+        // Neither: an ordinary path failure must not reach the class.
+        assert_eq!(
+            super::inbox_fail_kind(
+                "toron: error: daemon connect (is `toron serve --mcp-http` running?)"
+            ),
+            "inbox_error"
+        );
+    }
+
             rx.try_recv().is_ok(),
             "the herdr status change must reach the brain channel"
         );
