@@ -2894,6 +2894,12 @@ mod tests {
             let _ = host.sweep_maintenance();
         });
         assert!(
+            rx.try_recv().is_ok(),
+            "the herdr status change must reach the brain channel"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// bd-ogzg: the skew is a DECLARED code from another repo, not a sentence
     /// this repo happens to agree with. Measured against two binaries and one
     /// ahead-store: the rebuilt toron says "... older than the store
@@ -2930,12 +2936,6 @@ mod tests {
             ),
             "inbox_error"
         );
-    }
-
-            rx.try_recv().is_ok(),
-            "the herdr status change must reach the brain channel"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
