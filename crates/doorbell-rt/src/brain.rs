@@ -6,12 +6,18 @@
 //! (sensors fetch off-loop and deliver results as messages).
 
 use crate::api::Stats;
+use crate::file_host::should_audit_count;
 use crate::host::{Effect, Host};
 use crate::msg::{AskKind, AskReply, BrainMsg};
 use crate::sinks::{SendOutcome, SinkManager, Undelivered};
 use crate::store::FileStore;
 use doorbell_core::{PinBudget, take_allowed_like};
 use std::collections::BTreeMap;
+
+/// bd-5qyt: a journal append that failed. The row carries the seq the write
+/// could not take and the running count, so a lost row NAMES itself instead of
+/// surfacing later as an unattributable hole in the seq stream.
+pub const AUDIT_JOURNAL_WRITE_FAILED: &str = "journal_write_failed";
 
 pub struct BrainConfig {
     pub workspace: String,
@@ -158,6 +164,10 @@ pub struct Brain<H: Host> {
     /// many deaths it stands for. Reset on a real restart. Same shape as
     /// `dedup_high_us`: bounded sampling of a repeat, never silence.
     inert_died: u64,
+    /// Journal appends that FAILED (bd-5qyt). A failed write must not consume a
+    /// seq, so this is the tally of rows the journal still owes; the audit rows
+    /// ride it for the row count and it names the seq that could not be written.
+    journal_write_failed: u64,
     /// Consecutive unanswered expiries per pin (S3 deaf digest names
     /// subscriber + attempts; corr binds in bd-asr2.11 with receipts).
     deaf_attempts: BTreeMap<String, u32>,
@@ -250,6 +260,7 @@ impl<H: Host> Brain<H> {
             sweep_last: None,
             next_seq,
             inert_died: 0,
+            journal_write_failed: 0,
             deaf_attempts: BTreeMap::new(),
             dedup_high_us: None,
             sla_seen: std::collections::BTreeSet::new(),
@@ -1014,9 +1025,14 @@ impl<H: Host> Brain<H> {
                 })
                 .collect::<Vec<_>>()
         );
+        // bd-5qyt: the seq is spent only by a row that EXISTS. Taking it first
+        // and discarding the error (`let _ = ...`) burned a seq per failed
+        // append and left a hole nothing could attribute — measured: 16 seqs
+        // gone from flywheel-opencode, contiguous on both sides, not covered by
+        // any retention record. A gap is evidence, so the fix NAMES the loss
+        // (below) rather than hiding it by moving the counter.
         let seq = self.next_seq;
-        self.next_seq += 1;
-        let _ = self.store.append_journal_seq(
+        let written = self.store.append_journal_seq(
             &self.cfg.workspace,
             msg,
             &actions,
@@ -1025,6 +1041,33 @@ impl<H: Host> Brain<H> {
             Some(seq),
             Some(self.cfg.subscriber.as_str()),
         );
+        match written {
+            Ok(()) => self.next_seq += 1,
+            Err(e) => {
+                self.journal_write_failed += 1;
+                // GS-039: refuse the silent drop. Nothing else in the process
+                // notices a failed append, and a dropped decision row is worse
+                // than a dropped prompt — the fold reads the journal as truth.
+                eprintln!(
+                    "doorbell-rt: journal append FAILED on {} — refuse silent drop (GS-039), \
+                     seq {seq} stays owed: {e:#}",
+                    self.cfg.workspace
+                );
+                // Sampled like every other repeat here (1,2,3,5,9...): a full
+                // disk fails every tick, and the `failed` field keeps the
+                // repeat legible as one number instead of one row per tick.
+                if should_audit_count(self.journal_write_failed as usize - 1) {
+                    self.audit(
+                        AUDIT_JOURNAL_WRITE_FAILED,
+                        serde_json::json!({
+                            "seq": seq,
+                            "failed": self.journal_write_failed,
+                            "error": format!("{e:#}"),
+                        }),
+                    );
+                }
+            }
+        }
     }
 
     fn audit(&self, kind: &str, mut detail: serde_json::Value) {
@@ -1511,6 +1554,81 @@ mod tests {
             journal.matches("\"stage\":\"dedup\"").count(),
             2,
             "first 90 and 95 trace; the repeated 95 stays silent: {journal}"
+        );
+    }
+
+    /// bd-5qyt: a failing append must not consume a seq and must not be silent.
+    ///
+    /// Live shape this reproduces: `doorbell-journal-flywheel-opencode.jsonl`
+    /// ran contiguous through 4,633 sequenced rows except one hole — seq 153410
+    /// then 153427, with the 16 values between them in NO journal file and no
+    /// retention record covering the range. `journal()` took the seq, advanced
+    /// `next_seq` and threw the append's error away (`let _ = ...`), so each
+    /// failed write burned a seq and the hole was its only trace.
+    ///
+    /// The fault is real, not mocked: a DIRECTORY sits where the active journal
+    /// belongs, so `private_append` fails with EISDIR while the audit sidecar
+    /// (a different subdirectory) stays writable.
+    #[tokio::test]
+    async fn journal_write_failure_is_named_not_swallowed() {
+        let (mut brain, _rx, _tx) = test_brain("writefail", vec![]);
+        let blocked = brain.store.journal_file("w");
+        std::fs::create_dir_all(&blocked).expect("block the journal path");
+        let start = brain.next_seq;
+        let sweep = serde_json::json!({"rt_kind": "Sweep"});
+        for _ in 0..3 {
+            brain.journal(&sweep, &[], serde_json::json!({}), &[]);
+        }
+        assert_eq!(
+            brain.next_seq, start,
+            "a seq that was never written must not be consumed; the failed rows owe {start}"
+        );
+
+        let audit = std::fs::read_to_string(brain.store.audit_file("w")).expect("audit sidecar");
+        let rows: Vec<serde_json::Value> = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|v: &serde_json::Value| {
+                v.get("kind").and_then(|k| k.as_str()) == Some("journal_write_failed")
+            })
+            .collect();
+        let last = rows.last().expect("the loss must NAME itself, not vanish");
+        assert_eq!(
+            last.get("seq").and_then(|s| s.as_u64()),
+            Some(start),
+            "the row carries the seq that could not be written: {last}"
+        );
+        assert_eq!(
+            last.get("failed").and_then(|f| f.as_u64()),
+            Some(3),
+            "and the counter, so a run of failures reads as N not as one: {last}"
+        );
+        assert!(
+            last.get("error").is_some_and(|e| !e.is_null()),
+            "nor may it drop WHY: {last}"
+        );
+
+        // The retry the counter promises: unblocked, the SAME seq lands, so the
+        // journal has no hole to explain and nothing is owed.
+        std::fs::remove_dir_all(&blocked).expect("unblock the journal path");
+        brain.journal(&sweep, &[], serde_json::json!({}), &[]);
+        assert_eq!(
+            brain.next_seq,
+            start + 1,
+            "the row landed, so now the seq is spent"
+        );
+        assert_eq!(
+            brain.store.last_seq("w"),
+            start,
+            "the recovered row carries exactly the seq that failed"
+        );
+        assert!(
+            brain.store.fold_workspace("w").torn.is_none(),
+            "a recovered write leaves no tear behind"
+        );
+        assert_eq!(
+            brain.journal_write_failed, 3,
+            "and the tally survives the recovery"
         );
     }
 

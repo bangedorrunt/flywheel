@@ -94,9 +94,10 @@ fn full_channel_action(reported: &std::sync::atomic::AtomicBool) -> FullChannelA
 /// every power of two. Bounded (a 10,000-line flood leaves ~13 rows) and never
 /// silent, which is the whole point — the flood this replaces was invisible.
 ///
-/// Shared by the drop counter and the death-relay counter: both are repeats of
-/// one fault, and a repeat is a COUNT with a sampled row, not a row each.
-fn should_audit_count(prior_count: usize) -> bool {
+/// Shared by the drop counter, the death-relay counter and the journal
+/// write-failure counter: all three are repeats of one fault, and a repeat is a
+/// COUNT with a sampled row, not a row each.
+pub(crate) fn should_audit_count(prior_count: usize) -> bool {
     prior_count == 0 || prior_count.is_power_of_two()
 }
 
