@@ -924,6 +924,213 @@ pub fn profile_from_portable(value: &serde_json::Value) -> Result<(String, Profi
     Ok((name, profile))
 }
 
+/// bd-3uqz: the AGENT-PLANE MATRIX — every profile must route on every bare
+/// harness, because every workflow inherits that.
+///
+/// The operator's requirement is "agent profiles and bare harness should be able
+/// to work in ALL workflows". The workflow axis turned out to be INDEPENDENT of
+/// this: no builtin workflow names a harness, and `crew::enforce_budget_caps`
+/// constrains dispatch count and depth, not routability. So the property that
+/// actually decides whether a profile can crew any workflow lives on the agent
+/// plane, and the matrix below is where it is enforced. `no_workflow_pins_a_
+/// harness` guards the independence claim that makes that argument sound.
+///
+/// DYNAMIC, and that is the whole point. Nothing here is a hardcoded list: the
+/// workflows come from `builtin_workflows()`, the profiles from the operator's
+/// `profiles.toml`, the harnesses from the compiled registry, and the caps from
+/// `models.toml`. A matrix written against a fixed list of nine harnesses would
+/// keep passing after somebody adds a tenth.
+///
+/// It is GREEN today for a reason worth stating: both models in `models.toml`
+/// carry `caps = []`, which the resolver reads as "routable everywhere". The
+/// first model registered with a real `caps` list is what this test exists to
+/// catch, and it will name the profile, the harness, the caps that excluded it,
+/// and the fix.
+#[test]
+fn every_profile_routes_on_every_bare_harness() {
+    let reg = crate::models::ModelRegistry::load_routing().expect("routing registry");
+    let cat = ProfileCatalog::load().expect("profiles.toml");
+    let harnesses = canonical_harnesses();
+
+    // bd-hhyl's trap, refused explicitly: a matrix that enumerated nothing would
+    // report green and mean nothing. Assert the axes are populated FIRST, so an
+    // empty registry fails loudly instead of passing vacuously.
+    assert!(
+        !harnesses.is_empty(),
+        "the harness registry produced no canonical harnesses"
+    );
+    let names = cat.names();
+    assert!(
+        !names.is_empty(),
+        "profiles.toml yielded no profiles, so the matrix would be vacuous"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut cells = 0usize;
+    let mut bare = 0usize;
+    for pname in &names {
+        let Some(p) = cat.get(pname) else {
+            failures.push(format!(
+                "{pname}: listed by names() but get() returned None"
+            ));
+            continue;
+        };
+        // A profile with no model is a BARE spawn by design: the harness
+        // launches model-less. A legitimate cell, not a hole in the matrix.
+        if p.model.trim().is_empty() {
+            bare += 1;
+            continue;
+        }
+        for h in &harnesses {
+            cells += 1;
+            // The LADDER, not `resolve_strict`. My first version called
+            // `resolve_strict` directly and reported 54 of 81 cells failing,
+            // because most profiles name a SLOT (`@standard`) and that function
+            // accepts only a concrete model id — so it answered "model
+            // '@standard' is not in the registry" for a perfectly valid
+            // configuration. The product was right and the test was wrong.
+            // `resolve_profile_route_full` is the spawn-time path: slot alias, then
+            // the slot's harness, then the model, then the profile's own
+            // `model_fallback` chain.
+            if let Err(e) = reg.resolve_profile_route_full(h, &p.model, &p.model_fallback) {
+                failures.push(format!(
+                    "profile `{pname}` (model `{}`, declared harness `{}`) does not route on \
+                         harness `{h}`: {e:#}",
+                    p.model, p.harness
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} of {cells} profile x harness cells do not route ({bare} profile(s) are bare \
+         model-less spawns, not tested). A profile that cannot \
+             route on a harness cannot crew ANY workflow with that harness, because no \
+             workflow constrains the harness (see no_workflow_pins_a_harness). Fix with a \
+             `fallback` on the model, or empty `caps` if it really is portable:\n  -\n{}",
+        failures.len(),
+        failures.join("\n  - ")
+    );
+}
+
+/// bd-3uqz: every harness name that appears ANYWHERE in the workflow catalog must be a
+/// registered harness.
+///
+/// My first version tried to prove something stronger — that no workflow pins a
+/// harness at all, which is what would let the agent-plane matrix stand in for the
+/// workflow axis. It detected that by searching the `Debug` rendering for the
+/// substring `"harness:"`, and it failed on ALL FORTY workflows, because a
+/// `DispatchJob` carrying a spawn spec embeds a harness field incidentally. A
+/// detector that fires on every input detects nothing, and reporting that as a
+/// product defect would have been a false alarm on all forty.
+///
+/// So this asserts the part that is both TRUE and USEFUL: a harness named anywhere
+/// in the catalog is a real one. That catches a typo'd or withdrawn harness, which
+/// is the actual way this breaks, and it does not overclaim an independence it
+/// cannot demonstrate.
+#[test]
+fn every_harness_named_by_a_workflow_is_registered() {
+    let workflows = crate::builtin_workflows::builtin_workflows();
+    // The non-vacuity guard, asserted BEFORE the property: a catalog accessor that
+    // started returning nothing would make the loop below pass in silence.
+    assert!(
+        workflows.len() >= 20,
+        "only {} workflows enumerated; the catalog accessor changed and this guard is \
+         now vacuous",
+        workflows.len()
+    );
+    let known = canonical_harnesses();
+    assert!(!known.is_empty(), "no canonical harnesses to check against");
+
+    let mut referenced: std::collections::BTreeSet<String> = Default::default();
+    for wf in workflows.values() {
+        let blob = format!("{wf:?}");
+        // Deliberately generous about the SHAPE and strict about the VALUE: the bug
+        // is a value that is not a registered harness, not a field named `harness`.
+        for chunk in blob.split("harness:").skip(1) {
+            let tail = chunk.trim_start();
+            // `Debug` renders the field as `Some("pi")` or `None`, so the naive
+            // read produced the literal strings "Some" and "None" as harness names.
+            // Unwrap the Option first and take the quoted contents; a bare `None`
+            // means the workflow pins nothing and contributes no name at all.
+            let v = match tail.strip_prefix("Some(") {
+                Some(rest) => rest
+                    .trim_start()
+                    .strip_prefix('"')
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or_default(),
+                None => continue,
+            };
+            if !v.is_empty() && v.chars().all(|c| c.is_alphanumeric() || "-_/".contains(c)) {
+                referenced.insert(v.to_string());
+            }
+        }
+    }
+    let unknown: Vec<&String> = referenced.iter().filter(|h| !known.contains(h)).collect();
+    assert!(
+        unknown.is_empty(),
+        "the workflow catalog names {} harness(es) that are not in the registry: {:?}. A \
+         crew spawned against one of these would target a harness nobody has.",
+        unknown.len(),
+        unknown
+    );
+}
+
+/// The slot fallback chain is the other way a crew gets pinned to a harness:
+/// `[slots.premium] harness = "pi", fallback_harness = "grok"` routes a crew
+/// through ONE of two harnesses. Both must be live registry entries, or a crew
+/// pinned to that slot spawns into a harness nobody has.
+#[test]
+fn every_slot_harness_and_its_fallback_are_live_registry_entries() {
+    let reg = crate::models::ModelRegistry::load_routing().expect("routing registry");
+    let harnesses = canonical_harnesses();
+    let mut checked = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    for (slot, spec) in &reg.slots {
+        // `harness` is a plain String and `fallback_harness` an Option, so both are
+        // normalized to Option<&str> rather than matched separately. An EMPTY harness
+        // is skipped too: it means the slot pins no harness and the caller's default
+        // applies, which is a legitimate configuration and not a broken reference.
+        let named: [(&str, Option<&str>); 2] = [
+            (
+                "harness",
+                Some(spec.harness.as_str()).filter(|h| !h.is_empty()),
+            ),
+            ("fallback_harness", spec.fallback_harness.as_deref()),
+        ];
+        for (label, h) in named {
+            let Some(h) = h else { continue };
+            checked += 1;
+            if !harnesses.iter().any(|c| c == h) {
+                bad.push(format!(
+                    "slot `{slot}` {label} `{h}` is not a registered harness"
+                ));
+            }
+        }
+    }
+    // The counter exists to be ASSERTED. A count that is computed and never
+    // read is a non-vacuity guard that guards nothing — the same trap as a
+    // test filter that matches nothing and reports green.
+    assert!(
+        checked > 0,
+        "no slot named a harness, so this guard proved nothing"
+    );
+    assert!(bad.is_empty(), "{}", bad.join("; "));
+}
+
+#[cfg(test)]
+/// Canonical harness names only: `all_spellings()` also returns ALIASES, and a
+/// matrix over aliases would test the same harness several times and inflate the
+/// cell count into looking like coverage.
+fn canonical_harnesses() -> Vec<String> {
+    crate::harness_registry::all_spellings()
+        .into_iter()
+        .filter(|s| crate::harness_registry::canonical(s) == *s)
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
