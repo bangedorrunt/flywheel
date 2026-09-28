@@ -105,6 +105,46 @@ pub const RETENTION_BYTES: u64 = 5 * 1024 * 1024;
 /// Generations kept besides the active file.
 pub const RETENTION_GENS: usize = 4;
 
+/// bd-3uqz: the workspace a journal file belongs to, generation suffix included.
+///
+/// Returns `None` for a file that is not a journal of ours.
+///
+/// The generation suffix is stripped because the LIVENESS guard in
+/// `prune_unhosted_workspace_logs` has to recognise it. That guard reads
+/// `doorbell-journal-<ws>.jsonl`, and for `doorbell-journal-flywheel.1.jsonl` a
+/// naive prefix-strip plus `.jsonl` strip yields `flywheel.1` — a workspace that
+/// is not in the hosted set even when `flywheel` is. The prune then deleted a live
+/// crew's retained history on age. A comment claimed the generation file "is
+/// covered by the same workspace name"; the code did not do that.
+///
+/// Only a trailing run of DIGITS is treated as the generation, because workspace
+/// names legitimately contain dots — `flywheel-toron.dev` and `flywheel-torondev`
+/// are both real rows in this state directory. Stripping the last dot-segment
+/// unconditionally would merge those two distinct workspaces into one name and
+/// hand a dead workspace's protection to a live one, which is the same class of
+/// error pointed the other way.
+pub fn journal_workspace(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("doorbell-journal-")?;
+    let rest = rest.strip_suffix(".jsonl")?;
+    let ws = match rest.rsplit_once('.') {
+        // A generation is digits, and something must remain in front of the dot.
+        Some((head, tail))
+            if !head.is_empty() && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            head
+        }
+        _ => rest,
+    };
+    // Never hand back a name that identifies nothing. `doorbell-journal-.jsonl`
+    // and `doorbell-journal-flywheel..jsonl` are malformed files, not workspaces,
+    // and a caller that receives Some("") has been handed a key no hosted set can
+    // ever contain — which is the same missing-liveness-guard failure one level up.
+    if ws.is_empty() || ws.ends_with('.') {
+        return None;
+    }
+    Some(ws)
+}
+
 /// bd-lorot: what a prune pass did. Counted so the hourly tick can be honest
 /// about it rather than deleting silently.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -184,15 +224,15 @@ impl FileStore {
         if let Ok(entries) = std::fs::read_dir(self.state_dir.join("journals")) {
             for entry in entries.filter_map(std::result::Result::ok) {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(ws) = name
-                    .strip_prefix("doorbell-journal-")
-                    .and_then(|n| n.strip_suffix(".jsonl"))
-                else {
+                // bd-3uqz: parse through the shared helper so a GENERATION file
+                // resolves to the workspace it belongs to. The previous inline
+                // parse produced `flywheel.1`, which is in no hosted set, so every
+                // retained generation of every live workspace was a prune
+                // candidate the moment it aged past the window. What the comment
+                // here claimed, and the code did not do.
+                let Some(ws) = journal_workspace(&name) else {
                     continue;
                 };
-                // A generation file (`…<ws>.1.jsonl`) is covered by the same
-                // workspace name, so pruning the active file's siblings is safe
-                // once the workspace itself is gone.
                 if live.contains(ws) {
                     continue;
                 }
@@ -1542,6 +1582,116 @@ mod prune_tests {
     fn ws_file(dir: &Path, ws: &str) -> PathBuf {
         dir.join("journals")
             .join(format!("doorbell-journal-{ws}.jsonl"))
+    }
+
+    fn ws_gen_file(dir: &Path, ws: &str, generation: usize) -> PathBuf {
+        dir.join("journals")
+            .join(format!("doorbell-journal-{ws}.{generation}.jsonl"))
+    }
+
+    /// bd-3uqz: the name parser, on its own, because the DOT cases are the ones
+    /// that would regress silently. Only a trailing run of digits is a generation:
+    /// `flywheel-toron.dev` and `flywheel-torondev` are both real workspaces in this
+    /// state directory, so an unconditional last-dot-strip would merge two distinct
+    /// workspaces and hand a dead one's protection to a live one — the same class
+    /// of error pointed the other way.
+    #[test]
+    fn a_journal_name_resolves_to_its_workspace_generation_or_not() {
+        for (name, want) in [
+            ("doorbell-journal-flywheel.jsonl", Some("flywheel")),
+            ("doorbell-journal-flywheel.1.jsonl", Some("flywheel")),
+            ("doorbell-journal-flywheel.4.jsonl", Some("flywheel")),
+            (
+                "doorbell-journal-flywheel-toron.dev.jsonl",
+                Some("flywheel-toron.dev"),
+            ),
+            (
+                "doorbell-journal-flywheel-toron.dev.2.jsonl",
+                Some("flywheel-toron.dev"),
+            ),
+            ("doorbell-journal-flywheel.abc.jsonl", Some("flywheel.abc")),
+            ("doorbell-journal-flywheel.1x.jsonl", Some("flywheel.1x")),
+            // Nothing in front of the dot, or nothing behind it: not a generation,
+            // and not a workspace either.
+            ("doorbell-journal-.jsonl", None),
+            ("doorbell-journal-flywheel..jsonl", None),
+            // Not ours.
+            ("flywheel.audit.jsonl", None),
+            ("doorbell-journal-flywheel.jsonl.bak", None),
+        ] {
+            assert_eq!(journal_workspace(name), want, "for {name}");
+        }
+    }
+
+    /// bd-3uqz: the age prune's LIVENESS GUARD does not see a generation file.
+    ///
+    /// The guard parses the workspace name with
+    /// `strip_prefix("doorbell-journal-")` then `strip_suffix(".jsonl")`. For
+    /// `doorbell-journal-flywheel.1.jsonl` that yields the name `flywheel.1`, not
+    /// `flywheel`, so `live.contains("flywheel.1")` is false for a workspace that
+    /// is hosted RIGHT NOW. A comment above the guard asserts the opposite —
+    /// "A generation file is covered by the same workspace name" — and the code
+    /// does not do what the comment says.
+    ///
+    /// The consequence is silent and it eats the thing retention exists to keep:
+    /// the daemon passes 7 days in production, so any generation file older than
+    /// a week is deleted even for a live crew. `rotate` later shifts `.1 -> .2`
+    /// over a hole, which is exactly the shape that made seven workspaces read
+    /// "torn" for days while the daemon believed it had kept its history.
+    ///
+    /// The sibling test above only ever wrote the ACTIVE file, so this
+    /// intersection — hosted workspace, generation file, aged out — was never
+    /// exercised. A fence in a comment is not a fence.
+    #[test]
+    fn a_hosted_workspaces_rotation_generations_are_never_age_pruned() {
+        let dir = std::env::temp_dir().join(format!("prune-gen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).expect("dirs");
+        let store = FileStore::new(&dir);
+        let now = 2_000_000_000u64;
+        const OLD: u64 = 30 * 24 * 60 * 60;
+
+        // One hosted workspace, its active file and all four retained generations.
+        for generation in 0..=super::RETENTION_GENS {
+            let path = if generation == 0 {
+                ws_file(&dir, "live")
+            } else {
+                ws_gen_file(&dir, "live", generation)
+            };
+            std::fs::write(&path, "row\n").expect("write");
+            let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - OLD);
+            std::fs::File::open(&path)
+                .and_then(|f| f.set_modified(old))
+                .unwrap_or_else(|e| panic!("age {}: {e}", path.display()));
+        }
+        // A genuinely abandoned workspace, generation file included, as the control.
+        std::fs::write(ws_gen_file(&dir, "gone", 1), "row\n").expect("write");
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - OLD);
+        std::fs::File::open(ws_gen_file(&dir, "gone", 1))
+            .and_then(|f| f.set_modified(old))
+            .expect("age gone");
+
+        let live = BTreeSet::from(["live".to_string()]);
+        let report = store.prune_unhosted_workspace_logs(&live, 7 * 24 * 60 * 60, now);
+
+        for generation in 0..=super::RETENTION_GENS {
+            let path = if generation == 0 {
+                ws_file(&dir, "live")
+            } else {
+                ws_gen_file(&dir, "live", generation)
+            };
+            assert!(
+                path.exists(),
+                "generation {generation} of a HOSTED workspace was pruned: {report:?}"
+            );
+        }
+        assert!(
+            !ws_gen_file(&dir, "gone", 1).exists(),
+            "the control must still prune: an unhosted workspace's generation is the thing \
+             this policy exists to reclaim"
+        );
+        assert_eq!(report.journals_removed, 1, "only the control: {report:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-lorot: an unhosted, old journal goes; a hosted one and a young one
