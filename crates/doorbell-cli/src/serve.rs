@@ -244,6 +244,28 @@ fn any_fresh(ages: &[Option<u64>], fresh_secs: u64) -> bool {
     ages.iter().any(|a| a.is_some_and(|age| age <= fresh_secs))
 }
 
+/// Every spelling a store-skew refusal can appear under, in one list so the
+/// probe stays independent of both the path and the arm that wrote the row.
+/// The first two are toron's own text (the marker arrived in a later build than
+/// the sentence, so during an upgrade window the marker is exactly what is
+/// missing). The last two are kinds OUR classifier writes, and a row only
+/// carries them because a refusal was already matched — proof on their own.
+const STORE_SKEW_NEEDLES: [&str; 4] = [
+    doorbell_rt::file_host::TORON_STORE_SKEW_MARKER,
+    doorbell_rt::file_host::TORON_STORE_SKEW_PROSE,
+    "\"kind\":\"inbox_store_skew\"",
+    "\"kind\":\"ack_sla_store_skew\"",
+];
+
+/// Age of the newest store-skew refusal in one audit file, whichever arm wrote
+/// it. The oldest match does not win: a skew is live if ANY spelling is fresh.
+fn store_skew_age(audit: &std::path::Path, now: u64) -> Option<u64> {
+    STORE_SKEW_NEEDLES
+        .iter()
+        .filter_map(|needle| doorbell_rt::tailprobe::newest_match_age_secs(audit, needle, now))
+        .min()
+}
+
 /// Watch-thrash measurement window. A healthy quiet watcher idle-exits at
 /// 90s and is respawned after the retry gate (~109s cadence measured live),
 /// so individual restarts are routine and two workspaces phase them
@@ -1878,16 +1900,14 @@ fn health_body(app: &AppState) -> String {
     // this fault never takes. ONE workspace is proof here, because the row
     // names a store, not a workspace. Live 2026-09-28: every fetch refused and
     // `/health` still read `degraded: []`.
-    let skew_ages: Vec<Option<u64>> = audits
-        .iter()
-        .map(|p| {
-            doorbell_rt::tailprobe::newest_match_age_secs(
-                p.as_path(),
-                "\"kind\":\"inbox_store_skew\"",
-                now,
-            )
-        })
-        .collect();
+    //
+    // bd-r39p: and it keys on the marker in the refusal TEXT, not on a row
+    // kind. Keyed on the kind it could only ever see `inbox_store_skew`, which
+    // is written by one arm — while the arm that actually failed live was
+    // `scan_ack_sla`, refused by the same shared store at the same moment under
+    // `ack_sla_error`. The store does not care which caller asked, so neither
+    // does the probe.
+    let skew_ages: Vec<Option<u64>> = audits.iter().map(|p| store_skew_age(p, now)).collect();
     if any_fresh(&skew_ages, PROBE_FRESH_SECS) {
         degraded.push("inbox_store_skew".to_string());
     }
@@ -2694,6 +2714,72 @@ mod tests {
         assert!(
             !body.contains("inbox_fetch_failing"),
             "one workspace with a fetch error is still not a dead fetch path: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-r39p: the probe keyed on the row KIND, so the only kind that could
+    /// ever satisfy it was the one `fetch_inbox` writes — and the arm that
+    /// actually failed live was `scan_ack_sla`, whose rows carry the same
+    /// refusal in their `error` field under a different kind. Live 2026-09-28:
+    /// the store refused every minute and `/health` read `degraded: []`.
+    ///
+    /// The fault is a property of the SHARED store, not of a row kind or a
+    /// workspace, so the probe keys on the marker toron stamps in the refusal
+    /// text and finds it wherever it lands. Both spellings are accepted: the
+    /// marker once toron is rebuilt past the migration that introduced it, and
+    /// the sentence it always carried, so the probe works during the upgrade
+    /// window instead of going blind exactly when skew is live.
+    #[test]
+    fn health_degrades_on_a_store_skew_marker_in_any_audit_kind() {
+        use super::{AppState, CachedHealth, health_body};
+        let dir = std::env::temp_dir().join(format!("db-health-skew2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
+        std::fs::create_dir_all(dir.join("journals")).expect("mkdir journal");
+        let ts = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 5, 0)
+            .expect("now in range")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let refusal = "toron refuses this store: migration 14 is ahead of the \
+                       binary, which resolves at most 13 [toron-error=store_skew]";
+        // The kind is ack_sla_error: the arm that actually failed. Under the
+        // kind-keyed probe this row was invisible, and the skew with it.
+        std::fs::write(
+            dir.join("doorbell/ws-a.audit.jsonl"),
+            format!("{{\"ts\":\"{ts}\",\"kind\":\"ack_sla_error\",\"error\":\"{refusal}\"}}\n"),
+        )
+        .expect("write audit");
+        std::fs::write(dir.join("doorbell/ws-b.audit.jsonl"), "").expect("write audit");
+        let app = AppState {
+            started: std::time::Instant::now(),
+            fw_state: dir.clone(),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![
+                host_for_test("flywheel/ws-a"),
+                host_for_test("flywheel/ws-b"),
+            ])),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: std::time::Instant::now(),
+            })),
+        };
+        let body = health_body(&app);
+        assert!(
+            body.contains("inbox_store_skew"),
+            "a refusal carrying the marker degrades the daemon whatever kind wrote it: {body}"
+        );
+        // A stale marker is history, not a live fault.
+        let old = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 4000, 0)
+            .expect("old in range")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        std::fs::write(
+            dir.join("doorbell/ws-a.audit.jsonl"),
+            format!("{{\"ts\":\"{old}\",\"kind\":\"ack_sla_error\",\"error\":\"{refusal}\"}}\n"),
+        )
+        .expect("rewrite audit");
+        let body = health_body(&app);
+        assert!(
+            !body.contains("inbox_store_skew"),
+            "a skew the operator already fixed is not a live fault: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
