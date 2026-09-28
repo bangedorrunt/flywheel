@@ -52,7 +52,13 @@ pub trait Host: Send {
     fn scan_ack_sla(&mut self) -> Vec<String>;
     /// Restart the wake consumer with backoff (GS-007 never-deaf rule).
     /// The brain calls this on `Died`; results re-enter as watch Msgs.
-    fn restart_wake(&mut self);
+    ///
+    /// Returns `true` when this call actually took the restart slot, i.e. a
+    /// restart was performed; `false` when the death coalesced into one
+    /// already pending (every real host is single-flight). The brain journals
+    /// a `RestartWatch` row only for `true`, so the row and the `/health`
+    /// count mean restarts, not deaths (bd-watch-restart-metric-8dvf).
+    fn restart_wake(&mut self) -> bool;
     /// Binary-generation gate (.5: `WatcherGen`; default allows).
     fn inject_allowed(&self, _pin: &str) -> bool {
         true
@@ -114,6 +120,10 @@ pub struct MockHost {
     pub script: std::collections::VecDeque<Vec<Effect>>,
     pub tick_log: Vec<String>,
     pub restarts: u32,
+    /// Single-flight gate, mirroring `FileHost`: while a restart is pending,
+    /// further deaths coalesce instead of scheduling their own. Tests clear it
+    /// to model the gate reopening.
+    pub restart_pending: bool,
     /// Last-known status per pin, recorded at tick time (mirrors the
     /// real hosts so `prev_status` ordering is testable at the brain).
     pub statuses: BTreeMap<String, String>,
@@ -131,6 +141,7 @@ impl MockHost {
             script: Default::default(),
             tick_log: Vec::new(),
             restarts: 0,
+            restart_pending: false,
             statuses: Default::default(),
             unroutable: Default::default(),
         }
@@ -177,8 +188,13 @@ impl Host for MockHost {
         std::mem::take(&mut self.sla)
     }
 
-    fn restart_wake(&mut self) {
+    fn restart_wake(&mut self) -> bool {
+        if self.restart_pending {
+            return false;
+        }
+        self.restart_pending = true;
         self.restarts += 1;
+        true
     }
 
     fn has_route(&self, pin: &str) -> bool {
