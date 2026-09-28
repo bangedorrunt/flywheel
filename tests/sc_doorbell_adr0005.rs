@@ -481,6 +481,15 @@ fn toron_run(data_dir: &Path, args: &[&str]) -> Output {
         .arg("--json")
         .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
+        // bd-6bpg: TORON_MCP_URL beats the data-dir pin — toron says so out
+        // loud ("the DAEMON wins — the data-dir pin is being IGNORED"). This
+        // host has one exported, so every call below could have run against a
+        // live `toron serve`'s SHARED store while the assertions still passed:
+        // a green that proves nothing about the store this test pinned.
+        // Measured with a hostile URL (http://127.0.0.1:9/mcp): without this
+        // line `channel create` dies on "daemon connect", with it the test
+        // reads only its own data dir. Same defense toron's own e2e carries.
+        .env_remove("TORON_MCP_URL")
         // bd-un3t: the wake socket is MACHINE-scoped, not data-dir scoped.
         // `wake_sock::discover_sock_path` resolves `$XDG_STATE_HOME/toron/
         // wake.sock` and never consults TORON_MCP_DATA_DIR — deliberately, so
