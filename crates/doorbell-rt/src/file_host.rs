@@ -640,20 +640,32 @@ pub struct FileHost {
     /// The single live wake-socket consumer (shared with the restart task so
     /// a replacement aborts its predecessor). [`tokio::task::AbortHandle`]
     /// aborts on drop-scope, mirroring the old child reap.
-    wake_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    /// Holds the handle AND the flag that marks this consumer retired. bd-v7uu:
+    /// the pair travels together so a replacement cannot abort a consumer without
+    /// also being able to say it was deliberate.
+    wake_task: std::sync::Arc<std::sync::Mutex<Option<(tokio::task::AbortHandle, RetireFlag)>>>,
 }
 
 impl Drop for FileHost {
     /// Never outlive a live consumer: dropping the host (shutdown, or a
     /// retired generation) aborts the socket task instead of orphaning it.
+    ///
+    /// Marked retired first, for the same reason the restart path does: this is a
+    /// deliberate retirement, and reporting it as a lost consumer would be a lie
+    /// that also advances a backoff nobody is waiting on.
     fn drop(&mut self) {
         if let Ok(mut g) = self.wake_task.lock()
-            && let Some(h) = g.take()
+            && let Some((h, retire)) = g.take()
         {
+            retire.store(true, std::sync::atomic::Ordering::SeqCst);
             h.abort();
         }
     }
 }
+
+/// Set by whoever replaces a wake consumer, so its monitor can tell a deliberate
+/// retirement from a consumer that vanished on its own. bd-v7uu.
+type RetireFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
 impl FileHost {
     pub fn new(cfg: FileHostConfig) -> Self {
@@ -1508,14 +1520,17 @@ impl Host for FileHost {
             .unwrap_or_default()
     }
 
-    fn restart_wake(&mut self) {
+    /// Returns `true` when this death took the restart slot, `false` when it
+    /// coalesced into one already pending — the brain journals a restart row
+    /// only for `true` (bd-watch-restart-metric-8dvf).
+    fn restart_wake(&mut self) -> bool {
         // SINGLE-FLIGHT, before anything else. A burst of `Died` collapses to
         // one scheduled restart. Without this the backoff spaces nothing: every
         // death brings its own timer, and they all fire together after the
         // sleep — which is exactly how 1,613 connects landed in one second.
         use std::sync::atomic::Ordering;
         if self.restart_pending.swap(true, Ordering::SeqCst) {
-            return;
+            return false;
         }
         // The 16s cap is deliberate (GS-007 never-deaf: probing forever beats
         // going wake-blind), so the loop itself is not the bug. What was broken
@@ -1543,8 +1558,15 @@ impl Host for FileHost {
             pending.store(false, std::sync::atomic::Ordering::SeqCst);
             let Some(tx) = tx else { return };
             if let Ok(mut g) = slot.lock()
-                && let Some(h) = g.take()
+                && let Some((h, retire)) = g.take()
             {
+                // bd-v7uu: mark the predecessor RETIRED before aborting it. An
+                // abort closes the channel with no terminal outcome, which the
+                // consumer's monitor cannot otherwise distinguish from a crash — so
+                // every intentional restart logged `wake_consumer_dropped` and
+                // forwarded a synthetic `Died` that advanced the retry backoff. The
+                // recovery was counting itself as a failure.
+                retire.store(true, std::sync::atomic::Ordering::SeqCst);
                 h.abort();
             }
             let opts = crate::wake_sock::WakeOpts::new(
@@ -1560,6 +1582,7 @@ impl Host for FileHost {
             // let the borrow escape the 'static future.
             let absent_rows = absent.clone();
             let absent_for_audit = absent.clone();
+            let retire = opts.retire_flag();
             let handle = crate::wake_sock::spawn_wake_task(
                 opts,
                 move |kind, detail| {
@@ -1613,9 +1636,10 @@ impl Host for FileHost {
                 },
             );
             if let Ok(mut g) = slot.lock() {
-                *g = Some(handle);
+                *g = Some((handle, retire));
             }
         });
+        true
     }
 
     fn inject_allowed(&self, _pin: &str) -> bool {
@@ -2673,13 +2697,27 @@ mod tests {
         host.tx = Some(tokio::sync::mpsc::channel(64).0);
 
         rt.block_on(async {
-            host.restart_wake();
+            // bd-watch-restart-metric-8dvf: the gate's own answer IS the
+            // honest metric (the brain journals a restart row only for `true`).
+            // One death restarted; the other 50 coalesced and must report that
+            // they did not, or the journal counts deaths.
+            let mut took_the_slot = 0;
+            if host.restart_wake() {
+                took_the_slot += 1;
+            }
             for _ in 0..50 {
-                host.restart_wake();
+                if host.restart_wake() {
+                    took_the_slot += 1;
+                }
             }
             // Let the single scheduled task reach its sleep; the burst is
             // coalesced during the sleep, which is the window that matters.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                took_the_slot, 1,
+                "51 deaths reported {took_the_slot} restarts; the journal counts this answer, \
+                 so a gate that let each death through would count deaths as restarts"
+            );
         });
 
         let fails = host.retry.lock().expect("gate").fails();

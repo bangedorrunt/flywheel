@@ -166,6 +166,17 @@ pub struct WakeOpts {
     pub project: Option<String>,
     pub handshake_timeout: Duration,
     pub idle_timeout: Duration,
+    /// Set by whoever REPLACES this consumer, immediately before aborting it.
+    ///
+    /// bd-v7uu: a deliberate replacement and a crash both close the channel
+    /// without a terminal outcome, so the monitor could not tell them apart and
+    /// reported every restart as `wake_consumer_dropped` — AND forwarded a
+    /// synthetic `Died`, which advanced the retry backoff. Measured live: 36 rows
+    /// in 30 minutes, all in one workspace, the audit bursts, then a tail whose
+    /// spacing widened (65s, 71s, 192s, 337s, 569s) because each intentional
+    /// restart was counted as a failure by the very mechanism performing it. The
+    /// recovery was poisoning its own backoff and reading as an incident.
+    pub retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WakeOpts {
@@ -176,7 +187,15 @@ impl WakeOpts {
             project,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: IDLE_TIMEOUT,
+            retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// The flag the replacement sets. Held by the restarter so it can retire this
+    /// consumer without reaching into the task.
+    #[must_use]
+    pub fn retire_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.retired)
     }
 }
 
@@ -203,6 +222,9 @@ pub fn spawn_wake_task(
     on_event: impl Fn(WakeOutcome) + Send + 'static,
 ) -> tokio::task::AbortHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WakeOutcome>();
+    // Cloned BEFORE `opts` moves into the worker, because the monitor thread below
+    // is the only one that needs to know whether this consumer was retired.
+    let retired = opts.retire_flag();
     let audit = std::sync::Arc::new(on_audit);
     let worker_audit = audit.clone();
     let worker = tokio::spawn(async move {
@@ -223,7 +245,12 @@ pub fn spawn_wake_task(
                 break;
             }
         }
-        if !terminal {
+        // A RETIRED consumer is not a lost consumer. It was replaced on purpose,
+        // the replacement is already armed, and forwarding a synthetic `Died` here
+        // would both misreport a healthy restart AND advance the backoff that the
+        // restart was supposed to reset. Silence is correct here; the audit row and
+        // the inferred outcome are for consumers that vanish on their own.
+        if !terminal && !retired.load(std::sync::atomic::Ordering::SeqCst) {
             // bd-gdfe: the worker ended (panic, abort, unwind) with NO
             // terminal outcome. Journal the loss, then forward exactly one
             // Died so the brain re-arms — a consumer may never vanish
@@ -343,6 +370,136 @@ async fn run_wake_loop(
 
 #[cfg(test)]
 mod tests {
+
+    /// bd-v7uu: a DELIBERATELY retired consumer is silent; one that vanishes on
+    /// its own is still loud.
+    ///
+    /// This is the fix for a live incident I misread at first. The audit showed 36
+    /// `wake_consumer_dropped` rows in 30 minutes in one workspace and I took it
+    /// for the EMFILE storm returning. It was the restart path: a replacement
+    /// aborts its predecessor, an abort closes the channel with no terminal
+    /// outcome, and the monitor could not tell that from a crash — so it wrote the
+    /// row AND forwarded a synthetic `Died`, which advanced the retry backoff. The
+    /// tail's widening spacing (65s, 71s, 192s, 337s, 569s) was the backoff being
+    /// driven by the recovery itself.
+    ///
+    /// Both halves matter and the second is the one a "fix" would have dropped: a
+    /// crash must STILL be reported, or the doorbell goes wake-blind, which is the
+    /// permanent failure the original row exists to prevent.
+    #[test]
+    fn a_retired_consumer_is_silent_and_a_lost_one_is_still_loud() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // `spawn_wake_task` calls `tokio::spawn`, so it needs a runtime. A
+        // multi-thread one, because the abort below targets a task that has to be
+        // scheduled at least once for the abort to be a RETIREMENT rather than a
+        // cancellation-before-start.
+        // The consumer must be ALIVE and healthy when the abort lands, or the test
+        // measures the wrong thing. My first version pointed at a socket that did
+        // not exist, so the worker reported ITSELF (absent socket -> Died) before
+        // the abort mattered and the flag appeared to do nothing.
+        //
+        // So: bind a real socket, complete the handshake, and only then retire.
+        fn run_one(retire: bool) -> (usize, usize) {
+            use std::io::Write as _;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let path = std::env::temp_dir().join(format!(
+                "bd-v7uu-{}-{}.sock",
+                std::process::id(),
+                if retire { "retire" } else { "lost" }
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener =
+                std::os::unix::net::UnixListener::bind(&path).expect("bind a real socket");
+
+            let audits = Arc::new(AtomicUsize::new(0));
+            let died = Arc::new(AtomicUsize::new(0));
+            let (a, d) = (audits.clone(), died.clone());
+            let opts = WakeOpts {
+                sock_path: path.clone(),
+                kinds: vec![1u16],
+                project: Some("demo".into()),
+                handshake_timeout: Duration::from_millis(500),
+                // Long enough that idle is never what ends it; only the abort can.
+                idle_timeout: Duration::from_secs(30),
+                retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let flag = opts.retire_flag();
+
+            // The server side: accept once, complete the handshake, then hold.
+            let server = std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let _ = sock.write_all(b"{\"heartbeat\":{\"ts_ms\":5}}\n");
+                    let _ = sock.write_all(b"{\"eose\":{\"cursor\":\"1\"}}\n");
+                    let _ = sock.flush();
+                    // Hold the connection open until the consumer is gone.
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let _ = sock.shutdown(std::net::Shutdown::Both);
+                }
+            });
+
+            rt.block_on(async {
+                let handle = spawn_wake_task(
+                    opts,
+                    move |_kind, _v| {
+                        a.fetch_add(1, Ordering::SeqCst);
+                    },
+                    move |out| {
+                        // ONLY a forwarded Died. Counting every outcome made a
+                        // healthy handshake frame read as a death, which is how the
+                        // first two versions of this fence failed for the wrong
+                        // reason.
+                        if matches!(out, WakeOutcome::Died) {
+                            d.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                );
+                // Let the handshake land so the consumer is genuinely healthy.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if retire {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                // Abort is how a replacement retires a predecessor. Both arms do the
+                // SAME thing to the task; only the flag differs, so anything the two
+                // disagree about is the flag's doing.
+                handle.abort();
+                for _ in 0..300 {
+                    if !retire && audits.load(Ordering::SeqCst) > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            server.join().ok();
+            let _ = std::fs::remove_file(&path);
+            (audits.load(Ordering::SeqCst), died.load(Ordering::SeqCst))
+        }
+
+        let (a_retired, d_retired) = run_one(true);
+        assert_eq!(
+            (a_retired, d_retired),
+            (0, 0),
+            "a deliberate replacement must be SILENT: no wake_consumer_dropped row \
+             and no synthetic Died, because the replacement is already armed and a \
+             synthetic death advances the backoff the restart was meant to reset"
+        );
+
+        let (a_lost, d_lost) = run_one(false);
+        assert_eq!(
+            a_lost, 1,
+            "a consumer that vanishes on its own MUST still be reported — this row \
+             is what prevents the permanent wake-blind gap"
+        );
+        assert_eq!(
+            d_lost, 1,
+            "and it must forward exactly one inferred Died so the brain re-arms"
+        );
+    }
     use super::*;
 
     #[test]
@@ -461,6 +618,7 @@ mod tests {
             project: None,
             handshake_timeout: Duration::from_secs(2),
             idle_timeout: Duration::from_secs(2),
+            retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let audit = std::sync::Arc::new(|_: &str, _: serde_json::Value| {});
@@ -528,6 +686,7 @@ mod tests {
             project: None,
             handshake_timeout: Duration::from_secs(2),
             idle_timeout: Duration::from_millis(400),
+            retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         rt.block_on(run_wake_loop(opts, &tx, &audit));
@@ -578,6 +737,7 @@ mod tests {
             project: None,
             handshake_timeout: Duration::from_millis(100),
             idle_timeout: Duration::from_millis(100),
+            retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<WakeOutcome>(8);
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -619,6 +779,7 @@ mod tests {
             project: None,
             handshake_timeout: Duration::from_millis(200),
             idle_timeout: Duration::from_millis(200),
+            retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let audits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
