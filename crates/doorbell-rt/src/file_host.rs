@@ -673,6 +673,9 @@ pub struct FileHost {
     /// through this channel (forwarder topology over a poll transport).
     tx: Option<tokio::sync::mpsc::Sender<BrainMsg>>,
     pending_audit: Option<(String, serde_json::Value)>,
+    /// The registry file whose ambiguity was last audited, so a standing
+    /// ambiguity is reported once instead of once per sweep.
+    registry_ambiguous_reported: Option<String>,
     /// The single live wake-socket consumer (shared with the restart task so
     /// a replacement aborts its predecessor). [`tokio::task::AbortHandle`]
     /// aborts on drop-scope, mirroring the old child reap.
@@ -737,6 +740,7 @@ impl FileHost {
             generation,
             tx: None,
             pending_audit: None,
+            registry_ambiguous_reported: None,
             wake_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -771,13 +775,26 @@ impl FileHost {
             &self.cfg.project,
             self.cfg.registry_file.as_deref(),
         );
-        if let Some(chosen) = ambiguous_file {
-            // bd-ztek: name the chosen file — first-sorted used to sweep a
-            // stale fleet's pins with no trace of which file won.
-            self.pending_audit = Some((
-                "registry_ambiguous".into(),
-                serde_json::json!({ "project": self.cfg.project, "registry_file": chosen }),
-            ));
+        match ambiguous_file {
+            Some(chosen) => {
+                // ONE row per outage, not one per sweep. The registry is never
+                // garbage-collected, so a standing ambiguity can run for days:
+                // 36 sweeps a minute named the same file and wrote ~52k rows a
+                // day, which is how the loudest line in the journal becomes the
+                // one readers skip. bd-ztek still keeps the name, because
+                // first-sorted used to sweep a stale fleet's pins with no trace
+                // of which file won.
+                if self.registry_ambiguous_reported.as_deref() != Some(chosen.as_str()) {
+                    self.registry_ambiguous_reported = Some(chosen.clone());
+                    self.pending_audit = Some((
+                        "registry_ambiguous".into(),
+                        serde_json::json!({ "project": self.cfg.project, "registry_file": chosen }),
+                    ));
+                }
+            }
+            // Cleared: a later ambiguity is a NEW outage and must be audited
+            // again, or dedupe would silence the second incident entirely.
+            None => self.registry_ambiguous_reported = None,
         }
         rows
     }
@@ -1928,6 +1945,41 @@ mod tests {
         cfg.herdr_bin = "true".into();
         cfg.registry_file = Some(dir.join("agents").join("proj.json"));
         (FileHost::new(cfg), dir)
+    }
+
+    /// The registry has no garbage collection, so an ambiguity can persist for
+    /// days. Auditing it once per sweep wrote 1,644 rows in 45 minutes, every
+    /// one naming the same file — a row every 1.7s, ~52k a day — and trained
+    /// the reader to skip it. Deduped to one row per outage, which is the rule
+    /// the socket's own absent-audit already follows.
+    #[test]
+    fn a_persistent_registry_ambiguity_is_audited_once_not_per_sweep() {
+        let dir = tmp_state("registry-drip");
+        for hashed in ["proj-aaaaaaaa", "proj-bbbbbbbb"] {
+            std::fs::write(
+                dir.join("agents").join(format!("{hashed}.json")),
+                serde_json::to_string(&entries()).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
+        cfg.toron_bin = "true".into();
+        cfg.herdr_bin = "true".into();
+        let mut host = FileHost::new(cfg);
+
+        let mut audits = 0;
+        for _ in 0..36 {
+            let _ = host.registry_rows();
+            if host.pending_audit.take().is_some() {
+                audits += 1;
+            }
+        }
+        assert_eq!(
+            audits, 1,
+            "36 sweeps of one persistent ambiguity wrote {audits} audit rows; live it ran \
+             once per 1.7s for a day, 52k rows all naming a single file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn entries() -> serde_json::Value {
