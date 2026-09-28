@@ -1591,12 +1591,6 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
     }
     (min_age.filter(|a| *a != u64::MAX), max_seq)
 }
-/// bd-k0p7: a build older than this is worth degrading on. Chosen to sit
-/// above a normal rebuild-and-restart cycle (minutes) and well below the 11h
-/// the last incident actually ran, so a daemon nobody rebuilt cannot read as
-/// fresh.
-pub(super) const BUILD_STALE_SECS: u64 = 6 * 60 * 60;
-
 /// The build identity of the RUNNING executable. The IO half of bd-k0p7: it
 /// resolves `current_exe` and stats it, then hands the observation to the
 /// pure [`doorbell_rt::api::resolve_build_stamp`]. Never trusts the source
@@ -1628,7 +1622,8 @@ pub(super) fn running_build_stamp(now_unix: u64) -> doorbell_rt::api::BuildStamp
 ///
 /// bd-k0p7 built this field to catch a real incident: a committed doorbell-cli
 /// fix sat unrun for 11h because flywheel was rebuilt and doorbell was not. But
-/// it implemented the catch as a WALL-CLOCK AGE test (`age_s > BUILD_STALE_SECS`),
+/// it implemented the catch as a WALL-CLOCK AGE test (`age_s` older than a
+/// fixed six-hour window),
 /// and age is a proxy for staleness, not staleness. Measured 2026-09-28 on this
 /// host: the only doorbell source change in the preceding 4.5h was a
 /// rustfmt-only commit (3 insertions, 12 deletions, all line rewrapping), so the
@@ -1718,6 +1713,18 @@ fn known_journal_workspaces(fw_state: &std::path::Path) -> Vec<String> {
     out
 }
 
+/// A daemon in standby that already knows workspaces is blind to every wake.
+///
+/// Standby means no hosted loop, so no rings, no inbox-digest wake and no
+/// ack-SLA nudge are delivered, and nothing in the daemon notices. This is also
+/// the exact shape `/health` reports for the first seconds after a restart,
+/// before the daemon auto-hosts from subscriptions: a boot window, not a failed
+/// restart. A standby daemon over an empty state dir is legitimately quiet and
+/// stays green.
+pub(super) fn standby_blind_to_wakes(hosted: usize, known_workspaces: usize) -> bool {
+    hosted == 0 && known_workspaces > 0
+}
+
 fn health_body(app: &AppState) -> String {
     // bd-2o1v: hosting is dynamic — snapshot under the lock once.
     // GS-062: alive-first + alphabetical slug (not insertion order).
@@ -1742,7 +1749,7 @@ fn health_body(app: &AppState) -> String {
     // nudges — every wake path degrades to manual and NOTHING notices. Mark it
     // degraded and name the arming verb so `arrive`/`briefing`/`status` see it.
     let known_workspaces = known_journal_workspaces(&app.fw_state);
-    let wake_blind = mode == "standby" && !known_workspaces.is_empty();
+    let wake_blind = standby_blind_to_wakes(hosted.len(), known_workspaces.len());
     if wake_blind {
         degraded.push("standby_with_known_workspaces".to_string());
     }
@@ -2031,6 +2038,11 @@ mod tests {
     use super::known_journal_workspaces;
     use super::{PortHolder, classify_port_holder};
 
+    /// The superseded wall-clock window, kept as a fixture: only the tests that
+    /// describe what the age rule USED to degrade still need the number, and a
+    /// production constant nobody reads is a build warning, not a policy.
+    const LEGACY_BUILD_STALE_SECS: u64 = 6 * 60 * 60;
+
     /// bd-y40k: the drain's timeout verdict must SURFACE in the straggler
     /// note — a diagnosis nobody prints pins nothing.
     #[test]
@@ -2173,7 +2185,7 @@ mod tests {
         let old = doorbell_rt::api::resolve_build_stamp(Some((1_000_000 - 39_600, 1)), 1_000_000);
         assert_eq!(old.age_s, Some(39_600), "uptime stays visible");
         assert!(
-            old.age_s.is_some_and(|a| a > super::BUILD_STALE_SECS),
+            old.age_s.is_some_and(|a| a > LEGACY_BUILD_STALE_SECS),
             "and it still exceeds the advisory window, so the context is unchanged"
         );
     }
@@ -2186,15 +2198,41 @@ mod tests {
         let unknown = doorbell_rt::api::resolve_build_stamp(None, 1_000_000);
         assert_eq!(unknown.age_s, None);
         assert!(
-            !unknown.age_s.is_some_and(|a| a > super::BUILD_STALE_SECS),
+            !unknown.age_s.is_some_and(|a| a > LEGACY_BUILD_STALE_SECS),
             "unknown must not read as stale"
         );
         // And a build inside the window is fresh.
         let fresh = doorbell_rt::api::resolve_build_stamp(Some((1_000_000 - 60, 1)), 1_000_000);
-        assert!(!fresh.age_s.is_some_and(|a| a > super::BUILD_STALE_SECS));
+        assert!(!fresh.age_s.is_some_and(|a| a > LEGACY_BUILD_STALE_SECS));
         // The 11h incident shape IS stale.
         let stale = doorbell_rt::api::resolve_build_stamp(Some((1_000_000 - 39_600, 1)), 1_000_000);
-        assert!(stale.age_s.is_some_and(|a| a > super::BUILD_STALE_SECS));
+        assert!(stale.age_s.is_some_and(|a| a > LEGACY_BUILD_STALE_SECS));
+    }
+
+    /// The `/health` shape seen for the first seconds after a restart:
+    /// `standby`, no hosted loop, and a state dir that already knows
+    /// workspaces. It reads like a failed restart and is not one — the daemon
+    /// auto-hosts from subscriptions moments later.
+    ///
+    /// Pinned at the predicate so the boot window cannot be reported as a
+    /// broken plane, and so a standby daemon over an empty state dir never
+    /// borrows the flag to look degraded.
+    #[test]
+    fn a_standby_window_over_a_known_state_dir_is_degraded() {
+        use super::standby_blind_to_wakes;
+
+        assert!(
+            standby_blind_to_wakes(0, 13),
+            "standby over a state dir that knows workspaces delivers no wake, so it must degrade"
+        );
+        assert!(
+            !standby_blind_to_wakes(2, 13),
+            "a hosted daemon must never carry the standby flag"
+        );
+        assert!(
+            !standby_blind_to_wakes(0, 0),
+            "standby over an empty state dir is quiet, not degraded"
+        );
     }
 
     /// bd-pf3b: the probe must cost ONE sample window for ALL stragglers —
