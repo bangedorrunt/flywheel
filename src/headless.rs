@@ -227,6 +227,34 @@ pub fn build_argv_roles(
     Ok(argv)
 }
 
+impl HarnessOutcome {
+    /// bd-7wah: pull a human-usable reason out of an error frame.
+    ///
+    /// opencode nests the provider's own message under `error.message` and puts the
+    /// provider's own kind under `error.type`, with an HTTP `status` beside it. All
+    /// three matter: "400" alone does not say whose limit was hit, and
+    /// "provider.invalid-request" alone does not say what to do about it.
+    fn describe_error_frame(v: &Value) -> String {
+        let err = v.get("error");
+        let message = err
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| err.and_then(Value::as_str))
+            .or_else(|| v.get("message").and_then(Value::as_str))
+            .unwrap_or("harness reported an error with no message")
+            .to_string();
+        let kind = err
+            .and_then(|e| e.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("error");
+        let status = err
+            .and_then(|e| e.get("status"))
+            .map(|s| format!(" (HTTP {s})"))
+            .unwrap_or_default();
+        format!("{kind}{status}: {message}")
+    }
+}
+
 /// Parse a harness's stdout into an outcome (pure). Harnesses that emit a
 /// JSON stream (NDJSON message events) yield response + usage; anything else
 /// falls back to raw stdout as the response.
@@ -254,6 +282,19 @@ pub fn parse_stream(stdout: &str, harness: &str) -> HarnessOutcome {
             continue; // banner noise, not stream corruption
         };
         saw_json = true;
+
+        // bd-7wah: a TOP-LEVEL `type: "error"` is how opencode reports a rejected
+        // request, and the old parser never looked at it — the error was only ever
+        // read from INSIDE a `message_end`, so a provider 400 became an empty
+        // success. Measured on this host: every opencode headless dispatch was
+        // failing with `maximum context length is 36864 tokens ... you requested
+        // about 37930`, and 383 of 442 run records recorded it as a success.
+        if v.get("type").and_then(Value::as_str) == Some("error") {
+            if error.is_none() {
+                error = Some(HarnessOutcome::describe_error_frame(&v));
+            }
+            continue;
+        }
         if v.get("type").and_then(Value::as_str) != Some("message_end") {
             continue;
         }
@@ -297,6 +338,18 @@ pub fn parse_stream(stdout: &str, harness: &str) -> HarnessOutcome {
         // plain-text harness output (no JSON stream): raw stdout IS the
         // response, no usage accounting available.
         response = stdout.to_string();
+    } else if response.is_empty() && error.is_none() {
+        // bd-7wah: we were told this is a JSON stream and it contained no assistant
+        // message. That is a PROTOCOL DISAGREEMENT — the harness and this build do
+        // not agree on the shape — and it used to be reported as `success` with an
+        // empty response, which is how a broken dispatch looked like a working one.
+        // Distinct from "the agent finished and said nothing", which is a different
+        // bug with a different fix, and both are now distinguishable from success.
+        error = Some(format!(
+            "unrecognised stream shape: {} JSON line(s), none carrying an assistant \
+             message. The harness and this build disagree on the NDJSON shape.",
+            stdout.lines().filter(|l| !l.trim().is_empty()).count()
+        ));
     }
     HarnessOutcome {
         response: response.trim().to_string(),
@@ -1479,5 +1532,92 @@ mod bd_crlx_interactive_model_tests {
             plan.env_pin(),
             Some("opencode-go/muse-spark-1.3-contributor")
         );
+    }
+}
+
+/// bd-7wah: a REAL captured line, not a synthetic one.
+///
+/// Recorded 2026-09-29 from `opencode run --format json "reply with exactly: PONG"` on this
+/// host, reproduced three times in a row. It is here because every opencode headless
+/// dispatch was returning an empty response with `status: "success"`, and no test
+/// covered the shape — 383 of 442 run records, 100% of the opencode ones.
+///
+/// The line is a top-level `type: "error"`. The old parser set `saw_json` on it, which
+/// SUPPRESSED the raw-stdout fallback, then looked only for `type == "message_end"`,
+/// found none, and returned an empty response with no error — because the error was
+/// only ever read from INSIDE a `message_end`. A hardcoded `exit_code: 0` then recorded
+/// the failure as a success. So a real 400 became indistinguishable from working.
+#[cfg(test)]
+const OPENCODE_ERROR_LINE: &str = r#"{"type":"error","sessionID":"ses_f16f636bdffeu7VnCKCO","timestamp":"2026-09-29T00:00:00Z","error":{"type":"provider.invalid-request","message":"This endpoint's maximum context length is 36864 tokens. However, you requested about 37930 tokens (34707 of text input, 3223 of tool input).","status":400}}"#;
+
+#[cfg(test)]
+mod bd_7wah_tests {
+    use super::{HarnessOutcome, OPENCODE_ERROR_LINE, parse_stream};
+
+    /// THE RED TEST. The captured opencode failure must be a FAILURE that names the
+    /// provider's reason. Before the fix this returned success with an empty response,
+    /// which is how 87% of every dispatch on this host came back empty and green.
+    #[test]
+    fn a_real_opencode_error_line_is_a_failure_that_names_the_reason() {
+        let out: HarnessOutcome = parse_stream(OPENCODE_ERROR_LINE, "opencode");
+        assert_eq!(
+            out.status, "fail",
+            "a top-level `type: error` must not be reported as success"
+        );
+        assert!(
+            out.error.as_deref().unwrap_or_default().contains("36864"),
+            "the provider's own reason must survive: {:?}",
+            out.error
+        );
+        assert_eq!(
+            out.response, "",
+            "and the response stays empty rather than being invented"
+        );
+    }
+
+    /// The companion: a stream that DOES carry an assistant message still parses, so
+    /// the fix does not break the 13% that worked.
+    #[test]
+    fn a_well_formed_assistant_message_still_parses() {
+        let line = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"PONG"}],"usage":{"input":11,"output":3},"model":"m"}}"#;
+        let out = parse_stream(line, "opencode");
+        assert_eq!(out.status, "success");
+        assert_eq!(out.response, "PONG");
+        assert_eq!(out.tokens_in, 11);
+        assert_eq!(out.tokens_out, 3);
+    }
+
+    /// `saw_json` with nothing usable in it is UNRECOGNISED, not an empty success. This
+    /// is the third reachable-but-silent state, and it is the one that made the 87%
+    /// invisible rather than merely frequent.
+    #[test]
+    fn json_but_no_assistant_message_and_no_error_is_a_failure_not_an_empty_success() {
+        let out = parse_stream(r#"{"type":"session_start","sessionID":"s"}"#, "opencode");
+        assert_eq!(
+            out.status, "fail",
+            "a stream shape we do not recognise is a protocol disagreement, not a success"
+        );
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unrecognised"),
+            "and it says so rather than reporting nothing: {:?}",
+            out.error
+        );
+    }
+
+    /// The genuine fallback still works: a harness that answers in plain text with no
+    /// JSON at all. This is the `pi`/`omp` path that reached 0% empty, and it must not
+    /// regress.
+    #[test]
+    fn plain_text_output_is_still_the_response() {
+        let out = parse_stream(
+            "hello from a plain-text harness
+",
+            "pi",
+        );
+        assert_eq!(out.status, "success");
+        assert_eq!(out.response, "hello from a plain-text harness");
     }
 }

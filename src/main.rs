@@ -13239,6 +13239,49 @@ fn cmd_unanswered_triage(
     Ok(())
 }
 
+/// bd-7wah: is this stderr only warnings?
+///
+/// Deliberately conservative — it looks for a leading `Warning:`/`warning:` on each
+/// non-blank line. A line that does not start with a warning marker makes the whole
+/// stream count as real output, so a genuine error buried under a warning is still
+/// reported. The failure mode of being wrong here is "we called it warnings when it
+/// was not", which costs a slightly vaguer message; the failure mode of the old code
+/// was "we called a NO_COLOR warning the cause of an empty dispatch", which costs the
+/// diagnosis entirely.
+fn stderr_is_only_warnings(stderr: &str) -> bool {
+    let mut any = false;
+    for line in stderr.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        any = true;
+        let lower = line.to_ascii_lowercase();
+        if !(lower.starts_with("warning") || lower.starts_with("warn:")) {
+            return false;
+        }
+    }
+    any
+}
+/// bd-7wah: stderr must not become THE error when the parser already has one.
+///
+/// The recorded shape of the bug: a provider 400 parsed correctly, then a
+/// `NO_COLOR` warning on stderr overwrote it, and the run log named a colour
+/// warning as the cause. 20 runs carry that as their explanation.
+#[test]
+fn stderr_is_never_the_error_when_the_parser_already_has_one() {
+    assert!(
+        stderr_is_only_warnings("Warning: NO_COLOR is ignored"),
+        "a lone warning IS only warnings — that is the 20-run false attribution, and \\
+         the caller must be able to name it as such rather than as a cause"
+    );
+    assert!(
+        !stderr_is_only_warnings("Warning: something\nError: provider 400: context length"),
+        "a real error line under a warning makes the stream real output"
+    );
+    assert!(stderr_is_only_warnings("Warning: a\nwarning: b"));
+    assert!(
+        !stderr_is_only_warnings(""),
+        "empty stderr is not 'only warnings' — there is nothing to classify"
+    );
+}
+
 fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "snapshot")?;
@@ -29864,8 +29907,30 @@ fn cmd_internal_run_headless(
             let mut outcome = headless::parse_stream(&stdout, harness);
             outcome.exit_code = output.status.code().unwrap_or(-1);
             outcome.duration_ms = duration_ms;
-            if outcome.response.is_empty() && !stderr.trim().is_empty() {
-                outcome.error = Some(stderr.trim().to_string());
+            // bd-7wah: stderr is the LAST resort for a reason, not the first.
+            //
+            // The old order was "empty response + any stderr => stderr IS the
+            // error", which is wrong twice over. It fires on a `NO_COLOR` warning —
+            // recorded 20 times in the run log as THE reason a dispatch produced
+            // nothing, the least informative answer possible. And it OVERWRITES a
+            // real parse error, so a provider's own 400 could be clobbered by a
+            // warning printed after it.
+            //
+            // Precedence now: the parse error (which names the harness's own reason)
+            // wins; stderr is only consulted when the parser had nothing; and a
+            // stderr that is only warnings is reported as such rather than as a
+            // cause, because "the harness warned and said nothing" and "the harness
+            // failed and said nothing" are different bugs.
+            if outcome.response.is_empty() && outcome.error.is_none() && !stderr.trim().is_empty() {
+                let trimmed = stderr.trim();
+                if stderr_is_only_warnings(trimmed) {
+                    outcome.error = Some(format!(
+                        "harness produced no response and its stderr carried only warnings: \
+                         {trimmed}"
+                    ));
+                } else {
+                    outcome.error = Some(trimmed.to_string());
+                }
             }
             if output.status.code() != Some(0) && outcome.error.is_none() {
                 outcome.error = Some(format!("harness exited {}", output.status));
