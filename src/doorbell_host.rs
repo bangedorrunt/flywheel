@@ -555,7 +555,12 @@ impl Host for RtHost {
         crate::drain_pending_facts(&crate::config::state_dir(), &self.project)
     }
 
-    fn restart_wake(&mut self) {
+    /// Always `true`: this host has no single-flight gate (it spawns a task per
+    /// call and spaces them with the retry backoff), so every death really does
+    /// schedule its own restart, and the journal row the brain writes for it is
+    /// honest about that. The counts on the daemon path come from `FileHost`,
+    /// which does coalesce (bd-watch-restart-metric-8dvf).
+    fn restart_wake(&mut self) -> bool {
         // GS-007 never-deaf rule: burst in a task, gate across calls.
         let backoff = self.retry.lock().map(|mut r| r.record_fail()).unwrap_or(16);
         let tx = self.brain_tx.clone();
@@ -592,6 +597,7 @@ impl Host for RtHost {
                 serde_json::json!({ "kind": "watch_restart" }),
             );
         });
+        true
     }
 }
 

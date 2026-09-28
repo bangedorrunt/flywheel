@@ -1807,13 +1807,18 @@ fn health_body(app: &AppState) -> String {
         .iter()
         .map(|w| workspace_journal_path(&app.fw_state, w))
         .collect();
+    // bd-watch-restart-metric-8dvf: the brain journals one `RestartWatch` row
+    // per ACTUAL restart (not per `Died` message), so this count is the thing
+    // the flag's name says. It is also reported as a rate: a burst is legible
+    // as N/min, where the bare threshold only says "crossed".
     let restarts = doorbell_rt::tailprobe::count_matches_within_across(
         journals.iter().map(std::path::PathBuf::as_path),
         "RestartWatch",
         now,
         WATCH_WINDOW_SECS,
     );
-    if restarts > WATCH_RESTARTS_ALLOWED_PER_WS * ws_names.len() {
+    let restart_budget = WATCH_RESTARTS_ALLOWED_PER_WS * ws_names.len();
+    if restarts > restart_budget {
         degraded.push("watch_restart_loop".to_string());
     }
     // bd-ba8t: the prompt hop needs an INJECTABLE pane, and that precondition
@@ -1856,6 +1861,16 @@ fn health_body(app: &AppState) -> String {
         "watch": {
             "state": if hosted.is_empty() { "standby" } else { "hosted" },
             "last_event_age_s": watch_age,
+            // bd-watch-restart-metric-8dvf: the measured rate next to the
+            // budget it is compared against, so an operator reads "23.4/min
+            // against a 1.2/min budget" instead of only "watch_restart_loop".
+            "restarts": restarts,
+            "restart_window_s": WATCH_WINDOW_SECS,
+            "restart_budget_per_window": restart_budget,
+            "restart_rate_per_min": ((restarts as f64 * 60.0 / WATCH_WINDOW_SECS as f64)
+                * 100.0)
+                .round()
+                / 100.0,
         },
         // GS-062 ASK-USER E: wake_liveness Quiet/Live/Deaf (same shape as
         // flywheel serve /health). Keys come from AppState.hosted.
@@ -2902,6 +2917,18 @@ mod tests {
         assert!(
             body.contains("watch_restart_loop"),
             "watch thrash must be named in degraded: {body}"
+        );
+        // bd-watch-restart-metric-8dvf: 19 rows inside the 300s window is 3.8
+        // restarts/min against a 6-per-window budget. Both numbers ride in the
+        // payload, so a burst is legible as a rate rather than only as a
+        // crossed flag.
+        assert!(
+            body.contains("\"restarts\":19") && body.contains("\"restart_rate_per_min\":3.8"),
+            "the measured rate must be readable next to the flag: {body}"
+        );
+        assert!(
+            body.contains("\"restart_budget_per_window\":6"),
+            "the budget the burst was measured against must be named: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

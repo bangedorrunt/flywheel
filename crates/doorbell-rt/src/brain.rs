@@ -580,13 +580,27 @@ impl<H: Host> Brain<H> {
 
     async fn on_died(&mut self) {
         let effects = self.host.tick(&BrainMsg::Died);
+        // bd-watch-restart-metric-8dvf: `RestartWatch` means a restart
+        // HAPPENED. `restart_wake` is single-flight, so a burst of deaths
+        // collapses into one restart; journaling a restart row per death made
+        // `/health` count ~40x the truth (1,412 rows in one 300s window
+        // against 35 real watch cycles) and made `restarted: true` a lie for
+        // every coalesced death.
+        let restarted = self.host.restart_wake();
+        let decided: Vec<Effect> = if restarted {
+            effects
+        } else {
+            effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, Effect::RestartWatch))
+                .collect()
+        };
         self.journal(
             &serde_json::json!({"rt_kind": "Died"}),
-            &effects,
-            serde_json::json!({"stage": "executed", "restarted": true}),
+            &decided,
+            serde_json::json!({"stage": "executed", "restarted": restarted}),
             &[],
         );
-        self.host.restart_wake();
         let _ = self
             .hear
             .expire(self.host.now_unix(), doorbell_core::UNANSWERED_SECS);
@@ -1627,6 +1641,37 @@ mod tests {
 
     /// E12 crash harness (process-crash model): task abort (no graceful
     /// shutdown — the async equivalent of SIGKILL for journal semantics:
+    /// bd-watch-restart-metric-8dvf: `RestartWatch` must mean a restart
+    /// HAPPENED. `restart_wake` is single-flight, so a burst of deaths
+    /// collapses to ONE restart; journaling every death as a restart is what
+    /// made `/health` count ~40x the truth (1,412 rows inside one 300s window
+    /// against 35 real watch cycles) and made `restarted: true` a lie for
+    /// every coalesced death.
+    #[tokio::test]
+    async fn a_burst_of_deaths_leaves_one_restart_row() {
+        let (mut brain, _rx, _tx) =
+            test_brain("restart-burst", vec![vec![Effect::RestartWatch]; 50]);
+        for _ in 0..50 {
+            brain.dispatch(BrainMsg::Died).await;
+        }
+        assert_eq!(
+            brain.host.restarts, 1,
+            "50 deaths, one restart: the single-flight gate must coalesce the burst"
+        );
+        let journal = std::fs::read_to_string(brain.store.journal_file("w")).unwrap();
+        let rows = journal.matches("\"RestartWatch\"").count();
+        assert_eq!(
+            rows, 1,
+            "the journal carries one RestartWatch row per ACTUAL restart; counting deaths \
+             instead is the defect. got {rows} rows:\n{journal}"
+        );
+        assert_eq!(
+            journal.matches("\"restarted\":false").count(),
+            49,
+            "a coalesced death must say it did not restart, not claim one: {journal}"
+        );
+    }
+
     /// flushed bytes survive, in-flight vanishes) then rebuild on the same
     /// store. Acceptance: 3 prompts fill the window, restart, 0 further
     /// prompts in the window; refold reproduces budget state exactly; every
