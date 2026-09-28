@@ -1918,11 +1918,12 @@ fn health_body(app: &AppState) -> String {
     // workspace, while `/health` reported `torn_tails: null` (which is about the
     // JOURNAL, a different file).
     //
-    // Degrade only on a tear that is HAPPENING: a torn row cannot carry its own
-    // `ts`, so the newest PARSEABLE row bounds it from above, and a fresh
-    // newest row means the file is still being written. Otherwise 513 rows from
-    // last week would pin the daemon red forever, and a field that is always red
-    // is a field nobody reads.
+    // Degrade only on a tear that is HAPPENING. A torn row cannot be dated (the
+    // splice mangles the quote before its `ts`), so the probe bounds it from
+    // below with the last datable row in FRONT of it. Gating on the newest row
+    // instead would say "live" whenever the FILE is being written, which is
+    // always on a healthy daemon, and the 513 historical rows would pin
+    // `degraded` red forever.
     let mut audit_tears: Vec<serde_json::Value> = Vec::new();
     let mut tearing_now = false;
     for (ws, path) in ws_names.iter().zip(audits.iter()) {
@@ -1932,15 +1933,19 @@ fn health_body(app: &AppState) -> String {
         if tear.torn == 0 {
             continue;
         }
-        let newest_age = tear.newest_row.map(|ts| now.saturating_sub(ts));
-        if newest_age.is_some_and(|age| age <= PROBE_FRESH_SECS) {
+        let tear_after_age = tear.tear_after.map(|ts| now.saturating_sub(ts));
+        if tear_after_age.is_some_and(|age| age <= PROBE_FRESH_SECS) {
             tearing_now = true;
         }
         audit_tears.push(serde_json::json!({
             "workspace": ws,
             "torn": tear.torn,
             "scanned": tear.scanned,
-            "newest_row_age_s": newest_age,
+            // The tear happened AT OR AFTER this row. null = the torn lines are
+            // at the head of the window with nothing datable in front of them,
+            // which is UNMEASURED, not fresh.
+            "tear_after_age_s": tear_after_age,
+            "newest_row_age_s": tear.newest_row.map(|ts| now.saturating_sub(ts)),
         }));
     }
     audit_tears.sort_by(|a, b| {
@@ -2882,10 +2887,16 @@ mod tests {
             chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 4000, 0)
                 .expect("in range")
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        // Two spliced rows (what concurrent appenders produce) under good rows.
+        // Two spliced rows (what concurrent appenders produce), with GOOD rows
+        // in front of them, which is the only shape a real file has: the probe
+        // bounds a tear by the last datable row before it, so a fixture that
+        // opens with the tear would test nothing about the bound.
         let spliced = r#"{"kind":"wake_sock_absent","reason":"x"{"kind":"y","ts":"#;
         let good = |t: &str| format!("{{\"ts\":\"{t}\",\"kind\":\"ok\",\"workspace\":\"ws-a\"}}\n");
-        let torn_with = |t: &str| format!("{spliced}\n{spliced}\n{}{}", good(t), good(t));
+        // Each splice needs its own newline: the constant has none, so without
+        // one the two of them land on the SAME line and the file carries one
+        // torn row where the test claims two.
+        let torn_with = |t: &str| format!("{}{}\n{}\n{}", good(t), spliced, spliced, good(t));
         std::fs::write(&audit, torn_with(&fresh)).expect("write audit");
         let body = health_body(&app);
         let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
@@ -2906,7 +2917,9 @@ mod tests {
                 .is_some_and(|d| d.iter().any(|x| x == "audit_rows_torn")),
             "a tear under rows written seconds ago is happening now: {body}"
         );
-        // The same tear, with the last good row old: reported, NOT degraded.
+        // The same tear, with the row IN FRONT of it old: reported, NOT
+        // degraded. The rows after it stay fresh on purpose — a gate that keyed
+        // on the newest row would still call this live, which is the bug.
         std::fs::write(&audit, torn_with(&aged)).expect("rewrite audit");
         let body = health_body(&app);
         let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
@@ -2915,10 +2928,17 @@ mod tests {
             "history is still reported: the rows are still lost"
         );
         assert!(
+            v["audit_torn_rows"][0]["tear_after_age_s"]
+                .as_u64()
+                .is_some_and(|age| age > 4000 - 60),
+            "the tear is dated from the row in front of it, not the newest: {body}"
+        );
+        assert!(
             !v["degraded"]
                 .as_array()
                 .is_some_and(|d| d.iter().any(|x| x == "audit_rows_torn")),
-            "a tear nobody is appending to any more is not a live fault: {body}"
+            "a tear nobody is appending to any more is not a live fault, even \
+             though this file is still being written: {body}"
         );
         // A clean file reports null, not zero: absent is UNMEASURED, which is
         // not the same claim.
