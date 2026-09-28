@@ -2850,7 +2850,11 @@ mod tests {
     #[test]
     fn health_counts_unreadable_audit_rows_and_only_degrades_on_a_live_tear() {
         use super::{AppState, CachedHealth, health_body};
-        let dir = std::env::temp_dir().join(format!("db-health-tear-{}", std::process::id()));
+        // Named for THIS test alone. The pid suffix is shared by every test in
+        // this binary, so a name reused from another test is a race between two
+        // fixtures that each `remove_dir_all` the same directory — which is how
+        // this test passed alone and failed 6 times in 6 in the full suite.
+        let dir = std::env::temp_dir().join(format!("db-health-audittear-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
         std::fs::create_dir_all(dir.join("journals")).expect("mkdir journal");
@@ -2866,26 +2870,34 @@ mod tests {
             })),
         };
         let audit = dir.join("doorbell/ws-a.audit.jsonl");
-        let ts = |secs_ago: i64| {
-            chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - secs_ago, 0)
+        // Both stamps captured ONCE, up front, and every phase writes a whole
+        // file from them. Deriving the aged fixture by string-replacing the
+        // fresh one silently no-ops the moment the test crosses a second
+        // boundary, which is a test that passes on a fast machine and fails on a
+        // loaded one -- the exact shape of a flake nobody can reproduce.
+        let fresh = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64, 0)
+            .expect("in range")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let aged =
+            chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 4000, 0)
                 .expect("in range")
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        };
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         // Two spliced rows (what concurrent appenders produce) under good rows.
         let spliced = r#"{"kind":"wake_sock_absent","reason":"x"{"kind":"y","ts":"#;
-        std::fs::write(
-            &audit,
-            format!(
-                "{spliced}\n{spliced}\n{{\"ts\":\"{t0}\",\"kind\":\"ok\",\"workspace\":\"ws-a\"}}\n\
-                 {{\"ts\":\"{t0}\",\"kind\":\"ok\",\"workspace\":\"ws-a\"}}\n",
-                t0 = ts(0)
-            ),
-        )
-        .expect("write audit");
+        let good = |t: &str| format!("{{\"ts\":\"{t}\",\"kind\":\"ok\",\"workspace\":\"ws-a\"}}\n");
+        let torn_with = |t: &str| format!("{spliced}\n{spliced}\n{}{}", good(t), good(t));
+        std::fs::write(&audit, torn_with(&fresh)).expect("write audit");
         let body = health_body(&app);
         let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
-        let tears = v["audit_torn_rows"].as_array().expect("tears reported");
-        assert_eq!(tears.len(), 1, "the workspace is listed: {body}");
+        let on_disk = std::fs::read_to_string(&audit).expect("fixture still on disk");
+        let tears = v["audit_torn_rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tears reported: {body}"));
+        assert_eq!(
+            tears.len(),
+            1,
+            "the workspace is listed: {body}\nfixture:\n{on_disk}"
+        );
         assert_eq!(tears[0]["torn"], 2, "both spliced rows are counted");
         assert_eq!(tears[0]["scanned"], 2, "beside what WAS readable");
         assert!(
@@ -2895,9 +2907,7 @@ mod tests {
             "a tear under rows written seconds ago is happening now: {body}"
         );
         // The same tear, with the last good row old: reported, NOT degraded.
-        let mut old = std::fs::read_to_string(&audit).expect("read");
-        old = old.replace(&ts(0), &ts(4000));
-        std::fs::write(&audit, old).expect("rewrite audit");
+        std::fs::write(&audit, torn_with(&aged)).expect("rewrite audit");
         let body = health_body(&app);
         let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
         assert_eq!(
@@ -2912,11 +2922,7 @@ mod tests {
         );
         // A clean file reports null, not zero: absent is UNMEASURED, which is
         // not the same claim.
-        std::fs::write(
-            &audit,
-            format!("{{\"ts\":\"{}\",\"kind\":\"ok\"}}\n", ts(0)),
-        )
-        .expect("clean");
+        std::fs::write(&audit, good(&fresh)).expect("clean");
         let body = health_body(&app);
         let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
         assert!(
