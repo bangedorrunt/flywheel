@@ -333,6 +333,22 @@ impl FileStore {
         const KEEP_LINES: usize = 4000;
         let mut dropped_lines = 0usize;
         let mut dropped_bytes = 0u64;
+        // The seq range this rotation removes. Without it the drop record cannot
+        // be tied to the gap it leaves, so a designed drop and a lost write look
+        // identical to the fold — which is why seven workspaces read "torn" for
+        // days while the daemon knew perfectly well what it had deleted.
+        let mut drop_lo: Option<u64> = None;
+        let mut drop_hi: Option<u64> = None;
+        // A plain fn, not a closure: a closure would hold the `drop_lo`/`drop_hi`
+        // borrows for the whole body, and the audit row at the end reads them.
+        fn note(acc: &mut Option<u64>, other: &mut Option<u64>, lo: Option<u64>, hi: Option<u64>) {
+            if let Some(l) = lo {
+                *acc = Some(acc.map_or(l, |x: u64| x.min(l)));
+            }
+            if let Some(h) = hi {
+                *other = Some(other.map_or(h, |x: u64| x.max(h)));
+            }
+        }
         let active = self.journal_file(workspace);
         let active_lines = count_lines(&active);
         // Spill the active excess into a fresh .1 (shift first, dropping
@@ -348,6 +364,13 @@ impl FileStore {
             if overflow.exists() {
                 dropped_lines += count_lines(&overflow);
                 dropped_bytes += file_bytes(&overflow);
+                // Read before removing: this is the only moment the span is
+                // recoverable.
+                if let Ok(raw) = std::fs::read_to_string(&overflow) {
+                    let lines: Vec<&str> = raw.lines().collect();
+                    let (lo, hi) = seq_span(&lines);
+                    note(&mut drop_lo, &mut drop_hi, lo, hi);
+                }
                 let _ = std::fs::remove_file(&overflow);
             }
             for n in (1..RETENTION_GENS).rev() {
@@ -382,10 +405,18 @@ impl FileStore {
             if need >= gl {
                 dropped_lines += gl;
                 dropped_bytes += gb;
+                if let Ok(raw) = std::fs::read_to_string(&p) {
+                    let lines: Vec<&str> = raw.lines().collect();
+                    let (lo, hi) = seq_span(&lines);
+                    note(&mut drop_lo, &mut drop_hi, lo, hi);
+                }
                 let _ = std::fs::remove_file(&p);
             } else if let Ok(raw) = std::fs::read_to_string(&p) {
                 let rows: Vec<&str> = raw.lines().collect();
-                let keep = &rows[need.min(rows.len())..];
+                let cut = need.min(rows.len());
+                let keep = &rows[cut..];
+                let (lo, hi) = seq_span(&rows[..cut]);
+                note(&mut drop_lo, &mut drop_hi, lo, hi);
                 dropped_lines += rows.len() - keep.len();
                 dropped_bytes += gb - count_bytes(keep);
                 let _ = std::fs::write(&p, keep.join("\n") + "\n");
@@ -401,6 +432,8 @@ impl FileStore {
                 "kind": "journal_rotated",
                 "dropped_lines": dropped_lines,
                 "dropped_bytes": dropped_bytes,
+                "seq_from": drop_lo,
+                "seq_to": drop_hi,
             }),
         );
     }
@@ -524,7 +557,14 @@ impl FileStore {
         let mut first_seq: Option<u64> = None;
         let mut prev_seq: Option<u64> = None;
         let mut torn: Option<TornTail> = None;
-        'files: for path in self.journal_chain(workspace) {
+        // A designed drop is not a tear. Retention records what it removed, so a
+        // gap a record accounts for is folded straight through: calling a
+        // healthy workspace degraded forever is how a signal stops meaning
+        // anything (measured: seven workspaces, `journal_torn_tail`
+        // permanently red, most of them for drops the daemon performed itself).
+        let drops = self.retention_drops(workspace);
+        let chain = self.journal_chain(workspace);
+        'files: for path in &chain {
             let Ok(raw) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -538,6 +578,11 @@ impl FileStore {
                         at_line: idx + 1,
                         file: path.display().to_string(),
                         reason: "unparseable row".into(),
+                        missing_seqs: 0,
+                        missing_from: None,
+                        missing_to: None,
+                        rows_withheld: 0,
+                        explained_by_drop: None,
                     });
                     break 'files;
                 };
@@ -548,17 +593,42 @@ impl FileStore {
                     if let Some(p) = prev_seq
                         && s != p + 1
                     {
-                        torn = Some(TornTail {
-                            at_line: idx + 1,
-                            file: path.display().to_string(),
-                            reason: format!("seq gap: {p} -> {s}"),
-                        });
-                        break 'files;
+                        let missing_from = p + 1;
+                        let missing_to = s - 1;
+                        let missing = s - p - 1;
+                        match drops.iter().find(|d| d.explains(missing_from, missing_to)) {
+                            // Retention, on the record: not a tear.
+                            Some(_) => {}
+                            None => {
+                                torn = Some(TornTail {
+                                    at_line: idx + 1,
+                                    file: path.display().to_string(),
+                                    reason: format!(
+                                        "seq gap: {p} -> {s} ({missing} seqs missing, \
+                                         {missing_from}..={missing_to}, no retention record \
+                                         accounts for them)"
+                                    ),
+                                    missing_seqs: missing,
+                                    missing_from: Some(missing_from),
+                                    missing_to: Some(missing_to),
+                                    rows_withheld: 0,
+                                    explained_by_drop: None,
+                                });
+                                break 'files;
+                            }
+                        }
                     }
                     prev_seq = Some(s);
                 }
                 rows.push(v);
             }
+        }
+        if let Some(t) = torn.as_mut() {
+            // How much history the tear hides. The fold STOPS here, so every row
+            // after it is unreachable from `doorbell why` — a cost the old
+            // boolean never mentioned, and the reason a single 16-row gap looked
+            // the same as a 5,175-row one.
+            t.rows_withheld = rows_withheld_after(&chain, &t.file, t.at_line);
         }
         if let Some(t) = &torn {
             // bd-lorot: this fired on EVERY fold, and a health probe folds, so a
@@ -583,6 +653,10 @@ impl FileStore {
                         "file": t.file,
                         "at_line": t.at_line,
                         "reason": t.reason,
+                        "missing_seqs": t.missing_seqs,
+                        "missing_from": t.missing_from,
+                        "missing_to": t.missing_to,
+                        "rows_withheld": t.rows_withheld,
                         "fingerprint": fingerprint,
                     }),
                 );
@@ -622,6 +696,26 @@ impl FileStore {
             .read(true)
             .open(self.journal_file(workspace))?;
         f.sync_data()
+    }
+
+    /// Retention drops this workspace's audit sidecar records, oldest first.
+    /// A drop with no `seq_from`/`seq_to` is returned with both `None`: the
+    /// daemon must not guess a range it never wrote, because a guessed range
+    /// would silently excuse a real lost write.
+    #[must_use]
+    pub fn retention_drops(&self, workspace: &str) -> Vec<RetentionDrop> {
+        let Ok(raw) = std::fs::read_to_string(self.audit_file(workspace)) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("journal_rotated"))
+            .map(|v| RetentionDrop {
+                seq_from: v.get("seq_from").and_then(|s| s.as_u64()),
+                seq_to: v.get("seq_to").and_then(|s| s.as_u64()),
+                dropped_lines: v.get("dropped_lines").and_then(|s| s.as_u64()).unwrap_or(0),
+            })
+            .collect()
     }
 
     pub fn append_audit(&self, workspace: &str, entry: serde_json::Value) {
@@ -700,6 +794,80 @@ pub struct TornTail {
     pub at_line: usize,
     pub file: String,
     pub reason: String,
+    /// How many seq values are missing at the tear (0 for an unparseable row).
+    /// A bare boolean said only "torn"; the number is what makes it a finding —
+    /// 16 missing is a lost append, 5,175 missing is retention with a paper cut.
+    pub missing_seqs: u64,
+    pub missing_from: Option<u64>,
+    pub missing_to: Option<u64>,
+    /// Rows the fold did NOT return because it stopped here. The fold stops, so
+    /// everything past the tear is unreachable from `doorbell why` — that cost
+    /// was previously invisible, not just unreported.
+    pub rows_withheld: usize,
+    /// A recorded retention drop that accounts for this gap. `Some` means rows
+    /// were removed on purpose by `rotate()` and the record says so.
+    pub explained_by_drop: Option<String>,
+}
+
+/// One recorded retention drop: rows `rotate()` removed on purpose.
+///
+/// The audit row already existed; what it lacked was a LINK to the seq stream,
+/// so a designed drop and a lost write both surfaced as "seq gap" and the fold
+/// had no way to tell them apart. A drop with no range is recorded as exactly
+/// that (`None`), never guessed.
+#[derive(Debug, Clone)]
+pub struct RetentionDrop {
+    pub seq_from: Option<u64>,
+    pub seq_to: Option<u64>,
+    pub dropped_lines: u64,
+}
+
+impl RetentionDrop {
+    /// True when this drop accounts for the missing range `(from ..= to)`.
+    #[must_use]
+    pub fn explains(&self, from: u64, to: u64) -> bool {
+        match (self.seq_from, self.seq_to) {
+            (Some(lo), Some(hi)) => lo <= from && hi >= to,
+            _ => false,
+        }
+    }
+}
+
+/// Rows the fold did not return because it stopped at a tear: the rest of the
+/// torn file plus every later file in the chain.
+fn rows_withheld_after(chain: &[std::path::PathBuf], torn_file: &str, at_line: usize) -> usize {
+    let mut withheld = 0usize;
+    let mut reached = false;
+    for path in chain {
+        if !reached {
+            if path.display().to_string() != torn_file {
+                continue;
+            }
+            reached = true;
+            // 1-based: the row AT the tear is discarded too (the fold breaks
+            // before pushing it), so it counts as withheld history as well.
+            withheld += count_lines(path).saturating_sub(at_line - 1);
+        } else if let Ok(raw) = std::fs::read_to_string(path) {
+            withheld += raw.lines().filter(|l| !l.trim().is_empty()).count();
+        }
+    }
+    withheld
+}
+
+/// First and last `seq` in a run of raw journal lines. Used when rotation
+/// removes rows: without it the drop record cannot be tied to the gap it made.
+fn seq_span(lines: &[&str]) -> (Option<u64>, Option<u64>) {
+    let mut lo: Option<u64> = None;
+    let mut hi: Option<u64> = None;
+    for line in lines {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(s) = v.get("seq").and_then(|s| s.as_u64())
+        {
+            lo = Some(lo.map_or(s, |x| x.min(s)));
+            hi = Some(hi.map_or(s, |x| x.max(s)));
+        }
+    }
+    (lo, hi)
 }
 
 fn count_lines(path: &std::path::Path) -> usize {
@@ -955,6 +1123,94 @@ mod tests {
             rows_before, rows_after,
             "six folds of an unchanged tear wrote {rows_before} -> {rows_after} LoudMiss rows: \
              a report that repeats unchanged is noise that trains a reader to skip the field"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The tear signal said ONE thing: torn. It never said how big, where, or
+    /// how much history that cost — so the 16-seq hole in opencode and the
+    /// 5,175-seq hole in chiebukuro read identically, and `/health` had one
+    /// permanently red boolean with no way to triage it.
+    #[test]
+    fn a_seq_gap_reports_its_size_its_range_and_what_it_hid() {
+        let (st, dir) = test_store("gap-detail");
+        for seq in 1..=3u64 {
+            append_seq(&st, "w", seq);
+        }
+        // 4..=19 gone, exactly the shape of the live opencode hole.
+        for seq in 20..=21u64 {
+            append_seq(&st, "w", seq);
+        }
+        let fold = st.fold_workspace("w");
+        let torn = fold.torn.expect("an unexplained gap is still a tear");
+        assert_eq!(torn.missing_seqs, 16, "the size is the finding: {torn:?}");
+        assert_eq!(torn.missing_from, Some(4));
+        assert_eq!(torn.missing_to, Some(19));
+        assert_eq!(
+            torn.rows_withheld, 2,
+            "the fold stops at the tear, so the 2 rows after it are unreachable — that \
+             cost was invisible before: {torn:?}"
+        );
+        assert!(
+            torn.reason.contains("16 seqs missing") && torn.reason.contains("no retention record"),
+            "the reason must name the size and say nothing accounts for it: {}",
+            torn.reason
+        );
+        let audit = std::fs::read_to_string(st.audit_file("w")).unwrap();
+        assert!(
+            audit.contains("\"missing_seqs\":16") && audit.contains("\"rows_withheld\":2"),
+            "the report must carry the numbers, not just the word torn: {audit}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// And the other half: a drop the daemon RECORDED is not a tear. Retention
+    /// removes rows on purpose; if the record cannot excuse the gap it made,
+    /// then every workspace that rotates reports `journal_torn_tail` forever
+    /// and the flag stops meaning anything. The fold must also keep going:
+    /// stopping threw away the readable tail of the file.
+    #[test]
+    fn a_recorded_retention_drop_is_not_a_tear() {
+        let (st, dir) = test_store("drop-explains");
+        for seq in 1..=3u64 {
+            append_seq(&st, "w", seq);
+        }
+        for seq in 20..=21u64 {
+            append_seq(&st, "w", seq);
+        }
+        st.append_audit(
+            "w",
+            serde_json::json!({
+                "kind": "journal_rotated",
+                "dropped_lines": 16,
+                "seq_from": 4,
+                "seq_to": 19,
+            }),
+        );
+        let fold = st.fold_workspace("w");
+        assert!(
+            fold.torn.is_none(),
+            "a recorded retention drop is not a tear: {:?}",
+            fold.torn
+        );
+        assert_eq!(
+            fold.rows.len(),
+            5,
+            "the fold must carry on past a designed drop instead of throwing the tail away"
+        );
+        // A record that does NOT cover the range must not excuse it: a guessed
+        // range would hide a real lost write.
+        st.append_audit(
+            "w",
+            serde_json::json!({"kind": "journal_rotated", "dropped_lines": 2, "seq_from": 4, "seq_to": 5}),
+        );
+        assert!(
+            st.retention_drops("w").iter().any(|d| d.explains(4, 19)),
+            "the first, covering record still explains it"
+        );
+        assert!(
+            !st.retention_drops("w").iter().any(|d| d.explains(4, 900)),
+            "a short record must not excuse a longer gap"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

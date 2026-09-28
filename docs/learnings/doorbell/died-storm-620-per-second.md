@@ -107,9 +107,28 @@ the fold at the tear, hiding everything after it from `doorbell why`.
 
 The unwritable window is most plausibly rotation: `rotate()` rewrites the active
 file with `std::fs::write(&active, tail.join("\n") + "\n")`, which is a
-truncate-and-rewrite from a snapshot, not an append, and it drops rows by design
-while its doc comment claims "Every drop is an audit row" — this file contains
-no rotation row at all.
+truncate-and-rewrite from a snapshot, not an append.
+
+**Correction to an earlier version of this section.** It said the journals
+contain no rotation row despite `rotate()` claiming "Every drop is an audit
+row". That was wrong, and wrong the same way as the shed claim above: I grepped
+the **journal** and concluded the audit did not exist. Rotation records live in
+the **audit sidecar**, `doorbell/<workspace>.audit.jsonl`. They are there:
+530 rows for flywheel-flywheel, 370 for flywheel-toron, 10 for opencode.
+
+And they settle the opencode gap by exclusion: every opencode rotation record is
+dated **2026-09-28 05:33 and 05:47** — hours AFTER the 07:32 gap it would have
+to explain. No record covers that range, so those 16 seqs were not retention.
+They were a lost write.
+
+chiebukuro is the opposite case and the worse one: **89 gaps, one of them 5,175
+seqs**, four generation files on disk (so rotation ran at least four times), and
+the sum of its recorded `dropped_lines` is **zero**. Dropped rows exist there
+with no record at all.
+
+So the two halves have different causes: a designed drop that the record cannot
+be tied to (no seq range in it, so the fold cannot tell it from corruption), and
+a lost write whose only trace is the gap.
 
 ## Re-deriving it
 
