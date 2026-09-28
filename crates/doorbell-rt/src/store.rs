@@ -105,7 +105,8 @@ pub const RETENTION_BYTES: u64 = 5 * 1024 * 1024;
 /// Generations kept besides the active file.
 pub const RETENTION_GENS: usize = 4;
 
-/// bd-3uqz: the workspace a journal file belongs to, generation suffix included.
+/// bd-oa4u (item C of bd-3uqz): the workspace a journal file belongs to, generation
+/// suffix included.
 ///
 /// Returns `None` for a file that is not a journal of ours.
 ///
@@ -224,7 +225,7 @@ impl FileStore {
         if let Ok(entries) = std::fs::read_dir(self.state_dir.join("journals")) {
             for entry in entries.filter_map(std::result::Result::ok) {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                // bd-3uqz: parse through the shared helper so a GENERATION file
+                // bd-oa4u: parse through the shared helper so a GENERATION file
                 // resolves to the workspace it belongs to. The previous inline
                 // parse produced `flywheel.1`, which is in no hosted set, so every
                 // retained generation of every live workspace was a prune
@@ -1589,7 +1590,7 @@ mod prune_tests {
             .join(format!("doorbell-journal-{ws}.{generation}.jsonl"))
     }
 
-    /// bd-3uqz: the name parser, on its own, because the DOT cases are the ones
+    /// bd-oa4u: the name parser, on its own, because the DOT cases are the ones
     /// that would regress silently. Only a trailing run of digits is a generation:
     /// `flywheel-toron.dev` and `flywheel-torondev` are both real workspaces in this
     /// state directory, so an unconditional last-dot-strip would merge two distinct
@@ -1623,7 +1624,7 @@ mod prune_tests {
         }
     }
 
-    /// bd-3uqz: the age prune's LIVENESS GUARD does not see a generation file.
+    /// bd-oa4u: the age prune's LIVENESS GUARD does not see a generation file.
     ///
     /// The guard parses the workspace name with
     /// `strip_prefix("doorbell-journal-")` then `strip_suffix(".jsonl")`. For
