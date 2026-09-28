@@ -100,6 +100,65 @@ pub fn count_matches_within(path: &Path, needle: &str, now: u64, window_secs: u6
         .count()
 }
 
+/// What one bounded tail read says about an audit file's own READABILITY.
+///
+/// bd-sfvq: an audit row is a line of JSON, and a line that is not JSON is a
+/// row that no reader can ever see. Every other probe here works by SUBSTRING
+/// on the raw text, so a spliced line does not merely undercount one probe, it
+/// disappears from all of them at once — and `ts_of` cannot date it either, so
+/// it cannot even be reported as stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditTear {
+    /// Lines in the examined tail that do not parse as a JSON object.
+    pub torn: usize,
+    /// Parseable lines seen, so `torn` reads as a share of something.
+    pub scanned: usize,
+    /// Unix seconds of the newest PARSEABLE row. A torn line carries no usable
+    /// `ts`, so this bounds it from above: a fresh newest row means the file is
+    /// still being written, so a torn line among them is a tear happening NOW.
+    pub newest_row: Option<u64>,
+}
+
+/// Read the tail once and report what is unreadable in it. `None` when the file
+/// cannot be read at all — absent is UNMEASURED, which is not zero.
+pub fn audit_tear(path: &Path) -> Option<AuditTear> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(MAX_TAIL_BYTES);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = String::new();
+    f.take(MAX_TAIL_BYTES).read_to_string(&mut buf).ok()?;
+    let mut tear = AuditTear {
+        torn: 0,
+        scanned: 0,
+        newest_row: None,
+    };
+    // A window that starts mid-file begins in the MIDDLE of a row, so its
+    // first line is a fragment that is torn by construction. Counting it would
+    // report a fault on every healthy file larger than the window, which is the
+    // one way a truth-telling field teaches an operator to ignore it.
+    let mid_file = start > 0;
+    for (n, line) in buf.lines().enumerate() {
+        if mid_file && n == 0 {
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(serde_json::Value::Object(_)) => {
+                tear.scanned += 1;
+                if let Some(ts) = ts_of(line) {
+                    tear.newest_row = Some(tear.newest_row.map_or(ts, |cur: u64| cur.max(ts)));
+                }
+            }
+            // A bare string/number parses but is not a row either.
+            _ => tear.torn += 1,
+        }
+    }
+    Some(tear)
+}
+
 /// Sum of [`count_matches_within`] across several files.
 pub fn count_matches_within_across<'a>(
     paths: impl IntoIterator<Item = &'a Path>,

@@ -1911,6 +1911,47 @@ fn health_body(app: &AppState) -> String {
     if any_fresh(&skew_ages, PROBE_FRESH_SECS) {
         degraded.push("inbox_store_skew".to_string());
     }
+    // bd-sfvq: the audit files' own readability. Every other probe here
+    // substring-matches raw text, so a row that is not JSON is invisible to ALL
+    // of them at once — and `ts_of` cannot date it either, so it cannot even be
+    // reported as stale. Measured 2026-09-28: 513 unreadable rows in one
+    // workspace, while `/health` reported `torn_tails: null` (which is about the
+    // JOURNAL, a different file).
+    //
+    // Degrade only on a tear that is HAPPENING: a torn row cannot carry its own
+    // `ts`, so the newest PARSEABLE row bounds it from above, and a fresh
+    // newest row means the file is still being written. Otherwise 513 rows from
+    // last week would pin the daemon red forever, and a field that is always red
+    // is a field nobody reads.
+    let mut audit_tears: Vec<serde_json::Value> = Vec::new();
+    let mut tearing_now = false;
+    for (ws, path) in ws_names.iter().zip(audits.iter()) {
+        let Some(tear) = doorbell_rt::tailprobe::audit_tear(path) else {
+            continue;
+        };
+        if tear.torn == 0 {
+            continue;
+        }
+        let newest_age = tear.newest_row.map(|ts| now.saturating_sub(ts));
+        if newest_age.is_some_and(|age| age <= PROBE_FRESH_SECS) {
+            tearing_now = true;
+        }
+        audit_tears.push(serde_json::json!({
+            "workspace": ws,
+            "torn": tear.torn,
+            "scanned": tear.scanned,
+            "newest_row_age_s": newest_age,
+        }));
+    }
+    audit_tears.sort_by(|a, b| {
+        b["torn"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["torn"].as_u64().unwrap_or(0))
+    });
+    if tearing_now {
+        degraded.push("audit_rows_torn".to_string());
+    }
     let journals: Vec<std::path::PathBuf> = ws_names
         .iter()
         .map(|w| workspace_journal_path(&app.fw_state, w))
@@ -2032,6 +2073,15 @@ fn health_body(app: &AppState) -> String {
                     })
                     .collect(),
             )
+        },
+        // bd-sfvq: unreadable AUDIT rows, beside the journal's torn tails rather
+        // than inside them, because they are a different file and a different
+        // fault. `null` when every hosted audit is clean, so "nothing is torn"
+        // cannot arrive looking like "torn, but zero".
+        "audit_torn_rows": if audit_tears.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Array(audit_tears)
         },
         "known_workspaces": known_workspaces.len(),
         "standby_hint": if wake_blind {
@@ -2781,6 +2831,139 @@ mod tests {
             !body.contains("inbox_store_skew"),
             "a skew the operator already fixed is not a live fault: {body}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-sfvq: the honesty plane was silent about its own unreadable rows.
+    /// 513 rows in one workspace's audit did not parse as JSON, and `/health`
+    /// said `torn_tails: null` — true, because `torn_tails` is about the
+    /// JOURNAL, a different file. Every other probe substring-matches raw text,
+    /// so a non-JSON row vanishes from all of them at once and `ts_of` cannot
+    /// even date it.
+    ///
+    /// Two rules, and the second is the one that keeps the field usable: a
+    /// historical tear is REPORTED and a tear happening NOW is DEGRADED. A torn
+    /// row has no `ts` of its own, so the newest parseable row bounds it from
+    /// above; if that row is fresh, the file is still being written, so the
+    /// tear is live. Without the freshness gate, last week's 513 rows would pin
+    /// the daemon red forever and the field would teach operators to ignore it.
+    #[test]
+    fn health_counts_unreadable_audit_rows_and_only_degrades_on_a_live_tear() {
+        use super::{AppState, CachedHealth, health_body};
+        let dir = std::env::temp_dir().join(format!("db-health-tear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
+        std::fs::create_dir_all(dir.join("journals")).expect("mkdir journal");
+        let app = AppState {
+            started: std::time::Instant::now(),
+            fw_state: dir.clone(),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![host_for_test(
+                "flywheel/ws-a",
+            )])),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: std::time::Instant::now(),
+            })),
+        };
+        let audit = dir.join("doorbell/ws-a.audit.jsonl");
+        let ts = |secs_ago: i64| {
+            chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - secs_ago, 0)
+                .expect("in range")
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        // Two spliced rows (what concurrent appenders produce) under good rows.
+        let spliced = r#"{"kind":"wake_sock_absent","reason":"x"{"kind":"y","ts":"#;
+        std::fs::write(
+            &audit,
+            format!(
+                "{spliced}\n{spliced}\n{{\"ts\":\"{t0}\",\"kind\":\"ok\",\"workspace\":\"ws-a\"}}\n\
+                 {{\"ts\":\"{t0}\",\"kind\":\"ok\",\"workspace\":\"ws-a\"}}\n",
+                t0 = ts(0)
+            ),
+        )
+        .expect("write audit");
+        let body = health_body(&app);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
+        let tears = v["audit_torn_rows"].as_array().expect("tears reported");
+        assert_eq!(tears.len(), 1, "the workspace is listed: {body}");
+        assert_eq!(tears[0]["torn"], 2, "both spliced rows are counted");
+        assert_eq!(tears[0]["scanned"], 2, "beside what WAS readable");
+        assert!(
+            v["degraded"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|x| x == "audit_rows_torn")),
+            "a tear under rows written seconds ago is happening now: {body}"
+        );
+        // The same tear, with the last good row old: reported, NOT degraded.
+        let mut old = std::fs::read_to_string(&audit).expect("read");
+        old = old.replace(&ts(0), &ts(4000));
+        std::fs::write(&audit, old).expect("rewrite audit");
+        let body = health_body(&app);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
+        assert_eq!(
+            v["audit_torn_rows"][0]["torn"], 2,
+            "history is still reported: the rows are still lost"
+        );
+        assert!(
+            !v["degraded"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|x| x == "audit_rows_torn")),
+            "a tear nobody is appending to any more is not a live fault: {body}"
+        );
+        // A clean file reports null, not zero: absent is UNMEASURED, which is
+        // not the same claim.
+        std::fs::write(
+            &audit,
+            format!("{{\"ts\":\"{}\",\"kind\":\"ok\"}}\n", ts(0)),
+        )
+        .expect("clean");
+        let body = health_body(&app);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("health json");
+        assert!(
+            v["audit_torn_rows"].is_null(),
+            "nothing unreadable is reported as nothing, not as a zero count: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-sfvq: a window that starts mid-file begins mid-ROW, so its first line
+    /// is a fragment that is torn by construction. Count it and every healthy
+    /// file larger than the window reports a fault forever, which is the fastest
+    /// way to teach an operator that a field is noise.
+    #[test]
+    fn audit_tear_does_not_count_the_windows_own_first_fragment() {
+        let dir = std::env::temp_dir().join(format!("db-tear-frag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("big.audit.jsonl");
+        let ts = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64, 0)
+            .expect("in range")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let row = format!(
+            "{{\"ts\":\"{ts}\",\"kind\":\"ok\",\"pad\":\"{}\"}}\n",
+            "p".repeat(200)
+        );
+        // Comfortably past MAX_TAIL_BYTES so the window must start mid-file.
+        let whole: String = std::iter::repeat_n(row.as_str(), 2000).collect();
+        std::fs::write(&path, &whole).expect("write big");
+        assert!(
+            whole.len() as u64 > doorbell_rt::tailprobe::MAX_TAIL_BYTES,
+            "the fixture must exceed the window or this test proves nothing"
+        );
+        let tear = doorbell_rt::tailprobe::audit_tear(&path).expect("readable");
+        assert_eq!(tear.torn, 0, "a healthy big audit tears nowhere: {tear:?}");
+        assert!(tear.scanned > 0, "and rows were really read: {tear:?}");
+        // A real splice inside the same size file is still caught — spliced into
+        // the LAST row, because the probe reads the tail and a splice planted
+        // in the head is outside what it can see (that is the point of a bounded
+        // read, and this test must not confuse a bounded read with a blind one).
+        let (head, tail) = whole
+            .rsplit_once(&format!("{{\"ts\":\"{ts}\""))
+            .expect("many rows");
+        let spliced = format!("{head}{{\"kind\":\"a\"{{\"kind\":\"b\",\"ts\":{tail}");
+        std::fs::write(&path, spliced).expect("write spliced");
+        let tear = doorbell_rt::tailprobe::audit_tear(&path).expect("readable");
+        assert_eq!(tear.torn, 1, "one real splice inside a big file: {tear:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

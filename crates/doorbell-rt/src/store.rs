@@ -904,7 +904,25 @@ impl FileStore {
             }
         };
         use std::io::Write;
-        if let Err(e) = writeln!(f, "{entry}") {
+        // bd-sfvq: ONE write per row, not a `Display` stream. `O_APPEND` makes
+        // each `write(2)` land at the current end, so a row serialized through
+        // `Display` (which emits the document fragment by fragment) is spliced
+        // by any second appender into a line that is neither row — 513 such
+        // rows live in one workspace's audit. Serialize first, newline included
+        // in the same buffer, so the whole row is one syscall and O_APPEND does
+        // the rest.
+        let mut line = match serde_json::to_string(&entry) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "doorbell-rt: AUDIT append REFUSED on {workspace} (serialize) — a row \
+                     that cannot be serialized is not a row: {e:#}"
+                );
+                return Err(std::io::Error::other(e));
+            }
+        };
+        line.push('\n');
+        if let Err(e) = f.write_all(line.as_bytes()) {
             eprintln!(
                 "doorbell-rt: AUDIT append FAILED on {workspace} (write) — refuse silent \
                  drop (GS-039): {e:#}"
@@ -1677,6 +1695,108 @@ mod tests {
         assert_eq!(FileStore::entry_version(&fold.rows[0]), 1);
         assert_eq!(FileStore::entry_version(&fold.rows[1]), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod audit_append_tests {
+    use super::*;
+
+    /// bd-sfvq: an audit row must land WHOLE or not at all.
+    ///
+    /// The writer opened `O_APPEND` and then wrote the row with
+    /// `writeln!(f, "{entry}")`, where `entry` is a `serde_json::Value`. A
+    /// `Value`'s `Display` emits the document in fragments (brace, key, value,
+    /// comma...), and `write_fmt` turns each fragment into its own `write(2)`.
+    /// `O_APPEND` makes each of those small writes land at the current end, so
+    /// two appenders interleave FRAGMENTS and produce a line that is neither
+    /// row. Measured live on 2026-09-28: 513 such rows in one workspace's
+    /// audit, each one a splice of two or three writers' bytes.
+    ///
+    /// The fix is to serialize to a buffer and hand the file ONE write, which
+    /// `O_APPEND` makes atomic against other appenders. Threads stand in for
+    /// processes here: each holds its own descriptor, which is the same race.
+    /// The rows are fat (4 KiB) on purpose — a thin row fragments into a
+    /// handful of writes and the race stops being observable, so a green test
+    /// would prove nothing.
+    #[test]
+    fn concurrent_audit_appends_never_splice_a_row() {
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 12;
+        let dir = std::env::temp_dir().join(format!("dbrt-auditappend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FileStore::new(&dir);
+        // Pre-build the payloads: a Value built per row would put the race
+        // behind the allocator as well as the writer.
+        let payloads: Vec<Vec<serde_json::Value>> = (0..WRITERS)
+            .map(|w| {
+                (0..PER_WRITER)
+                    .map(|i| {
+                        serde_json::json!({
+                            "kind": "probe",
+                            "writer": w,
+                            "seq": i,
+                            "filler": "x".repeat(4096),
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut handles = Vec::new();
+        let mut seen: std::collections::BTreeSet<(Option<u64>, Option<u64>)> =
+            std::collections::BTreeSet::new();
+        for (w, rows) in payloads.into_iter().enumerate() {
+            let dir = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = FileStore::new(&dir);
+                for row in rows {
+                    store.append_audit("ws", row).expect("append");
+                }
+                w
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread");
+        }
+        let body = std::fs::read_to_string(store.audit_file("ws")).expect("audit body");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines.len(),
+            WRITERS * PER_WRITER,
+            "every row is its own line: a short count means rows were lost"
+        );
+        for (n, line) in lines.iter().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("row {n} is not one row ({e}): {line:.200}"));
+            let obj = parsed.as_object().expect("an audit row is an object");
+            assert_eq!(
+                obj.len(),
+                4,
+                "row {n} carries exactly this row's fields, so no other writer's \
+                 fragment rode in: {line:.200}"
+            );
+            // Completeness, NOT order. Which writer's row lands on which line
+            // is a race with no contract, so an ordering assertion here would
+            // be a test of the scheduler. What must hold is that every
+            // (writer, seq) pair appears exactly once: nothing lost, nothing
+            // duplicated.
+            let pair = (obj["writer"].as_u64(), obj["seq"].as_u64());
+            assert!(
+                pair.0.is_some() && pair.1.is_some(),
+                "row {n} is identifiable: {line:.120}"
+            );
+            assert!(
+                seen.insert(pair),
+                "row {n} duplicates an earlier one, so a row was written twice: {line:.120}"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            WRITERS * PER_WRITER,
+            "every row that was written is in the file exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
