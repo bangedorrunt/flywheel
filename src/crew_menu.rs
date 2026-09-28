@@ -67,6 +67,15 @@ impl HarnessMenu {
     pub fn offers(&self, harness: &str) -> bool {
         self.options.iter().any(|o| o.harness == harness)
     }
+
+    /// Re-establish the diversity floor after something reordered `options`.
+    ///
+    /// bd-drlm: the Jev ranker calls this so a model cannot collapse a crew onto
+    /// one lens. It is a no-op when the floor is already satisfied, so it is safe
+    /// to call unconditionally.
+    pub fn reapply_diversity_floor(&mut self) {
+        enforce_diversity_floor(&mut self.options, self.crew);
+    }
 }
 
 /// How many distinct harnesses a crew that size should lead with.
@@ -184,6 +193,25 @@ fn rank(options: &mut Vec<HarnessOption>, crew: u32) {
             .cmp(&a.roles.len())
             .then(a.harness.cmp(&b.harness))
     });
+    enforce_diversity_floor(options, crew);
+}
+
+/// Test-only seam so a fence in another module can run the REAL deterministic rank
+/// instead of re-implementing it. A copy of this logic in a test is a second
+/// implementation that can agree with the wrong thing.
+#[cfg(test)]
+pub(crate) fn rank_public_for_test(options: &mut Vec<HarnessOption>, crew: u32) {
+    rank(options, crew);
+}
+
+/// Promote the best harness that is not already leading into the floor-th slot.
+///
+/// bd-drlm: extracted from `rank` so a Jev pass can RE-ESTABLISH it. The floor is
+/// a property of the crew size and the set, not of the order the deterministic
+/// sort happened to produce, so anything that reorders must re-run it — otherwise
+/// a confident model could put one harness in every leading slot of a five-agent
+/// crew, which is the exact failure this rule exists to prevent.
+pub(crate) fn enforce_diversity_floor(options: &mut Vec<HarnessOption>, crew: u32) {
     let floor = diversity_floor(crew);
     if options.len() <= floor {
         return;

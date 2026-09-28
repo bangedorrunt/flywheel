@@ -33,6 +33,20 @@ impl HarnessTier {
     pub const fn may_be_asked_for_a_model(self) -> bool {
         matches!(self, Self::Open)
     }
+
+    /// The tier as a word, for anything a person or a model reads.
+    ///
+    /// bd-drlm: the Jev state carries this so the model can tell an open harness
+    /// that accepts a chosen model from a closed one that does not, instead of
+    /// guessing from a profile list. Derived from the same enum the gate uses, so
+    /// the word cannot disagree with the gate.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
 }
 
 /// Slot names, spelled as the config uses them.

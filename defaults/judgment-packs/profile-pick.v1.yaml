@@ -8,7 +8,6 @@ questions:
   - id: profile_fit
     kind: score
     instructions: "How fit is `candidate` (coder-family profile: coder, rust-coder, ts-coder, zig-coder) to implement `goal.text` (language + task fit): poor, adequate, or strong?"
-    options: [poor, adequate, strong]
     criteria:
       - "poor: wrong language or task outside the profile's when-scope."
       - "adequate: adjacent language, or a generic task the profile covers with guidance."
