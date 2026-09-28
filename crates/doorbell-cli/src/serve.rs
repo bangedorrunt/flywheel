@@ -235,6 +235,15 @@ fn inbox_path_down(ages: &[Option<u64>], fresh_secs: u64) -> bool {
     !ages.is_empty() && ages.iter().all(|a| a.is_some_and(|age| age <= fresh_secs))
 }
 
+/// True when ANY workspace has fresh evidence. The mirror of
+/// [`inbox_path_down`], and the right rule for a fault that is not
+/// per-workspace: the toron store is shared, so one workspace failing to open
+/// it is proof the rest will fail too. Waiting for all of them is how a live
+/// store skew stayed invisible (bd-xkte).
+fn any_fresh(ages: &[Option<u64>], fresh_secs: u64) -> bool {
+    ages.iter().any(|a| a.is_some_and(|age| age <= fresh_secs))
+}
+
 /// Watch-thrash measurement window. A healthy quiet watcher idle-exits at
 /// 90s and is respawned after the retry gate (~109s cadence measured live),
 /// so individual restarts are routine and two workspaces phase them
@@ -1818,6 +1827,25 @@ fn health_body(app: &AppState) -> String {
     if inbox_path_down(&ages, PROBE_FRESH_SECS) {
         degraded.push("inbox_fetch_failing".to_string());
     }
+    // bd-xkte: a toron store AHEAD of the binary the daemon shells refuses
+    // every fetch, and the probe above structurally cannot name it — the store
+    // is shared, so "every hosted workspace has a fresh path-error" is a shape
+    // this fault never takes. ONE workspace is proof here, because the row
+    // names a store, not a workspace. Live 2026-09-28: every fetch refused and
+    // `/health` still read `degraded: []`.
+    let skew_ages: Vec<Option<u64>> = audits
+        .iter()
+        .map(|p| {
+            doorbell_rt::tailprobe::newest_match_age_secs(
+                p.as_path(),
+                "\"kind\":\"inbox_store_skew\"",
+                now,
+            )
+        })
+        .collect();
+    if any_fresh(&skew_ages, PROBE_FRESH_SECS) {
+        degraded.push("inbox_store_skew".to_string());
+    }
     let journals: Vec<std::path::PathBuf> = ws_names
         .iter()
         .map(|w| workspace_journal_path(&app.fw_state, w))
@@ -2484,7 +2512,8 @@ mod tests {
         assert!(super::straggler_note(&clean).is_none());
     }
     use super::{
-        REAP_AFTER_SECS, bins_allow_hosting, inbox_path_down, reap_candidates, unhosted_subscribed,
+        REAP_AFTER_SECS, any_fresh, bins_allow_hosting, inbox_path_down, reap_candidates,
+        unhosted_subscribed,
     };
 
     /// bd-xwgh round 2: a mid-shutdown doorbell whose accept loop is gone
@@ -2536,6 +2565,80 @@ mod tests {
             !inbox_path_down(&[Some(500)], 120),
             "a stale error is not live path-down"
         );
+    }
+
+    /// bd-xkte: the mirror rule. A shared store means one workspace is proof,
+    /// which is exactly what `inbox_path_down` cannot express.
+    #[test]
+    fn any_fresh_needs_only_one_workspace() {
+        assert!(!any_fresh(&[], 120), "no hosts is not a fault");
+        assert!(
+            any_fresh(&[Some(5)], 120),
+            "one fresh row is proof when the fault is shared"
+        );
+        assert!(
+            any_fresh(&[Some(5), None], 120),
+            "a silent sibling does not excuse the one that spoke"
+        );
+        assert!(!any_fresh(&[Some(500), None], 120), "stale is not live");
+    }
+
+    /// bd-xkte: a toron store AHEAD of the binary the daemon shells refuses
+    /// every fetch, and `inbox_fetch_failing` structurally cannot name it —
+    /// that probe needs EVERY hosted workspace to hold a fresh path-error, and
+    /// the store is shared, so the shape never holds. Live on 2026-09-28 every
+    /// fetch refused while `/health` read `degraded: []`. One workspace is
+    /// proof here.
+    ///
+    /// The second half is the guard on the mirror rule: it must not relax
+    /// `inbox_fetch_failing`, because one workspace's fetch error is still a
+    /// local miss and not a dead fetch path.
+    #[test]
+    fn health_degrades_on_any_fresh_store_skew_row() {
+        use super::{AppState, CachedHealth, health_body};
+        let dir = std::env::temp_dir().join(format!("db-health-skew-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
+        std::fs::create_dir_all(dir.join("journals")).expect("mkdir journal");
+        let ts = chrono::DateTime::from_timestamp(doorbell_rt::lease::unix_now() as i64 - 5, 0)
+            .expect("now in range")
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // Two hosted workspaces, the fault on ONE of them.
+        std::fs::write(
+            dir.join("doorbell/ws-a.audit.jsonl"),
+            format!("{{\"ts\":\"{ts}\",\"kind\":\"inbox_store_skew\",\"workspace\":\"ws-a\"}}\n"),
+        )
+        .expect("write audit");
+        std::fs::write(dir.join("doorbell/ws-b.audit.jsonl"), "").expect("write audit");
+        let app = AppState {
+            started: std::time::Instant::now(),
+            fw_state: dir.clone(),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![
+                host_for_test("flywheel/ws-a"),
+                host_for_test("flywheel/ws-b"),
+            ])),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: std::time::Instant::now(),
+            })),
+        };
+        let body = health_body(&app);
+        assert!(
+            body.contains("inbox_store_skew"),
+            "one workspace's fresh skew row is proof the store is unopenable: {body}"
+        );
+        // The same shape under the generic kind must stay quiet.
+        std::fs::write(
+            dir.join("doorbell/ws-a.audit.jsonl"),
+            format!("{{\"ts\":\"{ts}\",\"kind\":\"inbox_error\",\"workspace\":\"ws-a\"}}\n"),
+        )
+        .expect("rewrite audit");
+        let body = health_body(&app);
+        assert!(
+            !body.contains("inbox_fetch_failing"),
+            "one workspace with a fetch error is still not a dead fetch path: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-mk60 test seam: a keyed host handle with a real (unused) channel.
