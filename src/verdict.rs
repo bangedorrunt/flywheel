@@ -542,6 +542,21 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
              close is illegal regardless of verdicts"
         );
     }
+    // An EMPTY commit is not a candidate: it changes no files, so it cannot
+    // contain the work. It satisfies the message grep and nothing else, and
+    // `commit_is_bookkeeping_only` answers "not bookkeeping" for it, so on its
+    // own it used to be handed out as the bound revision — a LEGAL close for a
+    // commit that proves nothing. Refuse instead of certifying.
+    let candidates: Vec<&str> = candidates
+        .into_iter()
+        .filter(|sha| !commit_changes_nothing(cwd, sha).unwrap_or(false))
+        .collect();
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "SHA rule: every commit carrying bead id {bead_id} is EMPTY (it changes no files), \
+             so none of them can prove it — close against the commit that carries the work"
+        );
+    }
     for sha in &candidates {
         if !commit_is_bookkeeping_only(cwd, sha)? {
             return Ok((*sha).to_string());
@@ -550,6 +565,38 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     // Every candidate is bookkeeping-only: the id is still attributable and
     // "no commit carries the id" would be a lie that reopens a legal close.
     Ok(candidates[0].to_string())
+}
+
+/// Git stdout for `args` in `cwd`, trimmed of the trailing newline.
+fn git_stdout(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = StdCommand::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| anyhow::anyhow!("git not found: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// True when `sha` changes no files at all: an empty commit.
+///
+/// A merge is never called empty here — `git show --name-only` prints nothing
+/// for a merge without `-m`, so the answer would be a false positive.
+fn commit_changes_nothing(cwd: &Path, sha: &str) -> anyhow::Result<bool> {
+    let parents = git_stdout(cwd, &["rev-list", "--parents", "-n", "1", sha])?;
+    if parents.split_whitespace().count() > 2 {
+        return Ok(false);
+    }
+    Ok(git_stdout(
+        cwd,
+        &["show", "--name-only", "--format=", "--no-renames", sha],
+    )?
+    .is_empty())
 }
 
 /// Rebuild a `BeadUnit` from `br show <id> --json`: priority, title, and the
@@ -1478,6 +1525,63 @@ mod tests {
             String::from_utf8_lossy(&cm.stderr)
         );
         (dir, bead_id)
+    }
+
+    /// An empty commit can cite the bead id and change nothing.
+    ///
+    /// The message grep finds it, and `commit_is_bookkeeping_only` answers
+    /// "not bookkeeping" for it (an empty path list is deliberately not
+    /// bookkeeping, so a missing path list can never silently retarget the
+    /// bound revision) — which together made `git commit --allow-empty -m
+    /// "<id>"` a free LEGAL close for a bead nobody worked (2026-09-28: a
+    /// concurrent `git reset` unstaged the index and the commit landed empty).
+    #[test]
+    fn derive_head_sha_skips_an_empty_commit() {
+        let (dir, bead_id) = scratch_workspace("sha-empty-skip");
+        let work = derive_head_sha(&dir, &bead_id).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", &bead_id])
+            .current_dir(&dir)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "empty commit failed: {out:?}");
+        assert_ne!(head_sha(&dir), work, "HEAD moved to the empty commit");
+        assert_eq!(
+            derive_head_sha(&dir, &bead_id).unwrap(),
+            work,
+            "an empty commit must never become the bound revision"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And when every commit carrying the id is empty, the answer is a refusal
+    /// that names the empty commit — never a LEGAL verdict on a commit that
+    /// cannot contain the work.
+    #[test]
+    fn derive_head_sha_refuses_when_every_candidate_is_empty() {
+        let bead_id = "test-empty-only";
+        let dir = std::env::temp_dir().join(format!("fw-verdict-emptyonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", bead_id],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        }
+        let err = derive_head_sha(&dir, bead_id).expect_err("an empty-only binding must refuse");
+        assert!(
+            err.to_string().to_lowercase().contains("empty"),
+            "the refusal must name the empty commit, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Acceptance round-trip: `br gate report` then ledger check legal on the
