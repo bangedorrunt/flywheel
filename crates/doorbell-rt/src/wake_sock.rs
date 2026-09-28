@@ -43,6 +43,19 @@ pub const AUDIT_SOCK_FRAME: &str = "wake_sock_frame";
 pub const AUDIT_SOCK_IDLE: &str = "wake_sock_idle";
 /// bd-kz54: the subscribe handshake could not be written.
 pub const AUDIT_SOCK_HANDSHAKE: &str = "wake_sock_handshake";
+/// A resync the sidecar asked for. The ONLY exit that reconnects instead of
+/// ending, so it is the only one whose rate the brain's restart backoff never
+/// bounds — and until now the only one that wrote no row at all.
+pub const AUDIT_SOCK_SHED: &str = "wake_sock_shed";
+
+/// Floor between resync reconnects. A shed is lossless and non-fatal by design,
+/// so it does not end the consumer and does not reach the backoff that every
+/// other exit gets. Without a floor, a sidecar that keeps shedding turns this
+/// loop into a reconnect spinner: the cursor makes it correct, nothing made it
+/// slow. Cheap on the healthy path (a shed after hours of streaming pays 500ms
+/// once) and it bounds the worst case at 2 resyncs/second instead of
+/// socket-speed.
+pub const RESYNC_FLOOR: Duration = Duration::from_millis(500);
 /// bd-gdfe: a consumer that ended without its terminal outcome (worker
 /// panic or abort) journals this instead of dying silently — the gap that
 /// left hosted workspaces wake-blind with no backoff explanation.
@@ -166,6 +179,10 @@ pub struct WakeOpts {
     pub project: Option<String>,
     pub handshake_timeout: Duration,
     pub idle_timeout: Duration,
+    /// Minimum gap between reconnects after a shed (see [`RESYNC_FLOOR`]).
+    /// Configurable so a test can prove the floor is honoured without waiting
+    /// on the production value.
+    pub resync_floor: Duration,
     /// Set by whoever REPLACES this consumer, immediately before aborting it.
     ///
     /// bd-v7uu: a deliberate replacement and a crash both close the channel
@@ -187,6 +204,7 @@ impl WakeOpts {
             project,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: IDLE_TIMEOUT,
+            resync_floor: RESYNC_FLOOR,
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -280,7 +298,13 @@ async fn run_wake_loop(
         let _ = tx.send(out);
     };
     let mut cursor: Option<String> = None;
+    // Resyncs this loop has performed. Counted across reconnects so the audit
+    // rows read as a rate (1, 2, 3 ...) rather than N unrelated blips.
+    let mut resyncs: u64 = 0;
     loop {
+        if resyncs > 0 {
+            tokio::time::sleep(opts.resync_floor).await;
+        }
         let stream = match tokio::time::timeout(
             opts.handshake_timeout,
             tokio::net::UnixStream::connect(&opts.sock_path),
@@ -334,6 +358,18 @@ async fn run_wake_loop(
                     Ok(FrameAction::Heartbeat) => send(WakeOutcome::Heartbeat),
                     Ok(FrameAction::Eose) => {}
                     Ok(FrameAction::Shed(from)) => {
+                        // Lossless, not silent: the cursor makes the resync
+                        // correct, this row makes it visible, and the floor at
+                        // the top of the loop keeps it from spinning.
+                        resyncs += 1;
+                        audit(
+                            AUDIT_SOCK_SHED,
+                            serde_json::json!({
+                                "resync_from": from,
+                                "resync_index": resyncs,
+                                "floor_ms": opts.resync_floor.as_millis() as u64,
+                            }),
+                        );
                         cursor = Some(from);
                         break true; // transparent reconnect, lossless via cursor
                     }
@@ -427,6 +463,7 @@ mod tests {
                 handshake_timeout: Duration::from_millis(500),
                 // Long enough that idle is never what ends it; only the abort can.
                 idle_timeout: Duration::from_secs(30),
+                resync_floor: Duration::from_millis(50),
                 retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             let flag = opts.retire_flag();
@@ -589,6 +626,107 @@ mod tests {
         assert!(!p.exists() || true, "constructor never connects");
     }
 
+    /// The silent path: `Shed` is the only exit that reconnects instead of
+    /// ending, so it never reaches the brain's restart backoff and it used to
+    /// write no audit row at all ("transparent, lossless via cursor"). A sidecar
+    /// that keeps shedding therefore drove a reconnect loop with nothing to
+    /// bound it and nothing to show for it — the one exit whose rate was
+    /// invisible in the journal.
+    ///
+    /// Three properties, all of which the unguarded arm failed: the shed is
+    /// AUDITED (one row per resync, naming the cursor and how many resyncs have
+    /// happened), the loop is THROTTLED (a floor between reconnects), and a shed
+    /// is still not a death (lossless means no `Died`).
+    #[tokio::test]
+    async fn a_shed_loop_is_audited_and_throttled_and_is_not_a_death() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("wake-shed-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        const SHEDS: usize = 3;
+        tokio::spawn(async move {
+            for i in 0..SHEDS {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 1024];
+                let _ = s.read(&mut buf).await; // subscribe line
+                let line = format!("{{\"shed\":{{\"resync_from\":\"resync-{i}\"}}}}\n");
+                let _ = s.write_all(line.as_bytes()).await;
+                // Close: the shed arm reconnects on its own, it does not need EOF.
+            }
+        });
+        let floor = Duration::from_millis(60);
+        let opts = WakeOpts {
+            sock_path: path.clone(),
+            kinds: vec![9],
+            project: None,
+            handshake_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(2),
+            resync_floor: floor,
+            retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let audit = std::sync::Arc::new(move |k: &str, d: serde_json::Value| {
+            sink.lock().expect("audit lock").push((k.to_string(), d));
+        });
+        let started = std::time::Instant::now();
+        run_wake_loop(opts, &tx, &audit).await;
+        let elapsed = started.elapsed();
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(o) = rx.recv().await {
+            got.push(o);
+        }
+        let deaths = got
+            .iter()
+            .filter(|o| matches!(o, WakeOutcome::Died))
+            .count();
+        assert_eq!(
+            deaths, 1,
+            "a resync is lossless, not a death: {SHEDS} sheds must produce exactly one \
+             terminal Died (the EOF after the server stops), got {deaths} in {got:?}"
+        );
+        let rows = seen.lock().expect("audit lock");
+        let sheds: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|(k, _)| k == AUDIT_SOCK_SHED)
+            .map(|(_, d)| d)
+            .collect();
+        assert!(
+            elapsed >= floor * SHEDS as u32,
+            "{SHEDS} sheds reconnected in {elapsed:?}: the floor must bound the rewind loop, \
+             which is the only exit that does not reach the brain's backoff (floor {floor:?}). \
+             outcomes {got:?}, audits {:?}, shed rows {sheds:?}",
+            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sheds.len(),
+            SHEDS,
+            "every resync owes the journal a row: a rewind loop with no audit row is an \
+             incident that leaves no trace. audits: {:?}",
+            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            sheds[0]["resync_from"] == "resync-0" && sheds[2]["resync_from"] == "resync-2",
+            "the row must name the cursor it resynced to, or it cannot be followed: {sheds:?}"
+        );
+        assert_eq!(
+            sheds
+                .iter()
+                .map(|d| d["resync_index"].as_u64())
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)],
+            "the rows must count the resyncs, so a loop reads as a rate instead of N \
+             unrelated blips: {sheds:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn temp_socket_serves_scripted_frames_to_died() {
         use tokio::io::AsyncWriteExt;
@@ -618,6 +756,7 @@ mod tests {
             project: None,
             handshake_timeout: Duration::from_secs(2),
             idle_timeout: Duration::from_secs(2),
+            resync_floor: Duration::from_millis(50),
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -686,6 +825,7 @@ mod tests {
             project: None,
             handshake_timeout: Duration::from_secs(2),
             idle_timeout: Duration::from_millis(400),
+            resync_floor: Duration::from_millis(50),
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -737,6 +877,7 @@ mod tests {
             project: None,
             handshake_timeout: Duration::from_millis(100),
             idle_timeout: Duration::from_millis(100),
+            resync_floor: Duration::from_millis(50),
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<WakeOutcome>(8);
@@ -779,6 +920,7 @@ mod tests {
             project: None,
             handshake_timeout: Duration::from_millis(200),
             idle_timeout: Duration::from_millis(200),
+            resync_floor: Duration::from_millis(50),
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
