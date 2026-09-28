@@ -468,6 +468,18 @@ fn toron_run(data_dir: &Path, args: &[&str]) -> Output {
         .arg("--json")
         .arg("--no-input")
         .env("TORON_MCP_DATA_DIR", data_dir)
+        // bd-un3t: the wake socket is MACHINE-scoped, not data-dir scoped.
+        // `wake_sock::discover_sock_path` resolves `$XDG_STATE_HOME/toron/
+        // wake.sock` and never consults TORON_MCP_DATA_DIR — deliberately, so
+        // producer and consumers share one derivation (ADR-0036 Spec 2). On a
+        // host running `toron serve`, a pinned `watch --once` therefore
+        // attaches to THAT daemon: the project filter matches nothing, the
+        // whole budget burns, and the in-process replay over the pinned store
+        // is never reached (measured: 15.0s `watch: timeout` with the socket,
+        // 16ms to the stored event without it). Pin the socket into this
+        // test's own data dir, where no daemon runs, so the assertions below
+        // cover the replay-over-its-own-store path they are written for.
+        .env("TORON_WAKE_SOCK", data_dir.join("wake.sock"))
         .output()
         .unwrap_or_else(|e| panic!("spawn toron {}: {e}", toron_bin().display()))
 }
