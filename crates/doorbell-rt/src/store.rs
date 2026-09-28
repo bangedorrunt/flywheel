@@ -690,6 +690,21 @@ impl FileStore {
             .any(|ws| self.fold_workspace(ws).torn.is_some())
     }
 
+    /// The SAME rule as [`Self::any_torn_tail_among`] (a tear on a workspace we
+    /// abandon is history, not a delivery fault) but it hands back the numbers
+    /// instead of one boolean: which workspace, how many seqs, which range, and
+    /// how many rows the stopped fold cannot reach.
+    ///
+    /// The bare name read identically for a 16-row hole and a 5,175-row one, so
+    /// `/health` could say a journal was torn and never how badly.
+    #[must_use]
+    pub fn torn_tails_among(&self, hosted: &[&str]) -> Vec<(String, TornTail)> {
+        hosted
+            .iter()
+            .filter_map(|ws| self.fold_workspace(ws).torn.map(|t| ((*ws).to_string(), t)))
+            .collect()
+    }
+
     /// fsync the active journal (D4.2: before Prompt-intent delivery).
     pub fn sync_journal(&self, workspace: &str) -> std::io::Result<()> {
         let f = std::fs::OpenOptions::new()

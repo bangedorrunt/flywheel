@@ -1735,7 +1735,9 @@ fn health_body(app: &AppState) -> String {
     // bd-lorot: scoped to what we HOST. Scanning every journal let an abandoned
     // workspace hold `degraded` red forever.
     let hosted_ws: Vec<&str> = hosted.iter().filter_map(|h| hosted_workspace(h)).collect();
-    if store.any_torn_tail_among(&hosted_ws) {
+    // One fold, not two: the detailed probe answers the boolean AND the numbers.
+    let tears = store.torn_tails_among(&hosted_ws);
+    if !tears.is_empty() {
         degraded.push("journal_torn_tail".to_string());
     }
     let mode = if hosted.is_empty() {
@@ -1906,6 +1908,32 @@ fn health_body(app: &AppState) -> String {
             "prompt_hop": if no_prompt_hop { "no_pane_in_herdr" } else { "ok" },
         },
         "degraded": degraded,
+        // bd-5qyt: the tear's SIZE rides beside the flag. `journal_torn_tail`
+        // alone reads the same for a 16-row hole and a 5,175-row one, and this
+        // body is what `doorbell status` prints verbatim. Explicit `null` (not
+        // an empty array) when nothing is torn — the `standby_hint` shape, so
+        // "nothing is torn" never arrives looking like "torn, but tiny".
+        "torn_tails": if tears.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Array(
+                tears
+                    .iter()
+                    .map(|(ws, t)| {
+                        serde_json::json!({
+                            "workspace": ws,
+                            "file": t.file,
+                            "at_line": t.at_line,
+                            "reason": t.reason,
+                            "missing_seqs": t.missing_seqs,
+                            "missing_from": t.missing_from,
+                            "missing_to": t.missing_to,
+                            "rows_withheld": t.rows_withheld,
+                        })
+                    })
+                    .collect(),
+            )
+        },
         "known_workspaces": known_workspaces.len(),
         "standby_hint": if wake_blind {
             serde_json::Value::String(
@@ -2967,6 +2995,80 @@ mod tests {
         assert!(
             body.contains("\"restart_budget_per_window\":6"),
             "the budget the burst was measured against must be named: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tear detail exists (`bd-9ase`) and `/health` still reduced it to one
+    /// bare name: `degraded: ["journal_torn_tail"]` reads identically for a
+    /// 16-row hole and a 5,175-row one. The numbers ride in `torn_tails` now, so
+    /// `doorbell status` — which prints this body verbatim — answers "how bad"
+    /// in the same probe.
+    ///
+    /// The ADR-0012 token stays in `degraded` (E14 and the CLI reader pin it);
+    /// the detail is ADDED, never substituted.
+    #[test]
+    fn health_names_the_tear_size_not_just_the_kind() {
+        use super::{AppState, CachedHealth, health_body};
+        let dir = std::env::temp_dir().join(format!("db-health-tear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("mkdir audit");
+        std::fs::create_dir_all(dir.join("journals")).expect("mkdir journal");
+        // Sweeps contiguous through seq 3, then seq 10: six values (4..=9) gone,
+        // and the two rows after the hole are what the fold withholds.
+        let mut journal = String::new();
+        for seq in [1, 2, 3, 10, 11] {
+            journal.push_str(&format!(
+                "{{\"v\":2,\"seq\":{seq},\"actions\":[],\"executed\":{{}}}}\n"
+            ));
+        }
+        std::fs::write(
+            dir.join("journals/doorbell-journal-flywheel-flywheel.jsonl"),
+            journal,
+        )
+        .expect("write journal");
+        let app = AppState {
+            started: std::time::Instant::now(),
+            fw_state: dir.clone(),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![host_for_test(
+                "flywheel/flywheel-flywheel",
+            )])),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: std::time::Instant::now(),
+            })),
+        };
+        let body = health_body(&app);
+        // The flag itself is unchanged: still degraded, still the pinned name.
+        assert!(
+            body.contains("journal_torn_tail"),
+            "a real tear still degrades with the ADR-0012 token: {body}"
+        );
+        // And now the numbers that make it readable: which workspace, how many
+        // seqs, which range, and how much history the fold cannot reach.
+        assert!(
+            body.contains("\"workspace\":\"flywheel-flywheel\"")
+                && body.contains("\"missing_seqs\":6")
+                && body.contains("\"missing_from\":4")
+                && body.contains("\"missing_to\":9")
+                && body.contains("\"rows_withheld\":2"),
+            "the tear must arrive with its size, range and withheld rows: {body}"
+        );
+        // A healthy workspace must NOT grow the key: an always-present empty
+        // array reads as a field that means nothing.
+        std::fs::write(
+            dir.join("journals/doorbell-journal-flywheel-flywheel.jsonl"),
+            "{\"v\":2,\"seq\":1,\"actions\":[],\"executed\":{}}\n",
+        )
+        .expect("heal journal");
+        let healed = health_body(&app);
+        assert!(
+            !healed.contains("journal_torn_tail"),
+            "a healed journal is not degraded: {healed}"
+        );
+        assert!(
+            healed.contains("\"torn_tails\":null"),
+            "and it says so explicitly rather than with an empty array: {healed}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

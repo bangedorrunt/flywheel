@@ -102,12 +102,27 @@ let _ = self.store.append_journal_seq(...);   // error discarded
 The seq advances before the write, and the write's error is thrown away. Any
 failing append therefore burns a seq permanently and reports nothing in the
 moment; the gap is the only trace, it is unexplainable from the journal, and
-`/health` reduces it to a single boolean (`journal_torn_tail`) that also stops
-the fold at the tear, hiding everything after it from `doorbell why`.
+`/health` used to reduce it to a single boolean (`journal_torn_tail`) that also
+stops the fold at the tear, hiding everything after it from `doorbell why`.
+(The boolean was never the false part — rows really were gone. What it could not
+say was which workspace, how many seqs, or how much history it was hiding.)
 
-The unwritable window is most plausibly rotation: `rotate()` rewrites the active
-file with `std::fs::write(&active, tail.join("\n") + "\n")`, which is a
-truncate-and-rewrite from a snapshot, not an append.
+An earlier version of this section called rotation "the most plausible"
+unwritable window, pointing at `rotate()`'s truncate-and-rewrite of the active
+file. That does not hold up: a rotation *removes* rows a seq was already spent
+on, so it can produce a gap that a retention record can be tied to, but it
+cannot explain seqs that were consumed and never written. The burned-seq path
+above does, which is why it is fixed rather than explained again.
+
+**Fixed (bd-5qyt).** `journal()` spends the seq only on a row that exists, and a
+failed append now names itself: a `journal_write_failed` audit row carrying the
+seq that could not be written plus the running count (sampled 1,2,3,5,9..., the
+same shape as every other repeat in that file), and a loud stderr line at the
+moment it happens instead of a hole discovered later. `/health` stopped reducing
+the result to one boolean too: `torn_tails` carries the workspace,
+`missing_seqs`, the `missing_from`..`missing_to` range and `rows_withheld`
+alongside the ADR-0012 `journal_torn_tail` token, which `doorbell status` prints
+verbatim.
 
 **Correction to an earlier version of this section.** It said the journals
 contain no rotation row despite `rotate()` claiming "Every drop is an audit
