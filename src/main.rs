@@ -55,6 +55,7 @@ mod herdr_shim;
 mod ingress;
 mod init_scaffold;
 mod intent;
+mod stuck_vs_busy;
 mod unanswered_triage;
 // Jev RANKS the derived crew menu; it never defines one. The ranker and its
 // rubric are built and tested here, and nothing calls them yet: bd-drlm wires
@@ -839,6 +840,29 @@ enum Commands {
         /// `.unanswered` files (default: the same XDG ladder flywheel uses).
         #[arg(long)]
         flywheel_state_dir: Option<std::path::PathBuf>,
+        /// Report what WOULD be asked and exit, spending no request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// bd-3uqz: is a doorbell brain WEDGED, or genuinely WORKING? The second Jev
+    /// fit, and the one that was built but UNREACHABLE — clippy caught the whole
+    /// module as dead code, which is the correct verdict for a judgment nothing
+    /// can ask.
+    ///
+    /// ANNOTATE-ONLY, and structurally so: the module exposes a LABEL and has no
+    /// function that takes a pid, port, or name and acts on it. This command
+    /// prints the deterministic counters AND the judgment side by side, and cannot
+    /// restart or stop anything, so there is nothing here to gate.
+    ///
+    /// Prints `unknown` with the numbers named when Jev is unavailable or declines,
+    /// so "we did not ask" never reads as "we checked and it is fine", and the
+    /// deterministic reading always stands beside it.
+    StuckVsBusy {
+        /// Doorbell health port. 18980 is this host's launched doorbell; 18080 is
+        /// toron's daemon. They are DIFFERENT services, and reading the wrong one
+        /// yields a plausible empty result rather than an error.
+        #[arg(long, default_value = "18980")]
+        port: u16,
         /// Report what WOULD be asked and exit, spending no request.
         #[arg(long)]
         dry_run: bool,
@@ -2704,6 +2728,7 @@ fn main() {
             flywheel_state_dir,
             dry_run,
         }) => cmd_unanswered_triage(flywheel_state_dir.clone(), *dry_run),
+        Some(Commands::StuckVsBusy { port, dry_run }) => cmd_stuck_vs_busy(*port, *dry_run),
         Some(Commands::Helm { project }) => cmd_helm(&cfg, project),
         Some(Commands::Briefing {
             objective,
@@ -13236,6 +13261,156 @@ fn cmd_unanswered_triage(
     let out =
         crate::unanswered_triage::run(&dir, &doorbell_dir, &transport, dry_run, now, "toron")?;
     println!("{out}");
+    Ok(())
+}
+
+/// bd-3uqz: fetch the live doorbell health, run the stuck-vs-busy judgment over it,
+/// and print both readings side by side.
+///
+/// The two outputs are deliberately both present. The judgment can be `unknown`,
+/// and when it is, the only useful thing a reader has is the deterministic
+/// counters beside it. Printing the label alone would make an unasked question look
+/// like an answer.
+fn cmd_stuck_vs_busy(port: u16, dry_run: bool) -> anyhow::Result<()> {
+    use crate::judgment::UreqTransport;
+    use crate::stage::{Signal, Stage};
+    let url = format!("http://127.0.0.1:{port}/health");
+    // A wrong port gives a CONNECTION error, which is the good case. A wrong
+    // SERVICE gives a well-formed document that is simply about the wrong thing,
+    // so the refusal below is what catches it.
+    let body = ureq::get(&url)
+        .call()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "GET {url}: {e}. If this is a connection refusal, check the PORT: 18980 is \
+             the doorbell and 18080 is toron's daemon."
+            )
+        })?
+        .into_string()
+        .map_err(|e| anyhow::anyhow!("read {url} body: {e}"))?;
+    let health: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("{url} is not JSON: {e}"))?;
+
+    // A health document with no watch and no wake is a WRONG SERVICE, not a
+    // judgment to make. Refuse before spending a request, and say why.
+    if health.get("watch").is_none() || health.get("wake").is_none() {
+        return Err(anyhow::anyhow!(
+            "{url} answered but carries no watch and no wake counters, so this is not a \
+             doorbell health document. Refusing to ask a judgment about the wrong service."
+        ));
+    }
+
+    // Jev is an ENHANCEMENT, never a dependency — bd-3uqz's own rule, applied to
+    // the second fit. No key must produce a clean "not asked" report, not an error.
+    let transport = UreqTransport::from_authority(&crate::authority::RuntimeAuthority::resolve())
+        .unwrap_or_else(|_| UreqTransport {
+            api_key: String::new(),
+            url: crate::judgment::SYSTEMONE_URL.to_string(),
+        });
+    let asked_jev = !transport.api_key.is_empty();
+
+    if dry_run {
+        let ev = crate::stuck_vs_busy::evidence(&health);
+        println!(
+            "{}",
+            serde_json::json!({
+                "would_ask": true,
+                "health_url": url,
+                "questions": [crate::stuck_vs_busy::Q_WEDGED, crate::stuck_vs_busy::Q_WORKING],
+                "evidence": serde_json::from_str::<serde_json::Value>(&ev)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        );
+        return Ok(());
+    }
+
+    let mut menu = crate::crew_menu::HarnessMenu {
+        crew: 0,
+        options: Vec::new(),
+        registered_unconfigured: Vec::new(),
+    };
+    // The objective NESTS the health document under `health` because the stage's
+    // preflight looks there. A top-level document would make that preflight pass
+    // VACUOUSLY — the same trap the `.unanswered` triage fell into.
+    let objective = serde_json::json!({ "health": health }).to_string();
+    let mut ctx = crate::stage::StageCtx {
+        objective: &objective,
+        menu: &mut menu,
+    };
+    // Run the PREFLIGHT leaf first, then the Jev leaf, rather than the composed
+    // stage. `StageReport` carries no children and `combine()` flattens leaf
+    // details into `id=signal` pairs, so a composed judgment's own verdict is
+    // DISCARDED — I first ran `stage()` here and got the verdict `health`,
+    // parsed from `"health:has-counters=Holds"`. Running the leaves the way
+    // `unanswered_triage` does costs one request and yields the real label.
+    let Stage::Compose { stages, .. } = crate::stuck_vs_busy::stage() else {
+        unreachable!("stuck_vs_busy::stage() is a Compose by construction")
+    };
+    let find = |id: &str| {
+        stages
+            .iter()
+            .find(|s| matches!(s, Stage::Code { id: sid, .. } if *sid == id))
+    };
+    let Some(pre) = find("health:has-counters") else {
+        unreachable!("the preflight leaf is named in the module")
+    };
+    let pre_report = pre.run(&mut ctx, &transport);
+    if pre_report.signal != Signal::Holds {
+        // Refused BEFORE spending a request, which is the point of the preflight.
+        println!(
+            "{}",
+            serde_json::json!({
+                "verdict": "unknown",
+                "signal": format!("{:?}", pre_report.signal),
+                "detail": pre_report.detail,
+                "health_url": url,
+                "asked_jev": false,
+                "request_spent": false,
+                "acts_on_the_daemon": false,
+            })
+        );
+        return Ok(());
+    }
+    let Some(jev) = stages
+        .iter()
+        .find(|s| matches!(s, Stage::Jev { id: sid, .. } if *sid == "stuck-vs-busy:noul"))
+    else {
+        unreachable!("the jev leaf is named in the module")
+    };
+    let report = jev.run(&mut ctx, &transport);
+    let verdict = report
+        .detail
+        .split(':')
+        .next()
+        .unwrap_or("unknown")
+        .trim()
+        .to_string();
+
+    // The deterministic reading travels WITH the judgment, always. That is the
+    // whole safety property: if Jev is unreachable the label says `unknown` and
+    // these counters are still there to act on by hand.
+    println!(
+        "{}",
+        serde_json::json!({
+            "verdict": verdict,
+            "signal": format!("{:?}", report.signal),
+            "detail": report.detail,
+            "health_url": url,
+            "asked_jev": asked_jev,
+            "request_spent": true,
+            "deterministic_counters": {
+                "restarts": health["watch"]["restarts"],
+                "restart_budget_per_window": health["watch"]["restart_budget_per_window"],
+                "last_event_age_s": health["watch"]["last_event_age_s"],
+                "deaf_ceiling_ms": health["wake"]["deaf_ceiling_ms"],
+                "sweep_last_age_s": health["sweep"]["last_age_s"],
+                "injectable": health["injection"]["injectable"],
+                "pins": health["injection"]["pins"],
+                "degraded": health["degraded"],
+            },
+            "acts_on_the_daemon": false,
+        })
+    );
     Ok(())
 }
 
