@@ -44,12 +44,28 @@ quietest audit trail.
 
 ## What is NOT fixed
 
-1. **The rate.** Each wake worker emits at most one `Died` (`run_wake_loop`
-   sends one and returns; the forwarder infers at most one more), and
-   `restart_wake` is single-flight with a backoff, which is why only 2 of 1,717
-   rows in the peak minute produced a `RestartWatch`. Those two facts do not add
-   up to 127 per second, let alone 620. The reproduction is complete and
-   repeatable; the cause of the rate is not derived. Do not patch it blind.
+1. **The rate: found by elimination, and it is the silent path.** A row per
+   `Died` message means 620 rows/s is 620 `Died` messages a second. `run_wake_loop`
+   has exactly one exit that loops with **no delay and no audit row**:
+   `FrameAction::Shed` sets the cursor to `resync_from` and reconnects
+   immediately. Connect failure, handshake failure, EOF, read error and
+   deaf-silence are each audited first; the shed arm is not. The evidence picks
+   it out:
+
+   - Across all three storms: **9,741 `Died` rows and not one socket audit row**.
+     Every audited way the reader ends accounts for those rows and none fired.
+   - Delivered `Watch` lines were 2, 3 and 4 against 4,877, 3,383 and 2,169
+     deaths. Lines kept arriving and almost none landed: a full channel being
+     re-fed, not a busy bus.
+   - Nothing in the replay path sleeps, so it can run at socket speed. That is
+     what 127/s, 179/s and 620/s look like.
+
+   So the shape is a resync loop re-feeding the consumer faster than the brain
+   drains, where each line that cannot be enqueued costs a death. It is not
+   proved by a replay trace, because failed lines are never journaled and the
+   arm that loops writes nothing. Closing that gap is the work: audit the shed,
+   and throttle the resync. Then a recurrence is a measurement, not an
+   inference.
 2. **The amplifier.** The brain writes a journal row per `Died` **message**,
    including the 2,112 in that minute that produced no action and
    `executed.restarted: false`. A `Died` that changes nothing still costs a row,
