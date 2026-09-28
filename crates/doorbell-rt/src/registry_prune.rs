@@ -120,7 +120,7 @@ impl Decision {
 /// the entire 65% hazard in one branch.
 pub fn decide(
     rows: &[Row],
-    known_panes: &[String],
+    known_panes: &std::collections::BTreeSet<String>,
     confirmations: &mut std::collections::BTreeMap<String, u32>,
     required: u32,
 ) -> Decision {
@@ -192,7 +192,7 @@ mod tests {
         ]
     }
 
-    fn herdr(panes: &[&str]) -> Vec<String> {
+    fn herdr(panes: &[&str]) -> std::collections::BTreeSet<String> {
         panes.iter().map(|s| (*s).to_string()).collect()
     }
 
@@ -206,7 +206,7 @@ mod tests {
     fn a_herdr_restart_prunes_nothing_and_counts_nothing() {
         let mut c: BTreeMap<String, u32> = BTreeMap::new();
         for sweep in 1..=5 {
-            let d = decide(&rows(), &[], &mut c, REQUIRED_CONFIRMATIONS);
+            let d = decide(&rows(), &Default::default(), &mut c, REQUIRED_CONFIRMATIONS);
             assert_eq!(
                 d.pruned(),
                 Vec::<&str>::new(),
