@@ -577,6 +577,27 @@ impl FileStore {
         (lines, bytes, oldest)
     }
 
+    /// bd-3uqz item E: sequence-number holes across the ACTIVE file and every
+    /// retained generation, as one window.
+    ///
+    /// Generations are read oldest-first so the window is contiguous in the same
+    /// order the reader folds them, and a rotation that dropped a contiguous range
+    /// still reads as 0% holes rather than as a burn.
+    pub fn journal_seq_holes(&self, workspace: &str) -> SeqHoles {
+        let mut lines: Vec<String> = Vec::new();
+        for n in (1..=RETENTION_GENS).rev() {
+            let p = self.journal_gen_file(workspace, n);
+            if let Ok(raw) = std::fs::read_to_string(&p) {
+                lines.extend(raw.lines().map(str::to_string));
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string(self.journal_file(workspace)) {
+            lines.extend(raw.lines().map(str::to_string));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        seq_holes(&refs)
+    }
+
     /// Retained journal rows (stats denominator for journal lag).
     pub fn journal_row_count(&self, workspace: &str) -> u64 {
         self.journal_chain(workspace)
@@ -1056,6 +1077,91 @@ fn seq_span(lines: &[&str]) -> (Option<u64>, Option<u64>) {
         }
     }
     (lo, hi)
+}
+
+/// bd-3uqz item E: how many sequence numbers a journal burned without recording a
+/// row for them.
+///
+/// The cause was fixed in ad128f1 ("a failed journal append no longer burns a
+/// seq"), but the condition was discoverable only by a forensic script because
+/// health had no field for it. Measured 2026-09-28: flywheel-chiebukuro carried
+/// 4939 rows across a 12901 seq span — 61.7% holes — while six other workspaces
+/// were at 0.0%.
+///
+/// This counts a hole as a number inside [lo, hi] with no row behind it, and it
+/// deliberately does NOT count a designed retention drop: `rotate` discards a
+/// CONTIGUOUS range, so the oldest generation simply starts later and the span
+/// stays dense. That is why a tail drop reads 0% here and a burn does not.
+///
+/// `duplicates` is reported separately rather than folded in. A duplicate write
+/// and a burned number look identical if you only count rows against a span, and
+/// they are different defects with different fixes: one is a replay, the other is
+/// a failed append. Reporting only a percentage would have made them the same
+/// event.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SeqHoles {
+    /// Rows in the window, including rows that carry no `seq`.
+    pub rows: usize,
+    /// Rows that carried a `seq`.
+    pub seq_rows: usize,
+    /// Distinct `seq` values seen.
+    pub distinct: usize,
+    /// Lowest `seq`, if any row had one.
+    pub seq_from: Option<u64>,
+    /// Highest `seq`, if any row had one.
+    pub seq_to: Option<u64>,
+    /// Sequence numbers inside the span with no row behind them.
+    pub holes: u64,
+    /// `seq_rows - distinct`: the same number recorded twice.
+    pub duplicates: usize,
+}
+
+impl SeqHoles {
+    /// Size of the number range the window covers. Zero when no row had a `seq`.
+    pub fn span(&self) -> u64 {
+        match (self.seq_from, self.seq_to) {
+            (Some(lo), Some(hi)) => hi.saturating_sub(lo).saturating_add(1),
+            _ => 0,
+        }
+    }
+
+    /// Holes as a percentage of the span, to two decimals. `None` rather than
+    /// `0.0` when there is no span: a workspace with nothing sequenced is not a
+    /// healthy 0%, it is an unmeasured one, and those read identically otherwise.
+    pub fn holes_pct(&self) -> Option<f64> {
+        let span = self.span();
+        if span == 0 {
+            return None;
+        }
+        Some(((self.holes as f64 / span as f64) * 10_000.0).round() / 100.0)
+    }
+}
+
+/// bd-3uqz item E: the pure arithmetic behind `journal.holes_pct`. Counts DISTINCT
+/// seq values rather than rows, so a replayed write cannot inflate the denominator
+/// and hide real holes behind it.
+pub fn seq_holes(lines: &[&str]) -> SeqHoles {
+    let mut out = SeqHoles {
+        rows: lines.iter().filter(|l| !l.trim().is_empty()).count(),
+        ..SeqHoles::default()
+    };
+    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(s) = v.get("seq").and_then(|s| s.as_u64()) else {
+            continue;
+        };
+        out.seq_rows += 1;
+        out.seq_from = Some(out.seq_from.map_or(s, |x: u64| x.min(s)));
+        out.seq_to = Some(out.seq_to.map_or(s, |x: u64| x.max(s)));
+        seen.insert(s);
+    }
+    out.distinct = seen.len();
+    out.duplicates = out.seq_rows - out.distinct;
+    out.holes = out.span().saturating_sub(out.distinct as u64);
+    out
 }
 
 fn count_lines(path: &std::path::Path) -> usize {
@@ -1622,6 +1728,97 @@ mod prune_tests {
         ] {
             assert_eq!(journal_workspace(name), want, "for {name}");
         }
+    }
+
+    /// bd-3uqz item E: `seq_holes` on its own, because every case here encodes a
+    /// different real event and a percentage alone is easy to agree with by
+    /// accident.
+    fn row(seq: Option<u64>) -> String {
+        serde_json::json!({ "v": 1, "msg": "m", "seq": seq }).to_string()
+    }
+
+    #[test]
+    fn a_dense_journal_has_no_holes_and_says_zero_percent() {
+        let lines: Vec<String> = (1..=100).map(|s| row(Some(s))).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let h = seq_holes(&refs);
+        assert_eq!((h.rows, h.distinct, h.holes), (100, 100, 0), "{h:?}");
+        assert_eq!(h.holes_pct(), Some(0.0));
+        assert_eq!(h.duplicates, 0);
+    }
+
+    /// The measured flywheel-chiebukuro shape was 4939 rows across a 12901 span.
+    /// A percentage is only meaningful if the ARITHMETIC is pinned, so this uses
+    /// a small exact case and asserts the numbers, not just the shape.
+    #[test]
+    fn a_burned_range_is_counted_against_the_span() {
+        // seq 1..=6 present, 7..=15 burned, 16..=20 present: a 20-number span
+        // carrying 11 rows, so 9 holes — 45.0%.
+        let mut lines: Vec<String> = (1..=6).map(|s| row(Some(s))).collect();
+        lines.extend((16..=20).map(|s| row(Some(s))));
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let h = seq_holes(&refs);
+        assert_eq!(h.rows, 11, "{h:?}");
+        assert_eq!(h.span(), 20);
+        assert_eq!(h.holes, 9);
+        assert_eq!(h.holes_pct(), Some(45.0));
+    }
+
+    /// A DESIGNED retention drop must not read as a burn. `rotate` discards a
+    /// CONTIGUOUS range, so the oldest generation simply starts later and the span
+    /// stays dense. If this reported holes, every rotated workspace would look like
+    /// flywheel-chiebukuro and the field would be pure noise.
+    #[test]
+    fn a_contiguous_tail_drop_is_a_drop_not_a_hole() {
+        // Rows 1001..=1100 retained after a rotation that dropped 1..=1000.
+        let lines: Vec<String> = (1001..=1100).map(|s| row(Some(s))).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let h = seq_holes(&refs);
+        assert_eq!(h.holes, 0, "a contiguous drop is not a hole: {h:?}");
+        assert_eq!(h.holes_pct(), Some(0.0));
+    }
+
+    /// A replayed write and a burned number are DIFFERENT defects. Counting rows
+    /// against a span lets a duplicate inflate the denominator and hide real
+    /// holes, so distinct values are counted and the repeats are named.
+    #[test]
+    fn a_duplicated_seq_is_named_and_does_not_hide_holes() {
+        let mut lines: Vec<String> = (1..=5).map(|s| row(Some(s))).collect();
+        lines.push(row(Some(3))); // replay of 3
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let h = seq_holes(&refs);
+        assert_eq!(h.rows, 6);
+        assert_eq!(h.seq_rows, 6);
+        assert_eq!(h.distinct, 5, "6 rows carry 5 distinct numbers");
+        assert_eq!(h.duplicates, 1, "the repeat is named, not absorbed");
+        assert_eq!(h.holes, 0, "a replay must not invent a hole");
+    }
+
+    /// Rows with no `seq` are excluded from BOTH sides. Counting them in the
+    /// denominator would report a hole where the only fault is a missing field.
+    #[test]
+    fn rows_without_a_seq_do_not_appear_in_either_side_of_the_ratio() {
+        let mut lines: Vec<String> = (1..=10).map(|s| row(Some(s))).collect();
+        lines.push(row(None));
+        lines.push(row(None));
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let h = seq_holes(&refs);
+        assert_eq!(h.rows, 12, "both unsequenced rows are still rows");
+        assert_eq!(h.seq_rows, 10);
+        assert_eq!(h.span(), 10);
+        assert_eq!(h.holes, 0);
+    }
+
+    /// A window with nothing sequenced is UNMEASURED, not healthy. Returning 0.0
+    /// would put a clean bill of health on a journal the scan never read.
+    #[test]
+    fn an_unsequenced_window_reports_absent_rather_than_zero_percent() {
+        let lines: Vec<String> = vec![row(None), row(None)];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let h = seq_holes(&refs);
+        assert_eq!(h.holes_pct(), None, "absent, not 0.0: {h:?}");
+        assert_eq!(h.span(), 0);
+        assert_eq!(seq_holes(&[]).holes_pct(), None);
     }
 
     /// bd-oa4u: the age prune's LIVENESS GUARD does not see a generation file.
