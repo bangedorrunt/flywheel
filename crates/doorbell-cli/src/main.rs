@@ -1,6 +1,7 @@
 // governed-by: ADR-0012
 //! `doorbell` daemon binary (ADR-0012 D2, Phase 1).
 
+mod armstate;
 mod lifecycle;
 mod migrate;
 mod ping;
@@ -28,6 +29,18 @@ struct Cli {
     /// Empty = standby: bind + reads only.
     #[arg(long, global = true)]
     host: Vec<String>,
+    /// bd-u54l: explicitly go standby and PERSIST an empty host set.
+    ///
+    /// Without this verb the ONLY way to reach standby is to omit `--host`, which
+    /// is also exactly what a bug does — bd-jbz1 reached it four times by typing
+    /// `doorbell restart`. An explicit verb makes "no wakes are delivered" a state
+    /// someone chose, recorded in hosts.json, and reportable by `doorbell status`.
+    // global, so it reads as `doorbell restart --unhost` and not only
+    // `doorbell --unhost restart` — matching --host, which is how every operator
+    // will type it. A flag that only works in one position is a flag that gets
+    // typed wrong.
+    #[arg(long, global = true)]
+    unhost: bool,
 }
 
 #[derive(Subcommand)]
@@ -82,6 +95,24 @@ async fn main() -> anyhow::Result<()> {
         cli.state_dir.is_none() && lifecycle::env_is_unset_or_empty("DOORBELL_STATE_DIR");
     let cfg =
         lifecycle::Config::resolve_full(cli.state_dir, cli.port, cli.flywheel_state_dir, hosts)?;
+
+    // bd-u54l: `effective_hosts = persisted merged-under argv`, NEVER argv alone.
+    //
+    // This is the fix for bd-jbz1 and it has to happen HERE, before start/restart,
+    // because `start` renders the expected launchd unit from `cfg.hosts` and
+    // compares it to the installed one. With an empty argv that comparison
+    // mismatched a unit carrying three hosts, and the fallback was "starting
+    // detached" using the SAME hostless config: no wakes AND no supervision, while
+    // `restart` printed "started" and exited 0.
+    //
+    // Resolving here rather than inside `start` is deliberate: `restart` calls
+    // `start(cfg)` with the same config, so one resolution fixes both verbs.
+    let persisted = armstate::load(&cfg.state_dir)?;
+    let arm = armstate::resolve(&persisted, &cfg.hosts, cli.unhost);
+    let mut cfg = cfg;
+    cfg.hosts = arm.hosts.clone();
+    armstate::announce(&arm.hosts, arm.source);
+
     // bd-fpd5: migrate-once off the legacy platform dir into the XDG
     // default. Explicit --state-dir / DOORBELL_STATE_DIR means
     // user-managed: never touch, migrate manually instead.

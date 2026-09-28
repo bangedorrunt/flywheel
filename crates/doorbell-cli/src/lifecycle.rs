@@ -842,6 +842,7 @@ pub fn start(cfg: &Config) -> Result<()> {
             "doorbell: already running (pid {pid}, port {}) — adopted",
             cfg.port
         );
+        warn_if_arm_diverges(cfg);
         return Ok(());
     }
     let exe = std::env::current_exe().context("current_exe")?;
@@ -860,6 +861,7 @@ pub fn start(cfg: &Config) -> Result<()> {
                     "doorbell: already running (pid {pid}, port {}) — adopted",
                     cfg.port
                 );
+                warn_if_arm_diverges(cfg);
                 Ok(())
             }
             // A Squatter verdict propagates through the `?` above.
@@ -883,6 +885,7 @@ pub fn start(cfg: &Config) -> Result<()> {
             "doorbell: already running (pid {pid}, port {}) — adopted",
             cfg.port
         );
+        warn_if_arm_diverges(cfg);
         return Ok(());
     }
     // Supervised start, but only when the installed unit renders
@@ -901,9 +904,58 @@ pub fn start(cfg: &Config) -> Result<()> {
             &cfg.hosts,
             &toron_mcp_url(),
         );
-        if existing == rendered {
+        // bd-u54l: compare the PARSED ARGV, not the file bytes.
+        //
+        // The old `existing == rendered` was a byte equality over a file an
+        // operator can hand-edit, so a whitespace-only divergence reported a
+        // mismatch and cost launchd supervision. That was not hypothetical: the
+        // installed unit used tab indentation while the template emits eight
+        // spaces, so `restart` said "starting detached" forever with every host
+        // correct. bd-jbz1 blamed the config; the config was fine.
+        // The plist's argv begins with the BINARY, so it belongs in the
+        // comparison: dropping it would make a unit pointing at a different
+        // binary compare EQUAL, and that mismatch is precisely the one that must
+        // still fall back to detached.
+        let exe_path = exe.display().to_string();
+        let mut want = vec![exe_path.clone()];
+        want.extend(serve_args(
+            &cfg.state_dir.display().to_string(),
+            cfg.port,
+            &cfg.flywheel_state.display().to_string(),
+            &cfg.hosts,
+        ));
+        let have = plist_program_args(&existing);
+        // A HOST-ONLY difference is not a mismatch of daemon: it is the arm state
+        // the operator just changed, and the unit is ours to re-render. Without
+        // this, `--unhost` from a supervised three-host setup produced a DETACHED
+        // daemon AND left a stale unit that would re-host all three on the next
+        // login — the decision would evaporate, which is the exact accident
+        // bd-u54l exists to remove.
+        let hosts_only =
+            have.len() != want.len() && strip_host_args(&have) == strip_host_args(&want);
+        let matches = have == want;
+        if !matches && hosts_only {
+            eprintln!(
+                "doorbell: installed unit's host set differs from this arm ({}) — re-rendering \
+                 the unit so the recorded state survives a reboot",
+                if cfg.hosts.is_empty() {
+                    "unhosted"
+                } else {
+                    "re-armed"
+                }
+            );
+            install_rendered(cfg, &rendered)
+                .context("re-render the autostart unit for the new arm")?;
+        }
+        if matches || hosts_only {
             match start_via_supervisor(cfg, &unit)? {
                 Some(pid) => {
+                    // bd-u54l: record what is now armed. Persisted HERE rather than
+                    // on every `start`, because the adopt path below returns Ok
+                    // without arming anything — persisting there would write down
+                    // a host set that the RUNNING daemon was not started with.
+                    crate::armstate::persist(&cfg.state_dir, &cfg.hosts)
+                        .context("persist armed hosts")?;
                     println!(
                         "doorbell: started (pid {pid}, port {}, supervised)",
                         cfg.port
@@ -979,6 +1031,11 @@ pub fn start(cfg: &Config) -> Result<()> {
                 OwnerVerdict::Managed(p) if p == pid => {
                     // Detached by disowning: never wait on it (reparented on unix).
                     std::mem::forget(child);
+                    // bd-u54l: the detached path is exactly where bd-jbz1 lost
+                    // supervision, so the armed set is recorded here too. A detached
+                    // daemon is the one an operator most needs `status` to explain.
+                    crate::armstate::persist(&cfg.state_dir, &cfg.hosts)
+                        .context("persist armed hosts")?;
                     println!("doorbell: started (pid {pid}, port {})", cfg.port);
                     Ok(())
                 }
@@ -1319,6 +1376,123 @@ pub fn install(cfg: &Config) -> Result<()> {
     install_rendered(cfg, &body)
 }
 
+/// bd-u54l: adopting a running daemon IGNORES the arm you just asked for.
+///
+/// `start` returns early on `try_adopt` without re-arming, so a `restart` that
+/// adopts leaves `hosts.json` describing a set the RUNNING daemon was not started
+/// with. That is the same class of defect as bd-jbz1 — the command says it
+/// succeeded and the request is quietly not applied — and it is why the persist
+/// calls sit on the two real arm paths rather than on every `start`.
+///
+/// Rather than change control flow on a path that guards against double-starting,
+/// this says so loudly and names the fix. Silently keeping a stale arm is what
+/// made the original bug survive four reproductions.
+fn warn_if_arm_diverges(cfg: &Config) {
+    let Ok(persisted) = crate::armstate::load(&cfg.state_dir) else {
+        return;
+    };
+    if persisted == cfg.hosts {
+        return;
+    }
+    let show = |v: &[(String, String)]| {
+        if v.is_empty() {
+            "nothing".to_string()
+        } else {
+            v.iter()
+                .map(|(p, w)| format!("{p}/{w}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    eprintln!(
+        "doorbell: WARNING adopted a daemon that is already running, so the arm you asked for was \
+         NOT applied. Recorded: [{}]. Requested: [{}]. Stop it first (`doorbell stop`) and start \
+         again to change the armed set.",
+        show(&persisted),
+        show(&cfg.hosts)
+    );
+}
+
+/// bd-u54l: the serve argv, as DATA. Every path that has to agree on what the
+/// unit launches goes through this, so the unit renderer and the unit COMPARISON
+/// cannot drift apart.
+///
+/// Extracted because the comparison used to be a raw BYTE equality
+/// (`existing == rendered`) over a file an operator can hand-edit, and a
+/// whitespace-only divergence cost launchd supervision silently. That is not
+/// hypothetical: the installed unit carried tab indentation while the template
+/// emits eight spaces (the `args.join("\n        ")` below), so `restart` reported
+/// "installed unit does not match this config — starting detached" forever, with
+/// every host correct. Comparing the PARSED argv cannot fail that way.
+pub fn serve_args(
+    state_dir: &str,
+    port: u16,
+    flywheel_state: &str,
+    hosts: &[(String, String)],
+) -> Vec<String> {
+    let mut args = vec![
+        "serve".to_string(),
+        "--state-dir".to_string(),
+        state_dir.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--flywheel-state-dir".to_string(),
+        flywheel_state.to_string(),
+    ];
+    for (p, w) in hosts {
+        args.push("--host".to_string());
+        args.push(format!("{p}/{w}"));
+    }
+    args
+}
+
+/// bd-u54l: the `<string>` entries of a plist's `ProgramArguments`, in order.
+///
+/// A deliberately small scanner, not an XML parser: the unit is written by
+/// [`render_autostart`] and read back for comparison, so the shape is known. It
+/// tolerates any indentation and any key order around the array, which is the
+/// whole point — the previous byte comparison did not.
+pub fn plist_program_args(xml: &str) -> Vec<String> {
+    let Some(start) = xml.find("<key>ProgramArguments</key>") else {
+        return Vec::new();
+    };
+    let rest = &xml[start..];
+    let Some(open) = rest.find("<array>") else {
+        return Vec::new();
+    };
+    let rest = &rest[open + "<array>".len()..];
+    let Some(end) = rest.find("</array>") else {
+        return Vec::new();
+    };
+    rest[..end]
+        .split("<string>")
+        .skip(1)
+        .filter_map(|s| s.split("</string>").next())
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// Drop every `--host <project>/<workspace>` pair from a serve argv.
+///
+/// bd-u54l: this is how a HOST-ONLY mismatch is recognised. `--unhost` and an
+/// explicit re-arm both change the arm state and nothing else about the daemon,
+/// so the unit is ours to re-render. A mismatch in anything else — the binary,
+/// the state dir, the port — is a genuinely different daemon and must still fall
+/// back to detached, which is the documented and correct behaviour.
+pub fn strip_host_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--host" {
+            i += 2;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out
+}
+
 /// Render the platform autostart unit with live paths (pure — golden
 /// tested). The unit reproduces the `start` serve argv (`--state-dir`,
 /// `--port`, `--flywheel-state-dir`, repeatable `--host p/w`) so an
@@ -1335,18 +1509,15 @@ pub fn render_autostart(
 ) -> String {
     #[cfg(target_os = "macos")]
     {
-        let mut args = vec![
-            "<string>--state-dir</string>".to_string(),
-            format!("<string>{state_dir}</string>"),
-            "<string>--port</string>".to_string(),
-            format!("<string>{port}</string>"),
-            "<string>--flywheel-state-dir</string>".to_string(),
-            format!("<string>{flywheel_state}</string>"),
-        ];
-        for (p, w) in hosts {
-            args.push("<string>--host</string>".to_string());
-            args.push(format!("<string>{p}/{w}</string>"));
-        }
+        // One source for the argv: the template supplies the binary and `serve`,
+        // so drop the leading "serve" `serve_args` includes. Building this list
+        // independently is how the renderer and the comparison could disagree
+        // about what the daemon is.
+        let args: Vec<String> = serve_args(state_dir, port, flywheel_state, hosts)
+            .into_iter()
+            .skip(1) // `serve` comes from the template, not the arg list
+            .map(|a| format!("<string>{a}</string>"))
+            .collect();
         include_str!("../units/com.doorbell.serve.plist")
             .replace("DOORBELL_BIN", exe)
             .replace("DOORBELL_STATE_DIR_VALUE", state_dir)
@@ -1760,6 +1931,114 @@ mod tests {
                 "{bad:?} must be refused (project AND workspace are required)"
             );
         }
+    }
+
+    /// bd-u54l: the argv comparison must survive INDENTATION, because that is the
+    /// real root cause of the lost supervision. The installed unit was hand-edited
+    /// with tabs while the template emits eight spaces, so the old byte comparison
+    /// reported a mismatch forever while every host was correct — and `restart`
+    /// answered "starting detached" and exited 0.
+    #[test]
+    fn the_unit_comparison_ignores_indentation() {
+        let args = serve_args(
+            "/st",
+            18980,
+            "/fw",
+            &[("flywheel".into(), "flywheel-flywheel".into())],
+        );
+        let want: Vec<String> = std::iter::once("/bin/doorbell".to_string())
+            .chain(args.iter().cloned())
+            .collect();
+        let render = |indent: &str| {
+            let body: Vec<String> = want
+                .iter()
+                .map(|a| format!("{indent}<string>{a}</string>"))
+                .collect();
+            format!(
+                "<plist>\n<key>ProgramArguments</key>\n<array>\n{}\n</array>\n</plist>\n",
+                body.join("\n")
+            )
+        };
+        let tabs = render("\t");
+        let spaces = render("        ");
+        assert_ne!(tabs, spaces, "the two renderings must differ byte-wise");
+        assert_eq!(
+            plist_program_args(&tabs),
+            want,
+            "a TAB-indented unit must compare EQUAL — this is the case that cost supervision"
+        );
+        assert_eq!(plist_program_args(&spaces), want);
+    }
+
+    /// A host-only difference is the arm state changing, NOT a different daemon.
+    /// `--unhost` from a supervised three-host setup must re-render the unit and
+    /// stay supervised; falling back to detached left a stale unit that re-hosted
+    /// all three on the next login, so the decision evaporated.
+    #[test]
+    fn a_host_only_difference_is_recognised_as_such() {
+        let three = serve_args(
+            "/st",
+            18980,
+            "/fw",
+            &[
+                ("flywheel".into(), "flywheel-flywheel".into()),
+                ("opencode".into(), "flywheel-opencode".into()),
+                ("toron".into(), "flywheel-toron".into()),
+            ],
+        );
+        let none = serve_args("/st", 18980, "/fw", &[]);
+        assert_ne!(three, none);
+        assert_eq!(
+            strip_host_args(&three),
+            strip_host_args(&none),
+            "unhosting changes the arm state and NOTHING else"
+        );
+    }
+
+    /// The inverse, and the case that must KEEP falling back to detached: a
+    /// different binary, state dir, port or flywheel state is a different daemon.
+    #[test]
+    fn a_different_daemon_is_not_mistaken_for_an_arm_change() {
+        let base = serve_args("/st", 18980, "/fw", &[("p".into(), "w".into())]);
+        for other in [
+            serve_args("/other-st", 18980, "/fw", &[("p".into(), "w".into())]),
+            serve_args("/st", 19999, "/fw", &[("p".into(), "w".into())]),
+            serve_args("/st", 18980, "/other-fw", &[("p".into(), "w".into())]),
+        ] {
+            assert_ne!(
+                strip_host_args(&base),
+                strip_host_args(&other),
+                "a different daemon must NOT be treated as an arm change"
+            );
+        }
+    }
+
+    /// `strip_host_args` must not swallow a trailing `--host` with nothing after
+    /// it, and must not drop a value that merely looks like a host pair.
+    #[test]
+    fn stripping_hosts_does_not_swallow_unrelated_arguments() {
+        let a: Vec<String> = vec![
+            "doorbell".into(),
+            "serve".into(),
+            "--host".into(),
+            "p/w".into(),
+            "--port".into(),
+            "18980".into(),
+        ];
+        assert_eq!(
+            strip_host_args(&a),
+            vec!["doorbell", "serve", "--port", "18980"]
+        );
+        let dangling = vec!["doorbell".into(), "serve".into(), "--host".into()];
+        assert_eq!(strip_host_args(&dangling), vec!["doorbell", "serve"]);
+    }
+
+    /// A plist with no ProgramArguments must read as empty rather than panic or
+    /// invent an argv — a malformed unit has to FAIL the comparison, not pass it.
+    #[test]
+    fn a_unit_without_program_arguments_reads_as_empty() {
+        assert!(plist_program_args("<plist/>").is_empty());
+        assert!(plist_program_args("<key>Label</key><string>x</string>").is_empty());
     }
 
     #[test]
