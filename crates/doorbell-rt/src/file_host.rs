@@ -52,6 +52,42 @@ fn inbox_fail_kind(stderr: &str) -> &'static str {
 /// Registry key + resolution live in core (bd-z5ou single owner).
 use doorbell_core::{PresenceVerdict, registry_key};
 
+/// A watch line that could not be enqueued is a DELIVERY failure, not a
+/// consumer death. This is the audit kind whose absence hid the storm: the
+/// flood wrote no audit row at all, so the audit log read calm while the
+/// journal filled with fabricated deaths.
+pub const AUDIT_BRAIN_FULL: &str = "wake_brain_full";
+
+/// What one un-enqueueable watch line does.
+#[derive(Debug, PartialEq, Eq)]
+enum FullChannelAction {
+    /// The first failure for this consumer: report one death so the restart
+    /// still happens (GS062-ADV-5's intent), and audit it loudly.
+    ReportDeath,
+    /// Subsequent failures: count only. Same fault, same consumer — reporting
+    /// each as a death is what turned a full channel into a Died storm
+    /// (live: 1,928 rows in four minutes, peaking at 127 per second, and every
+    /// one of them advanced the retry backoff as if the child had died).
+    CountDropped,
+}
+
+/// One consumer may report at most one death, however many lines it fails to
+/// enqueue.
+fn full_channel_action(reported: &std::sync::atomic::AtomicBool) -> FullChannelAction {
+    if reported.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        FullChannelAction::CountDropped
+    } else {
+        FullChannelAction::ReportDeath
+    }
+}
+
+/// Which of the counted drops also carry an audit row: the first, and then
+/// every power of two. Bounded (a 10,000-line flood leaves ~13 rows) and never
+/// silent, which is the whole point — the flood this replaces was invisible.
+fn should_audit_drop(prior_drops: usize) -> bool {
+    prior_drops == 0 || prior_drops.is_power_of_two()
+}
+
 /// Minimal generation record — same JSON shape as flywheel's
 /// `WatcherGen` (`started_unix`, `binary_mtime_unix`, `binary_len`,
 /// `binary_hash` sha1-of-first-8k, empty = pre-hash).
@@ -1576,8 +1612,17 @@ impl Host for FileHost {
             );
             let audit_state = fw_state.clone();
             let audit_workspace = workspace.clone();
+            // `audit_state`/`audit_workspace` are moved into the on_audit
+            // closure below, so the outcome arm keeps its own handles for the
+            // drop audit. Without an audit there, a full channel was invisible.
+            let full_state = fw_state.clone();
+            let full_workspace = workspace.clone();
             let beat_state = fw_state.clone();
             let beat_workspace = workspace.clone();
+            // One death report per consumer: the flood was one consumer hitting
+            // one full channel, reported as a death per line.
+            let reported_death = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             // `retry` is hoisted before the spawn; re-reading `self` here would
             // let the borrow escape the 'static future.
             let absent_rows = absent.clone();
@@ -1623,7 +1668,39 @@ impl Host for FileHost {
                                 absent_rows.fetch_and(0, std::sync::atomic::Ordering::SeqCst);
                             }
                             Err(_) => {
-                                crate::msg::deliver_died_blocking(&tx);
+                                // The line could not be enqueued. Report ONE
+                                // death for this consumer so a restart still
+                                // happens and the socket's cursor replays what
+                                // was missed, then count the rest instead of
+                                // manufacturing a death per line.
+                                match full_channel_action(&reported_death) {
+                                    FullChannelAction::ReportDeath => {
+                                        FileHost::append_audit_row(
+                                            &full_state,
+                                            &full_workspace,
+                                            AUDIT_BRAIN_FULL,
+                                            serde_json::json!({
+                                                "reason": "watch line could not be enqueued (brain channel full); reporting one death so the consumer restarts and replays from the cursor",
+                                            }),
+                                        );
+                                        crate::msg::deliver_died_blocking(&tx);
+                                    }
+                                    FullChannelAction::CountDropped => {
+                                        let prior = dropped
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        if should_audit_drop(prior) {
+                                            FileHost::append_audit_row(
+                                                &full_state,
+                                                &full_workspace,
+                                                AUDIT_BRAIN_FULL,
+                                                serde_json::json!({
+                                                    "reason": "further watch lines could not be enqueued",
+                                                    "dropped": prior + 1,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         },
                         WakeOutcome::Heartbeat => {
@@ -2669,6 +2746,48 @@ mod tests {
         assert!(!host3.inject_allowed("PinA"), "stale gen refuses");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// A full channel reports ONE death, not one per line. The live burst
+    /// (2026-09-28 03:53-03:56Z) was 1,928 `Died` rows
+    /// in one workspace, peaking at 127 inside a single second and pulsing
+    /// every few seconds for three minutes — each one claiming the child had
+    /// died, each one advancing the retry backoff, and not one audit row to
+    /// show for any of it.
+    #[test]
+    fn a_full_channel_reports_one_death_not_one_per_line() {
+        let reported = std::sync::atomic::AtomicBool::new(false);
+        let actions: Vec<FullChannelAction> =
+            (0..200).map(|_| full_channel_action(&reported)).collect();
+        let deaths = actions
+            .iter()
+            .filter(|action| **action == FullChannelAction::ReportDeath)
+            .count();
+        assert_eq!(
+            deaths, 1,
+            "200 un-enqueueable lines reported {deaths} deaths; every one after the first is \
+             the same consumer hitting the same full channel"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| **a == FullChannelAction::CountDropped)
+                .count(),
+            199,
+            "the rest must be counted, not turned into deaths"
+        );
+    }
+
+    /// The counted drops still leave a trace: bounded, and never silent — the
+    /// flood this replaces wrote no audit row at all.
+    #[test]
+    fn the_drop_audit_is_geometric_not_silent() {
+        let audited: Vec<usize> = (0..17).filter(|n| should_audit_drop(*n)).collect();
+        assert_eq!(
+            audited,
+            vec![0, 1, 2, 4, 8, 16],
+            "a flood must leave a bounded trace: not zero rows, and not one per drop"
+        );
+    }
+
     /// bd-lorot: a burst of deaths must schedule ONE restart.
     ///
     /// This is the fence for the live incident of 2026-09-27, where the
