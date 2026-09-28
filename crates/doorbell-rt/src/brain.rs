@@ -19,6 +19,18 @@ use std::collections::BTreeMap;
 /// surfacing later as an unattributable hole in the seq stream.
 pub const AUDIT_JOURNAL_WRITE_FAILED: &str = "journal_write_failed";
 
+/// bd-jcys: the D4.2 write-ahead flush failed. The decided row is IN the
+/// journal but not on disk, so the prompt it describes can reach a sink with
+/// nothing durable to explain it. Delivery is NOT withheld (see
+/// `Brain::flush_journal`), so this row is the only trace — it cannot be
+/// silent.
+pub const AUDIT_JOURNAL_SYNC_FAILED: &str = "journal_sync_failed";
+
+/// bd-jcys: a wake-state write failed. `persist_wake` already warned on its own
+/// path; the two direct `save_wake` call sites discarded the error. One helper
+/// now names all three, with the same sampled-row shape as the other repeats.
+pub const AUDIT_WAKE_SAVE_FAILED: &str = "wake_save_failed";
+
 pub struct BrainConfig {
     pub workspace: String,
     pub digest_threshold: usize,
@@ -168,6 +180,12 @@ pub struct Brain<H: Host> {
     /// seq, so this is the tally of rows the journal still owes; the audit rows
     /// ride it for the row count and it names the seq that could not be written.
     journal_write_failed: u64,
+    /// bd-jcys: write-ahead flushes that FAILED (see `flush_journal`). Same
+    /// sampled shape as `journal_write_failed`: a repeat is a COUNT, not a row
+    /// each, and the row names the context that failed to flush.
+    journal_sync_failed: u64,
+    /// bd-jcys: wake-state saves that FAILED (see `flush_wake`).
+    wake_save_failed: u64,
     /// Consecutive unanswered expiries per pin (S3 deaf digest names
     /// subscriber + attempts; corr binds in bd-asr2.11 with receipts).
     deaf_attempts: BTreeMap<String, u32>,
@@ -237,16 +255,7 @@ impl<H: Host> Brain<H> {
         // redeliver within the refolded budget; the resume row makes the
         // redelivery visible instead of silent.
         let redelivered = count_journaled_prompts(&store, &cfg.workspace);
-        if redelivered > 0 {
-            let _ = store.append_journal(
-                &cfg.workspace,
-                &serde_json::json!({"rt_kind": "Resume"}),
-                &serde_json::json!([]),
-                serde_json::json!({"stage": "resume", "redelivered": redelivered}),
-                &[],
-            );
-        }
-        Self {
+        let mut this = Self {
             cfg,
             host,
             store,
@@ -261,11 +270,25 @@ impl<H: Host> Brain<H> {
             next_seq,
             inert_died: 0,
             journal_write_failed: 0,
+            journal_sync_failed: 0,
+            wake_save_failed: 0,
             deaf_attempts: BTreeMap::new(),
             dedup_high_us: None,
             sla_seen: std::collections::BTreeSet::new(),
             liveness: std::sync::Arc::new(BrainLiveness::new()),
+        };
+        // bd-jcys: the resume row rides `journal()` like every other row, so it
+        // is sequenced, attributed to this subscriber, and cannot fail silently.
+        // It used to be a direct `append_journal` whose error went to `let _ =`.
+        if redelivered > 0 {
+            this.journal(
+                &serde_json::json!({"rt_kind": "Resume"}),
+                &[],
+                serde_json::json!({"stage": "resume", "redelivered": redelivered}),
+                &[],
+            );
         }
+        this
     }
 
     /// bd-y40k: share ONE probe between the brain's touches and the drain's
@@ -360,10 +383,11 @@ impl<H: Host> Brain<H> {
                 ExitStep::JournalUndelivered.note(&ws, dispatched, elapsed_ms())
             );
             let pins: Vec<String> = undelivered.iter().map(|u| u.pin.clone()).collect();
-            let _ = self.store.append_journal(
-                &self.cfg.workspace,
+            // bd-jcys: through `journal()` — this is the last row a Brain
+            // writes, so one lost here is unrecoverable.
+            self.journal(
                 &serde_json::json!({"rt_kind": "Shutdown"}),
-                &serde_json::json!([]),
+                &[],
                 serde_json::json!({"stage": "drain", "undelivered": undelivered.len()}),
                 &pins,
             );
@@ -400,10 +424,11 @@ impl<H: Host> Brain<H> {
                     "degraded",
                     serde_json::json!({ "source": source, "reason": reason }),
                 );
-                let _ = self.store.append_journal(
-                    &self.cfg.workspace,
+                // bd-jcys: through `journal()` — this row used to be
+                // unsequenced, unattributed, and silent on failure.
+                self.journal(
                     &serde_json::json!({"rt_kind": "Degraded", "source": source}),
-                    &serde_json::json!([]),
+                    &[],
                     serde_json::json!({"stage": "degraded", "reason": reason}),
                     &[],
                 );
@@ -507,7 +532,7 @@ impl<H: Host> Brain<H> {
             }
             self.wake.plane_s_cursor_us =
                 Some(self.wake.plane_s_cursor_us.map(|c| c.max(us)).unwrap_or(us));
-            let _ = self.store.save_wake(&self.cfg.workspace, &self.wake);
+            self.flush_wake("watch-cursor");
         }
         *self.stats.rings_by_class.entry("watch".into()).or_default() += 1;
         let effects = self.host.tick(&BrainMsg::Watch(line.clone()));
@@ -547,7 +572,7 @@ impl<H: Host> Brain<H> {
         }
         // Decided-before-delivery: flush the journal BEFORE any Prompt
         // intent reaches a sink (D4.2 write-ahead invariant).
-        let _ = self.store.sync_journal(&self.cfg.workspace);
+        self.flush_journal("watch");
         let delivered = self.deliver_prompts(injects).await;
         let woke = delivered.first().cloned();
         self.persist_wake(woke.as_deref(), "watch");
@@ -575,7 +600,7 @@ impl<H: Host> Brain<H> {
             serde_json::json!({"stage": "drain"}),
             &raw.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
         );
-        let _ = self.store.sync_journal(&self.cfg.workspace);
+        self.flush_journal("status");
         let delivered = self.deliver_prompts(injects).await;
         // GS-039 P0-1 REAL observation: wake-worthy status transitions that
         // show the agent woke (working) or settled after work
@@ -724,7 +749,7 @@ impl<H: Host> Brain<H> {
         let refs: Vec<&serde_json::Value> = rows.iter().collect();
         if let Some(hw) = doorbell_core::inbox_high_water_from_values(refs) {
             self.wake.since_by_pin.insert(pin.clone(), hw);
-            let _ = self.store.save_wake(&self.cfg.workspace, &self.wake);
+            self.flush_wake("inbox-cursor");
         }
         let effects = self.host.tick(&BrainMsg::InboxFetched {
             pin: pin.clone(),
@@ -845,7 +870,7 @@ impl<H: Host> Brain<H> {
         if raw.len() != injects.len() {
             self.stats.drops += (raw.len() - injects.len()) as u64;
         }
-        let _ = self.store.sync_journal(&self.cfg.workspace);
+        self.flush_journal("deliver");
         self.deliver_prompts(injects).await
     }
 
@@ -1094,10 +1119,68 @@ impl<H: Host> Brain<H> {
         if let Some(pin) = woke {
             changed |= doorbell_core::note_wake(&mut self.wake, pin, self.host.now_unix());
         }
-        if changed && let Err(e) = self.store.save_wake(&self.cfg.workspace, &self.wake) {
-            // GS-039: refuse silent drop — loud warn with the failing arm.
-            eprintln!(
-                "doorbell-rt: observed-wake stamp FAILED on {ctx} — refuse silent drop (GS-039): {e:#}"
+        if changed {
+            self.flush_wake(ctx);
+        }
+    }
+
+    /// bd-jcys: the D4.2 write-ahead flush, named on failure.
+    ///
+    /// The invariant is decided-before-delivery: the decided row must be
+    /// durable before a Prompt intent reaches a sink. When the flush fails the
+    /// row is written but not on disk, and the prompt still goes out — that is
+    /// deliberate. Withholding it would LOSE the wake: `on_watch` has already
+    /// advanced and persisted the plane-S cursor, so the next ring dedups the
+    /// event away and the prompt is gone for good. At-least-once delivery is
+    /// the contract, so a delivered prompt with an undurable row is the smaller
+    /// loss — and naming it is what keeps "the journal is the truth" honest.
+    fn flush_journal(&mut self, ctx: &str) {
+        let Err(e) = self.store.sync_journal(&self.cfg.workspace) else {
+            return;
+        };
+        self.journal_sync_failed += 1;
+        eprintln!(
+            "doorbell-rt: journal write-ahead flush FAILED on {} ({ctx}) — refuse silent \
+             drop (GS-039), the decided row may not be durable: {e:#}",
+            self.cfg.workspace
+        );
+        // Sampled like the other repeat counters: a full disk fails every tick,
+        // and `failed` keeps the repeat legible as one number.
+        if should_audit_count(self.journal_sync_failed as usize - 1) {
+            self.audit(
+                AUDIT_JOURNAL_SYNC_FAILED,
+                serde_json::json!({
+                    "context": ctx,
+                    "failed": self.journal_sync_failed,
+                    "error": format!("{e:#}"),
+                }),
+            );
+        }
+    }
+
+    /// bd-jcys: a wake-state write that failed. Both consumers already fail
+    /// SAFE — a lost plane-S cursor re-rings old history, a lost inbox
+    /// high-water re-fetches — so this names the failure instead of changing
+    /// the flow. `persist_wake` warned on its own path; the direct `save_wake`
+    /// sites discarded the error entirely.
+    fn flush_wake(&mut self, ctx: &str) {
+        let Err(e) = self.store.save_wake(&self.cfg.workspace, &self.wake) else {
+            return;
+        };
+        self.wake_save_failed += 1;
+        eprintln!(
+            "doorbell-rt: wake state write FAILED on {} ({ctx}) — refuse silent drop \
+             (GS-039): {e:#}",
+            self.cfg.workspace
+        );
+        if should_audit_count(self.wake_save_failed as usize - 1) {
+            self.audit(
+                AUDIT_WAKE_SAVE_FAILED,
+                serde_json::json!({
+                    "context": ctx,
+                    "failed": self.wake_save_failed,
+                    "error": format!("{e:#}"),
+                }),
             );
         }
     }
@@ -1629,6 +1712,77 @@ mod tests {
         assert_eq!(
             brain.journal_write_failed, 3,
             "and the tally survives the recovery"
+        );
+    }
+
+    /// bd-jcys: the D4.2 write-ahead flush is the one durable write whose
+    /// failure changes what the journal can PROVE — the decided row is in the
+    /// file but not on disk, so a crash there leaves a delivered prompt with
+    /// nothing to explain it. Two things must both hold: the failure is NAMED,
+    /// and the prompt still goes out. Withholding it would lose the wake
+    /// outright, because `on_watch` has already advanced the plane-S cursor
+    /// and the next ring would dedup it away.
+    ///
+    /// The fault is real, not mocked: a FILE sits where the `journals/`
+    /// directory belongs, so every journal open fails ENOTDIR while the audit
+    /// sidecar (a different subdirectory) stays writable.
+    #[tokio::test]
+    async fn a_failed_write_ahead_flush_is_named_and_delivery_survives() {
+        let prompt = Effect::Prompt {
+            pin: "p".into(),
+            line: "[doorbell] write-ahead".into(),
+        };
+        let (mut brain, _rx, _tx) = test_brain("sync-fail", vec![vec![prompt]]);
+        let (sink, _sent) = MockSink::new();
+        brain.sinks.add_sink("herdr", Box::new(sink));
+        let journals = brain
+            .store
+            .journal_file("w")
+            .parent()
+            .expect("journals dir")
+            .to_path_buf();
+        std::fs::create_dir_all(journals.parent().expect("state dir")).expect("state dir");
+        std::fs::write(&journals, b"not a directory").expect("block the journals dir");
+
+        brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
+
+        let audit = std::fs::read_to_string(brain.store.audit_file("w")).expect("audit sidecar");
+        assert!(
+            audit.contains("\"kind\":\"journal_sync_failed\""),
+            "the failed write-ahead flush must NAME itself, not vanish: {audit}"
+        );
+        assert_eq!(
+            brain.stats.injects, 1,
+            "delivery is NOT withheld: the cursor already advanced, so dropping the \
+             prompt here would lose the wake outright"
+        );
+    }
+
+    /// bd-jcys (Tier 2): the plane-S cursor save is the durable write in
+    /// `on_watch` that could fail with no trace — `persist_wake` already warned
+    /// on its own path, the direct `save_wake` sites did not. A lost cursor
+    /// re-rings old history (the safe direction), so this NAMES the failure
+    /// instead of changing the flow; the audit sidecar is what an operator
+    /// greps.
+    #[tokio::test]
+    async fn a_failed_wake_save_is_named_in_the_audit() {
+        let (mut brain, _rx, _tx) = test_brain("wake-save-fail", vec![vec![]]);
+        // A DIRECTORY where the wake state belongs: `private_write` opens
+        // EISDIR, so the save cannot land.
+        std::fs::create_dir_all(brain.store.wake_file("w")).expect("block the wake state");
+
+        brain
+            .dispatch(BrainMsg::Watch("{\"kind\":9,\"created_at\":100}".into()))
+            .await;
+
+        assert!(
+            brain.wake.plane_s_cursor_us.is_some(),
+            "premise: the cursor advanced in memory, so a save really was attempted"
+        );
+        let audit = std::fs::read_to_string(brain.store.audit_file("w")).expect("audit sidecar");
+        assert!(
+            audit.contains("\"kind\":\"wake_save_failed\""),
+            "a wake-state write that did not land must NAME itself: {audit}"
         );
     }
 

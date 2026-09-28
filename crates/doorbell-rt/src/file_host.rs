@@ -20,6 +20,7 @@
 
 use crate::host::{CoreReducer, Effect, Host};
 use crate::msg::BrainMsg;
+use crate::store::FileStore;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -1221,12 +1222,6 @@ impl FileHost {
         kind: &str,
         detail: serde_json::Value,
     ) {
-        let path = state_dir
-            .join("doorbell")
-            .join(format!("{workspace}.audit.jsonl"));
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let mut entry = serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             "workspace": workspace,
@@ -1235,14 +1230,17 @@ impl FileHost {
         if let (Some(obj), serde_json::Value::Object(map)) = (entry.as_object_mut(), detail) {
             obj.extend(map);
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{entry}");
-        }
+        // bd-jcys: ONE audit append. This was a second implementation that
+        // discarded both the mkdir and the write (`let _ =` inside `if let Ok`),
+        // so a wake-sock row — the EVIDENCE channel — could vanish with no
+        // trace. `FileStore::append_audit` is the single owner: owner-only dir
+        // and file, and it warns on every failure as well as returning the
+        // error. This caller holds no `&self` (that is why the free function
+        // exists at all), so it wraps the same root in a throwaway store
+        // instead of carrying a second copy of the writer.
+        let store = FileStore::new(state_dir.to_path_buf());
+        let path = store.audit_file(workspace);
+        let _ = store.append_audit(workspace, entry);
         // bd-lorot: the audit log had NO rotation while the journal had a full
         // retention discipline. See rotate_audit_if_oversized for why that is
         // backwards: the audit log is the high-volume one.
@@ -1884,6 +1882,31 @@ impl Host for FileHost {
 mod tests {
     use super::*;
     use crate::host::Host;
+
+    /// bd-jcys: `append_audit_row` is the wake-sock task's only audit door,
+    /// and it used to be a SECOND implementation that swallowed its own
+    /// failures. It now delegates to `FileStore::append_audit`, so the row
+    /// lands 0600 inside a 0700 directory like every other audit row — the
+    /// shape a perms audit and a backup both rely on. Fork the writer again
+    /// and this goes red.
+    #[cfg(unix)]
+    #[test]
+    fn wake_sock_audit_row_rides_the_one_audit_writer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dbrt-auditrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        FileHost::append_audit_row(&dir, "w", "probe", serde_json::json!({"n": 1}));
+        let file = dir.join("doorbell").join("w.audit.jsonl");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600, "the row lands owner-only");
+        assert_eq!(mode(&dir.join("doorbell")), 0o700, "in an owner-only dir");
+        let body = std::fs::read_to_string(&file).expect("audit row");
+        assert!(
+            body.contains("\"kind\":\"probe\"") && body.contains("\"n\":1"),
+            "and keeps the row shape the callers pass: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// bd-3vr9: the captain-pane union. A swept pin with no registry
     /// route binds the pane whose herdr `toron_pin` token names it, so
