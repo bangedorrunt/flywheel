@@ -448,6 +448,13 @@ fn adr_d5_names_collab_without_loop_and_bead_dispatch() {
     assert!(adr.contains("SC-D9"), "scenario SC-D9 missing from §9");
 }
 
+/// The toron CLI this file drives: an explicit TORON_BIN, else the sibling
+/// build. There is deliberately NO PATH fallback (bd-oylu). A bare `toron` is
+/// whatever happens to be installed, and an older one refuses the store this
+/// test's own working-tree `toron_core` just migrated ("migration 14 is applied
+/// … but this toron build resolves at most 13"), so the test dies at
+/// `channel create` with an error that looks like a product bug rather than a
+/// missing build. Fail loud and name both levers instead.
 fn toron_bin() -> PathBuf {
     if let Ok(p) = std::env::var("TORON_BIN") {
         return PathBuf::from(p);
@@ -456,10 +463,16 @@ fn toron_bin() -> PathBuf {
         .parent()
         .unwrap_or(Path::new("/Users/bangedorrunt/workspace"))
         .join("toron/target/debug/toron");
-    if sibling.exists() {
-        return sibling;
-    }
-    PathBuf::from("toron")
+    assert!(
+        sibling.exists(),
+        "toron CLI not found at {} — set TORON_BIN, or build it in the sibling toron \
+         repo with `mbx build -p toron-cli`. This test does not fall back to `toron` on \
+         PATH on purpose: an installed toron can be older than the working tree and then \
+         refuses the store the in-process toron_core migrated, which reads as a product \
+         failure instead of a missing build.",
+        sibling.display()
+    );
+    sibling
 }
 
 fn toron_run(data_dir: &Path, args: &[&str]) -> Output {
