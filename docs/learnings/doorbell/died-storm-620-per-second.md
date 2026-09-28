@@ -42,39 +42,74 @@ quietest audit trail.
 - **The 2026-09-28 storm stopped at the deploy that carried `7cdb927`:**
   2,168 `Died` rows before 04:33:34Z, one in the 38 minutes after.
 
-## What is NOT fixed
+## Correction: the rate was NOT the shed loop
 
-1. **The rate: found by elimination, and it is the silent path.** A row per
-   `Died` message means 620 rows/s is 620 `Died` messages a second. `run_wake_loop`
-   has exactly one exit that loops with **no delay and no audit row**:
-   `FrameAction::Shed` sets the cursor to `resync_from` and reconnects
-   immediately. Connect failure, handshake failure, EOF, read error and
-   deaf-silence are each audited first; the shed arm is not. The evidence picks
-   it out:
+An earlier version of this file named the unthrottled `FrameAction::Shed` arm as
+**the** source of the rate, "by elimination". That was wrong, and the reason is
+simple: **the shed arm does not emit `Died` at all.** It keeps the cursor and
+reconnects; it reports nothing, so it cannot produce the rows the storm is made
+of. Elimination reasoning is only as good as the candidate list, and mine had
+the wrong candidate on it.
 
-   - Across all three storms: **9,741 `Died` rows and not one socket audit row**.
-     Every audited way the reader ends accounts for those rows and none fired.
-   - Delivered `Watch` lines were 2, 3 and 4 against 4,877, 3,383 and 2,169
-     deaths. Lines kept arriving and almost none landed: a full channel being
-     re-fed, not a busy bus.
-   - Nothing in the replay path sleeps, so it can run at socket speed. That is
-     what 127/s, 179/s and 620/s look like.
+The shed arm is still a real hole and is now guarded (audited per resync,
+throttled by `RESYNC_FLOOR`), because a loop that reconnects with no delay and
+no row is unbounded and invisible whether or not it caused this storm.
 
-   So the shape is a resync loop re-feeding the consumer faster than the brain
-   drains, where each line that cannot be enqueued costs a death. It is not
-   proved by a replay trace, because failed lines are never journaled and the
-   arm that loops writes nothing. Closing that gap is the work: audit the shed,
-   and throttle the resync. Then a recurrence is a measurement, not an
-   inference.
-2. **The amplifier.** The brain writes a journal row per `Died` **message**,
+What the rows say instead: the storm's unit is a **failed enqueue that reports
+itself as a death** — `deliver_died_blocking` failing because the brain channel
+was full, and the failure re-reporting a death, which `7cdb927` fixed. That is
+how 620 deaths/second coexist with a daemon at 3% CPU and no socket audit: the
+loop never touches the socket.
+
+## What is fixed
+
+1. **The amplifier: cut.** The brain wrote a journal row per `Died` **message**,
    including the 2,112 in that minute that produced no action and
-   `executed.restarted: false`. A `Died` that changes nothing still costs a row,
-   so the journal amplifies noise 265:1 against truth. Contrast the metric,
-   where counting only real restarts was exactly right.
-3. **Line 1710.** `WakeOutcome::Died => deliver_died_blocking(&tx)` in
-   `crates/doorbell-rt/src/file_host.rs` is unconditional: no counter, no
+   `executed.restarted: false` — 2,120 rows for 8 real restarts, 265 rows of
+   noise per restart of truth. An inert death is now a COUNT, journaled at
+   1, 2, 4, 8 ... (`coalesced_deaths` names the deaths each row stands for), so
+   a storm costs `log2(deaths)` rows and still accounts for every death.
+   Red first: 4,096 inert deaths wrote 4,096 rows; now ≤ 16.
+2. **The silent path: guarded.** The `Shed` arm audits one row per resync
+   (`wake_sock_shed`, with `resync_from` and a running `resync_index` so a loop
+   reads as a rate) and waits `RESYNC_FLOOR` (500ms) before reconnecting, which
+   bounds it at 2 resyncs/second instead of socket speed. Proven by neutering
+   each half in turn: without the sleep, 3 sheds took 1.4ms; without the audit,
+   0 rows.
+3. **Line 1710 is still open.** `WakeOutcome::Died => deliver_died_blocking(&tx)`
+   in `crates/doorbell-rt/src/file_host.rs` is unconditional: no counter, no
    single-flight, unlike the sibling arm at 1686 that `7cdb927` guarded. It is
    the only other `Died` producer in the process besides 1686.
+
+## Lost rows: a seq is allocated before the write
+
+The storm cost data, and this is how. `doorbell-journal-flywheel-opencode.jsonl`
+is contiguous through 4,633 sequenced rows except for one hole: line 3256 is
+seq 153410 at `07:32:24Z`, line 3257 is seq **153427** at `07:32:41Z`. Sixteen
+seq values exist in no file on disk (checked across every journal in the
+directory), and nothing in the corpus is missing a `seq` field.
+
+Both sides of the hole are the **`Sweep` cadence at one row per second**. So the
+sweeps kept ticking through a 17-second window and each tick consumed a seq and
+left nothing behind. The mechanism is in `brain.rs`:
+
+```rust
+let seq = self.next_seq;
+self.next_seq += 1;
+let _ = self.store.append_journal_seq(...);   // error discarded
+```
+
+The seq advances before the write, and the write's error is thrown away. Any
+failing append therefore burns a seq permanently and reports nothing in the
+moment; the gap is the only trace, it is unexplainable from the journal, and
+`/health` reduces it to a single boolean (`journal_torn_tail`) that also stops
+the fold at the tear, hiding everything after it from `doorbell why`.
+
+The unwritable window is most plausibly rotation: `rotate()` rewrites the active
+file with `std::fs::write(&active, tail.join("\n") + "\n")`, which is a
+truncate-and-rewrite from a snapshot, not an append, and it drops rows by design
+while its doc comment claims "Every drop is an audit row" — this file contains
+no rotation row at all.
 
 ## Re-deriving it
 
