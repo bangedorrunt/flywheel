@@ -966,8 +966,13 @@ fn every_profile_routes_on_every_bare_harness() {
     );
 
     let mut failures: Vec<String> = Vec::new();
+    let mut open_failures: Vec<String> = Vec::new();
+    let mut defaulted_cells: Vec<String> = Vec::new();
     let mut cells = 0usize;
     let mut bare = 0usize;
+    let mut routed = 0usize;
+    let mut defaulted = 0usize;
+    let mut refused = 0usize;
     for pname in &names {
         let Some(p) = cat.get(pname) else {
             failures.push(format!(
@@ -989,28 +994,75 @@ fn every_profile_routes_on_every_bare_harness() {
             // accepts only a concrete model id — so it answered "model
             // '@standard' is not in the registry" for a perfectly valid
             // configuration. The product was right and the test was wrong.
-            // `resolve_profile_route_full` is the spawn-time path: slot alias, then
-            // the slot's harness, then the model, then the profile's own
-            // `model_fallback` chain.
-            if let Err(e) = reg.resolve_profile_route_full(h, &p.model, &p.model_fallback) {
-                failures.push(format!(
-                    "profile `{pname}` (model `{}`, declared harness `{}`) does not route on \
-                         harness `{h}`: {e:#}",
-                    p.model, p.harness
-                ));
+            // `resolve_profile_route_full` is the spawn-time path.
+            match reg.resolve_profile_route_full(h, &p.model, &p.model_fallback) {
+                Ok((_h, model, step)) => {
+                    routed += 1;
+                    if step == "dynamic_default" {
+                        defaulted += 1;
+                        defaulted_cells.push(format!(
+                            "profile `{pname}` (model `{}`) on harness `{h}` -> {model} \
+                             via {step}",
+                            p.model
+                        ));
+                    }
+                }
+                Err(e) => {
+                    // bd-ziy9: NOT every harness may receive a model, and this branch
+                    // now asserts WHICH ones may not rather than demanding all nine
+                    // route. A Closed-tier harness is a frontier CLI with its own
+                    // model, documented as "Never asked for one"
+                    // (harness_registry.rs:25); handing one a `zai/*` id would delete
+                    // that constraint rather than satisfy the requirement, and the
+                    // `big-pickle` cap is the same kind of cost fact. So the previous
+                    // "all 9 must route" assertion was not a stricter test — it was a
+                    // test that could only be made green by breaking a rule, which is
+                    // why it was red.
+                    let open = crate::harness_registry::tier_of(h).is_some_and(
+                        crate::harness_registry::HarnessTier::may_be_asked_for_a_model,
+                    );
+                    if open {
+                        open_failures.push(format!(
+                            "OPEN-tier harness `{h}`: profile `{pname}` (model `{}`, declared \
+                             harness `{}`) does not route: {e:#}",
+                            p.model, p.harness
+                        ));
+                    } else {
+                        refused += 1;
+                    }
+                }
             }
         }
     }
 
     assert!(
         failures.is_empty(),
-        "{} of {cells} profile x harness cells do not route ({bare} profile(s) are bare \
-         model-less spawns, not tested). A profile that cannot \
-             route on a harness cannot crew ANY workflow with that harness, because no \
-             workflow constrains the harness (see no_workflow_pins_a_harness). Fix with a \
-             `fallback` on the model, or empty `caps` if it really is portable:\n  -\n{}",
-        failures.len(),
+        "the profile catalog disagrees with itself: {}",
         failures.join("\n  - ")
+    );
+    // Non-vacuity on the NEW axis too: a matrix where every cell is refused, or where
+    // no cell ever needed a default, would report green while testing nothing. The
+    // dynamic rung is the point of bd-ziy9, so its absence must be a failure.
+    assert!(
+        refused > 0,
+        "no CLOSED-tier harness was exercised, so the 'must refuse' half of the contract is \
+         untested — the registry's tier table changed shape"
+    );
+    assert!(
+        defaulted > 0,
+        "no cell needed the dynamic-default rung, so this test would pass even if bd-ziy9's \
+         routing change were reverted. Reverted-rung-detector.\n  routed through it:\n  - {}",
+        defaulted_cells.join("\n  - ")
+    );
+    assert!(
+        open_failures.is_empty(),
+        "{} of {cells} profile x harness cells on an OPEN-tier harness do not route \
+         ({routed} route, {defaulted} of them through the dynamic default, {refused} correctly \
+         refused on a CLOSED-tier harness, {bare} profile(s) are bare model-less spawns). An \
+         OPEN-tier profile that cannot route cannot crew ANY workflow with that harness, \
+         because no workflow constrains the harness (see no_workflow_pins_a_harness):\n  - {}",
+        open_failures.len(),
+        open_failures.join("\n  - ")
     );
 }
 
