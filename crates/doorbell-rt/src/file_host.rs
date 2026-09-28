@@ -570,11 +570,14 @@ struct StaleReap {
     reaped: Vec<String>,
 }
 
-/// bd-adms: how long a registry pin's pane must be missing before the sweep
-/// stops fetching it. Long enough to cover a spawn race (the pane is created
-/// before the registry row is written, but herdr may brief us mid-flight),
-/// short enough that a dead fleet stops costing fetches.
-const STALE_PANE_GRACE_SECS: u64 = 120;
+// bd-3uqz: STALE_PANE_GRACE_SECS is GONE, deliberately rather than left as a dead
+// constant. It was a wall-clock window standing in for "we have seen this
+// repeatedly", and it was wrong in both directions: one herdr outage outlasting the
+// window pruned a live fleet, and a pane that died and returned inside the window
+// was never pruned. The evidence is now
+// `registry_prune::REQUIRED_CONFIRMATIONS` consecutive observations, and leaving a
+// named 120s grace behind would invite the next reader to think time still decides
+// something here.
 
 /// bd-3vr9: a presence verdict older than this yields to live herdr
 /// status. Presence rows arrive only on agent publish; hook-less panes
@@ -680,6 +683,21 @@ pub struct FileHost {
     /// `herdr pane list` (bd-adms). RAM-only on purpose: a restart re-arms
     /// the grace window instead of reaping on stale evidence.
     stale_panes: BTreeMap<String, u64>,
+    /// bd-3uqz: consecutive sweeps in which herdr did NOT list a pin's pane.
+    ///
+    /// This replaces a wall-clock window for deciding a pane is dead. Time was a
+    /// PROXY for "we have seen this repeatedly" and it is wrong in both directions:
+    /// one herdr outage outlasting the window prunes a live fleet, and a pane that
+    /// dies and returns inside the window is never pruned. A count measures the
+    /// thing itself.
+    ///
+    /// `stale_panes` stays for reporting WHEN a pin first went missing, which is
+    /// what makes the audit line useful; it no longer decides anything.
+    pane_absent_confirmations: BTreeMap<String, u32>,
+    /// bd-3uqz: what the last prune decided and why, so the audit line and any
+    /// later "why does this pin not wake?" are answerable from state rather than
+    /// from memory. A prune that leaves no record has no history.
+    tombstones: BTreeMap<String, crate::registry_prune::Tombstone>,
     /// Pins already audited as reaped, so the audit fires once per episode.
     reaped_pins: Vec<String>,
     /// Operator pins currently bound via herdr token (bd-3vr9), so the
@@ -794,6 +812,8 @@ impl FileHost {
             index_pins: Vec::new(),
             index_pins_raw: Vec::new(),
             stale_panes: BTreeMap::new(),
+            pane_absent_confirmations: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
             reaped_pins: Vec::new(),
             unroutable_pins: Vec::new(),
             captain_routed_pins: Vec::new(),
@@ -938,36 +958,86 @@ impl FileHost {
     /// `panes_missing` after it stops costing a fetch per tick.
     fn reap_stale_registry_pins(&mut self, rows: &[RegistryRow], now: u64) -> StaleReap {
         let known = herdr_pane_ids(&self.cfg.herdr_bin);
-        if known.is_empty() {
-            return StaleReap {
-                live: rows.to_vec(),
-                vanished: Vec::new(),
-                reaped: Vec::new(),
-            };
+        // bd-3uqz: the DECISION is `registry_prune::decide`, which is pure and
+        // fenced. This function is only the plumbing — herdr's answer in, the audit
+        // and the index out. The two rules that matter live in the pure module
+        // because they are the ones that were wrong HERE:
+        //
+        //  - a row whose pane is EMPTY resolves by LABEL and is never pruned. The
+        //    old test was `!pane.is_empty() && known.contains(pane)`, so an empty
+        //    pane never matched "alive" and fell through to the reap branch —
+        //    deleting exactly the legacy rows `prompt_hop_keeps_the_label_when_the_
+        //    row_has_no_pane` exists to support. No test covered the intersection.
+        //  - an EMPTY pane list from herdr is NO EVIDENCE: nothing is pruned and
+        //    nothing is COUNTED, so an outage cannot manufacture confirmations for
+        //    panes that are alive. Live, 13 of 20 rows (65%) had a pane herdr did
+        //    not list, so absence-based pruning would wipe two thirds of the table
+        //    on its first sweep — during an outage, when it matters most.
+        let decision_rows: Vec<crate::registry_prune::Row> = rows
+            .iter()
+            .map(|(pin, pane, _)| crate::registry_prune::Row {
+                pin: pin.clone(),
+                pane: pane.clone(),
+            })
+            .collect();
+        let decision = crate::registry_prune::decide(
+            &decision_rows,
+            &known,
+            &mut self.pane_absent_confirmations,
+            crate::registry_prune::REQUIRED_CONFIRMATIONS,
+        );
+        for t in &decision.tombstones {
+            self.tombstones.insert(t.pin.clone(), t.clone());
         }
+
+        // Reporting only: when did this pin first go missing. The decision above
+        // deliberately does not consult the clock.
+        for (pin, pane, _) in rows {
+            if pane.is_empty() || known.contains(pane) {
+                self.stale_panes.remove(pin);
+            } else {
+                self.stale_panes.entry(pin.clone()).or_insert(now);
+            }
+        }
+
         let mut vanished: Vec<String> = Vec::new();
         let mut reaped: Vec<String> = Vec::new();
+        for (pin, fate) in &decision.fates {
+            match fate {
+                crate::registry_prune::Fate::Alive
+                | crate::registry_prune::Fate::NoEvidence
+                | crate::registry_prune::Fate::LabelRouted => {
+                    self.reaped_pins.retain(|p| p != pin);
+                }
+                crate::registry_prune::Fate::Unconfirmed => vanished.push(pin.clone()),
+                crate::registry_prune::Fate::Pruned => {
+                    vanished.push(pin.clone());
+                    reaped.push(pin.clone());
+                }
+            }
+        }
         for (pin, pane, _) in rows {
-            if !pane.is_empty() && known.contains(pane) {
-                self.stale_panes.remove(pin);
-                self.reaped_pins.retain(|p| p != pin);
+            if !reaped.contains(pin) {
                 continue;
             }
-            vanished.push(pin.clone());
-            let since = *self.stale_panes.entry(pin.clone()).or_insert(now);
-            if now.saturating_sub(since) < STALE_PANE_GRACE_SECS {
-                continue;
-            }
-            reaped.push(pin.clone());
             if !self.reaped_pins.contains(pin) {
+                let t = self.tombstones.get(pin);
                 self.audit_file(
                     "registry_pin_stale",
                     serde_json::json!({
                         "pin": pin,
                         "pane": pane,
                         "workspace": self.cfg.workspace,
-                        "grace_s": STALE_PANE_GRACE_SECS,
-                        "why": "pane absent from `herdr pane list`; dropped from the sweep",
+                        // bd-3uqz: the evidence is a COUNT of consecutive sweeps, not
+                        // elapsed time. Reporting `grace_s` here would have kept
+                        // describing a rule that no longer exists.
+                        "absent_confirmations": t.map_or(
+                            crate::registry_prune::REQUIRED_CONFIRMATIONS,
+                            |t| t.confirmations),
+                        "required_confirmations": crate::registry_prune::REQUIRED_CONFIRMATIONS,
+                        "missing_since": self.stale_panes.get(pin).copied().unwrap_or(0),
+                        "why": "pane absent from `herdr pane list` across consecutive \
+                                confirmations; positive evidence of death, dropped from the sweep",
                     }),
                 );
                 self.reaped_pins.push(pin.clone());
@@ -2103,11 +2173,17 @@ mod tests {
     /// bd-adms: the registry is not garbage-collected. Live, three pins sat
     /// on `w11:*` panes herdr had long GC'd, so every tick fetched dead
     /// inboxes (and their failed fetches wrote the `inbox_error` stream that
-    /// hid a real outage). A pin whose pane is gone must leave the sweep set
-    /// after the grace window, ONCE and visibly — and a pin whose pane is
-    /// present must never be touched.
+    /// hid a real outage). A pin whose pane is gone must leave the sweep set,
+    /// ONCE and visibly — and a pin whose pane is present must never be touched.
+    ///
+    /// bd-3uqz: this used to advance a CLOCK past STALE_PANE_GRACE_SECS. The
+    /// evidence is now a count of CONSECUTIVE sweeps, so the test drives sweeps
+    /// instead. The intent is unchanged and still worth asserting; only the driver
+    /// moved. A clock is a proxy for "we have seen this repeatedly" and it is wrong
+    /// in both directions — one herdr outage outlasting the window prunes a live
+    /// fleet, and a pane that died and returned inside the window is never pruned.
     #[test]
-    fn stale_registry_pins_leave_the_sweep_after_the_grace_window() {
+    fn stale_registry_pins_leave_the_sweep_after_three_confirmations() {
         let dir = tmp_state("reap");
         std::fs::write(
             dir.join("agents").join("proj.json"),
@@ -2141,18 +2217,34 @@ mod tests {
         assert_eq!(
             host.pins(),
             vec!["LivePin".to_string(), "DeadPin".to_string()],
-            "inside the grace window nothing is reaped"
+            "the first sighting of a vanished pane is not evidence"
         );
-        // Push the grace window past STALE_PANE_GRACE_SECS and refresh again.
-        let birth = FileHost::now_unix();
-        host.stale_panes
-            .insert("DeadPin".to_string(), birth - STALE_PANE_GRACE_SECS - 1);
-        host.index_refreshed_at = birth - INDEX_TTL_SECS - 1;
-        host.refresh_index();
+        // bd-3uqz: drive CONSECUTIVE SWEEPS, not a clock. The index is TTL-gated,
+        // so each pass has to age out before the next one is a real observation.
+        //
+        // The refresh_index() above was ALREADY the first sighting, so
+        // REQUIRED_CONFIRMATIONS - 1 more are needed. Written as a decrement so the
+        // arithmetic cannot drift: my first conversion looped the full count and
+        // pruned one sweep early, because the initial refresh was silently the
+        // first observation.
+        let mut needed = crate::registry_prune::REQUIRED_CONFIRMATIONS - 1;
+        while needed > 0 {
+            let birth = FileHost::now_unix();
+            host.index_refreshed_at = birth - INDEX_TTL_SECS - 1;
+            host.refresh_index();
+            needed -= 1;
+            if needed > 0 {
+                assert!(
+                    host.pins().contains(&"DeadPin".to_string()),
+                    "{needed} confirmation(s) still outstanding: an unconfirmed pane must \
+                     stay in the sweep"
+                );
+            }
+        }
         assert_eq!(
             host.pins(),
             vec!["LivePin".to_string()],
-            "the pin on a vanished pane leaves the sweep"
+            "three consecutive confirmations of a vanished pane is positive evidence of death"
         );
         assert!(
             host.reducer.model.unroutable.contains("DeadPin"),
