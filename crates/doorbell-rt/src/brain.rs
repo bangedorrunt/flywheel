@@ -1081,7 +1081,7 @@ impl<H: Host> Brain<H> {
             obj.insert("workspace".into(), self.cfg.workspace.clone().into());
             obj.insert("kind".into(), kind.into());
         }
-        self.store.append_audit(&self.cfg.workspace, detail);
+        let _ = self.store.append_audit(&self.cfg.workspace, detail);
     }
 
     fn persist_hear(&self) {
