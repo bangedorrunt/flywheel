@@ -55,6 +55,7 @@ mod herdr_shim;
 mod ingress;
 mod init_scaffold;
 mod intent;
+mod unanswered_triage;
 // Jev RANKS the derived crew menu; it never defines one. The ranker and its
 // rubric are built and tested here, and nothing calls them yet: bd-drlm wires
 // them into the crew menu. Silent until then, never deleted — the module is the
@@ -825,6 +826,23 @@ enum Commands {
     Status { project: Option<String> },
     /// Print the fleet snapshot contract (flywheel-snapshot.v1) as robot JSON
     Snapshot { project: String },
+    /// bd-3uqz: LABEL the pins in the doorbell's `.unanswered` files as
+    /// mail-only-by-design, dead, or unknown. READ-ONLY by construction: it
+    /// prints JSON and never writes, because those files are what gate P2b reads
+    /// to decide whether a crew is INVISIBLE (bd-y90n). A `dead` label is a
+    /// REVIEW QUEUE ENTRY, not a deletion, and this command has no delete path.
+    ///
+    /// Prints `null` per pin rather than guessing when Jev is unavailable or
+    /// declines, so "we did not ask" never reads as "we checked and it is fine".
+    UnansweredTriage {
+        /// Flywheel state dir, whose `doorbell/` subdirectory holds the
+        /// `.unanswered` files (default: the same XDG ladder flywheel uses).
+        #[arg(long)]
+        flywheel_state_dir: Option<std::path::PathBuf>,
+        /// Report what WOULD be asked and exit, spending no request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Session-start drain over the snapshot: OPEN DECISIONS, UNREAD
     /// STATUS, RECORD DIVERGENCE — always printed, even when empty
     Helm { project: String },
@@ -2682,6 +2700,10 @@ fn main() {
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
         Some(Commands::Snapshot { project }) => cmd_snapshot(&cfg, project),
+        Some(Commands::UnansweredTriage {
+            flywheel_state_dir,
+            dry_run,
+        }) => cmd_unanswered_triage(flywheel_state_dir.clone(), *dry_run),
         Some(Commands::Helm { project }) => cmd_helm(&cfg, project),
         Some(Commands::Briefing {
             objective,
@@ -13168,6 +13190,55 @@ pub fn ingress_adapters_for_project(
 /// ADR-0010 D10 (bd-67qg): print the fleet snapshot contract as robot
 /// JSON. Validates against `snapshot::schema_keys` — a missing key is a
 /// contract break, never an empty section.
+/// bd-3uqz: wire the triage to a real verb. Without a caller the whole module is
+/// dead code in a binary crate, and a judgment nothing invokes is theater.
+fn cmd_unanswered_triage(
+    flywheel_state_dir: Option<std::path::PathBuf>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use crate::judgment::UreqTransport;
+    let dir = flywheel_state_dir.unwrap_or_else(|| {
+        // Mirrors the doorbell CLI's ladder (DOORBELL_STATE_DIR > XDG > platform)
+        // so the triage reads the SAME directory the daemon writes.
+        std::env::var_os("DOORBELL_STATE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let base = std::env::var_os("XDG_STATE_HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                            .join(".local/state")
+                    });
+                base.join("flywheel")
+            })
+    });
+    // Jev is an ENHANCEMENT, never a dependency: no key must produce a clean
+    // "not asked" report, not an error. bd-3uqz's own rule, applied to the door.
+    let transport = UreqTransport::from_authority(&crate::authority::RuntimeAuthority::resolve())
+        .unwrap_or_else(|_| UreqTransport {
+            api_key: String::new(),
+            url: crate::judgment::SYSTEMONE_URL.to_string(),
+        });
+    // The clock and the binary are passed IN, not read here: the core must not read
+    // the clock or the environment, so the host owns both (the effect law).
+    let now = crate::unanswered_triage::unix_now();
+    let doorbell_dir = std::env::var_os("DOORBELL_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                        .join(".local/state")
+                })
+                .join("doorbell")
+        });
+    let out =
+        crate::unanswered_triage::run(&dir, &doorbell_dir, &transport, dry_run, now, "toron")?;
+    println!("{out}");
+    Ok(())
+}
+
 fn cmd_snapshot(cfg: &Config, project: &str) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "snapshot")?;
