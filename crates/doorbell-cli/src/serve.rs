@@ -487,31 +487,37 @@ impl std::fmt::Display for SendFail {
 /// Send `Shutdown` to every retiring loop under ONE shared deadline,
 /// returning each failure as a VALUE with its reason — the caller is
 /// loud (bd-burk: closed channels; bd-umuh: a bounded budget).
-/// Cancellation-safe: a dropped `send` future enqueues nothing, and a
-/// timed-out walk reports the blocked key plus every key behind it that
-/// never got the message.
+///
+/// bd-v5r0: the sends RACE, which is the same fix the join phase below
+/// already carries. The walk used to be sequential under a single
+/// deadline, so the first channel that was full — a brain mid-dispatch —
+/// parked it for the whole budget and every key BEHIND it was reported
+/// BudgetExhausted without ever being tried. Live on the 2026-09-28 restart
+/// that was all three hosted workspaces at once, so all three brains died
+/// with the process instead of draining their sinks. Each send now races
+/// the deadline on its own: a key is BudgetExhausted only if its OWN send
+/// did not land, and the total wall time is still bounded by `budget`
+/// (stop's grace covers it, asserted in `stop_grace_covers_...`).
+/// Cancellation-safe: a dropped `send` future enqueues nothing, and
+/// `join_all` preserves table order, so the same table reports the same way
+/// twice.
 async fn send_shutdowns(
     retiring: &[HostedLoop],
     budget: std::time::Duration,
 ) -> Vec<(String, SendFail)> {
     let deadline = tokio::time::Instant::now() + budget;
-    let mut failed = Vec::new();
-    for (i, h) in retiring.iter().enumerate() {
+    let sends = retiring.iter().map(|h| async move {
         match tokio::time::timeout_at(deadline, h.tx.send(doorbell_rt::BrainMsg::Shutdown)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => failed.push((h.key.clone(), SendFail::ChannelClosed)),
-            Err(_) => {
-                failed.push((h.key.clone(), SendFail::BudgetExhausted));
-                failed.extend(
-                    retiring[i + 1..]
-                        .iter()
-                        .map(|h| (h.key.clone(), SendFail::BudgetExhausted)),
-                );
-                break;
-            }
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some((h.key.clone(), SendFail::ChannelClosed)),
+            Err(_) => Some((h.key.clone(), SendFail::BudgetExhausted)),
         }
-    }
-    failed
+    });
+    futures::future::join_all(sends)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Join every supervised loop CONCURRENTLY inside `budget` (bd-zzgb).
@@ -2385,8 +2391,10 @@ mod tests {
     /// one brain not receiving (mid `run_cli`, up to 15s) parked the serial
     /// walk, the 10s drain budget never even started, and stop's grace
     /// expired mid-drain (SIGKILL before any note printed). The budget is
-    /// injected policy; an exhausted budget reports the blocked key AND
-    /// every key behind it that never got its Shutdown.
+    /// injected policy: BOTH sends here are genuinely blocked (each channel
+    /// is already full), so both report the exhausted budget and the call
+    /// still returns inside it. bd-v5r0 kept this shape, and added the
+    /// regression test above it for the case where only the first is blocked.
     #[tokio::test(start_paused = true)]
     async fn send_shutdowns_bounds_the_send_phase_and_names_every_unsent_key() {
         // Capacity 1, pre-filled: the next send parks until the budget fires.
@@ -2414,6 +2422,44 @@ mod tests {
                 ("queued/ws".to_string(), super::SendFail::BudgetExhausted),
             ],
             "blocked key and the never-attempted key behind it both report the exhausted budget: {failed:?}"
+        );
+    }
+
+    /// bd-v5r0: one blocked send must not starve the loops behind it. The
+    /// walk was sequential under a single shared deadline, so a full channel
+    /// (a brain mid-dispatch) parked the walk and every key behind it was
+    /// reported BudgetExhausted WITHOUT being tried — the same head-of-line
+    /// defect the join phase was already cured of, which is why this is a
+    /// regression test and not an observation.
+    ///
+    /// Fixture: the FIRST loop is full (its send parks) and the SECOND is
+    /// empty (its send lands on the first poll). Racing the sends tells the
+    /// empty one; walking in table order never reaches it.
+    #[tokio::test(start_paused = true)]
+    async fn send_shutdowns_races_so_one_blocked_brain_cannot_starve_the_rest() {
+        let (busy_tx, _busy_rx) = tokio::sync::mpsc::channel(1);
+        busy_tx.try_send(doorbell_rt::BrainMsg::Shutdown).unwrap();
+        let (free_tx, mut free_rx) = tokio::sync::mpsc::channel(1);
+        let retiring = vec![
+            super::HostedLoop {
+                key: "busy/ws".into(),
+                tx: busy_tx,
+            },
+            super::HostedLoop {
+                key: "free/ws".into(),
+                tx: free_tx,
+            },
+        ];
+        let failed = super::send_shutdowns(&retiring, std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            failed,
+            [("busy/ws".to_string(), super::SendFail::BudgetExhausted)],
+            "only the loop whose OWN send could not land fails: {failed:?}"
+        );
+        assert!(
+            matches!(free_rx.try_recv(), Ok(doorbell_rt::BrainMsg::Shutdown)),
+            "the loop behind the blocked one MUST have been told — a sequential \
+             walk under one deadline never tried it"
         );
     }
 
