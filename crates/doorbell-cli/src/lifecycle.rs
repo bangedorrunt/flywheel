@@ -221,6 +221,76 @@ fn read_pid(path: &PathBuf) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// bd-3uqz: remove pid files in the state dir whose daemon is gone.
+///
+/// Returns the NAMES it removed, and the caller is expected to say so. A cleanup
+/// that cannot report what it deleted cannot be told apart from data loss, and this
+/// project has already paid for a log pruned from under the reader whose state
+/// lived inside it.
+///
+/// Only three things are eligible, and each exclusion is the point:
+///
+/// 1. `doorbell.pid` is NEVER touched. It is the authoritative pidfile, and a
+///    prune that removed it would make a live daemon look unowned.
+/// 2. A file whose name is not all digits is not a pid file. `doorbell.sock`,
+///    `doorbell.log`, `hosts.json` and anything else live here too.
+/// 3. A pid that is still ALIVE is never removed. Reaping a live daemon's marker
+///    is strictly worse than leaving litter, so "cannot tell dead from alive" means
+///    "leave it alone" — an unparseable or absent pid is treated as dead, because
+///    a file that cannot name a running process is not evidence of one.
+#[cfg(unix)]
+pub fn prune_dead_pid_files(state_dir: &std::path::Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "doorbell.pid" || name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(pid) = body.trim().parse::<i32>() else {
+            // Unparseable: cannot name a live process, so it is litter.
+            if std::fs::remove_file(entry.path()).is_ok() {
+                removed.push(name);
+            }
+            continue;
+        };
+        if pid <= 0 {
+            if std::fs::remove_file(entry.path()).is_ok() {
+                removed.push(name);
+            }
+            continue;
+        }
+        if !pid_is_alive(pid) && std::fs::remove_file(entry.path()).is_ok() {
+            removed.push(name);
+        }
+    }
+    removed
+}
+
+/// `kill -0 <pid>` exits 0 when the process exists and is signalable, non-zero
+/// otherwise. It delivers no signal, so this is a pure liveness probe.
+///
+/// Returns `true` when liveness CANNOT be established. "Cannot tell" must mean
+/// "leave it alone": reaping a live daemon's pidfile is strictly worse than
+/// leaving litter behind, so the failure mode is asymmetric on purpose.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
+}
+
 /// Exclusive-create pidfile claim. `serve` claims the regular pidfile itself
 /// once both binds succeed — a launchd/systemd started daemon is then
 /// pidfile-managed exactly like a `start` child, so stop/status/restart see
@@ -234,7 +304,24 @@ pub fn claim_pid_file(path: &PathBuf, pid: u32) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, format!("{pid}\n"))
+    std::fs::write(path, format!("{pid}\n"))?;
+    // bd-3uqz: the daemon has just proved it owns this state dir, which is the
+    // one moment at which "is anything else still running here?" has an answer.
+    // Pruned HERE rather than in `start` so a launchd-started daemon prunes too.
+    // Loudly, because a cleanup that cannot say what it removed is
+    // indistinguishable from data loss.
+    if let Some(dir) = path.parent() {
+        let removed = prune_dead_pid_files(dir);
+        if !removed.is_empty() {
+            eprintln!(
+                "doorbell: pruned {} dead pid file(s) from {}: {}",
+                removed.len(),
+                dir.display(),
+                removed.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 #[cfg(not(unix))]
 pub fn claim_pid_file(path: &PathBuf, pid: u32) -> std::io::Result<()> {
@@ -1445,6 +1532,89 @@ fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unique-enough scratch dir. `doorbell-cli` has no uuid dep, and a test that
+    /// needed one would be the only thing pulling it in.
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("db-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    /// bd-3uqz: the state dir accumulates dead pid files and nothing reclaims them.
+    ///
+    /// Measured live 2026-09-28 in `~/.local/state/doorbell`: seven numeric pid
+    /// files, every one DEAD, none of them `doorbell.pid`:
+    ///
+    ///     17110 -> 77533   20783 -> 20783   48403 -> 48403   4883 -> 91503
+    ///     54949 -> 26844   59780 -> 68346   80758 -> 87537
+    ///
+    /// Five of the seven have a filename that does not match the pid inside, so
+    /// they are per-PORT pid files left by test runs rather than per-daemon
+    /// pidfiles. Trivial in bytes, genuinely harmful in ambiguity: anything asking
+    /// "is a doorbell running?" has to know which file is authoritative, and
+    /// `status` has to be defensive about it.
+    ///
+    /// The fence is on the DEAD ones only. Reaping a pid that is still alive would
+    /// be a far worse bug than the litter, so that case is asserted too — a prune
+    /// that cannot tell dead from alive must not run at all.
+    #[test]
+    fn dead_pid_files_are_pruned() {
+        let dir = scratch("pidprune");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // This process is definitionally alive, so its pid is the "do not touch" case.
+        let live = std::process::id();
+        std::fs::write(dir.join("12345"), format!("{live}\n")).expect("live pid file");
+        // A pid that cannot be running: 0 is never a valid pid.
+        std::fs::write(dir.join("20783"), "0\n").expect("dead pid file");
+        // Unparseable contents are also not evidence of a live daemon.
+        std::fs::write(dir.join("4883"), "not-a-pid\n").expect("garbage pid file");
+        // The authoritative pidfile must survive regardless.
+        std::fs::write(dir.join("doorbell.pid"), format!("{}\n", live)).expect("real pidfile");
+
+        let pruned = prune_dead_pid_files(&dir);
+
+        assert_eq!(
+            pruned.len(),
+            2,
+            "both the dead and the unparseable file are prunable: {pruned:?}"
+        );
+        assert!(!dir.join("20783").exists(), "dead pid file survived");
+        assert!(!dir.join("4883").exists(), "unparseable pid file survived");
+        assert!(
+            dir.join("12345").exists(),
+            "a LIVE pid file was reaped — that is the bug this fence exists to stop"
+        );
+        assert!(
+            dir.join("doorbell.pid").exists(),
+            "the authoritative pidfile must never be pruned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning must not be silent. The project has already paid once for a log
+    /// pruned from under a reader whose state lived in it, and the lesson generalises
+    /// to anything a cleanup touches: if a prune cannot say what it removed, it
+    /// cannot be told apart from data loss.
+    #[test]
+    fn a_prune_reports_what_it_removed() {
+        let dir = scratch("pidreport");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("20783"), "0\n").expect("dead pid file");
+        std::fs::write(dir.join("4883"), "0\n").expect("dead pid file");
+        let pruned = prune_dead_pid_files(&dir);
+        assert_eq!(pruned.len(), 2);
+        for name in &pruned {
+            assert!(
+                std::fs::read_to_string(dir.join(name)).is_err(),
+                "{name} was reported pruned but still exists"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn default_state_ladder_prefers_explicit_env_then_xdg_then_home() {
