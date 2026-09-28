@@ -1407,14 +1407,28 @@ pub fn pane_dispatch(
     // agent so two dispatches cannot race into one agent, and FencedStale closes
     // the read-then-rebind race the old gate had no generation check for.
     let fence = acquire_dispatch_fence(&entry.name, unix_millis())?;
+    // One refusal, two shapes: a park can name its deadline and the other two
+    // cannot, so the tail is shared rather than copied into both arms.
+    let fenced_tail = "— refusing to send a second prompt into an agent that already holds one. \
+                       The busy-owner fence requires a durable park, which toron-workflow's \
+                       engine has no step for; see bd-fen3. Give each concurrent stage its \
+                       own agent.";
     let _permit = match fence {
         FenceOutcome::Send(p) => Some(p),
-        FenceOutcome::Park { .. } | FenceOutcome::ForkAndRetry | FenceOutcome::CapContention => {
+        // bd-fen3: `until_ms` is the part a caller has to act on. "Busy" alone
+        // cannot tell "retry in a moment" from "this agent is held for another
+        // ten minutes", and those are different decisions.
+        FenceOutcome::Park { until_ms } => {
+            let wait_s = until_ms.saturating_sub(unix_millis()) / 1_000;
             return Err(anyhow!(
-                "pane dispatch @{profile_name} ({}) is fenced as busy — refusing to send a \
-                 second prompt into an agent that already holds one. The busy-owner fence \
-                 requires a durable park, which toron-workflow's engine has no step for; see \
-                 bd-fen3. Give each concurrent stage its own agent.",
+                "pane dispatch @{profile_name} ({}) is fenced as busy for another {wait_s}s \
+                 (park until {until_ms}) {fenced_tail}",
+                entry.name
+            ));
+        }
+        FenceOutcome::ForkAndRetry | FenceOutcome::CapContention => {
+            return Err(anyhow!(
+                "pane dispatch @{profile_name} ({}) is fenced as busy {fenced_tail}",
                 entry.name
             ));
         }
@@ -4647,7 +4661,7 @@ mod bd_fen3_fence_tests {
     /// wait wearing a bounded wait's clothes, which is the whole thing the fence
     /// exists to prevent.
     #[test]
-    fn hold_continued_parks_at_the_FENCE_deadline_not_a_fresh_one() {
+    fn hold_continued_parks_at_the_fence_deadline_not_a_fresh_one() {
         let effects = [E::HoldContinued {
             agent: "a".into(),
             until_ms: 1_700_000_000_000,

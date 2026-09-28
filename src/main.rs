@@ -55,6 +55,11 @@ mod herdr_shim;
 mod ingress;
 mod init_scaffold;
 mod intent;
+// Jev RANKS the derived crew menu; it never defines one. The ranker and its
+// rubric are built and tested here, and nothing calls them yet: bd-drlm wires
+// them into the crew menu. Silent until then, never deleted — the module is the
+// auditable half of "the model orders options, it does not choose them".
+#[allow(dead_code)]
 mod jev_rank;
 mod judgment;
 // Kernel contracts are introduced incrementally; unused variants remain

@@ -305,7 +305,7 @@ mod tests {
 
 #[cfg(test)]
 mod bd_lmtu_heartbeat_tests {
-    use super::{STAMP_INTERVAL, path as heartbeat_path, spawn_heartbeat_ticker};
+    use super::{STAMP_INTERVAL, spawn_heartbeat_ticker};
 
     /// bd-lmtu: the ticker must ACTUALLY stamp, repeatedly, for as long as it is
     /// held. This is the behaviour that was missing entirely — the function had

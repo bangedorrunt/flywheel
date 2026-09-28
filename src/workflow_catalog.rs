@@ -184,12 +184,6 @@ pub fn seed_user_catalog_with(
     Ok(report)
 }
 
-/// Fill gaps only. Kept as the default entry point so existing callers are
-/// unchanged; `--overwrite` routes through [`seed_user_catalog_with`].
-pub fn seed_user_catalog(config_root: &Path) -> Result<CatalogSeedReport> {
-    seed_user_catalog_with(config_root, OverwriteScope::None, false)
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CatalogSeedReport {
     pub created_workflows: Vec<String>,
@@ -1200,7 +1194,7 @@ msg = "legacy triage"
     #[test]
     fn clean_seed_uses_per_entry_toml_for_builtins() {
         let dir = config_root("seed-entry-toml");
-        seed_user_catalog(&dir).unwrap();
+        seed_user_catalog_with(&dir, OverwriteScope::None, false).unwrap();
         assert!(dir.join("workflows/goal.yaml").is_file());
         assert!(dir.join("stages/ce-execute.toml").is_file());
         assert!(!dir.join("stages.toml").exists());
@@ -1226,7 +1220,7 @@ msg = "legacy triage"
             "[operator]\nkeep = \"yes\"\n\n[stages.custom]\nname = \"custom\"\nprompt = \"operator stage\"\n",
         );
 
-        let seed = seed_user_catalog(&dir).unwrap();
+        let seed = seed_user_catalog_with(&dir, OverwriteScope::None, false).unwrap();
         assert!(!seed.created_workflows.is_empty());
         assert!(!seed.created_stages.is_empty());
         assert!(seed.kept_workflows.is_empty());
@@ -1252,7 +1246,7 @@ msg = "legacy triage"
             "seeding must preserve unknown top-level user data"
         );
 
-        let second_seed = seed_user_catalog(&dir).unwrap();
+        let second_seed = seed_user_catalog_with(&dir, OverwriteScope::None, false).unwrap();
         assert!(second_seed.created_stages.is_empty());
         assert_eq!(
             fs::read_to_string(&seeded_path).unwrap(),

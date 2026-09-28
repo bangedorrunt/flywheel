@@ -802,14 +802,12 @@ mod tests {
         // A sidecar that accepts the subscription and then says nothing, ever.
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         std::thread::spawn(move || {
-            for stream in listener.incoming().take(2) {
-                if let Ok(mut s) = stream {
-                    use std::io::Read;
-                    let mut buf = [0u8; 512];
-                    let _ = s.read(&mut buf); // consume the subscribe line
-                    // then hold the connection open, silent
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                }
+            for mut s in listener.incoming().take(2).flatten() {
+                use std::io::Read;
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf); // consume the subscribe line
+                // then hold the connection open, silent
+                std::thread::sleep(std::time::Duration::from_millis(1500));
             }
         });
 

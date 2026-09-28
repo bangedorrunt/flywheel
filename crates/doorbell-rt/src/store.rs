@@ -565,7 +565,7 @@ impl FileStore {
         let drops = self.retention_drops(workspace);
         let chain = self.journal_chain(workspace);
         'files: for path in &chain {
-            let Ok(raw) = std::fs::read_to_string(&path) else {
+            let Ok(raw) = std::fs::read_to_string(path) else {
                 continue;
             };
             for (idx, line) in raw.lines().enumerate() {
@@ -1008,7 +1008,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
     /// bd-v7uu: one row per distinct tear must survive the AUDIT's own retention.
     ///
     /// The dedup used to be `raw.contains(&fingerprint)` over the audit file — and

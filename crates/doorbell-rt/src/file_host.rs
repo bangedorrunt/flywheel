@@ -3042,11 +3042,11 @@ mod tests {
 // live (bd-kz54): one stale-socket respawn loop grew `flywheel-toron` to 14 GB
 // and the whole doorbell state dir to 26 GB — 65.5 M rows of one identical
 // failure, none of which said anything the first row did not.
-///
-/// The journal is allowed to keep generations because it is the run record. The
-/// audit log is diagnostics, so it is capped in place: keep the newest rows,
-/// drop the rest. Retention is by BYTES as well as rows, because a pathological
-/// row (a long error string) can blow a row budget on its own.
+//
+// The journal is allowed to keep generations because it is the run record. The
+// audit log is diagnostics, so it is capped in place: keep the newest rows,
+// drop the rest. Retention is by BYTES as well as rows, because a pathological
+// row (a long error string) can blow a row budget on its own.
 // ---------------------------------------------------------------------------
 
 /// Hard cap on one workspace's audit log.
@@ -3055,6 +3055,20 @@ pub const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// Newest rows kept on rotation. Matches the journal's `KEEP_LINES` so both logs
 /// age out on the same scale.
 pub const AUDIT_KEEP_LINES: usize = 4000;
+
+// bd-iyq5: a fence, not a test. Both sides are compile-time constants, so a
+// runtime assertion checked nothing a build would not — a keep-count of zero, or
+// one too big to fit the cap, must stop the BUILD rather than a test run.
+const _: () = {
+    assert!(
+        AUDIT_KEEP_LINES > 0,
+        "rotation that keeps nothing erases the log"
+    );
+    assert!(
+        AUDIT_KEEP_LINES * 250 < AUDIT_MAX_BYTES as usize,
+        "the rows kept must fit inside the byte cap"
+    );
+};
 
 /// Pure: the newest `keep` complete lines of an audit body, each newline
 /// terminated. A rotation must never leave a half-written row, because the next
@@ -3115,7 +3129,7 @@ fn rotate_audit_if_oversized(path: &Path) {
 
 #[cfg(test)]
 mod audit_rotation_tests {
-    use super::{AUDIT_KEEP_LINES, AUDIT_MAX_BYTES, audit_tail_keep, rotate_audit_if_oversized};
+    use super::{AUDIT_MAX_BYTES, audit_tail_keep, rotate_audit_if_oversized};
     use std::io::Write;
 
     /// The tail is the NEWEST rows, never the oldest — an audit log whose
@@ -3207,18 +3221,9 @@ mod audit_rotation_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The keep-count is reachable and fits the cap. A fence on the constant
-    /// itself, because a keep-count that cannot fit inside the cap would make
-    /// every rotation a no-op that still pays the rewrite.
-    #[test]
-    fn the_keep_count_is_bounded_and_fits_the_cap() {
-        assert!(
-            AUDIT_KEEP_LINES > 0,
-            "rotation that keeps nothing erases the log"
-        );
-        assert!(
-            AUDIT_KEEP_LINES * 250 < AUDIT_MAX_BYTES as usize,
-            "keeping {AUDIT_KEEP_LINES} rows must fit inside {AUDIT_MAX_BYTES} bytes"
-        );
-    }
+    // The keep-count fence moved to a `const` assertion beside the constants
+    // (bd-iyq5). Both sides were compile-time constants, so a `#[test]` that
+    // asserted them checked nothing a build would not — and clippy was right to
+    // say so. The fence survives; it just fails the BUILD now instead of a test
+    // run.
 }

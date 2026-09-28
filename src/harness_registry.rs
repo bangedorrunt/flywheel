@@ -40,6 +40,7 @@ impl HarnessTier {
     /// that accepts a chosen model from a closed one that does not, instead of
     /// guessing from a profile list. Derived from the same enum the gate uses, so
     /// the word cannot disagree with the gate.
+    #[allow(dead_code)] // bd-drlm: read by the Jev state, wired when the ranker lands
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -172,6 +173,12 @@ pub fn implied_slot(name: &str) -> Option<&'static str> {
 }
 
 /// Every spelling the registry accepts, canonical names first.
+///
+/// Only the spelling-completeness test reads it today, and it stays a `pub`
+/// registry accessor rather than a `#[cfg(test)]` helper: it is the one place
+/// the full accepted vocabulary is enumerable, which is what makes "every
+/// spelling is known" a fact rather than a claim.
+#[allow(dead_code)]
 #[must_use]
 pub fn all_spellings() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = REGISTRY.iter().map(|s| s.canonical).collect();

@@ -55,6 +55,11 @@ pub struct HarnessMenu {
     pub registered_unconfigured: Vec<String>,
 }
 
+// bd-drlm: the menu is read by people and by Jev. These three are the reading
+// half — the ranker's inputs and the floor it re-applies — and they have no
+// caller until the Jev pass is wired in. Kept because a menu nobody can read
+// back is the thing this module exists to prevent.
+#[allow(dead_code)]
 impl HarnessMenu {
     /// The leading harnesses, in rank order.
     #[must_use]
