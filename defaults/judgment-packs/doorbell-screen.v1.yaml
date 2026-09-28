@@ -20,7 +20,6 @@ questions:
   - id: urgency
     kind: score
     instructions: "How urgent is `material.text`: routine background, soon (this session), or immediate (blocked peer / live incident)?"
-    options: [routine, soon, immediate]
     criteria:
       - "routine: FYI, digests, FYI-style status; nothing waits on it."
       - "soon: work for this session, but no one is blocked right now."

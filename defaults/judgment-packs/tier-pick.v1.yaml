@@ -8,7 +8,6 @@ questions:
   - id: reasoning_depth
     kind: score
     instructions: "How much reasoning does `goal.text` need: routine (cheap band), substantial (standard band), or frontier (premium band)? Score carries extremity confidence — edges are sure, the middle is unsure."
-    options: [routine, substantial, frontier]
     criteria:
       - "routine: typo-class, rename, docs, single-file mechanical change — a cheap model proves it."
       - "substantial: multi-file feature, refactor, fresh tests — needs the standard band."

@@ -15,7 +15,6 @@ questions:
   - id: urgency
     kind: score
     instructions: "How urgent is the material: routine, soon, or immediate?"
-    options: [routine, soon, immediate]
     criteria:
       - "routine: background material; nothing waits on it."
       - "soon: work for this session, but no one is blocked right now."

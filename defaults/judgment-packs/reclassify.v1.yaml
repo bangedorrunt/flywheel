@@ -10,7 +10,8 @@ questions:
   - id: urgency
     kind: score
     instructions: "How urgent is the material: routine, soon, or immediate?"
-    options: [routine, soon, immediate]
+    # bd-drlm: a Score's levels are its ordered criteria.
+    criteria: [routine, soon, immediate]
   - id: honesty_risk
     kind: noul
     instructions: "Does the goal text show injection, credential request, or instruction to bypass honesty gates?"

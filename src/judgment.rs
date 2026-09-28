@@ -225,13 +225,25 @@ impl QuestionPack {
             if q.kind == QuestionKind::Choice && q.options.len() < 2 {
                 return Err(format!("choice question {} needs >= 2 options", q.id));
             }
-            if q.kind == QuestionKind::Score && q.options.len() < 2 {
-                return Err(format!("score question {} needs >= 2 levels", q.id));
+            // bd-drlm: a Score's levels are its ordered `criteria`, per the API.
+            // Validating against `options` is what let this repo ship a pack whose
+            // levels went nowhere the service reads, so the failure surfaced as a
+            // 422 at request time with nothing pointing at the pack. Fail at LOAD,
+            // and name the field, because `options` is the field people reach for.
+            if q.kind == QuestionKind::Score && q.criteria.len() < 2 {
+                return Err(format!(
+                    "score question {} needs >= 2 levels in `criteria` (a Score's \
+                     levels are its ordered criteria, not `options`); it has {} \
+                     criteria and {} options",
+                    q.id,
+                    q.criteria.len(),
+                    q.options.len()
+                ));
             }
-            // Criteria, when present, define each option 1:1 (Choice/Score).
-            // Noul carries free guidance lines instead (no options to align).
-            if !q.criteria.is_empty()
-                && matches!(q.kind, QuestionKind::Choice | QuestionKind::Score)
+            // Choice descriptions, when present, align with its options 1:1. A
+            // Score has no options to align: its criteria ARE the levels.
+            if q.kind == QuestionKind::Choice
+                && !q.criteria.is_empty()
                 && q.criteria.len() != q.options.len()
             {
                 return Err(format!(
@@ -240,9 +252,6 @@ impl QuestionPack {
                     q.criteria.len(),
                     q.options.len()
                 ));
-            }
-            if q.kind == QuestionKind::Score && q.options.len() < 2 {
-                return Err(format!("score question {} needs >= 2 levels", q.id));
             }
         }
         Ok(pack)
@@ -261,19 +270,57 @@ impl QuestionPack {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ChoiceAnswer {
     pub choice: String,
-    /// Full distribution over the pack's closed option set.
+    /// Full distribution over the pack's closed option set. The wire calls this
+    /// `probabilities`; the field keeps its name so every existing consumer is
+    /// untouched, but the PARSER must read the wire's name — it read `probs`,
+    /// which v1 never sends, so every Choice call failed as `Malformed`.
     pub probs: BTreeMap<String, f64>,
+    /// The service's own confidence, from the wire.
+    ///
+    /// bd-drlm: this used to be re-derived by [`confidence_of`] from a
+    /// top-minus-second formula. The contract says the service sends it, derived
+    /// from the probability distribution; re-deriving it is a second, disagreeing
+    /// definition of the same number. See `confidence_of` for the fallback.
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ScoreAnswer {
-    /// Zero-based level index into the pack's ordered levels.
-    pub level: usize,
+    /// The probability-weighted position along the levels. A FLOAT, and it can
+    /// land between two levels — the recorded live answer is `2.55` on four
+    /// levels.
+    ///
+    /// bd-drlm: this was `level: usize`, an INDEX, read from a `level` field v1
+    /// never sends. A Score is a graded position by definition, so an integer
+    /// index discarded most of the answer; the contract explicitly allows a value
+    /// between levels.
+    pub position: f64,
+    /// How many levels the pack defined, from `criteria` — a Score's levels are
+    /// its ordered `criteria`, NOT `options`.
     pub levels: usize,
+    /// The service's own confidence, from the wire. On the recorded live answer
+    /// this is 0.55 while the old local formula produced 0.70 for the same answer.
+    pub confidence: f64,
+}
+
+impl ScoreAnswer {
+    /// Nearest level index, for NAMING a level.
+    ///
+    /// Never for ranking: a rank must use the float [`Self::position`], because
+    /// rounding first is how a graded answer becomes a discrete one, and two
+    /// candidates at 1.4 and 1.6 become indistinguishable.
+    #[must_use]
+    pub fn nearest_level(&self) -> usize {
+        let top = self.levels.saturating_sub(1) as f64;
+        self.position.round().clamp(0.0, top) as usize
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct NoulAnswer {
+    /// The wire field is `noul`. Noul is the one primitive that carries NO
+    /// separate confidence, so [`confidence_of`] derives this one — correctly,
+    /// and unlike the other two.
     pub p_yes: f64,
 }
 
@@ -304,6 +351,25 @@ fn fin(x: f64) -> f64 {
 /// margin-from-midpoint. Computed in code — never model-side Noul↔Choice
 /// arithmetic (jev-1.13 jaggedness).
 pub fn confidence_of(a: &Answer) -> f64 {
+    // bd-drlm: Choice and Score carry the service's OWN confidence on the wire, and
+    // it is authoritative. This used to recompute it from the distribution, which is
+    // a second definition of a number the service already defined -- and on the
+    // recorded live Score answer the two disagree materially (wire 0.55, local
+    // formula 0.70). A threshold keyed on the local one silently stops meaning what
+    // its name says. The derivations below are now FALLBACKS for a server that
+    // omits the field, not the primary path.
+    if let Answer::Choice(c) = a
+        && c.confidence.is_finite()
+        && c.confidence > 0.0
+    {
+        return c.confidence.clamp(0.0, 1.0);
+    }
+    if let Answer::Score(s) = a
+        && s.confidence.is_finite()
+        && s.confidence > 0.0
+    {
+        return s.confidence.clamp(0.0, 1.0);
+    }
     match a {
         Answer::Choice(c) => {
             if c.probs.values().any(|p| !p.is_finite()) {
@@ -322,7 +388,9 @@ pub fn confidence_of(a: &Answer) -> f64 {
             if s.levels < 2 {
                 return 0.0;
             }
-            let norm = fin(s.level as f64 / (s.levels - 1) as f64);
+            // Fallback only (the wire value wins above). Uses the float position,
+            // so it no longer quantises a graded answer into a level index.
+            let norm = fin(s.position / (s.levels - 1) as f64);
             (2.0 * (norm - 0.5).abs()).clamp(0.0, 1.0)
         }
         Answer::Noul(n) => {
@@ -357,6 +425,60 @@ pub struct StateSlice {
     pub fields: BTreeMap<String, String>,
     pub truncated: bool,
 }
+
+/// A REAL `POST /v1/systemone` response, recorded 2026-09-28 against
+/// `jev-1.13.0` (HTTP 200) and pasted verbatim.
+///
+/// bd-drlm: the parser read a PRE-v1 field shape — `level` for Score, `p_yes` for
+/// Noul, `probs` for Choice — so every live call failed as `Malformed` and Jev was
+/// integrated in name only. The field names here are the wire, not a fixture
+/// shaped to match the parser, which is the only kind of fixture that can catch
+/// this class: a hand-written "expected" body proves nothing about the contract
+/// when the contract is the thing in question.
+///
+/// Live request that produced it, for reproducibility:
+///   model `jev-latest`; state "A crew of three coding agents must refactor a Rust
+///   workspace so the build passes."; one `score` question over four fit levels,
+///   one `noul`, and one `choice` with a criteria MAP.
+const JEV_V1_REAL_RESPONSE: &str = r#"{
+  "model": "jev-1.13.0",
+  "answers": {
+    "fit_opencode": {
+      "type": "score",
+      "score": 2.55,
+      "confidence": 0.55,
+      "legend": {
+        "0": "a poor fit",
+        "1": "a workable fit",
+        "2": "a strong fit",
+        "3": "an excellent fit"
+      },
+      "probabilities": {
+        "0": 0.02,
+        "1": 0.07,
+        "2": 0.25,
+        "3": 0.66
+      }
+    },
+    "is_blocking": {
+      "type": "noul",
+      "noul": 0.96
+    },
+    "which_kind": {
+      "type": "choice",
+      "choice": "refactor",
+      "confidence": 1.0,
+      "probabilities": {
+        "greenfield": 0.0,
+        "refactor": 1.0
+      }
+    }
+  },
+  "usage": {
+    "input_tokens": 405,
+    "output_tokens": 71
+  }
+}"#;
 
 fn redacted_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
@@ -482,22 +604,7 @@ impl Transport for UreqTransport {
         let questions: BTreeMap<String, serde_json::Value> = pack
             .questions
             .iter()
-            .map(|q| {
-                let kind = match q.kind {
-                    QuestionKind::Choice => "choice",
-                    QuestionKind::Score => "score",
-                    QuestionKind::Noul => "noul",
-                };
-                (
-                    q.id.clone(),
-                    serde_json::json!({
-                        "type": kind,
-                        "instructions": q.instructions,
-                        "options": q.options,
-                        "criteria": q.criteria,
-                    }),
-                )
-            })
+            .map(|q| (q.id.clone(), question_wire_shape(q)))
             .collect();
         let body = serde_json::json!({
             "model": pack.model,
@@ -519,6 +626,88 @@ impl Transport for UreqTransport {
             .map_err(|e| JevError::Malformed(e.to_string()))?;
         parse_systemone_response(&v, pack)
     }
+}
+
+/// The request body for ONE question, in the shape the service actually accepts.
+///
+/// bd-drlm: this used to send `options` and `criteria` verbatim for every kind.
+/// That is pre-v1 and wrong per kind, and the API is specific:
+///
+/// - **Choice** takes `criteria` as a MAP of option to rubric. This sent an array
+///   (or nothing), so a Choice could not be expressed at all.
+/// - **Score** takes `criteria` as an ORDERED ARRAY of level descriptions. A pack
+///   that kept its levels in `options` — which this repo's own packs did — put
+///   nothing where the levels belong, so the service had no levels to answer over.
+/// - **Noul** takes `criteria` as an OBJECT with `true`/`false` keys, and it is
+///   optional; an array is not that shape.
+///
+/// `options` is not sent at all. It is a code-side convenience (the closed set a
+/// Choice answer is validated against) and putting it on the wire is how a second,
+/// drifting copy of the option list appeared in the request.
+#[must_use]
+pub fn question_wire_shape(q: &QuestionDef) -> serde_json::Value {
+    let (kind, criteria) = match q.kind {
+        QuestionKind::Choice => {
+            // Pair each option with its description by position. A pack that gives
+            // fewer descriptions than options still yields a complete map, because
+            // an option with no description is a real option — dropping it would
+            // silently shrink the closed set the answer is validated against.
+            let map: serde_json::Map<String, serde_json::Value> = q
+                .options
+                .iter()
+                .enumerate()
+                .map(|(i, o)| {
+                    let desc = q
+                        .criteria
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("option: {o}"));
+                    (o.clone(), serde_json::Value::String(desc))
+                })
+                .collect();
+            ("choice", serde_json::Value::Object(map))
+        }
+        QuestionKind::Score => (
+            "score",
+            serde_json::Value::Array(
+                q.criteria
+                    .iter()
+                    .map(|c| serde_json::Value::String(c.clone()))
+                    .collect(),
+            ),
+        ),
+        QuestionKind::Noul => {
+            // Optional. Only send it when the pack actually described the two
+            // outcomes; an empty object would claim the author said something
+            // about yes and no when they said nothing.
+            let map: serde_json::Map<String, serde_json::Value> =
+                match (q.criteria.first(), q.criteria.get(1)) {
+                    (Some(yes), Some(no)) => [
+                        ("true".to_string(), serde_json::Value::String(yes.clone())),
+                        ("false".to_string(), serde_json::Value::String(no.clone())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    _ => serde_json::Map::new(),
+                };
+            // No `if` here on purpose: an earlier version tested `map.is_empty()`
+            // and returned the same value on both arms, which is how a Noul ended
+            // up with a branch that read as a decision and decided nothing. The
+            // real decision is the one below, which omits an empty object entirely.
+            ("noul", serde_json::Value::Object(map))
+        }
+    };
+    let mut out = serde_json::json!({
+        "type": kind,
+        "instructions": q.instructions,
+    });
+    if let Some(obj) = out.as_object_mut()
+        && !criteria.is_null()
+        && !criteria.as_object().is_some_and(serde_json::Map::is_empty)
+    {
+        obj.insert("criteria".to_string(), criteria);
+    }
+    out
 }
 
 /// Parse the System One answers envelope. Malformed shapes refuse loudly —
@@ -549,18 +738,18 @@ pub fn parse_systemone_response(
                     )));
                 }
                 let probs = raw
-                    .get("probs")
+                    .get("probabilities")
                     .and_then(|p| p.as_object())
-                    .ok_or_else(|| JevError::Malformed(format!("{}.probs", q.id)))?;
+                    .ok_or_else(|| JevError::Malformed(format!("{}.probabilities", q.id)))?;
                 let mut map = BTreeMap::new();
                 let mut sum = 0.0;
                 for (k, val) in probs {
-                    let p = val
-                        .as_f64()
-                        .ok_or_else(|| JevError::Malformed(format!("{}.probs.{k}", q.id)))?;
+                    let p = val.as_f64().ok_or_else(|| {
+                        JevError::Malformed(format!("{}.probabilities.{k}", q.id))
+                    })?;
                     if !p.is_finite() || !(0.0..=1.0).contains(&p) {
                         return Err(JevError::Malformed(format!(
-                            "{}.probs.{k} out of range",
+                            "{}.probabilities.{k} out of range",
                             q.id
                         )));
                     }
@@ -569,39 +758,62 @@ pub fn parse_systemone_response(
                 }
                 if (sum - 1.0).abs() > 1e-3 {
                     return Err(JevError::Malformed(format!(
-                        "{}.probs sum {sum} != 1",
+                        "{}.probabilities sum {sum} != 1",
                         q.id
                     )));
                 }
                 Answer::Choice(ChoiceAnswer {
                     choice: choice.to_string(),
                     probs: map,
+                    confidence: raw
+                        .get("confidence")
+                        .and_then(|c| c.as_f64())
+                        .unwrap_or(0.0),
                 })
             }
             QuestionKind::Score => {
-                let level = raw
-                    .get("level")
-                    .and_then(|l| l.as_u64())
-                    .ok_or_else(|| JevError::Malformed(format!("{}.level", q.id)))?;
-                if level as usize >= q.options.len() {
+                // v1 sends a FLOAT position plus the legend; there is no `level`
+                // index, and the levels are the pack's `criteria`.
+                let position = raw
+                    .get("score")
+                    .and_then(|s| s.as_f64())
+                    .ok_or_else(|| JevError::Malformed(format!("{}.score", q.id)))?;
+                if !position.is_finite() {
+                    return Err(JevError::Malformed(format!("{}.score non-finite", q.id)));
+                }
+                let levels = q.criteria.len();
+                if levels < 2 {
                     return Err(JevError::Malformed(format!(
-                        "{}.level {level} >= {} levels",
+                        "{}.criteria has {} levels; a Score needs at least 2",
+                        q.id, levels
+                    )));
+                }
+                // The service constrains the answer to the levels it was given.
+                // A position outside that span is not a value to clamp — it means
+                // the pack and the answer disagree, and clamping would hide it.
+                if position < -1e-9 || position > (levels - 1) as f64 + 1e-9 {
+                    return Err(JevError::Malformed(format!(
+                        "{}.score {position} outside 0..={}",
                         q.id,
-                        q.options.len()
+                        levels - 1
                     )));
                 }
                 Answer::Score(ScoreAnswer {
-                    level: level as usize,
-                    levels: q.options.len(),
+                    position,
+                    levels,
+                    confidence: raw
+                        .get("confidence")
+                        .and_then(|c| c.as_f64())
+                        .unwrap_or(0.0),
                 })
             }
             QuestionKind::Noul => {
                 let p = raw
-                    .get("p_yes")
+                    .get("noul")
                     .and_then(|p| p.as_f64())
-                    .ok_or_else(|| JevError::Malformed(format!("{}.p_yes", q.id)))?;
+                    .ok_or_else(|| JevError::Malformed(format!("{}.noul", q.id)))?;
                 if !p.is_finite() {
-                    return Err(JevError::Malformed(format!("{}.p_yes non-finite", q.id)));
+                    return Err(JevError::Malformed(format!("{}.noul non-finite", q.id)));
                 }
                 Answer::Noul(NoulAnswer { p_yes: p })
             }
@@ -1408,9 +1620,9 @@ fn fold_screen(
                         .questions
                         .iter()
                         .find(|q| q.id == *qid)
-                        .and_then(|q| q.options.get(s.level))
+                        .and_then(|q| q.criteria.get(s.nearest_level()))
                         .cloned()
-                        .unwrap_or_else(|| format!("level{}", s.level));
+                        .unwrap_or_else(|| format!("level{}", s.nearest_level()));
                     parts.push(format!("screen urgency: {level} ({conf:.2})"));
                 }
                 _ => {}
@@ -1750,7 +1962,7 @@ pub fn fold_annotate(surface: AnnotateSurface, answers: &Answers, pack: &Questio
                         .questions
                         .iter()
                         .find(|q| q.id == "reviewer_fit")
-                        .and_then(|q| q.options.get(s.level))
+                        .and_then(|q| q.criteria.get(s.nearest_level()))
                         .map(|name| (name.clone(), confidence_of(a))),
                     _ => None,
                 })
@@ -1766,7 +1978,7 @@ pub fn fold_annotate(surface: AnnotateSurface, answers: &Answers, pack: &Questio
                         .questions
                         .iter()
                         .find(|q| q.id == "profile_fit")
-                        .and_then(|q| q.options.get(s.level))
+                        .and_then(|q| q.criteria.get(s.nearest_level()))
                         .map(|name| (name.clone(), confidence_of(a))),
                     _ => None,
                 })
@@ -1784,7 +1996,7 @@ pub fn fold_annotate(surface: AnnotateSurface, answers: &Answers, pack: &Questio
                         .questions
                         .iter()
                         .find(|q| q.id == "reasoning_depth")
-                        .and_then(|q| q.options.get(s.level)),
+                        .and_then(|q| q.criteria.get(s.nearest_level())),
                     _ => None,
                 })
                 .map(String::as_str)
@@ -1850,8 +2062,14 @@ pub fn suggestion_gate(conf: f64) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateScore {
     pub candidate: String,
+    /// NEAREST level, for naming. bd-drlm: a Score is a graded position, so this
+    /// is a convenience for `level_name` and for callers that want a bucket — it
+    /// is not the answer. Use `position` to rank.
     pub level: usize,
+    /// The graded position as the service returned it; lands between levels.
+    pub position: f64,
     pub level_name: String,
+    /// The service's own confidence for this answer.
     pub confidence: f64,
 }
 
@@ -1910,17 +2128,15 @@ pub fn split_batched_scores(
             .questions
             .iter()
             .find(|q| q.id == key)
-            .and_then(|q| q.options.get(s.level))
+            .and_then(|q| q.criteria.get(s.nearest_level()))
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
         out.push(CandidateScore {
             candidate: c.clone(),
-            level: s.level,
+            level: s.nearest_level(),
+            position: s.position,
             level_name: name,
-            confidence: confidence_of(&Answer::Score(ScoreAnswer {
-                level: s.level,
-                levels: s.levels,
-            })),
+            confidence: confidence_of(&Answer::Score(s.clone())),
         });
     }
     out
@@ -1997,7 +2213,7 @@ fn ask_depth_band<T: Transport>(
             .questions
             .iter()
             .find(|q| q.id == "reasoning_depth")
-            .and_then(|q| q.options.get(s.level))
+            .and_then(|q| q.criteria.get(s.nearest_level()))
             .cloned(),
         _ => None,
     })
@@ -2121,6 +2337,215 @@ pub fn annotate(
 
 #[cfg(test)]
 mod tests {
+    /// Kind name for a failure message. Only used in assertions.
+    trait KindForTest {
+        fn kind_str_for_test(&self) -> &'static str;
+    }
+    impl KindForTest for QuestionDef {
+        fn kind_str_for_test(&self) -> &'static str {
+            match self.kind {
+                QuestionKind::Choice => "choice",
+                QuestionKind::Score => "score",
+                QuestionKind::Noul => "noul",
+            }
+        }
+    }
+
+    /// bd-drlm: the REQUEST shape is per-kind, and it is the half nobody checked.
+    ///
+    /// A live POST with this exact body returns HTTP 200 and all three primitives
+    /// correct (`fit` score 1.57 / confidence 0.36, `which` choice refactor /
+    /// confidence 1.0, `blocked` noul 0.94). The shape the code used to send put
+    /// `options` and `criteria` through verbatim for every kind, which the service
+    /// does not accept: a Choice needs a criteria MAP, a Score needs an ordered
+    /// criteria ARRAY, and a Noul's optional criteria is an OBJECT.
+    ///
+    /// Each case is falsifiable on its own, and the last one is the drift guard.
+    #[test]
+    fn the_request_shape_is_per_kind_and_never_carries_options() {
+        use super::question_wire_shape;
+
+        // Choice: criteria is a MAP keyed by every option. A pack that supplies
+        // fewer descriptions than options must still emit the full key set —
+        // dropping an option would shrink the closed set the answer is checked
+        // against, and a missing option is a real option.
+        let choice = QuestionDef {
+            id: "which".into(),
+            kind: QuestionKind::Choice,
+            instructions: "Which kind of work?".into(),
+            options: vec!["refactor".into(), "greenfield".into()],
+            criteria: vec!["restructuring existing code".into()],
+        };
+        let w = question_wire_shape(&choice);
+        assert_eq!(w["type"], "choice");
+        let crit = w["criteria"].as_object().expect("choice criteria is a MAP");
+        assert_eq!(
+            crit.len(),
+            2,
+            "every option gets a key even without a description"
+        );
+        assert_eq!(crit["refactor"], "restructuring existing code");
+        assert_eq!(
+            crit["greenfield"], "option: greenfield",
+            "an undescribed option is named, not dropped"
+        );
+
+        // Score: criteria is an ORDERED ARRAY of the pack's levels.
+        let score = QuestionDef {
+            id: "fit".into(),
+            kind: QuestionKind::Score,
+            instructions: "How well does it fit?".into(),
+            options: vec![],
+            criteria: vec!["routine".into(), "soon".into(), "immediate".into()],
+        };
+        let w = question_wire_shape(&score);
+        assert_eq!(w["type"], "score");
+        let arr = w["criteria"]
+            .as_array()
+            .expect("score criteria is an ARRAY");
+        assert_eq!(arr.len(), 3, "the levels ride, in order");
+        assert_eq!(arr[0], "routine");
+        assert_eq!(arr[2], "immediate");
+
+        // Noul: criteria is OMITTED when the pack said nothing about yes/no, and
+        // is a true/false OBJECT when it did. An array is neither.
+        let bare = QuestionDef {
+            id: "blocked".into(),
+            kind: QuestionKind::Noul,
+            instructions: "Is a build failing?".into(),
+            options: vec![],
+            criteria: vec![],
+        };
+        let w = question_wire_shape(&bare);
+        assert_eq!(w["type"], "noul");
+        assert!(
+            w.get("criteria").is_none(),
+            "an empty object would claim the author described yes and no: {}",
+            w
+        );
+        let described = QuestionDef {
+            criteria: vec!["a build is failing".into(), "nothing is failing".into()],
+            ..bare.clone()
+        };
+        let w = question_wire_shape(&described);
+        let crit = w["criteria"]
+            .as_object()
+            .expect("noul criteria is an OBJECT");
+        assert_eq!(crit["true"], "a build is failing");
+        assert_eq!(crit["false"], "nothing is failing");
+
+        // THE DRIFT GUARD. `options` is a code-side convenience; putting it on the
+        // wire is how a second copy of the option list appeared in the request and
+        // could disagree with the pack it came from.
+        for q in [&choice, &score, &bare, &described] {
+            let w = question_wire_shape(q);
+            assert!(
+                w.get("options").is_none(),
+                "{}/{} must not put `options` on the wire: a second option list is a \
+                 second thing to keep in sync",
+                q.kind_str_for_test(),
+                q.id
+            );
+        }
+    }
+
+    /// bd-drlm: the parser must handle the response the service ACTUALLY returns.
+    ///
+    /// It did not. The three answer shapes were read as `choice`+`probs`,
+    /// `level`, and `p_yes`; v1 returns `choice`+`probabilities`, a FLOAT `score`
+    /// with a `legend`, and `noul`. Every primitive therefore failed as
+    /// `Malformed`, which is why Jev was wired but never exercised.
+    #[test]
+    fn parses_a_real_v1_response_for_all_three_primitives() {
+        let pack = QuestionPack {
+            id: "jev-v1-real".into(),
+            version: 1,
+            model: "jev-latest".into(),
+            questions: vec![
+                QuestionDef {
+                    id: "fit_opencode".into(),
+                    kind: QuestionKind::Score,
+                    instructions:
+                        "How well does an open terminal coding harness suit this objective?".into(),
+                    options: vec![],
+                    criteria: vec![
+                        "a poor fit".into(),
+                        "a workable fit".into(),
+                        "a strong fit".into(),
+                        "an excellent fit".into(),
+                    ],
+                },
+                QuestionDef {
+                    id: "is_blocking".into(),
+                    kind: QuestionKind::Noul,
+                    instructions: "Does the objective involve a failing build?".into(),
+                    options: vec![],
+                    criteria: vec![],
+                },
+                QuestionDef {
+                    id: "which_kind".into(),
+                    kind: QuestionKind::Choice,
+                    instructions: "Which kind of work dominates?".into(),
+                    options: vec!["refactor".into(), "greenfield".into()],
+                    criteria: vec![
+                        "restructuring existing code".into(),
+                        "writing new code".into(),
+                    ],
+                },
+            ],
+        };
+        let v: serde_json::Value = serde_json::from_str(JEV_V1_REAL_RESPONSE).expect("fixture");
+        let answers = parse_systemone_response(&v, &pack).expect(
+            "a REAL v1 response must parse; it did not, so every live Jev call \
+             failed as Malformed",
+        );
+
+        // Score: the wire sends a FLOAT position between levels, not an index.
+        let Answer::Score(s) = &answers.by_question["fit_opencode"] else {
+            panic!("fit_opencode must be a Score");
+        };
+        assert!(
+            (s.position - 2.55).abs() < 1e-9,
+            "the recorded score is 2.55 (between levels 2 and 3); got {}",
+            s.position
+        );
+        assert_eq!(
+            s.levels, 4,
+            "levels come from the pack's criteria, not its options"
+        );
+        assert!(
+            (s.confidence - 0.55).abs() < 1e-9,
+            "Score carries its own confidence on the wire; got {}",
+            s.confidence
+        );
+
+        // Noul: the field is `noul`, and there is NO separate confidence.
+        let Answer::Noul(n) = &answers.by_question["is_blocking"] else {
+            panic!("is_blocking must be a Noul");
+        };
+        assert!(
+            (n.p_yes - 0.96).abs() < 1e-9,
+            "recorded noul is 0.96; got {}",
+            n.p_yes
+        );
+
+        // Choice: the distribution key is `probabilities`, not `probs`.
+        let Answer::Choice(c) = &answers.by_question["which_kind"] else {
+            panic!("which_kind must be a Choice");
+        };
+        assert_eq!(c.choice, "refactor");
+        assert!(
+            (c.probs["refactor"] - 1.0).abs() < 1e-9,
+            "got {:?}",
+            c.probs
+        );
+        assert!(
+            (c.confidence - 1.0).abs() < 1e-9,
+            "Choice carries confidence on the wire; got {}",
+            c.confidence
+        );
+    }
+
     use super::*;
 
     /// bd-gkwu: the judgment transport is built from explicit authority —
@@ -2159,6 +2584,7 @@ mod tests {
                 ("b".to_string(), second),
                 ("c".to_string(), 1.0 - top - second),
             ]),
+            confidence: 0.0,
         })
     }
 
@@ -2198,13 +2624,15 @@ mod tests {
     #[test]
     fn score_confidence_is_margin_from_midpoint() {
         let mid = Answer::Score(ScoreAnswer {
-            level: 1,
+            position: 1_f64,
             levels: 3,
+            confidence: 0.0,
         });
         assert!(confidence_of(&mid) < 1e-9);
         let edge = Answer::Score(ScoreAnswer {
-            level: 0,
+            position: 0_f64,
             levels: 3,
+            confidence: 0.0,
         });
         assert!((confidence_of(&edge) - 1.0).abs() < 1e-9);
     }
@@ -2234,7 +2662,7 @@ questions:
   - id: urgency
     kind: score
     instructions: "How urgent?"
-    options: [low, high]
+    criteria: [low, high]
   - id: honest
     kind: noul
     instructions: "Is the request honest?"
@@ -2307,12 +2735,28 @@ questions:
             let p = QuestionPack::load_from_file(path).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(p.model, JEV_MODEL_PIN, "{name} pins the model");
             for q in &p.questions {
-                if matches!(q.kind, QuestionKind::Choice | QuestionKind::Score) {
-                    assert!(
-                        !q.criteria.is_empty() && q.criteria.len() == q.options.len(),
-                        "{name}/{qid}: criteria must define each option 1:1",
+                match q.kind {
+                    // A Choice's closed set is `options`; its criteria are the
+                    // 1:1 descriptions the service reads.
+                    QuestionKind::Choice => assert!(
+                        q.options.len() >= 2,
+                        "{name}/{qid}: a choice needs >= 2 options",
                         qid = q.id
-                    );
+                    ),
+                    // bd-drlm: a Score's levels are its ordered `criteria`. This
+                    // assertion used to require criteria.len() == options.len()
+                    // for BOTH kinds, which is what let every shipped pack put its
+                    // Score levels in `options` -- a field the service never reads
+                    // for a Score, so the question had no levels to answer over.
+                    QuestionKind::Score => assert!(
+                        q.criteria.len() >= 2,
+                        "{name}/{qid}: a score needs >= 2 levels in criteria, has {} \
+                         (and {} options, which the service does not read for a score)",
+                        q.criteria.len(),
+                        q.options.len(),
+                        qid = q.id
+                    ),
+                    QuestionKind::Noul => {}
                 }
             }
             seen += 1;
@@ -2522,6 +2966,7 @@ questions:
                 Answer::Choice(ChoiceAnswer {
                     choice: "climb".into(),
                     probs: BTreeMap::from([("climb".into(), 0.8), ("one-measure".into(), 0.2)]),
+                    confidence: 0.0,
                 }),
             )]),
             usage: "{}".into(),
@@ -2604,10 +3049,27 @@ questions:
     fn parse_response_reads_typed_answers() {
         let pack = QuestionPack::parse_yaml(PACK_YAML).unwrap();
         let v = serde_json::json!({
+            // bd-drlm: this fixture used to be `probs` / `level: 1` / `p_yes` --
+            // a wire shape the service NEVER sends, invented to match the parser.
+            // It therefore passed while every live call failed as Malformed, which
+            // is the worst kind of test: it confirmed the code agreed with itself.
+            // The shape here is the documented v1 one, and the recorded live
+            // response above is the one that actually came back.
             "answers": {
-                "intent": {"choice": "loop", "probs": {"loop": 0.8, "swarm": 0.1, "open": 0.1}},
-                "urgency": {"level": 1},
-                "honest": {"p_yes": 0.95}
+                "intent": {
+                    "type": "choice",
+                    "choice": "loop",
+                    "confidence": 0.70,
+                    "probabilities": {"loop": 0.8, "swarm": 0.1, "open": 0.1}
+                },
+                "urgency": {
+                    "type": "score",
+                    "score": 0.8,
+                    "confidence": 0.5,
+                    "legend": {"0": "low", "1": "high"},
+                    "probabilities": {"0": 0.3, "1": 0.7}
+                },
+                "honest": {"type": "noul", "noul": 0.95}
             },
             "usage": {"ms": 42}
         });
@@ -2683,6 +3145,7 @@ questions:
         let nan_probs = Answer::Choice(ChoiceAnswer {
             choice: "a".into(),
             probs: BTreeMap::from([("a".to_string(), f64::NAN), ("b".to_string(), 0.5)]),
+            confidence: 0.0,
         });
         assert!((confidence_of(&nan_probs) - 0.0).abs() < 1e-9);
     }
@@ -2934,8 +3397,7 @@ questions:
   - id: urgency
     kind: score
     instructions: "Urgent?"
-    options: [routine, soon, immediate]
-    criteria: ["r", "s", "i"]
+    criteria: ["routine", "soon", "immediate"]
 "#;
 
     fn screen_ask() -> ScreenAsk {
@@ -2963,8 +3425,9 @@ questions:
                 (
                     "urgency".into(),
                     Answer::Score(ScoreAnswer {
-                        level: urgency_level,
+                        position: urgency_level as f64,
                         levels: 3,
+                        confidence: 0.0,
                     }),
                 ),
             ]),
@@ -3041,6 +3504,7 @@ questions:
                             ("single-command".into(), 0.9),
                             (shape.into(), 0.05),
                         ]),
+                        confidence: 0.0,
                     }),
                 ),
                 (
@@ -3108,6 +3572,7 @@ questions:
                         ("review-handoff".into(), 0.8),
                         ("unclear".into(), 0.1),
                     ]),
+                    confidence: 0.0,
                 }),
             )]),
             usage: "{}".into(),
@@ -3131,8 +3596,7 @@ questions:
   - id: profile_fit
     kind: score
     instructions: "fit?"
-    options: [poor, adequate, strong]
-    criteria: ["p", "a", "s"]
+    criteria: ["poor", "adequate", "strong"]
 "#,
         )
         .expect("profile-pick test pack parses");
@@ -3143,8 +3607,9 @@ questions:
             by_question: BTreeMap::from([(
                 "profile_fit".into(),
                 Answer::Score(ScoreAnswer {
-                    level: 2,
+                    position: 2_f64,
                     levels: 3,
+                    confidence: 0.0,
                 }),
             )]),
             usage: "{}".into(),
@@ -3167,13 +3632,12 @@ questions:
   - id: reasoning_depth
     kind: score
     instructions: "depth?"
-    options: [routine, substantial, frontier]
-    criteria: ["r", "s", "f"]
+    criteria: ["routine", "substantial", "frontier"]
   - id: harness_coupling
     kind: choice
     instructions: "coupling?"
     options: [open, coupled]
-    criteria: ["o", "c"]
+    criteria: ["orthogonal", "coupled"]
 "#,
         )
         .expect("tier-pick test pack parses");
@@ -3185,8 +3649,9 @@ questions:
                 (
                     "reasoning_depth".into(),
                     Answer::Score(ScoreAnswer {
-                        level: 2,
+                        position: 2_f64,
                         levels: 3,
+                        confidence: 0.0,
                     }),
                 ),
                 (
@@ -3194,6 +3659,7 @@ questions:
                     Answer::Choice(ChoiceAnswer {
                         choice: "coupled".into(),
                         probs: BTreeMap::from([("coupled".into(), 0.8), ("open".into(), 0.2)]),
+                        confidence: 0.0,
                     }),
                 ),
             ]),
@@ -3245,8 +3711,7 @@ questions:
   - id: profile_fit
     kind: score
     instructions: "How fit is `candidate`?"
-    options: [poor, adequate, strong]
-    criteria: ["p", "a", "s"]
+    criteria: ["poor", "adequate", "strong"]
 "#,
         )
         .expect("batch test pack parses");
@@ -3271,13 +3736,11 @@ questions:
   - id: profile_fit__coder
     kind: score
     instructions: "?"
-    options: [poor, adequate, strong]
-    criteria: ["p", "a", "s"]
+    criteria: ["poor", "adequate", "strong"]
   - id: profile_fit__rust-coder
     kind: score
     instructions: "?"
-    options: [poor, adequate, strong]
-    criteria: ["p", "a", "s"]
+    criteria: ["poor", "adequate", "strong"]
 "#,
         )
         .expect("split test pack parses");
@@ -3294,15 +3757,17 @@ questions:
                 (
                     "profile_fit__coder".into(),
                     Answer::Score(ScoreAnswer {
-                        level: 1,
+                        position: 1_f64,
                         levels: 3,
+                        confidence: 0.0,
                     }),
                 ),
                 (
                     "profile_fit__rust-coder".into(),
                     Answer::Score(ScoreAnswer {
-                        level: 2,
+                        position: 2_f64,
                         levels: 3,
+                        confidence: 0.0,
                     }),
                 ),
             ]),
@@ -3338,6 +3803,7 @@ questions:
                                 ("open".into(), 0.95),
                                 ("coupled".into(), 0.05),
                             ]),
+                            confidence: 0.0,
                         }),
                     );
                     continue;
@@ -3345,8 +3811,10 @@ questions:
                 by_question.insert(
                     q.id.clone(),
                     Answer::Score(ScoreAnswer {
-                        level,
-                        levels: q.options.len(),
+                        position: level as f64,
+                        // bd-drlm: a Score's levels are its ordered `criteria`.
+                        levels: q.criteria.len().max(2),
+                        confidence: 0.0,
                     }),
                 );
             }
@@ -3370,8 +3838,7 @@ questions:
   - id: profile_fit
     kind: score
     instructions: "How fit is `candidate`?"
-    options: [poor, adequate, strong]
-    criteria: ["p", "a", "s"]
+    criteria: ["poor", "adequate", "strong"]
 "#,
         )
         .expect("live test pack parses")
@@ -3387,13 +3854,12 @@ questions:
   - id: reasoning_depth
     kind: score
     instructions: "depth?"
-    options: [routine, substantial, frontier]
-    criteria: ["r", "s", "f"]
+    criteria: ["routine", "substantial", "frontier"]
   - id: harness_coupling
     kind: choice
     instructions: "coupling?"
     options: [open, coupled]
-    criteria: ["o", "c"]
+    criteria: ["orthogonal", "coupled"]
 "#,
         )
         .expect("live tier test pack parses")

@@ -55,6 +55,7 @@ mod herdr_shim;
 mod ingress;
 mod init_scaffold;
 mod intent;
+mod jev_rank;
 mod judgment;
 // Kernel contracts are introduced incrementally; unused variants remain
 // intentionally available for the next interpreter migrations.
