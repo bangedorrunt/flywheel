@@ -56,6 +56,33 @@ fn private_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
+/// Replace a file's contents atomically: write a sibling temp file, then rename
+/// over the target.
+///
+/// bd-xz7k: `std::fs::write` truncates FIRST, so its failure mode on a journal
+/// rewrite was a destroyed file plus a discarded error. With a temp-and-rename a
+/// failed rewrite is a no-op, and the original bytes are still there to fold.
+fn private_replace(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = tmp_beside(path);
+    if let Err(e) = private_write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The sibling temp file an atomic replace writes before renaming over its
+/// target. Named beside the target so the rename stays on one filesystem.
+fn tmp_beside(path: &std::path::Path) -> std::path::PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(".tmp");
+    std::path::PathBuf::from(raw)
+}
+
 /// Create `dir` (all the way down) owner-only.
 #[cfg(unix)]
 fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
@@ -339,6 +366,13 @@ impl FileStore {
         // days while the daemon knew perfectly well what it had deleted.
         let mut drop_lo: Option<u64> = None;
         let mut drop_hi: Option<u64> = None;
+        // bd-xz7k: every destructive step is CHECKED. This method is the one that
+        // deletes rows, and it used to discard every write error (`let _ =`) and
+        // then report a clean drop carrying a seq range — so a failed rewrite
+        // both destroyed the journal and produced a record that excused the loss
+        // (the flywheel-chiebukuro shape: four generations on disk, 89 gaps, and
+        // a sum of recorded dropped_lines of zero).
+        let mut failed: Vec<String> = Vec::new();
         // A plain fn, not a closure: a closure would hold the `drop_lo`/`drop_hi`
         // borrows for the whole body, and the audit row at the end reads them.
         fn note(acc: &mut Option<u64>, other: &mut Option<u64>, lo: Option<u64>, hi: Option<u64>) {
@@ -371,22 +405,42 @@ impl FileStore {
                     let (lo, hi) = seq_span(&lines);
                     note(&mut drop_lo, &mut drop_hi, lo, hi);
                 }
-                let _ = std::fs::remove_file(&overflow);
+                if let Err(e) = std::fs::remove_file(&overflow) {
+                    failed.push(format!("remove {}: {e}", overflow.display()));
+                }
             }
             for n in (1..RETENTION_GENS).rev() {
                 let from = self.journal_gen_file(workspace, n);
-                if from.exists() {
-                    let _ = std::fs::rename(&from, self.journal_gen_file(workspace, n + 1));
+                if from.exists()
+                    && let Err(e) = std::fs::rename(&from, self.journal_gen_file(workspace, n + 1))
+                {
+                    failed.push(format!("shift {}: {e}", from.display()));
                 }
             }
-            let _ = std::fs::write(self.journal_gen_file(workspace, 1), head.join("\n") + "\n");
-            let _ = std::fs::write(&active, tail.join("\n") + "\n");
+            // The head is committed to .1 BEFORE the active file is trimmed, on
+            // purpose: if the trim fails, those rows still exist twice (in .1
+            // and in the untrimmed active) — visible and recoverable. The other
+            // order would lose them outright.
+            if let Err(e) = private_replace(
+                &self.journal_gen_file(workspace, 1),
+                (head.join("\n") + "\n").as_bytes(),
+            ) {
+                failed.push(format!("write gen1: {e}"));
+            }
+            if failed.is_empty()
+                && let Err(e) = private_replace(&active, (tail.join("\n") + "\n").as_bytes())
+            {
+                failed.push(format!("rewrite active: {e}"));
+            }
         }
         // Enforce totals, oldest first. Whole-generation deletion
         // overshoots crumb excesses (it would eat a fresh .1 for one row
         // over), so trim the oldest generation partially instead — keep
         // its newest rows, drop exactly the excess.
-        loop {
+        // A half-applied spill must not be compounded by the totals enforcer:
+        // deleting more files on top of a broken chain is how a recoverable
+        // inconsistency becomes an unrecoverable one.
+        while failed.is_empty() {
             let (total_lines, total_bytes, oldest) = self.generation_totals(workspace);
             if total_lines <= RETENTION_LINES && total_bytes <= RETENTION_BYTES {
                 break;
@@ -410,7 +464,10 @@ impl FileStore {
                     let (lo, hi) = seq_span(&lines);
                     note(&mut drop_lo, &mut drop_hi, lo, hi);
                 }
-                let _ = std::fs::remove_file(&p);
+                if let Err(e) = std::fs::remove_file(&p) {
+                    failed.push(format!("remove {}: {e}", p.display()));
+                    break;
+                }
             } else if let Ok(raw) = std::fs::read_to_string(&p) {
                 let rows: Vec<&str> = raw.lines().collect();
                 let cut = need.min(rows.len());
@@ -419,23 +476,42 @@ impl FileStore {
                 note(&mut drop_lo, &mut drop_hi, lo, hi);
                 dropped_lines += rows.len() - keep.len();
                 dropped_bytes += gb - count_bytes(keep);
-                let _ = std::fs::write(&p, keep.join("\n") + "\n");
+                if let Err(e) = private_replace(&p, (keep.join("\n") + "\n").as_bytes()) {
+                    failed.push(format!("trim {}: {e}", p.display()));
+                    break;
+                }
             } else {
                 break;
             }
         }
-        self.append_audit(
-            workspace,
-            serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "workspace": workspace,
-                "kind": "journal_rotated",
-                "dropped_lines": dropped_lines,
-                "dropped_bytes": dropped_bytes,
-                "seq_from": drop_lo,
-                "seq_to": drop_hi,
-            }),
-        );
+        // Loud first (GS-039): an operator watching stderr must not have to read
+        // the audit to learn that the rotation failed.
+        if !failed.is_empty() {
+            eprintln!(
+                "doorbell-rt: journal ROTATION FAILED on {workspace} — refuse silent drop \
+                 (GS-039); no seq range is recorded for this rotation: {}",
+                failed.join("; ")
+            );
+        }
+        let mut row = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "workspace": workspace,
+            "kind": "journal_rotated",
+            "dropped_lines": dropped_lines,
+            "dropped_bytes": dropped_bytes,
+        });
+        if let Some(obj) = row.as_object_mut() {
+            if failed.is_empty() {
+                // A range may only be recorded for rows we are SURE we removed.
+                // A wrong range does not merely misreport: it EXCUSES a later
+                // gap, because `RetentionDrop::explains` trusts it.
+                obj.insert("seq_from".into(), drop_lo.into());
+                obj.insert("seq_to".into(), drop_hi.into());
+            } else {
+                obj.insert("rotate_failed".into(), failed.join("; ").into());
+            }
+        }
+        let _ = self.append_audit(workspace, row);
     }
 
     /// (lines, bytes, oldest-generation-path) across active + generations.
@@ -643,7 +719,7 @@ impl FileStore {
                 // even if the audit write fails, or a failed report becomes a
                 // permanently re-firing one.
                 self.mark_tear_reported(workspace, &fingerprint);
-                self.append_audit(
+                let _ = self.append_audit(
                     workspace,
                     serde_json::json!({
                         "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -733,15 +809,47 @@ impl FileStore {
             .collect()
     }
 
-    pub fn append_audit(&self, workspace: &str, entry: serde_json::Value) {
+    /// Append one audit row, and refuse the silent drop on the way (bd-xz7k).
+    ///
+    /// The audit is the EVIDENCE channel — every tear report, every rotation and
+    /// every relayed death is delivered through it — and its own write error
+    /// used to be discarded twice over (the `private_dir`, and the `writeln!`
+    /// inside an `if let Ok(...)`). So the channel could stop recording in total
+    /// silence, which is the same defect bd-5qyt fixed one file over on the
+    /// journal, where it mattered less.
+    ///
+    /// The error is both returned (a caller that can act may) and warned about
+    /// here (so the many callers that cannot still say something out loud).
+    pub fn append_audit(&self, workspace: &str, entry: serde_json::Value) -> std::io::Result<()> {
         let path = self.audit_file(workspace);
-        if let Some(parent) = path.parent() {
-            let _ = private_dir(parent);
+        if let Some(parent) = path.parent()
+            && let Err(e) = private_dir(parent)
+        {
+            eprintln!(
+                "doorbell-rt: AUDIT append FAILED on {workspace} (mkdir) — refuse silent \
+                 drop (GS-039): {e:#}"
+            );
+            return Err(e);
         }
+        let mut f = match private_append(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "doorbell-rt: AUDIT append FAILED on {workspace} (open) — refuse silent \
+                     drop (GS-039): {e:#}"
+                );
+                return Err(e);
+            }
+        };
         use std::io::Write;
-        if let Ok(mut f) = private_append(&path) {
-            let _ = writeln!(f, "{entry}");
+        if let Err(e) = writeln!(f, "{entry}") {
+            eprintln!(
+                "doorbell-rt: AUDIT append FAILED on {workspace} (write) — refuse silent \
+                 drop (GS-039): {e:#}"
+            );
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Missing or corrupt file → DEFAULT (never a crash): at-least-once
@@ -1055,6 +1163,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// bd-xz7k: a rotation that FAILS must hide no rows and must not claim the
+    /// drop it did not perform.
+    ///
+    /// The failure is real, not mocked: a directory sits where the rewrite's
+    /// sibling temp file goes, so the replace fails with EISDIR. Under the old
+    /// code the active journal was rewritten IN PLACE with `let _ = ...`, so the
+    /// error vanished, the rows were gone, and the audit row that followed still
+    /// reported a clean drop carrying a seq range — a record that reads as
+    /// "designed" and would excuse a real gap forever. That is the
+    /// flywheel-chiebukuro shape: four generations on disk, 89 gaps, and a sum
+    /// of recorded dropped_lines of zero.
+    #[test]
+    fn a_failed_rotation_hides_no_rows_and_claims_no_range() {
+        let (st, dir) = test_store("rot-fail");
+        // A production-sized active journal, written directly so no append can
+        // trigger maybe_rotate first and rotate it out from under the test.
+        let mut body = String::new();
+        for seq in 1..=5000u64 {
+            body.push_str(&format!(
+                "{{\"v\":2,\"seq\":{seq},\"actions\":[],\"executed\":{{}}}}\n"
+            ));
+        }
+        let active = st.journal_file("w");
+        std::fs::create_dir_all(active.parent().expect("journals dir")).expect("mkdir journals");
+        std::fs::write(&active, &body).expect("oversized active journal");
+        let blocked = super::tmp_beside(&active);
+        std::fs::create_dir_all(&blocked).expect("block the rewrite");
+
+        st.rotate("w");
+
+        assert_eq!(
+            super::count_lines(&active),
+            5000,
+            "a rotation that could not rewrite the active journal must leave every row in it"
+        );
+        let audit = std::fs::read_to_string(st.audit_file("w")).expect("audit sidecar");
+        assert!(
+            audit.contains("journal_rotated"),
+            "the attempt is still reported — silence is the bug: {audit}"
+        );
+        assert!(
+            audit.contains("rotate_failed"),
+            "and the failure NAMES itself: {audit}"
+        );
+        assert!(
+            !audit.contains("seq_from"),
+            "a range may only be recorded for rows we are SURE were removed, or a later \
+             gap gets excused by a drop that never happened: {audit}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// bd-xz7k: the audit is the EVIDENCE channel — every tear report is
+    /// delivered through it — so its own write failure cannot be discarded.
+    /// The old shape swallowed both the mkdir and the writeln inside an
+    /// `if let Ok(...)`.
+    #[test]
+    fn a_failed_audit_append_is_reported_not_swallowed() {
+        let (st, dir) = test_store("audit-fail");
+        // Block the audit path itself: a directory where the file belongs.
+        std::fs::create_dir_all(st.audit_file("w")).expect("block the audit file");
+        let result = st.append_audit("w", serde_json::json!({"kind": "probe"}));
+        assert!(
+            result.is_err(),
+            "an audit row that did not land must be an error the caller can see, \
+             not a discarded Result: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_files_and_dirs() {
@@ -1062,7 +1240,7 @@ mod tests {
         // owner-only (0600, dirs 0700) — they carry wake metadata.
         let (st, dir) = test_store("perms");
         append_seq(&st, "w", 1);
-        st.append_audit("w", serde_json::json!({"kind": "x"}));
+        let _ = st.append_audit("w", serde_json::json!({"kind": "x"}));
         st.save_wake("w", &Default::default()).unwrap();
         st.save_unanswered("w", &["p".into()]);
         let mode = |p: &std::path::Path| {
@@ -1262,7 +1440,7 @@ mod tests {
         for seq in 20..=21u64 {
             append_seq(&st, "w", seq);
         }
-        st.append_audit(
+        let _ = st.append_audit(
             "w",
             serde_json::json!({
                 "kind": "journal_rotated",
@@ -1284,7 +1462,7 @@ mod tests {
         );
         // A record that does NOT cover the range must not excuse it: a guessed
         // range would hide a real lost write.
-        st.append_audit(
+        let _ = st.append_audit(
             "w",
             serde_json::json!({"kind": "journal_rotated", "dropped_lines": 2, "seq_from": 4, "seq_to": 5}),
         );
