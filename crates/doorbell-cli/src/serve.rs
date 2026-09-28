@@ -1755,6 +1755,51 @@ fn health_body(app: &AppState) -> String {
     if !tears.is_empty() {
         degraded.push("journal_torn_tail".to_string());
     }
+    // bd-3uqz item E: `journal.seq_holes` — the condition that was REAL
+    // (flywheel-chiebukuro at 61.7%, 7962 sequence numbers burned for 4939
+    // events) and had no field, so the only way to see it was a forensic script
+    // counting rows in Python.
+    //
+    // ABSENT rather than zero when nothing is wrong, which is the whole contract
+    // for a health field. A workspace at 0.0% holes and a workspace with nothing
+    // sequenced would otherwise read identically, and one of those is UNMEASURED.
+    // `holes_pct` is None for a window with no seq, and a clean workspace is not
+    // listed at all. Worst first, so the top entry is the one to read.
+    //
+    // A CONTINUOUS retention drop is deliberately not a hole: `rotate` discards a
+    // contiguous range, so a rotated workspace stays dense. That is what stops
+    // every rotated workspace from reading like a burn.
+    //
+    // Deliberately NOT pushed into `degraded`. A field that fires on a healthy
+    // path is worse than no field, and 61.7% was a bug already fixed in ad128f1 —
+    // the point here is VISIBILITY of a recurrence, not a new red light for a
+    // condition that is already healed.
+    let mut seq_holes: Vec<serde_json::Value> = hosted_ws
+        .iter()
+        .filter_map(|ws| {
+            let h = store.journal_seq_holes(ws);
+            let pct = h.holes_pct()?;
+            (h.holes > 0).then(|| {
+                serde_json::json!({
+                    "workspace": ws,
+                    "holes_pct": pct,
+                    "holes": h.holes,
+                    "rows": h.rows,
+                    "seq_from": h.seq_from,
+                    "seq_to": h.seq_to,
+                    // Named apart from holes: a replayed write and a burned number
+                    // look identical in a ratio and are different defects.
+                    "duplicates": h.duplicates,
+                })
+            })
+        })
+        .collect();
+    seq_holes.sort_by(|a, b| {
+        b["holes_pct"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&a["holes_pct"].as_f64().unwrap_or(0.0))
+    });
     let mode = if hosted.is_empty() {
         "standby"
     } else {
@@ -1978,7 +2023,19 @@ fn health_body(app: &AppState) -> String {
         } else {
             serde_json::Value::Null
         },
-        "journal": {"seq": max_seq, "lag_lines": 0},
+        "journal": {
+            "seq": max_seq,
+            "lag_lines": 0,
+            // `null`, not `[]`, when nothing burned — the torn_tails shape, so
+            // "no workspace burned a seq" never arrives looking like a report of
+            // zero burned sequences.
+            "seq_holes": if seq_holes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::Array(seq_holes)
+            },
+            "scanned": hosted_ws.len(),
+        },
         "owner": {"pid": std::process::id(), "gen": null, "host": hostname()},
     })
     .to_string()
@@ -3144,6 +3201,116 @@ mod tests {
         assert!(
             body.contains("\"restart_budget_per_window\":6"),
             "the budget the burst was measured against must be named: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-3uqz item E: `journal.seq_holes` fires on a real burn and is ABSENT on a
+    /// clean path. Both halves are asserted, because the recorded lesson is that a
+    /// health field which fires on a healthy path is worse than no field at all.
+    ///
+    /// The burn fixture is the measured flywheel-chiebukuro shape in miniature: seq
+    /// 1..=6 then 16..=20, a 20-number span carrying 11 rows and 9 holes — 45.0%.
+    #[test]
+    fn health_reports_a_burned_seq_range_and_stays_absent_on_a_dense_one() {
+        use super::{AppState, CachedHealth, health_body};
+        let dir = std::env::temp_dir().join(format!("holes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).expect("dirs");
+        let row = |seq: u64| format!("{{\"ts\":\"1970-01-01T00:00:00Z\",\"v\":2,\"seq\":{seq}}}\n");
+        let mut burned = String::new();
+        for s in 1..=6 {
+            burned.push_str(&row(s));
+        }
+        for s in 16..=20 {
+            burned.push_str(&row(s));
+        }
+        let mut dense = String::new();
+        for s in 1..=50 {
+            dense.push_str(&row(s));
+        }
+        std::fs::write(dir.join("journals/doorbell-journal-burned.jsonl"), &burned)
+            .expect("write burned");
+        std::fs::write(dir.join("journals/doorbell-journal-dense.jsonl"), &dense)
+            .expect("write dense");
+
+        let app = AppState {
+            started: std::time::Instant::now(),
+            fw_state: dir.clone(),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![
+                host_for_test("flywheel/burned"),
+                host_for_test("flywheel/dense"),
+            ])),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: std::time::Instant::now(),
+            })),
+        };
+        let body = health_body(&app);
+        assert!(
+            body.contains("\"holes_pct\":45.0"),
+            "the burn must be legible: {body}"
+        );
+        assert!(
+            body.contains("\"holes\":9"),
+            "the raw count rides beside it, so the percentage is checkable: {body}"
+        );
+        assert!(
+            body.contains("\"workspace\":\"burned\""),
+            "the workspace must be NAMED, not just counted: {body}"
+        );
+        assert!(
+            !body.contains("\"workspace\":\"dense\""),
+            "a dense workspace must not be listed at all — absent, not a row reading 0.0: {body}"
+        );
+        assert!(
+            body.contains("\"scanned\":2"),
+            "both hosted workspaces are scanned, so absence means clean, not unread: {body}"
+        );
+        // The pre-existing journal keys survive: this field is ADDITIVE and must
+        // not have displaced them via a duplicate key in one json!() object.
+        assert!(
+            body.contains("\"lag_lines\":0"),
+            "the existing journal keys must survive the merge: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The absent case on its own, because "fires on a healthy path" is the failure
+    /// this field could most easily have. Every hosted workspace dense must produce
+    /// `seq_holes: null` — not an empty array, and not a row reading 0.0.
+    #[test]
+    fn health_leaves_seq_holes_null_when_every_hosted_workspace_is_clean() {
+        use super::{AppState, CachedHealth, health_body};
+        let dir = std::env::temp_dir().join(format!("holes-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).expect("dirs");
+        let mut dense = String::new();
+        for s in 1..=20u64 {
+            dense.push_str(&format!(
+                "{{\"ts\":\"1970-01-01T00:00:00Z\",\"v\":2,\"seq\":{s}}}\n"
+            ));
+        }
+        std::fs::write(dir.join("journals/doorbell-journal-clean.jsonl"), &dense).expect("write");
+        let app = AppState {
+            started: std::time::Instant::now(),
+            fw_state: dir.clone(),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(vec![host_for_test(
+                "flywheel/clean",
+            )])),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: std::time::Instant::now(),
+            })),
+        };
+        let body = health_body(&app);
+        assert!(
+            body.contains("\"seq_holes\":null"),
+            "nothing burned must read as null, not [] and not 0.0: {body}"
+        );
+        assert!(
+            !body.contains("holes_pct"),
+            "and must not appear at all: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
