@@ -462,9 +462,23 @@ impl ModelRegistry {
             return Ok((h, slot.model.clone()));
         }
         if harness.is_empty() {
+            // bd-ziy9: this bail is DELIBERATELY still a bail, and the reason is
+            // worth stating because "add a default" was the obvious next suggestion
+            // and it is the wrong one.
+            //
+            // There is no default-harness concept anywhere in the codebase, and
+            // inventing one here would be a silent policy decision on the exact path
+            // that currently tells the truth: a profile naming a concrete model and
+            // no harness is genuinely unconfigured, and which harness it "should"
+            // land on is an operator choice, not a derivation. So the two real fixes
+            // are named instead — and the slot form is the one that matches the
+            // "dynamic with a default" shape, because a slot carries a harness AND a
+            // model together and both can then detour per harness.
             anyhow::bail!(
                 "profile has no harness and model {model:?} is not a slot alias \
-                 (@cheap/@standard/@premium)"
+                 (@cheap/@standard/@premium). Either name a harness on the profile, or \
+                 use a slot alias — `flywheel slot set <name> --harness <h> --model <id>` \
+                 — which carries both halves and can then resolve a default per harness."
             );
         }
         Ok((harness.to_string(), model.to_string()))
@@ -563,12 +577,128 @@ impl ModelRegistry {
                 return Ok((fb_h, fb, "registry_fallback"));
             }
         }
+        // bd-ziy9 step 6: the DYNAMIC DEFAULT, and the rung the profile ladder was
+        // missing. Every rung above names something DECLARED — the profile's pin,
+        // the slot's model, an authored `model_fallback[]`, a slot's
+        // `fallback_harness`, a registry `fallback`. None of them can answer
+        // "nothing was declared for THIS harness, so what runs here?", which is
+        // exactly the bare-harness profile's question: `harness: ""` means inherit
+        // the crew's harness, and `@cheap` names a tier, not a model.
+        //
+        // The bare path has answered that question since bd-88m4
+        // (`bare_model_launch_args` -> `coupled_default_model` -> the harness's
+        // implied slot), and it had exactly one caller while this function had
+        // none. That asymmetry is the whole bug: a bare spawn of the same intent
+        // routed, and a profile carrying that intent failed on 8 of 9 harnesses.
+        //
+        // Order is deliberate, and each rung is a rung the bare path also uses:
+        //   6a. the harness's IMPLIED slot, honoring `[defaults]` — but only when
+        //       its model can actually run here, because a slot's model is a
+        //       declaration about its OWN harness, not a licence anywhere.
+        //   6b. a coupled harness's own family model (grok/claude/codex).
+        //   6c. a portable registry pick.
+        //
+        // NOTHING HERE OPTIMISES COST, and that is a finding rather than an
+        // omission: every registered model reports `cost_in_per_mtok = 0.0`, so the
+        // registry holds NO cost data at all. A "cheapest routable model" ordering
+        // would invent a cost fact, which is the same class of error as inferring an
+        // empty dispatch's cause from one unrepresentative sample. So 6c prefers the
+        // tier's own provider FAMILY (preserving intent), then takes the
+        // lexicographically first portable id — `models` is a `BTreeMap`, so that is
+        // a stable order rather than a hash order, and the returned step name says
+        // which rung fired so the ledger records a pick nobody has to reverse-engineer.
+        if !h.is_empty() {
+            // The tier gate is checked ONCE, here, and it is what makes the rungs
+            // below safe: a Closed harness is documented as "Frontier CLI with its
+            // own model. Never asked for one" (harness_registry.rs:25). Handing
+            // codex or claude a `zai/*` id to turn a matrix green would delete that
+            // constraint rather than satisfy the requirement, so the whole dynamic
+            // block is unreachable for them — structurally, not by a check someone
+            // can forget in a later edit.
+            //
+            // `tier_of` is `None` for an unregistered name, and `None` is treated as
+            // NOT open. An unknown harness must never be handed a model on the
+            // strength of not being known to be closed.
+            let open = crate::harness_registry::tier_of(&h)
+                .is_some_and(crate::harness_registry::HarnessTier::may_be_asked_for_a_model);
+            if open {
+                // The harness's own implied slot, honoring `[defaults]`. `self.slots`
+                // is keyed by slot name, which is why the name comes from
+                // `implied_slot_name_for_harness` rather than off the `SlotSpec`.
+                let implied = implied_slot_name_for_harness(&h)
+                    .and_then(|name| self.slots.get(name).map(|s| (name, s)));
+                if let Some((name, slot)) = implied {
+                    let m = self
+                        .effective_slot_model(name)
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or_else(|| slot.model.clone());
+                    // A slot's model is a declaration about its OWN harness, not a
+                    // licence to run anywhere: pi's `@standard` model is portable, but
+                    // the general rule has to survive a slot that is not.
+                    if self.caps_permit(&m, &h) {
+                        return Ok((h, m, "implied_slot"));
+                    }
+                }
+                // 6b: a coupled harness's own family model. No `claude/`, `codex/` or
+                // `grok/` id is registered today, so this is None in practice — it is
+                // here so the day one is, the profile path picks it up rather than
+                // needing the same change made twice.
+                if let Some(m) = self.coupled_default_model(&h) {
+                    return Ok((h, m, "coupled_default"));
+                }
+                // 6c: last resort. A `harness: ""` profile is the caller that lands
+                // here with a real intent to preserve, so the TIER's own family
+                // leads — read off the slot the profile named, not off whatever
+                // model happened to fail, so `@cheap` still means "an opencode-family
+                // model if one can run here".
+                let want_family = slot_alias(model)
+                    .and_then(|name| self.slots.get(name))
+                    .map(|slot| self.family_of(&slot.model));
+                if let Some(pick) = self.portable_pick(&h, want_family.as_deref()) {
+                    return Ok((h, pick, "dynamic_default"));
+                }
+            }
+        }
         // Loud failure naming every rung tried (ADR D1: no silent hop).
         anyhow::bail!(
             "no routable model: primary {primary:?} cannot run on harness {h:?} \
              (caps), model_fallback {model_fallback:?} has no caps-compatible id, \
              slot fallback_harness unroutable, and registry fallback absent/incompatible"
         )
+    }
+
+    /// Can `id` run on `harness`? A missing entry is **false**, deliberately: the
+    /// dynamic-default rungs choose from registered models, and treating an unknown
+    /// id as routable would let the ladder hand a caller a name nothing can serve.
+    /// [`Self::resolve_profile_route_full`]'s *primary* check stays lenient for
+    /// ad-hoc operator strings, which is a different question and is resolved
+    /// strictly at spawn time.
+    fn caps_permit(&self, id: &str, harness: &str) -> bool {
+        self.models
+            .get(id)
+            .is_some_and(|e| e.caps.is_empty() || e.caps.iter().any(|c| c == harness))
+    }
+
+    /// The stable portable pick for step 6c: the first registered model this
+    /// harness can run, preferring `want_family` so a tier's provider intent
+    /// survives, then plain order.
+    ///
+    /// Deterministic because `self.models` is a `BTreeMap` — the order is
+    /// lexicographic on the id, not a hash order that could change the resolved
+    /// route between two runs of the same config. That matters: the spawn ledger
+    /// records the RESOLVED route, and a route that moves run-to-row makes the
+    /// ledger unreadable.
+    fn portable_pick(&self, harness: &str, want_family: Option<&str>) -> Option<String> {
+        let ok = |id: &str| self.caps_permit(id, harness);
+        if let Some(fam) = want_family
+            && let Some(id) = self
+                .models
+                .keys()
+                .find(|id| ok(id) && self.family_of(id) == fam)
+        {
+            return Some(id.clone());
+        }
+        self.models.keys().find(|id| ok(id)).cloned()
     }
 
     /// Slot model honoring `[defaults]` (bd-ll3k): the role-flag surface
@@ -771,9 +901,24 @@ impl ModelRegistry {
 /// reference these bare ids, so routing works zero-config and the registry
 /// stays the SINGLE place a provider prefix lives.
 ///
-/// `big-pickle` is capped to the `opencode` harness — it is free ONLY
-/// there; strict resolution refuses it elsewhere (no fallback by design,
-/// the scout profile pins the opencode harness).
+/// `big-pickle` is capped to the `opencode` harness — it is free ONLY there,
+/// and strict resolution refuses it elsewhere.
+///
+/// bd-ziy9 CORRECTED THE CLAUSE THAT USED TO BE HERE. This comment read "no
+/// fallback by design, the scout profile pins the opencode harness", and the
+/// second half was FALSE: the builtin scout profile is `harness: ""`, which
+/// means it inherits whatever harness the crew supplies. The whole "no fallback
+/// is by design" argument was therefore resting on a pin that did not exist, and
+/// the consequence was a profile that could not crew 8 of the 9 registered
+/// harnesses.
+///
+/// The cap itself was never the defect and is untouched — it encodes that the
+/// model is free on opencode and nowhere else, which is a cost fact. What was
+/// missing was not a fallback for `big-pickle` but a DEFAULT on the HARNESS
+/// side, so that a profile naming a tier rather than a model has something to
+/// resolve to on a harness where the tier's own model cannot run. That is
+/// `resolve_profile_route_full`'s dynamic-default rung, and a bare-harness spawn
+/// has had it since bd-88m4 while the profile path had no equivalent.
 pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
     let mut m = BTreeMap::new();
     m.insert(
@@ -1535,6 +1680,202 @@ mod tests {
         );
     }
 
+    /// bd-ziy9: the dynamic-default rung, and the three properties that make it
+    /// safe rather than merely convenient.
+    ///
+    /// 1. It RESOLVES a bare-harness profile on an OPEN-tier harness that the
+    ///    declared rungs cannot serve. Before the rung, `scout` failed on 5 of 9.
+    /// 2. It REFUSES a CLOSED-tier harness, because a frontier CLI is documented
+    ///    as "Never asked for one". This is the half a naive fix would delete.
+    /// 3. It is DETERMINISTIC, because the spawn ledger records the resolved route
+    ///    and a route that moves between runs makes the ledger unreadable.
+    #[test]
+    fn the_dynamic_default_resolves_open_tier_refuses_closed_tier_and_is_deterministic() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::load_routing().expect("routing");
+
+        // (1) A `harness: ""` profile naming a TIER, on an open-tier harness with no
+        // implied slot and no declared fallback. `pa` is exactly that cell.
+        let open = reg
+            .resolve_profile_route_full("pa", "@cheap", &[])
+            .expect("an open-tier harness must resolve via the dynamic default");
+        assert_eq!(
+            open.2, "dynamic_default",
+            "the rung must NAME itself so the ledger records which hop fired: {open:?}"
+        );
+        assert!(
+            reg.caps_permit(&open.1, "pa"),
+            "the pick must be a model that can actually run here, not a hopeful one: {open:?}"
+        );
+
+        // (2) A Closed-tier harness must NOT be handed a model. codex is the clean
+        // case: it is Closed and has no implied slot and no registered codex/
+        // family, so nothing may be substituted for it.
+        let refused = reg.resolve_profile_route_full("codex", "@cheap", &[]);
+        assert!(
+            refused.is_err(),
+            "a Closed-tier harness must never be given a foreign model, got {refused:?}"
+        );
+        // The refusal must NAME the reason, so it reads as a decision rather than a
+        // dead end — ADR D1's "no silent hop" applied to the refusal direction.
+        let msg = format!("{:#}", refused.expect_err("must fail"));
+        assert!(
+            msg.contains("codex") && msg.contains("no routable model"),
+            "the refusal must name the harness and the reason: {msg}"
+        );
+
+        // (3) Same input, same answer. `models` is a BTreeMap so the pick is
+        // lexicographic, not hash-ordered; if that ever changes this catches it.
+        let a = reg
+            .resolve_profile_route_full("jcode", "@cheap", &[])
+            .expect("route");
+        let b = reg
+            .resolve_profile_route_full("jcode", "@cheap", &[])
+            .expect("route");
+        assert_eq!(a, b, "the dynamic default must be stable across calls");
+
+        // (4) THE ONE THAT DECIDES WHETHER ANY OF THIS IS REAL. The spawn path does
+        // not stop at the ladder: `resolve_profile_launch_plan` (main.rs:3931) feeds
+        // the ladder's model straight into `resolve_strict`, which REQUIRES a
+        // registry entry and refuses a caps-excluded harness. A dynamic pick that
+        // does not survive strict resolution is a green matrix over a spawn that
+        // still fails, so the two must be checked in the same breath.
+        for (harness, model) in [
+            ("pa", &open.1),
+            ("jcode", &a.1),
+            (
+                "fx",
+                &reg.resolve_profile_route_full("fx", "@cheap", &[])
+                    .expect("fx routes")
+                    .1,
+            ),
+        ] {
+            let flag = reg.resolve_strict(model, harness).unwrap_or_else(|e| {
+                panic!(
+                    "the dynamic pick {model:?} must survive strict resolution on {harness}: {e}"
+                )
+            });
+            assert!(
+                !flag.is_empty(),
+                "strict resolution of a real pick must yield a flag, not an empty string"
+            );
+        }
+        // (5) THE WHOLE CHAIN, ending in launch ARGS rather than a model id. Rungs
+        // 6a-6c are proven in the registry above, but the operator's question is "can
+        // this profile crew a pa crew", and that is decided by
+        // `profile_launch_plan` -> `resolve_strict` -> argv. Testing the registry
+        // alone leaves the last mile unproven, and an unproven last mile is how a
+        // green matrix hides a spawn that still fails.
+        for h in ["opencode", "pi", "omp", "pa", "jcode", "fx"] {
+            let plan = crate::profile_launch_plan(
+                h,
+                &crate::profile::Profile {
+                    harness: String::new(),
+                    model: "@cheap".into(),
+                    effort: "low".into(),
+                    provider: String::new(),
+                    model_fallback: Vec::new(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_or_else(|e| panic!("the scout profile must build a launch plan on {h}: {e}"));
+            assert!(
+                !plan.model.is_empty(),
+                "{h}: a plan with no model would launch model-less, which is not what the \
+                 dynamic default decided"
+            );
+        }
+    }
+
+    /// bd-ttaa: the harness-side gap is a DECISION, pinned so it cannot be changed
+    /// by accident and so nobody re-derives it as an oversight.
+    ///
+    /// A profile naming a CONCRETE model and NO harness still fails. There is no
+    /// default harness, deliberately: choosing one would silently decide where every
+    /// harness-less profile runs, which is an operator's choice rather than a
+    /// derivation. The profile path a SLOT does not hit this — it resolves on every
+    /// Open-tier harness via the dynamic default.
+    ///
+    /// The bail had NO test at all before this, so the state was reachable and
+    /// unpinned; a future "just add a default" edit would have looked like a bug fix
+    /// with nothing to contradict it.
+    #[test]
+    fn a_concrete_model_with_no_harness_fails_loudly_and_names_both_fixes() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::load_routing().expect("routing");
+        let err = reg
+            .resolve_profile_route_full("", "opencode-go/muse-spark-1.3-contributor", &[])
+            .expect_err("a concrete model with no harness has nowhere to run");
+        let msg = format!("{err:#}");
+        // The message must name BOTH real fixes, or an operator hits a wall.
+        assert!(
+            msg.contains("slot alias") && msg.contains("flywheel slot set"),
+            "the bail must name the slot form as the fix, not just refuse: {msg}"
+        );
+        // And it must stay a REFUSAL, naming the reason.
+        assert!(
+            msg.contains("no harness"),
+            "the refusal must name the actual reason: {msg}"
+        );
+        // The contrast that makes this a decision rather than a bug: the same
+        // profile shape with a SLOT resolves fine, on every Open-tier harness.
+        for h in ["pa", "jcode", "fx"] {
+            assert!(
+                reg.resolve_profile_route_full(h, "@cheap", &[]).is_ok(),
+                "{h}: a slot-naming profile must resolve where a concrete-model one cannot"
+            );
+        }
+    }
+
+    /// The rung must never COST the operator a choice by silently preferring a
+    /// family the tier never asked for. `@cheap`'s intent is the `opencode`
+    /// family, so when an `opencode/`-family model can run on the harness it must
+    /// win over the alphabetically-first portable id.
+    #[test]
+    fn the_dynamic_default_preserves_the_tiers_own_provider_family() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::load_routing().expect("routing");
+        let (_, model, step) = reg
+            .resolve_profile_route_full("pa", "@cheap", &[])
+            .expect("route");
+        assert_eq!(step, "dynamic_default");
+        let wanted = reg
+            .slots
+            .get("cheap")
+            .map(|s| reg.family_of(&s.model))
+            .expect("the cheap slot is compiled in");
+        // If any registered model of that family is portable, the pick MUST be one
+        // of them. Asserted conditionally so the test states the rule rather than
+        // the current registry contents.
+        let family_available = reg
+            .models
+            .keys()
+            .any(|id| reg.caps_permit(id, "pa") && reg.family_of(id) == wanted);
+        if family_available {
+            assert_eq!(
+                reg.family_of(&model),
+                wanted,
+                "a portable model of the tier's own family exists, so the pick must be it"
+            );
+        }
+    }
+
+    /// The `caps_permit` helper treats a MISSING registry entry as NOT routable,
+    /// while the primary rung's own check stays lenient for ad-hoc operator
+    /// strings. Those are different questions and the difference is load-bearing:
+    /// the dynamic rung chooses from the registry, so an unknown id must not be a
+    /// candidate for it.
+    #[test]
+    fn an_unregistered_id_is_not_a_dynamic_default_candidate() {
+        let _g = with_config_dir();
+        let reg = ModelRegistry::load_routing().expect("routing");
+        assert!(
+            !reg.caps_permit("provider/model-that-was-never-registered", "pa"),
+            "an unknown id must not be offered as routable by the default rungs"
+        );
+    }
+
     #[test]
     fn full_ladder_caps_block_detours_to_model_fallback_then_slot_harness() {
         let _g = with_config_dir();
@@ -1557,13 +1898,49 @@ mod tests {
         );
         assert_eq!(h, "opencode");
 
-        // Step 4: empty model_fallback → premium's fallback_harness=grok…
-        // but cheap's slot has NO fallback_harness; big-pickle is
-        // caps-blocked and the registry has no other opencode-capped model
-        // nor a fallback → loud failure naming the rungs (no silent hop).
-        let err = reg
+        // Step 6: empty model_fallback, the primary caps-blocked, and cheap's slot
+        // has no fallback_harness. bd-ziy9 CHANGED THIS ASSERTION and the reason
+        // matters, so it is recorded rather than quietly rewritten.
+        //
+        // It used to expect a LOUD FAILURE, on the stated premise that "the registry
+        // has no other opencode-capped model nor a fallback". That premise is no
+        // longer true: `opencode-go/deepseek-v4-flash` is registered, portable, and
+        // in the tier's own family, so the dynamic-default rung resolves this cell.
+        //
+        // What did NOT change is ADR D1's "no silent hop". The hop is REPORTED —
+        // the step comes back as `dynamic_default`, so the ledger records which rung
+        // fired instead of a reader having to infer a substitution. A named hop and
+        // a silent one are different things, and this is the first.
+        let (h, m, route) = reg
             .resolve_profile_route_full("", "@cheap", &[])
-            .expect_err("loud failure");
+            .expect("the dynamic default resolves this cell");
+        assert_eq!(
+            route, "dynamic_default",
+            "the default rung must NAME itself, or it is the silent hop ADR D1 forbids"
+        );
+        assert_eq!(h, "opencode", "the harness the slot declares is kept");
+        assert!(
+            reg.caps_permit(&m, "opencode"),
+            "the substituted model must actually run here, not merely exist: {m}"
+        );
+        assert_ne!(
+            m, "big-pickle",
+            "the primary is caps-blocked to omp, so it must not be the pick"
+        );
+
+        // The loud-failure path is still REQUIRED, and pinning it needs a registry
+        // where the default genuinely cannot help. Without this the dynamic rung
+        // would make the failure path unreachable, which is how a real operator
+        // error (a misconfigured model nobody is told about) turns silent.
+        let mut barren = ModelRegistry::load_routing().expect("routing");
+        for e in barren.models.values_mut() {
+            // An empty `caps` reads as "portable", so every entry must name an
+            // explicit allow-list that excludes opencode.
+            e.caps = vec!["some-other-harness".into()];
+        }
+        let err = barren
+            .resolve_profile_route_full("", "@cheap", &[])
+            .expect_err("with no routable model anywhere, the ladder must still fail loud");
         assert!(
             err.to_string().contains("no routable model"),
             "names the failure: {err}"

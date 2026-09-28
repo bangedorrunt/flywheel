@@ -79,6 +79,25 @@ Compiled-in fleet: cheap=opencode/big-pickle, standard=pi/muse-spark-1.3
 model, model-opaque, no `grok/*` key needed). Bare `[models.<id>]` keys
 fail loudly; `flywheel model add <id> --provider <p>` is the fix.
 
+**A slot names a model, not a promise about every harness.** `big-pickle` is
+capped to `opencode` because it is free only there, so a profile naming
+`@cheap` has nothing routable on a `pa` crew from that slot alone. When every
+declared rung misses, resolution falls back to a **default**: the harness's own
+implied slot, then a coupled harness's own family model, then a portable
+registry pick that prefers the tier's own provider. The hop is *named* in
+`profile show --json` (`implied_slot`, `coupled_default`, `dynamic_default`) so
+the spawn ledger records which rung fired rather than leaving a substitution to
+infer.
+
+This applies to **Open-tier** harnesses only. `grok`, `codex` and `claude` are
+frontier CLIs that run their own models and are never handed one, so a profile
+naming a tier still fails on them — loudly, and by design. If you want a role
+to crew one of those, the profile must name that harness.
+
+A profile with a **concrete** model and no harness still fails: there is no
+default harness, because picking one would silently decide where every
+harness-less profile runs. Use a slot, or name the harness.
+
 ### `~/.config/flywheel/profiles.toml` — role overlay
 
 ```toml
