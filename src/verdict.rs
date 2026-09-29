@@ -530,6 +530,30 @@ fn commit_is_bookkeeping_only(cwd: &Path, sha: &str) -> anyhow::Result<bool> {
 /// Fail-closed: when EVERY candidate is bookkeeping-only, the newest one is
 /// still returned — the id is attributable and "no commit carries the id"
 /// would be a lie that reopens a legal close.
+/// bd-pi4p: binding rank over parsed `(sha, subject-carries-id,
+/// subject-carries-bracketed-id)` rows. Pure so both occurrence shapes are
+/// unit-testable without git. Tiers, newest-first inside each: bracketed
+/// subject citation, bare subject mention, body-only fallback.
+fn rank_binding<'a>(parsed: &'a [(String, bool, bool)], candidates: &[&'a str]) -> Vec<&'a str> {
+    let cited: Vec<&str> = parsed
+        .iter()
+        .filter(|(sha, _, bracket)| *bracket && candidates.contains(&sha.as_str()))
+        .map(|(sha, _, _)| sha.as_str())
+        .collect();
+    if !cited.is_empty() {
+        return cited;
+    }
+    let mentioned: Vec<&str> = parsed
+        .iter()
+        .filter(|(sha, subject, _)| *subject && candidates.contains(&sha.as_str()))
+        .map(|(sha, _, _)| sha.as_str())
+        .collect();
+    if !mentioned.is_empty() {
+        return mentioned;
+    }
+    candidates.to_vec()
+}
+
 pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     // The subject rides along so the ranking is decided from ONE git call.
     let out = StdCommand::new("git")
@@ -549,13 +573,20 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
         );
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let parsed: Vec<(String, bool)> = stdout
+    let parsed: Vec<(String, bool, bool)> = stdout
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(|l| match l.split_once('\u{1f}') {
-            Some((sha, subject)) => (sha.to_string(), subject.contains(bead_id)),
-            None => (l.to_string(), false),
+            Some((sha, subject)) => (
+                sha.to_string(),
+                subject.contains(bead_id),
+                // bd-pi4p: structural citation `[bd-xxxx]` outranks a bare
+                // prose mention, so a later sentence can no longer steal the
+                // binding from the commit that cites it.
+                subject.contains(&format!("[{bead_id}]")),
+            ),
+            None => (l.to_string(), false, false),
         })
         .collect();
     if parsed.is_empty() {
@@ -571,7 +602,7 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     // commit that proves nothing. Refuse instead of certifying.
     let candidates: Vec<&str> = parsed
         .iter()
-        .map(|(sha, _)| sha.as_str())
+        .map(|(sha, _, _)| sha.as_str())
         .filter(|sha| !commit_changes_nothing(cwd, sha).unwrap_or(false))
         .collect();
     if candidates.is_empty() {
@@ -580,19 +611,12 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
              so none of them can prove it — close against the commit that carries the work"
         );
     }
-    // Ranked: subject-carrying non-empty commits first, in git's newest-first
-    // order; the full non-empty set only when no commit carries the id in its
-    // subject (a pre-marker shape, still attributable).
-    let ranked: Vec<&str> = parsed
-        .iter()
-        .filter(|(sha, subject)| *subject && candidates.contains(&sha.as_str()))
-        .map(|(sha, _)| sha.as_str())
-        .collect();
-    let ranked = if ranked.is_empty() {
-        candidates
-    } else {
-        ranked
-    };
+    // Ranked (bd-pi4p tiers): bracketed-subject citations first, bare
+    // subject mentions next, body-only fallback last — newest-first inside
+    // each tier. Every close this crew ships cites `[bd-xxxx]` in the
+    // subject, so tier 1 resolves exactly as before; only prose thieves
+    // move down.
+    let ranked: Vec<&str> = rank_binding(&parsed, &candidates);
     for sha in &ranked {
         if !commit_is_bookkeeping_only(cwd, sha)? {
             return Ok((*sha).to_string());
@@ -743,6 +767,50 @@ pub(crate) fn note_binding(note: &str) -> NoteBinding {
         Some((k, _)) if *k != "sha" => NoteBinding::NoLeadingBinding,
         Some((_, v)) if !is_full_sha(v) => NoteBinding::MalformedSha((*v).to_string()),
         Some((_, v)) => NoteBinding::Bound((*v).to_string()),
+    }
+}
+
+#[cfg(test)]
+mod binding_rank_tests {
+    use super::*;
+
+    fn row(sha: &str, subject: bool, bracket: bool) -> (String, bool, bool) {
+        (sha.to_string(), subject, bracket)
+    }
+
+    /// bd-pi4p occurrence 1: thief mentions the id in body prose (newest),
+    /// real commit cites it bracketed in the subject. Citation wins.
+    #[test]
+    fn bracketed_subject_beats_newer_body_prose() {
+        let parsed = vec![row("thief", false, false), row("real", true, true)];
+        let cands = vec!["thief", "real"];
+        assert_eq!(rank_binding(&parsed, &cands), vec!["real"]);
+    }
+
+    /// bd-pi4p hardening: thief carries a BARE id in its subject
+    /// ("follow-up to bd-1"), real commit cites bracketed. Citation wins.
+    #[test]
+    fn bracketed_subject_beats_bare_subject_mention() {
+        let parsed = vec![row("thief", true, false), row("real", true, true)];
+        let cands = vec!["thief", "real"];
+        assert_eq!(rank_binding(&parsed, &cands), vec!["real"]);
+    }
+
+    /// Pre-marker shape preserved: no brackets anywhere, bare subject
+    /// mention still outranks body-only.
+    #[test]
+    fn bare_subject_still_beats_body_without_brackets() {
+        let parsed = vec![row("thief", false, false), row("real", true, false)];
+        let cands = vec!["thief", "real"];
+        assert_eq!(rank_binding(&parsed, &cands), vec!["real"]);
+    }
+
+    /// All body-only: newest-first fallback, unchanged.
+    #[test]
+    fn body_only_falls_back_to_newest_first() {
+        let parsed = vec![row("new", false, false), row("old", false, false)];
+        let cands = vec!["new", "old"];
+        assert_eq!(rank_binding(&parsed, &cands), vec!["new", "old"]);
     }
 }
 
