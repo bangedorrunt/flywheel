@@ -257,9 +257,17 @@ impl Stage {
 /// Combine child reports under one rule. All policy for a composed stage is here,
 /// in Rust, where it is testable without a model.
 fn combine(rule: Rule, reports: &[StageReport]) -> (Signal, String) {
+    // bd-utzj: carry each leaf's detail when it has one — id=signal pairs
+    // alone discard a Jev leaf verdict the moment combine() runs.
     let detail = reports
         .iter()
-        .map(|r| format!("{}={:?}", r.id, r.signal))
+        .map(|r| {
+            if r.detail.is_empty() {
+                format!("{}={:?}", r.id, r.signal)
+            } else {
+                format!("{}={:?}({})", r.id, r.signal, r.detail)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let holds = reports.iter().filter(|r| r.signal == Signal::Holds).count();
@@ -331,6 +339,23 @@ pub fn verdict_of(reports: &[StageReport], placement: Placement) -> Verdict {
 mod tests {
     use super::*;
     use crate::judgment::JevError;
+
+    /// bd-utzj: a composed report must carry its leaves' detail, not just
+    /// their id=signal pairs — otherwise a Jev leaf verdict is unreachable.
+    #[test]
+    fn combine_keeps_leaf_detail() {
+        let leaf = StageReport {
+            id: "wedged",
+            placement: Placement::Preflight,
+            signal: Signal::Holds,
+            detail: "wedged=0.95 working=0.05".to_string(),
+        };
+        let (_, detail) = combine(Rule::All, &[leaf]);
+        assert!(
+            detail.contains("wedged=0.95"),
+            "composed detail must carry the leaf verdict, got: {detail}"
+        );
+    }
 
     fn ctx<'a>(objective: &'a str, menu: &'a mut HarnessMenu) -> StageCtx<'a> {
         StageCtx { objective, menu }
