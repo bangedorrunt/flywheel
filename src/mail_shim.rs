@@ -3222,6 +3222,107 @@ mod tests {
         assert!(missing.as_array().unwrap().is_empty());
     }
 
+    /// bd-7hdb: `fetch_inbox` orders ASC by rumor time and then applies
+    /// `limit` as a `.take(n)` over that ascending list, so a limit keeps the
+    /// OLDEST n rows. An un-scoped read of a long inbox therefore never shows a
+    /// brand-new message, and `mail watch` / `collab` would poll a thread whose
+    /// reply had already arrived and time out on it forever.
+    ///
+    /// Scoping the read to the thread fixes it, because the thread filter is
+    /// applied BEFORE the limit takes effect. This test pins both halves: the
+    /// trap (un-scoped, the newest row is dropped) and the way out (scoped, the
+    /// newest row of the thread survives). The un-scoped half is a
+    /// characterization, not an endorsement — if a future store change makes
+    /// the limit a newest-N window, this goes red and the scoping can be
+    /// revisited on the evidence rather than left behind as cargo cult.
+    #[test]
+    fn a_thread_scoped_read_survives_a_limit_smaller_than_the_inbox() {
+        // Reads the shared mail root — serialize under the crate-wide env lock;
+        // sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
+        // Unique per run: a pid-only slug re-runs accumulate into the same
+        // project and the exact-count assertions below would drift.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = format!("thread-limit-{}-{stamp}", std::process::id());
+        mail.ensure_project(&project).expect("project");
+        mail.register_agent(&project, "LimitSender", "opencode", "test", "seed")
+            .expect("sender registered");
+        mail.register_agent(&project, "LimitRecv", "opencode", "test", "seed")
+            .expect("recipient registered");
+        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+            .expect("facade identity registered");
+        let recv = vec!["LimitRecv".to_string()];
+
+        // Four older rows in one thread, then the two newest in the thread the
+        // watcher actually cares about. Distinct subjects: `collapse_duplicates`
+        // folds identical (sender, subject, body) rows.
+        for (subject, thread) in [
+            ("old-a", "busy-thread"),
+            ("old-b", "busy-thread"),
+            ("old-c", "busy-thread"),
+            ("old-d", "busy-thread"),
+            ("reply-a", "target-thread"),
+            ("reply-b", "target-thread"),
+        ] {
+            mail.send(&project, &recv, subject, "body", "normal", false, Some(thread))
+                .expect("send");
+        }
+
+        // The trap: limit 2 over a 6-row inbox keeps the OLDEST two.
+        let unscoped = mail
+            .inbox_filtered(
+                &project,
+                "LimitRecv",
+                &MailInboxFilter {
+                    include_bodies: false,
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .expect("unscoped inbox");
+        let unscoped_subjects: Vec<&str> = unscoped
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["subject"].as_str())
+            .collect();
+        assert!(
+            !unscoped_subjects.contains(&"reply-b"),
+            "characterization: an un-scoped read drops the newest row, so a \
+             collab watch on a busy inbox can never see its reply: {unscoped_subjects:?}"
+        );
+
+        // The way out: the same limit, scoped to the thread, keeps the newest.
+        let scoped = mail
+            .inbox_filtered(
+                &project,
+                "LimitRecv",
+                &MailInboxFilter {
+                    include_bodies: false,
+                    limit: 2,
+                    thread_id: Some("target-thread".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("thread-scoped inbox");
+        let scoped_subjects: Vec<&str> = scoped
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["subject"].as_str())
+            .collect();
+        assert_eq!(
+            scoped_subjects,
+            vec!["reply-a", "reply-b"],
+            "a thread-scoped read survives a limit smaller than the inbox: \
+             {scoped_subjects:?}"
+        );
+    }
+
     /// c3b.3: `ack_overdue_only` has no toron projection (rows carry no
     /// ack_ts) — the request fails with an honest error naming the filter,
     /// never a silent unfiltered inbox.
