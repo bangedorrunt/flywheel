@@ -403,7 +403,7 @@ mod tests {
     /// The diversity rule must not invent an option or duplicate one.
     #[test]
     fn diversity_never_duplicates_or_invents_an_option() {
-        let c = catalog(&[("a", "opencode"), ("b", "pi"), ("c", "omp")]);
+        let c = catalog(&[("a", "opencode"), ("b", "pi"), ("c", "grok")]);
         for crew in 1..=9 {
             let m = harness_menu(&c, crew);
             let mut seen = BTreeSet::new();
