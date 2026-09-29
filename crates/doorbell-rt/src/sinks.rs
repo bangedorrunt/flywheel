@@ -242,7 +242,7 @@ impl SinkManager {
         let mut inner = st.inner.lock().await;
         let n = inner.shed_overflow.len();
         if n > 0 {
-            let overflow: Vec<Intent> = inner.shed_overflow.drain(..).collect();
+            let overflow: Vec<Intent> = std::mem::take(&mut inner.shed_overflow);
             inner.queue.extend(overflow);
             inner.notify.notify_one();
         }
