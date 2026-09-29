@@ -507,7 +507,7 @@ mod tests {
 
     /// The trap, with a real judged path so the leaf detail is actually produced.
     #[test]
-    fn the_composed_detail_does_not_carry_the_verdict_so_the_leaf_must_be_run() {
+    fn the_composed_detail_carries_the_verdict_so_the_leaf_stays_put() {
         let mut m = menu();
         let body = r#"{"health":{"watch":{"restarts":0},"wake":{"class":"Live"}}}"#;
         let mut ctx = StageCtx {
@@ -522,36 +522,12 @@ mod tests {
                 working: 0.05,
             },
         );
+        // bd-utzj: the composed stage carries the leaf verdict now, so no
+        // leaf re-run — the caller reads report.detail straight.
         assert!(
-            !composed.detail.contains("wedged="),
-            "if this ever starts carrying the verdict, the caller can be simplified to \
-             run the composed stage: {}",
+            composed.detail.contains("wedged=0.95") && composed.detail.contains("working=0.05"),
+            "the verdict lives in the composed detail: {}",
             composed.detail
-        );
-        // And the leaf DOES carry it — the thing the caller is reaching for.
-        let Stage::Compose { stages, .. } = &st else {
-            panic!("compose")
-        };
-        let jev = stages
-            .iter()
-            .find(|s| matches!(s, Stage::Jev { id, .. } if *id == "stuck-vs-busy:noul"))
-            .expect("jev leaf");
-        let leaf = jev.run(
-            &mut ctx,
-            &Canned {
-                wedged: 0.95,
-                working: 0.05,
-            },
-        );
-        assert!(
-            leaf.detail.contains("wedged=0.95") && leaf.detail.contains("working=0.05"),
-            "the leaf detail is where the verdict lives: {}",
-            leaf.detail
-        );
-        assert!(
-            leaf.detail.starts_with("wedged:"),
-            "and it is PREFIXED with the verdict, which is what the verb splits on: {}",
-            leaf.detail
         );
     }
 
