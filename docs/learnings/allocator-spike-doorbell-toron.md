@@ -36,3 +36,16 @@ hottest alloc shape on journal + mailbox paths), 100k rounds = 6.4M allocs,
 Profiling shows allocator cost above 5% of tick time on a real workload, or
 the API stabilizes with full collection support AND a measured hot path
 demands it. Re-run the /tmp probe shape against that path first.
+
+## Amendment 2026-09-29 (nightly 1.101, bd-ar9y)
+
+Readiness moved: custom `Allocator` impls plus `Box::new_in` /
+`Vec::with_capacity_in` now compile with NO feature gate (probed on
+1.101.0-nightly 2026-09-28; the earlier probe needed
+`#![feature(allocator_api)]`). `HashMap::new_in` is still gated behind
+`allocator_ext` (issue #163177).
+
+Decision reaffirmed: our hottest maps (presence, registries, index pins) are
+exactly the still-gated collections, and the 5ns/alloc ceiling stands
+independent of gating. The revisit bar above is unchanged — full collection
+support plus a measured hot path.
