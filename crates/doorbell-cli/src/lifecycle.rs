@@ -2457,13 +2457,29 @@ mod tests {
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(20));
                     }
-                    Err(_) => break,
+                    // bd-fdg5: transient accept errors (EMFILE under fd
+                    // pressure, Interrupted) must not kill the fake server —
+                    // that turned suite parallelism into a permanent outage
+                    // the client could never recover from. The 10s deadline
+                    // above still bounds the loop.
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
                 }
             }
         });
         let cfg = test_cfg(&dir, port);
+        // bd-fdg5: the server thread has no readiness sync; under full-suite
+        // load its first accept can land after the client's windows. Bounded
+        // retry (not sleep-and-hope): same assertion, repeated to a deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut got = None;
+        while got.is_none() && std::time::Instant::now() < deadline {
+            got = stop_target(&cfg);
+            if got.is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         assert_eq!(
-            stop_target(&cfg),
+            got,
             Some(decoy.id()),
             "pidfile-less stop must take the protocol-attested owner"
         );
