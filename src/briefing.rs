@@ -79,6 +79,11 @@ pub struct Briefing {
     /// missing menu must never be a reason a captain cannot see the plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_menu: Option<crate::crew_menu::HarnessMenu>,
+    /// bd-xaw8: installed-binary staleness. None = unmeasured (renders
+    /// absent, never a false claim); Some(true) also warns on stderr via
+    /// apply_staleness. Additive and optional like the menu above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_build: Option<bool>,
     /// bd-drlm: what the Jev pass actually did to the menu above, in one
     /// operator-readable line. Additive and optional for the same reason the menu
     /// is.
@@ -205,6 +210,25 @@ fn has_diagnose_then_fix(objective: &str) -> bool {
 }
 
 /// Assemble a briefing. `unique_roles` is the packed-from inventory (may be empty).
+impl Briefing {
+    /// Compute installed-binary staleness, set the field, warn loudly when
+    /// stale. IO lives here (caller side) so assemble stays pure.
+    pub fn apply_staleness(&mut self) {
+        match crate::stale_check::freshness() {
+            crate::stale_check::Freshness::Stale => {
+                self.stale_build = Some(true);
+                eprintln!(
+                    "flywheel: installed binary predates its sources — rebuild and reinstall; briefing fields may be missing"
+                );
+            }
+            crate::stale_check::Freshness::Fresh => {
+                self.stale_build = Some(false);
+            }
+            crate::stale_check::Freshness::Unknown => {}
+        }
+    }
+}
+
 pub fn assemble(
     objective: &str,
     world: &World,
@@ -354,6 +378,7 @@ pub fn assemble(
         },
         alternatives,
         harness_menu,
+        stale_build: None,
         // bd-drlm: `assemble` is PURE and stays that way — no network, no clock.
         // The Jev pass runs in the CALLER (cmd_briefing) and writes this line, so
         // the ranking cannot leak into the pure core that derives the menu.

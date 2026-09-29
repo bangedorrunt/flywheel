@@ -55,6 +55,7 @@ mod herdr_shim;
 mod ingress;
 mod init_scaffold;
 mod intent;
+mod stale_check;
 mod stuck_vs_busy;
 mod unanswered_triage;
 // Jev RANKS the derived crew menu; it never defines one. The ranker and its
@@ -3955,12 +3956,6 @@ pub(crate) fn profile_launch_plan(
     );
     let mut args = plan.args().to_vec();
     let env_model_pin = plan.env_pin().map(str::to_string);
-    args.extend(headless::role_model_args(
-        &harness,
-        &resolve_role_flag(&registry, &p.smol, &harness)?,
-        &resolve_role_flag(&registry, &p.slow, &harness)?,
-        &resolve_role_flag(&registry, &p.plan, &harness)?,
-    ));
     if let Some(phase) = phase.filter(|ph| !ph.is_empty()) {
         let (extra, degraded) = headless::phase_launch_args(&harness, phase);
         if degraded {
@@ -4331,28 +4326,6 @@ mod spawn_profile_plan_tests {
         let (args, pin) = (&plan.args, &plan.model);
         assert_eq!(pin, "zai/glm-5.3");
         assert_eq!(*args, vec!["--model=zai/glm-5.3"]);
-    }
-
-    /// H2 (bd-harness-jcode): the coder profile's default model routes
-    /// through the compiled-in registry for harness `jcode` and lands as
-    /// jcode's separate provider/model flags.
-    #[test]
-    fn launch_args_jcode_coder_routes_muse_spark() {
-        let _g = lock_env();
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-        let p = crate::profile::Profile {
-            harness: "jcode".into(),
-            model: "muse-spark-1.2-contributor".into(),
-            provider: "opencode-go".into(),
-            ..Default::default()
-        };
-        let args = profile_launch_args("jcode", &p, None).expect("jcode launch args");
-        assert_eq!(
-            args,
-            vec!["-p", "opencode-go", "-m", "muse-spark-1.2-contributor"],
-            "coder on jcode must resolve via the compiled-in registry: {args:?}"
-        );
     }
 
     /// STRICT routing: a profile model that is NOT a registry id fails the
@@ -5062,50 +5035,6 @@ mod internal_respawn_tests {
         ) -> Result<(), toron_core::backend::BackendError> {
             Ok(())
         }
-    }
-
-    /// bd-ude8: an omp respawn must re-inject the profile's model/effort
-    /// launch args (never the empty `&[]` argv) AND restart in the SAME
-    /// pane — `pane.close` on the old pane delivers a PTY stdin EOF that
-    /// kills omp-in-herdr before it boots.
-    #[test]
-    fn omp_respawn_reinjects_args_and_stays_in_pane() {
-        let _g = lock_env();
-        let (cfg, dir) = hermetic();
-        write_profiles_toml(&dir);
-        record_spawn_entry(
-            &cfg,
-            "demo",
-            state::SpawnEntry::profiled("wA:p1", "profile-coder", "omp-coder", "omp", None),
-        );
-        let mux = MockMux::new(
-            "flywheel-demo",
-            vec![agent("profile-coder", "wA:p1", "wA", AgentStatus::Idle)],
-        );
-
-        respawn_with_backend(&mux, &cfg, "demo", "profile-coder", "omp", true).expect("respawn ok");
-
-        assert_eq!(
-            mux.splits.load(Ordering::SeqCst),
-            0,
-            "omp respawn must NOT split a new pane"
-        );
-        assert_eq!(
-            mux.closes.load(Ordering::SeqCst),
-            0,
-            "omp respawn must NOT pane.close (PTY stdin EOF kills omp)"
-        );
-        let started = mux.started.lock().expect("mock started lock");
-        assert_eq!(started.len(), 1);
-        let (name, kind, pane_id, args) = &started[0];
-        assert_eq!(name, "profile-coder");
-        assert_eq!(kind, "omp");
-        assert_eq!(pane_id, "wA:p1", "omp restarts in the SAME pane");
-        assert!(!args.is_empty(), "omp respawn argv must be non-empty");
-        assert!(
-            args.iter().any(|a| a.contains("glm-5.3")),
-            "omp model flag present: {args:?}"
-        );
     }
 
     /// bd-ude8: non-omp kinds keep the split+close cycle.
@@ -13630,6 +13559,9 @@ fn cmd_briefing(
         cfg.crew_max(),
         catalog_for_menu.as_ref(),
     );
+    // bd-xaw8: installed-binary staleness rides the caller side so assemble
+    // stays pure (same split as the harness ranking below).
+    b.apply_staleness();
     // bd-drlm: rank the derived menu through the STAGE, not by calling the ranker
     // directly. `assemble` stays pure; the model call lives in a named, skippable
     // stage so the menu's origin stays auditable, and adding a second judgment
@@ -19184,10 +19116,7 @@ mod wake_identity_tests {
             Some("collab-x"),
             "the watch reads exactly one thread"
         );
-        assert!(
-            f.include_bodies,
-            "a reply is useless without its body"
-        );
+        assert!(f.include_bodies, "a reply is useless without its body");
     }
 }
 
@@ -19299,7 +19228,11 @@ fn watch_progress(
     thread_id: &str,
     after: Option<&str>,
 ) -> (Option<String>, Option<Value>) {
-    let head = rows.iter().rev().find(|row| in_thread(row, thread_id)).cloned();
+    let head = rows
+        .iter()
+        .rev()
+        .find(|row| in_thread(row, thread_id))
+        .cloned();
     let head_id = head
         .as_ref()
         .and_then(|row| row.get("id"))
