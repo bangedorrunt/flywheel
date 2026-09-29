@@ -525,13 +525,23 @@ mod tests {
     #[test]
     fn open_fd_count_moves_with_real_opens() {
         let before = super::open_fd_count().expect("census must read here");
-        let held: Vec<std::fs::File> = (0..3)
+        // Hold 8 with margin: parallel tests churn fds, so one measurement
+        // can catch a net concurrent close (measured live: 45 -> 47 with 3
+        // held). Retry bounded; closes are transient.
+        let held: Vec<std::fs::File> = (0..8)
             .map(|_| std::fs::File::open("/dev/null").unwrap())
             .collect();
-        let after = super::open_fd_count().expect("census must still read");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let after = loop {
+            let n = super::open_fd_count().expect("census must still read");
+            if n >= before + 3 || std::time::Instant::now() >= deadline {
+                break n;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(
             after >= before + 3,
-            "three held opens must show: {before} -> {after}"
+            "held opens must show: {before} -> {after}"
         );
         drop(held);
     }
