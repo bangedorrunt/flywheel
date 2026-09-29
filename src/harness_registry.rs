@@ -84,29 +84,6 @@ pub const REGISTRY: &[HarnessSpec] = &[
         implied_slot: Some(SLOT_STANDARD),
     },
     HarnessSpec {
-        // bd-88m4: omp IS the premium harness (ADR-0007: premium =
-        // omp/zai/glm-5.3) — a bare omp spawn rides the premium slot
-        // instead of launching model-less.
-        canonical: "omp",
-        aliases: &[],
-        tier: HarnessTier::Open,
-        implied_slot: Some(SLOT_PREMIUM),
-    },
-    HarnessSpec {
-        // prime-agent ships a BUILT-IN herdr socket integration and reports
-        // pane.report_agent, which herdr accepts as hook authority.
-        canonical: "pa",
-        aliases: &[],
-        tier: HarnessTier::Open,
-        implied_slot: None,
-    },
-    HarnessSpec {
-        canonical: "jcode",
-        aliases: &[],
-        tier: HarnessTier::Open,
-        implied_slot: None,
-    },
-    HarnessSpec {
         // Closed: grok picks its own frontier model.
         canonical: "grok",
         aliases: &["gk"],
@@ -393,7 +370,8 @@ mod tests {
     fn the_registry_holds_exactly_the_named_harnesses() {
         let got: BTreeSet<&str> = REGISTRY.iter().map(|s| s.canonical).collect();
         let want: BTreeSet<&str> = [
-            "opencode", "pi", "omp", "pa", "jcode", "grok", "codex", "claude", "fx",
+            // bd-47fu (operator-directed): omp, pa, jcode dropped.
+            "opencode", "pi", "grok", "codex", "claude", "fx",
         ]
         .into_iter()
         .collect();
