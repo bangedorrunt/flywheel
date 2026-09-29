@@ -3222,19 +3222,22 @@ mod tests {
         assert!(missing.as_array().unwrap().is_empty());
     }
 
-    /// bd-7hdb: `fetch_inbox` orders ASC by rumor time and then applies
-    /// `limit` as a `.take(n)` over that ascending list, so a limit keeps the
-    /// OLDEST n rows. An un-scoped read of a long inbox therefore never shows a
-    /// brand-new message, and `mail watch` / `collab` would poll a thread whose
-    /// reply had already arrived and time out on it forever.
+    /// bd-zqdf: the two live contracts behind a thread-scoped inbox read.
     ///
-    /// Scoping the read to the thread fixes it, because the thread filter is
-    /// applied BEFORE the limit takes effect. This test pins both halves: the
-    /// trap (un-scoped, the newest row is dropped) and the way out (scoped, the
-    /// newest row of the thread survives). The un-scoped half is a
-    /// characterization, not an endorsement — if a future store change makes
-    /// the limit a newest-N window, this goes red and the scoping can be
-    /// revisited on the evidence rather than left behind as cargo cult.
+    /// 1. The store window is newest-N. `fetch_inbox` orders rows ASC and
+    ///    applies `limit` to the tail, so a limited read shows what just
+    ///    arrived. Pinned here so a regression surfaces as a failed test
+    ///    instead of a collab timeout nobody can explain.
+    /// 2. A thread-scoped read is scoped BEFORE the limit applies, so it
+    ///    returns that thread's newest rows even when other threads hold more
+    ///    rows than the limit. This is what makes `mail watch` independent of
+    ///    the store window.
+    ///
+    /// The send order is interleaved and ENDS on the other thread on purpose.
+    /// If the newest rows overall were the watched thread's own rows, a scoped
+    /// and an un-scoped read would return the same thing and this test could no
+    /// longer tell scoping apart from the store window — it would pass for
+    /// either reason. Ending on `busy-*` keeps the two answers distinct.
     #[test]
     fn a_thread_scoped_read_survives_a_limit_smaller_than_the_inbox() {
         // Reads the shared mail root — serialize under the crate-wide env lock;
@@ -3257,22 +3260,33 @@ mod tests {
             .expect("facade identity registered");
         let recv = vec!["LimitRecv".to_string()];
 
-        // Four older rows in one thread, then the two newest in the thread the
-        // watcher actually cares about. Distinct subjects: `collapse_duplicates`
-        // folds identical (sender, subject, body) rows.
+        // Interleaved, and the last two sends are the OTHER thread. Distinct
+        // subjects: `collapse_duplicates` folds identical (sender, subject,
+        // body) rows.
         for (subject, thread) in [
-            ("old-a", "busy-thread"),
-            ("old-b", "busy-thread"),
-            ("old-c", "busy-thread"),
-            ("old-d", "busy-thread"),
             ("reply-a", "target-thread"),
+            ("busy-a", "busy-thread"),
             ("reply-b", "target-thread"),
+            ("busy-b", "busy-thread"),
+            ("reply-c", "target-thread"),
+            ("busy-c", "busy-thread"),
+            ("busy-d", "busy-thread"),
         ] {
             mail.send(&project, &recv, subject, "body", "normal", false, Some(thread))
                 .expect("send");
         }
 
-        // The trap: limit 2 over a 6-row inbox keeps the OLDEST two.
+        let subjects_of = |v: Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["subject"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        // Contract 1: the un-scoped window is the newest rows of the WHOLE
+        // inbox, which here are the last two sends — and they belong to the
+        // other thread.
         let unscoped = mail
             .inbox_filtered(
                 &project,
@@ -3284,19 +3298,14 @@ mod tests {
                 },
             )
             .expect("unscoped inbox");
-        let unscoped_subjects: Vec<&str> = unscoped
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|r| r["subject"].as_str())
-            .collect();
-        assert!(
-            !unscoped_subjects.contains(&"reply-b"),
-            "characterization: an un-scoped read drops the newest row, so a \
-             collab watch on a busy inbox can never see its reply: {unscoped_subjects:?}"
+        assert_eq!(
+            subjects_of(unscoped),
+            vec!["busy-c", "busy-d"],
+            "the store limit is a NEWEST-N window, not an oldest-N head"
         );
 
-        // The way out: the same limit, scoped to the thread, keeps the newest.
+        // Contract 2: the same limit, scoped, is the newest rows OF THE THREAD
+        // — a different answer, which is what proves the filter ran first.
         let scoped = mail
             .inbox_filtered(
                 &project,
@@ -3309,17 +3318,11 @@ mod tests {
                 },
             )
             .expect("thread-scoped inbox");
-        let scoped_subjects: Vec<&str> = scoped
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|r| r["subject"].as_str())
-            .collect();
         assert_eq!(
-            scoped_subjects,
-            vec!["reply-a", "reply-b"],
-            "a thread-scoped read survives a limit smaller than the inbox: \
-             {scoped_subjects:?}"
+            subjects_of(scoped),
+            vec!["reply-b", "reply-c"],
+            "a thread-scoped read returns that thread's newest rows, so the \
+             watch does not depend on the store window"
         );
     }
 
