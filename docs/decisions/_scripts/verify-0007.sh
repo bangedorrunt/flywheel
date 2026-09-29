@@ -73,19 +73,26 @@ if echo "$out" | grep -q "compiled-in ids are never"; then
 else
   bad "model remove compiled-in guard fails"
 fi
-if "$BIN" profile show coder 2>/dev/null | grep -q '"model": "@standard"'; then
-  ok "profile show coder carries the @standard slot alias (harness=pi via inherit)"
+# bd-1zn2: the `@standard`-literal era is over (47fu routing; the human
+# view carries `harness` plus `model_fallback`, the resolved concrete model
+# lives in --json covered by check 15). Assert the human view is routed.
+if "$BIN" profile show coder 2>/dev/null | grep -q '"harness": "[^"]\+"'; then
+  ok "profile show coder exposes a routed harness"
 else
   bad "profile show coder is not slot-routed"
 fi
 
 # 15. ADR-0007 D1 full resolve ladder exposed via profile show --json
-# (resolved route: slot-inherited harness/model; primary unless caps-blocked)
-RESOLVED_H=$("$BIN" profile show coder --json 2>/dev/null | grep -o '"harness": "pi"' | head -1)
-RESOLVED_M=$("$BIN" profile show coder --json 2>/dev/null | grep -o '"model": "opencode-go/deepseek-v4-flash"' | head -1)
-RESOLVED_R=$("$BIN" profile show coder --json 2>/dev/null | grep -o '"route": "primary"' | head -1)
+# (resolved route: slot-inherited harness/model plus route status).
+# bd-1zn2: structural, not literal — the VALUES are operator config and
+# differ per machine (this box resolves opencode/muse-spark, not
+# pi/deepseek); what the ADR guarantees is the SHAPE. One call, not three.
+SHOW_JSON=$("$BIN" profile show coder --json 2>/dev/null || true)
+RESOLVED_H=$(echo "$SHOW_JSON" | grep -o '"harness": "[^"]\+"' | head -1)
+RESOLVED_M=$(echo "$SHOW_JSON" | grep -o '"model": "[^"]\+"' | head -1)
+RESOLVED_R=$(echo "$SHOW_JSON" | grep -o '"route": "[^"]\+"' | head -1)
 if [ -n "$RESOLVED_H" ] && [ -n "$RESOLVED_M" ] && [ -n "$RESOLVED_R" ]; then
-  ok "profile show --json exposes the D1 resolved route (pi + deepseek-v4-flash, primary)"
+  ok "profile show --json exposes the D1 resolved route ($RESOLVED_H, $RESOLVED_M, $RESOLVED_R)"
 else
   bad "profile show --json missing or wrong resolved route"
 fi
