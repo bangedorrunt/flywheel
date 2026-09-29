@@ -3256,7 +3256,7 @@ questions:
 
     #[test]
     fn b5_find_pack_picks_highest_version() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap();
+        let _g = crate::config::lock_env();
         let base = std::env::temp_dir().join(format!("jev-pack-{}", std::process::id()));
         let xdg = base.join("xdg");
         let dir = base.join(".flywheel/judgment-packs");
@@ -3283,7 +3283,7 @@ questions:
     /// the same id does not replace it, even at a higher version.
     #[test]
     fn xdg_pack_is_the_source_of_truth() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap();
+        let _g = crate::config::lock_env();
         let base = std::env::temp_dir().join(format!("jev-xdg-{}", std::process::id()));
         let xdg = base.join("xdg");
         let proj = base.join("proj");

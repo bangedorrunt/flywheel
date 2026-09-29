@@ -823,7 +823,7 @@ mod tests {
     /// operator sets FLYWHEEL_NO_DOORBELL_ENSURE=1.
     #[test]
     fn degraded_audit_ensure_degraded_on_opt_out() {
-        let _g = crate::config::ENV_LOCK.lock().unwrap();
+        let _g = crate::config::lock_env();
         let prior = std::env::var_os("FLYWHEEL_NO_DOORBELL_ENSURE");
         unsafe { std::env::set_var("FLYWHEEL_NO_DOORBELL_ENSURE", "1") };
         let got = ensure_doorbell_spawn();
