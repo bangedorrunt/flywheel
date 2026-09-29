@@ -12,7 +12,7 @@
 
 use crate::lifecycle::Config;
 use anyhow::{Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 const LOGROTATE_BYTES: u64 = 1024 * 1024;
 
@@ -860,20 +860,39 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // handle is dropped (not awaited) on purpose — awaiting it here would
     // block the accept loop.
     drop(health_tick);
-    let serve_tcp = async {
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(CONNECTION_LIMIT));
+    let tcp_listener = &tcp;
+    let tcp_connections = connections.clone();
+    let tcp_app = app.clone();
+    let serve_tcp = async move {
         loop {
-            let (stream, _) = tcp.accept().await?;
-            let app = app.clone();
-            tokio::spawn(handle_http(stream, app));
+            let (stream, _) = tcp_listener.accept().await?;
+            let Ok(permit) = tcp_connections.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            let app = tcp_app.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                handle_http(stream, app).await;
+            });
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
-    let serve_uds = async {
+    let uds_listener = &uds;
+    let uds_connections = connections.clone();
+    let serve_uds = async move {
         loop {
-            let (stream, _) = uds.accept().await?;
-            let app = app.clone();
-            tokio::spawn(handle_uds(stream, app));
+            let (stream, _) = uds_listener.accept().await?;
+            let Ok(permit) = uds_connections.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            tokio::spawn(async move {
+                let _permit = permit;
+                handle_uds(stream).await;
+            });
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -1402,12 +1421,76 @@ fn cached_health_body(app: &AppState) -> String {
     app.health.lock().body.clone()
 }
 
+const REQUEST_LIMIT: usize = 4096;
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const CONNECTION_LIMIT: usize = 128;
+
+async fn read_bounded_request<R>(reader: &mut R, delimiter: &[u8]) -> std::io::Result<String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use std::io::{Error, ErrorKind};
+    use tokio::io::AsyncBufReadExt;
+
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let mut bytes = Vec::with_capacity(256);
+        loop {
+            let (consumed, found) = {
+                let available = reader.fill_buf().await?;
+                if available.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "request ended before delimiter",
+                    ));
+                }
+                let mut consumed = 0;
+                let mut found = false;
+                while consumed < available.len() {
+                    bytes.push(available[consumed]);
+                    consumed += 1;
+                    if bytes.len() > REQUEST_LIMIT {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "request exceeds size limit",
+                        ));
+                    }
+                    if bytes.ends_with(delimiter) {
+                        found = true;
+                        break;
+                    }
+                }
+                (consumed, found)
+            };
+            reader.consume(consumed);
+            if found {
+                return String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e));
+            }
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "request timed out"))?
+}
+
+async fn read_http_request<R>(stream: &mut R) -> std::io::Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = tokio::io::BufReader::with_capacity(512, stream);
+    read_bounded_request(&mut reader, &[13, 10, 13, 10]).await
+}
+
+async fn read_uds_request<R>(stream: &mut R) -> std::io::Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = tokio::io::BufReader::with_capacity(512, stream);
+    read_bounded_request(&mut reader, &[10]).await
+}
+
 async fn handle_http(mut stream: tokio::net::TcpStream, app: AppState) {
-    let mut buf = vec![0u8; 4096];
-    let Ok(n) = stream.read(&mut buf).await else {
+    let Ok(req) = read_http_request(&mut stream).await else {
         return;
     };
-    let req = String::from_utf8_lossy(&buf[..n]);
     let path = req
         .lines()
         .next()
@@ -1441,35 +1524,31 @@ async fn handle_http(mut stream: tokio::net::TcpStream, app: AppState) {
             serde_json::json!({"error": "not found"}).to_string(),
         ),
     };
-    let _ = stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {code}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .await;
+    let response = format!(
+        "HTTP/1.1 {code}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = tokio::time::timeout(REQUEST_TIMEOUT, stream.write_all(response.as_bytes())).await;
 }
 
-async fn handle_uds(mut stream: tokio::net::UnixStream, app: AppState) {
-    // UDS speaks the same minimal surface: one JSON line in, one out.
-    // Verbs ride here in Phase 2; today only `ping` answers.
-    let mut buf = vec![0u8; 4096];
-    let Ok(n) = stream.read(&mut buf).await else {
+async fn handle_uds<S>(mut stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // UDS accepts exact verbs only; arbitrary text is never a liveness reply.
+    let Ok(req) = read_uds_request(&mut stream).await else {
         return;
     };
-    let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-    let body = if req.contains("ping") {
-        let p = &doorbell_rt::api::PING;
-        serde_json::json!({"protocol": p.protocol, "core_v": p.core_v, "journal_v": p.journal_v})
-            .to_string()
-            + "\n"
-    } else {
-        serde_json::json!({"alive": true, "uptime_s": app.started.elapsed().as_secs()}).to_string()
-            + "\n"
+    let body = match req.trim() {
+        "ping" => {
+            let p = &doorbell_rt::api::PING;
+            serde_json::json!({"protocol": p.protocol, "core_v": p.core_v, "journal_v": p.journal_v})
+        }
+        _ => serde_json::json!({"error": "invalid request"}),
     };
-    let _ = stream.write_all(body.as_bytes()).await;
+    let mut response = serde_json::to_vec(&body).unwrap_or_default();
+    response.push(10);
+    let _ = tokio::time::timeout(REQUEST_TIMEOUT, stream.write_all(&response)).await;
 }
 
 /// Journal mtime age per hosted workspace — sweep liveness without
@@ -3722,8 +3801,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// bd-o86s RED: /health serves a cached snapshot — a fresh cache
-    /// returns its body without recomputing (no shells, no greps).
+    /// A fragmented header is not interpreted as a complete request.
+    #[tokio::test(start_paused = true)]
+    async fn http_reader_waits_for_complete_fragmented_request() {
+        use super::read_http_request;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let reader = tokio::spawn(async move { read_http_request(&mut server).await });
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: local")
+            .await
+            .expect("fragmented header");
+        tokio::task::yield_now().await;
+        assert!(!reader.is_finished(), "reader waits for header terminator");
+        client
+            .write_all(b"host\r\n\r\n")
+            .await
+            .expect("header suffix");
+        assert_eq!(
+            reader.await.expect("reader task").expect("request"),
+            "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn uds_handler_waits_for_exact_ping_line_and_rejects_substrings() {
+        use super::handle_uds;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(128);
+        let handler = tokio::spawn(handle_uds(server));
+        client.write_all(b"pi").await.expect("prefix");
+        tokio::task::yield_now().await;
+        assert!(!handler.is_finished(), "must wait for newline");
+        client.write_all(&[b'n', b'g', 10]).await.expect("suffix");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("reply");
+        handler.await.expect("handler");
+        let ping: serde_json::Value = serde_json::from_slice(&response).expect("ping JSON");
+        assert_eq!(ping["protocol"], doorbell_rt::api::PING.protocol);
+
+        let (mut client, server) = tokio::io::duplex(128);
+        let handler = tokio::spawn(handle_uds(server));
+        client.write_all(b"not-ping").await.expect("invalid verb");
+        client.write_all(&[10]).await.expect("line terminator");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("reply");
+        handler.await.expect("handler");
+        let invalid: serde_json::Value = serde_json::from_slice(&response).expect("error JSON");
+        assert!(invalid.get("error").is_some());
+        assert!(invalid.get("protocol").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_reader_rejects_oversize_and_times_out() {
+        use super::{REQUEST_LIMIT, REQUEST_TIMEOUT, read_bounded_request};
+        use tokio::io::AsyncWriteExt;
+        use tokio::io::BufReader;
+
+        let (mut client, server) = tokio::io::duplex(8192);
+        let mut server = BufReader::with_capacity(512, server);
+        let oversized = tokio::spawn(async move { read_bounded_request(&mut server, &[10]).await });
+        client
+            .write_all(&vec![b'x'; REQUEST_LIMIT + 1])
+            .await
+            .expect("oversized input");
+        assert_eq!(
+            oversized.await.expect("reader task").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let (_client, server) = tokio::io::duplex(64);
+        let mut server = BufReader::with_capacity(512, server);
+        let waiting = tokio::spawn(async move { read_bounded_request(&mut server, &[10]).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        assert_eq!(
+            waiting.await.expect("reader task").unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn http_reader_stops_at_header_terminator_when_body_is_coalesced() {
+        use super::{REQUEST_LIMIT, read_bounded_request};
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        let (mut client, server) = tokio::io::duplex(8192);
+        let mut server = BufReader::with_capacity(8192, server);
+        let mut request = b"GET /health HTTP/1.1".to_vec();
+        request.extend_from_slice(&[13, 10]);
+        request.extend_from_slice(b"Host: local");
+        request.extend_from_slice(&[13, 10, 13, 10]);
+        request.extend(vec![b'x'; REQUEST_LIMIT + 1]);
+        client.write_all(&request).await.expect("header and body");
+        let parsed = read_bounded_request(&mut server, &[13, 10, 13, 10])
+            .await
+            .expect("header");
+        assert!(parsed.as_bytes().ends_with(&[13, 10, 13, 10]));
+        assert!(!parsed.contains(&"x".repeat(64)));
+    }
+
     #[test]
     fn health_cache_serves_snapshot_without_recompute() {
         use super::{AppState, CachedHealth, HEALTH_CACHE_TTL_SECS, cached_health_body};

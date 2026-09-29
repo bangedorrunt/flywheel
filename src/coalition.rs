@@ -388,12 +388,13 @@ impl CoalitionStore {
         // effects recorded — the coalition binds the run; real headless
         // execution of goal steps is `workflow run <goal> --execute`).
         let rt = runtime()?;
-        let run_output = rt.block_on(async {
+        let invocation = rt.block_on(async {
             let engine = toron_workflow::WorkflowEngine::local_with(
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
             )?;
             engine.invoke(&run_id, wf.clone(), json!({})).await
-        })?;
+        });
+        let (run_status, exit_code, response, error) = coalition_invocation_outcome(invocation);
         run_log::write_run(&run_log::RunLogEntry {
             run_id: run_id.clone(),
             ts: crate::state::now_iso(),
@@ -404,16 +405,22 @@ impl CoalitionStore {
             model: String::new(),
             mode: "coalition".into(),
             prompt_hash: String::new(),
-            response: run_output.to_string(),
-            status: "completed".into(),
+            response,
+            status: run_status.into(),
             tokens_in: 0,
             tokens_out: 0,
             duration_ms: 0,
-            exit_code: 0,
-            error: None,
+            exit_code,
+            error: error.clone(),
             phase: None,
             phase_degraded: false,
         })?;
+        if run_status != "completed" {
+            bail!(
+                "goal workflow {goal:?} did not complete successfully (status: {run_status}){}",
+                error.map(|e| format!(": {e}")).unwrap_or_default()
+            );
+        }
 
         // NIP-29 channel: create + metadata (project-scoped, operator-signed).
         let channel_id = id.clone();
@@ -1401,6 +1408,96 @@ fn slug(goal: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Preserve invocation errors as unknown outcomes. The engine may return a
+/// typed suspension rather than a value, and no coalition may activate then.
+fn coalition_invocation_outcome(
+    invocation: anyhow::Result<Value>,
+) -> (&'static str, i32, String, Option<String>) {
+    match invocation {
+        Ok(output) => {
+            let (status, exit_code, error) = coalition_run_outcome(&output);
+            (status, exit_code, output.to_string(), error)
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            ("unknown", 1, message.clone(), Some(message))
+        }
+    }
+}
+
+/// Preserve the engine's terminal outcome in the coalition run log. A parked
+/// approval is suspended, not completed; absent or partial evidence is never
+/// enough to create an active coalition.
+fn coalition_run_outcome(output: &Value) -> (&'static str, i32, Option<String>) {
+    let status = output.get("status").and_then(Value::as_str);
+    if let Some(status) = status {
+        return match status {
+            "failed" | "fail" | "error" => (
+                "fail",
+                1,
+                output
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Some(output.to_string())),
+            ),
+            "blocked" => (
+                "blocked",
+                1,
+                output
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Some(output.to_string())),
+            ),
+            "suspended" | "pending" | "parked" => (
+                "suspended",
+                0,
+                output
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ),
+            "succeeded" | "completed" | "done" | "ok" => ("completed", 0, None),
+            other => (
+                "unknown",
+                1,
+                Some(format!("unrecognized workflow status: {other}")),
+            ),
+        };
+    }
+    if output.get("parked") == Some(&Value::Bool(true)) {
+        return (
+            "suspended",
+            0,
+            output
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    if output.get("ok") == Some(&Value::Bool(false)) || output.get("error").is_some() {
+        return (
+            "fail",
+            1,
+            output
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some(output.to_string())),
+        );
+    }
+    if output.is_object() {
+        ("completed", 0, None)
+    } else {
+        (
+            "unknown",
+            1,
+            Some(format!("unrecognized workflow result: {output}")),
+        )
+    }
+}
+
 /// Resolve a goal workflow across built-ins + catalog (same precedence as
 /// `workflow run`: catalog shadows built-ins).
 fn resolve_goal_workflow(goal: &str) -> Result<toron_workflow::schema::Workflow> {
@@ -1492,6 +1589,146 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
         }
+    }
+
+    #[test]
+    fn failed_goal_run_is_logged_as_failure_and_never_activates_coalition() {
+        struct RestoreXdg {
+            config: Option<std::ffi::OsString>,
+            state: Option<std::ffi::OsString>,
+            data: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestoreXdg {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.config.take() {
+                        Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                        None => std::env::remove_var("XDG_CONFIG_HOME"),
+                    }
+                    match self.state.take() {
+                        Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                        None => std::env::remove_var("XDG_STATE_HOME"),
+                    }
+                    match self.data.take() {
+                        Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                        None => std::env::remove_var("XDG_DATA_HOME"),
+                    }
+                }
+            }
+        }
+
+        let _env = crate::config::lock_env();
+        let restore = RestoreXdg {
+            config: std::env::var_os("XDG_CONFIG_HOME"),
+            state: std::env::var_os("XDG_STATE_HOME"),
+            data: std::env::var_os("XDG_DATA_HOME"),
+        };
+        let root = std::env::temp_dir().join(format!("fw-coal-fail-{}", uuid::Uuid::new_v4()));
+        let workflow_dir = root.join("config/flywheel/workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(
+            workflow_dir.join("coalition-failing-run.yaml"),
+            r#"name: coalition-failing-run
+trigger:
+  type: webhook
+steps:
+  - name: dispatch
+    action: dispatch_job
+    assignee: x
+    spec: { task: "must fail without a runner" }
+    on_error: fail_run
+"#,
+        )
+        .expect("workflow");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+            std::env::set_var("XDG_STATE_HOME", root.join("state"));
+            std::env::set_var("XDG_DATA_HOME", root.join("data"));
+        }
+
+        let store = CoalitionStore::open_at(
+            "coalition-fail-test",
+            root.join("coalitions"),
+            root.join("mail"),
+        )
+        .expect("open store");
+        store.register_agent("captain").expect("register captain");
+        let members = vec!["captain".to_string()];
+        let formed = store.form(
+            "coalition-failing-run",
+            "captain",
+            &members,
+            &BTreeMap::new(),
+            &[],
+            None,
+        );
+        let recorded = run_log::read_runs()
+            .into_iter()
+            .find(|run| run.workflow == "coalition-failing-run")
+            .expect("failed engine outcome is retained in the run log");
+        let manifests = store.list().expect("list");
+        assert_eq!(
+            recorded.status, "fail",
+            "engine output: {}",
+            recorded.response
+        );
+        assert!(
+            formed.is_err(),
+            "failed goal must refuse coalition activation"
+        );
+        assert!(
+            manifests.is_empty(),
+            "failure must not leave an active manifest"
+        );
+        drop(restore);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn coalition_invocation_error_is_logged_as_unknown() {
+        assert_eq!(
+            coalition_invocation_outcome(Err(anyhow!("approval remains pending"))),
+            (
+                "unknown",
+                1,
+                "approval remains pending".to_string(),
+                Some("approval remains pending".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn coalition_run_outcome_preserves_failure_pending_success_and_unknown() {
+        assert_eq!(
+            coalition_run_outcome(&json!({"status": "failed", "error": "dispatch refused"})),
+            ("fail", 1, Some("dispatch refused".into()))
+        );
+        assert_eq!(
+            coalition_run_outcome(&json!({"status": "blocked"})),
+            ("blocked", 1, Some(json!({"status": "blocked"}).to_string()))
+        );
+        assert_eq!(
+            coalition_run_outcome(&json!({"parked": true, "ok": true})),
+            ("suspended", 0, None)
+        );
+        assert_eq!(
+            coalition_run_outcome(&json!({"status": "suspended"})),
+            ("suspended", 0, None)
+        );
+        assert_eq!(
+            coalition_run_outcome(&json!({"step": {"ok": true}})),
+            ("completed", 0, None)
+        );
+        assert_eq!(coalition_run_outcome(&Value::Null).0, "unknown");
+        assert_eq!(
+            coalition_run_outcome(&json!({"error": "unclassified"})).0,
+            "fail"
+        );
+        assert_eq!(
+            coalition_run_outcome(&json!({"status": "alien"})).0,
+            "unknown"
+        );
+        assert_eq!(coalition_run_outcome(&json!("not an object")).0, "unknown");
     }
 
     #[test]
@@ -1662,11 +1899,10 @@ mod tests {
         );
         assert_eq!(report.auto_coalesce.len(), 1, "{:?}", report.auto_coalesce);
 
-        // Auto-coalesce forms an ad-hoc coalition binding the pair. Goal
-        // must be a dispatch-only workflow (a request_approval step would
-        // park the recording run durably — `beads` is dispatch-only).
+        // Auto-coalesce forms an ad-hoc coalition binding the pair. Use a
+        // workflow with defaulted inputs; `beads` requires an explicit plan.
         let formed = store
-            .auto_coalesce("beads", "oc", &report)
+            .auto_coalesce("ce-compound", "oc", &report)
             .expect("auto-coalesce");
         assert_eq!(formed.len(), 1, "one ad-hoc coalition formed");
         assert_eq!(formed[0].members, vec!["oc".to_string(), "pi".to_string()]);
@@ -1676,7 +1912,9 @@ mod tests {
             "auto-coalesce stays single-project"
         );
         // Idempotent: a second pass forms nothing new.
-        let again = store.auto_coalesce("beads", "oc", &report).expect("again");
+        let again = store
+            .auto_coalesce("ce-compound", "oc", &report)
+            .expect("again");
         assert!(again.is_empty(), "idempotent per formation");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1696,7 +1934,7 @@ mod tests {
         // oc is already in a coalition with pi.
         store
             .form(
-                "beads",
+                "ce-compound",
                 "oc",
                 &["oc".into(), "pi".into()],
                 &BTreeMap::new(),
@@ -1769,7 +2007,7 @@ mod tests {
         let member_projects = BTreeMap::from([("pi".to_string(), "proj-b".to_string())]);
         let m = store
             .form(
-                "beads",
+                "ce-compound",
                 "oc",
                 &["oc".into(), "pi".into()],
                 &member_projects,
@@ -1915,7 +2153,7 @@ mod tests {
         // pi is NOT registered in proj-b.
         let err = store
             .form(
-                "beads",
+                "ce-compound",
                 "oc",
                 &["oc".into(), "pi".into()],
                 &BTreeMap::from([("pi".to_string(), "proj-b".to_string())]),
@@ -1997,7 +2235,7 @@ mod tests {
         store.register_agent("pi").expect("register pi");
         let m = store
             .form(
-                "beads",
+                "ce-compound",
                 "oc",
                 &["oc".into(), "pi".into()],
                 &BTreeMap::new(),
@@ -2061,7 +2299,7 @@ mod tests {
         store.register_agent("pi").expect("register pi");
         let m = store
             .form(
-                "beads",
+                "ce-compound",
                 "oc",
                 &["oc".into(), "pi".into()],
                 &BTreeMap::new(),
@@ -2169,7 +2407,7 @@ mod tests {
         // Form with oc + pi; pi declares an intent on the board.
         let m = store
             .form(
-                "beads",
+                "ce-compound",
                 "oc",
                 &["oc".into(), "pi".into()],
                 &BTreeMap::new(),
@@ -2253,7 +2491,7 @@ mod tests {
 
         let m = store
             .form(
-                "beads",
+                "ce-compound",
                 "oc",
                 &["oc".into(), "pi".into()],
                 &BTreeMap::new(),
