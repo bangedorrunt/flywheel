@@ -1446,6 +1446,83 @@ mod tests {
         let _ = report;
     }
 
+    /// bd-3mrc: graceful shutdown journals the drain AND boot still resumes.
+    /// Crash-resume is pinned by crash_abort_restart_...; this pins the drain
+    /// path end to end: endpoint down parks the sink, queued intents drain into
+    /// the journaled drain row, reboot on the same store refolds budgets and
+    /// logs the resume row. If the drain row ever stops riding journal() or
+    /// pre-delivery journaling regresses, this goes red while crash stays green.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_boot_still_resumes_drained_prompts() {
+        use std::collections::VecDeque;
+        let dir = std::env::temp_dir().join(format!("dbrt-graceful-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mk = || {
+            let (tx, rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+            let mut host = MockHost::new(1_000_000);
+            host.script = VecDeque::from(vec![
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "m1".into(),
+                }],
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "m2".into(),
+                }],
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "m3".into(),
+                }],
+            ]);
+            let sinks = SinkManager::new(tx.clone());
+            let brain = Brain::new(BrainConfig::new("w"), host, FileStore::new(&dir), sinks);
+            (brain, rx, tx)
+        };
+        let (mut a, rx, tx) = mk();
+        // Endpoint down from the first send: nothing delivers, all park.
+        let (mut sink, _sent) = MockSink::new();
+        sink.fail_after = Some(0);
+        a.sinks.add_sink("herdr", Box::new(sink));
+        tx.send(BrainMsg::Watch("{\"kind\":9}".into()))
+            .await
+            .expect("watch queues");
+        tx.send(BrainMsg::Fact {
+            summary: "x".into(),
+        })
+        .await
+        .expect("fact queues");
+        tx.send(BrainMsg::Fact {
+            summary: "y".into(),
+        })
+        .await
+        .expect("fact queues");
+        tx.send(BrainMsg::Shutdown).await.expect("shutdown queues");
+        let report = tokio::time::timeout(std::time::Duration::from_secs(8), a.run(rx))
+            .await
+            .expect("run must exit on shutdown");
+        assert_eq!(
+            report.undelivered.len(),
+            1,
+            "the first failure parks the sink and the rest shed to digest by design; the queued remainder must drain as undelivered"
+        );
+        let journal = std::fs::read_to_string(FileStore::new(&dir).journal_file("w")).unwrap();
+        assert!(
+            journal.contains("\"stage\":\"drain\"") && journal.contains("\"undelivered\":1"),
+            "drain row journals the set: {journal}"
+        );
+        drop(report);
+        // Reboot on the same store: refold + resume row.
+        let (b, _rx2, _tx2) = mk();
+        let budget = b.budgets.get("p").expect("refolded budget row");
+        assert_eq!(budget.prompts.len(), 3, "all three grants refolded");
+        let journal = std::fs::read_to_string(FileStore::new(&dir).journal_file("w")).unwrap();
+        assert!(
+            journal.contains("\"stage\":\"resume\""),
+            "boot logs its resume row: {journal}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// bd-zzgb: a dispatch outliving the warn bound must be NAMED while it
     /// still runs (the drain prints this before the process exits) and must
     /// NOT be cancelled — a mid-write abort corrupts, and the budget is what
