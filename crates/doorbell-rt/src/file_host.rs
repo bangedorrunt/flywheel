@@ -100,6 +100,12 @@ use doorbell_core::{PresenceVerdict, registry_key};
 /// journal filled with fabricated deaths.
 pub const AUDIT_BRAIN_FULL: &str = "wake_brain_full";
 
+/// HerdrStatus changes the sweep could not enqueue on a full or closed brain
+/// channel. Counted per host (self.herdr advances only on receipt, so drops
+/// self-heal next sweep); audited sampled via should_audit_count, the same
+/// repeat-is-a-count shape as wake_brain_full.
+pub const AUDIT_HERDR_FULL: &str = "herdr_brain_full";
+
 /// A consumer death relayed to the brain, counted so a STORM reads as a rate.
 ///
 /// The relay used to be the quietest place in the process: one death in, one
@@ -813,6 +819,10 @@ pub struct FileHost {
     /// as "death #1" — one row each, unbounded, which is the very shape this
     /// guards against.
     died_relayed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// HerdrStatus sends dropped on a full or closed brain channel, this host.
+    /// Host-wide like died_relayed: the sweep recomputes `changed` every tick,
+    /// so the count survives across sweeps by construction.
+    herdr_dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     daemon_exe: PathBuf,
     generation: Option<GenRecord>,
     /// Status-change outbox: the poll loop `tell`s `HerdrStatus` back
@@ -885,6 +895,7 @@ impl FileHost {
             restart_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             absent_rows: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             died_relayed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            herdr_dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             daemon_exe,
             generation,
             tx: None,
@@ -1396,6 +1407,9 @@ impl FileHost {
         // instead of carrying a second copy of the writer.
         let store = FileStore::new(state_dir.to_path_buf());
         let path = store.audit_file(workspace);
+        // Deliberate fire-and-forget: append_audit eprintln!s the cause on
+        // every failure path AND counts it (crate::store::audit_write_failures),
+        // so no caller can silently drop a journal write anymore.
         let _ = store.append_audit(workspace, entry);
         // bd-lorot: the audit log had NO rotation while the journal had a full
         // retention discipline. See rotate_audit_if_oversized for why that is
@@ -2025,10 +2039,35 @@ impl Host for FileHost {
                 // while /health kept reporting `mode=hosted`. A full channel
                 // drops the update, which is what the ignored result already
                 // meant.
-                let _ = tx.try_send(BrainMsg::HerdrStatus {
+                match tx.try_send(BrainMsg::HerdrStatus {
                     pin: pin.clone(),
                     status: status.clone(),
-                });
+                }) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Self-healing: self.herdr advances only on receipt
+                        // (the BrainMsg::HerdrStatus arm), so a dropped update
+                        // is recomputed as changed next sweep — delay, not
+                        // loss. Count every drop and audit sampled, the same
+                        // repeat-is-a-count shape as wake_brain_full.
+                        let closed = matches!(e, tokio::sync::mpsc::error::TrySendError::Closed(_));
+                        let prior = self
+                            .herdr_dropped
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if should_audit_count(prior) {
+                            Self::append_audit_row(
+                                &self.cfg.flywheel_state,
+                                &self.cfg.workspace,
+                                AUDIT_HERDR_FULL,
+                                serde_json::json!({
+                                    "reason": "herdr status change could not be enqueued (brain channel full or closed); next sweep retries",
+                                    "dropped": prior + 1,
+                                    "closed": closed,
+                                }),
+                            );
+                        }
+                    }
+                }
             }
         }
         rows
@@ -3196,6 +3235,129 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "the herdr status change must reach the brain channel"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-jqjh: a full brain channel must not silently drop HerdrStatus.
+    /// The drop self-heals (self.herdr advances only on receipt, so the next
+    /// sweep retries) — but the rate has to be countable and sampled-audited,
+    /// same shape as wake_brain_full. Fence: no `let _ =` on this send.
+    #[test]
+    fn sweep_full_channel_counts_herdr_drops_and_audits_sampled() {
+        let dir = tmp_state("sweep-full");
+        let script = dir.join("herdr");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        std::fs::write(
+            dir.join("agents").join("proj.json"),
+            serde_json::to_string(&entries()).unwrap(),
+        )
+        .unwrap();
+        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
+        cfg.toron_bin = "true".into();
+        cfg.herdr_bin = script.to_string_lossy().into_owned();
+        cfg.registry_file = Some(dir.join("agents").join("proj.json"));
+        // Capacity 1, prefilled: every HerdrStatus send goes Full.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(BrainMsg::Died).unwrap();
+        let mut host = FileHost::new(cfg).with_tx(tx);
+        host.refresh_index();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for _ in 0..4 {
+                let _ = host.sweep_maintenance();
+            }
+        });
+        assert_eq!(
+            host.herdr_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "every Full send must be counted"
+        );
+        // The filler never left: nothing the sweep sent got through.
+        assert!(matches!(rx.try_recv(), Ok(BrainMsg::Died)));
+        let body = std::fs::read_to_string(dir.join("doorbell").join("w.audit.jsonl")).unwrap();
+        let rows = body.matches(AUDIT_HERDR_FULL).count();
+        assert_eq!(
+            rows, 3,
+            "sampled audit: priors 0,1,2 row, prior 3 counts only, got: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-jqjh: a closed brain channel (brain gone) counts too, flagged closed.
+    #[test]
+    fn sweep_closed_channel_counts_herdr_drop_as_closed() {
+        let dir = tmp_state("sweep-closed");
+        let script = dir.join("herdr");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        std::fs::write(
+            dir.join("agents").join("proj.json"),
+            serde_json::to_string(&entries()).unwrap(),
+        )
+        .unwrap();
+        let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
+        cfg.toron_bin = "true".into();
+        cfg.herdr_bin = script.to_string_lossy().into_owned();
+        cfg.registry_file = Some(dir.join("agents").join("proj.json"));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(rx);
+        let mut host = FileHost::new(cfg).with_tx(tx);
+        host.refresh_index();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = host.sweep_maintenance();
+        });
+        assert_eq!(
+            host.herdr_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the Closed send must be counted"
+        );
+        let body = std::fs::read_to_string(dir.join("doorbell").join("w.audit.jsonl")).unwrap();
+        assert!(
+            body.contains(AUDIT_HERDR_FULL) && body.contains("\"closed\":true"),
+            "the drop must be audited and flagged closed, got: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-jqjh: the audit door itself failing must be countable, not `let _`.
+    /// A FILE where the state dir should be fails mkdir with ENOTDIR for any
+    /// uid, so this stays hermetic even as root.
+    #[test]
+    fn audit_write_failure_increments_counter() {
+        let dir = tmp_state("audit-fail");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let before = crate::store::audit_write_failures();
+        FileHost::append_audit_row(&blocker, "w", "probe", serde_json::json!({"n": 1}));
+        assert_eq!(
+            crate::store::audit_write_failures(),
+            before + 1,
+            "one failed append, one count"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
