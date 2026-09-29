@@ -270,11 +270,15 @@ mod tests {
     // AC: journal rollback restores the checkpointed row.
     #[test]
     fn adr0010_d7_journal_rollback_restores_prior_record() {
-        let dir = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test process; state paths are process-global.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
-        }
+        // bd-envlock: the crate env guard, not a hand-rolled tempdir. The old
+        // `tempfile::tempdir()` + `set_var` was dropped at end of test, so for
+        // the rest of the PROCESS `XDG_STATE_HOME` pointed at a directory that
+        // no longer existed, and this test held no lock while doing it. Any
+        // concurrent or later test writing state artifacts then failed on a
+        // missing directory, which reads as a random flake rather than a test
+        // bug. `test_state_home()` locks AND unsets the var plus removes the
+        // dir on drop, so the next test inherits the real state home.
+        let _home = crate::config::test_state_home();
         let project = "demo";
         let old = entry();
         save_relaunch_journal(project, &old).unwrap();
