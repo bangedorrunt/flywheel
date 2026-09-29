@@ -19111,12 +19111,96 @@ mod wake_identity_tests {
         assert!(out.contains("Your mail identity is DustySparrow"), "{out}");
         assert!(!out.contains('{'), "no literal placeholders: {out}");
     }
+
+    /// bd-7hdb: a reply that lands between the collab send and the watcher
+    /// startup must still be reported. The watcher used to take the thread
+    /// head as its baseline, so exactly that reply became the baseline and the
+    /// wait timed out on a thread that was answered.
+    #[test]
+    fn a_reply_present_before_the_watch_starts_is_still_an_arrival() {
+        let row = |id: &str, thread: &str| json!({ "id": id, "thread_id": thread });
+        let rows = vec![row("ask-1", "collab-x"), row("reply-1", "collab-x")];
+
+        // Collab: the outbound ask is the baseline, so the reply is NEW even
+        // though it was already in the projection.
+        let (baseline, arrival) = watch_progress(&rows, "collab-x", Some("ask-1"));
+        assert_eq!(baseline.as_deref(), Some("ask-1"));
+        assert_eq!(
+            arrival.as_ref().and_then(|r| r["id"].as_str()),
+            Some("reply-1"),
+            "a reply that landed before the watcher started must not be swallowed"
+        );
+
+        // Standalone `mail watch`: the head is the baseline, so an already
+        // present thread reports nothing new.
+        let (baseline, arrival) = watch_progress(&rows, "collab-x", None);
+        assert_eq!(baseline.as_deref(), Some("reply-1"));
+        assert!(
+            arrival.is_none(),
+            "standalone watch keeps head-at-start: existing messages are not new"
+        );
+
+        // Another thread's row is never an arrival for this one.
+        let other = vec![row("ask-1", "collab-x"), row("elsewhere", "collab-y")];
+        let (_, arrival) = watch_progress(&other, "collab-x", Some("ask-1"));
+        assert!(arrival.is_none(), "thread match is exact: {arrival:?}");
+    }
+
+    /// bd-7hdb: the thread-scoping is only worth anything if the watch actually
+    /// scopes its read, so the call site is pinned, not just the helper.
+    /// `mail_shim::a_thread_scoped_read_survives_a_limit_smaller_than_the_inbox`
+    /// proves the mechanism against the real store; this proves the watch uses
+    /// it. Without this the fix could be reverted to a hand-built filter and
+    /// the mail_shim test would stay green over a watch that no longer scopes.
+    #[test]
+    fn cmd_mail_watch_scopes_its_read_to_the_watched_thread() {
+        // Every needle is split so this test cannot match its own source: a
+        // whole-literal marker matches HERE first and the slice collapses to
+        // the test body, which silently passes/fails for the wrong reason.
+        let call = ["watch_filter", "(thread_id)"].concat();
+        let start = ["fn cmd_mail_", "watch("].concat();
+        let end = ["fn watch_", "filter("].concat();
+        let src = include_str!("main.rs");
+        let body = src
+            .split_once(&start)
+            .and_then(|(_, rest)| rest.split_once(&end))
+            .map(|(body, _)| body)
+            .expect("cmd_mail_watch body is locatable in main.rs");
+        assert!(
+            body.contains(&call),
+            "cmd_mail_watch must read through watch_filter(thread_id): an \
+             un-scoped read is truncated to the OLDEST rows, so the reply it \
+             waits for would never appear"
+        );
+    }
+
+    /// bd-7hdb: the scoping the tripwire above checks is real only if the
+    /// filter carries the thread id.
+    #[test]
+    fn the_watch_filter_is_scoped_to_the_thread() {
+        let f = watch_filter("collab-x");
+        assert_eq!(
+            f.thread_id.as_deref(),
+            Some("collab-x"),
+            "the watch reads exactly one thread"
+        );
+        assert!(
+            f.include_bodies,
+            "a reply is useless without its body"
+        );
+    }
 }
 
 /// Block until a thread gains a message newer than the current latest
 /// (thread = a message id or a free-form thread id; search by thread_id).
-/// Polls `search_messages(thread_id=...)` every `interval_secs`; prints the
-/// newest message and exits 0 on the first NEW arrival, 1 on timeout.
+/// Polls the inbox every `interval_secs`; prints the newest message and exits
+/// 0 on the first NEW arrival, 1 on timeout.
+///
+/// `after_id` is the caller's own outbound message, when it has one. It is
+/// then the baseline, because reading the thread head at startup would make a
+/// reply that landed between the send and this watch into the starting point
+/// and the wait would time out on a thread that was answered (bd-7hdb).
+/// Standalone `mail watch` passes `None` and keeps head-at-start.
 fn cmd_mail_watch(
     cfg: &Config,
     project: &str,
@@ -19124,43 +19208,34 @@ fn cmd_mail_watch(
     as_agent: Option<&str>,
     timeout_secs: u64,
     interval_secs: u64,
+    after_id: Option<&str>,
 ) -> Result<()> {
     let key = project_dir_str(cfg, project)?;
     let mail = mail_as(cfg, &key, as_agent)?;
     mail.ensure_project(&key)?;
-    // Watch via fetch_inbox + CLIENT-side thread match: FTS5 tokenizes on
-    // hyphens and letter/digit boundaries, so hyphenated thread ids are not
-    // reliably phrase-searchable (e2e-verified). The inbox projection
-    // carries `thread_id` per row — exact matching, no FTS dependency.
-    let latest = |m: &mail_shim::Mail| -> Result<Option<Value>> {
-        let v = m.inbox_filtered(
-            &key,
-            &m.name,
-            &mail_shim::MailInboxFilter {
-                unread_only: false,
-                include_bodies: true,
-                limit: 200,
-                ..Default::default()
-            },
-        )?;
-        Ok(v.as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .rev()
-            .find(|row| {
-                row.get("thread_id")
-                    .and_then(|t| t.as_str())
-                    .map(|t| t == thread_id)
-                    .unwrap_or(false)
-            }))
+    // The read is scoped to THIS thread and still matched client-side. Two
+    // separate reasons, do not conflate them:
+    //
+    // 1. Server-side scope is load-bearing, not an optimization. `fetch_inbox`
+    //    orders ASC by rumor time and applies `limit` as a `.take(n)` over
+    //    that ascending list, so the limit keeps the OLDEST n rows. An
+    //    un-scoped read of a long inbox never contains a brand-new message and
+    //    the watch would time out on a thread that was already answered
+    //    (bd-7hdb). The thread filter is applied BEFORE the limit, so scoping
+    //    here is what makes the reply visible at all.
+    // 2. The client-side match is belt-and-braces. FTS5 tokenizes on hyphens
+    //    and letter/digit boundaries, so hyphenated thread ids are not
+    //    reliably phrase-searchable (e2e-verified) — hence exact `thread_id`
+    //    equality on the row rather than a phrase search.
+    let rows = |m: &mail_shim::Mail| -> Result<Vec<Value>> {
+        let v = m.inbox_filtered(&key, &m.name, &watch_filter(thread_id))?;
+        Ok(v.as_array().cloned().unwrap_or_default())
     };
     let start = std::time::Instant::now();
-    let seen: Option<String> =
-        latest(&mail)?.and_then(|m| m.get("id").and_then(|i| i.as_str()).map(String::from));
+    let (seen, _) = watch_progress(&rows(&mail)?, thread_id, after_id);
     let mut empty_noted = false;
     eprintln!(
-        "flywheel: watching thread {thread_id} (latest {}); Ctrl-C to abort",
+        "flywheel: watching thread {thread_id} (baseline {}); Ctrl-C to abort",
         seen.as_deref().unwrap_or("<none>")
     );
     loop {
@@ -19169,27 +19244,80 @@ fn cmd_mail_watch(
             eprintln!("flywheel: no new message in thread {thread_id} within {timeout_secs}s");
             std::process::exit(1);
         }
-        match latest(&mail)? {
-            Some(m) => {
-                let id = m.get("id").and_then(|i| i.as_str()).map(String::from);
-                if id.as_deref() != seen.as_deref() {
-                    print_json(&json!({ "thread": thread_id, "new_message": m }));
-                    return Ok(());
-                }
-            }
-            None => {
-                // GS-040: empty thread is normal while waiting for the first
-                // reply — the asker's OUTBOUND collab ask does not appear in
-                // their inbox projection, so `seen` starts None. Keep polling
-                // until timeout (no invent-fail / early exit).
-                if seen.is_none() && !empty_noted {
-                    eprintln!(
-                        "flywheel: thread {thread_id} has no messages yet (waiting for reply…)"
-                    );
-                    empty_noted = true;
-                }
-            }
+        let current = rows(&mail)?;
+        let (_, arrival) = watch_progress(&current, thread_id, after_id);
+        if let Some(m) = arrival {
+            print_json(&json!({ "thread": thread_id, "new_message": m }));
+            return Ok(());
         }
+        // GS-040: an empty thread is normal while waiting for the first
+        // reply — the asker's OUTBOUND collab ask does not appear in their
+        // inbox projection, so the thread reads empty until the peer answers.
+        // Keyed on the THREAD, not the baseline: with an ask baseline the
+        // baseline is never None, and the note is exactly the case it covers.
+        if !current.iter().any(|row| in_thread(row, thread_id)) && !empty_noted {
+            eprintln!("flywheel: thread {thread_id} has no messages yet (waiting for reply…)");
+            empty_noted = true;
+        }
+    }
+}
+
+/// The inbox read a thread watch performs. Scoped to the thread so the store's
+/// `limit` (which keeps the OLDEST rows of an ascending list) cannot hide the
+/// very reply the watch exists to detect. Pure: one thread in, one filter out.
+fn watch_filter(thread_id: &str) -> mail_shim::MailInboxFilter {
+    mail_shim::MailInboxFilter {
+        unread_only: false,
+        include_bodies: true,
+        limit: 200,
+        thread_id: Some(thread_id.to_owned()),
+        ..Default::default()
+    }
+}
+
+/// Exact thread membership of one inbox row. FTS5 tokenizes on hyphens, so the
+/// projection's `thread_id` is matched verbatim rather than phrase-searched.
+fn in_thread(row: &Value, thread_id: &str) -> bool {
+    row.get("thread_id")
+        .and_then(|t| t.as_str())
+        .map(|t| t == thread_id)
+        .unwrap_or(false)
+}
+
+/// The baseline a watch starts from, and the message that already counts as a
+/// new arrival. Pure: `rows` is the inbox projection, the thread match is
+/// exact, and the newest matching row is the head.
+///
+/// `after` is the baseline when the caller supplies one (collab's outbound
+/// ask). The head is then an arrival BY CONSTRUCTION — including a reply that
+/// landed between the send and this watch, which the old head-at-startup
+/// baseline swallowed and then timed out on (bd-7hdb). With `None` the head IS
+/// the baseline, which is the standalone `mail watch` contract: messages that
+/// were already there are not reported as new.
+fn watch_progress(
+    rows: &[Value],
+    thread_id: &str,
+    after: Option<&str>,
+) -> (Option<String>, Option<Value>) {
+    let head = rows.iter().rev().find(|row| in_thread(row, thread_id)).cloned();
+    let head_id = head
+        .as_ref()
+        .and_then(|row| row.get("id"))
+        .and_then(|i| i.as_str())
+        .map(str::to_owned);
+    match after {
+        // The ask is the baseline, so ANY other message in the thread is an
+        // arrival — including one that landed before this watch started, and
+        // excluding the ask itself if a projection ever echoes it back.
+        Some(ask) => {
+            let arrival = head.filter(|row| {
+                row.get("id")
+                    .and_then(|i| i.as_str())
+                    .is_some_and(|i| i != ask)
+            });
+            (Some(ask.to_owned()), arrival)
+        }
+        None => (head_id, None),
     }
 }
 
@@ -19209,7 +19337,15 @@ fn cmd_collab(
     let key = project_dir_str(cfg, project)?;
     let mail = mail_as(cfg, &key, as_agent)?;
     mail.ensure_project(&key)?;
-    let thread_id = format!("collab-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
+    // Two collabs in the same second used to mint the SAME thread id, so their
+    // waits watched each other's replies. Milliseconds plus the pid make a
+    // collision a non-event; the `%Y%m%dT%H%M%S` prefix is kept so the
+    // thread stays human-recognisable (and the e2e grep still matches it).
+    let thread_id = format!(
+        "collab-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3f"),
+        std::process::id()
+    );
     // bd-aseq: expectations are keyed by the identity stored HERE — resolve
     // through the spawn registry pin so the thread lands in the inbox the
     // agent actually reads (never a parallel hash-mapped one).
@@ -19256,7 +19392,17 @@ fn cmd_collab(
         "flywheel: asked {} (thread {thread_id}, msg {msg_id}); waiting up to {timeout_secs}s for the reply…",
         targets.join(", ")
     );
-    cmd_mail_watch(cfg, project, &thread_id, as_agent, timeout_secs, 5)
+    // The ask itself is the baseline, so a reply that landed before the
+    // watcher started is still NEW (bd-7hdb).
+    cmd_mail_watch(
+        cfg,
+        project,
+        &thread_id,
+        as_agent,
+        timeout_secs,
+        5,
+        Some(&msg_id),
+    )
 }
 
 // ---- worktree ----
