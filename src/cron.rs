@@ -2156,6 +2156,47 @@ owner = "housekeeper"
     /// fails (the sequencing gate: the workflow must pass the SAME health
     /// gates as the bash saga before the systemd timer is disabled).
     ///
+    /// A port on 127.0.0.1 that is CONFIRMED CLOSED at the moment it is
+    /// returned, or the test is not testing what it claims.
+    ///
+    /// The health-gate test used to fabricate its "service is down" port as
+    /// `last_port + 1`, which silently assumed the next port up was free. It is
+    /// not: under full-suite load a sibling test holds it, the probe to the
+    /// "dead" service gets a 200, and the test fails having proved nothing
+    /// about the gate. Observed exactly that — `Ok({"ok": true, "status": 200})`
+    /// in a full run, green in isolation.
+    ///
+    /// Bind to get a port, drop the listener to release it, then confirm a
+    /// connect is actually refused; if something grabbed it in between, take
+    /// another. The precondition is checked rather than assumed, so a busy
+    /// machine costs a retry instead of a red test.
+    fn confirmed_closed_port() -> u16 {
+        for _ in 0..64 {
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+                listener.local_addr().expect("local addr").port()
+                // listener drops here, releasing the port
+            };
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                return port;
+            }
+        }
+        panic!("no closed port on 127.0.0.1 after 64 attempts");
+    }
+
+    /// bd-closedport: the helper's contract is that it returns a port which
+    /// REFUSES a connection. Without this, a regression in the helper would
+    /// silently turn the health-gate test back into the flaky thing it was.
+    #[test]
+    fn the_confirmed_closed_port_helper_really_is_closed() {
+        let port = confirmed_closed_port();
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "port {port} must refuse connections, or the caller is not testing \
+             a down service"
+        );
+    }
+
     /// NOTE: probes are EXPLICIT per-service steps, not a `foreach` — the
     /// engine's foreach does not (yet) inject `{{item}}` into the template
     /// context (engine-side gap, BlueOak's lane). The bash saga also checks
@@ -2247,8 +2288,10 @@ owner = "housekeeper"
             assert_eq!(out["ok"], true, "all services up => probe passes: {out}");
         }
 
-        // One dead service (e.g. honcho down) → the probe fails.
-        let dead = ports.last().unwrap() + 1;
+        // One dead service (e.g. honcho down) → the probe fails. The port is
+        // CONFIRMED closed rather than assumed to be: `last + 1` is just a
+        // number, and on a busy machine it belongs to somebody else.
+        let dead = confirmed_closed_port();
         let dead_out = runner(&inv_of(Action::CallWebhook {
             url: format!("http://127.0.0.1:{dead}/health"),
             method: Some("GET".into()),
