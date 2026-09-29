@@ -1165,6 +1165,22 @@ pub fn close_check(cwd: &Path, bead_id: &str) -> anyhow::Result<CloseCheck> {
 #[doc(hidden)]
 pub static LOOP_REPORTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Take [`LOOP_REPORTER_LOCK`] (poison-tolerant). Test-only.
+///
+/// Mirrors `config::lock_env`: a `Mutex` stays poisoned for the life of the
+/// process once a holder panics, so a plain `.lock().unwrap()` would turn one
+/// unrelated panicking test into a permanent failure for every later test that
+/// arms the loop reporter. `LOOP_ARMED` is process-global and persists across
+/// tests, so the arming sequence runs many times per binary and a poisoned lock
+/// here is very costly.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn lock_loop_reporter() -> std::sync::MutexGuard<'static, ()> {
+    LOOP_REPORTER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Arm the loop reporter. Called once by the durable loop at startup
 /// (durable.rs, bd-w1-reopen-f6tw wiring). Idempotent.
 #[cfg(test)]
@@ -1627,7 +1643,7 @@ mod tests {
     fn loop_only_reporter_guard_blocks_workers_then_loop_roundtrips() {
         // Arming is process-global — serialize with other arming tests and
         // reset the flag (it persists once armed).
-        let _lock = crate::verdict::LOOP_REPORTER_LOCK.lock().unwrap();
+        let _lock = crate::verdict::lock_loop_reporter();
         crate::verdict::test_reset_loop_reporter();
         let (dir, bead_id) = scratch_workspace("gate-roundtrip");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();

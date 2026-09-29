@@ -1654,4 +1654,102 @@ daily = [
              {offenders:?}"
         );
     }
+
+    /// bd-poison: no test may take a crate-wide static lock with `.unwrap()`.
+    ///
+    /// A `Mutex` is poisoned when a thread panics while holding it, and a
+    /// poisoned lock stays poisoned for the life of the process. So one test
+    /// that panics inside a guarded section makes every LATER test that takes
+    /// the same lock fail with `PoisonError` — a cascade that has nothing to do
+    /// with what those later tests are testing, and that keeps failing on every
+    /// run thereafter.
+    ///
+    /// That is how `judgment::tests::b5_find_pack_picks_highest_version` and
+    /// `judgment::tests::xdg_pack_is_the_source_of_truth` were failing: neither
+    /// was broken, they were downstream of an unrelated panic holding
+    /// `ENV_LOCK`. They read as real regressions and were not.
+    ///
+    /// `lock_env()` already recovers from poisoning, and the crate documents it
+    /// as the reference pattern. The rule this enforces is simply that a
+    /// crate-wide test lock is taken through its poison-tolerant accessor, never
+    /// directly. Per-test local mutexes are fine with `.unwrap()` and are not
+    /// flagged: poisoning one only breaks the single test that owns it.
+    #[test]
+    fn no_test_takes_a_crate_wide_lock_without_the_poison_tolerant_accessor() {
+        /// Crate-wide static test locks. A per-test local mutex is not listed:
+        /// only a lock shared across tests can cascade.
+        const SHARED_LOCKS: [&str; 2] = ["ENV_LOCK", "LOOP_REPORTER_LOCK"];
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let Ok(src) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            for (i, line) in src.lines().enumerate() {
+                for lock in SHARED_LOCKS {
+                    let needle = format!("{lock}.lock().unwrap()");
+                    if line.contains(&needle) {
+                        offenders.push(format!(
+                            "{}:{}: {lock}",
+                            file.display(),
+                            i + 1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these take a crate-wide test lock with .unwrap(), so one unrelated \
+             panic poisons the lock and every later test using it fails with \
+             PoisonError: {offenders:?}"
+        );
+    }
+
+    /// bd-poison: the accessor itself must survive poisoning, or routing every
+    /// test through it buys nothing. This one poisons the real `ENV_LOCK` on
+    /// purpose.
+    ///
+    /// Safe to do because every crate-wide lock user now goes through a
+    /// poison-tolerant accessor. Before that was true, this test would have
+    /// cascaded into unrelated failures — which is the behaviour it pins shut.
+    #[test]
+    fn the_env_lock_accessor_survives_being_poisoned() {
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = lock_env();
+            panic!("deliberate: poison the crate env lock");
+        })
+        .is_err();
+        assert!(panicked, "the poisoning panic must actually fire");
+
+        // The lock is now poisoned. Taking it again must still hand out a guard
+        // rather than exploding, and that guard must be usable.
+        let guard = lock_env();
+        drop(guard);
+
+        // A second acquisition must also work, proving the lock is genuinely
+        // released and not merely handed out once.
+        let guard = lock_env();
+        drop(guard);
+    }
 }

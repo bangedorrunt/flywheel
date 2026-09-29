@@ -21085,7 +21085,7 @@ mod loop_run_verify_tests {
     fn cheap_p3_loop_runnable_records_and_stays_closed() {
         // Arming is process-global — serialize with other arming tests and
         // reset the flag (it persists once armed).
-        let _lock = crate::verdict::LOOP_REPORTER_LOCK.lock().unwrap();
+        let _lock = crate::verdict::lock_loop_reporter();
         crate::verdict::test_reset_loop_reporter();
         let cfg = no_mail_cfg();
         let dir = std::env::temp_dir().join(format!("lrv-ok-{}", std::process::id()));
