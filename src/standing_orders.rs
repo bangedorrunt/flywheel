@@ -67,7 +67,7 @@ mod tests {
     fn global_is_numbered_one_constraint_per_line() {
         let text = global_standing_orders();
         let lines: Vec<&str> = text.lines().collect();
-        assert!(!lines.is_empty());
+        assert_ne!(lines, [] as [&str; 0]);
         let mut n = 0usize;
         for line in lines {
             if line.starts_with('#') {

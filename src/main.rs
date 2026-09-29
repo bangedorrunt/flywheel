@@ -420,7 +420,7 @@ model = "fallback-model"
             assert_eq!(next, "test-fallback");
             // Ensure the helper is the same one headless uses (no fork)
             let chain = fallback_chain_for("test-primary");
-            assert!(!chain.is_empty());
+            assert_ne!(chain, [] as [String; 0]);
         });
     }
 }
@@ -4289,10 +4289,9 @@ mod spawn_profile_plan_tests {
         // Unknown harness injects nothing — but the model must still ROUTE.
         let mut unknown = profile("hermes", "glm-5.3");
         unknown.effort = "max".into();
-        assert!(
-            profile_launch_args("hermes", &unknown, None)
-                .expect("unknown harness, routable model")
-                .is_empty()
+        assert_eq!(
+            profile_launch_args("hermes", &unknown, None).expect("unknown harness, routable model"),
+            [] as [String; 0]
         );
     }
 
@@ -4442,10 +4441,10 @@ mod spawn_profile_plan_tests {
             "omp spawn without --model uses the premium slot"
         );
         // Unknown kind: no implied slot → no flags (unchanged).
-        assert!(
+        assert_eq!(
             bare_model_launch_args("kind-without-slot", "", "")
-                .expect("unknown kind has no implied slot")
-                .is_empty()
+                .expect("unknown kind has no implied slot"),
+            [] as [String; 0]
         );
     }
 
@@ -9559,8 +9558,14 @@ mod bk9t_digest_line_tests {
     #[test]
     fn rows_without_a_digest_action_are_empty() {
         let entry = serde_json::json!({"actions": ["FetchInbox"]});
-        assert!(digest_action_entries(&entry).is_empty());
-        assert!(digest_action_entries(&serde_json::json!({})).is_empty());
+        assert_eq!(
+            digest_action_entries(&entry),
+            [] as [(String, String, String); 0]
+        );
+        assert_eq!(
+            digest_action_entries(&serde_json::json!({})),
+            [] as [(String, String, String); 0]
+        );
     }
 }
 
@@ -12557,8 +12562,11 @@ mod agent_mail_name_tests {
                 "docs/decisions/0034-renamed.md".to_string(),
             ]
         );
-        assert!(uncommitted_decision_docs(" M src/main.rs\n").is_empty());
-        assert!(uncommitted_decision_docs("").is_empty());
+        assert_eq!(
+            uncommitted_decision_docs(" M src/main.rs\n"),
+            [] as [String; 0]
+        );
+        assert_eq!(uncommitted_decision_docs(""), [] as [String; 0]);
     }
 }
 
@@ -16132,7 +16140,10 @@ mod bd_4pxy_tests {
         );
         // a toron pin with no registry row still misses — the error (not
         // the matcher) is what teaches the raw-pane ladder
-        assert!(match_indices(&agents, &[to_want_token("flywheel", "KeenAuditor")]).is_empty());
+        assert_eq!(
+            match_indices(&agents, &[to_want_token("flywheel", "KeenAuditor")]),
+            [] as [usize; 0]
+        );
     }
 
     #[test]
@@ -18659,7 +18670,7 @@ mod wake_identity_tests {
         });
         let rows = vec![normal];
         let urgent = wake_urgent(&rows);
-        assert!(urgent.is_empty());
+        assert_eq!(urgent, [] as [&serde_json::Value; 0]);
         let picked = newest_urgent(&urgent, rows.first()).expect("fallback");
         assert_eq!(picked.get("id").and_then(|i| i.as_str()), Some("n1"));
         assert!(newest_urgent(&[], None).is_none());
@@ -21203,7 +21214,10 @@ mod loop_tests {
         );
         // Fully covered -> empty delta (no forwarder churn per sweep).
         let all: HashSet<String> = ids.into_iter().filter(|p| !p.is_empty()).collect();
-        assert!(doorbell_uncovered_panes(&all, &["w1:p1".to_string()]).is_empty());
+        assert_eq!(
+            doorbell_uncovered_panes(&all, &["w1:p1".to_string()]),
+            [] as [String; 0]
+        );
     }
 
     /// bd-loop-mode-rename-0tqy: the clap subcommand is `loop-mode` with a
@@ -21325,7 +21339,7 @@ mod loop_tests {
         assert_eq!(assigned, vec!["bd-r1", "bd-r2", "bd-f1"]);
         // second call assigns nothing new (dedup)
         let again = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
-        assert!(again.is_empty());
+        assert_eq!(again, [] as [String; 0]);
     }
 
     #[test]
@@ -21354,7 +21368,7 @@ mod loop_tests {
         }];
         let mut assigned = vec!["bd-r1".to_string()];
         let prompts = work_prompts(&inprog, &ready, &mut assigned, "flywheel");
-        assert!(prompts.is_empty());
+        assert_eq!(prompts, [] as [String; 0]);
     }
 
     #[test]
@@ -34996,7 +35010,7 @@ mod xproj_tests {
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].1.contains("recipe=daily"));
         seen.insert("2".to_string());
-        assert!(xproj_prompts_for_unseen(&items, &seen).is_empty());
+        assert_eq!(xproj_prompts_for_unseen(&items, &seen), [] as [(String, String); 0]);
     }
 
     // ---- bd-context-limit-honor-luqg: exact-body CONTEXT_LIMIT scan ----

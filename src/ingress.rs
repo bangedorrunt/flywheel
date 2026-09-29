@@ -579,7 +579,7 @@ mod tests {
             seq: 1,
         };
         let (next, cmds) = ws_tick(&ws, &WsMsg::Herdr { event: pe });
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, [] as [crate::workspace::Cmd; 0]);
         assert_eq!(
             next.swarm.pending_events.len(),
             1,

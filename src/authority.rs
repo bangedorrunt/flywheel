@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn resolve_never_panics_without_env() {
         let a = HostAuthority::resolve();
-        assert!(!a.home.is_empty());
+        assert_ne!(a.home, "");
     }
 
     #[test]

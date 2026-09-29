@@ -3584,7 +3584,10 @@ questions:
         };
         let line = fold_annotate(AnnotateSurface::CoalitionIntent, &answers, &pack);
         assert!(line.contains("intent=review-handoff"), "{line}");
-        assert!(AnnotateSurface::parse("wave-readiness") == Some(AnnotateSurface::WaveReadiness));
+        assert_eq!(
+            AnnotateSurface::parse("wave-readiness"),
+            Some(AnnotateSurface::WaveReadiness)
+        );
         assert!(AnnotateSurface::parse("bogus").is_none());
     }
 
@@ -3621,7 +3624,10 @@ questions:
         };
         let line = fold_annotate(AnnotateSurface::ProfilePick, &answers, &pack);
         assert!(line.contains("fit=strong"), "{line}");
-        assert!(AnnotateSurface::parse("profile-pick") == Some(AnnotateSurface::ProfilePick));
+        assert_eq!(
+            AnnotateSurface::parse("profile-pick"),
+            Some(AnnotateSurface::ProfilePick)
+        );
     }
 
     /// bd-88m4: the tier-pick fold combines both questions; parse knows
@@ -3673,7 +3679,10 @@ questions:
         let line = fold_annotate(AnnotateSurface::TierPick, &answers, &pack);
         assert!(line.contains("depth=frontier"), "{line}");
         assert!(line.contains("coupling=coupled"), "{line}");
-        assert!(AnnotateSurface::parse("tier-pick") == Some(AnnotateSurface::TierPick));
+        assert_eq!(
+            AnnotateSurface::parse("tier-pick"),
+            Some(AnnotateSurface::TierPick)
+        );
     }
 
     /// bd-88m4: the offline tier-pick table fires only on strong cues —

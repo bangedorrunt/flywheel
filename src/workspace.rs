@@ -2463,7 +2463,7 @@ mod tests {
                 .expect("kept")
                 .awaiting_clear
         );
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, [] as [Cmd; 0]);
     }
 
     #[test]
@@ -2718,7 +2718,7 @@ mod tests {
                 exited: false,
             },
         );
-        assert!(cmds2.is_empty());
+        assert_eq!(cmds2, [] as [Cmd; 0]);
     }
 
     #[test]
@@ -2766,7 +2766,7 @@ mod tests {
                 .any(|c| matches!(c, Cmd::Send { name, .. } if name == "oc")),
             "Msg::Tick must run swarm_slice, not no-op: {cmds:?}"
         );
-        assert!(next.swarm.queue.is_empty());
+        assert_eq!(next.swarm.queue, [] as [String; 0]);
         assert!(next.swarm.dispatch_pending.contains("oc"));
     }
 
@@ -3842,7 +3842,7 @@ mod role_model_tests {
                 pin: "DustySparrow".into(),
             },
         );
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, [] as [Cmd; 0]);
         assert_eq!(
             next.roles.get("wheelhouse").map(String::as_str),
             Some("DustySparrow")
@@ -4798,7 +4798,7 @@ mod d6_open_decisions_tests {
             held_beads: &[],
             done_without_close: &[],
         };
-        assert!(record_divergence(&empty).is_empty());
+        assert_eq!(record_divergence(&empty), [] as [Divergence; 0]);
         assert_eq!(render_divergence(&[]), "RECORD DIVERGENCE: none");
     }
 }
@@ -5449,7 +5449,7 @@ mod adr0010_d2_tests {
                 through_seq: w1.seq,
             },
         );
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, [] as [Cmd; 0]);
         assert_eq!(
             dup.wake.shown, w1ack.wake.shown,
             "duplicate ack changes nothing"
@@ -5485,7 +5485,7 @@ mod adr0010_d2_tests {
                 through_seq: 7,
             },
         );
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, [] as [Cmd; 0]);
         assert_eq!(next.wake_acked.get("Ghost"), Some(&7));
         assert!(!next.wake.shown.contains_key("Ghost"));
     }

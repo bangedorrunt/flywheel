@@ -12344,8 +12344,14 @@ mod tests {
                 ("Cargo.lock".to_string(), "bd-b".to_string()),
             ]
         );
-        assert!(parse_reservation_rows(&json!({})).is_empty());
-        assert!(parse_reservation_rows(&json!({"reservations": "nope"})).is_empty());
+        assert_eq!(
+            parse_reservation_rows(&json!({})),
+            [] as [(String, String); 0]
+        );
+        assert_eq!(
+            parse_reservation_rows(&json!({"reservations": "nope"})),
+            [] as [(String, String); 0]
+        );
     }
 
     /// Always-serialize paths: a held reservation on .beads/**, .flywheel/**,
@@ -12884,7 +12890,7 @@ mod tests {
     fn parse_poll_events_batch_empty_and_error() {
         let raw = r#"{"events":[],"max_seq":7,"stream_error":"subscribe failed: down"}"#;
         let batch = parse_poll_events_batch(raw, 0).unwrap();
-        assert!(batch.events.is_empty());
+        assert_eq!(batch.events, [] as [PollEvent; 0]);
         assert_eq!(batch.max_seq, 7);
         assert_eq!(
             batch.stream_error.as_deref(),
@@ -13242,7 +13248,7 @@ mod tests {
         // legacy 3-element still works
         let v2 = serde_json::json!(["b", "working", "pi"]);
         let s2 = parse_poll_entry(&v2).unwrap();
-        assert!(s2.pane_id.is_empty());
+        assert_eq!(s2.pane_id, "");
     }
 
     // ---- bd-test-event-poll-parity: decision-level differential ----
@@ -15317,7 +15323,7 @@ mod reclaim_tests {
         let actions_old = plan_reclaim(now, &[bead_old], &panes, &board);
         assert_eq!(actions_old.len(), 1);
         let actions_new = plan_reclaim(now, &[bead_new], &panes, &board);
-        assert!(actions_new.is_empty());
+        assert_eq!(actions_new, [] as [LoopAction; 0]);
     }
     #[test]
     fn reclaim_human_86400_not_7200() {
@@ -15325,7 +15331,10 @@ mod reclaim_tests {
         let panes: Vec<AgentState> = vec![];
         let board: Vec<(String, String)> = vec![];
         let bead_human_8000 = bead_with_age("bd-h", "bangedorrunt", 8000, now);
-        assert!(plan_reclaim(now, &[bead_human_8000], &panes, &board).is_empty());
+        assert_eq!(
+            plan_reclaim(now, &[bead_human_8000], &panes, &board),
+            [] as [LoopAction; 0]
+        );
         let bead_human_old = bead_with_age("bd-h2", "bangedorrunt", 86401, now);
         assert_eq!(
             plan_reclaim(now, &[bead_human_old], &panes, &board).len(),
@@ -15346,15 +15355,19 @@ mod reclaim_tests {
         )];
         let comments = std::collections::HashMap::new();
         let dirty: Vec<String> = vec![];
-        assert!(plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty).is_empty());
+        assert_eq!(
+            plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty),
+            [] as [LoopAction; 0]
+        );
         let reservations2 = vec![(
             "src/foo.rs".to_string(),
             "bd-x".to_string(),
             "GoldCove".to_string(),
         )];
         let bead2 = bead_with_age("bd-x", "GoldCove", 9000, now);
-        assert!(
-            plan_reclaim_ex(now, &[bead2], &panes, &reservations2, &comments, &dirty).is_empty()
+        assert_eq!(
+            plan_reclaim_ex(now, &[bead2], &panes, &reservations2, &comments, &dirty),
+            [] as [LoopAction; 0]
         );
         let bead3 = bead_with_age("bd-x", "GoldCove", 9000, now);
         assert_eq!(
@@ -15375,7 +15388,10 @@ mod reclaim_tests {
             nudge_streak: 0,
         }];
         let board: Vec<(String, String)> = vec![];
-        assert!(plan_reclaim(now, &[bead], &panes, &board).is_empty());
+        assert_eq!(
+            plan_reclaim(now, &[bead], &panes, &board),
+            [] as [LoopAction; 0]
+        );
     }
     #[test]
     fn reclaim_recent_comment_blocks() {
@@ -15386,7 +15402,10 @@ mod reclaim_tests {
         let mut comments = std::collections::HashMap::new();
         comments.insert("bd-c".into(), (now - 100, "some comment".into()));
         let dirty: Vec<String> = vec![];
-        assert!(plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty).is_empty());
+        assert_eq!(
+            plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty),
+            [] as [LoopAction; 0]
+        );
         let mut comments2 = std::collections::HashMap::new();
         comments2.insert("bd-c".into(), (now - 5000, "old".into()));
         let bead2 = bead_with_age("bd-c", "GoldCove", 9000, now);
@@ -15407,7 +15426,10 @@ mod reclaim_tests {
             (now - 5000, "touched src/foo.rs and tests/bar.rs".into()),
         );
         let dirty = vec!["src/foo.rs".into()];
-        assert!(plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty).is_empty());
+        assert_eq!(
+            plan_reclaim_ex(now, &[bead], &panes, &reservations, &comments, &dirty),
+            [] as [LoopAction; 0]
+        );
     }
     #[test]
     fn reclaim_leaf_no_br_close() {
@@ -15970,7 +15992,7 @@ mod tick_replay_tests {
         };
         let (parked, no_actions) = tick(&busy, &LoopMsg::Tick { now: 0 });
         assert_eq!(parked.queue.len(), 1, "working crew holds the queue");
-        assert!(no_actions.is_empty());
+        assert_eq!(no_actions, [] as [LoopAction; 0]);
     }
 }
 
@@ -16494,7 +16516,7 @@ mod loop_invoke_vehicle_tests {
                 resurface_secs: 3_600,
             },
         );
-        assert!(acts.is_empty());
+        assert_eq!(acts, [] as [LoopAction; 0]);
         assert!(next.drain_pending.is_empty(), "no drain is invented");
     }
 

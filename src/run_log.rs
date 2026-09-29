@@ -237,6 +237,6 @@ mod tests {
         let b = new_run_id();
         assert_ne!(a, b);
         assert!(a.starts_with("hl-"), "prefixed for the runs view");
-        assert!(!a.is_empty());
+        assert_ne!(a, "");
     }
 }

@@ -1329,7 +1329,7 @@ mod reserved_log_sweep_tests {
     /// An empty sweep is empty — no phantom projects.
     #[test]
     fn empty_sweep_yields_no_projects() {
-        assert!(project_log_names(Vec::new()).is_empty());
+        assert_eq!(project_log_names(Vec::new()), [] as [String; 0]);
     }
 }
 
@@ -2151,7 +2151,7 @@ mod tests {
 
         #[test]
         fn crew_recipients_empty_registry_is_empty() {
-            assert!(crew_recipients(&[], None).is_empty());
+            assert_eq!(crew_recipients(&[], None), [] as [String; 0]);
         }
     }
     use super::*;
@@ -2371,7 +2371,7 @@ mod last_sent_tests {
         let p = last_sent_file(project);
         let _ = std::fs::create_dir_all(p.parent().unwrap());
         std::fs::write(&p, "{not json!!").unwrap();
-        assert!(load_last_sent(project).is_empty());
+        assert_eq!(load_last_sent(project), [] as [SentRecord; 0]);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2742,10 +2742,13 @@ mod loops_sidecar_tests {
         assert!(left.iter().any(|e| e.agent == "oc" && e.thread == "t2"));
         assert!(left.iter().any(|e| e.agent == "pi" && e.thread == "t1"));
         // missing file → empty; corrupt → empty
-        assert!(load_expected_replies("l4s1-no-such-project").is_empty());
+        assert_eq!(
+            load_expected_replies("l4s1-no-such-project"),
+            [] as [ExpectedReply; 0]
+        );
         let path = expected_reply_file(&p);
         std::fs::write(&path, "{not json").unwrap();
-        assert!(load_expected_replies(&p).is_empty());
+        assert_eq!(load_expected_replies(&p), [] as [ExpectedReply; 0]);
         // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
@@ -2768,10 +2771,13 @@ mod loops_sidecar_tests {
         save_spawn_registry(&p, &entries[..1]).unwrap();
         assert_eq!(load_spawn_registry(&p), entries[..1]);
         // missing → empty; corrupt → empty
-        assert!(load_spawn_registry("l4s1-no-such-project").is_empty());
+        assert_eq!(
+            load_spawn_registry("l4s1-no-such-project"),
+            [] as [SpawnEntry; 0]
+        );
         let path = spawn_registry_file(&p);
         std::fs::write(&path, "{not json").unwrap();
-        assert!(load_spawn_registry(&p).is_empty());
+        assert_eq!(load_spawn_registry(&p), [] as [SpawnEntry; 0]);
         // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
@@ -2875,7 +2881,7 @@ mod loops_sidecar_tests {
         // missing → empty
         let empty_dir =
             std::env::temp_dir().join(format!("fw-agent-names-none-{}", std::process::id()));
-        assert!(load_agent_names(&empty_dir).is_empty());
+        assert_eq!(load_agent_names(&empty_dir), [] as [SpawnEntry; 0]);
         // cleanup
         let _ = std::fs::remove_file(agent_names_file(&dir));
         let _ = std::fs::remove_file(dir.join(".flywheel").join("agent-names.json.tmp"));

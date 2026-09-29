@@ -1221,9 +1221,9 @@ msg = "legacy triage"
         );
 
         let seed = seed_user_catalog_with(&dir, OverwriteScope::None, false).unwrap();
-        assert!(!seed.created_workflows.is_empty());
-        assert!(!seed.created_stages.is_empty());
-        assert!(seed.kept_workflows.is_empty());
+        assert_ne!(seed.created_workflows, [] as [String; 0]);
+        assert_ne!(seed.created_stages, [] as [String; 0]);
+        assert_eq!(seed.kept_workflows, [] as [String; 0]);
         let after_seed = catalog_drift(&dir).unwrap();
         assert!(
             after_seed
@@ -1247,7 +1247,7 @@ msg = "legacy triage"
         );
 
         let second_seed = seed_user_catalog_with(&dir, OverwriteScope::None, false).unwrap();
-        assert!(second_seed.created_stages.is_empty());
+        assert_eq!(second_seed.created_stages, [] as [String; 0]);
         assert_eq!(
             fs::read_to_string(&seeded_path).unwrap(),
             seeded_stages,
@@ -1460,7 +1460,7 @@ mod bd_sync_overwrite {
             BUGFIX,
             "seed with no --overwrite rewrote an existing file"
         );
-        assert!(rep.overwritten_workflows.is_empty());
+        assert_eq!(rep.overwritten_workflows, [] as [String; 0]);
         let _ = std::fs::remove_dir_all(&r);
     }
 

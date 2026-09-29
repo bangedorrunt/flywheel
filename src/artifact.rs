@@ -1004,7 +1004,7 @@ mod tests {
         records.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         assert_eq!(records.len(), 2);
         for rec in &records {
-            assert!(!rec.sha256.is_empty());
+            assert_ne!(rec.sha256, "");
             assert!(rec.path.exists() || rec.path.to_string_lossy().contains("file"));
             let json = serde_json::to_value(rec).unwrap();
             assert!(json.get("transcript").is_none());
