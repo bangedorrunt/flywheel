@@ -1550,4 +1550,108 @@ daily = [
         st::clear_captain_alias_file(&proj);
         let _ = std::fs::remove_file(st::spawn_registry_file(&proj));
     }
+
+    /// bd-envlock: a test that points `XDG_STATE_HOME` at a temp dir without
+    /// taking the crate env guard corrupts every other test in the process.
+    ///
+    /// `adr0010_d7_journal_rollback_restores_prior_record` did exactly that: it
+    /// made a `tempfile::tempdir()`, set the var, and let both the directory and
+    /// the binding die with the test. `tempdir()` is dropped at end of test, so
+    /// for the rest of the process `XDG_STATE_HOME` pointed at a path that no
+    /// longer existed. A concurrent or later test writing state artifacts then
+    /// failed on a directory that was never there, and because the symptom is a
+    /// missing directory rather than a wrong value, it reads as a random flake
+    /// instead of a test bug.
+    ///
+    /// The lock alone is not the whole fix. `test_state_home()` is preferred
+    /// because its `Drop` unsets the variable AND removes the directory, so the
+    /// next test inherits the real state home rather than a dead one. This test
+    /// accepts either guard: a test that only reads the environment needs the
+    /// lock without needing a temp dir.
+    ///
+    /// Scoped per `#[test]` block on purpose. A file-level check would let any
+    /// one test in a 30-lock file excuse a 31st test that locks nothing, which
+    /// is exactly the failure this exists to catch. A test that mutates the var
+    /// inside a helper function rather than in the test body is invisible to
+    /// this scan; those stay covered by the module-level convention that a file
+    /// touching `XDG_STATE_HOME` holds a guard somewhere.
+    #[test]
+    fn every_test_pointing_xdg_state_home_holds_the_env_guard() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+
+        /// One block per `#[test]`, each bounded at the next test or module
+        /// attribute. Bounding only at the next `#[test]` is not enough: the
+        /// LAST test in a module would then run on into the following module
+        /// and be blamed for whatever that module sets. Bounding only at the
+        /// next `#[cfg(` is not enough either: consecutive tests share no cfg
+        /// between them, so the first would swallow all the rest and be named
+        /// for an offence committed by a later one.
+        fn test_blocks(src: &str) -> Vec<&str> {
+            const TEST: &str = "#[test]";
+            let mut blocks = Vec::new();
+            let mut rest = src;
+            while let Some(t) = rest.find(TEST) {
+                let mut end = rest.len();
+                for marker in ["#[tokio::test]", "#[cfg("] {
+                    if let Some(i) = rest[t..].find(marker) {
+                        end = end.min(t + i);
+                    }
+                }
+                // The next test bounds this one, but search PAST this block's
+                // own marker or the block would be empty.
+                if let Some(i) = rest[t + TEST.len()..].find(TEST) {
+                    end = end.min(t + TEST.len() + i);
+                }
+                blocks.push(&rest[t..end]);
+                rest = &rest[end..];
+            }
+            blocks
+        }
+
+        let mut files = Vec::new();
+        walk(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let Ok(src) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            for block in test_blocks(&src) {
+                if !block.contains("set_var(\"XDG_STATE_HOME\"") {
+                    continue;
+                }
+                if block.contains("test_state_home()") || block.contains("lock_env()") {
+                    continue;
+                }
+                let name = block
+                    .trim_start_matches("#[test]")
+                    .split('(')
+                    .next()
+                    .unwrap_or("<unparsed>")
+                    .trim();
+                offenders.push(format!("{}: {name}", file.display()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these tests set XDG_STATE_HOME with no env guard, so the whole test \
+             process inherits a state home that may already have been deleted: \
+             {offenders:?}"
+        );
+    }
 }
