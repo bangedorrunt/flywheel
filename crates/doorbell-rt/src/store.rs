@@ -166,6 +166,24 @@ pub struct FileStore {
     state_dir: PathBuf,
 }
 
+/// Failed audit-row appends process-wide, counted by the writer itself.
+/// append_audit eprintln!s the cause on every failure path; it also bumps
+/// this, so the failure is queryable (health, tests) and no call-site
+/// `let _` can silently drop a journal write anymore — present or future.
+static AUDIT_WRITE_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many audit-row appends have failed since process start.
+#[allow(dead_code)] // consumed by tests today; health wiring is a follow-up, not this bead
+pub(crate) fn audit_write_failures() -> usize {
+    AUDIT_WRITE_FAILURES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Bump the write-failure count. Only the writer calls this.
+pub(crate) fn note_audit_write_failure() {
+    AUDIT_WRITE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 impl FileStore {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -891,6 +909,7 @@ impl FileStore {
                 "doorbell-rt: AUDIT append FAILED on {workspace} (mkdir) — refuse silent \
                  drop (GS-039): {e:#}"
             );
+            note_audit_write_failure();
             return Err(e);
         }
         let mut f = match private_append(&path) {
@@ -900,6 +919,7 @@ impl FileStore {
                     "doorbell-rt: AUDIT append FAILED on {workspace} (open) — refuse silent \
                      drop (GS-039): {e:#}"
                 );
+                note_audit_write_failure();
                 return Err(e);
             }
         };
@@ -918,6 +938,7 @@ impl FileStore {
                     "doorbell-rt: AUDIT append REFUSED on {workspace} (serialize) — a row \
                      that cannot be serialized is not a row: {e:#}"
                 );
+                note_audit_write_failure();
                 return Err(std::io::Error::other(e));
             }
         };
@@ -927,6 +948,7 @@ impl FileStore {
                 "doorbell-rt: AUDIT append FAILED on {workspace} (write) — refuse silent \
                  drop (GS-039): {e:#}"
             );
+            note_audit_write_failure();
             return Err(e);
         }
         Ok(())
