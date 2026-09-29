@@ -58,6 +58,17 @@ impl BrainConfig {
     }
 }
 
+/// The event id of a watch line, when it carries one. Local to the brain:
+/// the pure core keeps the time helpers, and the id-based dedup needs both
+/// halves in one place to decide "same event, or merely same second".
+fn watch_line_id(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 pub struct RunReport {
     pub undelivered: Vec<Undelivered>,
     pub stats: Stats,
@@ -194,6 +205,13 @@ pub struct Brain<H: Host> {
     /// newer than every traced one earns a journal row — O(1) sampling that
     /// keeps the journal bounded while staying answerable.
     dedup_high_us: Option<i64>,
+    /// Redelivery window: ids of watch lines already handled this process
+    /// lifetime, in arrival order. The plane-S high-water cannot do this job
+    /// (a second holds many events), and the window is what keeps the
+    /// same-second case from reading as a redelivery. Bounded, because a
+    /// forgotten id can only allow a duplicate ring, never hide a new one.
+    watch_seen: std::collections::VecDeque<String>,
+    watch_seen_set: BTreeSet<String>,
     /// bd-adms: the last ack-SLA expiry set `toron ack-sla` reported. A corr
     /// past SLA is re-reported on EVERY scan (live: the same 89 ids every
     /// 60s, forever), so only a CHANGE is news — a steady backlog is one
@@ -274,6 +292,8 @@ impl<H: Host> Brain<H> {
             wake_save_failed: 0,
             deaf_attempts: BTreeMap::new(),
             dedup_high_us: None,
+            watch_seen: std::collections::VecDeque::new(),
+            watch_seen_set: BTreeSet::new(),
             sla_seen: std::collections::BTreeSet::new(),
             liveness: std::sync::Arc::new(BrainLiveness::new()),
         };
@@ -502,37 +522,53 @@ impl<H: Host> Brain<H> {
     async fn on_watch(&mut self, line: String) {
         // Gap 1: plane-S cursor — skip old history on restart, persist
         // early so a crash right after doesn't re-ring.
-        if let Some(created_at) = doorbell_core::watch_created_at(&line) {
-            let us = (created_at as i64) * 1_000_000;
-            if self.wake.plane_s_cursor_us.is_some_and(|c| us <= c) {
-                // bd-bpj1 (F3): the drop leaves a trace — a silent dedup is
-                // indistinguishable from a lost event on later inspection.
-                // Bounded two ways: presence heartbeats (kind 20001, never
-                // ring) stay silent, and only a suppression newer than every
-                // traced one earns a row (redeliveries repeat identically).
-                *self
-                    .stats
-                    .rings_by_class
-                    .entry("watch_dedup".into())
-                    .or_default() += 1;
-                let ring_candidate = serde_json::from_str::<serde_json::Value>(&line)
-                    .ok()
-                    .and_then(|v| v.get("kind").and_then(|k| k.as_u64()))
-                    .is_none_or(|k| k != 20001);
-                if ring_candidate && self.dedup_high_us.is_none_or(|h| us > h) {
-                    self.dedup_high_us = Some(us);
-                    self.journal(
-                        &serde_json::json!({"rt_kind": "Watch"}),
-                        &[],
-                        serde_json::json!({"stage": "dedup", "cursor_us": us}),
-                        &[],
-                    );
-                }
-                return;
+        //
+        // The timestamp answers ONE question — is this history from before a
+        // restart? — and only a STRICTLY older second is unambiguous. Two
+        // events can share a second, so `<=` also ate the second wake of every
+        // busy second, indistinguishably from a redelivery. The id decides
+        // "same event"; the high-water only decides "before the restart".
+        let id = watch_line_id(&line);
+        let redelivered = id
+            .as_deref()
+            .is_some_and(|id| self.watch_seen_set.contains(id));
+        let us = doorbell_core::watch_created_at(&line).map(|c| (c as i64) * 1_000_000);
+        let history = us.is_some_and(|us| us < self.wake.plane_s_cursor_us.unwrap_or(i64::MIN));
+        if redelivered || history {
+            // bd-bpj1 (F3): the drop leaves a trace — a silent dedup is
+            // indistinguishable from a lost event on later inspection.
+            // Bounded two ways: presence heartbeats (kind 20001, never
+            // ring) stay silent, and only a suppression newer than every
+            // traced one earns a row (redeliveries repeat identically).
+            *self
+                .stats
+                .rings_by_class
+                .entry("watch_dedup".into())
+                .or_default() += 1;
+            let ring_candidate = serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .and_then(|v| v.get("kind").and_then(|k| k.as_u64()))
+                .is_none_or(|k| k != 20001);
+            if let (Some(us), true) = (us, ring_candidate)
+                && self.dedup_high_us.is_none_or(|h| us > h)
+            {
+                self.dedup_high_us = Some(us);
+                self.journal(
+                    &serde_json::json!({"rt_kind": "Watch"}),
+                    &[],
+                    serde_json::json!({"stage": "dedup", "cursor_us": us}),
+                    &[],
+                );
             }
+            return;
+        }
+        if let Some(us) = us {
             self.wake.plane_s_cursor_us =
                 Some(self.wake.plane_s_cursor_us.map(|c| c.max(us)).unwrap_or(us));
             self.flush_wake("watch-cursor");
+        }
+        if let Some(id) = id {
+            self.remember_watch_id(id);
         }
         *self.stats.rings_by_class.entry("watch".into()).or_default() += 1;
         let effects = self.host.tick(&BrainMsg::Watch(line.clone()));
@@ -1107,6 +1143,19 @@ impl<H: Host> Brain<H> {
             obj.insert("kind".into(), kind.into());
         }
         let _ = self.store.append_audit(&self.cfg.workspace, detail);
+    }
+
+    /// Remember one handled watch id, evicting oldest-first past the cap.
+    fn remember_watch_id(&mut self, id: String) {
+        const WATCH_SEEN_CAP: usize = 512;
+        if self.watch_seen_set.insert(id.clone()) {
+            self.watch_seen.push_back(id);
+        }
+        while self.watch_seen.len() > WATCH_SEEN_CAP {
+            if let Some(old) = self.watch_seen.pop_front() {
+                self.watch_seen_set.remove(&old);
+            }
+        }
     }
 
     fn persist_hear(&self) {
@@ -1860,6 +1909,73 @@ mod tests {
         assert!(
             audit.contains("\"kind\":\"wake_save_failed\""),
             "a wake-state write that did not land must NAME itself: {audit}"
+        );
+    }
+
+    /// Two events can share a second, so `created_at` alone cannot answer
+    /// "already handled": the plane-S high-water is compared with `<=`, so the
+    /// second event of a busy second was dropped before it could ring, and the
+    /// drop was indistinguishable from a redelivery. The id is what
+    /// distinguishes them, and a redelivery must still dedup.
+    #[tokio::test]
+    async fn two_events_in_one_second_both_ring_and_a_redelivery_still_dedups() {
+        let line = |id: &str| format!("{{\"kind\":9,\"id\":\"{id}\",\"created_at\":100}}");
+        let (mut brain, _rx, _tx) = test_brain(
+            "same-second",
+            vec![
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "first".into(),
+                }],
+                vec![Effect::Prompt {
+                    pin: "p".into(),
+                    line: "second".into(),
+                }],
+            ],
+        );
+        let (sink, sent) = MockSink::new();
+        brain.sinks.add_sink("herdr", Box::new(sink));
+
+        brain.dispatch(BrainMsg::Watch(line("aa"))).await;
+        brain.dispatch(BrainMsg::Watch(line("bb"))).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if sent.lock().expect("sent log").len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both same-second wakes deliver");
+        let lines: Vec<String> = sent
+            .lock()
+            .expect("sent log")
+            .iter()
+            .map(|(_, l)| l.clone())
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["first".to_string(), "second".to_string()],
+            "a shared second is not a reason to drop a wake: {lines:?}"
+        );
+
+        // The same id again is a redelivery and must dedup, not re-ring.
+        brain.dispatch(BrainMsg::Watch(line("aa"))).await;
+        assert_eq!(
+            sent.lock().expect("sent log").len(),
+            2,
+            "a redelivered event is still suppressed"
+        );
+        assert_eq!(
+            brain
+                .stats
+                .rings_by_class
+                .get("watch_dedup")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "the suppression stays counted, never silent"
         );
     }
 
