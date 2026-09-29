@@ -515,7 +515,7 @@ fn status_lists_all_with_derived_status() {
         &["cron", "status", "--json", "--project", "/nonexistent-proj"],
     ));
     let rows = v["crons"].as_array().unwrap();
-    assert!(!rows.is_empty());
+    assert_ne!(rows.as_slice(), [] as [serde_json::Value; 0]);
     let row = rows.iter().find(|c| c["name"] == "alpha").unwrap();
     assert_eq!(row["status"], "due");
     assert!(row["next_due"].as_i64().is_some(), "next_due computed");

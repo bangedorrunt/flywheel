@@ -284,7 +284,7 @@ mod tests {
     fn exactly_twenty_one_leaves_with_when_and_rule() {
         assert_eq!(PRINCIPLES.len(), 21);
         for p in &PRINCIPLES {
-            assert!(!p.name.is_empty());
+            assert_ne!(p.name, "");
             assert!(!p.when.is_empty(), "{}: when must be non-empty", p.name);
             assert!(!p.rule.is_empty(), "{}: rule must be non-empty", p.name);
         }

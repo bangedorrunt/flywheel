@@ -2093,7 +2093,7 @@ mod tests {
             state: "idle".into(),
         };
         let (next, cmds) = crate::workspace::tick(&model, &presence);
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, [] as [crate::workspace::Cmd; 0]);
         journal_append_workspace(
             &dir,
             "ws1",
@@ -2185,7 +2185,10 @@ mod tests {
             cmds.iter().any(|c| matches!(c, Cmd::Digest { .. })),
             "digest batch emits: {cmds:?}"
         );
-        assert!(drained.wake.digests.is_empty());
+        assert_eq!(
+            drained.wake.digests,
+            [] as [doorbell_core::wake_core::DigestEntry; 0]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2717,17 +2720,17 @@ mod tests {
         let npub = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         h.note_inject("PaleHarbor", Some(npub), 10);
         h.note_heard_pubkey(npub);
-        assert!(h.unanswered_pins().is_empty());
-        assert!(h.expire(200, UNANSWERED_SECS).is_empty());
+        assert_eq!(h.unanswered_pins(), [] as [String; 0]);
+        assert_eq!(h.expire(200, UNANSWERED_SECS), [] as [String; 0]);
     }
 
     #[test]
     fn hear_timeout_marks_unanswered() {
         let mut h = HearTracker::default();
         h.note_inject("PaleHarbor", None, 10);
-        assert!(
-            h.expire(10 + UNANSWERED_SECS - 1, UNANSWERED_SECS)
-                .is_empty()
+        assert_eq!(
+            h.expire(10 + UNANSWERED_SECS - 1, UNANSWERED_SECS),
+            [] as [String; 0]
         );
         let expired = h.expire(10 + UNANSWERED_SECS, UNANSWERED_SECS);
         assert_eq!(expired, vec!["PaleHarbor".to_string()]);
@@ -2740,7 +2743,7 @@ mod tests {
         h.note_inject("PaleHarbor", None, 0);
         let _ = h.expire(UNANSWERED_SECS, UNANSWERED_SECS);
         h.note_heard_pin("PaleHarbor");
-        assert!(h.unanswered_pins().is_empty());
+        assert_eq!(h.unanswered_pins(), [] as [String; 0]);
     }
 
     #[test]
@@ -2750,8 +2753,11 @@ mod tests {
         h.note_inject("PaleHarbor", None, 10);
         h.remember_npub("PaleHarbor", Some(npub));
         h.note_heard_pubkey(npub);
-        assert!(h.expire(10 + UNANSWERED_SECS, UNANSWERED_SECS).is_empty());
-        assert!(h.unanswered_pins().is_empty());
+        assert_eq!(
+            h.expire(10 + UNANSWERED_SECS, UNANSWERED_SECS),
+            [] as [String; 0]
+        );
+        assert_eq!(h.unanswered_pins(), [] as [String; 0]);
     }
 
     #[test]
@@ -2762,7 +2768,7 @@ mod tests {
         let _ = h.expire(UNANSWERED_SECS, UNANSWERED_SECS);
         assert_eq!(h.unanswered_pins(), vec!["PaleHarbor".to_string()]);
         h.note_heard_pubkey(npub);
-        assert!(h.unanswered_pins().is_empty());
+        assert_eq!(h.unanswered_pins(), [] as [String; 0]);
     }
 
     #[test]
@@ -2781,7 +2787,10 @@ mod tests {
             "{text}"
         );
         stop(&dir, "w1");
-        assert!(read_unanswered(&unanswered_file(&dir, "w1")).is_empty());
+        assert_eq!(
+            read_unanswered(&unanswered_file(&dir, "w1")),
+            [] as [String; 0]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

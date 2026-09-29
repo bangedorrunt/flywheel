@@ -111,7 +111,7 @@ mod tests {
         std::fs::write(&dir, b"not-a-dir").unwrap();
         let path = dir.join("x.toml");
         let err = atomic_write(&path, b"data").expect_err("write must fail");
-        assert!(!format!("{err:#}").is_empty());
+        assert_ne!(format!("{err:#}"), "");
         assert!(!path.exists(), "no destination written on failure");
         let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
             .unwrap()

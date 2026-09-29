@@ -238,8 +238,14 @@ mod tests {
         let pane: HashSet<String> = ["PlumGoose".to_string()].into_iter().collect();
         let heart: HashSet<String> = ["TealDune".to_string()].into_iter().collect();
         // Bound pane: silent. Heartbeat (CLI actor, no pane): silent.
-        assert!(dead_pin_warnings(&["PlumGoose".into()], &pane, &heart).is_empty());
-        assert!(dead_pin_warnings(&["TealDune".into()], &pane, &heart).is_empty());
+        assert_eq!(
+            dead_pin_warnings(&["PlumGoose".into()], &pane, &heart),
+            [] as [String; 0]
+        );
+        assert_eq!(
+            dead_pin_warnings(&["TealDune".into()], &pane, &heart),
+            [] as [String; 0]
+        );
         // Roster-only pin (bound to nothing, no heartbeat): loud.
         let warns = dead_pin_warnings(&["QuietHeron".into()], &pane, &heart);
         assert_eq!(warns.len(), 1);
@@ -250,7 +256,7 @@ mod tests {
             dead_pin_warnings(&["@QuietHeron".into()], &pane, &heart).len(),
             1
         );
-        assert!(dead_pin_warnings(&[], &pane, &heart).is_empty());
+        assert_eq!(dead_pin_warnings(&[], &pane, &heart), [] as [String; 0]);
     }
 
     /// bd-8pis: bound-but-dead panes warn; daemon-down trusts the

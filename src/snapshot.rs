@@ -737,7 +737,7 @@ mod adr0010_d10_tests {
             ]
         });
         assert_eq!(parse_held_paths(&board), vec!["src/**"]);
-        assert!(parse_held_paths(&serde_json::json!({})).is_empty());
+        assert_eq!(parse_held_paths(&serde_json::json!({})), [] as [String; 0]);
     }
 
     #[test]

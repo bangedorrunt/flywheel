@@ -1527,7 +1527,7 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), VerdictKind::ALL.len());
         for k in VerdictKind::ALL {
-            assert!(!k.gate_name().is_empty());
+            assert_ne!(k.gate_name(), "");
             assert_eq!(k.gate_name(), k.gate_name().to_ascii_lowercase());
         }
     }
@@ -1869,7 +1869,7 @@ mod tests {
         // non-runnable band (nothing could have been run).
         let bead = bead_from_br_show_for_close(&dir, &bead_id).unwrap();
         assert_eq!(bead.priority, 3);
-        assert!(bead.verify.is_empty());
+        assert_eq!(bead.verify, "");
         assert!(!verify_is_loop_runnable(&bead.verify));
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
         let v = |kind| Verdict {
@@ -2528,7 +2528,7 @@ mod tests {
                     receipt_eligible,
                     "non-runnable VERIFY bead MAY close via WorkerReceipt"
                 );
-                assert!(!sha.is_empty());
+                assert_ne!(sha, "");
             }
             other => panic!("expected Missing(receipt-eligible), got {other:?}"),
         }
