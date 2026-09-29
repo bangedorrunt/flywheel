@@ -999,6 +999,7 @@ dependencies = [
  "dirs",
  "doorbell-core",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha1",

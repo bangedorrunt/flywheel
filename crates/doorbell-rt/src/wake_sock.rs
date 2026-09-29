@@ -56,6 +56,64 @@ pub const AUDIT_SOCK_SHED: &str = "wake_sock_shed";
 /// once) and it bounds the worst case at 2 resyncs/second instead of
 /// socket-speed.
 pub const RESYNC_FLOOR: Duration = Duration::from_millis(500);
+
+/// bd-68q2: the process is out of file descriptors — reconnecting is futile
+/// until they drop, and auditing it as "sidecar absent" restarts into a wall
+/// while hiding the real fault (the 234-fd EMFILE that killed wake.sock).
+pub const AUDIT_SOCK_EMFILE: &str = "wake_sock_emfile";
+
+/// True when a connect error means WE are out of fds (EMFILE) or the system
+/// is (ENFILE) — either way the wall is on our side of the socket.
+pub(crate) fn is_fd_exhaustion(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(code) if code == libc::EMFILE || code == libc::ENFILE
+    )
+}
+
+/// Process fd census. Honestly absent (None), never zero, where unreadable.
+/// Used in EMFILE/still-failing rows and /health next to the restart rate —
+/// the two numbers that together say "restart storm" vs "fd wall".
+pub fn open_fd_count() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    let n = std::fs::read_dir("/proc/self/fd").ok().map(|rd| rd.count());
+    #[cfg(target_os = "macos")]
+    let n = macos_fd_count();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let n: Option<usize> = None;
+    n
+}
+
+/// macOS fd census via proc_pidinfo. The null-buffer size query goes stale
+/// (measured: identical size before/after real opens), so fill a real buffer
+/// and grow on truncation instead of trusting the hint.
+#[cfg(target_os = "macos")]
+fn macos_fd_count() -> Option<usize> {
+    let elem = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: buffer is a live Vec of the passed size; proc_pidinfo writes at
+    // most buffersize bytes. n < 0 is failure; n == size may be truncation.
+    let mut size = 1024 * elem;
+    for _ in 0..4 {
+        let mut buf = vec![0u8; size];
+        let n = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                size as libc::c_int,
+            )
+        };
+        if n < 0 {
+            return None;
+        }
+        if (n as usize) < size {
+            return Some(n as usize / elem);
+        }
+        size *= 2;
+    }
+    None
+}
 /// bd-gdfe: a consumer that ended without its terminal outcome (worker
 /// panic or abort) journals this instead of dying silently — the gap that
 /// left hosted workspaces wake-blind with no backoff explanation.
@@ -312,12 +370,39 @@ async fn run_wake_loop(
         .await
         {
             Ok(Ok(s)) => s,
-            _ => {
+            Ok(Err(e)) => {
+                // bd-68q2: this was one wildcard arm, so EMFILE (WE are out of
+                // fds — reconnecting is futile until they drop) read as
+                // "sidecar absent" and restarted into a wall. Name the wall,
+                // census the fds, keep the restart (never-deaf).
+                let emfile = is_fd_exhaustion(&e);
+                audit(
+                    if emfile {
+                        AUDIT_SOCK_EMFILE
+                    } else {
+                        AUDIT_SOCK_ABSENT
+                    },
+                    serde_json::json!({
+                        "sock": opts.sock_path.display().to_string(),
+                        "reason": if emfile {
+                            "connect failed: process out of file descriptors, not an absent sidecar"
+                        } else {
+                            "connect failed: daemon sidecar absent, not a quiet bus"
+                        },
+                        "os_error": e.raw_os_error(),
+                        "open_fds": open_fd_count(),
+                    }),
+                );
+                send(WakeOutcome::Died);
+                return;
+            }
+            Err(_) => {
                 audit(
                     AUDIT_SOCK_ABSENT,
                     serde_json::json!({
                         "sock": opts.sock_path.display().to_string(),
-                        "reason": "connect failed: daemon sidecar absent, not a quiet bus",
+                        "reason": "connect timed out: sidecar not accepting, not a quiet bus",
+                        "timeout_ms": opts.handshake_timeout.as_millis() as u64,
                     }),
                 );
                 send(WakeOutcome::Died);
@@ -406,6 +491,58 @@ async fn run_wake_loop(
 
 #[cfg(test)]
 mod tests {
+    /// bd-68q2: EMFILE/ENFILE (we are out of fds) must not read as "sidecar
+    /// absent". Wrong diagnosis here restarts into a wall and hides the real
+    /// fault the way the wildcard arm once hid every stream end.
+    #[test]
+    fn fd_exhaustion_classifies_by_errno_not_kind() {
+        assert!(
+            super::is_fd_exhaustion(&std::io::Error::from_raw_os_error(libc::EMFILE)),
+            "EMFILE is us out of fds, not an absent sidecar"
+        );
+        assert!(
+            super::is_fd_exhaustion(&std::io::Error::from_raw_os_error(libc::ENFILE)),
+            "ENFILE is the system out of fds, same wall"
+        );
+        assert!(
+            !super::is_fd_exhaustion(&std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such socket"
+            )),
+            "a missing socket stays absent"
+        );
+        assert!(
+            !super::is_fd_exhaustion(&std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "nobody listening"
+            )),
+            "refused stays absent"
+        );
+    }
+
+    /// bd-68q2: the fd census must move with real opens, or it is decoration.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn open_fd_count_moves_with_real_opens() {
+        let before = super::open_fd_count().expect("census must read here");
+        let held: Vec<std::fs::File> = (0..3)
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
+            .collect();
+        let after = super::open_fd_count().expect("census must still read");
+        assert!(
+            after >= before + 3,
+            "three held opens must show: {before} -> {after}"
+        );
+        drop(held);
+    }
+
+    /// bd-68q2: where the census cannot read it is honestly absent, never zero.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn open_fd_count_is_honestly_absent_elsewhere() {
+        // No assert on Some: the contract is Option, callers render null.
+        let _ = super::open_fd_count();
+    }
 
     /// bd-v7uu: a DELIBERATELY retired consumer is silent; one that vanishes on
     /// its own is still loud.

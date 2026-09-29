@@ -2104,6 +2104,10 @@ fn health_body(app: &AppState) -> String {
                 * 100.0)
                 .round()
                 / 100.0,
+            // bd-68q2: process fd census next to the restart rate — the two
+            // numbers that together say "restart storm" vs "fd wall". Null
+            // where unreadable; the EMFILE rows carry the same number at failure.
+            "open_fds": doorbell_rt::wake_sock::open_fd_count(),
         },
         // GS-062 ASK-USER E: wake_liveness Quiet/Live/Deaf (same shape as
         // flywheel serve /health). Keys come from AppState.hosted.

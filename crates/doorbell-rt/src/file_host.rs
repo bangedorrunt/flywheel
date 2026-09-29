@@ -100,6 +100,29 @@ use doorbell_core::{PresenceVerdict, registry_key};
 /// journal filled with fabricated deaths.
 pub const AUDIT_BRAIN_FULL: &str = "wake_brain_full";
 
+/// Digest row kind for a still-failing wake socket: the live rate, the fd
+/// census, and the backoff about to sleep. A month-long outage used to read
+/// as ONE absent row (deduped) plus silent 16s reconnects; this names the
+/// ongoing rate sampled (should_audit_count), bounded rows, true size readable.
+/// The 16s gate itself is untouched (GS-007 never-deaf).
+pub const AUDIT_WAKE_FAILING_STILL: &str = "wake_failing_still";
+
+/// Build the still-failing digest row. Pure constructor so the shape is
+/// unit-testable; the sampling decision stays with the caller.
+pub(crate) fn failing_still_row(
+    consecutive_fails: u64,
+    open_fds: Option<usize>,
+    backoff_s: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": AUDIT_WAKE_FAILING_STILL,
+        "reason": "wake socket still failing; reconnecting per never-deaf backoff, not parked",
+        "consecutive_fails": consecutive_fails,
+        "open_fds": open_fds,
+        "backoff_s": backoff_s,
+    })
+}
+
 /// HerdrStatus changes the sweep could not enqueue on a full or closed brain
 /// channel. Counted per host (self.herdr advances only on receipt, so drops
 /// self-heal next sweep); audited sampled via should_audit_count, the same
@@ -1808,6 +1831,18 @@ impl Host for FileHost {
         // going wake-blind), so the loop itself is not the bug. What was broken
         // is that the gate never opened again — see the `retry` field.
         let backoff = self.retry.lock().map(|mut r| r.record_fail()).unwrap_or(16);
+        // bd-68q2: sample a digest naming the live rate, the fd census, and
+        // the backoff — one row per power-of-two fails, decided by fails, not
+        // by wall clock, so a storm reads as a rate in the audit log.
+        let fails = self.retry.lock().map(|r| r.fails()).unwrap_or(0);
+        if should_audit_count(fails as usize) {
+            Self::append_audit_row(
+                &self.cfg.flywheel_state,
+                &self.cfg.workspace,
+                AUDIT_WAKE_FAILING_STILL,
+                failing_still_row(fails as u64, crate::wake_sock::open_fd_count(), backoff),
+            );
+        }
         let tx = self.tx.clone();
         let project = self.cfg.project.clone();
         let fw_state = self.cfg.flywheel_state.clone();
@@ -3237,6 +3272,30 @@ mod tests {
             "the herdr status change must reach the brain channel"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-68q2: the still-failing digest names the rate, the fd census, and
+    /// the backoff — one row per power-of-two fails, decided by the caller.
+    #[test]
+    fn failing_still_row_names_rate_and_fds() {
+        let row = failing_still_row(8, Some(234), 16);
+        assert_eq!(
+            row.get("kind").and_then(|k| k.as_str()),
+            Some(AUDIT_WAKE_FAILING_STILL),
+            "the row carries its kind"
+        );
+        assert_eq!(
+            row.get("consecutive_fails").and_then(|f| f.as_u64()),
+            Some(8)
+        );
+        assert_eq!(row.get("open_fds").and_then(|f| f.as_u64()), Some(234));
+        assert_eq!(row.get("backoff_s").and_then(|b| b.as_u64()), Some(16));
+        let row_none = failing_still_row(9, None, 16);
+        assert_eq!(
+            row_none.get("open_fds"),
+            Some(&serde_json::Value::Null),
+            "absent census stays null, never zero"
+        );
     }
 
     /// bd-jqjh: a full brain channel must not silently drop HerdrStatus.
