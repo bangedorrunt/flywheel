@@ -954,7 +954,7 @@ mod adr0010_d12_tests {
             "unknown tier falls back"
         );
         let (none, skipped_all) = parse_lane_entries("not json", LearningLane::Wiki);
-        assert!(none.is_empty());
+        assert_eq!(none, [] as [LearningEntry; 0]);
         assert_eq!(skipped_all, 1);
     }
 

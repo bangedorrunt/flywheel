@@ -743,6 +743,7 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 as_agent.as_deref(),
                 *timeout_secs,
                 *interval_secs,
+                None,
             )?;
         }
         MailCmd::Send {

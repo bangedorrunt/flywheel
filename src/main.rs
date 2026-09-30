@@ -4230,14 +4230,14 @@ mod spawn_profile_plan_tests {
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
         std::fs::write(
             cfg_home.join("flywheel/models.toml"),
-            "[models.\"opencode-go/deepseek-v4-flash\"]\n",
+            "[models.\"opencode-go/deepseek-v4.1-flash\"]\n",
         )
         .expect("models.toml");
-        let p = profile("omp", "deepseek-v4-flash");
-        let args = profile_launch_args("omp", &p, None).expect("launch args");
+        let p = profile("pi", "deepseek-v4.1-flash");
+        let args = profile_launch_args("pi", &p, None).expect("launch args");
         assert_eq!(
             args,
-            vec!["--model=opencode-go/deepseek-v4-flash"],
+            vec!["--model", "opencode-go/deepseek-v4.1-flash"],
             "spawn must inject registry provider, not bare id: {args:?}"
         );
     }
@@ -4248,7 +4248,7 @@ mod spawn_profile_plan_tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         // Compiled-in routing defaults apply zero-config (no models.toml).
-        let p = profile("opencode", "deepseek-v4-flash");
+        let p = profile("opencode", "deepseek-v4.1-flash");
         assert_eq!(
             // bd-crlx: opencode gets NO model argv. The root command herdr
             // launches has no `--model` (only `opencode run` does) and v2.0.16
@@ -4263,7 +4263,7 @@ mod spawn_profile_plan_tests {
                 .expect("opencode")
                 .env_model_pin
                 .as_deref(),
-            Some("opencode-go/deepseek-v4-flash"),
+            Some("opencode-go/deepseek-v4.1-flash"),
             "the pin must be delivered by pane env, not dropped"
         );
         assert!(
@@ -4275,16 +4275,15 @@ mod spawn_profile_plan_tests {
             profile_launch_args("pi", &pi, None).expect("pi"),
             vec!["--model", "zai/glm-5.3"]
         );
-        let mut omp = profile("omp", "glm-5.3");
-        omp.effort = "max".into();
-        omp.smol = "deepseek-v4-flash".into();
+        // bd-47fu: omp is gone, and it was the ONLY harness carrying
+        // `--thinking=`/`--smol=`; pi takes TWO argv entries and has no
+        // role-model flags, which is the live contract now.
+        let mut pi = profile("pi", "zai/glm-5.3");
+        pi.effort = "max".into();
+        pi.smol = "zai/glm-4.5-air".into();
         assert_eq!(
-            profile_launch_args("omp", &omp, None).expect("omp"),
-            vec![
-                "--model=zai/glm-5.3",
-                "--thinking=max",
-                "--smol=opencode-go/deepseek-v4-flash"
-            ]
+            profile_launch_args("pi", &pi, None).expect("pi"),
+            vec!["--model", "zai/glm-5.3", "--thinking", "max"]
         );
         // Unknown harness injects nothing — but the model must still ROUTE.
         let mut unknown = profile("hermes", "glm-5.3");
@@ -4320,11 +4319,11 @@ mod spawn_profile_plan_tests {
             "the argv embeds the recorded pin: {args:?} vs {pin}"
         );
         // A concrete id takes the same one-resolution path.
-        let plan = profile_launch_plan("omp", &profile("omp", "glm-5.3"), None)
+        let plan = profile_launch_plan("pi", &profile("pi", "zai/glm-5.3"), None)
             .expect("concrete model plan");
         let (args, pin) = (&plan.args, &plan.model);
         assert_eq!(pin, "zai/glm-5.3");
-        assert_eq!(*args, vec!["--model=zai/glm-5.3"]);
+        assert_eq!(*args, vec!["--model", "zai/glm-5.3"]);
     }
 
     /// STRICT routing: a profile model that is NOT a registry id fails the
@@ -4347,23 +4346,23 @@ mod spawn_profile_plan_tests {
         )
         .expect("models.toml");
         // Bare id: alphabetical default provider (aaa).
-        let bare = profile("omp", "glm-5.2");
+        let bare = profile("pi", "glm-5.2");
         assert_eq!(
-            profile_launch_args("omp", &bare, None).expect("bare"),
-            vec!["--model=aaa/glm-5.2"]
+            profile_launch_args("pi", &bare, None).expect("bare"),
+            vec!["--model", "aaa/glm-5.2"]
         );
         // Explicit provider pins the other provider carrying the same id.
-        let mut pinned = profile("omp", "glm-5.2");
+        let mut pinned = profile("pi", "glm-5.2");
         pinned.provider = "zzz".into();
         assert_eq!(
-            profile_launch_args("omp", &pinned, None).expect("pinned"),
-            vec!["--model=zzz/glm-5.2"]
+            profile_launch_args("pi", &pinned, None).expect("pinned"),
+            vec!["--model", "zzz/glm-5.2"]
         );
         // Unknown provider: loud failure naming the composite — never a
         // silent fall back to the default provider.
-        let mut ghost = profile("omp", "glm-5.2");
+        let mut ghost = profile("pi", "glm-5.2");
         ghost.provider = "qqq".into();
-        let err = profile_launch_args("omp", &ghost, None).expect_err("unknown provider");
+        let err = profile_launch_args("pi", &ghost, None).expect_err("unknown provider");
         assert!(
             err.to_string().contains("qqq/glm-5.2"),
             "error names the composite pair: {err}"
@@ -4388,26 +4387,31 @@ mod spawn_profile_plan_tests {
         )
         .expect("models.toml");
         // Bare model id: registered -> default-provider route.
-        let args = bare_model_launch_args("omp", "glm-5.2", "").expect("bare id");
+        let args = bare_model_launch_args("pi", "glm-5.2", "").expect("bare id");
         assert_eq!(
             args,
-            vec!["--model=aaa/glm-5.2"],
+            vec!["--model", "aaa/glm-5.2"],
             "registered bare id routes"
         );
         // Explicit provider pins the other provider carrying the same id.
-        let args = bare_model_launch_args("omp", "glm-5.2", "zzz").expect("pinned");
-        assert_eq!(args, vec!["--model=zzz/glm-5.2"], "explicit provider wins");
+        let args = bare_model_launch_args("pi", "glm-5.2", "zzz").expect("pinned");
+        assert_eq!(
+            args,
+            vec!["--model", "zzz/glm-5.2"],
+            "explicit provider wins"
+        );
         // Unregistered pair: LENIENT passthrough (never a strict failure —
         // the strict check is for profile-sourced ids only).
-        let args = bare_model_launch_args("omp", "ghost-model", "").expect("lenient passthrough");
-        assert_eq!(args, vec!["--model=ghost-model"]);
-        let args = bare_model_launch_args("omp", "ghost-model", "qqq").expect("pair passthrough");
-        assert_eq!(args, vec!["--model=qqq/ghost-model"]);
-        // Empty model: bd-88m4 — omp rides the premium slot now.
+        let args = bare_model_launch_args("pi", "ghost-model", "").expect("lenient passthrough");
+        assert_eq!(args, vec!["--model", "ghost-model"]);
+        let args = bare_model_launch_args("pi", "ghost-model", "qqq").expect("pair passthrough");
+        assert_eq!(args, vec!["--model", "qqq/ghost-model"]);
+        // Empty model: pi rides the standard slot, so a bare spawn with no
+        // --model resolves the compiled-in standard pair.
         assert_eq!(
-            bare_model_launch_args("omp", "", "").expect("empty model"),
-            vec!["--model=zai/glm-5.3"],
-            "bare omp without --model uses the premium slot"
+            bare_model_launch_args("pi", "", "").expect("empty model"),
+            vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
+            "bare pi without --model uses the standard slot"
         );
     }
 
@@ -4433,12 +4437,13 @@ mod spawn_profile_plan_tests {
             vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
             "pi spawn without --model uses the standard slot: {args:?}"
         );
-        // bd-88m4: omp IS the premium harness — a bare omp spawn rides
-        // the premium slot instead of launching model-less.
-        assert_eq!(
-            bare_model_launch_args("omp", "", "").expect("omp implies premium"),
-            vec!["--model=zai/glm-5.3"],
-            "omp spawn without --model uses the premium slot"
+        // bd-47fu: omp WAS the premium harness and is gone. The remaining
+        // premium-slot harness is Closed (grok), and its bare-spawn refusal
+        // is now the contract: never launch model-less, never guess.
+        let err = bare_model_launch_args("grok", "", "").expect_err("closed premium");
+        assert!(
+            err.to_string().contains("grok"),
+            "the refusal names the harness that cannot be routed: {err}"
         );
         // Unknown kind: no implied slot → no flags (unchanged).
         assert_eq!(
@@ -4545,14 +4550,14 @@ mod spawn_profile_plan_tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
         let p = profile("omp", "totally-unknown-model");
-        let err = profile_launch_args("omp", &p, None).expect_err("unknown id must fail");
+        let err = profile_launch_args("pi", &p, None).expect_err("unknown id must fail");
         assert!(
             err.to_string().contains("flywheel model add"),
             "error names the fix: {err}"
         );
-        // big-pickle is opencode-only (free there alone): omp is refused.
-        let bp = profile("omp", "big-pickle");
-        let err = profile_launch_args("omp", &bp, None).expect_err("caps must refuse omp");
+        // big-pickle is opencode-only (free there alone): pi is refused.
+        let bp = profile("pi", "big-pickle");
+        let err = profile_launch_args("pi", &bp, None).expect_err("caps must refuse");
         assert!(
             err.to_string().contains("not routable"),
             "caps exclusion is an error: {err}"
@@ -4566,9 +4571,9 @@ mod spawn_profile_plan_tests {
             Some("opencode/big-pickle")
         );
         // A role model (smol) is held to the same standard.
-        let mut role = profile("omp", "deepseek-v4-flash");
+        let mut role = profile("pi", "zai/glm-4.5-air");
         role.smol = "ghost-role".into();
-        assert!(profile_launch_args("omp", &role, None).is_err());
+        assert!(profile_launch_args("pi", &role, None).is_err());
     }
 
     #[test]
@@ -4579,14 +4584,14 @@ mod spawn_profile_plan_tests {
         // bd-crlx: the peer template is the ONLY launch arg opencode gets.
         // Prepending a model flag here is what killed every opencode pane
         // seat, so the launch text is now genuinely arg 0.
-        let p = profile("opencode", "deepseek-v4-flash");
+        let p = profile("opencode", "deepseek-v4.1-flash");
         let plan = profile_launch_plan("opencode", &p, None).expect("launch args");
         let mut args = plan.args.clone();
         args.extend(vec!["peer template".to_string()]);
         assert_eq!(args, vec!["peer template"]);
         assert_eq!(
             plan.env_model_pin.as_deref(),
-            Some("opencode-go/deepseek-v4-flash"),
+            Some("opencode-go/deepseek-v4.1-flash"),
             "the model still reaches the seat, by env"
         );
     }
@@ -4666,9 +4671,11 @@ mod profile_run_spawn_tests {
         let _guard = crate::config::lock_env();
         let dir = tempfile::TempDir::new().expect("temp dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-        let mut coder = profile("omp", "glm-5.3");
+        // bd-47fu: omp is no longer a registered harness; the point of the
+        // test is a KNOWN profile injecting args, so name a live one.
+        let mut coder = profile("pi", "zai/glm-5.3");
         coder.effort = "max".into();
-        let args = profile_launch_args("omp", &coder, None).expect("launch args");
+        let args = profile_launch_args("pi", &coder, None).expect("launch args");
         assert!(
             !args.is_empty(),
             "known profile must inject model/effort args"
@@ -4880,7 +4887,7 @@ mod internal_respawn_tests {
     fn write_profiles_toml(dir: &tempfile::TempDir) {
         std::fs::write(
             dir.path().join("config/flywheel/profiles.toml"),
-            "[profiles.omp-coder]\nharness = \"omp\"\nmodel = \"glm-5.3\"\neffort = \"max\"\nsmol = \"glm-4.5-air\"\n",
+            "[profiles.pi-coder]\nharness = \"pi\"\nmodel = \"zai/glm-5.3\"\neffort = \"max\"\nsmol = \"zai/glm-4.5-air\"\n",
         )
         .expect("profiles.toml");
         // The role model is a USER registry entry (layered over the
@@ -5082,17 +5089,17 @@ mod internal_respawn_tests {
         state::save_spawn_registry(
             &key,
             &[
-                state::SpawnEntry::profiled("wA:p1", "profile-coder", "omp-coder", "omp", None),
+                state::SpawnEntry::profiled("wA:p1", "profile-coder", "pi-coder", "pi", None),
                 state::SpawnEntry::legacy("wA:p2", "flywheel-demo-oc"),
             ],
         )
         .expect("registry");
 
-        let omp = respawn_launch_args(&cfg, "demo", "profile-coder", "omp");
-        assert!(!omp.is_empty(), "profiled agent re-injects its launch args");
+        let pi = respawn_launch_args(&cfg, "demo", "profile-coder", "pi");
+        assert!(!pi.is_empty(), "profiled agent re-injects its launch args");
         assert!(
-            omp.iter().any(|a| a.contains("glm-5.3")),
-            "model flag: {omp:?}"
+            pi.iter().any(|a| a.contains("glm-5.3")),
+            "model flag: {pi:?}"
         );
 
         let legacy = respawn_launch_args(&cfg, "demo", "flywheel-demo-oc", "opencode");
@@ -35010,7 +35017,10 @@ mod xproj_tests {
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].1.contains("recipe=daily"));
         seen.insert("2".to_string());
-        assert_eq!(xproj_prompts_for_unseen(&items, &seen), [] as [(String, String); 0]);
+        assert_eq!(
+            xproj_prompts_for_unseen(&items, &seen),
+            [] as [(String, String); 0]
+        );
     }
 
     // ---- bd-context-limit-honor-luqg: exact-body CONTEXT_LIMIT scan ----

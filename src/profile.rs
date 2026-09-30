@@ -1328,13 +1328,13 @@ model = "deepseek-v3"
         let path = tmp_profiles_toml(
             r#"
 [profiles.coder]
-smol = "deepseek-v4-flash"
+smol = "deepseek-v4.1-flash"
 plan = "glm-5.2"
 "#,
         );
         let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
         let c = cat.get("coder").expect("coder present");
-        assert_eq!(c.smol, "deepseek-v4-flash");
+        assert_eq!(c.smol, "deepseek-v4.1-flash");
         assert_eq!(c.plan, "glm-5.2");
         assert_eq!(c.slow, "", "absent role stays empty");
         assert_eq!(c.model, "@standard", "base model untouched (slot inherit)");
@@ -1362,7 +1362,7 @@ plan = "glm-5.2"
         let path = tmp_profiles_toml(
             r#"
 [profiles.coder]
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 provider = "deepseek"
 
 [profiles.scout]
@@ -1372,7 +1372,7 @@ model = "big-pickle"
         let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
         let c = cat.get("coder").expect("coder present");
         assert_eq!(c.provider, "deepseek", "explicit provider parsed");
-        assert_eq!(c.model, "deepseek-v4-flash");
+        assert_eq!(c.model, "deepseek-v4.1-flash");
         // Built-in untouched by an unrelated override keeps empty provider.
         let s = cat.get("scout").expect("scout present");
         assert_eq!(s.provider, "", "absent provider defaults empty");
@@ -1455,7 +1455,7 @@ spawn_cmd = "hermes --project {project} --role {role}"
             r#"
 [profiles.broken]
 harness = "oc"
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 "#,
         );
         let cat = ProfileCatalog::load_from(Some(&path)).expect("load");
@@ -1500,10 +1500,10 @@ spawn_cmd = "customx --go"
             r#"
 [profiles.coder]
 harness = "pi"
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 [profiles.reviewer]
 harness = "pi"
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 "#,
         );
         let mut cat = ProfileCatalog::load_from(Some(&path)).expect("load");
@@ -1522,10 +1522,10 @@ model = "deepseek-v4-flash"
             r#"
 [profiles.coder]
 harness = "pi"
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 [profiles.reviewer]
 harness = "pi"
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 "#,
         );
         let mut cat = ProfileCatalog::load_from(Some(&path)).expect("load");
@@ -1733,12 +1733,22 @@ model = "deepseek-v4-flash"
     /// Engine DI seam (ADR-0005 Spec 4a): `@planner` resolves, `@ghost` is None.
     #[test]
     fn resolve_for_engine_known_at_prefix_and_unknown_none() {
+        // Hermetic (bd-17ry rule): the resolved MODEL comes from the model
+        // registry, which reads the operator's models.toml. Without a pinned
+        // XDG the answer flips between the compiled-in pair and whatever the
+        // real machine has, and the test fails on the wrong day.
+        let _g = crate::config::lock_env();
+        let dir = std::env::temp_dir().join(format!("fw-prof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
         let cat = catalog();
         let got = cat
             .resolve_for_engine("@planner")
             .expect("@planner must resolve");
-        assert_eq!(got["spec"]["harness"], "omp");
+        // bd-47fu: the planner's default harness is pi; omp is dropped.
+        assert_eq!(got["spec"]["harness"], "pi");
         assert_eq!(got["spec"]["model"], "zai/glm-5.3");
+        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got["spec"]["backend"], "herdr");
         assert_eq!(got["spec"]["role"], "planner");
         assert_eq!(
@@ -1843,7 +1853,7 @@ model = "big-pickle"
     fn fallback_empty_by_default() {
         let cat = ProfileCatalog::load_from(None).expect("defaults");
         for name in cat.names() {
-            assert!(cat.get(&name).unwrap().fallback.is_empty());
+            assert_eq!(cat.get(&name).unwrap().fallback, [] as [String; 0]);
             assert!(
                 cat.get(&name).unwrap().model_fallback.is_empty(),
                 "model_fallback is distinct and empty by default"
