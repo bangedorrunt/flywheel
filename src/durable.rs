@@ -8531,6 +8531,12 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // means "take over deliberately" — fresh state, not a zombie replay.
     // (stale-loop clearing happens after the id is chosen, below, so the
     // resumed invocation itself is preserved — bd-87hq.)
+    // bd-6si7: the host edge is the ONE place allowed to read the clock, and
+    // it reads it once, then hands the value down. Every leaf below is
+    // therefore a pure function of its arguments plus this stamp.
+    let now_nanos = crate::authority::RuntimeAuthority::resolve()
+        .clock
+        .now_nanos();
     let id = match crate::state::load_active_loop(&params.project)? {
         Some(al) if !params.force && promise_pending(&resonate, &al.id).await? => {
             eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
@@ -8550,12 +8556,14 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
                 &params.project,
                 &serde_json::to_value(&params)?,
                 "swarm-loop",
+                now_nanos,
             )?
         }
         _ => fresh_loop_id(
             &params.project,
             &serde_json::to_value(&params)?,
             "swarm-loop",
+            now_nanos,
         )?,
     };
 
@@ -8599,15 +8607,13 @@ fn fresh_loop_id(
     project: &str,
     params: &serde_json::Value,
     prefix: &str,
+    now_nanos: u128,
 ) -> anyhow::Result<String> {
+    // bd-6si7: the clock is an INJECTED value, not a sample taken here. The
+    // host edge resolves the authority and hands the leaf the stamp; a leaf
+    // that reads the clock itself is un-replayable and un-substitutable.
     let id_project = project.rsplit('/').next().unwrap_or(project);
-    let fresh = format!(
-        "{prefix}:{id_project}:{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
+    let fresh = format!("{prefix}:{id_project}:{now_nanos}");
     crate::state::save_active_loop(
         project,
         &crate::state::ActiveLoop::new(fresh.clone(), params.clone(), crate::state::now_iso()),
@@ -9679,6 +9685,34 @@ mod tests {
         // non-loop promises are never matched
         assert!(!id_is_project_loop("cron:weekly-review", "toron"));
         assert!(!id_is_project_loop("wf-graph-fanout-1", "toron"));
+    }
+
+    /// bd-6si7: the fresh-id leaf is a PURE function of its inputs plus the
+    /// injected stamp. Two calls with the same stamp MUST produce the same
+    /// id (replay determinism) and the source must not name a clock at all —
+    /// a leaf that samples time is neither replayable nor substitutable.
+    #[test]
+    fn fresh_loop_id_is_a_pure_function_of_its_stamp() {
+        let dir = std::env::temp_dir().join(format!("fw-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = "ns/loopproj";
+        let params = serde_json::json!({"project": project});
+
+        let a = super::fresh_loop_id(project, &params, "swarm-loop", 1_700_000_000_000_000_000)
+            .expect("first id");
+        let b = super::fresh_loop_id(project, &params, "swarm-loop", 1_700_000_000_000_000_000)
+            .expect("same stamp, same id");
+        let c = super::fresh_loop_id(project, &params, "swarm-loop", 1_700_000_000_000_000_001)
+            .expect("a different stamp is a different invocation");
+
+        assert_eq!(a, b, "the same stamp must replay to the same id");
+        assert_ne!(a, c, "a new invocation must not reuse a settled id");
+        assert!(
+            a.contains("loopproj") && !a.contains('/'),
+            "the id stays path-safe and project-scoped: {a}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
