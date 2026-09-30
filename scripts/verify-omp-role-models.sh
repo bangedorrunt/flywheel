@@ -61,9 +61,9 @@ if [ -f "$PROF" ]; then cp "$PROF" "$BAK"; fi
 PROFILE_NAME="verify-omp-role-models-$$"
 if "$FW" profile create "$PROFILE_NAME" \
     --harness omp \
-    --model deepseek-v4-flash \
+    --model deepseek-v4.1-flash \
     --effort high \
-    --smol deepseek-v4-flash \
+    --smol deepseek-v4.1-flash \
     --slow glm-5.2 \
     --plan big-pickle >/dev/null 2>&1; then
   pass "G2a: profile create --smol/--slow/--plan accepted"
@@ -76,7 +76,7 @@ if echo "$LIST" | python3 -c "
 import json,sys
 rows=json.load(sys.stdin)['profiles']
 p=[r for r in rows if r['name']=='$PROFILE_NAME'][0]
-assert p['smol']=='deepseek-v4-flash', p
+assert p['smol']=='deepseek-v4.1-flash', p
 assert p['slow']=='glm-5.2', p
 assert p['plan']=='big-pickle', p
 print('ok')" 2>/dev/null | grep -q ok; then
@@ -89,7 +89,7 @@ SHOW=$("$FW" profile show "$PROFILE_NAME" 2>/dev/null)
 if echo "$SHOW" | python3 -c "
 import json,sys
 p=json.load(sys.stdin)
-assert p['smol']=='deepseek-v4-flash', p
+assert p['smol']=='deepseek-v4.1-flash', p
 assert p['slow']=='glm-5.2', p
 assert p['plan']=='big-pickle', p
 print('ok')" 2>/dev/null | grep -q ok; then
@@ -100,13 +100,13 @@ fi
 
 # ---- G5: registry resolution does not block ---------------------------------
 say "=== G5: registry round-trip ==="
-if "$FW" model add deepseek-v4-flash --provider opencode-go >/dev/null 2>&1; then
-  pass "G5a: role model id registered (opencode-go/deepseek-v4-flash)"
+if "$FW" model add deepseek-v4.1-flash --provider opencode-go >/dev/null 2>&1; then
+  pass "G5a: role model id registered (opencode-go/deepseek-v4.1-flash)"
 else
   fail "G5a: model add failed for role model"
 fi
 MODELS=$("$FW" model list --json 2>/dev/null)
-if echo "$MODELS" | grep -q "deepseek-v4-flash"; then
+if echo "$MODELS" | grep -q "deepseek-v4.1-flash"; then
   pass "G5b: model list shows the role model id"
 else
   fail "G5b: model list missing role model"

@@ -45,6 +45,6 @@ Runtime adapters are the effect boundary described by ADR-0016. Resolve host ide
 - Resonate: `http://localhost:8001`, sqlite `~/.local/state/flywheel/resonate.db`; `flywheel deps --ensure` or `flywheel daemon start` starts it when down (loopback urls only)
 - Toron daemon (optional): `toron daemon` / `com.toron.serve`, `127.0.0.1:18080`. Passphrase file, never plist.
 - State: `~/.local/state/flywheel/` — event logs, `loops.json` schema v2 (`src/state.rs`)
-- Config: `~/.config/flywheel/config.toml` — models registry `models.toml` uses composite `provider/model` keys (e.g. `[models."opencode-go/deepseek-v4-flash"]`); `Profile.provider` pins the composite; bare `--model`/`--provider` on spawn is lenient fallback, profile routing is strict.
+- Config: `~/.config/flywheel/config.toml` — models registry `models.toml` uses composite `provider/model` keys (e.g. `[models."opencode-go/deepseek-v4.1-flash"]`); `Profile.provider` pins the composite; bare `--model`/`--provider` on spawn is lenient fallback, profile routing is strict.
 
 Copy `.env.example` → `.env`. Never commit tokens.
