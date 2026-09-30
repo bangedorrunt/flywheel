@@ -306,7 +306,9 @@ mod tests {
             &catalog(&[("a", "oc"), ("b", "gk"), ("c", "pi"), ("d", "omp")]),
             2,
         );
-        for h in ["opencode", "grok", "pi", "omp"] {
+        // bd-47fu: omp is dropped, and `fx` is not in this catalog, so the
+        // menu is right not to offer it. The list IS the configured set.
+        for h in ["opencode", "grok", "pi"] {
             assert!(m.offers(h), "{h} is configured and must be offered");
         }
     }
@@ -361,7 +363,7 @@ mod tests {
     /// catalog must always produce the same order.
     #[test]
     fn the_ranking_is_stable_across_repeated_builds() {
-        let c = catalog(&[("a", "opencode"), ("b", "pi"), ("c", "omp"), ("d", "grok")]);
+        let c = catalog(&[("a", "opencode"), ("b", "pi"), ("c", "fx"), ("d", "grok")]);
         let first: Vec<String> = harness_menu(&c, 4)
             .ranked()
             .iter()
