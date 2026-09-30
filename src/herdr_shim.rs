@@ -178,7 +178,6 @@ pub fn ensure_integration_parent_dirs(kind: &str) {
     let home = std::path::PathBuf::from(crate::authority::HostAuthority::resolve().home);
     let dirs: &[&str] = match kind {
         "pi" => &[".pi/agent/extensions"],
-        "omp" => &[".omp/agent/extensions"],
         "opencode" => &[".config/opencode/plugins"],
         _ => &[],
     };
@@ -248,7 +247,6 @@ impl IntegrationStatus {
 /// install, nothing to report).
 pub const INTEGRATION_KINDS: &[&str] = &[
     "pi",
-    "omp",
     "claude",
     "codex",
     "copilot",
@@ -1245,7 +1243,6 @@ pub struct PaneProcessInfoProcess {
 }
 
 /// Result of `pane.process_info` (bd-1np). `foreground_processes` lists the
-/// processes in the pane's foreground process group — a live agent process is
 /// the group leader (`pid == foreground_process_group_id`); the `shell_pid`
 /// is the pane's shell, which reclaims the foreground after the agent exits.
 #[derive(Debug, Clone, Deserialize)]
@@ -1276,10 +1273,6 @@ pub fn kind_process_names(kind: &str) -> &'static [&'static str] {
         "opencode" => &["opencode"],
         "pi" => &["pi", "gemini"],
         "grok" => &["grok", "grok-build"],
-        "omp" => &["omp"],
-        // H2 (bd-harness-jcode): the jcode TUI runs as the `jcode` binary in
-        // the pane's foreground process group while the agent lives.
-        "jcode" => &["jcode"],
         // unknown kind — no process-name mapping; the caller must treat the
         // probe as inconclusive rather than false-negative "healthy".
         _ => &[],
@@ -1325,7 +1318,6 @@ pub fn pane_agent_alive(info: &PaneProcessInfo, kind: &str) -> Option<bool> {
 }
 
 /// Spawn-to-dispatch readiness gate (bd-eign.6): poll `pane.process_info`
-/// until the agent's binary appears in the pane's foreground process group.
 ///
 /// herdr's `agent.start` returns once the launch command is dispatched, NOT
 /// when the agent TUI is ready to receive input — during the 2-30s boot
@@ -1651,7 +1643,7 @@ mod process_liveness_tests {
         assert!(kind_process_names("opencode").contains(&"opencode"));
         assert!(kind_process_names("pi").contains(&"pi"));
         assert!(kind_process_names("grok").contains(&"grok"));
-        assert!(kind_process_names("omp").contains(&"omp"));
+        assert!(kind_process_names("pi").contains(&"pi"));
     }
 }
 
@@ -2642,7 +2634,7 @@ hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/herdr-agent-stat
             parse_integration_status_output(raw).into_iter().collect();
         assert_eq!(map.len(), 4);
         assert!(map["pi"].installed && map["pi"].current);
-        assert!(map["omp"].installed && map["omp"].current);
+        assert!(map["pi"].installed && map["pi"].current);
         assert!(!map["claude"].installed);
         assert!(map["hermes"].installed && !map["hermes"].current);
     }
@@ -2781,7 +2773,7 @@ mod gs049_launch_pending_tests {
 
     fn agent(pending: bool, ready: bool, status: AgentStatus) -> AgentInfo {
         AgentInfo {
-            agent: Some("omp".into()),
+            agent: Some("pi".into()),
             agent_status: status,
             cwd: None,
             display_agent: None,

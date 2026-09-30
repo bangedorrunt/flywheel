@@ -107,7 +107,7 @@ model = "muse-spark-1.3-contributor"
 provider = "opencode-go"                 # pins the composite key
 effort = "high"
 fallback = ["scout"]                     # profile names: billing/auth/provider hops
-model_fallback = ["opencode-go/deepseek-v4-flash"]  # model ids: rate_limit hops
+model_fallback = ["opencode-go/deepseek-v4.1-flash"]  # model ids: rate_limit hops
 ```
 
 Six builtins (oracle/planner/reviewer @premium, coder/housekeeper

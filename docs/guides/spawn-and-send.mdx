@@ -62,7 +62,7 @@ Panes are peer-aware by default (`integrations/peer-aware.md.tpl`). Opt out per 
 
 ## Model routing (strict)
 
-Registry keys are composite `provider/model`, for example `[models."opencode-go/deepseek-v4-flash"]`. `Profile.provider` pins the composite key; bare ids fall back to the default provider (user-file entries first, else alphabetically first). `resolve_strict` adds the prefix and enforces `caps`; an unregistered id or a caps-excluded harness fails the spawn and names the fix (`flywheel model add <id> --provider <p>`). Nothing bypasses the registry.
+Registry keys are composite `provider/model`, for example `[models."opencode-go/deepseek-v4.1-flash"]`. `Profile.provider` pins the composite key; bare ids fall back to the default provider (user-file entries first, else alphabetically first). `resolve_strict` adds the prefix and enforces `caps`; an unregistered id or a caps-excluded harness fails the spawn and names the fix (`flywheel model add <id> --provider <p>`). Nothing bypasses the registry.
 
 Compiled slots: `cheap` (opencode/big-pickle), `standard` (pi + muse-spark), `premium` (omp + glm, fallback grok). The grok harness runs only its own proprietary model; grok models are available on pi, omp, and opencode. Dotted ids need quotes: `[models."glm-5.2"]`.
 

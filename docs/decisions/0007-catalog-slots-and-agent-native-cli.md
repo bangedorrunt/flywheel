@@ -30,7 +30,7 @@ model = "opencode/big-pickle"
 
 [slots.standard]
 harness = "pi"
-model = "opencode-go/deepseek-v4-flash"
+model = "opencode-go/deepseek-v4.1-flash"
 
 [slots.premium]
 harness = "omp"
@@ -103,7 +103,7 @@ Skill Sync Contract: Commands enum, `--robot-capabilities` (`catalog` object), A
 
 ### Verification
 
-- [ ] `cargo test models` — slot resolve `@cheap`→opencode+big-pickle; `@standard`→pi+deepseek-v4-flash; user slot overlay; save does not bake compiled-in slots; tiers on compiled-in models
+- [ ] `cargo test models` — slot resolve `@cheap`→opencode+big-pickle; `@standard`→pi+deepseek-v4.1-flash; user slot overlay; save does not bake compiled-in slots; tiers on compiled-in models
 - [ ] `cargo test profile` — 6 built-ins, no `pa` profile, harness recipes still present; coder/housekeeper inherit standard; omp smol/slow/plan filled on oracle/planner/reviewer; `model_fallback` ≠ `fallback`
 - [ ] compiled-in squads `default`/`plan`/`review`/`recon`
 - [ ] `model remove` N ids, bare→composite, refuse compiled-in

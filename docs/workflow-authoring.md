@@ -65,7 +65,7 @@ flywheel profile remove hachiko-researcher
 
 **Default model map (2026-08-10):** all six profiles run **`omp`** by default. Per-role:
 `oracle` = `opencode-go/glm-5.2` (high/max effort; fallback to the grok harness's premium model on rate-limit),
-`planner`/`coder`/`reviewer`/`housekeeper` = `opencode-go/deepseek-v4-flash`,
+`planner`/`coder`/`reviewer`/`housekeeper` = `opencode-go/deepseek-v4.1-flash`,
 `scout` = `opencode/big-pickle`. Registered in `~/.config/flywheel/models.toml`. `reviewer` runs on
 **opencode** in review/debate workflows (a per-step harness override — cross-harness review independence);
 grok/opencode are otherwise used only when a profile/workflow explicitly asks. If a pinned harness has no

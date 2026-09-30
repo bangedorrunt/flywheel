@@ -331,10 +331,10 @@ mod tests {
             models: vec![RoleModelChoice {
                 role: "coder".into(),
                 harness: "omp".into(),
-                default_model: "deepseek-v4-flash".into(),
+                default_model: "deepseek-v4.1-flash".into(),
                 alternatives: vec![
                     (
-                        "opencode-go/deepseek-v4-flash".into(),
+                        "opencode-go/deepseek-v4.1-flash".into(),
                         0.001,
                         vec!["omp".into(), "opencode".into()],
                     ),
@@ -382,13 +382,13 @@ mod tests {
         let (outcome, rendered) = drive(&["", "", "", ""]);
         assert_eq!(
             outcome,
-            go(2, &[("coder", "deepseek-v4-flash")], &[("coder", "omp")])
+            go(2, &[("coder", "deepseek-v4.1-flash")], &[("coder", "omp")])
         );
         // The golden sections all render.
         assert!(rendered.contains("== captain briefing: steer \"goal\""));
         assert!(rendered.contains("crew budget N"));
         assert!(rendered.contains("default=2"));
-        assert!(rendered.contains("deepseek-v4-flash"));
+        assert!(rendered.contains("deepseek-v4.1-flash"));
         assert!(rendered.contains("$0.001/mtok"));
         assert!(rendered.contains("caps=omp,opencode"));
         assert!(rendered.contains("cost ?"), "unknown cost is honest");
@@ -478,7 +478,7 @@ mod tests {
         let outcome = run_briefing(&ctx(), &mut inp, &mut out).expect("eof-safe");
         assert_eq!(
             outcome,
-            go(2, &[("coder", "deepseek-v4-flash")], &[("coder", "omp")]),
+            go(2, &[("coder", "deepseek-v4.1-flash")], &[("coder", "omp")]),
             "EOF counts as Enter/yes"
         );
     }
@@ -488,7 +488,7 @@ mod tests {
         let (outcome, rendered) = drive(&["", "", "pi", "y"]);
         assert_eq!(
             outcome,
-            go(2, &[("coder", "deepseek-v4-flash")], &[("coder", "pi")])
+            go(2, &[("coder", "deepseek-v4.1-flash")], &[("coder", "pi")])
         );
         assert!(rendered.contains("coder harness -> pi"), "{rendered}");
     }

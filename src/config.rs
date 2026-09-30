@@ -1709,11 +1709,7 @@ daily = [
                 for lock in SHARED_LOCKS {
                     let needle = format!("{lock}.lock().unwrap()");
                     if line.contains(&needle) {
-                        offenders.push(format!(
-                            "{}:{}: {lock}",
-                            file.display(),
-                            i + 1
-                        ));
+                        offenders.push(format!("{}:{}: {lock}", file.display(), i + 1));
                     }
                 }
             }
