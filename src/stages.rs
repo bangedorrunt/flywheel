@@ -304,7 +304,7 @@ impl StageLibrary {
             // gate.
             (
                 "wave-gate",
-                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow --project <this project slug>` — a failed check STOPS the wave. bd-mvy4: the `--project` is REQUIRED, not a nicety: `worktree` and `playbook-files` are project-scoped checks and both FAIL when no project is given, so omitting it made the gate hold every wave while naming a blocker that was the gate's own omission (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report.",
+                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow --project <this project slug>` — a failed check STOPS the wave. bd-mvy4: the `--project` is REQUIRED, not a nicety: `worktree` and `playbook-files` are project-scoped checks and both FAIL when no project is given, so omitting it made the gate hold every wave while naming a blocker that was the gate's own omission (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report. bd-mvy4 DEFECT 3: an EMPTY `ready` after the label scoping is a LOUD FAILURE, not a green wave — post `[gate] blocked: label <label> matched zero beads` and STOP. A run that dispatches nothing must never report success; that is the false-green this gate exists to prevent.",
             ),
             (
                 "wave-dispatch",
@@ -1706,6 +1706,28 @@ mod bd_mvy4_wave_gate {
             prompt.contains("ready.json") && prompt.contains("\"held\""),
             "the gate must keep writing the binding artifact with an explicit `held` field — \
              it is the only channel between the gate and the dispatch half"
+        );
+    }
+
+    /// bd-mvy4 DEFECT 3: a label nothing carries produced an empty `ready`
+    /// and a GREEN run that dispatched nothing. The gate must name the empty
+    /// label as a blocker, or the false green comes straight back.
+    ///
+    /// Asserted on the COMPILED-IN tier, not `StageLibrary::load()`: a
+    /// user-tier `stages/wave-gate.toml` legitimately overrides the prompt,
+    /// and a test that reads the merged view fails on whichever machine has
+    /// an override. The repo can only guarantee what it ships.
+    #[test]
+    fn the_wave_gate_refuses_an_empty_label() {
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let prompt = lib
+            .get_stage("wave-gate")
+            .expect("wave-gate")
+            .prompt
+            .clone();
+        assert!(
+            prompt.contains("matched zero beads"),
+            "an empty ready set must be a loud gate failure: {prompt}"
         );
     }
 }
