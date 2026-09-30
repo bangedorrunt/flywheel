@@ -21,6 +21,12 @@ pub struct HostAuthority {
 #[allow(dead_code)]
 pub trait Clock: Send + Sync {
     fn now_unix(&self) -> u64;
+    /// Nanosecond resolution, for ids that must differ WITHIN a second.
+    /// Second resolution would collide two invocations in the same second
+    /// and silently re-run a settled promise (bd-bvwf.4 resume contract).
+    fn now_nanos(&self) -> u128 {
+        u128::from(self.now_unix()) * 1_000_000_000
+    }
 }
 
 /// Monotonic authority for cooldowns and deadlines. It is intentionally
@@ -39,6 +45,12 @@ impl Clock for SystemClock {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs())
+    }
+
+    fn now_nanos(&self) -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
     }
 }
 
