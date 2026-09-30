@@ -137,12 +137,14 @@ mod tests {
     /// A model with EVERY field set to something non-default, so a missing pin in
     /// this fixture is a real gap rather than a coincidence.
     fn populated() -> WorkspaceModel {
-        let mut m = WorkspaceModel::default();
-        m.seq = 42;
-        m.last_now = 1_700_000_000;
-        m.last_digest_unix = 1_700_000_123;
-        m.session_topology = Some("open".into());
-        m.last_vehicle = Some("vehicle: none (raw)".into());
+        let mut m = WorkspaceModel {
+            seq: 42,
+            last_now: 1_700_000_000,
+            last_digest_unix: 1_700_000_123,
+            session_topology: Some("open".into()),
+            last_vehicle: Some("vehicle: none (raw)".into()),
+            ..Default::default()
+        };
         m.roles.insert("captain".into(), "BrashOtter".into());
         m.presence.insert(
             "BrashOtter".into(),

@@ -1154,14 +1154,15 @@ mod parity_tests {
         // Remote (refused) toron transport, both sides: fast-fails to the
         // hermetic CLI fallback (see module docs).
         fn remote_cfg() -> crate::config::Config {
-            let mut cfg = crate::config::Config::default();
-            cfg.mail = Some(crate::config::MailSections {
-                toron: Some(crate::config::MailServerConfig {
-                    url: Some("http://127.0.0.1:9/mcp".into()),
-                    token: None,
+            crate::config::Config {
+                mail: Some(crate::config::MailSections {
+                    toron: Some(crate::config::MailServerConfig {
+                        url: Some("http://127.0.0.1:9/mcp".into()),
+                        token: None,
+                    }),
                 }),
-            });
-            cfg
+                ..Default::default()
+            }
         }
 
         // Side A: embedded host.

@@ -667,13 +667,23 @@ pub fn inject_wake_in(
     let msg = crate::workspace::Msg::Fact {
         summary: summary.clone(),
     };
+    // The pin goes in the envelope attribution, not only in the summary text:
+    // a Fact row carries no pin field, so `doorbell why <pin>` (which reads
+    // `entry.pins` and Prompt/Audit cmds) could never attribute an injected
+    // row to its pin — the operator console door was unexplainable.
     journal_append_workspace(
         state_dir,
         workspace,
         &msg,
         &[],
-        serde_json::json!({ "stage": "inject", "pin": pin, "workspace": workspace, "inject_ts": now_unix }),
-        None,
+        serde_json::json!({
+            "stage": "inject",
+            "pin": pin,
+            "workspace": workspace,
+            "project": project,
+            "inject_ts": now_unix,
+        }),
+        Some(&[pin.to_string()]),
     );
     let _ = crate::append_pending_fact(&crate::config::state_dir(), project, &summary);
     Ok(summary)
@@ -1720,6 +1730,42 @@ mod tests {
         ev.is_presence = true;
         ev.addressed_to_self = true;
         assert_eq!(classify(&ev), None);
+    }
+
+    /// An injected row must be attributable to its pin, or
+    /// `doorbell why <pin>` cannot explain the operator console door.
+    /// The pin lives in the envelope `pins` field because a `Fact` msg
+    /// carries no pin of its own.
+    #[test]
+    fn injected_row_is_attributable_to_its_pin() {
+        let dir = std::env::temp_dir().join(format!("inject-attr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let summary = inject_wake_in(&dir, "proj", "ws", "CrimsonHeron", "probe", 1_000)
+            .expect("first inject is allowed");
+        assert!(summary.contains("CrimsonHeron"));
+
+        let entries = journal_read_all(&dir);
+        let entry = entries
+            .iter()
+            .find(|(_, v)| {
+                v.get("msg")
+                    .and_then(|m| m.get("Fact"))
+                    .and_then(|f| f.get("summary"))
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s.contains("probe"))
+            })
+            .map(|(_, v)| v)
+            .expect("the injected row is journaled");
+        let pins: Vec<&str> = entry
+            .get("pins")
+            .and_then(|p| p.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            pins.contains(&"CrimsonHeron"),
+            "the injected row must carry its pin in the envelope attribution: {entry}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

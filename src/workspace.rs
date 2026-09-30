@@ -5163,8 +5163,10 @@ mod adr0010_d1_tests {
 
     #[test]
     fn adr0010_d1_inbox_rows_register_overdue_corrs_on_the_ladder() {
-        let mut m = WorkspaceModel::default();
-        m.last_now = 5_000;
+        let m = WorkspaceModel {
+            last_now: 5_000,
+            ..Default::default()
+        };
         let (next, _) = tick(
             &m,
             &Msg::InboxRows {
@@ -5226,8 +5228,10 @@ mod adr0010_d1_tests {
     fn adr0010_d1_registration_then_ladder_beat_rings_without_a_send() {
         // The residual closed: an overdue corr seen ONLY on the wire (no
         // same-process send) climbs the ladder on the next AckSlaTick beat.
-        let mut m = WorkspaceModel::default();
-        m.last_now = 100;
+        let m = WorkspaceModel {
+            last_now: 100,
+            ..Default::default()
+        };
         let (m, _) = tick(
             &m,
             &Msg::InboxRows {
@@ -5251,8 +5255,10 @@ mod adr0010_d1_tests {
 
     #[test]
     fn adr0010_d1_registration_is_idempotent_and_refreshes_window() {
-        let mut m = WorkspaceModel::default();
-        m.last_now = 100;
+        let m = WorkspaceModel {
+            last_now: 100,
+            ..Default::default()
+        };
         let (m, _) = tick(
             &m,
             &Msg::InboxRows {
@@ -5291,8 +5297,10 @@ mod adr0010_d1_tests {
     fn adr0010_d1_slafired_same_log_same_effects() {
         // Tick Law: the new arm is a pure fold — same Msg log, same effects.
         let build = || {
-            let mut m = WorkspaceModel::default();
-            m.last_now = 42;
+            let m = WorkspaceModel {
+                last_now: 42,
+                ..Default::default()
+            };
             let logs: Vec<Vec<Msg>> = vec![
                 vec![
                     Msg::SlaFired {

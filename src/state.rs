@@ -1331,6 +1331,29 @@ mod reserved_log_sweep_tests {
     fn empty_sweep_yields_no_projects() {
         assert_eq!(project_log_names(Vec::new()), [] as [String; 0]);
     }
+
+    /// The sweep helper exists so log sweeps cannot re-hand-roll `*.jsonl`.
+    /// `workflow history` did: it parsed the reserved `miss-ledger` as a
+    /// project, printed a "missing field `kind`" warning per row, and returned
+    /// `runs: []` — the runs it was asked for never came back. Pin the
+    /// single enumeration as the only way a log sweep reaches the state dir.
+    #[test]
+    fn log_sweeps_go_through_the_shared_enumeration() {
+        let src = include_str!("main.rs");
+        let history = src
+            .split("WorkflowCmd::History { name } => {")
+            .nth(1)
+            .expect("the history arm exists")
+            .split("=>")
+            .next()
+            .expect("the arm body follows");
+        assert!(
+            history.contains("state::project_logs()"),
+            "`workflow history` must enumerate projects via state::project_logs() — \
+             a hand-rolled *.jsonl sweep re-parses the reserved bookkeeping logs \
+             as projects and silently empties the history"
+        );
+    }
 }
 
 pub fn project_checkpoint_dir(project: &str) -> PathBuf {

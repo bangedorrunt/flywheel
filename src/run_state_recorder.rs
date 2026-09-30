@@ -482,9 +482,11 @@ mod recorder_tests {
     #[tokio::test]
     async fn recorded_payload_decodes_back_to_the_same_model() {
         let (r, _d) = recorder("decode").await;
-        let mut model = WorkspaceModel::default();
-        model.seq = 9;
-        model.session_topology = Some("open".into());
+        let model = WorkspaceModel {
+            seq: 9,
+            session_topology: Some("open".into()),
+            ..Default::default()
+        };
         r.record(&model, &["eff-1".into(), "eff-2".into()])
             .await
             .expect("record");

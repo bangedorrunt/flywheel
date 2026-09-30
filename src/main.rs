@@ -2207,7 +2207,7 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
     // falls back to the ordinal-th agent of that kind.
     let idx = match_indices(&in_ws, &want);
     if idx.is_empty() {
-        let display: Vec<String> = in_ws.iter().map(|a| agent_display(a)).collect();
+        let display: Vec<String> = in_ws.iter().map(agent_display).collect();
         bail!(
             "no agents match --to {to} in {project} (available: {}; raw panes address by agent kind or pane id)",
             display.join(", ")
@@ -2319,7 +2319,7 @@ fn resolve_agents_dyn(
     // falls back to the ordinal-th agent of that kind.
     let idx = match_indices(&in_ws, &want);
     if idx.is_empty() {
-        let display: Vec<String> = in_ws.iter().map(|a| agent_display(a)).collect();
+        let display: Vec<String> = in_ws.iter().map(agent_display).collect();
         bail!(
             "no agents match --to {to} in {project} (available: {}; raw panes address by agent kind or pane id)",
             display.join(", ")
@@ -2900,8 +2900,8 @@ fn main() {
                 subscriber,
             } => cmd_doorbell_why(
                 &cfg,
-                &project,
-                &pin,
+                project,
+                pin,
                 *limit,
                 corr.as_deref(),
                 *seq,
@@ -2929,7 +2929,7 @@ fn main() {
                 extra,
                 project.as_deref(),
             ),
-            DoorbellCmd::Roster { project, json } => cmd_doorbell_roster(&cfg, &project, *json),
+            DoorbellCmd::Roster { project, json } => cmd_doorbell_roster(&cfg, project, *json),
             DoorbellCmd::Introduce {
                 project,
                 pin,
@@ -2940,8 +2940,8 @@ fn main() {
                 json,
             } => cmd_doorbell_introduce(
                 &cfg,
-                &project,
-                &pin,
+                project,
+                pin,
                 as_pin.as_deref(),
                 channel.as_deref(),
                 workspace.as_deref(),
@@ -3333,7 +3333,7 @@ fn main() {
             wiki,
             memory,
         }) => cmd_gate_learnings(
-            &root,
+            root,
             budget.unwrap_or_else(default_gate_budget),
             wiki.as_deref(),
             memory.as_deref(),
@@ -8950,10 +8950,7 @@ fn cmd_doorbell_why(
     let mut shown = 0usize;
     let mut matched = 0usize;
     for (workspace, entry) in &entries {
-        if scoped
-            .as_ref()
-            .is_some_and(|allowed| !allowed.iter().any(|w| w == workspace))
-        {
+        if !journal_row_in_scope(workspace, entry, &scoped, project) {
             continue;
         }
         if !doorbell::journal_version_accepted(entry) {
@@ -9194,7 +9191,7 @@ fn cmd_doorbell_why(
             .unwrap_or("");
         // fold tick replay already verified above; this print is the user-visible replay
         println!(
-            "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}{}",
+            "{workspace} {ts} seq={} {kind}{} actions=[{actions}]{}{}{}",
             replay_seq - 1,
             if status.is_empty() {
                 String::new()
@@ -9210,6 +9207,14 @@ fn cmd_doorbell_why(
             // which were read from the journal — the trust surface must
             // not blur the two.
             if folded { "" } else { " [journaled]" },
+            // A console-scope row lives in the SHARED `manual` file, so it is
+            // this project's by the project it records, not by its scope name.
+            // Say so: the reader must never read it as workspace activity.
+            if workspace == DOORBELL_CONSOLE_SCOPE {
+                " [console-inject]"
+            } else {
+                ""
+            },
         );
     }
     if matched == 0 {
@@ -9255,10 +9260,7 @@ fn cmd_doorbell_afk(cfg: &Config, project: &str, limit: usize) -> Result<()> {
     // the embedded fold cannot produce them (no InboxFetched arm — bd-c9jw).
     let mut bound: Vec<(String, String, String, String)> = Vec::new();
     for (ws, entry) in &entries {
-        if scoped
-            .as_ref()
-            .is_some_and(|allowed| !allowed.iter().any(|w| w == ws))
-        {
+        if !journal_row_in_scope(ws, entry, &scoped, project) {
             continue;
         }
         if !doorbell::journal_version_accepted(entry) {
@@ -9469,6 +9471,15 @@ fn cmd_doorbell_unsubscribe(_cfg: &Config, id: &str) -> Result<()> {
 /// fact helpers, and other projects' hosts. Folding them made `why` report a
 /// mismatch per row and made `afk` print an unbounded digest of another
 /// workspace's noise — in both cases burying the answer that was asked for.
+///
+/// The one exception is the operator console scope. `doorbell inject` writes
+/// there by DEFAULT (`--workspace manual`), so excluding it wholesale made the
+/// console door unexplainable: `why <pin>` reported "no journal entries" for a
+/// row that demonstrably existed. But `manual` is GLOBAL (every project
+/// injects into the same file), so including it by name would show another
+/// project's injects — trading invisibility for a silent cross-project blend.
+/// So the console scope is admitted per ROW, by the project the row records,
+/// never by the scope name alone. See [`console_row_is_for_project`].
 fn doorbell_scoped_workspaces(project: &str) -> Option<Vec<String>> {
     (project != "all").then(|| {
         let mut w = vec![project.to_string()];
@@ -9479,6 +9490,117 @@ fn doorbell_scoped_workspaces(project: &str) -> Option<Vec<String>> {
         );
         w
     })
+}
+
+/// The console scope `doorbell inject` defaults to. Shared by every project,
+/// so it is scoped by the recorded project, never by name.
+pub(crate) const DOORBELL_CONSOLE_SCOPE: &str = "manual";
+
+/// True when a row in the shared console scope was written FOR this project.
+/// Only console-inject rows qualify: they carry `executed.project`. A row
+/// with no recorded project is refused (fail-closed) rather than assumed ours.
+fn console_row_is_for_project(entry: &serde_json::Value, project: &str) -> bool {
+    entry
+        .get("executed")
+        .and_then(|e| e.get("project"))
+        .and_then(|p| p.as_str())
+        .is_some_and(|p| p == project)
+}
+
+/// The one scope test `why` and `afk` share, so the two can never disagree
+/// about what a project owns.
+///
+/// A row is in scope when its workspace is the project's own, OR when it sits
+/// in the shared console scope and records this project. `scoped = None`
+/// means `all` (no scoping). The console arm is deliberately per-ROW: the
+/// scope name is global, so admitting it wholesale would blend projects.
+fn journal_row_in_scope(
+    workspace: &str,
+    entry: &serde_json::Value,
+    scoped: &Option<Vec<String>>,
+    project: &str,
+) -> bool {
+    let Some(allowed) = scoped else { return true };
+    if allowed.iter().any(|w| w == workspace) {
+        return true;
+    }
+    workspace == DOORBELL_CONSOLE_SCOPE && console_row_is_for_project(entry, project)
+}
+
+#[cfg(test)]
+mod journal_scope_tests {
+    use super::*;
+
+    fn inject_row(project: &str) -> serde_json::Value {
+        serde_json::json!({
+            "msg": {"Fact": {"summary": format!("inject P: hello ({project})")}},
+            "pins": ["P"],
+            "executed": {"stage": "inject", "pin": "P", "project": project},
+            "workspace": DOORBELL_CONSOLE_SCOPE,
+        })
+    }
+
+    fn scoped_to(project: &str) -> Option<Vec<String>> {
+        Some(vec![project.to_string(), format!("{project}-crew")])
+    }
+
+    /// The console door must be explainable: a default inject lands in the
+    /// shared `manual` scope, and `why` still has to see it.
+    #[test]
+    fn console_inject_row_is_in_scope_for_its_own_project() {
+        let row = inject_row("proj-a");
+        assert!(journal_row_in_scope(
+            DOORBELL_CONSOLE_SCOPE,
+            &row,
+            &scoped_to("proj-a"),
+            "proj-a"
+        ));
+    }
+
+    /// The reason the console arm filters per ROW rather than by scope name:
+    /// `manual` is global, so admitting it wholesale would show another
+    /// project's injects — a silent cross-project blend.
+    #[test]
+    fn console_row_from_another_project_is_refused() {
+        let row = inject_row("proj-b");
+        assert!(
+            !journal_row_in_scope(DOORBELL_CONSOLE_SCOPE, &row, &scoped_to("proj-a"), "proj-a"),
+            "proj-b's inject must not answer a proj-a question"
+        );
+    }
+
+    /// Fail-closed: a console row with no recorded project is NOT assumed
+    /// ours. Refusing is the safe direction; guessing would blend projects.
+    #[test]
+    fn console_row_without_recorded_project_is_refused() {
+        let row = serde_json::json!({"msg": {"Fact": {"summary": "inject P: legacy"}}});
+        assert!(!journal_row_in_scope(
+            DOORBELL_CONSOLE_SCOPE,
+            &row,
+            &scoped_to("proj-a"),
+            "proj-a"
+        ));
+    }
+
+    /// The original exclusion (bd-a8ld) must survive: the synthetic
+    /// facts-lapsed-* / facts-close-* scopes are still not ours.
+    #[test]
+    fn synthetic_fact_scopes_stay_excluded() {
+        let row = serde_json::json!({"msg": {"Fact": {"summary": "closed"}}});
+        for ws in ["facts-lapsed-1", "facts-close-1", "some-other-project"] {
+            assert!(
+                !journal_row_in_scope(ws, &row, &scoped_to("proj-a"), "proj-a"),
+                "{ws} must stay out of proj-a's scope"
+            );
+        }
+    }
+
+    /// `all` means no scoping — the global scan still reads everything.
+    #[test]
+    fn no_scoping_admits_every_row() {
+        let row = serde_json::json!({"msg": {"Fact": {"summary": "x"}}});
+        assert!(journal_row_in_scope("anything", &row, &None, "proj-a"));
+    }
 }
 
 /// bd-a8ld: rewrite unit doorbell actions written in their pre-bd-z5ou
@@ -10024,6 +10146,7 @@ fn handle_workspace_cmds(
                 eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
             }
             workspace::Cmd::Digest { entries } => {
+                let holds = workspace::sorted_holds(workspace_model);
                 // ADR-0010 D5 (bd-65he): afk digest batch — render to
                 // stderr (journal-observable like Audit); steer-channel
                 // delivery is the dispatcher's apply step. Undelivered
@@ -10032,11 +10155,7 @@ fn handle_workspace_cmds(
                 let now = chrono::Utc::now().timestamp() as u64;
                 eprintln!(
                     "flywheel: [Digest]\n{}",
-                    workspace::render_digest_with_holds(
-                        entries,
-                        &workspace::sorted_holds(&workspace_model),
-                        now
-                    )
+                    workspace::render_digest_with_holds(entries, &holds, now)
                 );
             }
             workspace::Cmd::Send { .. }
@@ -25786,7 +25905,7 @@ fn cmd_workflow_evaluate(
     let (wf, source) = all
         .get(name)
         .ok_or_else(|| anyhow!("unknown workflow {name:?} (flywheel workflow list)"))?;
-    let blocking = lint_flywheel_tier(name, wf);
+    let blocking = lint_flywheel_tier(name, wf, project_root.as_deref());
     if blocking > 0 {
         bail!("workflow evaluate: lint blocked on {name} ({blocking} finding(s))");
     }
@@ -25946,7 +26065,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
     }
 
     /// Lint one workflow; print issues; return the blocking (Error-level) count.
-    fn lint_one(name: &str, wf: &Workflow) -> usize {
+    fn lint_one(name: &str, wf: &Workflow, project_root: Option<&std::path::Path>) -> usize {
         // Engine tier (toron-workflow lint): schema, guards (evalexpr +
         // timeout), template refs, graph acyclicity — inherited, fail-stop.
         // bd-4spn GAP 2: lint with the FLYWHEEL principle registry (names())
@@ -25972,7 +26091,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         // Flywheel tier (ADR-0005 lint-gate contract — the ENGINE cannot do
         // these: no dependency inversion means it never imports flywheel's
         // StageLibrary / ProfileCatalog). Owned here, fail-stop.
-        blocking += lint_flywheel_tier(name, wf);
+        blocking += lint_flywheel_tier(name, wf, project_root);
         blocking
     }
 
@@ -26079,12 +26198,13 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             Ok(())
         }
         WorkflowCmd::Lint { name, project } => {
+            let project_root = project.as_deref().map(|p| project_dir(cfg, p));
             let all = read_door_workflows(cfg, project)?;
             if let Some(n) = name {
                 let (wf, _) = all
                     .get(n)
                     .ok_or_else(|| anyhow!("unknown workflow {n:?} (flywheel workflow list)"))?;
-                let blocking = lint_one(n, wf);
+                let blocking = lint_one(n, wf, project_root.as_deref());
                 if blocking > 0 {
                     std::process::exit(1);
                 }
@@ -26092,7 +26212,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             } else {
                 let mut blocking_total = 0;
                 for (n, (wf, _)) in &all {
-                    blocking_total += lint_one(n, wf);
+                    blocking_total += lint_one(n, wf, project_root.as_deref());
                 }
                 if blocking_total > 0 {
                     std::process::exit(1);
@@ -26207,7 +26327,11 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 );
             }
             // Fail-stop gate: lint before running.
-            let blocking = lint_one(name, &wf);
+            let blocking = lint_one(
+                name,
+                &wf,
+                project.as_deref().map(|p| project_dir(cfg, p)).as_deref(),
+            );
             if blocking > 0 {
                 bail!("workflow {name:?} has {blocking} blocking lint issue(s) — refusing to run");
             }
@@ -26746,7 +26870,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             crew::enforce_budget_caps(&composed)?;
 
             // Fail-stop gate: lint before run / emit.
-            let blocking = lint_one(&wf_name, &composed);
+            let blocking = lint_one(&wf_name, &composed, Some(&project_root));
             if blocking > 0 {
                 bail!(
                     "composed workflow {wf_name:?} has {blocking} blocking lint issue(s) — refusing to run"
@@ -27107,7 +27231,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                     state::now_iso(),
                     operator_pin(),
                 ));
-                let blocking = lint_one(keep_name, &kept);
+                let blocking = lint_one(keep_name, &kept, Some(&project_root));
                 if blocking > 0 {
                     bail!(
                         "kept workflow {keep_name:?} has {blocking} blocking lint issue(s) — not kept"
@@ -27323,18 +27447,15 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
         }
         WorkflowCmd::History { name } => {
             use state::EventKind;
-            let dir = config::state_dir();
             let mut rows: Vec<Value> = Vec::new();
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                print_json(&json!({ "workflow": name, "runs": [] }));
-                return Ok(());
-            };
-            for entry in entries.flatten() {
-                let fname = entry.file_name().to_string_lossy().to_string();
-                if !fname.ends_with(".jsonl") {
-                    continue;
-                }
-                let project = fname.trim_end_matches(".jsonl").to_string();
+            // The ONE enumeration for log sweeps (state::project_logs), which
+            // excludes the reserved bookkeeping logs. This used to sweep
+            // `*.jsonl` by hand and parse `miss-ledger` as a project: every
+            // such row failed with "missing field `kind`", so the sweep
+            // printed a warning per row AND the run rows it was meant to find
+            // never came back — history reported `runs: []` beside 17
+            // unexplained stderr lines.
+            for project in state::project_logs() {
                 let Ok(events) = state::read_log(&project) else {
                     continue;
                 };
@@ -27464,7 +27585,7 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             // an `approve:<promise_id>` / `reject:<promise_id>` subject token
             // and calls engine.resolve_approval itself (≤2s cadence). This CLI
             // is the captain's half: send the decision mail.
-            let key = project_dir_str(cfg, &project)?;
+            let key = project_dir_str(cfg, project)?;
             let mail = mail_or_die(cfg)?;
             mail.ensure_project(&key)?;
             // The parked run scans the CONFIG identity's inbox (its own).
@@ -27932,9 +28053,20 @@ fn cmd_cron(cfg: &Config, cmd: &CronCmd) -> Result<()> {
 /// `inputs:`. The ENGINE cannot do these (no dependency inversion — it never
 /// imports flywheel's StageLibrary / ProfileCatalog), so the CLI owns them
 /// and fails closed before any run.
-fn lint_flywheel_tier(name: &str, wf: &toron_workflow::schema::Workflow) -> usize {
+///
+/// `project_root` is required, not optional: the lint must resolve stages
+/// through the SAME tiers the composer and runner use, or a project-tier
+/// stage (`.flywheel/stages.toml`) is reported unresolvable and every
+/// composed workflow that references it is refused. That made every
+/// project-authored stage uncomposable while `stage show` listed it as valid.
+fn lint_flywheel_tier(
+    name: &str,
+    wf: &toron_workflow::schema::Workflow,
+    project_root: Option<&std::path::Path>,
+) -> usize {
     let profiles = profile::ProfileCatalog::load().unwrap_or_default();
-    let stages = stages::StageLibrary::load().unwrap_or_default();
+    let project_stages = project_root.map(|r| r.join(".flywheel").join("stages.toml"));
+    let stages = stages::StageLibrary::load_layered(project_stages.as_deref()).unwrap_or_default();
     let declared_inputs: std::collections::HashSet<&str> =
         wf.inputs.iter().map(|i| i.name.as_str()).collect();
     let mut blocking = 0;
@@ -29252,7 +29384,7 @@ fn is_first_dispatch(skills_injected: bool) -> bool {
 /// missing (fresh pane still binding) or still booting. Anything else
 /// proceeds straight to the normal send path.
 fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
-    first && agent.is_none_or(|a| crate::herdr_shim::agent_still_booting(a))
+    first && agent.is_none_or(crate::herdr_shim::agent_still_booting)
 }
 
 /// bd-83as: have this agent's skills been injected yet (spawn registry)?
@@ -35601,7 +35733,7 @@ steps:
 "#,
         )
         .expect("parse");
-        let blocking = lint_flywheel_tier("t", &wf);
+        let blocking = lint_flywheel_tier("t", &wf, None);
         assert!(blocking > 0, "unresolved profile must be a blocking issue");
     }
 
@@ -35623,7 +35755,7 @@ steps:
 "#,
         )
         .expect("parse");
-        let blocking = lint_flywheel_tier("t", &wf);
+        let blocking = lint_flywheel_tier("t", &wf, None);
         assert!(blocking > 0, "unresolved stage must be a blocking issue");
     }
 
@@ -35645,7 +35777,7 @@ steps:
 "#,
         )
         .expect("parse");
-        let blocking = lint_flywheel_tier("t", &wf);
+        let blocking = lint_flywheel_tier("t", &wf, None);
         assert!(
             blocking > 0,
             "undeclared input ref must be a blocking issue"
@@ -35672,7 +35804,7 @@ steps:
 "#,
         )
         .expect("parse");
-        let blocking = lint_flywheel_tier("t", &wf);
+        let blocking = lint_flywheel_tier("t", &wf, None);
         assert_eq!(blocking, 0, "nested ref into declared root must lint clean");
     }
 
@@ -35694,7 +35826,7 @@ steps:
 "#,
         )
         .expect("parse");
-        let blocking = lint_flywheel_tier("t", &wf);
+        let blocking = lint_flywheel_tier("t", &wf, None);
         assert_eq!(blocking, 0, "clean workflow must lint clean");
     }
 
@@ -35710,13 +35842,54 @@ steps:
                 "built-in {name} fails engine lint: {:?}",
                 engine.issues
             );
-            let tier = lint_flywheel_tier(&name, &wf);
+            let tier = lint_flywheel_tier(&name, &wf, None);
             assert_eq!(
                 tier, 0,
                 "built-in {name} fails flywheel-tier lint (profile/stage/inputs)"
             );
         }
     }
+}
+
+/// The lint gate must resolve stages through the SAME tiers the composer
+/// uses. It used to call `StageLibrary::load()` (no project tier), so every
+/// project-authored stage in `.flywheel/stages.toml` was reported
+/// unresolvable and any composed workflow referencing it was refused —
+/// while `stage show` happily listed the same stage as valid.
+#[test]
+fn project_tier_stage_lints_clean_through_the_compose_gate() {
+    let dir = temp_state_root("proj-stage-lint");
+    let stages_dir = dir.join(".flywheel");
+    std::fs::create_dir_all(&stages_dir).expect("mkdir .flywheel");
+    std::fs::write(
+        stages_dir.join("stages.toml"),
+        "[stages.my-lane]\nname = \"my-lane\"\nrole = \"coder\"\nphase = \"implement\"\nprompt = \"do {{bead}}\"\n",
+    )
+    .expect("write stages.toml");
+
+    let wf = toron_workflow::parse_workflow(
+        r#"
+name: t
+trigger:
+  type: webhook
+inputs:
+  - name: goal
+steps:
+  - name: a
+    action: dispatch_job
+    assignee: x
+    spec: { profile: "@planner", stage: "my-lane" }
+"#,
+    )
+    .expect("parse");
+
+    let blocking = lint_flywheel_tier("t", &wf, Some(&dir));
+    assert_eq!(
+        blocking, 0,
+        "a project-tier stage must lint clean — the compose gate refuses \
+         every workflow that names one when it cannot resolve the project tier"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// bd-bvwf.1 regression: --retire-orphans must catch orphan workspaces from

@@ -126,7 +126,7 @@ fn invariant_6_effectful_runs_are_journaled() {
     assert!(
         has_test(
             &file("src/pane.rs"),
-            &decl("", "journal").trim_start_matches("fn ")
+            decl("", "journal").trim_start_matches("fn ")
         ) || has_test(&file("src/cron.rs"), "journal"),
         "invariant 6: nothing tests that the live arm is Enforced and the dry arm is not"
     );
