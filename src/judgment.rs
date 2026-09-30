@@ -4345,11 +4345,8 @@ pub fn pack_drift(user_dir: &Path, project_dir: &Path) -> Vec<PackDriftRow> {
         .map(|id| {
             let user = highest_pack(user_dir, &id);
             let project = highest_pack(project_dir, &id);
-            let uv = user.as_deref().and_then(|p| pack_entry(p)).map(|(_, v)| v);
-            let pv = project
-                .as_deref()
-                .and_then(|p| pack_entry(p))
-                .map(|(_, v)| v);
+            let uv = user.as_deref().and_then(pack_entry).map(|(_, v)| v);
+            let pv = project.as_deref().and_then(pack_entry).map(|(_, v)| v);
             let status = match (&user, &project) {
                 (None, Some(_)) => "missing",
                 (Some(_), None) => "user-only",

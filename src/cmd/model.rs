@@ -481,7 +481,7 @@ pub(crate) fn cmd_models(cmd: &ModelCmd) -> Result<()> {
                     raw.clone()
                 } else {
                     let routing = crate::models::ModelRegistry::load_routing()?;
-                    let p = routing.provider_of(&raw);
+                    let p = routing.provider_of(raw);
                     if p.is_empty() {
                         raw.clone()
                     } else {

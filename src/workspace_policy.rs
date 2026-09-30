@@ -93,11 +93,13 @@ mod tests {
 
     #[test]
     fn policy_is_consumed_by_the_reducer_instead_of_process_state() {
-        let mut model = crate::workspace::WorkspaceModel::default();
-        model.policy = WorkspacePolicy {
-            digest_interval_secs: 10_000,
-            digest_threshold: 1,
-            ..WorkspacePolicy::default()
+        let model = crate::workspace::WorkspaceModel {
+            policy: WorkspacePolicy {
+                digest_interval_secs: 10_000,
+                digest_threshold: 1,
+                ..WorkspacePolicy::default()
+            },
+            ..Default::default()
         };
         let (model, _) = crate::workspace::tick(
             &model,
