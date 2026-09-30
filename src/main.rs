@@ -19,6 +19,7 @@
 // which `scripts/verify-clippy.sh` judges with `-D warnings`, stay strict.
 #![cfg_attr(not(feature = "serve"), allow(dead_code))]
 
+mod adr0016_invariants;
 mod agent_ref;
 mod agentstate;
 mod artifact;
