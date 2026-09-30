@@ -2780,7 +2780,7 @@ mod tests {
             project,
             "flywheel-proj-oc",
             "opencode",
-            "deepseek-v4-flash",
+            "deepseek-v4.1-flash",
             "bd-qk9q implementer: stranded-bead reclaim fix",
         )
         .expect("prior session registration");
@@ -3219,7 +3219,7 @@ mod tests {
                 },
             )
             .expect("empty thread inbox");
-        assert!(missing.as_array().unwrap().is_empty());
+        assert_eq!(missing.as_array().unwrap(), &[] as &[serde_json::Value]);
     }
 
     /// bd-zqdf: the two live contracts behind a thread-scoped inbox read.
@@ -3272,8 +3272,16 @@ mod tests {
             ("busy-c", "busy-thread"),
             ("busy-d", "busy-thread"),
         ] {
-            mail.send(&project, &recv, subject, "body", "normal", false, Some(thread))
-                .expect("send");
+            mail.send(
+                &project,
+                &recv,
+                subject,
+                "body",
+                "normal",
+                false,
+                Some(thread),
+            )
+            .expect("send");
         }
 
         let subjects_of = |v: Value| -> Vec<String> {
@@ -3462,7 +3470,10 @@ mod tests {
                 },
             )
             .expect("other-thread read");
-        assert!(other_thread.as_array().unwrap().is_empty());
+        assert_eq!(
+            other_thread.as_array().unwrap(),
+            &[] as &[serde_json::Value]
+        );
     }
 
     /// The door must never answer "nothing overdue" for an identity it knows
@@ -3799,7 +3810,10 @@ mod locks_list_tests {
         // degenerate daemon reply: empty rows still a well-formed board
         let empty = remotes_to_board("x", json!({}));
         assert_eq!(empty["count"], 0);
-        assert!(empty["reservations"].as_array().expect("rows").is_empty());
+        assert_eq!(
+            empty["reservations"].as_array().expect("rows"),
+            &[] as &[serde_json::Value]
+        );
     }
 }
 /// Map the daemon `list_agents` envelope (`{"agents": [...]}`) onto the

@@ -763,7 +763,7 @@ fn spawn_crew_into(
                 // the harness cannot take as argv (opencode's root command has
                 // no `--model`) has to be pinned into the pane env at creation
                 // time. There is no "set it afterwards".
-                let (mut agent_args, model_pin, env_model_pin): (
+                let (agent_args, model_pin, env_model_pin): (
                     Vec<String>,
                     Option<String>,
                     Option<String>,
@@ -774,12 +774,6 @@ fn spawn_crew_into(
                         .map_err(|e| anyhow!("pane crew @{role} model routing: {e}"))?;
                     (plan.args, Some(plan.model), plan.env_model_pin)
                 };
-                agent_args.extend(headless::role_model_args(
-                    harness,
-                    &profile.smol,
-                    &profile.slow,
-                    &profile.plan,
-                ));
                 let pane_env =
                     pane_env_for_launch(cfg, mail_identity.as_deref(), env_model_pin.as_deref())?;
                 let pane_id = match &prev {
@@ -901,17 +895,11 @@ fn spawn_crew_into(
                                 },
                             );
                             let Some(route) = route else { return Err(e) };
-                            let mut fallback_args = headless::model_args(
+                            let fallback_args = headless::model_args(
                                 &route.harness,
                                 &route.model,
                                 (!profile.effort.is_empty()).then_some(profile.effort.as_str()),
                             );
-                            fallback_args.extend(headless::role_model_args(
-                                &route.harness,
-                                &profile.smol,
-                                &profile.slow,
-                                &profile.plan,
-                            ));
                             // GS-043 I4: journal before ModelEntry.fallback hop.
                             let intent = model_fallback_intent(
                                 project,
@@ -3509,7 +3497,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
         );
-        assert!(none.is_empty());
+        assert_eq!(none, [] as [(String, String); 0]);
     }
 
     /// bd-lvyi: a per-step harness override resolves to a crew pane OF THAT

@@ -133,6 +133,20 @@ pub const SLOT_CHEAP: &str = "cheap";
 pub const SLOT_STANDARD: &str = "standard";
 pub const SLOT_PREMIUM: &str = "premium";
 
+/// The harness a profile lands on when it names none, and its model is CONCRETE
+/// (so no slot can supply a more specific answer).
+///
+/// bd-47fu, operator-chosen 2026-09-29. It lives beside the tier constants because
+/// it is the same kind of fact: a compiled-in default the operator sets, not a
+/// per-machine choice. Making it a `models.toml` key would be a new config surface
+/// wanting its own ADR, and nothing needs it yet.
+///
+/// It is deliberately NOT `[defaults]`. That replaces the slot layer for every
+/// alias, so `@cheap` would leave opencode and `big-pickle` — free on opencode only
+/// — would stop being free. This constant is reached only when a profile names no
+/// harness AND its model is concrete, which is the one case that used to bail.
+pub const DEFAULT_HARNESS: &str = "pi";
+
 /// bd-ll3k: kind → slot NAME mapping behind [`ModelRegistry::implied_slot_for_harness`].
 /// Split out so consumers that resolve through [`ModelRegistry::effective_slot_model`]
 /// (defaults-aware) share the exact mapping instead of re-matching kinds.
@@ -462,24 +476,31 @@ impl ModelRegistry {
             return Ok((h, slot.model.clone()));
         }
         if harness.is_empty() {
-            // bd-ziy9: this bail is DELIBERATELY still a bail, and the reason is
-            // worth stating because "add a default" was the obvious next suggestion
-            // and it is the wrong one.
+            // bd-47fu: pi is the DEFAULT HARNESS for a profile that names none. This
+            // is the operator's stated choice (2026-09-29) and it resolves bd-ttaa,
+            // which recorded the missing concept instead of inventing one.
             //
-            // There is no default-harness concept anywhere in the codebase, and
-            // inventing one here would be a silent policy decision on the exact path
-            // that currently tells the truth: a profile naming a concrete model and
-            // no harness is genuinely unconfigured, and which harness it "should"
-            // land on is an operator choice, not a derivation. So the two real fixes
-            // are named instead — and the slot form is the one that matches the
-            // "dynamic with a default" shape, because a slot carries a harness AND a
-            // model together and both can then detour per harness.
-            anyhow::bail!(
-                "profile has no harness and model {model:?} is not a slot alias \
-                 (@cheap/@standard/@premium). Either name a harness on the profile, or \
-                 use a slot alias — `flywheel slot set <name> --harness <h> --model <id>` \
-                 — which carries both halves and can then resolve a default per harness."
-            );
+            // NOT the same as `[defaults]`, and the difference is the whole cost
+            // consequence: `[defaults]` replaces the slot layer for EVERY alias, so
+            // `@cheap` would leave opencode and `big-pickle` — free on opencode only —
+            // would stop being free. This applies at exactly the one point where
+            // nothing more specific exists, so `@cheap` keeps its slot's harness and
+            // the free tier is untouched.
+            let default = DEFAULT_HARNESS;
+            // The gate is STRUCTURAL. A default that names an unregistered harness, or
+            // a Closed-tier one that may never be handed a model, would reintroduce
+            // precisely the bug bd-ziy9 refused to fix. Refuse loudly instead: a
+            // misconfigured default must not become a silent misroute.
+            let usable = crate::harness_registry::tier_of(default)
+                .is_some_and(crate::harness_registry::HarnessTier::may_be_asked_for_a_model);
+            if !usable {
+                anyhow::bail!(
+                    "the default harness {default:?} is not an Open-tier registered harness, so \
+                     a profile may not be routed onto it. Fix \
+                     `DEFAULT_HARNESS` in models.rs, or name a harness on the profile."
+                );
+            }
+            return Ok((default.to_string(), model.to_string()));
         }
         Ok((harness.to_string(), model.to_string()))
     }
@@ -512,11 +533,29 @@ impl ModelRegistry {
         if primary_ok {
             return Ok((h, primary, "primary"));
         }
-        // Step 3: profile-ordered model_fallback ids on the same harness.
-        for id in model_fallback {
+        // Step 3: model_fallback ids on the same harness. The PROFILE's list first,
+        // then the SLOT's.
+        //
+        // bd-47fu FIXED A REAL DEFECT HERE. `SlotSpec.model_fallback` was read by
+        // exactly one thing — `flywheel slot show`, which DISPLAYS it — and by no
+        // routing path at all: this step walked only the profile's list. So a slot
+        // could declare a model fallback, an operator could see it in `slot show` and
+        // reasonably believe it routed, and the ladder would never consult it. The
+        // compiled-in standard slot's `zai/glm-5.3-flash` was already inert for this
+        // reason, which is how it went unnoticed: nothing failed, a route just
+        // happened elsewhere.
+        //
+        // The profile's list leads because it is the more specific statement. A
+        // profile that names its own fallback means it; the slot's list is the
+        // tier-wide default underneath. Letting the slot's list win would silently
+        // override an explicit per-profile choice.
+        let slot_fallbacks: &[String] = slot_alias(model)
+            .and_then(|name| self.slots.get(name))
+            .map_or(&[] as &[String], |s| s.model_fallback.as_slice());
+        for id in model_fallback.iter().chain(slot_fallbacks) {
             let caps_ok = self
                 .models
-                .get(id)
+                .get(id.as_str())
                 .map(|e| e.caps.is_empty() || e.caps.iter().any(|c| c == &h))
                 .unwrap_or(false);
             if caps_ok {
@@ -922,8 +961,16 @@ impl ModelRegistry {
 pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
     let mut m = BTreeMap::new();
     m.insert(
-        "opencode-go/deepseek-v4-flash".to_string(),
+        // bd-47fu: renamed from `opencode-go/deepseek-v4.1-flash` at the operator's
+        // direction, with the cost below from the same table. The rename is a
+        // rename with teeth: this id is asserted on by name in verify-0007.sh and in
+        // ~50 places across 12 files, so every one of those is a live reference, not
+        // documentation.
+        "opencode-go/deepseek-v4.1-flash".to_string(),
         ModelEntry {
+            // Operator cost table 2026-09-29: $0.30 in / $1.20 out per Mtok.
+            cost_in_per_mtok: 0.30,
+            cost_out_per_mtok: 1.20,
             tier: Some(Tier::Standard),
             ..ModelEntry::default()
         },
@@ -936,6 +983,36 @@ pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
             ..ModelEntry::default()
         },
     );
+    // bd-47fu: the premium tier's model fallback. `caps` is left empty, which reads
+    // as PORTABLE, and that is the whole point of a fallback: it has to be able to
+    // run wherever the primary could not, or it is not a fallback. A capped entry
+    // here would make the premium slot fail on exactly the harnesses the fallback
+    // exists to rescue.
+    m.insert(
+        "opencode-go/gpt-6-luna".to_string(),
+        ModelEntry {
+            // Operator cost table 2026-09-29: $0.10 in / $0.50 out per Mtok.
+            cost_in_per_mtok: 0.1,
+            cost_out_per_mtok: 0.5,
+            tier: Some(Tier::Premium),
+            ..ModelEntry::default()
+        },
+    );
+    // bd-47fu: from the operator cost table and previously unregistered. `caps`
+    // is empty, i.e. PORTABLE, which is what lets it serve as a fallback on any
+    // harness. At $1.74/$3.84 it is the most expensive entry here, so a cost-aware
+    // ordering must place it LAST among known-cost models rather than assume it
+    // is a mid tier.
+    m.insert(
+        "deepseek/deepseek-v4-pro".to_string(),
+        ModelEntry {
+            // Operator cost table 2026-09-29: $1.74 in / $3.84 out per Mtok.
+            cost_in_per_mtok: 1.74,
+            cost_out_per_mtok: 3.84,
+            tier: Some(Tier::Premium),
+            ..ModelEntry::default()
+        },
+    );
     m.insert(
         "zai/glm-5.3".to_string(),
         ModelEntry {
@@ -943,25 +1020,14 @@ pub fn compiled_in_models() -> BTreeMap<String, ModelEntry> {
             ..ModelEntry::default()
         },
     );
-    m.insert(
-        "zai/glm-5.3-flash".to_string(),
-        ModelEntry {
-            tier: Some(Tier::Standard),
-            ..ModelEntry::default()
-        },
-    );
     // Kept in the registry for explicit `--harness jcode` (bare harness).
     // Coder no longer defaults here (ADR-0007 D2: coder inherits @standard).
     m.insert(
-        "opencode-go/muse-spark-1.2-contributor".to_string(),
-        ModelEntry {
-            tier: Some(Tier::Standard),
-            ..ModelEntry::default()
-        },
-    );
-    m.insert(
         "opencode-go/muse-spark-1.3-contributor".to_string(),
         ModelEntry {
+            // Operator cost table 2026-09-29: $0.10 in / $0.20 out per Mtok.
+            cost_in_per_mtok: 0.10,
+            cost_out_per_mtok: 0.20,
             tier: Some(Tier::Standard),
             ..ModelEntry::default()
         },
@@ -985,17 +1051,38 @@ pub fn compiled_in_slots() -> BTreeMap<String, SlotSpec> {
         SlotSpec {
             harness: "pi".into(),
             model: "opencode-go/muse-spark-1.3-contributor".into(),
-            model_fallback: vec!["zai/glm-5.3-flash".into()],
+            // bd-47fu: repointed from the removed `zai/glm-5.3-flash`. This is the
+            // standard tier's ONLY fallback and it became LIVE in this same change
+            // (the slot list was previously read only by `slot show`), so removing
+            // the model without repointing here would have left @standard with a
+            // fallback id that resolves to nothing.
+            //
+            // COST, stated because it is a real jump: the primary is
+            // `muse-spark-1.3-contributor` at $0.10/$0.20, and this fallback is
+            // `deepseek-v4.1-flash` at $0.30/$1.20 — 3x the input and 6x the output.
+            model_fallback: vec!["opencode-go/deepseek-v4.1-flash".into()],
             ..SlotSpec::default()
         },
     );
     m.insert(
         SLOT_PREMIUM.to_string(),
         SlotSpec {
-            harness: "omp".into(),
+            // bd-47fu: was "omp", which the operator removed from the harness
+            // registry. Repointed to `pi` — the same harness the operator's
+            // models.toml already pins premium to, so compiled-in and user config
+            // now AGREE. Leaving it on a removed harness would have made every
+            // zero-config install resolve `@premium` onto a harness that does not
+            // exist, which is the kind of mismatch that only shows up on a machine
+            // without a models.toml.
+            harness: "pi".into(),
             model: "zai/glm-5.3".into(),
+            // bd-47fu: the premium tier's MODEL fallback, which is a different
+            // mechanism from `fallback_harness` below and from the registry-level
+            // `fallback` (ADR-0013 D4 keeps all three distinct). Order matters: the
+            // ladder walks `model_fallback` on the SAME harness first, so a
+            // caps-blocked premium primary tries this before it swaps harness.
+            model_fallback: vec!["opencode-go/gpt-6-luna".into()],
             fallback_harness: Some("grok".into()),
-            ..SlotSpec::default()
         },
     );
     m
@@ -1427,13 +1514,13 @@ mod tests {
 
         let reg = ModelRegistry::load_routing().expect("routing registry");
         assert_eq!(
-            reg.resolve("opencode-go/deepseek-v4-flash", "omp"),
-            "opencode-go/deepseek-v4-flash",
+            reg.resolve("opencode-go/deepseek-v4.1-flash", "omp"),
+            "opencode-go/deepseek-v4.1-flash",
             "compiled-in deepseek routes zero-config (composite key)"
         );
         assert_eq!(
-            reg.resolve("deepseek-v4-flash", "omp"),
-            "opencode-go/deepseek-v4-flash",
+            reg.resolve("deepseek-v4.1-flash", "omp"),
+            "opencode-go/deepseek-v4.1-flash",
             "bare id falls back to the compiled-in default provider"
         );
         assert_eq!(reg.resolve("glm-5.3", "omp"), "zai/glm-5.3");
@@ -1441,12 +1528,12 @@ mod tests {
         assert_eq!(reg.resolve("big-pickle", "opencode"), "opencode/big-pickle");
         std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
         // A user entry OVERRIDES the compiled-in default for the same id.
-        fs::write(&path, "[models.\"my-gateway/deepseek-v4-flash\"]\n")
+        fs::write(&path, "[models.\"my-gateway/deepseek-v4.1-flash\"]\n")
             .expect("write user models.toml");
         let reg = ModelRegistry::load_routing().expect("reload routing");
         assert_eq!(
-            reg.resolve("deepseek-v4-flash", "omp"),
-            "my-gateway/deepseek-v4-flash",
+            reg.resolve("deepseek-v4.1-flash", "omp"),
+            "my-gateway/deepseek-v4.1-flash",
             "user entry wins over compiled-in"
         );
         assert_eq!(
@@ -1475,9 +1562,9 @@ mod tests {
 
         assert_eq!(reg.resolve_strict("", "omp").expect("empty ok"), "");
         assert_eq!(
-            reg.resolve_strict("deepseek-v4-flash", "omp")
+            reg.resolve_strict("deepseek-v4.1-flash", "omp")
                 .expect("known ok"),
-            "opencode-go/deepseek-v4-flash"
+            "opencode-go/deepseek-v4.1-flash"
         );
         let err = reg
             .resolve_strict("no-such-model", "omp")
@@ -1583,11 +1670,16 @@ mod tests {
         let _g = with_config_dir();
         let path = crate::config::config_dir().join("models.toml");
         std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
-        fs::write(&path, "[models.deepseek-v4-flash]\nprovider = \"x\"\n").expect("write legacy");
+        // A DOT-FREE id on purpose. `[models.deepseek-v4.1-flash]` is a DOTTED KEY PATH
+        // in TOML, not a bare key: it parses as models -> deepseek-v4 -> 1-flash, so
+        // the fixture stopped being the thing this test is about. The dotted case has
+        // its own test below, because it now matters and did not before bd-47fu
+        // introduced the first model id containing a dot.
+        fs::write(&path, "[models.legacyflash]\nprovider = \"x\"\n").expect("write legacy");
         let err = ModelRegistry::load().expect_err("bare key must fail load()");
         let chain = format!("{err:#}");
         assert!(
-            chain.contains("must be provider/model") && chain.contains("deepseek-v4-flash"),
+            chain.contains("must be provider/model") && chain.contains("legacyflash"),
             "error names the rewrite: {chain}"
         );
         let err = ModelRegistry::load_routing().expect_err("bare key must fail load_routing()");
@@ -1627,16 +1719,23 @@ mod tests {
         let standard = reg.slot("@standard").expect("standard via alias");
         assert_eq!(standard.harness, "pi");
         assert_eq!(standard.model, "opencode-go/muse-spark-1.3-contributor");
-        assert_eq!(standard.model_fallback, vec!["zai/glm-5.3-flash"]);
+        assert_eq!(
+            standard.model_fallback,
+            vec!["opencode-go/deepseek-v4.1-flash"],
+            "bd-47fu repointed the standard fallback; the id must be a LIVE registry entry"
+        );
         let premium = reg.slot("premium").expect("premium");
-        assert_eq!(premium.harness, "omp");
+        assert_eq!(
+            premium.harness, "pi",
+            "bd-47fu: repointed from the removed omp; agrees with the operator models.toml"
+        );
         assert_eq!(premium.fallback_harness.as_deref(), Some("grok"));
         assert_eq!(
             reg.get("opencode/big-pickle").and_then(|e| e.tier),
             Some(Tier::Cheap)
         );
         assert_eq!(
-            reg.get("opencode-go/deepseek-v4-flash")
+            reg.get("opencode-go/deepseek-v4.1-flash")
                 .and_then(|e| e.tier),
             Some(Tier::Standard)
         );
@@ -1645,7 +1744,8 @@ mod tests {
             Some(Tier::Premium)
         );
         assert_eq!(
-            reg.get("zai/glm-5.3-flash").and_then(|e| e.tier),
+            reg.get("opencode-go/deepseek-v4.1-flash")
+                .and_then(|e| e.tier),
             Some(Tier::Standard)
         );
         assert_eq!(
@@ -1695,16 +1795,18 @@ mod tests {
         let reg = ModelRegistry::load_routing().expect("routing");
 
         // (1) A `harness: ""` profile naming a TIER, on an open-tier harness with no
-        // implied slot and no declared fallback. `pa` is exactly that cell.
+        // implied slot and no declared fallback. bd-47fu: pa is gone and
+        // `fx` is the remaining Open harness whose implied slot is None —
+        // exactly that cell.
         let open = reg
-            .resolve_profile_route_full("pa", "@cheap", &[])
+            .resolve_profile_route_full("fx", "@cheap", &[])
             .expect("an open-tier harness must resolve via the dynamic default");
         assert_eq!(
             open.2, "dynamic_default",
             "the rung must NAME itself so the ledger records which hop fired: {open:?}"
         );
         assert!(
-            reg.caps_permit(&open.1, "pa"),
+            reg.caps_permit(&open.1, "fx"),
             "the pick must be a model that can actually run here, not a hopeful one: {open:?}"
         );
 
@@ -1727,10 +1829,10 @@ mod tests {
         // (3) Same input, same answer. `models` is a BTreeMap so the pick is
         // lexicographic, not hash-ordered; if that ever changes this catches it.
         let a = reg
-            .resolve_profile_route_full("jcode", "@cheap", &[])
+            .resolve_profile_route_full("fx", "@cheap", &[])
             .expect("route");
         let b = reg
-            .resolve_profile_route_full("jcode", "@cheap", &[])
+            .resolve_profile_route_full("fx", "@cheap", &[])
             .expect("route");
         assert_eq!(a, b, "the dynamic default must be stable across calls");
 
@@ -1741,8 +1843,7 @@ mod tests {
         // does not survive strict resolution is a green matrix over a spawn that
         // still fails, so the two must be checked in the same breath.
         for (harness, model) in [
-            ("pa", &open.1),
-            ("jcode", &a.1),
+            ("fx", &open.1),
             (
                 "fx",
                 &reg.resolve_profile_route_full("fx", "@cheap", &[])
@@ -1766,7 +1867,11 @@ mod tests {
         // `profile_launch_plan` -> `resolve_strict` -> argv. Testing the registry
         // alone leaves the last mile unproven, and an unproven last mile is how a
         // green matrix hides a spawn that still fails.
-        for h in ["opencode", "pi", "omp", "pa", "jcode", "fx"] {
+        // bd-47fu: omp, pa, jcode are dropped. Only OPEN-tier harnesses
+        // must build a plan from an empty profile — a Closed harness is
+        // REQUIRED to refuse (that is the closed-tier contract, proven in
+        // `the_closed_tier_never_substitutes_a_model`).
+        for h in ["opencode", "pi", "fx"] {
             let plan = crate::profile_launch_plan(
                 h,
                 &crate::profile::Profile {
@@ -1788,44 +1893,110 @@ mod tests {
         }
     }
 
-    /// bd-ttaa: the harness-side gap is a DECISION, pinned so it cannot be changed
-    /// by accident and so nobody re-derives it as an oversight.
+    /// bd-47fu: a profile with a CONCRETE model and no harness now lands on the
+    /// default harness instead of bailing. This test used to assert the OPPOSITE —
+    /// it pinned "no default harness, deliberately" — and the operator has now made
+    /// that choice, so the assertion is inverted rather than deleted. Keeping the
+    /// test (and its reasoning) is the point: the decision is recorded in code, not
+    /// just in a bead.
     ///
-    /// A profile naming a CONCRETE model and NO harness still fails. There is no
-    /// default harness, deliberately: choosing one would silently decide where every
-    /// harness-less profile runs, which is an operator's choice rather than a
-    /// derivation. The profile path a SLOT does not hit this — it resolves on every
-    /// Open-tier harness via the dynamic default.
-    ///
-    /// The bail had NO test at all before this, so the state was reachable and
-    /// unpinned; a future "just add a default" edit would have looked like a bug fix
-    /// with nothing to contradict it.
+    /// The contrast that carries the cost guarantee: a SLOT profile must still get
+    /// its SLOT's harness, so `@cheap` keeps opencode and `big-pickle` stays free.
+    /// A default that leaked into the slot path would end the free tier silently,
+    /// which is the failure `[defaults]` would have caused.
     #[test]
-    fn a_concrete_model_with_no_harness_fails_loudly_and_names_both_fixes() {
+    fn a_concrete_model_with_no_harness_lands_on_the_default_and_slots_keep_their_own() {
         let _g = with_config_dir();
         let reg = ModelRegistry::load_routing().expect("routing");
-        let err = reg
+
+        // (1) The new default. A concrete model, no harness -> DEFAULT_HARNESS.
+        let (h, m, step) = reg
             .resolve_profile_route_full("", "opencode-go/muse-spark-1.3-contributor", &[])
-            .expect_err("a concrete model with no harness has nowhere to run");
-        let msg = format!("{err:#}");
-        // The message must name BOTH real fixes, or an operator hits a wall.
-        assert!(
-            msg.contains("slot alias") && msg.contains("flywheel slot set"),
-            "the bail must name the slot form as the fix, not just refuse: {msg}"
+            .expect("the default harness means this now resolves");
+        assert_eq!(
+            h, DEFAULT_HARNESS,
+            "the default must be the one that was chosen"
         );
-        // And it must stay a REFUSAL, naming the reason.
-        assert!(
-            msg.contains("no harness"),
-            "the refusal must name the actual reason: {msg}"
+        assert_eq!(
+            m, "opencode-go/muse-spark-1.3-contributor",
+            "the model is unchanged"
         );
-        // The contrast that makes this a decision rather than a bug: the same
-        // profile shape with a SLOT resolves fine, on every Open-tier harness.
-        for h in ["pa", "jcode", "fx"] {
-            assert!(
-                reg.resolve_profile_route_full(h, "@cheap", &[]).is_ok(),
-                "{h}: a slot-naming profile must resolve where a concrete-model one cannot"
-            );
+        assert_eq!(
+            step, "primary",
+            "the model's own route is untouched by the default"
+        );
+
+        // (2) THE cost guarantee. `@cheap` must still resolve to its SLOT's harness,
+        // which is opencode, where big-pickle is free. If a slot ever picked up the
+        // default instead, the free tier would end and nothing would say so.
+        let (ch, cm, _) = reg
+            .resolve_profile_route_full("", "@cheap", &[])
+            .expect("@cheap resolves");
+        assert_eq!(
+            ch, "opencode",
+            "a slot profile must keep its own harness, not the default — big-pickle is free \
+             on opencode only, so this is the free tier"
+        );
+        assert_eq!(cm, "opencode/big-pickle", "and its own model");
+
+        // (3) The default must be usable, or the guard is decorative. Asserting the
+        // constant is Open-tier is what stops a future edit naming a Closed harness
+        // and silently reintroducing a foreign-model substitution.
+        assert!(
+            crate::harness_registry::tier_of(DEFAULT_HARNESS)
+                .is_some_and(crate::harness_registry::HarnessTier::may_be_asked_for_a_model),
+            "the default harness must be registered AND Open tier, or it may never be \
+             handed a model"
+        );
+    }
+
+    /// bd-47fu: the premium tier's `model_fallback` must actually FIRE, and fire on
+    /// the SAME harness before any harness swap.
+    ///
+    /// "It is in the config" is not "it is used". The ladder has two distinct
+    /// fallback mechanisms and they are easy to confuse: `model_fallback` is tried on
+    /// the current harness, `fallback_harness` swaps the harness. A premium profile
+    /// whose primary is caps-blocked must reach `gpt-6-luna` on the SAME harness —
+    /// swapping to grok first would be a different, more expensive decision than the
+    /// operator asked for.
+    #[test]
+    fn the_premium_model_fallback_fires_on_the_same_harness_before_any_harness_swap() {
+        let _g = with_config_dir();
+        let mut reg = ModelRegistry::load_routing().expect("routing");
+        // Block the premium primary on pi, which is the operator's premium harness.
+        if let Some(e) = reg.models.get_mut("zai/glm-5.3") {
+            e.caps = vec!["omp".into()];
         }
+        let (h, m, step) = reg
+            .resolve_profile_route_full("pi", "@premium", &[])
+            .expect("premium must route somewhere");
+        assert_eq!(
+            step, "model_fallback",
+            "the tier's own fallback must be reached: {h} {m}"
+        );
+        assert_eq!(
+            h, "pi",
+            "NO harness swap — the model fallback is same-harness by design"
+        );
+        assert_eq!(
+            m, "opencode-go/gpt-6-luna",
+            "the fallback must be the one the operator added"
+        );
+        // And the contrast that proves the two mechanisms are distinct: with the
+        // fallback ALSO blocked, the ladder must fall through to the harness swap.
+        // If it did not, one mechanism would be shadowing the other and this test
+        // would still pass.
+        if let Some(e) = reg.models.get_mut("opencode-go/gpt-6-luna") {
+            e.caps = vec!["some-other-harness".into()];
+        }
+        let (h2, _m2, step2) = reg
+            .resolve_profile_route_full("pi", "@premium", &[])
+            .expect("the harness swap must still be reachable");
+        assert_eq!(
+            step2, "fallback_harness",
+            "with the model fallback blocked, the harness swap is the next rung: {step2}"
+        );
+        assert_eq!(h2, "grok", "premium's fallback_harness is grok");
     }
 
     /// The rung must never COST the operator a choice by silently preferring a
@@ -1837,7 +2008,7 @@ mod tests {
         let _g = with_config_dir();
         let reg = ModelRegistry::load_routing().expect("routing");
         let (_, model, step) = reg
-            .resolve_profile_route_full("pa", "@cheap", &[])
+            .resolve_profile_route_full("fx", "@cheap", &[])
             .expect("route");
         assert_eq!(step, "dynamic_default");
         let wanted = reg
@@ -1882,14 +2053,14 @@ mod tests {
         let mut reg = ModelRegistry::load_routing().expect("routing");
         // Block the primary: big-pickle may NOT run on opencode anymore.
         if let Some(e) = reg.models.get_mut("opencode/big-pickle") {
-            e.caps = vec!["omp".into()];
+            e.caps = vec!["fx".into()];
         }
         // Step 3 first: a caps-compatible model_fallback id wins.
         let (h, _m, route) = reg
             .resolve_profile_route_full(
                 "",
                 "@cheap",
-                &["opencode-go/deepseek-v4-flash".to_string()],
+                &["opencode-go/deepseek-v4.1-flash".to_string()],
             )
             .expect("model_fallback rung");
         assert_eq!(
@@ -1904,7 +2075,7 @@ mod tests {
         //
         // It used to expect a LOUD FAILURE, on the stated premise that "the registry
         // has no other opencode-capped model nor a fallback". That premise is no
-        // longer true: `opencode-go/deepseek-v4-flash` is registered, portable, and
+        // longer true: `opencode-go/deepseek-v4.1-flash` is registered, portable, and
         // in the tier's own family, so the dynamic-default rung resolves this cell.
         //
         // What did NOT change is ADR D1's "no silent hop". The hop is REPORTED —
@@ -1946,11 +2117,22 @@ mod tests {
             "names the failure: {err}"
         );
 
-        // Step 4 positive case: cap glm-5.3 to a NON-omp harness so the
-        // omp slot route is caps-blocked; fallback_harness=grok is
-        // model-opaque so no grok registry row is needed.
-        if let Some(e) = reg.models.get_mut("zai/glm-5.3") {
-            e.caps = vec!["pi".into()];
+        // The premium slot's HARNESS swap is still reachable, but bd-47fu moved it one
+        // rung later: premium now declares `model_fallback = ["opencode-go/gpt-6-luna"]`,
+        // and once the SLOT's list is honoured (it used to be read only by `slot show`,
+        // never by the ladder) the same-harness model fallback wins before any harness
+        // swap. That is the better order — a model hop on the harness you are already
+        // on beats moving to a different harness — so the EXPECTATION moved, not the
+        // code. Both halves are pinned together in
+        // `the_premium_model_fallback_fires_on_the_same_harness_before_any_harness_swap`.
+        // Block BOTH models so this rung is actually reached.
+        // bd-47fu: the premium slot's compiled-in harness is pi now (it was
+        // omp), so caps-PIRED models are still routable and this rung would
+        // never fire. Block them onto grok — the rung's own target.
+        for id in ["zai/glm-5.3", "opencode-go/gpt-6-luna"] {
+            if let Some(e) = reg.models.get_mut(id) {
+                e.caps = vec!["grok".into()];
+            }
         }
         let (h, m, route) = reg
             .resolve_profile_route_full("", "@premium", &[])
@@ -1971,14 +2153,14 @@ mod tests {
         // fallback to a caps-compatible id and block the primary caps.
         if let Some(e) = reg.models.get_mut("opencode/big-pickle") {
             e.caps = vec!["omp".into()];
-            e.fallback = Some("opencode-go/deepseek-v4-flash".into());
+            e.fallback = Some("opencode-go/deepseek-v4.1-flash".into());
         }
         let (h, m, route) = reg
             .resolve_profile_route_full("", "@cheap", &[])
             .expect("registry_fallback rung");
         assert_eq!(route, "registry_fallback");
         assert_eq!(h, "opencode", "non-grok fallback keeps the harness");
-        assert_eq!(m, "opencode-go/deepseek-v4-flash");
+        assert_eq!(m, "opencode-go/deepseek-v4.1-flash");
     }
 
     #[test]
@@ -2026,9 +2208,11 @@ model = "opencode/big-pickle"
         let _g = with_config_dir();
         let mut reg = ModelRegistry::load_routing().expect("routing");
         // No defaults: legacy routes hold.
+        // No defaults: legacy routes hold. bd-47fu: the premium slot's
+        // compiled-in harness is pi, not the dropped omp.
         assert_eq!(
             reg.resolve_profile_route("", "@premium").expect("route"),
-            ("omp".to_string(), "zai/glm-5.3".to_string())
+            ("pi".to_string(), "zai/glm-5.3".to_string())
         );
         reg.defaults = Some(DefaultsSpec {
             harness: "pi".to_string(),
@@ -2055,9 +2239,9 @@ model = "opencode/big-pickle"
             "explicit harness survives defaults"
         );
         assert_eq!(
-            reg.resolve_profile_route("omp", "zai/glm-5.3")
+            reg.resolve_profile_route("pi", "zai/glm-5.3")
                 .expect("route"),
-            ("omp".to_string(), "zai/glm-5.3".to_string()),
+            ("pi".to_string(), "zai/glm-5.3".to_string()),
             "concrete ids bypass defaults"
         );
         // Role-flag surface follows too (slow/plan burn premium today).
@@ -2130,12 +2314,13 @@ model = "opencode/big-pickle"
             Some("grok"),
             "premium's fallback_harness is a separate mechanism and still names grok"
         );
-        // bd-88m4: omp IS the premium harness — a bare omp spawn rides
-        // the premium slot instead of launching model-less.
+        // bd-47fu: omp WAS the premium harness and is gone; pi carries the
+        // premium slot now, which is the zero-config guarantee that a
+        // harness-less spawn still resolves a model.
         assert_eq!(
-            reg.implied_slot_for_harness("omp")
-                .map(|s| s.model.as_str()),
-            Some("zai/glm-5.3")
+            reg.slots.get("premium").map(|s| s.harness.as_str()),
+            Some("pi"),
+            "premium's compiled-in harness is pi after the omp drop"
         );
     }
 
@@ -2206,12 +2391,42 @@ model = "opencode/big-pickle"
     }
 
     #[test]
-    fn resolve_profile_route_rejects_empty_harness_without_slot() {
+    fn resolve_profile_route_defaults_the_harness_instead_of_rejecting() {
+        // bd-47fu INVERTED this test. It asserted the bail — "must pin harness or
+        // slot" — which was bd-ttaa's deliberate position that no default harness
+        // should be invented. The operator has now chosen pi, so the behaviour is
+        // the opposite. The test is inverted rather than deleted because the
+        // REASONING is the durable part: a reader who finds this should see that the
+        // bail was a recorded decision, later made, not an oversight.
         let reg = ModelRegistry::default();
-        let err = reg
+        let (h, m) = reg
             .resolve_profile_route("", "zai/glm-5.2")
-            .expect_err("must pin harness or slot");
-        assert!(err.to_string().contains("@cheap"));
+            .expect("a concrete model with no harness now lands on the default");
+        assert_eq!(h, DEFAULT_HARNESS, "the operator chose pi");
+        assert_eq!(
+            m, "zai/glm-5.2",
+            "the model is untouched by the default harness"
+        );
+
+        // And the guard is not unconditional: with a SLOT alias the slot's own
+        // harness still wins, because that is a more specific statement.
+        let mut reg = ModelRegistry::default();
+        reg.slots.insert(
+            SLOT_CHEAP.to_string(),
+            SlotSpec {
+                harness: "opencode".into(),
+                model: "opencode/big-pickle".into(),
+                ..SlotSpec::default()
+            },
+        );
+        let (h, _m) = reg
+            .resolve_profile_route("", "@cheap")
+            .expect("a slot profile resolves");
+        assert_ne!(
+            h, DEFAULT_HARNESS,
+            "a slot must NOT be collapsed onto the default harness — @cheap's opencode is \
+             where big-pickle is free"
+        );
     }
 
     /// The registry rung a rate-limited run retries with (bd-42fs, ADR-0024
@@ -2277,10 +2492,12 @@ model = "opencode/big-pickle"
     fn route_for_couples_grok_whoever_named_the_id() {
         let reg = reg_with_keys(&["a/next", "grok/grok-4"]);
         assert_eq!(
-            reg.route_for("a/next", "omp"),
+            // "pi" not "omp": omp was removed from the registry, and a test that
+            // names a harness which no longer exists reads as a live claim.
+            reg.route_for("a/next", "pi"),
             FallbackRoute {
                 model_id: "a/next".into(),
-                harness: "omp".into(),
+                harness: "pi".into(),
                 model: "a/next".into(),
             },
             "a non-grok id keeps the caller's harness"
