@@ -28,6 +28,7 @@ See [Functional effect kernel](./effect-kernel) for the reducer/interpreter laws
 - Budgets 5/30/3 are dispatcher-enforced.
 - After `[doorbell]`, publish presence `working` or post one kind-9 line within 120 seconds, or the pin is `unanswered`.
 - Journals (v2, rotated, seq-stamped) and subscriptions persist, so pending wakes survive crashes at-least-once.
+- Cursors hold rather than skip: a high-water only advances on input it could read, a cursor-less pin backfills from the 24h floor, and a position older than retention is named (`first foldable seq` / `first replayable seq`). The rules live in [effect-kernel discipline](../agent-instructions/effect-kernel).
 - `flywheel doorbell why <project> <pin> --seq <n> --corr <id>` folds the tick from default and explains a named wake.
 
 
