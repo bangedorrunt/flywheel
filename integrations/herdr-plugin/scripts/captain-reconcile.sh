@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# captain-reconcile.sh (bd-xenf) — stale toron binding reconcile on close.
+# captain-reconcile.sh — stale toron binding reconcile on close.
 # Diffs the last snapshot against live panes: vanished captain panes get a
 # gone presence row and leave the snapshot. Identity rows are never
 # mutated (no such agent CLI exists); the presence row IS the binding
-# signal bd-3vr9 reads. Never dispatches, closes, or writes beads.
+# signal the presence projection reads. Never dispatches, closes, or writes beads.
 # Always exits 0.
 set -u
 
