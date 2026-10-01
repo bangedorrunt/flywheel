@@ -46,6 +46,54 @@ wire / CLI / timer / process observation
 
 **12. Close authority is singular.** Beads close beads. Toron owns mailbox and reservation truth. The host owns run/effect journaling. A worker, Jev result, or report cannot self-admit completion.
 
+## Delivery cursors
+
+A cursor is a persisted position that gates delivery: everything before it
+is handled. It is the one durable value whose failure can be silent: a
+cursor that jumps drops work with no error. The honesty laws above apply
+to it with extra force. The contract for any code that reads or
+advances one:
+
+- **One cursor per consumer and scope, one owner.** The agent's toron
+  `--since last` cursor and the sweep's `since_by_pin` are two consumers
+  with two positions, not two copies of one. Do not add a second cursor
+  path for one consumer or join two cursors with gap-skip logic, because
+  that is two failure modes and no arbiter (ADR-0012 C6 rejected that
+  shape).
+- **Advance on what it could read, never past what it could not.**
+  `inbox_high_water_from_values` takes the newest time over rows whose
+  timestamp parses, and `None` when none do; `on_inbox_fetched` advances
+  `since_by_pin` only on that result, so a batch it cannot read stays in
+  place and re-sweeps. Re-reading is safe because redelivery is absorbed
+  by the dedup lattice; the cursor itself is at-least-once, never
+  at-most-once (bd-7qg6).
+- **Write the position before the effect it gates.** The plane-S cursor
+  is persisted (`flush_wake("watch-cursor")`) before the line is
+  classified, so a crash right after cannot re-ring history. The decided
+  journal row is flushed before any Prompt intent reaches a sink
+  (bd-jcys); when that flush fails it is named in the audit, and the
+  prompt still goes out. The cursor has already moved, so withholding
+  would lose the wake.
+- **Backfill from a bounded floor.** A consumer with no cursor starts at
+  the 24h redelivery floor (`redelivery_floor_rfc3339`), never at
+  wall-clock now: a strictly-newer-than-now fetch is empty forever and
+  the high-water initializes only on a non-empty batch, so a fresh or
+  state-lost pin would be deaf permanently (bd-5d0v).
+- **Monotonic, and restored by merge.** `plane_s_cursor_us` moves only by
+  `max`; `note_wake` is the same shape for the liveness stamp: a
+  same-second or older stamp is refused, never minted. Toron's durable
+  workflow cursors (`delivery_cursors`; flywheel bd-8nyh, toron bd-aqvg)
+  snapshot without in-flight marks and restore by union + max, never by a
+  smaller overwrite: marks are written after success and the delivery is
+  journaled before it, so a restart replays only what followed the last
+  saved tick.
+- **Name retention, never jump it.** A position older than journal
+  retention gets an explicit answer instead of a partial fold: `why`
+  reports the first foldable seq, SSE reconnects get
+  `Replay::Gone { first_replayable }`, rotation records what it dropped
+  (`journal_rotated{dropped_lines}`), and a torn tail stops the fold
+  loudly (D4.4).
+
 ## Review checklist
 
 Before merging a change touching a reducer or interpreter, check:
@@ -55,6 +103,7 @@ Before merging a change touching a reducer or interpreter, check:
 - Is there one interpreter and one journal identity for the command?
 - Can a crash between prepare, provider call, and settle leave an honest state?
 - Are accepted, delivered, shed, unavailable, failed, and unknown distinct?
+- Does every persisted cursor have one owner, advance only on input that could be read, and name a retention gap instead of jumping it?
 - Does replay avoid duplicate provider calls and terminal-row regression?
 - Does a Jev change remain advisory and evidence-bearing?
 - Is output ordering stable?
@@ -97,6 +146,8 @@ As of 2026-09-22, the reducer/Tick Law and serialized-policy boundaries pass fre
 ## Related sources
 
 - [Effect kernel decision record](../decisions/0016-functional-effect-kernel-redesign.md)
+- [Doorbell plane decision record](../decisions/0012-doorbell-plane-independent-runtime.md)
 - [Doorbell guide](../guides/doorbell.mdx)
 - [Session door](../guides/session-door.mdx)
 - [Judgment packs](../guides/judgment-packs.mdx)
+- [Delivery cursor persistence, bd-8nyh](../learnings/delivery-cursor-persist-bd-8nyh-2026-09-29.md)
