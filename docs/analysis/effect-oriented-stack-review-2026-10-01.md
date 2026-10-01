@@ -7,6 +7,20 @@ references/patterns.md, references/rust.md), revised 2026-10-01 (Effect 4.0-era
 TypeScript, fan-out/reduce, durable effects, delivery cursors).
 Follow-up filed: bd-0fvb.
 
+> **Status addendum 2026-10-02.** All four findings below are now closed, so
+> this file is kept for its evidence and no longer as a work list.
+> F1 closed by bd-0fvb (`durable.rs:8433` resolves authority once at the host
+> edge; the guard builds its forbidden strings with `concat()` so an adjacent
+> comment cannot satisfy the scan). T1 closed by bd-7n2a (fail-after-collect,
+> documented at `control_flow.rs:1607`/`:1664`: every copy is a journaled durable
+> child, so a sibling failure must not cancel it). T2 closed by bd-eqwq (ADR-0034
+> frontmatter is `status: accepted`). C1 closed by bd-6mt (`RetryStep` /
+> `jittered_delay` / `step_after_failure` in chiebukuro's `src/bridge/llm.rs`).
+> The flywheel verdict stays **conditional** and that is still true: `swarm_loop`
+> is migrated, other durable leaves still sample wall time. Skill-surface findings
+> from the same pass live in
+> [stack-skill-review-2026-10-02.md](stack-skill-review-2026-10-02.md).
+
 ## Verdicts at a glance
 
 | Layer | Verdict | One line |
@@ -138,7 +152,9 @@ Follow-up filed: bd-0fvb.
 
 ## Follow-ups
 
+All closed as of 2026-10-02; see the status addendum at the top.
+
 - bd-0fvb: thread RuntimeAuthority (clock + home) into durable loop leaves
-  (flywheel; filed from this review).
-- T1/T2 (toron) and C1 (chiebukuro) are report-only here; file them in their own
-  ledgers if the owners want them tracked.
+  (flywheel; filed from this review). CLOSED.
+- T1/T2 (toron) and C1 (chiebukuro) were report-only here; all closed
+  (bd-7n2a, bd-eqwq, bd-6mt).
