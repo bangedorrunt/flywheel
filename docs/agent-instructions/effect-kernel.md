@@ -58,31 +58,30 @@ advances one:
   `--since last` cursor and the sweep's `since_by_pin` are two consumers
   with two positions, not two copies of one. Do not add a second cursor
   path for one consumer or join two cursors with gap-skip logic, because
-  that is two failure modes and no arbiter (ADR-0012 C6 rejected that
-  shape).
+  that is two failure modes and no arbiter.
 - **Advance on what it could read, never past what it could not.**
   `inbox_high_water_from_values` takes the newest time over rows whose
   timestamp parses, and `None` when none do; `on_inbox_fetched` advances
   `since_by_pin` only on that result, so a batch it cannot read stays in
   place and re-sweeps. Re-reading is safe because redelivery is absorbed
   by the dedup lattice; the cursor itself is at-least-once, never
-  at-most-once (bd-7qg6).
+  at-most-once.
 - **Write the position before the effect it gates.** The plane-S cursor
   is persisted (`flush_wake("watch-cursor")`) before the line is
   classified, so a crash right after cannot re-ring history. The decided
-  journal row is flushed before any Prompt intent reaches a sink
-  (bd-jcys); when that flush fails it is named in the audit, and the
+  journal row is flushed before any Prompt intent reaches a sink;
+  when that flush fails it is named in the audit, and the
   prompt still goes out. The cursor has already moved, so withholding
   would lose the wake.
 - **Backfill from a bounded floor.** A consumer with no cursor starts at
   the 24h redelivery floor (`redelivery_floor_rfc3339`), never at
   wall-clock now: a strictly-newer-than-now fetch is empty forever and
   the high-water initializes only on a non-empty batch, so a fresh or
-  state-lost pin would be deaf permanently (bd-5d0v).
+  state-lost pin would be deaf permanently.
 - **Monotonic, and restored by merge.** `plane_s_cursor_us` moves only by
   `max`; `note_wake` is the same shape for the liveness stamp: a
   same-second or older stamp is refused, never minted. Toron's durable
-  workflow cursors (`delivery_cursors`; flywheel bd-8nyh, toron bd-aqvg)
+  workflow cursors (`delivery_cursors`)
   snapshot without in-flight marks and restore by union + max, never by a
   smaller overwrite: marks are written after success and the delivery is
   journaled before it, so a restart replays only what followed the last
@@ -150,4 +149,4 @@ As of 2026-09-22, the reducer/Tick Law and serialized-policy boundaries pass fre
 - [Doorbell guide](../guides/doorbell.mdx)
 - [Session door](../guides/session-door.mdx)
 - [Judgment packs](../guides/judgment-packs.mdx)
-- [Delivery cursor persistence, bd-8nyh](../learnings/delivery-cursor-persist-bd-8nyh-2026-09-29.md)
+- [Delivery cursor persistence](../learnings/delivery-cursor-persist-bd-8nyh-2026-09-29.md)
