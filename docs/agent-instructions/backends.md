@@ -1,13 +1,13 @@
 # Backends + config
 
-Pluggable multiplexer + mail (ADR-0002). Spine targets traits, not concretes.
+Pluggable multiplexer + mail. Spine targets traits, not concretes.
 
 ## Matrix
 
 | Role | Trait | Default | Stubs |
 |------|-------|---------|-------|
 | Multiplexer | `toron_core::backend::Backend` (re-export `MultiplexerBackend`) | herdr (`backend-herdr`) | superlogical (`Unsupported`) |
-| Mail | `toron_core::mailbox::surface::MailSurface` | toron (`mail-toron`) | none (bd-euav: single backend) |
+| Mail | `toron_core::mailbox::surface::MailSurface` | toron (`mail-toron`) | none (single backend) |
 
 Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
@@ -26,7 +26,7 @@ Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
 Ack-overdue reads (`flywheel __ack-overdue`, `Mail::ack_overdue`) are **in-process only**: they read per-recipient `message_reads` state through the mailbox projection, and the remote daemon exposes no ack-overdue tool, so the call fails loudly instead of answering an empty set. The blocked escalation's ack gate (see [loop.md](loop.md)) treats that as "not acked" and keeps its time ladder.
 
-Mailbox root (bd-t9ey): `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Never per-pid temp. `src/mail_shim.rs` + `src/coalition.rs` share this.
+Mailbox root: `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Never per-pid temp. `src/mail_shim.rs` + `src/coalition.rs` share this.
 
 ```bash
 flywheel backend list --json
@@ -38,7 +38,7 @@ herdr protocol v20. Socket: `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
 
 ## Effect-kernel authority
 
-Runtime adapters are the effect boundary described by ADR-0016. Resolve host identity, paths, configuration, clocks, process paths, and network clients once, then pass them into interpreters. Reducers never read these sources directly. A daemon or remote backend returning no proof yields `unknown` or a loud degraded result, never an invented success. See [effect-kernel discipline](effect-kernel.md).
+Runtime adapters are the effect boundary. Resolve host identity, paths, configuration, clocks, process paths, and network clients once, then pass them into interpreters. Reducers never read these sources directly. A daemon or remote backend returning no proof yields `unknown` or a loud degraded result, never an invented success. See [effect-kernel discipline](effect-kernel.md).
 
 ## Runtime
 

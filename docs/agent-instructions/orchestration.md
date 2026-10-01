@@ -1,6 +1,7 @@
 # Orchestration
 
-ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workflow-authoring.md).
+<!-- governed-by: ADR-0005, ADR-0010, ADR-0011, ADR-0012 -->
+Authoring: [docs/workflow-authoring.md](../workflow-authoring.md).
 
 | Noun | Command |
 |------|---------|
@@ -15,13 +16,13 @@ ADR-0005 + 0010 + 0011 + 0012. Authoring: [docs/workflow-authoring.md](../workfl
 | open mode | `/open-mode`: direct work in the current pane; no crew, durable loop, or swarm lifecycle |
 | loop mode | `/loop-mode` / `flywheel loop-mode run`: durable solo execution in one current harness; `--work` opts into tracked work |
 | swarm mode | `/swarm-mode`: captain-led multi-crew execution with parallel lanes; loop supervision is optional |
-| doorbell | workspace `__doorbell` (ADR-0005 Layer 0). Spawn starts it. `flywheel kill` stops it. `/peer-aware-mode` attaches. Shared by loop-mode and swarm-mode when enabled. |
+| doorbell | workspace `__doorbell`. Spawn starts it. `flywheel kill` stops it. `/peer-aware-mode` attaches. Shared by loop-mode and swarm-mode when enabled. |
 
-## Functional effect-kernel discipline (ADR-0016)
+## Functional effect-kernel discipline
 
 All orchestration paths still obey one Elm boundary: external observations become `Msg`, `tick` returns `Cmd`, interpreters perform effects, and results re-enter as `Msg`. Do not add policy to a runtime brain, CLI helper, or persistence projection. Time and environment are sampled at effect boundaries and injected; `Unknown` never becomes success; queue acceptance never becomes provider delivery; Jev remains advisory. The full review checklist is [effect-kernel discipline](./effect-kernel.md).
 
-## Session door (ADR-0011)
+## Session door
 
 `flywheel arrive <project> --as <pin>` then `flywheel briefing "<target>" --project <p> --json`. `--commit` runs argv. `decide` is the classifier leaf (emits `topology`; `"2 crews"` becomes `--crew 2`). A live fleet proposes join, not a second compose.
 
@@ -41,9 +42,9 @@ All orchestration paths still obey one Elm boundary: external observations becom
 
 `workflow run` without `--execute` records control-flow only (no pane dispatch). Real work needs `--execute`. `--mode` default is **headless**. `steer` always `--execute --mode pane`. `/swarm-mode` pins `compose --parts wave-swarm --run` (do not casually re-run decide until a material event). `/loop-mode` pins `loop-mode run <project> --work`.
 
-## Mid-session reclassify (GS-048)
+## Mid-session reclassify
 
-Doorbell wakes ≠ classify. On **material** context (AUTHORITATIVE objective change, explicit topology ask, new work-unit class, classifier miss, stage-chain exhaustion then continued asks): re-run `decide --json` + `workflow list --brief` + `stage list`, announce `vehicle: …` or `none: raw`. Sticky-open airtight (GS-049): preserve open unless loop/swarm/join is explicit; catalog miss must not invent-flip open→none; hold loop against swarm without explicit; sticky-held open clears invent workflow/argv (no invent `wave-swarm` headless under open). Tick Law: `Msg::MaterialContext` → `Cmd::Reclassify` (effect runs decide; GS-050 stable journal `effect_key` — retries keep the same key, ADR-0032 I8a) → `Msg::DecisionReady` announce. CLI: `flywheel reclassify "<goal>"` ticks MaterialContext (sticky-open) then prints briefing. Non-material Channel/Job wakes stay Prompt pull-hints only. Elm deepen: `workflow evaluate` is evaluate-without-commit; ActionStage on phase-bearing failures; sensor→Msg vocabulary in the doorbell guide (docs only).
+Doorbell wakes ≠ classify. On **material** context (AUTHORITATIVE objective change, explicit topology ask, new work-unit class, classifier miss, stage-chain exhaustion then continued asks): re-run `decide --json` + `workflow list --brief` + `stage list`, announce `vehicle: …` or `none: raw`. Sticky-open airtight: preserve open unless loop/swarm/join is explicit; catalog miss must not invent-flip open→none; hold loop against swarm without explicit; sticky-held open clears invent workflow/argv (no invent `wave-swarm` headless under open). Tick Law: `Msg::MaterialContext` → `Cmd::Reclassify` (effect runs decide; its journal `effect_key` stays stable across retries) → `Msg::DecisionReady` announce. CLI: `flywheel reclassify "<goal>"` ticks MaterialContext (sticky-open) then prints briefing. Non-material Channel/Job wakes stay Prompt pull-hints only. Elm deepen: `workflow evaluate` is evaluate-without-commit; ActionStage on phase-bearing failures; sensor→Msg vocabulary in the doorbell guide (docs only).
 
 
 ## Operating topologies
@@ -105,20 +106,20 @@ one explicit multi-lane shape for `workflow compose --parts`, captain-to-crew
 for `flywheel send`, and crew-to-crew rooms/jobs for `toron`. Read back every
 load-bearing post; “sent” alone is not delivery evidence.
 
-## Execution modes (ADR-0010)
+## Execution modes
 
 - **pane**: pre-spawn crew, `__send --confirm`, bus-auditable. `dispatch_job` live. `action: spawn` drains `SpawnSink` into `agent_start`.
 - **headless**: `__run-headless` one-shot, logs `runs/<id>.jsonl`. Spawn must not fake 43001/43004.
 
-## Run ledger + effect journal (ADR-0032 Spec 5/6/9)
+## Run ledger + effect journal
 
 `runs {list,show,pending,digest}` is the dashboard over the same state log `workflow history` and `cron history` read. ONE reader rule (`history_row_status`) decides a row's status at every door: a row that recorded none reads `unknown`, never a default `done`. Rows that **annotate** a run instead of recording one declare a `kind` — `phase-gate` (one ship-chain link), `loop-monitor` (the legacy loop monitor's start notice), `plan-warning` (the warn-first plan-artifact gate); they carry their real verdict, are skipped by `cron history`, and never count as run outcomes. Run rows carry terminal status + real project + failure artifact paths.
 
 Effect journal: flywheel embeds the engine, so flywheel owns the journal. Every engine built for a run that really dispatches (`workflow run --execute`, `compose --run`, `cron run --live`, the cron daemon) gets a host-owned `EffectRunner` (`src/effect_journal.rs`): an effectful `job`/`mailbox` leaf commits prepared intent, claims the attempt, invokes its provider **exactly once**, then settles — or records `failed`/`unknown` through the engine's one ambiguity rule. Rows land in toron's `workflow_effects` tables, keyed by the engine boundary's own derivation (a retry reuses one key; two runs never collide on a byte-identical payload). A sink no provider performs is **not** journaled — the leaf keeps the engine's `bypassed-sink-uncovered` marker with a loud reason. Dry arms (`run` without `--execute`, `cron run` without `--live`) stay unjournaled on purpose: they perform no external effect. Mailbox leaves journal only on the in-process plane (a remote `[mail.toron] url` cannot carry `corr`).
 
-The journal's honesty is carried by the engine's `EffectJournalMode` (`bd-engine-run-path-journaling-fwlx`, landed 2026-09-14): a constructor built for a run that really dispatches is `Enforced` — an effectful leaf with no injected runner **refuses** rather than dispatching unjournaled — while the dry arms stay `Recording`, where the marker means "recorded, not performed". `verify` journals through the same surface: the engine renders the command (so a templated `{{inputs.verify}}` reaches the sink resolved), runs the embedding's `VerifySink` first, and hands the already-executed result to the runner through `RunContext.provider_result` — the sink is the provider, so the row observes an effect that already happened and the command never runs twice. With no toron index open the engine keeps its loud marker, never a run that only looks journaled.
+The journal's honesty is carried by the engine's `EffectJournalMode` (landed 2026-09-14): a constructor built for a run that really dispatches is `Enforced` — an effectful leaf with no injected runner **refuses** rather than dispatching unjournaled — while the dry arms stay `Recording`, where the marker means "recorded, not performed". `verify` journals through the same surface: the engine renders the command (so a templated `{{inputs.verify}}` reaches the sink resolved), runs the embedding's `VerifySink` first, and hands the already-executed result to the runner through `RunContext.provider_result` — the sink is the provider, so the row observes an effect that already happened and the command never runs twice. With no toron index open the engine keeps its loud marker, never a run that only looks journaled.
 
-Run lifecycle: the journal is claimed in BOTH halves from one store (`effect_journal::journals`, `bd-mi9n`, ADR-0032 Spec 5/6 tail) — the effect runner AND a `RunJournal`. The engine reports its own run lifecycle (`Started` → `Running` → `Succeeded`/`Failed`) through the `RunJournal`, so a flywheel-driven run has a `workflow_runs` row with no embedding `create_run`/`cas_run_status` call, and the run row and its effect rows agree on `run_id` by construction (the engine supplies the same id to both seams). Idempotent by design, because a durable run replays: create-if-absent, CAS only when the status differs, a terminal row never moves — so a replayed tail cannot resurrect a finished run. Every journaled constructor passes it (`pane.rs` live arms, both `cron.rs` live engines); the dry arms pass `None`, since an engine that performs nothing must not mint a row claiming it ran. Best-effort by the effect path's rule: a journal failure is reported loud and never changes the run's outcome.
+Run lifecycle: the journal is claimed in BOTH halves from one store (`effect_journal::journals`) — the effect runner AND a `RunJournal`. The engine reports its own run lifecycle (`Started` → `Running` → `Succeeded`/`Failed`) through the `RunJournal`, so a flywheel-driven run has a `workflow_runs` row with no embedding `create_run`/`cas_run_status` call, and the run row and its effect rows agree on `run_id` by construction (the engine supplies the same id to both seams). Idempotent by design, because a durable run replays: create-if-absent, CAS only when the status differs, a terminal row never moves — so a replayed tail cannot resurrect a finished run. Every journaled constructor passes it (`pane.rs` live arms, both `cron.rs` live engines); the dry arms pass `None`, since an engine that performs nothing must not mint a row claiming it ran. Best-effort by the effect path's rule: a journal failure is reported loud and never changes the run's outcome.
 ## Collaboration bootstrap (empty-fleet edge)
 
 Any mode whose agent holds a registered mail identity but has no live
@@ -138,17 +139,13 @@ bootstrap its own coordination, or the human becomes the mail relay:
 
 Canonical text lives in `integrations/prompts/open.md.tpl` (bootstrap
 section) and `integrations/peer-aware.md.tpl` (boot-time arrival +
-roster-recency invariants). Pending beads (2026-09-07 retrospective):
-`bd-de9c` auto-bind `captain`; `bd-c29i` roster recency/prune;
-`bd-fhf0` mail-surface honesty (read receipt, contact-request render,
-corr re-use); `bd-jrlr` pin bootstrap templates; `bd-p0ed` verify-0005
-drift.
+roster-recency invariants).
 
 ## Profiles
 
-All six built-ins default harness **omp**. Per-role models live in `profiles.toml` / `models.toml` — registry keys are composite `provider/model` (e.g. `[models."opencode-go/deepseek-v4.1-flash"]`); `Profile.provider` pins the composite key, bare ids fall back to the default provider (user file entries first, else alphabetically-first). Bare harness+model `spawn --model <id> [--provider <p>]` (bd-j3so) is the lenient fallback for kind/count spawns without a named profile (registered ids route via composite, unknown ids pass through verbatim; `--provider` requires `--model`). `spawn --profile` writes the spawn-registry (behavior + skills). `profile run` / `squad spawn` use `profile_launch_args` (model/effort) and a **pane id**, never a workspace id.
+All six built-ins default harness **omp**. Per-role models live in `profiles.toml` / `models.toml` — registry keys are composite `provider/model` (e.g. `[models."opencode-go/deepseek-v4.1-flash"]`); `Profile.provider` pins the composite key, bare ids fall back to the default provider (user file entries first, else alphabetically-first). Bare harness+model `spawn --model <id> [--provider <p>]` is the lenient fallback for kind/count spawns without a named profile (registered ids route via composite, unknown ids pass through verbatim; `--provider` requires `--model`). `spawn --profile` writes the spawn-registry (behavior + skills). `profile run` / `squad spawn` use `profile_launch_args` (model/effort) and a **pane id**, never a workspace id.
 
-## Captain briefing (bd-xe9r/bd-nmzk)
+## Captain briefing
 
 Interactive TTY `steer`, `workflow run --execute`, and managed mode commands prompt before dispatch — inferred crew counts (editable), per-role model menus w/ cost/caps from the registry, squad/bare-harness shape, stage-chain preview, go/no-go. Skipped by `--json`, `--yes`, or an explicit `--crew`; non-TTY dispatch is byte-identical. Shared prompt module `src/steer_brief.rs` (`source` fork only, `workflow_briefing_context` extracts `objective`/`goal`/`target` from `--inputs`); prompt logic is pure over injected IO.
 
@@ -156,7 +153,7 @@ Interactive TTY `steer`, `workflow run --execute`, and managed mode commands pro
 
 Never invoke `__*` except documented `__wait-output`.
 
-## Which noun when (strategy surface, ADR-0028 E7)
+## Which noun when (strategy surface)
 
 | noun | is | choose it when | trail |
 | --- | --- | --- | --- |
@@ -168,7 +165,7 @@ Never invoke `__*` except documented `__wait-output`.
 Announce the vehicle on every dispatch (stage / workflow / compose token / `none: raw`) — crews restate it in reports (2026-09-04 contract).
 
 
-## Control planes (GS-048 diagram)
+## Control planes
 
 One Tick Law. WorkflowHost is an **adapter**, not an AgentServer/OTP actor.
 
@@ -200,6 +197,6 @@ flowchart TB
 ```
 
 - **Elm plane:** `(Model, Msg) → (Model, Vec<Cmd>)` — no I/O, no decide-inside-tick.
-- **Effect actor:** applies Cmd; journals effects (ADR-0032); feeds DecisionReady / receipts back as Msg.
+- **Effect actor:** applies Cmd; journals effects; feeds DecisionReady / receipts back as Msg.
 - **Beads:** work graph / close ceremony — not a second control plane.
 - **REJECT:** Redis / AgentServer / OTP / dual peer-aware SoT as reclassify substrate.
