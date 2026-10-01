@@ -2130,6 +2130,15 @@ async fn run_leaf_cmd_bounded(
             let _ = err.read_to_string(&mut buf);
             buf
         });
+        // bd-lf1u classification: this monotonic read is a HOST-side deadline
+        // on a real subprocess, not a decision input, so it is deliberately NOT
+        // migrated to an injected clock. The child runs in real time; polling a
+        // supplied clock would never advance relative to it, so the watchdog
+        // would either never fire or fire immediately. Same class as a
+        // `timeout` wrapped around a live effect: the bound is part of the
+        // effect, so it must be measured in real time. What the lens forbids is
+        // an ambient read feeding a DURABLE RESULT; `Instant::now()` here only
+        // decides when to stop waiting, and nothing it selects is recorded.
         let deadline = std::time::Instant::now() + watchdog;
         let status = loop {
             match child.try_wait() {
@@ -9694,15 +9703,30 @@ mod tests {
         assert!(!id_is_project_loop("wf-graph-fanout-1", "toron"));
     }
 
-    /// bd-6si7: the fresh-id leaf is a PURE function of its inputs plus the
-    /// injected stamp. Two calls with the same stamp MUST produce the same
-    /// id (replay determinism) and the source must not name a clock at all —
-    /// a leaf that samples time is neither replayable nor substitutable.
+    /// bd-6si7: the fresh-id leaf derives its id from its inputs plus the
+    /// INJECTED stamp, never from a clock it samples. Two calls with the same
+    /// stamp MUST produce the same id (replay determinism).
+    ///
+    /// Scope, stated honestly: the RETURNED id is a pure function of its
+    /// inputs. The call is not side-effect free -- `fresh_loop_id` persists an
+    /// active-loop sidecar and stamps that record with `now_iso()`. That stamp
+    /// is an observation on the record, not an input to the id, which is why
+    /// determinism still holds. An earlier version of this comment claimed the
+    /// source "must not name a clock at all"; nothing enforced that, and it
+    /// was not true.
+    ///
+    /// Hermetic by construction: the sidecar goes to `XDG_STATE_HOME`, so this
+    /// test points that at a per-run uuid directory. It previously created a
+    /// `fw-fresh-<pid>` directory, never pointed the state dir at it, and so
+    /// wrote to the SHARED real loops dir -- a latent flake under parallel
+    /// execution, and ambient state in a unit test besides. `lock_env`
+    /// serialises the env mutation, and the uuid keeps parallel runs apart (a
+    /// pid is identical for every test in one binary).
     #[test]
     fn fresh_loop_id_is_a_pure_function_of_its_stamp() {
-        let dir = std::env::temp_dir().join(format!("fw-fresh-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _g = crate::config::lock_env();
+        let dir = std::env::temp_dir().join(format!("fw-fresh-mt-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
         let project = "ns/loopproj";
         let params = serde_json::json!({"project": project});
 

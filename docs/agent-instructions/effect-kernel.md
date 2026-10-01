@@ -140,7 +140,13 @@ A green compile is not enough. A phase is complete only when its behavior witnes
 
 ## Current audit status
 
-As of 2026-09-22, the reducer/Tick Law and serialized-policy boundaries pass fresh audit and the full workspace gates are green. The kernel remains **conditionally compliant** until legacy Jev authority helpers are fully threaded from the entrypoint and durable effect leaves receive injected wall/monotonic clocks instead of sampling them directly. Those reads are outside reducers and do not invalidate replay witnesses, but they are still migration work under the strict authority contract.
+As of 2026-10-02, the reducer/Tick Law and serialized-policy boundaries pass fresh audit and the full workspace gates are green. The kernel remains **conditionally compliant**, and the residual is now narrow and named rather than a general "leaves sample time" claim.
+
+What is migrated: the durable loop workflow (`swarm_loop`) resolves `RuntimeAuthority` once at the host edge and takes it from `ctx.get_dependency`, and the source-shape guard asserts the body contains neither `RuntimeAuthority::resolve()` nor a clock read (it builds its forbidden strings with `concat()`, so an adjacent comment cannot satisfy the scan). Legacy Jev authority helpers are the remaining piece.
+
+What is deliberately NOT migrated: a host-side deadline on a real subprocess (`run_leaf_cmd_bounded`) keeps `Instant::now()`. The child runs in real time, so a supplied clock would never advance relative to it and the watchdog would be inert or immediate. A bound around a live effect is part of the effect and must be measured in real time; what the law forbids is an ambient read feeding a durable **result**.
+
+What is still open: durable leaves that stamp **data** with wall time (for example the `at` field on a verdict row) have no injected-clock seam yet — `loop_run_verify` is `#[function]` with no `Info` parameter, and no leaf in this codebase uses `Info::get_dependency`, so adding one changes a durable signature and its replay key. That is tracked rather than guessed at. Those reads are outside reducers and do not invalidate replay witnesses.
 
 ## Related sources
 
