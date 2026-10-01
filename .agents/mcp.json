@@ -1,12 +1,13 @@
 {
   "mcpServers": {
-    "toron": {
+    "executor": {
       "type": "http",
-      "url": "http://127.0.0.1:18080/mcp"
+      "url": "https://mcp.example-tailnet.ts.net/mcp"
     },
-    "chiebukuro": {
-      "type": "http",
-      "url": "http://127.0.0.1:18081/mcp"
+    "fff": {
+      "type": "local",
+      "command": "$HOME/.local/bin/fff-mcp",
+      "args": []
     }
   }
 }
