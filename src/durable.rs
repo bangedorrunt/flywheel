@@ -6014,7 +6014,10 @@ pub fn spawn_graph_vehicle(
 
 #[function]
 async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
-    let authority = crate::authority::RuntimeAuthority::resolve();
+    // bd-0fvb: the host edge resolves the authority once and injects it;
+    // the durable function reads it from the invocation context, so a
+    // replay never re-resolves ambient process state behind the checkpoint.
+    let authority = ctx.get_dependency::<crate::authority::RuntimeAuthority>();
     // bd-bpd9: beads whose graph vehicle was already spawned this process.
     let mut graph_invoked: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ADR-0026 W2: loop-identity fail-loud — hard-error at start if no usable key
@@ -6669,7 +6672,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         }
                     }
                 }
-                let now_secs = chrono::Utc::now().timestamp();
+                let now_secs = authority.now_unix() as i64;
                 // ADR-0025 / ADR-0016: thresholds ride the loop params
                 // (serialized with the invocation) so a replay reclaims by
                 // the same policy the original run used.
@@ -7270,7 +7273,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
         // bd-cy0s: tick stall detection — bead in_progress + pane listed + idle past threshold
         {
-            let now_secs = chrono::Utc::now().timestamp();
+            let now_secs = authority.now_unix() as i64;
             let threshold = params.pane_stall_secs;
             let inprog_for_stall: Vec<ReadyBead> = if params.work {
                 // reuse already-fetched inprog_for_renew if available, else fetch
@@ -7360,7 +7363,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         swarm.states = states.clone();
         // done_mailed + heal_states deliberately untouched: they persist on
         // swarm across polls (seeded from ActiveLoop at startup).
-        let now = chrono::Utc::now().timestamp() as u64;
+        let now = authority.now_unix();
         let fold = |swarm: &mut LoopModel,
                     ws_msg: crate::workspace::Msg,
                     journal: LoopMsg|
@@ -8424,11 +8427,16 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // result → serialization errors) and cross-project dispatch. A
     // per-project group scopes the worker to its own task.
     let base = params.project.rsplit('/').next().unwrap_or(&params.project);
+    // bd-0fvb: resolve the host authority ONCE here and inject it into the
+    // durable world — swarm_loop takes it from the invocation context, so
+    // the checkpointed function never resolves ambient process state.
+    let authority = crate::authority::RuntimeAuthority::resolve();
     let resonate = Resonate::new(ResonateConfig {
         url: Some(url.clone()),
         group: Some(format!("flywheel-{base}")),
         ..Default::default()
-    });
+    })
+    .with_dependency(authority.clone());
 
     resonate
         .register(swarm_loop)
@@ -8534,9 +8542,8 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // bd-6si7: the host edge is the ONE place allowed to read the clock, and
     // it reads it once, then hands the value down. Every leaf below is
     // therefore a pure function of its arguments plus this stamp.
-    let now_nanos = crate::authority::RuntimeAuthority::resolve()
-        .clock
-        .now_nanos();
+    // bd-0fvb: stamped from the same authority instance that was injected.
+    let now_nanos = authority.clock.now_nanos();
     let id = match crate::state::load_active_loop(&params.project)? {
         Some(al) if !params.force && promise_pending(&resonate, &al.id).await? => {
             eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
@@ -12355,6 +12362,46 @@ mod tests {
         assert!(
             src.contains("async fn reservation_board(args: ReservationBoardArgs)"),
             "checkpointed leaf retained for external/detached callers"
+        );
+    }
+
+    /// bd-0fvb: the durable function takes host authority from the invocation
+    /// context (injected once at the host edge via `with_dependency`), never
+    /// resolving or sampling the clock ambiently — an ambient read inside a
+    /// `#[function]` body is the replay-determinism bug the effect law bans.
+    /// Needles reaching into the host region are split so this test's own
+    /// source cannot satisfy them.
+    #[test]
+    fn bd_0fvb_authority_injected_not_ambient() {
+        let src = include_str!("durable.rs");
+        let loop_start = src.find("async fn swarm_loop(").expect("swarm_loop exists");
+        let loop_body = &src[loop_start..];
+        let loop_end = loop_body
+            .find("pub async fn run_durable_loop")
+            .expect("run_durable_loop after swarm_loop");
+        let body = &loop_body[..loop_end];
+        assert!(
+            body.contains(
+                "let authority = ctx.get_dependency::<crate::authority::RuntimeAuthority>();"
+            ),
+            "bd-0fvb: swarm_loop must take RuntimeAuthority from ctx.get_dependency (host DI)"
+        );
+        assert!(
+            !body.contains(&["RuntimeAuthority::", "resolve()"].concat()),
+            "bd-0fvb: no ambient RuntimeAuthority::resolve() inside the durable function"
+        );
+        for ambient in ["chrono::Utc::now", "SystemTime::now", "Instant::now"] {
+            assert!(
+                !body.contains(ambient),
+                "bd-0fvb: the durable function must not sample {ambient} directly"
+            );
+        }
+        let host = &loop_body[loop_end..];
+        let inject = [".with_dependency(", "authority.clone())"].concat();
+        let stamp = ["let now_nanos = authority", ".clock.now_nanos();"].concat();
+        assert!(
+            host.contains(&inject) && host.contains(&stamp),
+            "bd-0fvb: the host edge must inject the resolved authority and stamp time from it"
         );
     }
 
