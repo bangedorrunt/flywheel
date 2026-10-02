@@ -1094,8 +1094,10 @@ mod tests {
     use std::fs;
 
     /// Hermetic config dir for a test: the crate-wide env lock + a fresh
-    /// temp `XDG_CONFIG_HOME` for the guard's lifetime.
-    fn with_config_dir() -> std::sync::MutexGuard<'static, ()> {
+    /// temp `XDG_CONFIG_HOME` for the guard's lifetime. The lock now also
+    /// pins `XDG_STATE_HOME` (bd-uu58), so a config-dir test can no longer
+    /// land its `state_dir()` artifacts in the operator's real tree.
+    fn with_config_dir() -> crate::config::TestStateHome {
         let _g = crate::config::lock_env();
         let dir = std::env::temp_dir().join(format!("fw-models-{}", uuid::Uuid::new_v4()));
         // env mutation is unsafe in edition 2024 (matches run_log.rs tests)

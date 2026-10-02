@@ -27,12 +27,21 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Take the crate-wide env lock (poison-tolerant). Test-only (193.2).
+/// Take the crate-wide env lock (poison-tolerant) AND pin a hermetic
+/// `XDG_STATE_HOME`. Test-only (193.2).
+///
+/// bd-uu58: the lock alone is not hermetic. Env is process-global, so a test
+/// that takes this lock and writes `state_dir()` artifacts inherits whatever
+/// `XDG_STATE_HOME` a sibling left behind — or, when no sibling pinned one, the
+/// operator's real `~/.local/state/flywheel`. Measured: four `main.rs` spawn
+/// tests took only this lock, so their registries were written live and 133
+/// `agents/*.json` fixture files accumulated, four more per suite run. Pinning
+/// here routes every lock-holder hermetically at the one function they all
+/// already call, which is why the earlier per-call-site `test_state_home()`
+/// attempt (reverted as a non-fix) was the wrong layer.
 #[cfg(test)]
-pub fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+pub fn lock_env() -> TestStateHome {
+    test_state_home()
 }
 
 /// Hermetic state dir for a test (193.2): holds the crate-wide env lock and
@@ -46,12 +55,20 @@ pub fn lock_env() -> std::sync::MutexGuard<'static, ()> {
 pub struct TestStateHome {
     _env: std::sync::MutexGuard<'static, ()>,
     dir: PathBuf,
+    prev: Option<std::ffi::OsString>,
 }
 
 #[cfg(test)]
 impl Drop for TestStateHome {
     fn drop(&mut self) {
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        // Restore, don't remove: a test that set XDG_STATE_HOME WITHOUT this
+        // lock must not have its value erased by whoever ran next. Removing
+        // would hand the following test the real state dir — the bd-uu58 leak
+        // arriving through the drop path instead of the constructor.
+        match self.prev.take() {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -59,7 +76,9 @@ impl Drop for TestStateHome {
 /// Begin a hermetic state-dir test (see [`TestStateHome`]).
 #[cfg(test)]
 pub fn test_state_home() -> TestStateHome {
-    let _env = lock_env();
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -69,8 +88,9 @@ pub fn test_state_home() -> TestStateHome {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("create test state home");
+    let prev = std::env::var_os("XDG_STATE_HOME");
     unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
-    TestStateHome { _env, dir }
+    TestStateHome { _env, dir, prev }
 }
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_800_000;
@@ -1061,6 +1081,157 @@ daily = [
         unsafe { std::env::remove_var("FLYWHEEL_MAIL_NAME") };
     }
 
+    /// bd-uu58: `lock_env()` must be hermetic on its own, because it is the
+    /// choke point every env-mutating test already calls. A bare lock leaves
+    /// `XDG_STATE_HOME` pointing wherever the last lock-holder left it — or at
+    /// the operator's real `~/.local/state/flywheel` when nobody pinned one.
+    ///
+    /// Two assertions, because "not the real dir" alone would still pass for a
+    /// guard that pinned some *other* stale dir: (a) the resolved state dir
+    /// sits under the temp root, and (b) two lock-holders never share a dir,
+    /// so one test's fixtures can never become the next test's input.
+    #[test]
+    fn lock_env_pins_a_private_hermetic_state_dir() {
+        let first_dir;
+        {
+            let _g = lock_env();
+            first_dir = state_dir();
+            assert!(
+                first_dir.starts_with(std::env::temp_dir()),
+                "lock_env must resolve state_dir() under the temp root, got {first_dir:?} \
+                 (a fixture writing here lands in whatever XDG_STATE_HOME a sibling left)"
+            );
+            assert!(
+                std::fs::create_dir_all(first_dir.join("agents")).is_ok(),
+                "and the resolved dir is usable, so agents/ spawn registries written under \
+                 this lock are the ones a reader can find at state_dir()"
+            );
+        }
+        {
+            let _g = lock_env();
+            let second_dir = state_dir();
+            assert_ne!(
+                second_dir, first_dir,
+                "each lock-holder gets its own state home, so a stale fixture cannot be \
+                 inherited by the next test (this is what made the bd-9w95 spawn flake red)"
+            );
+        }
+    }
+
+    /// bd-uu58: drop must RESTORE the prior value, not remove the var. A test
+    /// that set `XDG_STATE_HOME` without taking this lock would otherwise have
+    /// its value erased by the next lock-holder to finish, handing that test the
+    /// real state dir — the same leak arriving through the drop path.
+    ///
+    /// Both reads happen UNDER the lock, which is what makes this deterministic
+    /// in a parallel binary: `ENV_LOCK` is not reentrant, so reading after the
+    /// guard's drop without re-taking it races any holder that grabbed the lock
+    /// in between. The value is invariant across lock-holders because every
+    /// sanctioned setter restores what it found, so reading it while holding the
+    /// lock is a stable sample.
+    #[test]
+    fn test_state_home_restores_the_prior_state_home_on_drop() {
+        let raw = || {
+            ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let prior = {
+            let _g = raw();
+            std::env::var_os("XDG_STATE_HOME")
+        };
+        {
+            let _home = test_state_home();
+            assert!(
+                state_dir().starts_with(std::env::temp_dir()),
+                "inside the guard the pinned temp dir wins"
+            );
+        }
+        let after = {
+            let _g = raw();
+            std::env::var_os("XDG_STATE_HOME")
+        };
+        assert_eq!(
+            after, prior,
+            "drop restores the prior value; removing the var would hand the next test \
+             the real state dir. Note this only proves the restore when the ambient \
+             XDG_STATE_HOME is SET — with it unset both arms are `None` and the \
+             assertion is vacuous, which is why M2 in scripts/mutations/ \
+             state-home.spec.sh names this test rather than a hand-built guard"
+        );
+    }
+
+    /// bd-uu58: the OTHER arm of the restore. `prior` here is genuinely `None`
+    /// on a clean process, so the test above only ever exercises "drop removes
+    /// an absent var" — where `remove_var` and "restore None" are the same act,
+    /// which is exactly why mutation M2 could not turn it red. Reaching the
+    /// `Some` arm needs a value already set when the guard is CONSTRUCTED, and
+    /// the one sanctioned way to set the var (under a guard) always captures
+    /// `None`. So the guard is built by hand here, from a lock this test already
+    /// holds.
+    ///
+    /// Every mutation of the var happens under the lock and restores what it
+    /// found, so the value is invariant across lock-holders and the re-take
+    /// below is a stable sample — that is what keeps this deterministic in a
+    /// parallel binary. Note `ENV_LOCK` is not reentrant: the guard is
+    /// constructed from the guard variable itself (moved in), never by calling
+    /// `test_state_home()` while holding it.
+    #[test]
+    fn drop_restores_a_foreign_prior_value_rather_than_clearing_it() {
+        let sentinel = std::env::temp_dir().join("flywheel-bd-uu58-prior");
+        let ours = std::env::temp_dir().join("flywheel-bd-uu58-ours");
+        let ambient = {
+            let _g = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::fs::create_dir_all(&ours).expect("create our dir");
+            let ambient = std::env::var_os("XDG_STATE_HOME");
+            unsafe { std::env::set_var("XDG_STATE_HOME", &sentinel) };
+            ambient
+        };
+        {
+            // The guard is built from a lock this test re-takes, never by
+            // calling `test_state_home()` while holding one (ENV_LOCK is not
+            // reentrant, so that deadlocks the whole binary).
+            let _g = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            {
+                let _home = TestStateHome {
+                    _env: _g,
+                    dir: ours.clone(),
+                    prev: Some(sentinel.clone().into_os_string()),
+                };
+                assert_eq!(
+                    std::env::var_os("XDG_STATE_HOME").as_deref(),
+                    Some(sentinel.as_os_str()),
+                    "construction carries the foreign value; it does not rewrite it"
+                );
+            }
+        }
+        {
+            // The struct's drop released the lock, so re-take it for the read:
+            // a sibling that ran in the gap pinned its own dir and restored what
+            // it found — the sentinel — so the value is invariant across holders
+            // and this is a stable sample.
+            let _g = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                std::env::var_os("XDG_STATE_HOME").as_deref(),
+                Some(sentinel.as_os_str()),
+                "drop puts the foreign value back. remove_var here would hand the next \
+                 test the real state dir — the bd-uu58 leak through the drop path"
+            );
+            // Leave the process exactly as found, under the lock.
+            unsafe { std::env::remove_var("XDG_STATE_HOME") };
+            if let Some(a) = ambient {
+                unsafe { std::env::set_var("XDG_STATE_HOME", a) };
+            }
+        }
+        let _ = std::fs::remove_dir_all(&ours);
+    }
+
     #[test]
     fn mail_env_overrides_ignore_empty_values() {
         let _g = ENV_LOCK
@@ -1635,7 +1806,19 @@ daily = [
                 if !block.contains("set_var(\"XDG_STATE_HOME\"") {
                     continue;
                 }
-                if block.contains("test_state_home()") || block.contains("lock_env()") {
+                // The guard the rule demands is serialization: a setter that
+                // does not hold ENV_LOCK can be observed mid-flight by any other
+                // test. `ENV_LOCK` itself counts, not only the hermetic
+                // accessors — a block that takes the raw lock and restores what
+                // it found cannot produce the "already been deleted" state home
+                // this rule exists to prevent. (bd-uu58: excluding the raw lock
+                // meant the only way to reach `TestStateHome`'s Some arm of the
+                // restore was a block the lint flagged, so the arm was untestable
+                // and M2 of scripts/mutations/state-home.spec.sh reported VACUOUS.)
+                if block.contains("test_state_home()")
+                    || block.contains("lock_env()")
+                    || block.contains("ENV_LOCK")
+                {
                     continue;
                 }
                 let name = block
