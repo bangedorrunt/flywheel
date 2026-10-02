@@ -130,6 +130,21 @@ impl RuntimeAuthority {
     pub fn now_unix(&self) -> u64 {
         self.clock.now_unix()
     }
+
+    /// Wall time as a chrono `DateTime`, read from the INJECTED clock.
+    ///
+    /// bd-lf1u: a durable leaf that stamps DATA with a timestamp must not call
+    /// `chrono::Utc::now()` — on replay the stamped value would differ from
+    /// the original run's. This is the one conversion, so the clock read stays
+    /// in the authority layer and the leaf keeps a single injected source.
+    ///
+    /// Second resolution is deliberate: this stamps evidence rows, not
+    /// ordering keys. Anything needing sub-second distinctness uses
+    /// `clock.now_nanos()` directly (see the `Clock` doc comment).
+    pub fn now_datetime(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(self.clock.now_unix() as i64, 0)
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+    }
 }
 
 impl HostAuthority {
@@ -197,5 +212,54 @@ mod tests {
         assert_eq!(authority.now_unix(), 42);
         assert_eq!(authority.host.cwd, std::path::Path::new("/tmp/fw-test"));
         assert_eq!(authority.monotonic.now_millis(), 42);
+    }
+
+    /// bd-lf1u: `now_datetime` must DERIVE from the injected clock, not from
+    /// the ambient one.
+    ///
+    /// The leaf-body guard can only prove the leaf stopped calling
+    /// `chrono::Utc::now()` directly. That is a source-shape fact, and it was
+    /// proven insufficient here: rewriting `now_datetime` to call
+    /// `SystemTime::now()` behind the injection point left every bd-lf1u test
+    /// green, because the ambient read had simply moved one call away. So the
+    /// property under test is behavioural — a fixed clock yields THAT instant,
+    /// and two different fixed clocks yield two different values — which is
+    /// what actually distinguishes injected time from wall time.
+    #[test]
+    fn bd_lf1u_now_datetime_derives_from_the_injected_clock() {
+        let early = RuntimeAuthority::for_test("/tmp/fw-home", 1_000_000_000);
+        let late = RuntimeAuthority::for_test("/tmp/fw-home", 1_700_000_000);
+
+        let a = early.now_datetime();
+        let b = late.now_datetime();
+
+        assert_eq!(
+            a.timestamp(),
+            1_000_000_000,
+            "now_datetime must return the injected instant, not the wall clock"
+        );
+        assert_eq!(b.timestamp(), 1_700_000_000);
+        assert_ne!(
+            a, b,
+            "two injected clocks must produce two different timestamps; equal values \
+             mean the injected clock is being ignored and ambient time is winning"
+        );
+
+        // Agreement between the two readings off the same authority: a
+        // DateTime that disagreed with the clock it came from would mean the
+        // conversion silently substituted a different source.
+        assert_eq!(
+            a.timestamp() as u64,
+            early.now_unix(),
+            "now_datetime and now_unix must read the SAME clock"
+        );
+
+        // And it must be the real calendar, not a synthetic counter: this
+        // instant is 2001-09-09T01:46:40Z.
+        assert_eq!(
+            a.to_rfc3339(),
+            "2001-09-09T01:46:40+00:00",
+            "the conversion must be a real calendar conversion of the injected instant"
+        );
     }
 }

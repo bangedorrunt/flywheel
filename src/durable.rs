@@ -1508,14 +1508,32 @@ pub struct LoopRunVerifyArgs {
     pub strict: bool,
 }
 
+/// The verdict row's timestamp, read from injected authority.
+///
+/// A free function rather than an inline call so the leaf body holds no
+/// ambient read at all (the `bd_lf1u` guard scans leaf bodies) and so the
+/// conversion is testable against a fixed clock.
+fn verdict_at(authority: &crate::authority::RuntimeAuthority) -> chrono::DateTime<chrono::Utc> {
+    authority.now_datetime()
+}
+
 /// Checkpointed leaf — close-detect loop-run VERIFY (cheap band): the LOOP
 /// is the verifier. Executes the bead's VERIFY (TIMEBOX timeout, cargo under
 /// the build slot), then IN-PROCESS (armed) writes the machine receipt and
 /// records `command-verified`. Non-zero exit / timeout -> failed-head marker
 /// (NEVER re-verify the same broken head) + reopen. Returns
 /// `{band: loop-runnable|non-runnable, recorded?|reopened?}`.
+///
+/// bd-lf1u: takes `&Info` and stamps the verdict row's `at` from the
+/// INJECTED authority rather than sampling `chrono::Utc::now()`. That row is
+/// durable DATA — a replay re-reads it — so ambient time made the recorded
+/// proof depend on when the replay happened. The SDK's `LeafWithInfo` kind is
+/// the seam: `&Info` as the first parameter leaves the durable args (and the
+/// replay key built from them) untouched, because `&Info` is supplied by the
+/// runtime and is not serialized.
 #[function]
-async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
+async fn loop_run_verify(info: &Info, args: LoopRunVerifyArgs) -> Result<Value> {
+    let authority = info.get_dependency::<crate::authority::RuntimeAuthority>();
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
     cmd.args(["__loop-run-verify", &args.project, &args.bead_id]);
@@ -1639,7 +1657,7 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
                     kind: crate::verdict::VerdictKind::CommandVerified,
                     bead_id: args.bead_id.clone(),
                     sha: sha.clone(),
-                    at: chrono::Utc::now(),
+                    at: verdict_at(&authority),
                     actor: crate::verdict::AgentName::new("flywheel-toron-loop1"),
                     receipt_path,
                     verify_cmd,
@@ -12426,6 +12444,162 @@ mod tests {
         assert!(
             host.contains(&inject) && host.contains(&stamp),
             "bd-0fvb: the host edge must inject the resolved authority and stamp time from it"
+        );
+    }
+
+    /// bd-lf1u: every `#[function]` body in this file must take its time from
+    /// INJECTED authority, never from an ambient read.
+    ///
+    /// bd-0fvb closed this for `swarm_loop` alone and guarded it by slicing
+    /// the source between two function names, so the one leaf that still
+    /// stamped durable DATA with wall time (`loop_run_verify`, the
+    /// `command-verified` verdict row) stayed green. This walks every
+    /// `#[function]` body instead: a new leaf cannot regress without the
+    /// guard noticing, wherever it is added.
+    ///
+    /// Two ways a source scan lies about its own extent, both hit while
+    /// writing this, and both fixed here rather than worked around:
+    ///
+    /// 1. Counting braces from the signature runs past the body, because a
+    ///    brace inside a string literal (`format!("{e}")`, `r#"{"ok":true}"#`)
+    ///    counts. The first version walked 2400 lines past `swarm_loop`'s end
+    ///    and reported three violations bd-0fvb had already proven absent. A
+    ///    top-level `fn`'s closing brace is the one at column 0, and rustfmt
+    ///    guarantees every nested one is indented — so the line shape is the
+    ///    reliable signal, not the bracket count.
+    /// 2. Scanning the whole file matches the `#[function]` TEXT inside this
+    ///    module's own fixtures, so the guard's self-test fed it phantom
+    ///    leaves. The scan stops at the first `#[cfg(test)] mod`, which is
+    ///    where test-only code begins; a `#[function]` in a test module is not
+    ///    a leaf the SDK ever registers, so it is not in scope.
+    fn ambient_clock_reads_in_durable_leaves(src: &str) -> Vec<String> {
+        let needles = ["chrono::Utc::now", "SystemTime::now", "Instant::now"];
+        let mut hits = Vec::new();
+        let scan_end = src.find("#[cfg(test)]\nmod ").unwrap_or(src.len());
+        let scan = &src[..scan_end];
+        let mut cursor = 0usize;
+        // `#[function]` may carry other attributes before the signature, so
+        // search forward rather than assuming adjacency.
+        while let Some(attr) = scan[cursor..].find("#[function]") {
+            let after = cursor + attr + "#[function]".len();
+            let Some(sig_off) = scan[after..].find("async fn ") else {
+                break;
+            };
+            let sig_at = after + sig_off;
+            let Some(line_off) = scan[sig_at..].find('\n') else {
+                break;
+            };
+            let sig_line_end = sig_at + line_off;
+            let name = scan[sig_at..sig_line_end]
+                .trim_start_matches("async fn ")
+                .split(['(', '<', ' '])
+                .next()
+                .unwrap_or("<unknown>")
+                .to_string();
+            // Body ends at the next column-0 `}`.
+            let body_end = match scan[sig_line_end..].find("\n}") {
+                Some(p) => sig_line_end + p + 2,
+                None => break,
+            };
+            let body = &scan[sig_line_end..body_end];
+            for needle in needles {
+                if body.contains(needle) {
+                    hits.push(format!("{name}: {needle}"));
+                }
+            }
+            cursor = body_end;
+        }
+        hits
+    }
+
+    #[test]
+    fn bd_lf1u_no_durable_leaf_samples_an_ambient_clock() {
+        let src = include_str!("durable.rs");
+        let hits = ambient_clock_reads_in_durable_leaves(src);
+        assert!(
+            hits.is_empty(),
+            "bd-lf1u: these #[function] bodies read wall time ambiently, which is the \
+             replay-determinism bug the effect law bans. A durable leaf that stamps DATA \
+             must take time from injected authority: add `&Info` as the first parameter \
+             and read `info.get_dependency::<RuntimeAuthority>()`:\n  {}\n\
+             (a host-side deadline on a live subprocess is a different thing and belongs \
+             in a plain helper, never in a #[function] body)",
+            hits.join("\n  ")
+        );
+    }
+
+    /// The scanner is the thing under test, so it gets its own proof. Three
+    /// ways it could be vacuous, each checked: a clean source must come back
+    /// empty, a planted violation must be found AND NAMED, and the extractor
+    /// must not run past a body whose braces live inside string literals —
+    /// the exact defect that made the first version of this guard report three
+    /// violations in a function bd-0fvb had already proven clean.
+    #[test]
+    fn bd_lf1u_leaf_scanner_actually_walks_bodies() {
+        let clean = "#[function]\nasync fn a_leaf(args: A) -> Result<Value> { Ok(json!(1)) }\n";
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(clean),
+            Vec::<String>::new()
+        );
+
+        // Attributes between `#[function]` and the signature must not hide it.
+        let planted = "#[function]\n#[allow(clippy::too_many_arguments)]\nasync fn b_leaf(args: A) -> Result<Value> {\n    let at = chrono::Utc::now();\n    Ok(json!(at))\n}\n";
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(planted),
+            vec!["b_leaf: chrono::Utc::now".to_string()],
+            "the walk must reach a body behind intervening attributes and name it"
+        );
+
+        for (needle, why) in [
+            ("chrono::Utc::now", "wall clock"),
+            ("SystemTime::now", "system time"),
+            ("Instant::now", "monotonic"),
+        ] {
+            let src = format!(
+                "#[function]\nasync fn c_leaf(args: A) -> Result<Value> {{\n    let _ = {needle}();\n    Ok(json!(0))\n}}\n"
+            );
+            assert_eq!(
+                ambient_clock_reads_in_durable_leaves(&src),
+                vec![format!("c_leaf: {needle}")],
+                "the scanner must catch a {why} read"
+            );
+        }
+
+        // The regression that made this guard lie. Braces inside string
+        // literals must not extend the body: a leaf whose last statement is
+        // `format!("{e}")` ends at its own `}`, and the clean leaf that follows
+        // must be scanned as its own body, not swallowed as a continuation.
+        let tricky = concat!(
+            "#[function]\n",
+            "async fn d_leaf(args: A) -> Result<Value> {\n",
+            "    let msg = format!(\"{} {}\", args.a, args.b);\n",
+            "    let raw = r#\"{\"ok\": true}\"#;\n",
+            "    Ok(json!(msg))\n",
+            "}\n",
+            "#[function]\n",
+            "async fn e_leaf(args: A) -> Result<Value> { Ok(json!(1)) }\n",
+        );
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(tricky),
+            Vec::<String>::new(),
+            "string-literal braces must not extend a leaf body past its own closing brace"
+        );
+
+        // A `#[function]` after a test module is out of scope: the SDK never
+        // registers it, and this module's own fixtures carry the attribute as
+        // text, which is how the first version scanned itself.
+        let after_tests = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { let _ = \"#[function]\\nasync fn phantom(a: A) -> Result<Value> {\\n let _ = chrono::Utc::now();\\n\"; }\n}\n";
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(after_tests),
+            Vec::<String>::new(),
+            "test-module code is out of scope, including the #[function] text inside fixtures"
+        );
+
+        let helper = "async fn plain_helper() { let _ = std::time::Instant::now(); }\n";
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(helper),
+            Vec::<String>::new(),
+            "a non-#[function] helper is not a durable leaf and must not be flagged"
         );
     }
 
