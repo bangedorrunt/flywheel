@@ -11475,7 +11475,13 @@ pub(crate) fn pinned_mail_identity(
     let key = project_dir(cfg, project).to_str().map(str::to_string)?;
     let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
-        Err(_) => return None, // mail not configured — silent skip
+        Err(e) => {
+            // bd-tg4n: NOT silent. This used to discard the error and hand
+            // back a bare None, which surfaced one layer up as an opaque
+            // "first spawn pins an identity" expect with nothing in it.
+            eprintln!("flywheel: mail backend unavailable for {name} ({kind}): {e}");
+            return None;
+        }
     };
     // bd-627z.2: configured-remote (a [mail.toron] url is set) but the
     // daemon is unreachable → loud warning, not the old silent eprintln.
@@ -19098,7 +19104,7 @@ mod wake_identity_tests {
             .expect("registry entry");
         assert_eq!(entry.pane_id, "w9:p1");
         assert_eq!(entry.mail_identity.as_deref(), Some(pin.as_str()));
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     /// bd-gpj0: arrive with HERDR_PANE_ID records the open-mode pane so
@@ -19124,7 +19130,7 @@ mod wake_identity_tests {
             Some(v) => unsafe { std::env::set_var("HERDR_PANE_ID", v) },
             None => unsafe { std::env::remove_var("HERDR_PANE_ID") },
         }
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     #[test]
@@ -19170,7 +19176,7 @@ mod wake_identity_tests {
             .expect("colliding spawn draws a fresh pin");
         assert_ne!(pin2, pin, "collision with the agents table redraws");
         assert!(valid_pair(&pin2, &ADJECTIVES, &NOUNS).is_some(), "{pin2}");
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     /// bd-add-missing-mail-identity-16le: the ADD path's identity step mints
@@ -19237,7 +19243,7 @@ mod wake_identity_tests {
                 "registered pin {p} resolves via the agents table (whois)"
             );
         }
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     /// bd-pin-public-plane-s-easy.2: register_spawned_agent writes the
@@ -19274,7 +19280,7 @@ mod wake_identity_tests {
             who_slug.npub, who_pin.npub,
             "whois(slug) resolves to the pin's npub after the fold"
         );
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     /// S9 (ADR-0018 D1a): the peer-aware spawn template injects the mail

@@ -16,7 +16,7 @@
 # so the cell holds `T` and a failing builder returns before the `set`.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(mail_shim::init_once_tests)
+TEST_FILTER=(mail_shim::init_once_tests mail_shim::cleanup_test_data_dir_tests)
 
 # ONE mutation, and it is not the obvious one.
 #
@@ -61,3 +61,20 @@ mutation "M1  a memoised value is never read back" \
     replace='    let _held = gate
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);'
+
+# The cleanup half of the same defect. Without the guard the singleton'"'"'s own
+# directory is deleted out from under its pooled connections; the unit test
+# cannot drive that branch, so it pins the OTHER half — that a dir which is NOT
+# the singleton'"'"'s is still removed. A cleanup that quietly does nothing would
+# satisfy the production symptom and leak a temp dir on every run, so this is
+# the half worth a test rather than a comment.
+mutation "M2  the cleanup removes nothing at all" \
+    file=src/mail_shim.rs \
+    expect=an_unrelated_temp_dir_is_still_removed \
+    find='    if built_mail_root() == Some(dir) {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(dir);' \
+    replace='    if built_mail_root().is_some() || dir.as_os_str().is_empty() {
+        return;
+    }'

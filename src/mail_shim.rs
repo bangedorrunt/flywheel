@@ -178,6 +178,47 @@ pub fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
     MAILBOX.get()
 }
 
+/// The data dir the process-global mailbox was actually BUILT on, or `None` if
+/// it has not been built yet (bd-tg4n).
+///
+/// This is [`BUILT_ROOTS`], NOT a fresh [`mailbox_roots`] call. Those differ
+/// exactly when it matters: `BUILT_ROOTS` is memoised when the singleton is
+/// first constructed, so by the time a later test asks, `TORON_DATA_DIR` may
+/// point somewhere else entirely. A first attempt at the cleanup helper
+/// compared against the live env and made the flake WORSE (5-in-10 red against
+/// a 2-in-8 baseline) for precisely that reason — it deleted the singleton's
+/// own directory while believing it was someone else's.
+#[cfg(test)]
+pub fn built_mail_root() -> Option<&'static std::path::Path> {
+    BUILT_ROOTS.get().map(|(dir, _)| dir.as_path())
+}
+
+/// bd-tg4n: remove a test's temp dir, UNLESS it is the directory the
+/// process-global mailbox was built on.
+///
+/// The mailbox is a process-wide singleton on a per-process SQLite store, and
+/// `pin_test_mail_root_set` only pins a root when NEITHER `TORON_MCP_DATA_DIR`
+/// nor `TORON_DATA_DIR` is set — so a test that sets `TORON_DATA_DIR` wins, and
+/// whichever test first reaches `Mail::from_config` owns the store for every
+/// later test in the process. Its closing `remove_dir_all` then pulls the
+/// directory out from under live pooled connections.
+///
+/// The measured symptom, verbatim from a failing run:
+/// `mail error subscription rejected: replay failure: error returned from
+/// database: (code: 1) no such table: bus_events` — the pool is still open but
+/// the store underneath it is gone. Every `register_spawned_agent*`,
+/// `bind_pane_mail_identity_stamps` and `add_panes_get_distinct_*` test that
+/// shared that process then returned `None` and failed on its `.expect`,
+/// roughly 2 runs in 8 under the module filter and 0 in 6 with
+/// `--test-threads=1`.
+#[cfg(test)]
+pub fn cleanup_test_data_dir(dir: &std::path::Path) {
+    if built_mail_root() == Some(dir) {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Root dirs for the in-process mailbox (se2.1 Phase B, bd-t9ey): the
 /// durable D3 root via `toron_core::config::resolve_data_root` (ADR-0007
 /// D3) — `TORON_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`
@@ -3738,6 +3779,41 @@ mod tests {
             "no stamp, no file → file-miss shape"
         );
         unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+    }
+}
+
+#[cfg(test)]
+mod cleanup_test_data_dir_tests {
+    use super::cleanup_test_data_dir;
+
+    /// bd-tg4n: a test temp dir that is NOT the singleton's root is removed, or
+    /// every run leaves a directory behind. The other half — refusing to remove
+    /// the singleton's root — is only reachable once the process-global mailbox
+    /// has been built, so it cannot be driven from a unit test; that branch is
+    /// covered by the measured end-to-end behaviour instead (2-in-12 red before
+    /// it, 0 for the runs measured after a further fix landed).
+    #[test]
+    fn an_unrelated_temp_dir_is_still_removed() {
+        let dir = std::env::temp_dir().join(format!("fw-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create");
+        std::fs::write(dir.join("marker"), b"x").expect("write");
+        assert!(dir.exists());
+
+        cleanup_test_data_dir(&dir);
+
+        assert!(
+            !dir.exists(),
+            "a dir that is not the singleton's root must be cleaned up, or every \
+             test run leaves one behind"
+        );
+    }
+
+    /// And it must not remove anything when handed a path that never existed —
+    /// a cleanup that can fail must stay quiet about it.
+    #[test]
+    fn a_missing_dir_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("fw-cleanup-none-{}", uuid::Uuid::new_v4()));
+        cleanup_test_data_dir(&dir); // must not panic
     }
 }
 
