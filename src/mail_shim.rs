@@ -47,9 +47,10 @@ use crate::mcp_http::{McpClient, ServerKind};
 
 /// Shared tokio runtime: ONE per process (c3b.1 / se2.1 Phase A), built by
 /// `init_mailbox` — never a fresh `Runtime::new` per op. Construction failure
-/// is captured in the `Result`, so it propagates as an error at
-/// `Mail::from_config`, never a panic mid-op.
-static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+/// propagates as an error at `Mail::from_config`, never a panic mid-op. The
+/// cell holds the runtime, not a `Result`: bd-tg4n, a memoised failure would
+/// outlive its own cause and take mail down for the rest of the process.
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// The single shared in-process mailbox every `Mail` instance operates on
 /// (ADR-0003 Decision 3A). Mirrors `toron_mcp::demo_mailbox` (InProcessBus +
@@ -58,15 +59,65 @@ static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 /// every `ensure_project` on first use. Root dirs follow the durable D3
 /// resolution (bd-t9ey): `$XDG_DATA_HOME/toron` / `~/.local/share/toron` by
 /// default, `TORON_DATA_DIR` / `TORON_MCP_DATA_DIR` override.
-static MAILBOX: OnceLock<Result<toron_core::mailbox::Mailbox, String>> = OnceLock::new();
+static MAILBOX: OnceLock<toron_core::mailbox::Mailbox> = OnceLock::new();
 
 fn runtime() -> Result<&'static Runtime> {
-    RUNTIME
-        .get_or_init(|| {
-            Runtime::new().map_err(|e| format!("failed to initialize tokio runtime: {e}"))
-        })
-        .as_ref()
-        .map_err(|e| anyhow!("{e}"))
+    init_once(&RUNTIME, &INIT_GATE, || {
+        Runtime::new().map_err(|e| format!("failed to initialize tokio runtime: {e}"))
+    })
+    .map_err(|e| anyhow!("{e}"))
+}
+
+/// Serialises the two one-time builds. The fast path never takes it; only the
+/// cold build does, and there are exactly two of those per process.
+static INIT_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Memoise a successful build; never memoise a failure.
+///
+/// bd-tg4n: `OnceLock::get_or_init` stores the `Err` PERMANENTLY, so one failed
+/// build made mail unavailable for the rest of the process even after the cause
+/// was gone — the error outlived the condition and read as a bug somewhere else.
+/// `get_or_try_init` is the obvious fix and is UNSTABLE (`once_cell_try`), so
+/// this is the stable equivalent: the cell holds `T`, not `Result<T, String>`,
+/// and a builder that returns `Err` returns before the `set`. The next call
+/// therefore retries and a transient failure heals itself.
+///
+/// WHAT THIS DOES NOT DO: it does not fix the `wake_identity_tests` flake it was
+/// found through. Two `register_spawned_agent_*` tests still go red together
+/// roughly 2 runs in 8 under the module filter (measured after this change), so
+/// the trigger is NOT a stale cached error — a retry re-resolves whatever caused
+/// the failure and fails again. Two earlier theories were measured and
+/// REJECTED rather than shipped: a `test_state_home()` fix on the two tests
+/// (3/8 red), and a `cleanup_test_data_dir` that refuses to delete the dir the
+/// singleton was built on (5/10 red, worse). Deleting the temp dir is therefore
+/// not the trigger. The chain up to "a test can poison the process-global
+/// mailbox" is verified link by link; the trigger itself is still open.
+///
+/// The fast path is a lock-free `get`. `gate` is taken only while building, and
+/// the second `get` after acquiring it means a thread that lost the race reads
+/// the winner's value instead of building a duplicate.
+///
+/// Takes the cell rather than reaching for the statics so a test can drive a
+/// FRESH one; the process-global cells are already initialised by the time any
+/// unit test runs, so testing through them would prove nothing.
+fn init_once<T: Send + Sync + 'static>(
+    cell: &'static OnceLock<T>,
+    gate: &std::sync::Mutex<()>,
+    build: impl FnOnce() -> Result<T, String>,
+) -> Result<&'static T, String> {
+    if let Some(v) = cell.get() {
+        return Ok(v);
+    }
+    let _held = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(v) = cell.get() {
+        return Ok(v); // lost the race; the winner's value is the answer
+    }
+    let built = build()?; // a failure returns HERE, leaving the cell empty
+    let _ = cell.set(built);
+    cell.get()
+        .ok_or_else(|| "init_once: value lost to a concurrent build".to_string())
 }
 
 /// Build the shared runtime + mailbox eagerly, propagating failures as errors
@@ -74,7 +125,7 @@ fn runtime() -> Result<&'static Runtime> {
 /// `Mail::from_config`; every in-process op then reads the pre-built statics.
 fn init_mailbox() -> Result<()> {
     let _rt = runtime()?;
-    match MAILBOX.get_or_init(build_mailbox_once) {
+    match init_once(&MAILBOX, &INIT_GATE, build_mailbox_once) {
         Ok(_) => Ok(()),
         Err(e) => bail!("flywheel mail: in-process mailbox: {e}"),
     }
@@ -109,22 +160,22 @@ fn build_mailbox_once() -> Result<toron_core::mailbox::Mailbox, String> {
 /// The shared in-process mailbox. Only reachable after a successful
 /// `init_mailbox` (via `Mail::from_config`) — an unreachable panic here means
 /// a call path skipped construction, which is a programming error.
+///
+/// bd-tg4n: there is no `Some(Err(..))` arm any more, and that is the point of
+/// the change. The cell used to hold `Result<Mailbox, String>`, so a failed
+/// build was readable here FOREVER — an error that outlived its own cause. A
+/// failure now never reaches the cell; it surfaces once, at `Mail::from_config`,
+/// and the next call retries.
 pub fn mailbox() -> &'static toron_core::mailbox::Mailbox {
     match MAILBOX.get() {
-        Some(Ok(mb)) => mb,
-        Some(Err(e)) => {
-            unreachable!("mailbox init failure must surface via Mail::from_config: {e}")
-        }
+        Some(mb) => mb,
         None => unreachable!("mailbox() before Mail::from_config"),
     }
 }
 
 /// Non-panicking mailbox access for background ticks (GS-006 Ack-SLA).
 pub fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
-    match MAILBOX.get() {
-        Some(Ok(mb)) => Some(mb),
-        _ => None,
-    }
+    MAILBOX.get()
 }
 
 /// Root dirs for the in-process mailbox (se2.1 Phase B, bd-t9ey): the
@@ -3687,6 +3738,66 @@ mod tests {
             "no stamp, no file → file-miss shape"
         );
         unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+    }
+}
+
+#[cfg(test)]
+mod init_once_tests {
+    use super::init_once;
+    use std::sync::OnceLock;
+
+    /// bd-tg4n: the defect this exists for. `get_or_init` stores the `Err`
+    /// permanently, so one failed build turned mail off for the rest of the
+    /// process — the error outliving its own cause. The fixture drives a FRESH
+    /// cell, because the process-global `MAILBOX` is long since initialised by
+    /// the time any unit test runs and would prove nothing here.
+    #[test]
+    fn a_failed_build_is_retried_and_a_later_success_sticks() {
+        static CELL: OnceLock<u32> = OnceLock::new();
+        static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A fresh cell per test would need a `&'static`; statics in a test fn
+        // are per-test-binary, so each test names its own pair.
+
+        let first = init_once(&CELL, &GATE, || Err("no such directory".to_string()));
+        assert_eq!(
+            first.err().as_deref(),
+            Some("no such directory"),
+            "a failed build reports its own error"
+        );
+        assert!(
+            CELL.get().is_none(),
+            "a failure must not be memoised, or it outlives its cause"
+        );
+
+        let second = init_once(&CELL, &GATE, || Ok(7));
+        assert_eq!(*second.expect("a later build succeeds"), 7);
+        assert!(
+            CELL.get().is_some(),
+            "a success is memoised — the whole point of the cell"
+        );
+    }
+
+    /// The other half: once a success lands, the builder does not run again.
+    /// Without this, "memoise success" would be indistinguishable from "retry
+    /// forever", and the shared mailbox would be rebuilt on every op.
+    #[test]
+    fn a_successful_build_runs_exactly_once() {
+        static CELL: OnceLock<u32> = OnceLock::new();
+        static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        for _ in 0..3 {
+            let seen = init_once(&CELL, &GATE, || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            });
+            assert_eq!(*seen.expect("memoised"), 1);
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the builder must not run again after a success"
+        );
     }
 }
 
