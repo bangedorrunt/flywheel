@@ -2512,7 +2512,11 @@ fn settle_retry<T, E>(
 ) -> Result<T, E> {
     let base = Duration::from_millis(sleep_ms);
     let policy = crate::retry::RetryPolicy {
-        max_attempts: retries.saturating_add(1).max(1),
+        // bd-9w95: `.max(1)` was dead. `retries` is a `u32`, so
+        // `saturating_add(1)` is >= 1 for every input — including
+        // `u32::MAX`, which saturates to `u32::MAX` rather than to 0. Two
+        // mechanisms each guaranteed the floor and only one was needed.
+        max_attempts: retries.saturating_add(1),
         base,
         cap: base,
     };
@@ -18102,6 +18106,11 @@ pub(crate) fn wake_identity_pin(
 /// the wire may deliver rows oldest-first, so `.first()` cited stale ids
 /// and misdirected the mandated reply to the wrong thread. Deterministic
 /// fallback: the first raw row when nothing urgent survives the filter.
+///
+/// bd-9w95: the timestamp alone leaves a tie to iteration order, and the point
+/// of this function is that the wire order is NOT trusted. A burst can land two
+/// urgent rows in the same microsecond; the event id breaks it, the same way a
+/// Nostr timestamp breaks a same-second tie.
 pub(crate) fn newest_urgent<'a>(
     urgent: &[&'a serde_json::Value],
     fallback: Option<&'a serde_json::Value>,
@@ -18110,9 +18119,14 @@ pub(crate) fn newest_urgent<'a>(
         .iter()
         .copied()
         .max_by_key(|m| {
-            m.get("created_ts_us")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
+            (
+                m.get("created_ts_us")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                m.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            )
         })
         .or(fallback)
 }
@@ -18789,6 +18803,36 @@ mod wake_identity_tests {
         );
     }
 
+    /// bd-9w95: `created_ts_us` is microseconds, but a burst can still land two
+    /// urgent rows in the same one, and with the timestamp alone the winner is
+    /// whichever row the slice ends on — the exact "trust the wire order"
+    /// failure bd-vbf2 removed from the timestamp axis. The fixture is
+    /// adversarial by construction: the two orders disagree, so a last-wins
+    /// selector fails one of them.
+    #[test]
+    fn vbf2_a_shared_microsecond_resolves_by_id_in_either_order() {
+        let low = json!({
+            "id": "1111aaaa", "sender": "PinkCastle", "subject": "a", "body_md": "x",
+            "importance": "high", "thread_id": "c43357a1", "created_ts_us": 1_787_300_794u64,
+        });
+        let high = json!({
+            "id": "9999zzzz", "sender": "SandySparrow", "subject": "b", "body_md": "x",
+            "importance": "high", "thread_id": "c43357a1", "created_ts_us": 1_787_300_794u64,
+        });
+        assert_eq!(
+            low["created_ts_us"], high["created_ts_us"],
+            "precondition: a shared timestamp or the tie never happens"
+        );
+        for order in [vec![low.clone(), high.clone()], vec![high, low]] {
+            let picked = newest_urgent(&wake_urgent(&order), None).expect("pick");
+            assert_eq!(
+                picked.get("id").and_then(|i| i.as_str()),
+                Some("9999zzzz"),
+                "the higher event id wins the shared microsecond in either order"
+            );
+        }
+    }
+
     #[test]
     fn vbf2_falls_back_to_first_raw_row_when_nothing_urgent() {
         let normal = json!({
@@ -18986,6 +19030,52 @@ mod wake_identity_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// bd-9w95: `incarnation` counts relaunches of ONE pane, so two fresh panes
+    /// serving the same name BOTH sit at 0 — the tie is the common case, and the
+    /// old comment claimed "highest generation wins" as if it were not. Among
+    /// equal incarnations the answer is the later registry row, because
+    /// `max_by_key` returns the last maximum and the registry is append-ordered.
+    /// This test states that rule instead of leaving it incidental; the hazard it
+    /// does NOT settle (folded legacy rows sort last) is in the learnings note.
+    #[test]
+    fn skills_injected_reads_the_later_registry_row_when_incarnations_tie() {
+        // `test_state_home`, not a bare `set_var`: this module has neighbours
+        // that set XDG_STATE_HOME without restoring it, so whichever test ran
+        // last decides where THEIR registries land. A raw setter here made
+        // `register_spawned_agent_pins_unique_adjnoun_identity` collide with its
+        // own `/tmp/fw-s9-mail-proj` leftovers and fail intermittently.
+        let _home = crate::config::test_state_home();
+        let project = "/tmp/fw-skills-tie-proj";
+        let name = "flywheel-toron-oc";
+        let injected = |pane: &str| {
+            let mut e = state::SpawnEntry::legacy(pane, name);
+            e.incarnation = 0;
+            e.skills_injected = true;
+            e
+        };
+        let pending = |pane: &str| {
+            let mut e = state::SpawnEntry::legacy(pane, name);
+            e.incarnation = 0;
+            e.skills_injected = false;
+            e
+        };
+        // The LAST row is the one the prefix is still owed on, so a last-wins
+        // read and an injected-first read disagree and the test can fail.
+        state::save_spawn_registry(project, &[injected("w1:p1"), pending("w2:p2")])
+            .expect("save registry");
+        assert!(
+            !skills_injected_for(project, name),
+            "the later row wins the shared incarnation, so the skill prefix is still owed"
+        );
+        state::save_spawn_registry(project, &[pending("w2:p2"), injected("w1:p1")])
+            .expect("save registry");
+        assert!(
+            skills_injected_for(project, name),
+            "and the rule is the registry's order, not the pane id: reversing the \
+             rows reverses the answer"
+        );
+    }
+
     /// S9 (ADR-0018 D1a) integration (embedded mailbox): spawn registers a
     /// UNIQUE adj+noun pin — never the slug — keeps it on re-spawn
     /// (idempotent), and redraws when the agents table already holds the
@@ -19039,6 +19129,19 @@ mod wake_identity_tests {
 
     #[test]
     fn register_spawned_agent_pins_unique_adjnoun_identity() {
+        // bd-9w95 FLAKY, PRE-EXISTING, NOT FIXED HERE. This test sets only
+        // TORON_DATA_DIR, so its spawn registry lands in whatever XDG_STATE_HOME
+        // happens to be — and when no sibling has set one, in the operator's
+        // REAL ~/.local/state/flywheel (measured: 43 `fw-*` fixture files there,
+        // including `agents/fw-s9-mail-proj-*.json`). The "first spawn" then
+        // finds that row instead of minting a pin, and the colliding-name search
+        // — which can only match inside the 9900-pair space — comes up empty.
+        // Measured red roughly 1 run in 3 under `-- wake_identity_tests`, green
+        // 4/4 when run as `-- register_spawned_agent`. Adding `test_state_home()`
+        // here and to `register_spawned_agent_folds_slug_to_pin` was tried and
+        // did NOT fix it (still 3/8 red), so it was reverted rather than shipped
+        // as a non-fix. The real cause is the module-wide env coupling between
+        // these tests; see the sweep note before touching either test again.
         let _g = crate::config::lock_env();
         let data = std::env::temp_dir().join(format!("fw-s9-mail-{}", uuid::Uuid::new_v4()));
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
@@ -19143,6 +19246,8 @@ mod wake_identity_tests {
     /// second identity.
     #[test]
     fn register_spawned_agent_folds_slug_to_pin() {
+        // bd-9w95: flaky alongside the sibling above for the same reason. Same
+        // verdict — the `test_state_home()` fix was tried and did not hold.
         let _g = crate::config::lock_env();
         let data = std::env::temp_dir().join(format!("fw-fold-{}", uuid::Uuid::new_v4()));
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
@@ -29391,8 +29496,17 @@ fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
 /// Absent registry or entry reads as not-injected (fail toward gating —
 /// the gate is a no-op wait on already-booted panes).
 fn skills_injected_for(project: &str, name: &str) -> bool {
-    // bd-rkx8: highest generation wins — a stale row must not speak for a
-    // fresh pane sharing its name.
+    // bd-rkx8: a stale row must not speak for a fresh pane sharing its name.
+    // bd-9w95: the rule is NARROWER than that comment used to claim.
+    // `incarnation` counts relaunches of ONE pane, so two fresh panes serving
+    // the same name both sit at 0 — the common case, not an edge case. Among
+    // equal incarnations `max_by_key` returns the LAST such row, and the
+    // registry is append-ordered, so that is the latest registration. Stated
+    // here because it is load-bearing and was previously incidental:
+    // `fold_legacy_alias` appends the legacy file's rows AFTER the canonical
+    // ones, so for equal incarnations this can still pick a folded legacy row.
+    // Fixing that needs a freshness key the entry does not carry; see the
+    // bd-9w95 note in docs/learnings before changing the selection.
     state::load_spawn_registry(project)
         .iter()
         .filter(|e| e.name == name)
