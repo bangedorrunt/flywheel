@@ -531,6 +531,22 @@ async fn live_mailbox(data_dir: &Path, project: &str, names: &[&str]) {
 
 /// SC-D1 live: real kind-9 `--mention` post, real `toron watch` NDJSON
 /// (npub `p` tag), then `__doorbell --once` injects `[doorbell]` for the pin.
+///
+/// bd-p2zm: `#[ignore]`d because it drives a REAL `toron` subprocess, so it
+/// cannot pass unless the sibling repo has been built — `toron_bin()` resolves
+/// `../toron/target/debug/toron` and asserts it exists. Un-ignored, `mbx test`
+/// was green or red depending on whether a sibling build happened to be on
+/// disk: measured this session, a full-suite run failed on exactly this after
+/// cache eviction removed the artifact, with an unrelated change in the tree.
+/// A suite that goes red for a reason unrelated to the diff teaches the reader
+/// to ignore red.
+///
+/// The loud `toron_bin()` assert is KEPT, not replaced with a skip: it is the
+/// better diagnostic, and a deliberate run should name its own prerequisite.
+/// Run it on purpose with:
+///
+///     mbx +nightly-aarch64-apple-darwin test --test sc_doorbell_adr0005 -- --ignored sc_d1_live
+#[ignore = "needs the sibling toron debug build (mbx +nightly-aarch64-apple-darwin build -p toron-cli in ~/workspace/toron)"]
 #[tokio::test]
 async fn sc_d1_live_kind9_channel_post_rings() {
     let poster = "LiveWillow";
