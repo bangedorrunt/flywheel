@@ -211,12 +211,30 @@ pub fn built_mail_root() -> Option<&'static std::path::Path> {
 /// shared that process then returned `None` and failed on its `.expect`,
 /// roughly 2 runs in 8 under the module filter and 0 in 6 with
 /// `--test-threads=1`.
+///
+/// bd-gpaa: the equality guard this shipped with could never fire. Callers hand
+/// it the DURABLE ROOT they set `TORON_DATA_DIR` to, but [`built_mail_root`]
+/// returns the Mailbox DATA dir — `{root}/projects` (see [`mailbox_data_dir`]).
+/// Two different paths, so the guard was a permanent no-op that read like a fix.
+/// [`dir_holds_live_store`] is at-or-under for that reason.
 #[cfg(test)]
 pub fn cleanup_test_data_dir(dir: &std::path::Path) {
-    if built_mail_root() == Some(dir) {
+    if dir_holds_live_store(built_mail_root(), dir) {
         return;
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Would removing `dir` take the process-global mailbox's store with it?
+///
+/// At-or-under, not equality: `built` is `{root}/projects` and callers pass
+/// `{root}`, so only the ancestor form fires. Component-wise `starts_with`, so
+/// a sibling sharing a string prefix (`fw-bind-stamp-XY` against
+/// `fw-bind-stamp-X`) is NOT protected. `None` means no mailbox exists yet, so
+/// nothing is protected — the dir is still removed.
+#[cfg(test)]
+fn dir_holds_live_store(built: Option<&std::path::Path>, dir: &std::path::Path) -> bool {
+    matches!(built, Some(root) if root.starts_with(dir))
 }
 
 /// Root dirs for the in-process mailbox (se2.1 Phase B, bd-t9ey): the
@@ -3784,14 +3802,11 @@ mod tests {
 
 #[cfg(test)]
 mod cleanup_test_data_dir_tests {
-    use super::cleanup_test_data_dir;
+    use super::{cleanup_test_data_dir, dir_holds_live_store};
+    use std::path::Path;
 
     /// bd-tg4n: a test temp dir that is NOT the singleton's root is removed, or
-    /// every run leaves a directory behind. The other half — refusing to remove
-    /// the singleton's root — is only reachable once the process-global mailbox
-    /// has been built, so it cannot be driven from a unit test; that branch is
-    /// covered by the measured end-to-end behaviour instead (2-in-12 red before
-    /// it, 0 for the runs measured after a further fix landed).
+    /// every run leaves a directory behind.
     #[test]
     fn an_unrelated_temp_dir_is_still_removed() {
         let dir = std::env::temp_dir().join(format!("fw-cleanup-{}", uuid::Uuid::new_v4()));
@@ -3814,6 +3829,77 @@ mod cleanup_test_data_dir_tests {
     fn a_missing_dir_is_not_an_error() {
         let dir = std::env::temp_dir().join(format!("fw-cleanup-none-{}", uuid::Uuid::new_v4()));
         cleanup_test_data_dir(&dir); // must not panic
+    }
+
+    /// bd-gpaa: THE defect. `BUILT_ROOTS` holds the Mailbox DATA dir
+    /// (`{root}/projects`) while every caller passes the DURABLE ROOT (`{root}`)
+    /// it set `TORON_DATA_DIR` to. The equality guard this replaced never
+    /// matched, so the singleton's own store was deleted out from under its
+    /// pooled connections and `wake_identity_tests` kept failing 2 runs in 12
+    /// with `no such table: bus_events`.
+    #[test]
+    fn the_durable_root_holding_the_store_is_protected() {
+        let root = std::env::temp_dir().join(format!("fw-root-{}", uuid::Uuid::new_v4()));
+        let built = root.join("projects");
+        assert!(
+            dir_holds_live_store(Some(&built), &root),
+            "deleting {{root}} deletes {{root}}/projects — the live store. This is \
+             the exact shape every wake_identity_tests caller passes."
+        );
+    }
+
+    /// The data dir itself, so protecting the ancestor does not regress into
+    /// protecting only that one spelling.
+    #[test]
+    fn the_store_dir_itself_is_protected() {
+        let built = std::env::temp_dir()
+            .join(format!("fw-self-{}", uuid::Uuid::new_v4()))
+            .join("projects");
+        assert!(
+            dir_holds_live_store(Some(&built), &built),
+            "the store dir is protected"
+        );
+    }
+
+    /// Further up: `remove_dir_all(&tmp_root)` in a test that never set
+    /// `TORON_DATA_DIR` still takes a pinned per-process root with it.
+    #[test]
+    fn an_ancestor_of_the_store_is_protected() {
+        let built = Path::new("/tmp/fw-anc/store/projects");
+        assert!(
+            dir_holds_live_store(Some(built), Path::new("/tmp/fw-anc")),
+            "an ancestor holds the store too"
+        );
+        assert!(
+            dir_holds_live_store(Some(built), Path::new("/tmp")),
+            "and so does the temp root every one of these lives under"
+        );
+    }
+
+    /// `Path::starts_with` is component-wise, so a sibling sharing a STRING
+    /// prefix is not protected. A text-prefix guard would leak every temp dir
+    /// whose sibling name shares a few characters, and would look correct.
+    #[test]
+    fn a_string_prefix_sibling_is_not_protected() {
+        assert!(
+            !dir_holds_live_store(
+                Some(Path::new("/tmp/fw-bind-stamp-XYZ/projects")),
+                Path::new("/tmp/fw-bind-stamp-XY")
+            ),
+            "fw-bind-stamp-XY does not contain fw-bind-stamp-XYZ"
+        );
+    }
+
+    /// An unrelated dir, and no mailbox at all: neither is protected, or every
+    /// temp dir on the box survives the suite.
+    #[test]
+    fn an_unrelated_dir_and_a_missing_store_are_unprotected() {
+        let built = Path::new("/tmp/fw-some-other/store/projects");
+        assert!(!dir_holds_live_store(
+            Some(built),
+            Path::new("/tmp/fw-unrelated")
+        ));
+        assert!(!dir_holds_live_store(None, Path::new("/tmp/fw-unrelated")));
     }
 }
 
