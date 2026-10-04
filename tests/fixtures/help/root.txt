@@ -14,6 +14,7 @@ Commands:
   add                Extend a running swarm with more agent panes
   list               List flywheel swarms and their agents
   status             Show one swarm's agents and states
+  progress           bd-swarm-cockpit-pczs: wave progress — beads grouped by `wave-N` label (closed/in_progress/ready) and the wave currently in flight. `br list --json` is the source (the labels live there)
   snapshot           Print the fleet snapshot contract (flywheel-snapshot.v1) as robot JSON
   unanswered-triage  bd-3uqz: LABEL the pins in the doorbell's `.unanswered` files as mail-only-by-design, dead, or unknown. READ-ONLY by construction: it prints JSON and never writes, because those files are what gate P2b reads to decide whether a crew is INVISIBLE (bd-y90n). A `dead` label is a REVIEW QUEUE ENTRY, not a deletion, and this command has no delete path
   stuck-vs-busy      bd-3uqz: is a doorbell brain WEDGED, or genuinely WORKING? The second Jev fit, and the one that was built but UNREACHABLE — clippy caught the whole module as dead code, which is the correct verdict for a judgment nothing can ask
@@ -30,6 +31,7 @@ Commands:
   interrupt          Interrupt an agent (sends Escape by default — cancels the current tool call and returns to the prompt). Kill-style keys (ctrl+c) are REFUSED unless --force: they terminate the agent process and drop the pane to a shell (bd-fw-interrupt-kills-agent-or3)
   view               Read an agent's terminal output
   output             Read an agent's output from the opencode structured session store (bd-eign.5) — the SQLite session log, not TUI scrollback (which the alternate screen garbles). Resolves the latest session for the project directory, optionally narrowed by opencode role; --session targets an exact session id
+  agent              bd-swarm-cockpit-pczs: agent-session reads. `agent tail <pin>` shows the pin's recent actions (tool calls / commands) from the session herdr reports (`agent_session`) — the debugging surface that used to require finding the raw pi session JSONL by hand
   watch              Watch a swarm: stream agent state changes until --until or timeout
   doorbell           bd-durable-doorbell-lngf: supervised pane-wake layer surface. Dispatchers are lazily healed — any of these (plus `recover`/`status`) restarts a dead one for workspaces that ever ran one
   loop-mode          Monitor a swarm: poll every N seconds, feed queued instructions to idle/finished agents, report blockers. Exits 0 when the queue is drained and the swarm settles. Runs as a durable Resonate workflow by default — crashes resume via `flywheel loop-mode run <project>` (same invocation id). For back-compat, the bare legacy form `flywheel loop <project>` (alias) is rewritten to `loop-mode run <project>` before parsing (see `rewrite_legacy_loop_args`). Renamed from `loop` to avoid harness built-in conflicts (bd-loop-mode-rename-0tqy) [alias: loop]

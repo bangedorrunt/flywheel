@@ -123,14 +123,14 @@ use serde_json::{Value, json};
 #[cfg(feature = "serve")]
 use cmd::DaemonCmd;
 use cmd::{
-    ArtifactsCmd, AssetCmd, BackendCmd, CheckpointCmd, CoalitionCmd, ConfigCmd, CrewCmd, CronCmd,
-    DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd, PrinciplesCmd,
-    ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd, ToronMailCmd,
-    WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_analytics, cmd_asset, cmd_audit, cmd_backend,
-    cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject,
-    cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start,
-    cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history,
-    cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_models, cmd_policy,
+    AgentCmd, ArtifactsCmd, AssetCmd, BackendCmd, CheckpointCmd, CoalitionCmd, ConfigCmd, CrewCmd,
+    CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd,
+    PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd,
+    ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics, cmd_asset,
+    cmd_audit, cmd_backend, cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest,
+    cmd_doorbell_inject, cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster,
+    cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe,
+    cmd_history, cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_models, cmd_policy,
     cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline,
     cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
@@ -827,6 +827,15 @@ enum Commands {
     },
     /// Show one swarm's agents and states
     Status { project: Option<String> },
+    /// bd-swarm-cockpit-pczs: wave progress — beads grouped by `wave-N`
+    /// label (closed/in_progress/ready) and the wave currently in flight.
+    /// `br list --json` is the source (the labels live there).
+    Progress {
+        project: Option<String>,
+        /// machine-readable rows
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the fleet snapshot contract (flywheel-snapshot.v1) as robot JSON
     Snapshot { project: String },
     /// bd-3uqz: LABEL the pins in the doorbell's `.unanswered` files as
@@ -1094,6 +1103,14 @@ enum Commands {
         /// max parts to read from the session
         #[arg(long, default_value = "200")]
         limit: u32,
+    },
+    /// bd-swarm-cockpit-pczs: agent-session reads. `agent tail <pin>` shows
+    /// the pin's recent actions (tool calls / commands) from the session
+    /// herdr reports (`agent_session`) — the debugging surface that used to
+    /// require finding the raw pi session JSONL by hand.
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
     },
     /// Watch a swarm: stream agent state changes until --until or timeout
     Watch {
@@ -2607,6 +2624,8 @@ fn main() {
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
+            "status <project> + progress [<project>] [--json] (bd-swarm-cockpit-pczs cockpit reads: status rows carry pin/npub/pane/verdict/bead/reservations/last_active_ts_us and print JSON when not a TTY; progress groups beads by wave-N label — closed/in_progress/ready/blocked/unknown — and names dispatching_wave, the lowest ready/in-progress wave; project defaults to the workspace cwd)",
+            "agent tail <pin> [--project <p>] [--json] [--n N] (bd-swarm-cockpit-pczs: the pin's recent actions — tool calls / commands — from the session herdr reports on the pane's agent_session; path sessions read the pi JSONL, id sessions read the opencode store; no newest-file guessing)",
             "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
                 "coalition debate plan-review profile squad model slot catalog runs list/show/pending/digest/reconcile",
                 "workflow cron recipes workflows pipeline template stage ensemble",
@@ -2729,6 +2748,7 @@ fn main() {
         }) => cmd_add(&cfg, project, counts, kinds, *settle_secs),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
+        Some(Commands::Progress { project, json }) => cmd_progress(&cfg, project.as_deref(), *json),
         Some(Commands::Snapshot { project }) => cmd_snapshot(&cfg, project),
         Some(Commands::UnansweredTriage {
             flywheel_state_dir,
@@ -2877,6 +2897,7 @@ fn main() {
             session,
             limit,
         }) => cmd_output(&cfg, project, role.as_deref(), session.as_deref(), *limit),
+        Some(Commands::Agent { cmd }) => cmd_agent(&cfg, cmd),
         Some(Commands::Watch {
             project,
             to,
@@ -14531,8 +14552,13 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     // (mail down degrades to silence, never a fabricated divergence).
     let key = crate::project_dir_str(cfg, project)?;
     let registry = state::load_spawn_registry(&project_dir(cfg, project).to_string_lossy());
+    // bd-swarm-cockpit-pczs: one facade for the identity bridge AND the
+    // per-pin whois below (npub + last activity), and one snapshot call
+    // whose pins already carry the live bead/reservation binding.
+    let mail = crate::mail_or_die(cfg).ok();
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     let actual_by_pane: std::collections::HashMap<String, String> = {
-        let mail = crate::mail_or_die(cfg).ok();
         agents
             .iter()
             .filter_map(|a| {
@@ -14577,6 +14603,23 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             let observed_pin = actual_by_pane.get(&a.pane_id).cloned();
             let divergent =
                 identity_divergence(expected_pin.as_deref(), observed_pin.as_deref()).is_some();
+            // bd-swarm-cockpit-pczs: cockpit fields — who the pin is on the
+            // mail plane (npub + last activity, soft-fail null when the
+            // roster cannot answer) and which bead/reservations the LIVE
+            // board binds it to (snapshot projection; no row = empty, never
+            // a default).
+            let herdr_name = a.name.clone().unwrap_or_else(|| a.pane_id.clone());
+            let who = expected_pin
+                .as_deref()
+                .and_then(|pin| mail.as_ref()?.whois(&key, pin).ok());
+            let npub = who
+                .as_ref()
+                .and_then(|w| w.get("npub").and_then(Value::as_str))
+                .map(str::to_string);
+            let last_active_ts_us = who
+                .as_ref()
+                .and_then(|w| w.get("last_active_ts_us").and_then(Value::as_u64));
+            let snap_pin = snap.pins.iter().find(|p| p.pin == herdr_name);
             json!({
                 "name": a.name, "kind": a.agent,
                 // bd-4pxy: a launch_pending agent is NOT idle — still booting.
@@ -14587,6 +14630,10 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 "identity_pin": expected_pin,
                 "observed_pin": observed_pin,
                 "identity_divergent": divergent,
+                "npub": npub,
+                "last_active_ts_us": last_active_ts_us,
+                "bead": snap_pin.and_then(|p| p.bead.clone()),
+                "reservations": snap_pin.map(|p| p.reservations.clone()).unwrap_or_default(),
             })
         })
         .collect();
@@ -14607,13 +14654,12 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             (k.to_string(), st)
         })
         .collect();
-    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let dispatcher = doorbell::dispatcher_status_line(&config::state_dir(), &ws_label);
     // ADR-0010 D10 (bd-67qg): OPEN DECISIONS from the one snapshot call —
     // the journal fold lives in snapshot::assemble (same replay rule as
-    // cmd_doorbell_why), not inline here. Renders on every status until
-    // an answer/--verdict clears the call.
-    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    // cmd_doorbell_why), not inline here (the call itself is hoisted above,
+    // bd-swarm-cockpit-pczs). Renders on every status until an answer/
+    // --verdict clears the call.
     let open_decision_rows: Vec<Value> = snap
         .decisions
         .iter()
@@ -14719,6 +14765,197 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             "open_decisions": open_decision_rows,
             "identity_divergent": identity_divergent,
         }));
+    }
+    Ok(())
+}
+
+// ---- bd-swarm-cockpit-pczs: wave progress ----
+
+/// Per-wave progress counts. `unknown` exists so a row whose `status` field
+/// is missing/unrecognized reads unknown — never a default `done` (the same
+/// honesty rule as `history_row_status`).
+#[derive(Debug, Default)]
+struct WaveCounts {
+    closed: u64,
+    in_progress: u64,
+    ready: u64,
+    blocked: u64,
+    unknown: u64,
+    total: u64,
+}
+
+impl WaveCounts {
+    fn add(&mut self, status: &str, ready: bool) {
+        match status {
+            "closed" => self.closed += 1,
+            "in_progress" => self.in_progress += 1,
+            // An open bead is `ready` only when `br ready` listed it — a
+            // blocked open bead is not dispatchable and says so.
+            "open" if ready => self.ready += 1,
+            "open" => self.blocked += 1,
+            _ => self.unknown += 1,
+        }
+        self.total += 1;
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "closed": self.closed,
+            "in_progress": self.in_progress,
+            "ready": self.ready,
+            "blocked": self.blocked,
+            "unknown": self.unknown,
+            "total": self.total,
+        })
+    }
+}
+
+/// Fold `br list --status all` rows + the `br ready` id set into per-wave
+/// counts. A bead's wave is its first `wave-N` label; no label lands in the
+/// `unlabeled` bucket — a wave is never invented. The dispatching wave is the
+/// LOWEST wave holding a ready or in-progress bead, the same floor
+/// `wave_gate_held` applies (ADR-0006 D2). Pure.
+fn progress_waves(rows: &[Value], ready_ids: &HashSet<String>) -> Value {
+    let mut waves: BTreeMap<u64, WaveCounts> = BTreeMap::new();
+    let mut unlabeled = WaveCounts::default();
+    for row in rows {
+        let status = row.get("status").and_then(Value::as_str).unwrap_or("");
+        let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+        let wave = row
+            .get("labels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u64>().ok()));
+        let counts = match wave {
+            Some(w) => waves.entry(w).or_default(),
+            None => &mut unlabeled,
+        };
+        counts.add(status, ready_ids.contains(id));
+    }
+    let dispatching = waves
+        .iter()
+        .find(|(_, c)| c.in_progress > 0 || c.ready > 0)
+        .map(|(w, _)| *w);
+    json!({
+        "dispatching_wave": dispatching,
+        "waves": waves
+            .iter()
+            .map(|(w, c)| {
+                let mut v = c.to_json();
+                v["wave"] = json!(w);
+                v
+            })
+            .collect::<Vec<_>>(),
+        "unlabeled": unlabeled.to_json(),
+    })
+}
+
+/// `br list --json` / `br ready --json` issue rows, envelope-tolerant (bare
+/// array or `{"issues":[...]}`, the schema-18 pagination envelope). An
+/// unrecognized object shape is loud — a progress board must never read
+/// empty because a shape changed.
+fn parse_issue_rows_json(raw: &str, what: &str) -> Result<Vec<Value>> {
+    let v: Value =
+        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("{what} bad JSON: {e}: {raw}"))?;
+    match &v {
+        Value::Array(items) => Ok(items.clone()),
+        Value::Object(obj) => {
+            let issues = obj.get("issues").cloned().unwrap_or_default();
+            anyhow::ensure!(
+                issues.is_array(),
+                "{what}: unrecognized object shape (expected issues array): {raw}"
+            );
+            Ok(issues.as_array().cloned().unwrap_or_default())
+        }
+        _ => bail!("{what}: expected array or issues object: {raw}"),
+    }
+}
+
+/// bd-swarm-cockpit-pczs: `flywheel progress` — beads grouped by their
+/// `wave-N` label with the wave currently dispatching. The project comes from
+/// the positional / `--project`, or the workspace cwd (same inherit rule as
+/// `steer`), so `flywheel progress --json` works from inside a project.
+fn cmd_progress(cfg: &Config, project: Option<&str>, json_out: bool) -> Result<()> {
+    ensure_project_opt(project, "progress")?;
+    let project = crate::cron::detect_project(cfg, project).ok_or_else(|| {
+        anyhow!(
+            "progress: no project — pass <project>/--project <slug> or run from a \
+             workspace/<project> cwd"
+        )
+    })?;
+    check_project_spelling(&project, "progress")?;
+    let dir = project_dir(cfg, &project);
+    let run_br = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("br")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .map_err(|e| anyhow!("br not found: {e}"))?;
+        if !out.status.success() {
+            bail!(
+                "br {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let rows = parse_issue_rows_json(&run_br(&["list", "--status", "all", "--json"])?, "br list")?;
+    let ready_ids: HashSet<String> = parse_ready_beads_json(&run_br(&["ready", "--json"])?)?
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    let mut out = progress_waves(&rows, &ready_ids);
+    out["project"] = json!(project);
+    if json_out || !std::io::stdout().is_terminal() {
+        print_json(&out);
+        return Ok(());
+    }
+    let cell = |v: &Value| v.as_u64().unwrap_or(0);
+    println!(
+        "{:<8} {:>7} {:>12} {:>6} {:>8}",
+        "WAVE", "CLOSED", "IN-PROGRESS", "READY", "BLOCKED"
+    );
+    for w in out["waves"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "{:<8} {:>7} {:>12} {:>6} {:>8}",
+            format!("wave-{}", cell(&w["wave"])),
+            cell(&w["closed"]),
+            cell(&w["in_progress"]),
+            cell(&w["ready"]),
+            cell(&w["blocked"])
+        );
+    }
+    let u = &out["unlabeled"];
+    if cell(&u["total"]) > 0 {
+        println!(
+            "{:<8} {:>7} {:>12} {:>6} {:>8}",
+            "-",
+            cell(&u["closed"]),
+            cell(&u["in_progress"]),
+            cell(&u["ready"]),
+            cell(&u["blocked"])
+        );
+    }
+    match out["dispatching_wave"].as_u64() {
+        Some(w) => println!("dispatching: wave-{w}"),
+        None => println!("dispatching: none (no ready or in-progress wave beads)"),
+    }
+    let unknown = cell(&out["unlabeled"]["unknown"])
+        + out["waves"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|w| cell(&w["unknown"]))
+            .sum::<u64>();
+    if unknown > 0 {
+        println!(
+            "{} {unknown} row(s) carry no recognized status — not counted as done",
+            crate::output::warn("warn:")
+        );
     }
     Ok(())
 }
@@ -21971,6 +22208,77 @@ mod loop_tests {
         // bare-array fallback (some br versions)
         let beads = parse_inprogress_beads_json(r#"[{"id":"bd-d","title":"four"}]"#).unwrap();
         assert_eq!(beads[0].id, "bd-d");
+    }
+
+    /// bd-swarm-cockpit-pczs: `progress_waves` groups by `wave-N`, counts an
+    /// open bead `ready` only when `br ready` listed it, and names the LOWEST
+    /// wave holding ready/in-progress work as dispatching. Unlabeled beads
+    /// never invent a wave; an unknown status reads unknown, never a default.
+    #[test]
+    fn progress_waves_groups_and_names_the_dispatching_wave() {
+        use std::collections::HashSet;
+        let rows = json!([
+            {"id": "bd-a", "status": "closed", "labels": ["wave-1"]},
+            {"id": "bd-b", "status": "in_progress", "labels": ["wave-1"]},
+            {"id": "bd-c", "status": "open", "labels": ["wave-1"]},
+            {"id": "bd-d", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-e", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-f", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-g", "status": "open"},
+            {"id": "bd-h", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-i", "status": "mystery", "labels": ["wave-2"]},
+        ]);
+        let ready: HashSet<String> = ["bd-h".to_string()].into_iter().collect();
+        let out = progress_waves(rows.as_array().unwrap(), &ready);
+        assert_eq!(
+            out["dispatching_wave"],
+            json!(1),
+            "wave 1 holds in-progress work"
+        );
+        let waves = out["waves"].as_array().unwrap();
+        assert_eq!(waves.len(), 2, "two labeled waves");
+        assert_eq!(waves[0]["wave"], json!(1));
+        assert_eq!(waves[0]["closed"], json!(1));
+        assert_eq!(waves[0]["in_progress"], json!(1));
+        assert_eq!(
+            waves[0]["ready"],
+            json!(0),
+            "bd-c is open but not in br ready"
+        );
+        assert_eq!(waves[0]["blocked"], json!(1));
+        assert_eq!(waves[1]["ready"], json!(1), "bd-h is open AND dispatchable");
+        assert_eq!(waves[1]["blocked"], json!(3));
+        assert_eq!(waves[1]["unknown"], json!(1), "no default status");
+        assert_eq!(out["unlabeled"]["blocked"], json!(1));
+        assert_eq!(out["unlabeled"]["total"], json!(1));
+
+        // A wave with only READY beads still dispatches before a later wave's
+        // in-progress work — the gate floor is the lowest ready/in-progress wave.
+        let rows2 = json!([
+            {"id": "bd-r1", "status": "open", "labels": ["wave-1"]},
+            {"id": "bd-r2", "status": "in_progress", "labels": ["wave-2"]},
+        ]);
+        let ready2: HashSet<String> = ["bd-r1".to_string()].into_iter().collect();
+        let out2 = progress_waves(rows2.as_array().unwrap(), &ready2);
+        assert_eq!(out2["dispatching_wave"], json!(1));
+
+        // Every wave closed -> nothing is dispatching.
+        let rows3 = json!([{"id": "bd-z", "status": "closed", "labels": ["wave-1"]}]);
+        let out3 = progress_waves(rows3.as_array().unwrap(), &HashSet::<String>::new());
+        assert_eq!(out3["dispatching_wave"], Value::Null);
+    }
+
+    /// bd-swarm-cockpit-pczs: both br envelopes parse; an unrecognized object
+    /// shape fails loud (a progress board must not read empty on a shape drift).
+    #[test]
+    fn parse_issue_rows_json_accepts_both_envelopes_and_refuses_unknown() {
+        let bare = parse_issue_rows_json(r#"[{"id":"bd-a","status":"open"}]"#, "br list").unwrap();
+        assert_eq!(bare.len(), 1);
+        let wrapped =
+            parse_issue_rows_json(r#"{"issues":[{"id":"bd-b"}],"total":1}"#, "br list").unwrap();
+        assert_eq!(wrapped.len(), 1);
+        assert!(parse_issue_rows_json(r#"{"rows":[]}"#, "br list").is_err());
+        assert!(parse_issue_rows_json("not json", "br list").is_err());
     }
 
     /// bd-627z.1: the in-progress parser carries the assignee (drives the
