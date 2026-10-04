@@ -115,3 +115,17 @@ Checklist for the next one:
 3. Can every branch of the new logic be driven without the thing that broke?
 4. Do the new tests fail when the fix is inverted — and does a VACUOUS verdict
    here mean "the test cannot fail" or "the filter never selected the test"?
+
+### bd-pb39 resolution (2026-10-04, Buffy)
+
+Closed as measured: the foreground suite completed green three consecutive
+times (2651 passed, exit 0 each), with both bracketing tests —
+`register_spawned_agent_folds_slug_to_pin` and
+`register_spawned_agent_pins_unique_adjnoun_identity` — reporting `ok` inside
+the full-suite run. Four earlier full-suite runs the same day also completed
+without a mid-run death (they failed on unrelated tripwires, since repaired).
+No lock-ordering deadlock was found; the death was the detached-run reaper
+described above, and the only real code defect in the cluster was the
+non-hermetic lock bd-uu58 fixed at `lock_env()`. The durable rule is the
+sampling one: a death position that varies across runs is the harness, not
+the code under test.
