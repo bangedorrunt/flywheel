@@ -7814,6 +7814,30 @@ fn ensure_and_join_channels(project: &str, channels: &[String], pins: &[String])
     }
 }
 
+/// bd-ux-papercuts-t2u5: the `spawn --join` refusal must name the verb that
+/// actually ADDS panes. "JOINING — not spawning" alone sent the operator
+/// hunting for `flywheel add` (three attempts, live friction 2026-10-03).
+fn spawn_join_notice(project: &str, live: &str) -> String {
+    format!(
+        "JOINING — not spawning  project={project} live={live}  (ADR-0011 D5; reuse first workspace)\nto ADD panes to a live swarm use `flywheel add {project} --pi N`"
+    )
+}
+
+#[cfg(test)]
+mod spawn_join_notice_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_join_refusal_names_add() {
+        let msg = spawn_join_notice("proj", "w1 (label \"proj\", 2 panes)");
+        assert!(msg.contains("JOINING — not spawning"), "{msg}");
+        assert!(
+            msg.contains("flywheel add proj --pi N"),
+            "the refusal must name `flywheel add <project> --pi N`: {msg}"
+        );
+    }
+}
+
 fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi: "" defeats the
     // dir.exists() bail below (the workspace root always exists) — panes
@@ -8055,10 +8079,7 @@ projects available: {}",
             // bd-bfwj: retired panes are dead — reap their registry rows now.
             pane::reap_dead_registry_rows(project, &mut c);
         } else if opts.join {
-            eprintln!(
-                "JOINING — not spawning  project={project} live={}  (ADR-0011 D5; reuse first workspace)",
-                detail.join(", ")
-            );
+            eprintln!("{}", spawn_join_notice(project, &detail.join(", ")));
             let pin = std::env::var("AGENT_NAME")
                 .ok()
                 .or_else(|| std::env::var("TORON_AGENT").ok())

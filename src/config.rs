@@ -135,10 +135,13 @@ pub struct DoorbellSection {
     /// opt-in so migration parity holds with the flag off.
     #[serde(default)]
     pub arrival_triple: bool,
-    /// beads-poller sensor (bd-asr2.15, D7): read-only WAL poll of the br
-    /// sqlite (holds, issue changes) emitting Fact Msgs. Default false.
-    /// The poller NEVER writes: `sqlite3 --readonly` + SELECT only.
-    #[serde(default)]
+    /// beads-poller sensor (bd-asr2.15, D7; ready-bead lane
+    /// bd-ux-papercuts-t2u5): read-only WAL poll of the br sqlite (holds,
+    /// issue changes, ready-bead appearances) emitting Fact Msgs. Default
+    /// true — a ready bead must ring the supervisor without a manual board
+    /// poll; `beads_poller = false` opts out. The poller NEVER writes:
+    /// `sqlite3 --readonly` + SELECT only.
+    #[serde(default = "default_true")]
     pub beads_poller: bool,
     /// cron doorbell sink (bd-asr2.16, D7): cron tick completion journals a
     /// Fact row and queues a pending wake (digest-visible with zero swarm;
@@ -176,6 +179,12 @@ pub struct ServiceEmit {
 
 fn default_service_rate() -> u32 {
     6
+}
+
+/// Ready-bead lane default (bd-ux-papercuts-t2u5): the beads poller is on
+/// unless explicitly disabled.
+fn default_true() -> bool {
+    true
 }
 /// `[mail]` section — the mail transport table (ADR-0003 V3, bd-euav:
 /// single-backend toron; the agentmail backend is deleted). Splitting
@@ -535,12 +544,13 @@ impl Config {
             .unwrap_or(false)
     }
 
-    /// Beads-poller flag (bd-asr2.15, D7): false unless opted in.
+    /// Beads-poller flag (bd-asr2.15, D7; default-on since
+    /// bd-ux-papercuts-t2u5): true unless explicitly disabled.
     pub fn doorbell_beads_poller(&self) -> bool {
         self.doorbell
             .as_ref()
             .map(|d| d.beads_poller)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Cron doorbell-sink flag (bd-asr2.16, D7): false unless opted in.

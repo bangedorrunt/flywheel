@@ -3119,6 +3119,45 @@ mod tests {
     }
 
     #[test]
+    fn ready_bead_fact_wakes_idle_managed_pane() {
+        // bd-ux-papercuts-t2u5 acceptance: a ready-bead appearance detected by
+        // the beads poller must reach an idle managed pane through the daemon
+        // host — the supervisor no longer has to poll the board by hand. The
+        // summary comes from the real sensor, so a poller that stops emitting
+        // `ready` fails this test too.
+        let fresh = crate::pollers::Snapshot::default();
+        let (snap, _) = crate::pollers::detect_changes(&fresh, &[], &[], "t0");
+        let issue = crate::pollers::IssueRow {
+            id: "bd-new".into(),
+            status: "open".into(),
+            updated_at: "t1".into(),
+            blocked: false,
+        };
+        let (_snap2, delta) = crate::pollers::detect_changes(&snap, &[], &[issue], "t1");
+        let summary = delta.fact_summaries().remove(0);
+        assert_eq!(summary, "bead bd-new ready");
+
+        let (mut host, _dir) = host_with_registry("t-ready", entries());
+        host.refresh_index();
+        host.tick(&BrainMsg::RoleBound {
+            role: "captain".into(),
+            pin: "PinA".into(),
+        });
+        host.tick(&BrainMsg::Presence {
+            pin: "PinA".into(),
+            state: "idle".into(),
+        });
+        let fx = host.tick(&BrainMsg::Fact { summary });
+        assert!(
+            fx.iter().any(|e| matches!(
+                e,
+                Effect::Prompt { pin, line } if pin == "PinA" && line == "[doorbell] bead bd-new ready"
+            )),
+            "ready-bead event must wake the idle captain: {fx:?}"
+        );
+    }
+
+    #[test]
     fn fact_without_captain_stays_fact_miss() {
         // No bind (or non-idle presence): the loud miss survives.
         let (mut host, _dir) = host_with_registry("t-fact-miss", entries());
