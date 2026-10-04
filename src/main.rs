@@ -11542,6 +11542,14 @@ pub(crate) fn pinned_mail_identity(
                 .iter()
                 .filter_map(|e| e.mail_identity.clone())
                 .collect();
+            // bd-spawn-identity-divergence-2vzw: the captain pin is never a
+            // valid identity for a spawned pane — reserve it out of the pool
+            // even when the alias is not visible in the agents table.
+            let (captain_pin, _) = lookup_captain_holder(project);
+            if let Some(captain) = captain_pin {
+                taken.insert(captain);
+            }
+            taken.insert("captain".to_string());
             match backend::run_mail(mail.list_agents(&key, None)) {
                 Ok(agents) => {
                     taken.extend(agents.into_iter().map(|a| a.name));
@@ -13976,6 +13984,78 @@ fn arrive_maybe_bind_pane(cfg: &Config, project: &str, pin: &str) {
     }
 }
 
+/// bd-spawn-identity-divergence-2vzw: what arrive may do with `--as`, judged
+/// against the identity the pane was SPAWNED with.
+///
+/// Sources, strongest first: the spawn-registry row for this pane id (written
+/// by spawn before the pane existed) and `FLYWHEEL_MAIL_AS` (injected into the
+/// pane env at create; herdr injects env only at split/create). A
+/// user-exported `AGENT_NAME` is deliberately NOT read here — it is the mail
+/// ladder's operator fallback, not spawn evidence. A spawned pane may only
+/// arrive as its injected pin, and the captain pin is never a valid arrival
+/// target for one: the measured 2026-10-03 incident had a planner pane arrive
+/// as the CAPTAIN pin (derivable from the brief text) until mail corrected it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArriveIdentityVerdict {
+    /// Not a spawned pane (no registry row): explicit --as is an operator
+    /// choice and is honored.
+    Unbound,
+    /// The request matches the injected identity (or nothing contradicts it).
+    Match,
+    /// The request contradicts the spawn evidence — refuse.
+    Refused {
+        injected: Option<String>,
+        reason: &'static str,
+    },
+}
+
+pub(crate) fn arrive_identity_verdict(
+    requested: &str,
+    registry_pin: Option<&str>,
+    env_pin: Option<&str>,
+    captain_pin: Option<&str>,
+) -> ArriveIdentityVerdict {
+    fn clean(p: Option<&str>) -> Option<&str> {
+        p.filter(|s: &&str| !s.trim().is_empty())
+    }
+    let registry_pin = clean(registry_pin);
+    let env_pin = clean(env_pin);
+    let injected = registry_pin.or(env_pin);
+    if registry_pin.is_some() && captain_pin == Some(requested) {
+        return ArriveIdentityVerdict::Refused {
+            injected: injected.map(str::to_string),
+            reason: "the captain pin is not a valid arrival target for a spawned pane",
+        };
+    }
+    match injected {
+        Some(pin) if pin != requested => ArriveIdentityVerdict::Refused {
+            injected: Some(pin.to_string()),
+            reason: "pin contradicts the identity injected at spawn",
+        },
+        Some(_) => ArriveIdentityVerdict::Match,
+        None if registry_pin.is_some() => ArriveIdentityVerdict::Match,
+        None => ArriveIdentityVerdict::Unbound,
+    }
+}
+
+/// bd-spawn-identity-divergence-2vzw: the pane's recorded identity (spawn
+/// registry) vs the identity it actually acted as (the pane identity bridge /
+/// pane token resolve). Both sides known and different = divergent; a missing
+/// side is not evidence. Returns an `expected != observed` message.
+pub(crate) fn identity_divergence(
+    expected: Option<&str>,
+    observed: Option<&str>,
+) -> Option<String> {
+    let (expected, observed) = (
+        expected.filter(|s| !s.trim().is_empty()),
+        observed.filter(|s| !s.trim().is_empty()),
+    );
+    match (expected, observed) {
+        (Some(e), Some(o)) if e != o => Some(format!("{e} != {o}")),
+        _ => None,
+    }
+}
+
 fn cmd_arrive(
     cfg: &Config,
     project: &str,
@@ -13985,6 +14065,60 @@ fn cmd_arrive(
     captain_override: Option<&str>,
 ) -> Result<()> {
     check_project_spelling(project, "arrive")?;
+    // bd-spawn-identity-divergence-2vzw: refuse an arrival that contradicts
+    // the identity injected at spawn — BEFORE any mail-registration or
+    // heartbeat effect, so a wrong pin cannot fork the pane's identity or
+    // overwrite the pane binding. The captain pin is never a valid target for
+    // a spawned pane.
+    if let Some(requested) = as_agent {
+        let dir = project_dir(cfg, project);
+        let registry = state::load_spawn_registry(dir.to_str().unwrap_or(project));
+        let pane_id = std::env::var("HERDR_PANE_ID")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        let registry_pin = pane_id.as_ref().and_then(|pane| {
+            registry
+                .iter()
+                .find(|e| &e.pane_id == pane)
+                .and_then(|e| e.mail_identity.clone())
+        });
+        let env_pin = std::env::var("FLYWHEEL_MAIL_AS").ok();
+        let (captain_pin, _) = lookup_captain_holder(project);
+        if let ArriveIdentityVerdict::Refused { injected, reason } = arrive_identity_verdict(
+            requested,
+            registry_pin.as_deref(),
+            env_pin.as_deref(),
+            captain_pin.as_deref(),
+        ) {
+            bail!(
+                "flywheel: arrive --as {requested} refused: {reason}{}. Re-run with `arrive --as {}` (or unset the stray pin).",
+                injected
+                    .as_deref()
+                    .map(|p| format!(" (injected: {p})"))
+                    .unwrap_or_default(),
+                injected.as_deref().unwrap_or(requested),
+            );
+        }
+        // Divergence report (never a refusal — a correct re-arrive heals the
+        // binding): the pane identity bridge says the pane last acted under
+        // another pin than its spawn row names.
+        if let Some(pane) = pane_id.as_deref()
+            && let Ok(key) = project_dir_str(cfg, project)
+            && let Ok(mail) = mail_or_die(cfg)
+        {
+            let bridge = mail
+                .resolve_pane_identity(&key, pane)
+                .get("agent_name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(msg) = identity_divergence(registry_pin.as_deref(), bridge.as_deref()) {
+                eprintln!(
+                    "RECORD DIVERGENCE: identity_divergent pane={pane} registry={msg} — the pane previously acted under another identity; this arrival re-binds it."
+                );
+            }
+        }
+    }
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     let world = briefing::World {
@@ -14356,6 +14490,40 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     if agents.is_empty() {
         bail!("no agents in {project} — is the swarm spawned?");
     }
+    // bd-spawn-identity-divergence-2vzw: registry pin vs the identity the
+    // pane actually acted as (pane token / identity bridge). Both sides known
+    // and different = identity_divergent; a missing side is not evidence
+    // (mail down degrades to silence, never a fabricated divergence).
+    let key = crate::project_dir_str(cfg, project)?;
+    let registry = state::load_spawn_registry(&project_dir(cfg, project).to_string_lossy());
+    let actual_by_pane: std::collections::HashMap<String, String> = {
+        let mail = crate::mail_or_die(cfg).ok();
+        agents
+            .iter()
+            .filter_map(|a| {
+                let mail = mail.as_ref()?;
+                mail.resolve_pane_identity(&key, &a.pane_id)
+                    .get("agent_name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| (a.pane_id.clone(), s.to_string()))
+            })
+            .collect()
+    };
+    let identity_divergent: Vec<String> = agents
+        .iter()
+        .filter_map(|a| {
+            let expected = registry
+                .iter()
+                .find(|e| e.pane_id == a.pane_id)
+                .and_then(|e| e.mail_identity.as_deref());
+            let observed = actual_by_pane.get(&a.pane_id).map(String::as_str);
+            identity_divergence(expected, observed).map(|m| format!("pane {}: {m}", a.pane_id))
+        })
+        .collect();
+    for line in &identity_divergent {
+        eprintln!("flywheel: identity_divergent {line}");
+    }
     let rows: Vec<Value> = agents
         .iter()
         .map(|a| {
@@ -14367,6 +14535,13 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             let herdr_status = a.agent_status.as_str();
             let verdict = crate::workspace::verdict_for(None, herdr_status, herdr_status != "dead")
                 .status_token();
+            let expected_pin = registry
+                .iter()
+                .find(|e| e.pane_id == a.pane_id)
+                .and_then(|e| e.mail_identity.clone());
+            let observed_pin = actual_by_pane.get(&a.pane_id).cloned();
+            let divergent =
+                identity_divergence(expected_pin.as_deref(), observed_pin.as_deref()).is_some();
             json!({
                 "name": a.name, "kind": a.agent,
                 // bd-4pxy: a launch_pending agent is NOT idle — still booting.
@@ -14374,6 +14549,9 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 "verdict": verdict,
                 "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id,
                 "launch_pending": pending,
+                "identity_pin": expected_pin,
+                "observed_pin": observed_pin,
+                "identity_divergent": divergent,
             })
         })
         .collect();
@@ -14504,6 +14682,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 "last": last_fact,
             },
             "open_decisions": open_decision_rows,
+            "identity_divergent": identity_divergent,
         }));
     }
     Ok(())
@@ -18495,6 +18674,64 @@ pub(crate) fn spawn_agent_profile(name: &str, kind: &str, project: &str) -> back
         model: Some(kind.to_string()),
         persona: None,
         task_description: Some(format!("{name} (flywheel agent for {project})")),
+    }
+}
+
+#[cfg(test)]
+mod spawn_identity_divergence_tests {
+    use super::*;
+
+    /// bd-spawn-identity-divergence-2vzw: a spawned pane may only arrive as
+    /// its injected pin; the captain pin is refused for spawned panes; an
+    /// operator pane (no spawn row) keeps explicit --as. Plus the divergence
+    /// detector and the captain-pin pool exclusion.
+    #[test]
+    fn spawn_identity_matches_registry() {
+        // spawned pane: registry pin wins, matching arrival passes
+        assert_eq!(
+            arrive_identity_verdict("SilverPond", Some("SilverPond"), None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Match
+        );
+        // spawned pane arriving as the wrong pin is refused
+        assert!(matches!(
+            arrive_identity_verdict("SlateHerder", Some("SilverPond"), None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Refused { .. }
+        ));
+        // the measured incident: a spawned planner pane arriving as the
+        // CAPTAIN pin is refused (captain-for-a-spawned-pane)
+        assert!(matches!(
+            arrive_identity_verdict("EmberOtter", Some("SilverPond"), None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Refused { .. }
+        ));
+        // env-injected pin (FLYWHEEL_MAIL_AS) is spawn evidence even before
+        // the registry row exists
+        assert!(matches!(
+            arrive_identity_verdict("SlateHerder", None, Some("SilverPond"), None),
+            ArriveIdentityVerdict::Refused { .. }
+        ));
+        // operator pane: no spawn row, no injected env — explicit --as is an
+        // operator choice (the captain may arrive as itself here)
+        assert_eq!(
+            arrive_identity_verdict("EmberOtter", None, None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Unbound
+        );
+        // divergence detector: both sides known and different
+        assert_eq!(
+            identity_divergence(Some("SilverPond"), Some("SlateHerder")),
+            Some("SilverPond != SlateHerder".to_string())
+        );
+        assert_eq!(
+            identity_divergence(Some("SilverPond"), Some("SilverPond")),
+            None
+        );
+        assert_eq!(identity_divergence(None, Some("SlateHerder")), None);
+        assert_eq!(identity_divergence(Some(""), Some("SlateHerder")), None);
+        // pool exclusion: a seed that would draw the captain pin redraws
+        let captain_pin = adjnoun_from_fnv(7);
+        let mut taken = std::collections::HashSet::new();
+        taken.insert(captain_pin.clone());
+        let drawn = unique_adjnoun_pin(&taken, 7);
+        assert_ne!(drawn, captain_pin, "captain pin must never be drawn");
     }
 }
 
