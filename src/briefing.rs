@@ -32,6 +32,12 @@ pub struct World {
     /// GS-049: agents still launch-pending (from snapshot assemble).
     #[serde(default)]
     pub launch_pending: u32,
+    /// bd-compose-plumbing-zdzi: the pin this briefing runs as (the
+    /// "arriving pin"). Bound into declared inputs the routed token can
+    /// derive (today `captain_pin`); `None` = not derivable, so the input is
+    /// named in `questions` instead of silently defaulting to nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +208,71 @@ fn splice_named_harness(argv: &mut Vec<String>, objective: &str) {
     }
 }
 
+/// bd-compose-plumbing-zdzi: derive the declared inputs of a compose-token run
+/// that this process can bind itself, and MERGE them into the emitted argv as
+/// `--inputs`. Today the derivable pair is `captain_pin` = the arriving pin:
+/// the agent being briefed IS the captain, and the recipe default `""` would
+/// aim every stage escalation at nobody. An operator-provided value already on
+/// the argv is never overwritten. Returns the declared names it could NOT
+/// derive, so the caller names them in `questions`.
+pub fn bind_declared_inputs(
+    argv: &mut Vec<String>,
+    token: &str,
+    agent_pin: Option<&str>,
+) -> Vec<&'static str> {
+    let Some(wf) = crate::builtin_workflows::builtin_recipe(token) else {
+        return Vec::new();
+    };
+    let mut underivable = Vec::new();
+    let mut bindings: Vec<(&'static str, String)> = Vec::new();
+    for name in ["captain_pin"] {
+        if !wf.inputs.iter().any(|i| i.name == name) {
+            continue;
+        }
+        match agent_pin.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(pin) => bindings.push((name, pin.to_string())),
+            None => underivable.push(name),
+        }
+    }
+    if !bindings.is_empty() {
+        merge_inputs_into_argv(argv, &bindings);
+    }
+    underivable
+}
+
+/// Merge `(name, value)` bindings into argv's `--inputs` JSON object —
+/// creating the flag when absent, extending it when present, and respecting
+/// a non-empty operator value already on the argv.
+fn merge_inputs_into_argv(argv: &mut Vec<String>, bindings: &[(&str, String)]) {
+    let existing = argv
+        .iter()
+        .position(|a| a == "--inputs")
+        .and_then(|i| argv.get(i + 1).cloned())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let mut merged = existing;
+    for (name, value) in bindings {
+        let already = merged
+            .get(*name)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !already {
+            merged.insert((*name).to_string(), serde_json::json!(value));
+        }
+    }
+    let rendered = serde_json::Value::Object(merged).to_string();
+    match argv.iter().position(|a| a == "--inputs") {
+        Some(i) if i + 1 < argv.len() => argv[i + 1] = rendered,
+        _ => {
+            argv.push("--inputs".into());
+            argv.push(rendered);
+        }
+    }
+}
+
 fn has_diagnose_then_fix(objective: &str) -> bool {
     let lower = objective.to_ascii_lowercase();
     let diagnose = lower.contains("diagnose") || lower.contains("forensic");
@@ -290,7 +361,22 @@ pub fn assemble(
     splice_project(&mut argv, &world.project);
     splice_named_harness(&mut argv, objective);
 
-    let missing = missing_required_inputs(decision.primitive, objective);
+    let mut missing = missing_required_inputs(decision.primitive, objective).to_vec();
+    // bd-compose-plumbing-zdzi: a compose token's declared inputs that this
+    // process can derive are bound into the argv it emits (`--inputs`); the
+    // underivable ones join `missing` below — a run is never emitted with a
+    // silently empty escalation target. Only a real compose argv binds (a
+    // join/arrive argv carries no `{{inputs.*}}` to resolve).
+    let binds_compose = argv
+        .windows(2)
+        .any(|w| w[0] == "workflow" && w[1] == "compose");
+    if binds_compose && is_compose_token(decision.primitive) {
+        missing.extend(bind_declared_inputs(
+            &mut argv,
+            decision.primitive,
+            world.agent_pin.as_deref(),
+        ));
+    }
     let why = if topology == "join" {
         format!(
             "live fleet on {} (pins={}, dispatcher={}) — join by default (ADR-0011 D5)",
@@ -659,7 +745,7 @@ fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
                     b.proposal.crew.insert((*role).into(), 1);
                 }
             }
-            b.proposal.argv = vec![
+            let mut argv = vec![
                 "flywheel".into(),
                 "workflow".into(),
                 "compose".into(),
@@ -672,7 +758,29 @@ fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
                 "--crew".into(),
                 n.to_string(),
             ];
+            // bd-compose-plumbing-zdzi: the same declared-input binding the
+            // classify path applies — an explicit swarm flip must not drop the
+            // captain pin the token needs. Underivable = the explicit choice
+            // still dispatches, with the input surfaced as a question below.
+            let underivable =
+                bind_declared_inputs(&mut argv, "wave-swarm", b.world.agent_pin.as_deref());
+            b.proposal.argv = argv;
             b.proposal.why = "wave-swarm (operator topology=swarm)".into();
+            if !underivable.is_empty() {
+                // Explicit operator choice: the body still dispatches, but the
+                // underivable input is surfaced the same way the classify path
+                // surfaces it — a named question, never a silent "".
+                b.proposal.why = format!(
+                    "wave-swarm (operator topology=swarm) — Missing inputs: {}. Pass them via \
+                     --inputs before --commit (captain_pin targets escalations).",
+                    underivable.join(", ")
+                );
+                b.questions.push(Question {
+                    id: "inputs".into(),
+                    options: underivable.iter().map(|n| (*n).to_string()).collect(),
+                    default: underivable.join(","),
+                });
+            }
         }
         _ => {}
     }
@@ -713,10 +821,15 @@ fn splice_role_models(argv: &mut Vec<String>, specs: &[String]) {
 mod tests {
     use super::*;
 
+    /// bd-compose-plumbing-zdzi: an empty FLEET, not an anonymous caller —
+    /// the fixture carries the arriving pin the way the CLI resolves it, so a
+    /// wave-swarm briefing in these tests emits a dispatchable argv. Tests
+    /// that need the underivable case build `World { agent_pin: None, .. }`.
     fn world_empty() -> World {
         World {
             project: "toron".into(),
             dispatcher: "absent".into(),
+            agent_pin: Some("captain".into()),
             ..World::default()
         }
     }
@@ -1173,6 +1286,64 @@ mod tests {
         assert_eq!(b.proposal.topology, "open");
         assert_eq!(b.proposal.workflow, "none");
         assert!(b.proposal.argv.is_empty(), "{:?}", b.proposal.argv);
+    }
+
+    /// bd-compose-plumbing-zdzi: the arriving pin is bound as `captain_pin` in
+    /// the emitted compose argv — the friction left `captain_pin` at its `""`
+    /// default, so every stage escalation targeted nobody and the operator
+    /// had to bind it by hand. With no derivable pin the input is NAMED in
+    /// `questions` and no argv is dispatched, never silently defaulted.
+    #[test]
+    fn briefing_binds_captain_pin_for_wave_swarm() {
+        let world = World {
+            agent_pin: Some("Buffy".into()),
+            ..world_empty()
+        };
+        let b = assemble("wave-swarm the auth lanes", &world, &[], 5, None);
+        assert_eq!(
+            b.proposal.token.as_deref(),
+            Some("wave-swarm"),
+            "precondition: routed to the token: {:?}",
+            b.proposal
+        );
+        let idx = b
+            .proposal
+            .argv
+            .iter()
+            .position(|a| a == "--inputs")
+            .unwrap_or_else(|| panic!("--inputs must be bound: {:?}", b.proposal.argv));
+        let inputs: serde_json::Value =
+            serde_json::from_str(&b.proposal.argv[idx + 1]).expect("--inputs is a JSON object");
+        assert_eq!(
+            inputs.get("captain_pin").and_then(|v| v.as_str()),
+            Some("Buffy"),
+            "the arriving pin is the captain: {:?}",
+            b.proposal.argv
+        );
+
+        // No derivable pin: the input is asked for, and nothing is dispatched.
+        let world = World {
+            agent_pin: None,
+            ..world_empty()
+        };
+        let b = assemble("wave-swarm the auth lanes", &world, &[], 5, None);
+        assert!(
+            b.proposal.argv.is_empty(),
+            "an underivable captain pin must not dispatch: {:?}",
+            b.proposal.argv
+        );
+        assert!(
+            b.questions
+                .iter()
+                .any(|q| q.id == "inputs" && q.options.iter().any(|o| o == "captain_pin")),
+            "captain_pin must be named as a missing input: {:?}",
+            b.questions
+        );
+        assert!(
+            b.proposal.why.contains("captain_pin"),
+            "why names the missing input: {}",
+            b.proposal.why
+        );
     }
 
     #[test]

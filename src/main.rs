@@ -7730,6 +7730,69 @@ fn dead_panes(
         .collect()
 }
 
+/// bd-compose-plumbing-zdzi: ensure the given channels exist (captain owns
+/// creation, idempotently — a crew pin must never become creator via a join
+/// race) and join every given pin with `--if-missing`. Join-before-post:
+/// membership is the only gate and a non-member post is a refused write, so
+/// the `spawn` join flags AND `workflow compose --run`'s declared steer
+/// channel go through THIS one implementation (the compose path had skipped
+/// it; spawn's inline copy was the only one — the divergence this bead
+/// records). Best-effort by contract: each failure warns with the exact
+/// remedy and a failed join never fails the run.
+fn ensure_and_join_channels(project: &str, channels: &[String], pins: &[String]) {
+    if channels.is_empty() {
+        return;
+    }
+    let captain = operator_pin();
+    for ch in channels {
+        let ensured = Command::new("toron")
+            .args([
+                "channel",
+                "create",
+                "--name",
+                ch,
+                "--project",
+                project,
+                "--as",
+                &captain,
+                ch,
+            ])
+            .output();
+        match ensured {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => eprintln!(
+                "flywheel: warn: channel ensure {ch} failed for {captain}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => eprintln!("flywheel: warn: channel ensure {ch} failed: {e}"),
+        }
+    }
+    for pin in pins {
+        for ch in channels {
+            let status = Command::new("toron")
+                .args([
+                    "channel",
+                    "join",
+                    ch,
+                    "--project",
+                    project,
+                    "--as",
+                    pin,
+                    "--if-missing",
+                ])
+                .output();
+            match status {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!(
+                    "flywheel: warn: channel join {ch} failed for {pin}: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => eprintln!("flywheel: warn: channel join {ch} failed for {pin}: {e}"),
+            }
+        }
+    }
+}
+
 fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi: "" defeats the
     // dir.exists() bail below (the workspace root always exists) — panes
@@ -8677,64 +8740,14 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
     // bd-kbl1c join-before-post: auto-join every --join-channel for every
     // spawned identity BEFORE first doorbell — membership is the only gate,
     // and a non-member post is a refused write (the 2026-08-22 silent-drop
-    // incident class). --if-missing keeps re-spawns idempotent (no duplicate
-    // bus event). Best-effort: a failed join never fails the spawn (the
-    // gate's remedy error still names the exact join command).
-    // bd-ka0w: ensure the room exists FIRST, idempotently, as the operator
-    // (captain owns creation; a crew pin must never become creator via a
-    // join race). Create-on-existing is a no-op preserving the creator.
+    // incident class). bd-compose-plumbing-zdzi: the ensure+join loop lives
+    // in `ensure_and_join_channels`, shared with `workflow compose --run`.
     if !opts.join_channels.is_empty() {
-        let captain = operator_pin();
-        for ch in &opts.join_channels {
-            let ensured = Command::new("toron")
-                .args([
-                    "channel",
-                    "create",
-                    "--name",
-                    ch,
-                    "--project",
-                    project,
-                    "--as",
-                    &captain,
-                    ch,
-                ])
-                .output();
-            match ensured {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => eprintln!(
-                    "flywheel: warn: channel ensure {ch} failed for {captain}: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => eprintln!("flywheel: warn: channel ensure {ch} failed: {e}"),
-            }
-        }
-        for e in &registry {
-            let Some(pin) = &e.mail_identity else {
-                continue;
-            };
-            for ch in &opts.join_channels {
-                let status = Command::new("toron")
-                    .args([
-                        "channel",
-                        "join",
-                        ch,
-                        "--project",
-                        project,
-                        "--as",
-                        pin,
-                        "--if-missing",
-                    ])
-                    .output();
-                match status {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => eprintln!(
-                        "flywheel: warn: channel join {ch} failed for {pin}: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ),
-                    Err(e) => eprintln!("flywheel: warn: channel join {ch} failed for {pin}: {e}"),
-                }
-            }
-        }
+        let pins: Vec<String> = registry
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
+        ensure_and_join_channels(project, &opts.join_channels, &pins);
     }
 
     // ADR-0005 D1: detached doorbell dispatcher. Spawn fails if it cannot
@@ -13704,6 +13717,15 @@ fn cmd_briefing(
         held_paths: snap.held_paths.clone(),
         coalition_id: snap.coalitions.first().cloned(),
         launch_pending: snap.launch_pending,
+        // bd-compose-plumbing-zdzi: the arriving pin — the ONE identity
+        // ladder (env over config name), so the emitted wave-swarm argv can
+        // bind `captain_pin` to the agent actually briefing.
+        agent_pin: select_reservation_identity(None, &|k| std::env::var(k).ok()).or_else(|| {
+            cfg.agent_mail
+                .as_ref()
+                .and_then(|m| m.name.clone())
+                .filter(|s| !s.trim().is_empty())
+        }),
     };
     if world.joinable {
         eprintln!("{}", briefing::join_banner(&world));
@@ -27384,6 +27406,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 }
             }
             let inputs_c = Value::Object(inputs_value);
+            // bd-compose-plumbing-zdzi: resolve the declared stage channel
+            // BEFORE anything spawns. An unresolvable channel refuses here —
+            // never a mid-run strict-render failure with panes already up.
+            let steer_channel = crew::resolve_steer_channel(&composed, &inputs_c)?;
             let run_id =
                 if let Some(k) = idempotency_key.as_deref().filter(|s| !s.trim().is_empty()) {
                     format!(
@@ -27438,6 +27464,18 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 *retire_orphans,
             )?;
             let entries = ctx.entries.clone();
+            // bd-compose-plumbing-zdzi: join-before-post for the run's OWN
+            // crew — every spawned pin joins the declared steer channel so a
+            // stage's first post is a member post, not a refused write (the
+            // friction's operator had to create + join by hand).
+            if let Some(channel) = steer_channel.as_deref() {
+                let pins: Vec<String> = entries
+                    .entries()
+                    .iter()
+                    .filter_map(|e| e.mail_identity.clone())
+                    .collect();
+                ensure_and_join_channels(project_name, &[channel.to_string()], &pins);
+            }
             let project_c = project_name.to_string();
             let wf_name_c = wf_name.clone();
             let runner: toron_workflow::engine::EffectRunner = {
