@@ -29661,22 +29661,51 @@ fn cmd_internal_send(
             eprintln!("flywheel: cannot persist skills_injected for {name}: {e:#}");
         }
     }
-    let send_text = match &profile_obj {
+    let mut send_text = match &profile_obj {
         Some((_, _, _, behavior, _)) => headless::conditioned_prompt(behavior, &send_base),
-        None => send_base,
+        // cloned so the degrade path below can still read the skills prefix
+        None => send_base.clone(),
     };
 
-    // ADR-0019 Spec 2: a dispatched bead brief (behavior + skills prefix +
-    // brief) over the 4 KiB cap is a LOOP BUG — fail loud, never silent
-    // truncation. Only briefs are capped (first line `GOAL ...`); captain
-    // steers, nudges, and mail wakes are raw text and exempt.
+    // ADR-0019 Spec 2, amended by bd-dispatch-cap-conditioning-l7jh: a
+    // dispatched bead brief (behavior + skills prefix + brief) over the
+    // 4 KiB cap DEGRADES to the pointer brief and sends — an over-cap class
+    // must not balloon into four rejects that hard-stop the loop. Only
+    // briefs are capped (first line `GOAL ...`); captain steers, nudges, and
+    // mail wakes are raw text and exempt. Errors only when even the pointer
+    // form cannot fit the cap with this conditioning.
     if text.starts_with("GOAL ") && send_text.len() > durable::DISPATCH_PROMPT_CAP {
-        bail!(
-            "flywheel: dispatched prompt for bead {} is {} bytes — over the {} byte cap (loop bug; NOT sent, never truncated)",
-            durable::bead_id_from_prompt(text).unwrap_or("<unknown>"),
-            send_text.len(),
-            durable::DISPATCH_PROMPT_CAP,
-        );
+        let bead = durable::bead_id_from_prompt(text).map(str::to_string);
+        let rebuilt = bead.as_deref().map(|id| {
+            // Preserve the exact skills prefix already prepended to send_base
+            // (base = prefix + text), so the degraded send keeps its
+            // conditioning and loses only the embedded brief.
+            let prefix = send_base.strip_suffix(text).unwrap_or_default();
+            let pointer = durable::pointer_brief(id, project, text.starts_with("GOAL Resume "));
+            let base = format!("{prefix}{pointer}");
+            match &profile_obj {
+                Some((_, _, _, behavior, _)) => headless::conditioned_prompt(behavior, &base),
+                None => base,
+            }
+        });
+        match rebuilt {
+            Some(degraded) if degraded.len() <= durable::DISPATCH_PROMPT_CAP => {
+                eprintln!(
+                    "flywheel: WARN dispatched prompt for bead {} is {} bytes — over the {} byte cap; degraded to the pointer brief ({} bytes)",
+                    bead.as_deref().unwrap_or("<unknown>"),
+                    send_text.len(),
+                    durable::DISPATCH_PROMPT_CAP,
+                    degraded.len(),
+                );
+                send_text = degraded;
+            }
+            _ => bail!(
+                "flywheel: dispatched prompt for bead {} is {} bytes — over the {} byte cap even as the pointer brief (loop bug; NOT sent, never truncated)",
+                bead.as_deref().unwrap_or("<unknown>"),
+                send_text.len(),
+                durable::DISPATCH_PROMPT_CAP,
+            ),
+        }
     }
 
     // review-fix F6: __send routes through the backend factory (ADR-0002).
