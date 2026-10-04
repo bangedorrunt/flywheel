@@ -87,9 +87,32 @@ pub use factory::{
 /// Drive one `MailSurface` future from sync flywheel dispatch (the durable
 /// loop is sync; each op is a short-lived block_on on the shared runtime —
 /// c3b.1). The surface impls never nest `block_on` on that runtime
-/// (in-process ops are pure async; adapters are sync-HTTP), so this is safe.
+/// (in-process ops are pure async; adapters are sync-HTTP), so this is safe
+/// **from a sync context**. A caller already driving async tasks (a durable
+/// leaf body runs on the loop's tokio worker) must use
+/// [`run_mail_off_runtime`] instead.
 pub fn run_mail<F: std::future::Future>(f: F) -> F::Output {
     crate::mail_shim::block_on(f)
+}
+
+/// The async-safe twin of [`run_mail`]: run one synchronous mail block (which
+/// `block_on`s the shared runtime inside) on a BLOCKING thread.
+///
+/// bd-swarm-loop-durable-panic-atlo: calling [`run_mail`] from an async
+/// context that is already driving tasks panics with "Cannot start a runtime
+/// from within a runtime" — the renew-filtered durable leaf did exactly that
+/// once per poll on the loop's tokio worker. `spawn_blocking` moves the whole
+/// block off the scheduler first; there the shared-runtime `block_on` is the
+/// documented thread→runtime bridge, the same F8 pattern
+/// `backend/toron.rs::run_facade` uses for the async surface methods.
+pub async fn run_mail_off_runtime<F, T>(f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow::anyhow!("mail blocking task join failed: {e}"))?
 }
 
 /// Errors a backend may surface. `Unsupported` is the honest signal for a
@@ -160,6 +183,44 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 impl From<MailError> for BackendError {
     fn from(e: MailError) -> Self {
         Self::Other(anyhow::anyhow!("{e}"))
+    }
+}
+
+#[cfg(test)]
+mod off_runtime_tests {
+    use super::run_mail_off_runtime;
+
+    /// The bridge must let the renew leaf's exact call shape (`run_mail`'s
+    /// shared-runtime `block_on`) run from inside a runtime without the
+    /// nested-runtime panic: prove it end-to-end on a real multi-thread
+    /// runtime. Inline (the pre-fix leaf) this test panics "Cannot start a
+    /// runtime from within a runtime" — verified red by calling the closure
+    /// directly before this helper existed.
+    #[test]
+    fn run_mail_off_runtime_bridges_without_nesting() {
+        let rt = tokio::runtime::Runtime::new().expect("test runtime");
+        let v = rt
+            .block_on(async {
+                run_mail_off_runtime(|| Ok(crate::mail_shim::block_on(async { 7i32 }))).await
+            })
+            .expect("the bridge must not nest block_on on the caller's runtime");
+        assert_eq!(v, 7);
+    }
+
+    /// The hazard the bridge exists for, pinned as a canary: a direct
+    /// shared-runtime `block_on` from inside another runtime panics. If a
+    /// future tokio ever permits the nesting, this test goes red and tells
+    /// us the bridge (and the leaf's shape) can be revisited.
+    #[test]
+    fn inline_shared_runtime_block_on_panics_inside_a_runtime() {
+        let rt = tokio::runtime::Runtime::new().expect("test runtime");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async { crate::mail_shim::block_on(async { 1i32 }) })
+        }));
+        assert!(
+            res.is_err(),
+            "nested block_on was expected to panic; the async-safe bridge is only necessary while it does"
+        );
     }
 }
 

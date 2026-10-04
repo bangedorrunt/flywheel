@@ -156,6 +156,13 @@ pub struct LoopParams {
     /// params loadable.
     #[serde(default)]
     pub force: bool,
+    /// bd-swarm-loop-durable-panic-atlo: opt IN to replaying a killed run's
+    /// pending invocation. Default false — a pending invocation at start
+    /// belongs to a dead owner (the pid registry refuses two live loops), and
+    /// replaying its checkpoints against a newer binary's leaf shapes storms
+    /// serialization errors. `#[serde(default)]` keeps saved params loadable.
+    #[serde(default)]
+    pub resume: bool,
     /// bd-p4oc strict vacuous gate: refuse 0-test VERIFY (also FLYWHEEL_VERIFY_STRICT=1)
     #[serde(default)]
     pub strict: bool,
@@ -2216,6 +2223,40 @@ pub fn poll_swarm_argv(project: &str, to: &str) -> Vec<String> {
     vec!["__poll".to_string(), project.to_string(), to.to_string()]
 }
 
+/// bd-swarm-loop-durable-panic-atlo: consecutive failed `--once` passes that
+/// stop `loop-mode supervise` with one actionable line.
+pub const SUPERVISE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// argv for one supervised pass (pure; the CLI spawns it as a child process
+/// so a crashed pass cannot kill the supervisor). Deliberately NO `--force`:
+/// a crashed pass leaves a DEAD pid entry which the next pass replaces
+/// silently, while a LIVE loop still owns the project — the pass must refuse
+/// loudly instead of taking the project over.
+pub fn supervise_pass_argv(project: &str, work: bool, to: &str) -> Vec<String> {
+    let mut args = vec![
+        "loop-mode".to_string(),
+        "run".to_string(),
+        project.to_string(),
+        "--once".to_string(),
+        "--to".to_string(),
+        to.to_string(),
+    ];
+    if work {
+        args.push("--work".to_string());
+    }
+    args
+}
+
+/// Consecutive-failed-pass accounting for supervise: a success resets the
+/// count, a non-zero pass exit accumulates. Pure so the stop rule is tested.
+pub fn supervise_failure_count(success: bool, consecutive: u32) -> u32 {
+    if success {
+        0
+    } else {
+        consecutive.saturating_add(1)
+    }
+}
+
 #[function]
 async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
     let exe = self_exe().map_err(map_err)?;
@@ -3912,29 +3953,50 @@ pub struct RenewFilteredArgs {
     pub extend_seconds: u64,
 }
 
-#[function]
-async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
-    if args.paths.is_empty() {
-        return Ok(json!({ "renewed": 0, "paths": [] }));
-    }
-    let cfg = Config::load().map_err(map_err)?;
-    let mail = crate::backend::mail_backend(&cfg).map_err(|e| map_err(anyhow::anyhow!("{e}")))?;
-    let key = crate::utf8_path(&crate::project_dir(&cfg, &args.project), "project path")
-        .map_err(map_err)?;
+/// The renew leaf's synchronous body: one mail block that must run OFF the
+/// durable loop's async worker. Split out so the acceptance test can drive
+/// the real block through the bridge on a runtime
+/// (`loop_mode_durable_survives_reclaim`) instead of a copy of it.
+fn renew_filtered_sync(
+    project: &str,
+    paths: &[String],
+    extend_seconds: u64,
+) -> anyhow::Result<Value> {
+    let cfg = Config::load()?;
+    let mail = crate::backend::mail_backend(&cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let key = crate::utf8_path(&crate::project_dir(&cfg, project), "project path")?;
     let _ = crate::backend::run_mail(mail.ensure_project(&key));
     let agent = cfg
         .agent_mail
         .as_ref()
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "flywheel".to_string());
-    let v = crate::backend::run_mail(mail.renew_reservations(
-        &key,
-        &agent,
-        &args.paths,
+    let v = crate::backend::run_mail(mail.renew_reservations(&key, &agent, paths, extend_seconds))
+        .map_err(|e| anyhow::anyhow!("mail backend: {e}"))?;
+    Ok(json!({ "renewed": v.renewed, "paths": paths }))
+}
+
+#[function]
+async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
+    if args.paths.is_empty() {
+        return Ok(json!({ "renewed": 0, "paths": [] }));
+    }
+    // bd-swarm-loop-durable-panic-atlo: this leaf body runs on the durable
+    // loop's tokio worker, where `run_mail`'s shared-runtime block_on panics
+    // ("Cannot start a runtime from within a runtime") — observed once per
+    // poll, before every dispatch. The whole sync mail block moves to a
+    // blocking thread through the async-safe bridge; there block_on is the
+    // documented thread→runtime bridge (backend::run_mail_off_runtime).
+    let (project, paths, extend_seconds) = (
+        args.project.clone(),
+        args.paths.clone(),
         args.extend_seconds,
-    ))
-    .map_err(|e| map_err(anyhow::anyhow!("mail backend: {e}")))?;
-    Ok(json!({ "renewed": v.renewed, "paths": args.paths }))
+    );
+    crate::backend::run_mail_off_runtime(move || {
+        renew_filtered_sync(&project, &paths, extend_seconds)
+    })
+    .await
+    .map_err(map_err)
 }
 
 /// Args for the [`release_bead_locks`] leaf.
@@ -5526,6 +5588,37 @@ fn blind_completion_count(complete_now: bool, leaf_failed: bool, consecutive: u3
         consecutive.saturating_add(1)
     } else {
         0
+    }
+}
+
+/// bd-swarm-loop-durable-panic-atlo: the outcome marker a RESUMED invocation
+/// returns when the stale-checkpoint signature trips. `run_durable_loop` sees
+/// it, starts one fresh invocation, and the operator gets one loud line.
+pub const STALE_CHECKPOINT_DEGRADE: &str = "stale-checkpoint-degrade";
+
+/// bd-swarm-loop-durable-panic-atlo: what the blind-completion door does once
+/// [`blind_completion_count`] reaches the abort threshold (pure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindCompletion {
+    /// Below the threshold — keep polling (the WARN prints each pass).
+    Continue,
+    /// Threshold on a RESUMED invocation: its checkpointed leaf results no
+    /// longer fit this binary. Degrade to a fresh run instead of aborting.
+    DegradeFresh,
+    /// Threshold on a fresh run: nothing to degrade to. Abort with the fix.
+    Abort,
+}
+
+/// Pure: the blind-completion outcome for (resumed, failures, threshold).
+/// A resumed invocation degrades to a fresh run; only a fresh invocation
+/// (which cannot be replaying stale checkpoints) aborts.
+pub fn blind_completion_outcome(resumed: bool, failures: u32, threshold: u32) -> BlindCompletion {
+    if failures < threshold {
+        BlindCompletion::Continue
+    } else if resumed {
+        BlindCompletion::DegradeFresh
+    } else {
+        BlindCompletion::Abort
     }
 }
 
@@ -8545,16 +8638,30 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             );
             if critical_leaf_failed_this_iter {
                 complete_holds = 0;
-                if blind_complete_failures >= DEFAULT_LEAF_FAILURE_ABORT_POLLS {
-                    return Err(map_err(anyhow::anyhow!(
-                        "loop abort: {blind_complete_failures} consecutive critical-leaf failures while the world looked empty (poll_events/poll_swarm/poll_ready/poll_inprogress/expected-replies). This is the stale-checkpoint signature — a previous binary's checkpointed leaf results no longer deserialize. Re-run with --force to reject the stale invocation and start fresh."
-                    )));
+                match blind_completion_outcome(
+                    params.resume,
+                    blind_complete_failures,
+                    DEFAULT_LEAF_FAILURE_ABORT_POLLS,
+                ) {
+                    BlindCompletion::Continue => {
+                        eprintln!(
+                            "flywheel: WARN {blind_complete_failures}/{} consecutive critical-leaf failures with an empty world — refusing to declare complete while blind (stale checkpointed invocation?).",
+                            DEFAULT_LEAF_FAILURE_ABORT_POLLS
+                        );
+                        wait_secs = params.active_interval_secs.clamp(5, 30);
+                    }
+                    BlindCompletion::DegradeFresh => {
+                        eprintln!(
+                            "flywheel: {blind_complete_failures} consecutive critical-leaf failures with an empty world on a RESUMED invocation — the checkpointed leaf results do not fit this binary (stale-checkpoint signature). Degrading to a fresh run; checkpoints are not replayed."
+                        );
+                        return Ok(STALE_CHECKPOINT_DEGRADE.to_string());
+                    }
+                    BlindCompletion::Abort => {
+                        return Err(map_err(anyhow::anyhow!(
+                            "loop abort: {blind_complete_failures} consecutive critical-leaf failures while the world looked empty (poll_events/poll_swarm/poll_ready/poll_inprogress/expected-replies) — the loop cannot see the tracker or the swarm. Fix: `flywheel loop-mode doctor --fix` (diagnose loop infrastructure), then re-run."
+                        )));
+                    }
                 }
-                eprintln!(
-                    "flywheel: WARN {blind_complete_failures}/{} consecutive critical-leaf failures with an empty world — refusing to declare complete while blind (stale checkpointed invocation?); aborting after the threshold. Re-run with --force.",
-                    DEFAULT_LEAF_FAILURE_ABORT_POLLS
-                );
-                wait_secs = params.active_interval_secs.clamp(5, 30);
             } else {
                 complete_holds += 1;
                 if complete_holds > params.drain_grace_polls {
@@ -8707,39 +8814,54 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(respawn_agent)
         .map_err(|e| anyhow::anyhow!("register respawn_agent: {e}"))?;
 
-    // Resume semantics: the persisted invocation id is reused while its promise
-    // is still pending (crash resume); once it settles (complete/blocked/failed),
-    // a fresh id starts a new run. SDK 0.6.0 does not support version-based
-    // re-invocation, so ids must change.
+    // Resume semantics (bd-swarm-loop-durable-panic-atlo): resuming a pending
+    // invocation is OPT-IN via --resume. A pending promise at start belongs to
+    // a DEAD owner (the pid registry refuses two live loops), so an automatic
+    // resume replays a killed run's checkpoints against the current binary's
+    // leaf shapes — the serialization storm this bead fixes. Default: start
+    // FRESH and let the stale sweep reject the zombie; --resume replays it;
+    // --force starts fresh and rejects it explicitly (bd-e131 takeover).
+    // SDK 0.6.0 does not support version-based re-invocation, so ids change.
     //
-    // bd-bvwf.4/bd-e131 force-takeover: with --force the loop REJECTS a stale
-    // pending invocation instead of resuming it. A killed loop (SIGKILL/crash)
-    // never settles its promise — it stays pending on the server, and a plain
-    // resume REPLAYS the killed run's checkpointed state (stranded beads, no
-    // agent knowledge from the fresh spawn) instead of starting clean. --force
-    // means "take over deliberately" — fresh state, not a zombie replay.
-    // (stale-loop clearing happens after the id is chosen, below, so the
-    // resumed invocation itself is preserved — bd-87hq.)
     // bd-6si7: the host edge is the ONE place allowed to read the clock, and
     // it reads it once, then hands the value down. Every leaf below is
     // therefore a pure function of its arguments plus this stamp.
     // bd-0fvb: stamped from the same authority instance that was injected.
     let now_nanos = authority.clock.now_nanos();
-    let id = match crate::state::load_active_loop(&params.project)? {
-        Some(al) if !params.force && promise_pending(&resonate, &al.id).await? => {
-            eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
-            al.id
-        }
-        Some(al) if params.force && promise_pending(&resonate, &al.id).await? => {
+    let prior = crate::state::load_active_loop(&params.project)?;
+    let prior_pending = match &prior {
+        Some(al) => promise_pending(&resonate, &al.id).await?,
+        None => false,
+    };
+    let start = loop_start_decision(prior_pending, params.force, params.resume);
+    // the workflow body must know whether THIS invocation resumed — the
+    // stale-checkpoint degrade keys off it
+    params.resume = start == LoopStart::Resume;
+    let mut id = match (start, prior) {
+        (LoopStart::Resume, Some(al)) => {
             eprintln!(
-                "flywheel: --force rejecting stale loop invocation {} (fresh run)",
+                "flywheel: resuming existing loop {} (--resume)",
                 dim_id(&al.id)
             );
-            let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
-                "rejected": "force-takeover",
-            }))
-            .unwrap_or_default();
-            let _ = resonate.promises.reject(&al.id, v).await;
+            al.id
+        }
+        (LoopStart::Fresh, Some(al)) if prior_pending => {
+            if params.force {
+                eprintln!(
+                    "flywheel: --force rejecting stale loop invocation {} (fresh run)",
+                    dim_id(&al.id)
+                );
+                let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
+                    "rejected": "force-takeover",
+                }))
+                .unwrap_or_default();
+                let _ = resonate.promises.reject(&al.id, v).await;
+            } else {
+                eprintln!(
+                    "flywheel: previous loop invocation {} is still pending but its run is dead — starting FRESH (checkpoints are NOT replayed; pass --resume to replay the killed run)",
+                    dim_id(&al.id)
+                );
+            }
             fresh_loop_id(
                 &params.project,
                 &serde_json::to_value(&params)?,
@@ -8764,23 +8886,49 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // `flywheel loop run` is safe, not only --force.
     clear_stale_loop_invocations(&resonate, base, Some(&id)).await;
 
-    // the workflow must know its own invocation id for the last-sent registry
-    // (bd-resume-dedup filters records to the SAME invocation)
-    params.invocation = id.clone();
-
-    // bd-bvwf.4: verify ownership right before the durable run — a newer
-    // process may have taken over the pid registry while this one resolved
-    // its invocation; the loser must never resume the same promise (two
-    // loops = double sends).
+    // bd-bvwf.4: verify ownership before the durable run — a newer process may
+    // have taken over the pid registry while this one resolved its
+    // invocation; the loser must never run it (two loops = double sends).
     crate::state::ensure_loop_owner(&params.project)?;
 
-    let task = resonate.run(&id, swarm_loop, params.clone());
-    let result: String = task
-        .await
-        .map_err(|e| anyhow::anyhow!("durable loop invocation failed: {e}"))?;
-
-    let _ = resonate.stop().await;
-    Ok(result)
+    // bd-swarm-loop-durable-panic-atlo: a resumed invocation whose replay hits
+    // the stale-checkpoint signature returns STALE_CHECKPOINT_DEGRADE instead
+    // of aborting; take it over with ONE fresh invocation. The fresh run
+    // cannot replay stale checkpoints, so a second marker means the
+    // environment (tracker/swarm) is genuinely unreadable — abort.
+    let mut can_degrade = start == LoopStart::Resume;
+    loop {
+        // the workflow must know its own invocation id for the last-sent
+        // registry (bd-resume-dedup filters records to the SAME invocation)
+        params.invocation = id.clone();
+        let task = resonate.run(&id, swarm_loop, params.clone());
+        let result: String = task
+            .await
+            .map_err(|e| anyhow::anyhow!("durable loop invocation failed: {e}"))?;
+        if result == STALE_CHECKPOINT_DEGRADE {
+            if can_degrade {
+                eprintln!(
+                    "flywheel: invocation {} hit the stale-checkpoint signature — starting a FRESH run; checkpoints are not replayed",
+                    dim_id(&id)
+                );
+                can_degrade = false;
+                params.resume = false;
+                id = fresh_loop_id(
+                    &params.project,
+                    &serde_json::to_value(&params)?,
+                    "swarm-loop",
+                    authority.clock.now_nanos(),
+                )?;
+                continue;
+            }
+            let _ = resonate.stop().await;
+            anyhow::bail!(
+                "loop is blind on a fresh run (critical leaf failures with an empty world) — fix: `flywheel loop-mode doctor --fix`, then re-run"
+            );
+        }
+        let _ = resonate.stop().await;
+        return Ok(result);
+    }
 }
 
 fn dim_id(id: &str) -> String {
@@ -8808,6 +8956,34 @@ fn fresh_loop_id(
     )?;
     Ok(fresh)
 }
+
+/// bd-swarm-loop-durable-panic-atlo: how a durable loop start treats a
+/// persisted active-loop invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopStart {
+    /// Start a fresh invocation id. A pending prior is rejected by the
+    /// stale sweep (or explicitly, with --force).
+    Fresh,
+    /// Reuse the pending invocation and replay its checkpoints (--resume).
+    Resume,
+}
+
+/// Pure start decision: resuming a dead run's checkpoints is OPT-IN.
+///
+/// bd-swarm-loop-durable-panic-atlo: a pending invocation whose owner process
+/// is gone is a zombie — replaying its checkpointed leaf results against the
+/// current binary's leaf shapes storms serialization errors (measured on
+/// elm-effect-rs). So a pending prior with no explicit `--resume` starts
+/// FRESH; `--force` also starts fresh (and rejects the prior explicitly, the
+/// bd-e131 takeover). No pending prior → always fresh.
+pub fn loop_start_decision(prior_pending: bool, force: bool, resume: bool) -> LoopStart {
+    if force || !prior_pending || !resume {
+        LoopStart::Fresh
+    } else {
+        LoopStart::Resume
+    }
+}
+
 /// Does a durable-promise id belong to `base`'s loop invocations? Both the
 /// durable and engine loops build their invocation id via `fresh_loop_id`,
 /// which uses the project's last path segment (`base`) — so ids are exactly
@@ -13092,6 +13268,7 @@ mod tests {
             claim_nudge_after_polls: 2,
             resonate_url: String::new(),
             force: false,
+            resume: false,
             strict: false,
             reclaim: crate::durable_policy::ReclaimPolicy::new(10, 20),
             pane_stall_secs: 1800,
@@ -13550,6 +13727,81 @@ mod tests {
                 "abort is not instant"
             );
         };
+    }
+
+    /// bd-swarm-loop-durable-panic-atlo: a resumed invocation facing the
+    /// stale-checkpoint signature DEGRADES to a fresh run; only a fresh one
+    /// (which cannot be replaying stale checkpoints) aborts.
+    #[test]
+    fn blind_completion_degrades_resumed_and_aborts_fresh() {
+        let t = DEFAULT_LEAF_FAILURE_ABORT_POLLS;
+        assert_eq!(
+            blind_completion_outcome(true, t - 1, t),
+            BlindCompletion::Continue
+        );
+        assert_eq!(
+            blind_completion_outcome(false, t - 1, t),
+            BlindCompletion::Continue
+        );
+        assert_eq!(
+            blind_completion_outcome(true, t, t),
+            BlindCompletion::DegradeFresh
+        );
+        // stays degradable beyond the threshold (no abort storm)
+        assert_eq!(
+            blind_completion_outcome(true, t + 5, t),
+            BlindCompletion::DegradeFresh
+        );
+        assert_eq!(
+            blind_completion_outcome(false, t, t),
+            BlindCompletion::Abort
+        );
+        assert_eq!(
+            blind_completion_outcome(false, t + 5, t),
+            BlindCompletion::Abort
+        );
+    }
+
+    /// bd-swarm-loop-durable-panic-atlo: replaying a dead run's checkpoints is
+    /// OPT-IN via `--resume`; a pending prior with no flag starts FRESH (the
+    /// zombie is rejected by the stale sweep, never replayed).
+    #[test]
+    fn loop_start_decision_fresh_unless_explicit_resume() {
+        assert_eq!(loop_start_decision(false, false, true), LoopStart::Fresh);
+        assert_eq!(loop_start_decision(true, false, false), LoopStart::Fresh);
+        assert_eq!(loop_start_decision(true, false, true), LoopStart::Resume);
+        // --force starts fresh and rejects the prior; it beats --resume
+        assert_eq!(loop_start_decision(true, true, true), LoopStart::Fresh);
+        assert_eq!(loop_start_decision(false, true, false), LoopStart::Fresh);
+    }
+
+    /// bd-swarm-loop-durable-panic-atlo: a supervised pass must never take a
+    /// live loop over (no `--force`), and the stop rule counts consecutive
+    /// failures, resetting on any success.
+    #[test]
+    fn supervise_pass_argv_never_forces_and_stops_after_consecutive_failures() {
+        let argv = supervise_pass_argv("proj", true, "all");
+        assert_eq!(argv[0], "loop-mode");
+        assert_eq!(argv[1], "run");
+        assert_eq!(argv[2], "proj");
+        assert!(argv.contains(&"--once".to_string()));
+        assert!(argv.contains(&"--work".to_string()));
+        assert!(
+            !argv.contains(&"--force".to_string()),
+            "a supervised pass must refuse loudly, not take over a live loop: {argv:?}"
+        );
+        let no_work = supervise_pass_argv("proj", false, "all");
+        assert!(!no_work.contains(&"--work".to_string()));
+        assert!(!no_work.contains(&"--force".to_string()));
+
+        assert_eq!(supervise_failure_count(true, 0), 0);
+        assert_eq!(supervise_failure_count(true, 2), 0);
+        assert_eq!(supervise_failure_count(false, 0), 1);
+        let mut n = 0;
+        for _ in 0..SUPERVISE_MAX_CONSECUTIVE_FAILURES {
+            n = supervise_failure_count(false, n);
+        }
+        assert_eq!(n, SUPERVISE_MAX_CONSECUTIVE_FAILURES);
     }
 
     // ---- bd-event-dispatch-zero-latency: route_event ----
@@ -16043,6 +16295,7 @@ mod reclaim_tests {
 #[cfg(test)]
 mod mail_health_tests {
 
+    use super::*;
     use crate::state::{ActiveLoop, MailHealth};
 
     #[test]
@@ -16119,6 +16372,84 @@ mod mail_health_tests {
         assert_eq!(al4.mail_health.consecutive_failures, 0);
         assert!(!al4.mail_degraded);
         let _ = crate::state::remove_active_loop(&project);
+    }
+
+    /// bd-swarm-loop-durable-panic-atlo acceptance: the renew/reclaim leaf
+    /// runs ON the durable loop's tokio worker. Pre-fix, its inline `run_mail`
+    /// nested the shared runtime's `block_on` inside a runtime — "Cannot
+    /// start a runtime from within a runtime" once per poll, before every
+    /// dispatch (`reclaimed stranded bead ... (re-dispatching)` storm). This
+    /// drives the REAL sync block through the async-safe bridge on a real
+    /// runtime, with a real (hermetic, in-process) mail op, and asserts it
+    /// completes. The inline canary below keeps the red evidence in-tree.
+    #[test]
+    fn loop_mode_durable_survives_reclaim() {
+        let _home = crate::config::test_state_home();
+        // Hermetic config: an existing XDG file stops Config::load from
+        // reading (and migrating) the operator's legacy config; empty means
+        // all defaults (in-process toron, agent "flywheel").
+        let cfg_home = std::env::temp_dir().join(format!("fw-reclaim-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("temp XDG config dir");
+        std::fs::write(cfg_home.join("flywheel/config.toml"), "").expect("empty config");
+        let prev_cfg_home = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+
+        let project = format!("loop-reclaim-{}", std::process::id());
+        // Register the identity the leaf renews AS (default "flywheel") under
+        // the same project key the leaf derives, so the renewal is a real Ok
+        // rather than an unregistered-agent error.
+        {
+            let cfg = Config::load().expect("config");
+            let key =
+                crate::utf8_path(&crate::project_dir(&cfg, &project), "project path").expect("key");
+            let mail = crate::backend::mail_backend(&cfg).expect("mail backend");
+            crate::backend::run_mail(mail.ensure_project(&key))
+                .map(|_| ())
+                .expect("ensure project");
+            crate::backend::run_mail(mail.register_agent(
+                &key,
+                &crate::spawn_agent_profile("flywheel", "flywheel", &project),
+            ))
+            .map(|_| ())
+            .expect("register agent");
+        }
+
+        // The loop's exact context: a multi-threaded tokio runtime driving
+        // the leaf. Inside it the sync mail block must go off-runtime.
+        let rt = tokio::runtime::Runtime::new().expect("loop runtime");
+        let paths = vec!["src/durable.rs".to_string()];
+        let (leaf_project, leaf_paths) = (project.clone(), paths.clone());
+        let out: anyhow::Result<serde_json::Value> = rt.block_on(async move {
+            crate::backend::run_mail_off_runtime(move || {
+                renew_filtered_sync(&leaf_project, &leaf_paths, 60)
+            })
+            .await
+        });
+
+        // The pre-fix shape, kept as a canary: an INLINE shared-runtime
+        // block_on from inside this runtime panics — the bd-atlo class.
+        let inline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                let _ = crate::backend::run_mail(async { 1i32 });
+            });
+        }));
+
+        unsafe {
+            match prev_cfg_home {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&cfg_home);
+
+        assert!(
+            inline.is_err(),
+            "inline shared-runtime block_on was expected to panic; if tokio ever permits \
+             the nesting, the bridge's reason is gone and this test needs revisiting"
+        );
+        let v =
+            out.expect("renew leaf must complete on the loop runtime (no nested-runtime panic)");
+        assert_eq!(v["renewed"], 0, "fresh project has no leases to renew: {v}");
     }
 }
 

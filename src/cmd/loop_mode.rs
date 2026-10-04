@@ -75,6 +75,13 @@ pub(crate) enum LoopCmd {
         /// take over the project from a live loop process instead of refusing
         #[arg(long)]
         force: bool,
+        /// bd-swarm-loop-durable-panic-atlo: replay a killed run's pending
+        /// invocation checkpoints. Default is FRESH — a pending invocation
+        /// belongs to a dead owner, and replaying its checkpoints against a
+        /// newer binary's leaf shapes storms serialization errors. Conflicts
+        /// with --force (fresh takeover).
+        #[arg(long, conflicts_with = "force")]
+        resume: bool,
         /// ADR-0019 Spec 3.3 (operator-only, logged): allow `loop run` in a
         /// workspace that carries an extra linked worktree (deliberate human
         /// experiment). Requires the operator key; the loop still never
@@ -84,6 +91,23 @@ pub(crate) enum LoopCmd {
         /// bd-p4oc strict vacuous gate: refuse 0-test VERIFY (also FLYWHEEL_VERIFY_STRICT=1)
         #[arg(long)]
         strict: bool,
+    },
+    /// bd-swarm-loop-durable-panic-atlo: own the once-pass cadence the
+    /// operator would otherwise hand-roll (`while true; do loop-mode run
+    /// --once; sleep N; done`). Each pass is a CHILD process, so a crash
+    /// cannot kill the supervisor; stops after 3 consecutive failed passes
+    /// with one actionable line.
+    Supervise {
+        project: String,
+        /// bead-driven passes: forward --work to `loop-mode run`
+        #[arg(long)]
+        work: bool,
+        /// seconds between passes (floor 5)
+        #[arg(long, default_value = "60")]
+        interval: u64,
+        /// agents to manage (forwarded to `loop-mode run`)
+        #[arg(long, default_value = "all")]
+        to: String,
     },
     /// Query the state of a durable loop invocation on the Resonate server
     Status { project: String },
