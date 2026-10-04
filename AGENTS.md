@@ -106,7 +106,7 @@ the full enum is `flywheel --help` and `flywheel decide`. Waiter, receipt, and r
 - [Orchestration](docs/agent-instructions/orchestration.md)
 - [Workflow composition and catalog overlays](docs/agent-instructions/workflow-composition.md): explicit `--parts` forms, `workflow seed`/`drift`, and steering boundaries
 - [Compound/pstack deep dives](docs/guides/compound-engineering.mdx), [pstack](docs/guides/pstack.mdx), [parity manifest](docs/upstream-parity.toml)
-- [Durable loop](docs/agent-instructions/loop.md)
+- [Durable loop](docs/agent-instructions/loop.md): resume is opt-in (`loop-mode run --resume` — a pending invocation with no live owner otherwise starts fresh); `loop-mode supervise` owns the once-pass cadence (no `--force`, stops after 3 consecutive failed passes).
 - [Functional effect-kernel discipline](docs/agent-instructions/effect-kernel.md)
 - Workflow DSL: [docs/workflow-authoring.md](docs/workflow-authoring.md)
 - Sibling mailbox: `../toron/AGENTS.md`

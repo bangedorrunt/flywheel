@@ -2602,7 +2602,7 @@ fn main() {
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
-            "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
+            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
@@ -2975,6 +2975,7 @@ fn main() {
                 confirm_timeout_ms,
                 engine,
                 force,
+                resume,
                 allow_worktree,
                 strict,
             } => {
@@ -3014,11 +3015,18 @@ fn main() {
                             *confirm_timeout_ms,
                             *engine,
                             *force,
+                            *resume,
                             *strict,
                         )
                     },
                 )
             }
+            LoopCmd::Supervise {
+                project,
+                work,
+                interval,
+                to,
+            } => cmd_loop_supervise(&cfg, project, *work, *interval, to),
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
@@ -7263,8 +7271,13 @@ mod spawn_boot_reliability_tests {
             recover_body.contains("doorbell::ensure_running"),
             "recover must heal dead dispatchers"
         );
+        // Slice the WHOLE function: a fixed byte window silently stops
+        // covering the tail as cmd_status grows (it did — the needles sat at
+        // ~5.4-5.7 KB after bd-spawn-identity-divergence-2vzw, outside a
+        // 5000-byte window that had passed for months).
         let status = crate::tripwire::find_fn(src, "cmd_status");
-        let status_body = &src[status..status + 5000];
+        let status_end = crate::tripwire::find_fn(src, "cmd_binding_rebind");
+        let status_body = &src[status..status_end];
         assert!(
             status_body.contains("doorbell::ensure_running") && status_body.contains("wake_state"),
             "status shows last_wake and lazy-heals"
@@ -20389,6 +20402,41 @@ fn cmd_loop_prune() -> Result<()> {
     Ok(())
 }
 
+/// `flywheel loop-mode supervise` (bd-swarm-loop-durable-panic-atlo): own
+/// the once-pass cadence the operator would otherwise hand-roll. Each pass is
+/// a CHILD process (`loop-mode run --once`), so a crashed pass cannot kill the
+/// supervisor; 3 consecutive failed passes stop it with one actionable line.
+fn cmd_loop_supervise(
+    _cfg: &Config,
+    project: &str,
+    work: bool,
+    interval_secs: u64,
+    to: &str,
+) -> Result<()> {
+    if interval_secs < 5 {
+        bail!("--interval must be >= 5 seconds");
+    }
+    let exe = std::env::current_exe().context("resolve the flywheel executable")?;
+    let mut consecutive_failures = 0u32;
+    loop {
+        let argv = durable::supervise_pass_argv(project, work, to);
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&argv);
+        let status = cmd
+            .status()
+            .with_context(|| format!("spawn `{}`", argv.join(" ")))?;
+        consecutive_failures =
+            durable::supervise_failure_count(status.success(), consecutive_failures);
+        if consecutive_failures >= durable::SUPERVISE_MAX_CONSECUTIVE_FAILURES {
+            bail!(
+                "loop-mode supervise stopping after {consecutive_failures} consecutive failed passes — see the failing pass above, or run one by hand: `flywheel loop-mode run {project} --once{}`, then re-run supervise",
+                if work { " --work" } else { "" }
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+    }
+}
+
 /// `flywheel loop doctor`: health report for loop infrastructure (bd-eign.4).
 /// Logic lives in durable::loop_doctor; this is a thin runtime + render stub.
 fn cmd_loop_doctor(cfg: &Config, fix: bool, json: bool) -> Result<()> {
@@ -20718,6 +20766,7 @@ fn cmd_loop(
     confirm_timeout_ms: Option<u64>,
     engine: bool,
     force: bool,
+    resume: bool,
     strict: bool,
 ) -> Result<()> {
     if interval_secs < 5 {
@@ -20813,6 +20862,7 @@ fn cmd_loop(
             claim_nudge_after_polls: cfg.claim_nudge_after_polls(),
             resonate_url: String::new(),
             force,
+            resume,
             strict,
         };
         let rt = tokio::runtime::Runtime::new()?;
