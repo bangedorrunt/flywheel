@@ -1173,7 +1173,7 @@ steps:
         "wave-swarm",
         r#"
 name: wave-swarm
-description: "The compounded wave swarm. GATE scopes br ready to one wave label (grounding-reads docs/learnings/), holds on any open lower wave; DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
+description: "The compounded wave swarm. GATE scopes br ready to one wave label (grounding-reads docs/learnings/), holds on any open lower wave; DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. bd-compose-stage-sequencing-zgi9: stages are SEQUENCED by completion markers under .flywheel/wave/ (<label>-<stage>.done) — each dispatch waits (retry, per-step budget 240 x 30s) for its predecessor's marker before the next stage fires; the outer --timeout remains the run bound. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
 trigger:
   type: webhook
 crew:
@@ -1202,24 +1202,51 @@ steps:
     spec:
       profile: "@planner"
       stage: wave-gate
-      task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` to the label; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. Objective: {{inputs.objective}}'
+      task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` to the label; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. When the gate is GREEN (artifact written, held:false, ready non-empty), write .flywheel/wave/{{inputs.wave_label}}-gate.done so DISPATCH may start; when held or blocked, post [gate] held and write NO marker. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_gate
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: gate_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-gate.done || { echo 'wave in flight: gate has not written .flywheel/wave/{{inputs.wave_label}}-gate.done after the step budget (240 x 30s) — the wave waits for real work; extend with a larger --timeout or fix the planner, never dispatch over a held gate'; exit 1; }"
   - name: dispatch
     action: dispatch_job
     assignee: x
     spec:
       profile: "@planner"
       stage: wave-dispatch
-      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage ce-execute --param payload per bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. Objective: {{inputs.objective}}'
+      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage ce-execute --param payload per bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. After every payload is posted, write .flywheel/wave/{{inputs.wave_label}}-dispatch.done so EXECUTE may start (never write it on a held/missing artifact). Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_dispatch
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: dispatch_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-dispatch.done || { echo 'wave in flight: dispatch has not written .flywheel/wave/{{inputs.wave_label}}-dispatch.done after the step budget (240 x 30s) — EXECUTE must not start until every payload is posted; extend with a larger --timeout if the dispatcher is really working'; exit 1; }"
   - name: execute
     action: dispatch_job
     assignee: x
     spec:
       profile: "{{inputs.coder_profile}}"
       stage: ce-execute
-      task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). Objective: {{inputs.objective}}'
+      task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). After the LAST listed bead is closed, write .flywheel/wave/{{inputs.wave_label}}-execute.done so REVIEW reads closes and never revises an open wave. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_execute
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: execute_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-execute.done || { echo 'wave in flight: execute has not written .flywheel/wave/{{inputs.wave_label}}-execute.done after the step budget (240 x 30s) — REVIEW must not start with closes still landing; extend with a larger --timeout if the wave is really working'; exit 1; }"
   - name: observe
     action: dispatch_job
     assignee: x
@@ -1234,16 +1261,34 @@ steps:
     spec:
       profile: "@reviewer"
       stage: ce-review
-      task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
+      task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. After the findings are posted, write .flywheel/wave/{{inputs.wave_label}}-review.done. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_review
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: review_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-review.done || { echo 'wave in flight: review has not written .flywheel/wave/{{inputs.wave_label}}-review.done after the step budget (240 x 30s) — VERIFY needs the findings first; extend with a larger --timeout if the reviewer is really working'; exit 1; }"
   - name: verify
     action: dispatch_job
     assignee: x
     spec:
       profile: "@reviewer"
       stage: wave-verify
-      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). Objective: {{inputs.objective}}'
+      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). After the verification report, write .flywheel/wave/{{inputs.wave_label}}-verify.done so COMPOUND reads verified solutions. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_verify
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: verify_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-verify.done || { echo 'wave in flight: verify has not written .flywheel/wave/{{inputs.wave_label}}-verify.done after the step budget (240 x 30s) — COMPOUND must not run before the wave is verified; extend with a larger --timeout if the verifier is really working'; exit 1; }"
   - name: compound
     action: dispatch_job
     assignee: x

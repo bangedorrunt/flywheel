@@ -2631,7 +2631,7 @@ fn main() {
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
-            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF (ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify); SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
+            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … extend with --timeout'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
         }));
@@ -27506,6 +27506,20 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 engine.clone(),
                 stop.clone(),
             )?;
+            // bd-compose-stage-sequencing-zgi9: a composed run can park on
+            // `request_approval` (SIGNOFF), so it starts the SAME approval
+            // drainer as the workflow-run arm. Without it the promise parks
+            // with nobody listening — SIGNOFF never surfaces. The drainer
+            // announces `flywheel workflow approve …` and scans the inbox for
+            // the decision token; a resumed run starts a fresh drainer, so the
+            // SIGNOFF is re-issued until it is resolved.
+            let approval_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let approval_drainer = pane::start_approval_drainer(
+                cfg.clone(),
+                project_name.to_string(),
+                engine.clone(),
+                approval_stop.clone(),
+            )?;
             let policy_receipts_count;
             let output = {
                 // bd-compose-not-durable-oxjy: composed runs carry the same
@@ -27539,6 +27553,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         // every future retry of the same key.
                         lifecycle.fail(&e.to_string());
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = approval_drainer.join();
                         return Err(e);
                     }
                 };
@@ -27568,6 +27584,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             spawn_receipts = drainer
                 .join()
                 .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
+            approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = approval_drainer
+                .join()
+                .map_err(|_| anyhow!("approval drainer thread panicked"));
             let mut reaped = false;
             if !ctx.retained {
                 let mut c = Client::connect(Some(&cfg.socket_path()))?;
