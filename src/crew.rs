@@ -1159,6 +1159,45 @@ fn steps_has_input(inputs: &[InputDecl], name: &str) -> bool {
     inputs.iter().any(|i| i.name == name)
 }
 
+/// bd-compose-plumbing-zdzi: the channel a composed run's stages post to —
+/// the workflow's declared `steer_channel`, resolved the way the run will
+/// resolve it (provided inputs win, the declared default is the fallback).
+///
+/// `Ok(None)` = this workflow declares no steer channel (nothing to ensure).
+/// `Err` = it DOES declare one and this run cannot resolve a non-empty value:
+/// compose refuses BEFORE the crew spawns, because join-before-post means
+/// every spawned pin needs the room and the strict renderer would otherwise
+/// fail mid-run with panes already up.
+pub fn resolve_steer_channel(wf: &Workflow, inputs: &serde_json::Value) -> Result<Option<String>> {
+    let Some(decl) = wf.inputs.iter().find(|i| i.name == "steer_channel") else {
+        return Ok(None);
+    };
+    let provided = inputs
+        .get("steer_channel")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = provided {
+        return Ok(Some(name.to_string()));
+    }
+    let default = decl
+        .default
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = default {
+        return Ok(Some(name.to_string()));
+    }
+    // bail! formats its literal: the doubled braces below print as the JSON
+    // object an operator can paste after --inputs.
+    anyhow::bail!(
+        "the workflow's steer_channel input cannot be resolved — declare a default or pass \
+         --inputs '{{\"steer_channel\":\"<name>\"}}'; join-before-post: every spawned pin must \
+         join the channel before any stage posts"
+    )
+}
+
 /// One part → one step (§3.6 T1): leaf parts (dispatch / stage-first /
 /// phase / workflow) build their dispatch or call step; control parts
 /// (`each:`/`when:`/`retry(n)`/`parallel:`) wrap the leaf in the matching
@@ -2776,6 +2815,67 @@ steps:
                 "await_{stage_name} waits at least an hour before giving up: {max_attempts} x {backoff_secs}s"
             );
         }
+    }
+
+    /// bd-compose-plumbing-zdzi Acceptance: a composed run ensures its declared
+    /// steer channel BEFORE anyone posts to it. Resolution is the run's own
+    /// (provided inputs win, the declared default is the fallback), a workflow
+    /// with no steer channel has nothing to ensure, and a declared-but-
+    /// unresolvable channel refuses up front instead of failing mid-run with
+    /// the crew already spawned.
+    #[test]
+    fn compose_ensures_steer_channel() {
+        let lib = crate::stages::StageLibrary::compiled_in();
+        let affinity = |s: &str| lib.get_stage(s).and_then(|st| st.role.clone());
+        let part = parse_compose_part("wave-swarm").expect("compose token parses");
+        let wf = compose_workflow_with("chan", "obj", None, &[part], &affinity).unwrap();
+
+        // The declared default (`adr0006-steer`) is what the run renders, so
+        // it is what compose must ensure and join every spawned pin into.
+        assert_eq!(
+            resolve_steer_channel(&wf, &serde_json::json!({}))
+                .unwrap()
+                .as_deref(),
+            Some("adr0006-steer"),
+            "the declared default is the channel the run renders"
+        );
+        // A provided --inputs value wins, exactly as the strict renderer uses it.
+        assert_eq!(
+            resolve_steer_channel(
+                &wf,
+                &serde_json::json!({"steer_channel": "elm-effect-steer"})
+            )
+            .unwrap()
+            .as_deref(),
+            Some("elm-effect-steer")
+        );
+        // A blank provided value counts as unset — never a nameless room.
+        assert_eq!(
+            resolve_steer_channel(&wf, &serde_json::json!({"steer_channel": "  "}))
+                .unwrap()
+                .as_deref(),
+            Some("adr0006-steer")
+        );
+        // No declared channel: nothing to ensure (compose invents no room).
+        let bare_part = parse_compose_part("coder:ce-execute").unwrap();
+        let bare = compose_workflow_with("bare", "obj", None, &[bare_part], &affinity).unwrap();
+        assert_eq!(
+            resolve_steer_channel(&bare, &serde_json::json!({})).unwrap(),
+            None
+        );
+        // Declared but unresolvable: refuse NOW, not mid-run with panes up.
+        let mut declared = wf.clone();
+        for input in &mut declared.inputs {
+            if input.name == "steer_channel" {
+                input.default = Some(serde_json::json!(""));
+            }
+        }
+        let err = resolve_steer_channel(&declared, &serde_json::json!({}))
+            .expect_err("declared-but-unresolvable must refuse");
+        assert!(
+            err.to_string().contains("cannot be resolved"),
+            "refusal names the unresolvable channel: {err}"
+        );
     }
 
     /// ADR-0006 D3: a compose token mixes with ordinary parts (token steps
