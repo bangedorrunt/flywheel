@@ -304,11 +304,11 @@ impl StageLibrary {
             // gate.
             (
                 "wave-gate",
-                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow --project <this project slug>` — a failed check STOPS the wave. bd-mvy4: the `--project` is REQUIRED, not a nicety: `worktree` and `playbook-files` are project-scoped checks and both FAIL when no project is given, so omitting it made the gate hold every wave while naming a blocker that was the gate's own omission (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` intersected with the wave label, and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report. bd-mvy4 DEFECT 3: an EMPTY `ready` after the label scoping is a LOUD FAILURE, not a green wave — post `[gate] blocked: label <label> matched zero beads` and STOP. A run that dispatches nothing must never report success; that is the false-green this gate exists to prevent.",
+                "Wave gate (ADR-0006 D3): run `flywheel preflight --mode workflow --project <this project slug>` — a failed check STOPS the wave. bd-mvy4: the `--project` is REQUIRED, not a nicety: `worktree` and `playbook-files` are project-scoped checks and both FAIL when no project is given, so omitting it made the gate hold every wave while naming a blocker that was the gate's own omission (post `[gate] blocked: <check>` to the steer channel; never fix infra yourself mid-gate). Then scope the ready set for this wave: `br ready --json` is already wave-gated by br itself, and the TYPED `wave` field is the authority (bd-wave-gate-typed-authority-27et) — select rows whose typed `wave` == N, falling back to the legacy `wave-N` label only when the typed field is null — and if ANY bead with an earlier wave-M (M<N) is open or in_progress, post `[gate] held: <bead ids>` and STOP (waves run in order, never around them). GROUNDING READ (ADR-0009, bounded by ADR-0010 D12): `flywheel __gate-learnings --budget ${FLYWHEEL_GATE_BUDGET:-4000}` — a budgeted projection of docs/learnings (top-N by reinforcement recency within ~4k tokens; pinned never decays, aging 30d / perishable 7d unreinforced decays OUT of the projection). Optional `--wiki/--memory` lane files (chiebukuro exports) join the SAME 4k pool — the budget is shared across lanes, never per-lane. Read ONLY the projected paths — frontmatter + rg context, under the budget; matching entries become the wave's carried constraints. BINDING CONTRACT (bd-wave-swarm-graduation-fix-98io — GATE output is the DISPATCH input): `mkdir -p .flywheel/wave` then write `.flywheel/wave/<wave-label>-ready.json` containing EXACTLY {\"wave_label\": \"<label>\", \"held\": <bool>, \"blockers\": [\"<bead-id>\"], \"in_flight\": [\"<bead-id>\"], \"ready\": [{\"id\": \"<bead-id>\", \"title\": \"...\", \"verify\": \"<VERIFY command>\", \"priority\": <n>}]} plus, when the grounding read matched, \"learnings\": [\"docs/learnings/<...>\"]. Reply with ONLY that JSON object. Never dispatch, never adjudicate — gate, write the artifact, report. bd-mvy4 DEFECT 3 (refined, bd-wave-gate-typed-authority-27et): an EMPTY `ready` with NO bead of this wave in flight is a LOUD FAILURE, not a green wave — post `[gate] blocked: wave <label> matched zero beads` and STOP; an EMPTY `ready` WITH in-flight beads is `held: false` + `in_flight` — the wave is WORK IN FLIGHT (a crew is closing it), so report it and write the marker, never a held/empty wave. A run that dispatches nothing must never report success; that is the false-green this gate exists to prevent.",
             ),
             (
                 "wave-dispatch",
-                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` (bd-wave-swarm-graduation-fix-98io — you dispatch ONLY beads the GATE wrote there; if the file is missing or \"held\": true, post `[dispatch] held` and STOP). For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `herdr agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage ce-execute --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md` — and when the gate artifact carries learnings[], append `--param learnings=<paths csv>` so the brief's LEARNINGS field carries their constraints. fresh-eyes-explore is scout-only; coder execution is ce-execute. Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --status=in_progress --assignee <herdr-name>` — the herdr slug, e.g. flywheel-toron-coder, never a pin), reserve files before editing, commit BEFORE close with the bead id in the message, gate the completion (`br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed`) then close with the commit sha (`br close <id> --commit-sha <sha>`) carrying the VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path.",
+                "Wave dispatch (ADR-0006 D3/D1/D4). FIRST read the gate artifact `.flywheel/wave/<wave-label>-ready.json` for `held` + `learnings[]` (bd-wave-swarm-graduation-fix-98io), then take the bead list LIVE: `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback) — the artifact is a snapshot and may be stale (bd-wave-gate-typed-authority-27et). If the file is missing or \"held\": true, post `[dispatch] held` and STOP. If the live ready set is empty and the artifact names `in_flight[]`, post `[dispatch] work in flight: <ids>` and continue without duplicating a running crew. For EACH bead in ready[] emit ONE payload to the crew's coder pane (find it: `herdr agent list`, this workspace, profile coder): `flywheel send --to <coder-pane-name> --stage ce-execute --param bead=<id> --param scope=<owned globs> --param exit=<the bead's VERIFY command from the artifact> --param channel=<steer-channel> --param pin=<coder-pin> --param report_file=/tmp/<id>-report-<epoch>.md` — and when the gate artifact carries learnings[], append `--param learnings=<paths csv>` so the brief's LEARNINGS field carries their constraints. fresh-eyes-explore is scout-only; coder execution is ce-execute. Every payload NAMES its bead id and carries the CLAIM/CLOSE CONTRACT — also post it once on the steer channel: claim before work (`br update <id> --status=in_progress --assignee <herdr-name>` — the herdr slug, e.g. flywheel-toron-coder, never a pin), reserve files before editing, commit BEFORE close with the bead id in the message, gate the completion (`br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed`) then close with the commit sha (`br close <id> --commit-sha <sha>`) carrying the VERIFY tail + principles citations. Full reports go to report_file; the steer channel gets a <=700-char summary plus the file path.",
             ),
             (
                 "wave-observe",
@@ -1728,6 +1728,64 @@ mod bd_mvy4_wave_gate {
         assert!(
             prompt.contains("matched zero beads"),
             "an empty ready set must be a loud gate failure: {prompt}"
+        );
+    }
+}
+
+/// bd-wave-gate-typed-authority-27et: the wave-gate/dispatch prompts are the
+/// thing under test (a prompt omission IS the failure mode), so the typed-
+/// authority semantics are pinned on the compiled-in tier.
+#[cfg(test)]
+mod wave_gate_typed_authority_tests {
+    fn compiled_in_prompt(stage: &str) -> String {
+        crate::stages::StageLibrary::compiled_in()
+            .get_stage(stage)
+            .unwrap_or_else(|| panic!("{stage} is a compiled-in stage"))
+            .prompt
+            .clone()
+    }
+
+    /// The gate selects by the TYPED `wave` field (legacy label fallback) —
+    /// not the label alone.
+    #[test]
+    fn the_wave_gate_scopes_by_the_typed_field() {
+        let prompt = compiled_in_prompt("wave-gate");
+        assert!(
+            prompt.contains("TYPED `wave` field is the authority")
+                && prompt.contains("typed `wave` == N")
+                && prompt.contains("falling back to the legacy `wave-N` label"),
+            "the gate must read the typed wave field with a label fallback: {prompt}"
+        );
+    }
+
+    /// An empty ready WITH in-flight beads is work in flight, and the
+    /// artifact carries the `in_flight` list the dispatch/execute halves
+    /// need. Proven red by deleting either branch.
+    #[test]
+    fn the_wave_gate_calls_an_empty_ready_with_inflight_work_in_flight() {
+        let prompt = compiled_in_prompt("wave-gate");
+        assert!(
+            prompt.contains("WORK IN FLIGHT") && prompt.contains("in_flight"),
+            "an empty ready with in-flight beads must read WORK IN FLIGHT, not a held/empty wave: {prompt}"
+        );
+        assert!(
+            prompt.contains("\"in_flight\": [\"<bead-id>\"]"),
+            "the binding artifact must carry the in_flight list: {prompt}"
+        );
+    }
+
+    /// DISPATCH reads the bead list LIVE — the artifact is a snapshot and
+    /// may be stale (the mid-wave empty-read-dead-dispatch gap).
+    #[test]
+    fn the_wave_dispatch_takes_the_bead_list_live() {
+        let prompt = compiled_in_prompt("wave-dispatch");
+        assert!(
+            prompt.contains("take the bead list LIVE") && prompt.contains("br ready --json"),
+            "dispatch must re-read br ready at dispatch time, not trust the artifact snapshot: {prompt}"
+        );
+        assert!(
+            prompt.contains("work in flight"),
+            "dispatch must not duplicate a crew already working the wave: {prompt}"
         );
     }
 }

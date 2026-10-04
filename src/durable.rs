@@ -99,14 +99,16 @@ pub struct LoopParams {
     pub max_iterations: Option<u64>,
     /// bead-driven mode: source work from `br ready` instead of a static queue
     pub work: bool,
-    /// bd-gnej kill-switch: disable the wave-gate (wave-N label ordering)
-    /// for graphs that do not use wave labels. Default false = gating ON.
+    /// bd-gnej kill-switch: disable the wave-gate (typed `wave` ordering,
+    /// legacy `wave-N` labels as fallback) for graphs that do not use
+    /// waves. Default false = gating ON.
     #[serde(default)]
     pub no_wave_gates: bool,
     /// ADR-0006 D2 wave-scoped dispatch (`--wave-label wave-N`): restrict
-    /// --work to ready beads labeled `wave-N`, held while any lower wave is
-    /// open/in_progress. None = default behavior, unchanged. `#[serde(default)]`
-    /// keeps pre-D2 saved params loadable.
+    /// --work to ready beads in wave N (typed field, legacy label fallback),
+    /// held while any lower wave is open/in_progress. None = default
+    /// behavior, unchanged. `#[serde(default)]` keeps pre-D2 saved params
+    /// loadable.
     #[serde(default)]
     pub wave_label: Option<String>,
     /// send every prompt via `__send --confirm` (landing confirmation).
@@ -936,6 +938,14 @@ pub struct ReadyBead {
     /// by wave order). `br ready --json` / `br list --json` emit them.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// bd-wave-gate-typed-authority-27et: br's typed `wave` field
+    /// (`br create --wave N` / `br update --wave N`) — the wave-order
+    /// authority since schema-18. `br ready` itself holds every higher wave
+    /// until all lower waves close, so the typed field is what a live wave
+    /// advance actually follows. `None` when unset, and also on the
+    /// `br list` read path, which does not project the field.
+    #[serde(default)]
+    pub wave: Option<u32>,
     /// bd-4spn: the bead's priority (0=P0 … 3=P3). Default 3 (exempt) so a
     /// missing field in a foreign br JSON never gates a bead.
     #[serde(default = "default_priority")]
@@ -966,6 +976,7 @@ impl Default for ReadyBead {
             assignee: None,
             verify: None,
             labels: Vec::new(),
+            wave: None,
             priority: 3,
             principles: String::new(),
             updated_at: None,
@@ -1106,18 +1117,35 @@ pub fn parse_principles_field(description: &str) -> String {
     out.join("\n").trim().to_string()
 }
 
-/// Parse a bead's `wave-N` label into its wave number (bd-gnej). A bead
-/// carrying `wave-3` → `Some(3)`. No wave label → `None` (no gating).
-pub fn bead_wave(b: &ReadyBead) -> Option<u32> {
-    b.labels
-        .iter()
-        .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()))
+/// The typed `wave` field from a br JSON row (bd-wave-gate-typed-authority-27et).
+/// `br ready --json` emits it as a number; `br list` emits `null`. A
+/// non-number reads as `None`, so a malformed value falls back to the legacy
+/// label instead of fabricating a wave. Pure.
+pub fn bead_wave_field(b: &serde_json::Value) -> Option<u32> {
+    b.get("wave")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|w| u32::try_from(w).ok())
 }
 
-/// bd-gnej wave-gate: a bead labeled `wave-N` is HELD while ANY bead with a
-/// `wave-M` label (M<N) is open or in_progress — earlier waves run first.
-/// No wave labels anywhere → no gating (identity). Pure — the single
-/// decision both dispatch paths (sync loop + durable loop) share.
+/// A bead's wave number. bd-wave-gate-typed-authority-27et: br's TYPED
+/// `wave` field is the authority (schema-18 shipped; `br ready` gates by it
+/// natively) — the legacy `wave-N` label is read only as the fallback, for
+/// beads that predate the field and for the `br list` path, which does not
+/// project it. When both are present the typed value wins, so a stale label
+/// can never overrule the tracker. No wave → `None` (no gating).
+pub fn bead_wave(b: &ReadyBead) -> Option<u32> {
+    b.wave.or_else(|| {
+        b.labels
+            .iter()
+            .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()))
+    })
+}
+
+/// bd-gnej wave-gate: a bead in wave N (typed `wave` field first, `wave-N`
+/// label fallback — [`bead_wave`]) is HELD while ANY bead with a lower wave
+/// (M<N) is open or in_progress — earlier waves run first. No wave anywhere
+/// → no gating (identity). Pure — the single decision both dispatch paths
+/// (sync loop + durable loop) share.
 pub fn wave_gate_held(ready: &[ReadyBead], inprogress: &[ReadyBead]) -> Vec<String> {
     // Lowest wave among ALL open/in-progress beads. A ready bead is held iff
     // its wave is strictly higher than that floor.
@@ -1137,15 +1165,13 @@ pub fn wave_gate_held(ready: &[ReadyBead], inprogress: &[ReadyBead]) -> Vec<Stri
 }
 
 /// ADR-0006 D2 wave-scoped dispatch (`loop run --work --wave-label wave-N`):
-/// the ready set is `br ready` ∩ labels containing exactly `label`, AND a
-/// hold ASSERT when any open (ready, unclaimed) or in_progress bead carries
-/// `wave-M` with M < N — earlier waves run to completion first. The error
+/// the ready set is `br ready` scoped to wave N via [`bead_wave`] — the
+/// TYPED `wave` field is the authority (bd-wave-gate-typed-authority-27et;
+/// schema-18 has shipped), the legacy `wave-N` label the fallback — AND a
+/// hold ASSERT when any open (ready, unclaimed) or in_progress bead has
+/// wave-M with M < N — earlier waves run to completion first. The error
 /// names every blocking bead so the operator sees the full hold. Pure —
 /// shared by both dispatch paths.
-///
-// TODO(beads ADR-0001 schema-18): label parsing here is TRANSITIONAL. When
-// beads ships the typed `wave` field in ready JSON, read that field and keep
-// this label path only as fallback (ADR-0006 §D2).
 pub fn wave_scope_filter(
     ready: &[ReadyBead],
     inprogress: &[ReadyBead],
@@ -1172,7 +1198,7 @@ pub fn wave_scope_filter(
     }
     Ok(ready
         .iter()
-        .filter(|b| b.labels.iter().any(|l| l == label))
+        .filter(|b| bead_wave(b) == Some(wave_n))
         .cloned()
         .collect())
 }
@@ -2478,6 +2504,8 @@ pub fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<
                         .collect()
                 })
                 .unwrap_or_default(),
+            // bd-wave-gate-typed-authority-27et: the typed `wave` field.
+            wave: bead_wave_field(b),
             // bd-4spn: priority for the PRINCIPLES dispatch gate; the
             // `## PRINCIPLES` section from the description (fall back to a
             // direct `principles` field if the br shape carries one).
@@ -10433,6 +10461,17 @@ mod tests {
         }
     }
 
+    /// bd-wave-gate-typed-authority-27et: rb + ONLY the typed field — the
+    /// schema-18 shape a `br create --wave N` bead has (NO `wave-N` label).
+    fn rb_typed(id: &str, wave: u32) -> ReadyBead {
+        ReadyBead {
+            id: id.into(),
+            verify: Some("true".into()),
+            wave: Some(wave),
+            ..Default::default()
+        }
+    }
+
     // ---- bd-gnej: wave-gate (wave-N label ordering) -----------------------
 
     /// A wave-2 bead is HELD while a wave-1 bead is open/in_progress —
@@ -10583,6 +10622,72 @@ mod tests {
         let scoped = wave_scope_filter(&ready, &inprog, "wave-2").expect("same wave runs together");
         let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, vec!["bd-w2b"], "{ids:?}");
+    }
+
+    // ---- bd-wave-gate-typed-authority-27et: typed wave is the authority ----
+
+    /// Acceptance: the gate reads the TYPED `wave` field. A hold and a
+    /// release driven by beads carrying NO `wave-N` label at all — the
+    /// schema-18 shape. Proven red by making `bead_wave` label-only.
+    #[test]
+    fn wave_gate_reads_typed_field() {
+        let ready = vec![rb_typed("bd-w1", 1), rb_typed("bd-w3", 3)];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let held = wave_gate_held(&ready, &inprog);
+        assert_eq!(
+            held,
+            vec!["bd-w3"],
+            "typed wave 3 is held while typed wave 1 is open: {held:?}"
+        );
+        // wave-1 closes: its row drops out of ready AND in_progress.
+        let ready = vec![rb_typed("bd-w3", 3)];
+        assert!(
+            wave_gate_held(&ready, &inprog).is_empty(),
+            "typed wave 3 releases when typed wave 1 closes"
+        );
+        // An in-progress lower typed wave also holds.
+        let inprog = vec![rb_typed("bd-w1", 1)];
+        assert_eq!(wave_gate_held(&ready, &inprog), vec!["bd-w3"]);
+    }
+
+    /// The typed field beats a conflicting legacy label — labels are legacy,
+    /// and a stale label must never overrule the tracker.
+    #[test]
+    fn typed_wave_beats_conflicting_label() {
+        let mut b = rb_typed("bd-x", 1);
+        b.labels = vec!["wave-2".into()];
+        assert_eq!(bead_wave(&b), Some(1), "typed field is the authority");
+    }
+
+    /// Legacy label beads still gate (migration fallback): no typed field ->
+    /// the `wave-N` label decides, exactly as before.
+    #[test]
+    fn label_wave_still_gates_without_typed_field() {
+        assert_eq!(bead_wave(&rb_wave("bd-legacy", 2)), Some(2));
+    }
+
+    /// `bead_wave_field` reads a numeric `wave` and refuses a malformed one
+    /// (so a bad value falls back to the label, never fabricates a wave).
+    #[test]
+    fn bead_wave_field_parses_numbers_only() {
+        assert_eq!(bead_wave_field(&serde_json::json!({"wave": 3})), Some(3));
+        assert_eq!(bead_wave_field(&serde_json::json!({"wave": null})), None);
+        assert_eq!(bead_wave_field(&serde_json::json!({"wave": "3"})), None);
+        assert_eq!(bead_wave_field(&serde_json::json!({})), None);
+    }
+
+    /// `--wave-label wave-2` SCOPE reads the typed field too (selection, not
+    /// just the hold): typed-wave rows are dispatched with no label present,
+    /// and a lower typed wave blocks with its id named.
+    #[test]
+    fn wave_scope_selects_typed_wave() {
+        let ready = vec![rb_typed("bd-w2", 2), rb_typed("bd-w3", 3)];
+        let scoped = wave_scope_filter(&ready, &[], "wave-2").expect("no lower wave open");
+        let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-w2"], "{ids:?}");
+        let err = wave_scope_filter(&ready, &[rb_typed("bd-w1", 1)], "wave-2")
+            .expect_err("lower typed wave open");
+        assert!(err.contains("bd-w1"), "must name the blocker: {err}");
     }
 
     /// A bead held by a NON-live assignee (captain, dead agent, unknown

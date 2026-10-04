@@ -2649,7 +2649,7 @@ fn main() {
                 "squads": "flywheel squad list/show/spawn/create/remove — compiled-ins: default/plan/review/recon; user recipes.toml overrides per name (ADR-0007 D3)",
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
-            "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
+            "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set by the TYPED `wave` field (bd-wave-gate-typed-authority-27et; schema-18 has shipped — the legacy `wave-N` label is read only as the fallback, and br ready itself holds every higher wave until lower waves close) and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged (ADR-0006 D2)",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … extend with --timeout'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
@@ -14811,23 +14811,25 @@ impl WaveCounts {
 }
 
 /// Fold `br list --status all` rows + the `br ready` id set into per-wave
-/// counts. A bead's wave is its first `wave-N` label; no label lands in the
-/// `unlabeled` bucket — a wave is never invented. The dispatching wave is the
-/// LOWEST wave holding a ready or in-progress bead, the same floor
-/// `wave_gate_held` applies (ADR-0006 D2). Pure.
+/// counts. A bead's wave is its TYPED `wave` field, with the legacy `wave-N`
+/// label as fallback (bd-wave-gate-typed-authority-27et); neither present
+/// lands in the `unlabeled` bucket — a wave is never invented. The
+/// dispatching wave is the LOWEST wave holding a ready or in-progress bead,
+/// the same floor `wave_gate_held` applies (ADR-0006 D2). Pure.
 fn progress_waves(rows: &[Value], ready_ids: &HashSet<String>) -> Value {
     let mut waves: BTreeMap<u64, WaveCounts> = BTreeMap::new();
     let mut unlabeled = WaveCounts::default();
     for row in rows {
         let status = row.get("status").and_then(Value::as_str).unwrap_or("");
         let id = row.get("id").and_then(Value::as_str).unwrap_or("");
-        let wave = row
-            .get("labels")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u64>().ok()));
+        let wave = row.get("wave").and_then(Value::as_u64).or_else(|| {
+            row.get("labels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u64>().ok()))
+        });
         let counts = match wave {
             Some(w) => waves.entry(w).or_default(),
             None => &mut unlabeled,
@@ -20463,6 +20465,9 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // bd-wave-gate-typed-authority-27et: the typed `wave` field is
+            // the authority; the label above is the legacy fallback.
+            wave: durable::bead_wave_field(&b),
             // bd-4spn: priority + the typed `principles` citations feed the
             // dispatch gate (PRINCIPLES required for P<=2).
             priority: b
@@ -20524,6 +20529,9 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // bd-wave-gate-typed-authority-27et: the typed `wave` field is
+            // the authority; the label above is the legacy fallback.
+            wave: durable::bead_wave_field(b),
             // bd-4spn: priority + the typed `principles` citations (the
             // resume path reads the same gate fields as the ready path).
             priority: b
@@ -22199,6 +22207,16 @@ mod loop_tests {
         assert!(beads[1].labels.is_empty(), "absent labels -> empty");
     }
 
+    /// bd-wave-gate-typed-authority-27et: br's typed `wave` field flows
+    /// through the ready parser (number; absent/null -> None, never 0).
+    #[test]
+    fn parse_ready_beads_json_carries_typed_wave() {
+        let raw = r#"[{"id":"bd-w","title":"w","wave":3},{"id":"bd-n","title":"n","wave":null}]"#;
+        let beads = parse_ready_beads_json(raw).unwrap();
+        assert_eq!(beads[0].wave, Some(3));
+        assert_eq!(beads[1].wave, None, "null -> no wave, not 0");
+    }
+
     #[test]
     fn parse_inprogress_beads_json_handles_issues_wrapper() {
         let raw = r#"{"issues":[{"id":"bd-c","title":"three"}],"total":1}"#;
@@ -22227,8 +22245,13 @@ mod loop_tests {
             {"id": "bd-g", "status": "open"},
             {"id": "bd-h", "status": "open", "labels": ["wave-2"]},
             {"id": "bd-i", "status": "mystery", "labels": ["wave-2"]},
+            // Typed-only row (no label): the field is the authority
+            // (bd-wave-gate-typed-authority-27et).
+            {"id": "bd-j", "status": "open", "wave": 2},
         ]);
-        let ready: HashSet<String> = ["bd-h".to_string()].into_iter().collect();
+        let ready: HashSet<String> = ["bd-h".to_string(), "bd-j".to_string()]
+            .into_iter()
+            .collect();
         let out = progress_waves(rows.as_array().unwrap(), &ready);
         assert_eq!(
             out["dispatching_wave"],
@@ -22246,7 +22269,11 @@ mod loop_tests {
             "bd-c is open but not in br ready"
         );
         assert_eq!(waves[0]["blocked"], json!(1));
-        assert_eq!(waves[1]["ready"], json!(1), "bd-h is open AND dispatchable");
+        assert_eq!(
+            waves[1]["ready"],
+            json!(2),
+            "bd-h by label, bd-j by the typed field — both dispatchable"
+        );
         assert_eq!(waves[1]["blocked"], json!(3));
         assert_eq!(waves[1]["unknown"], json!(1), "no default status");
         assert_eq!(out["unlabeled"]["blocked"], json!(1));
