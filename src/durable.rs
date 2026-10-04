@@ -2580,49 +2580,90 @@ pub fn build_brief(
     project: &str,
     resume: bool,
 ) -> std::result::Result<String, BriefError> {
+    let full = fill_brief(id, title, project, resume);
+    if full.len() <= DISPATCH_PROMPT_CAP {
+        return Ok(full);
+    }
+    // Over the cap: DEGRADE to the pointer brief (bd-dispatch-cap-conditioning-l7jh).
+    // Never truncate the full brief, never drop the dispatch.
+    let pointer = pointer_brief(id, project, resume);
+    if pointer.len() <= DISPATCH_PROMPT_CAP {
+        return Ok(pointer);
+    }
+    Err(BriefError {
+        bytes: pointer.len(),
+    })
+}
+
+/// Fill the full brief template. No cap check here — [`build_brief`] owns the
+/// degrade decision.
+fn fill_brief(id: &str, title: &str, project: &str, resume: bool) -> String {
     let goal = if resume {
         format!("Resume {id}: {title}")
     } else {
         format!("Execute {id}: {title}")
     };
-    let brief = BRIEF_TEMPLATE
+    BRIEF_TEMPLATE
         .replace("{goal}", &goal)
         .replace("{id}", id)
-        .replace("{project}", project);
-    if brief.len() > DISPATCH_PROMPT_CAP {
-        return Err(BriefError { bytes: brief.len() });
-    }
-    Ok(brief)
+        .replace("{project}", project)
+}
+
+/// The pointer brief (bd-dispatch-cap-conditioning-l7jh): the degraded form
+/// used when the full brief cannot fit the dispatch cap together with the
+/// agent's conditioning (behavior preamble + skills prefix). It names the
+/// bead, the `br show` read path that carries the full acceptance criteria,
+/// and the report contract — everything else is reachable, not embedded.
+/// Never truncated, and the `GOAL ` first line keeps the claim-watch bead-id
+/// extractor working ([`bead_id_from_prompt`]).
+pub fn pointer_brief(id: &str, project: &str, resume: bool) -> String {
+    let verb = if resume { "Resume" } else { "Execute" };
+    POINTER_TEMPLATE
+        .replace("{verb}", verb)
+        .replace("{id}", id)
+        .replace("{project}", project)
 }
 
 /// The brief template (ADR-0019 Spec 2 fields). `{id}` / `{goal}` /
 /// `{project}` are filled by [`build_brief`]; `{AGENT_NAME}` is substituted
 /// at dispatch time (plan_actions) so the state-file path is concrete.
 const BRIEF_TEMPLATE: &str = r#"GOAL {goal}.
-SCOPE may-write: only paths you hold an exclusive reservation on (reason={id}); may-not-write: everything else — no scope leak.
-CONTEXT pointers only (never paste file contents): bead {id} description (acceptance criteria + ## VERIFY fence); thread-id {id} for peer mail; .flywheel/agent-state/{AGENT_NAME}.json (state file); .flywheel/receipts/ (verification receipts).
-ACCEPTANCE close only when every acceptance criterion in the bead description holds — one checkable criterion per line in the close reason.
+SCOPE may-write only paths you hold an exclusive reservation on (reason={id}); anything else is may-not-write — no scope leak.
+CONTEXT pointers only, never paste file contents: br show {id} (acceptance criteria + ## VERIFY fence); thread-id {id}; state .flywheel/agent-state/{AGENT_NAME}.json; receipts .flywheel/receipts/.
+ACCEPTANCE close only when every acceptance criterion holds — one checkable line per criterion in the close reason.
 VERIFY run the bead's ## VERIFY command from its description; include its stdout in the REPORT. No ## VERIFY fence → say so explicitly; never substitute a whole-workspace matrix script.
-TIMEBOX about 90 minutes; on expiry return partial findings + deviations — never silently extend.
-FORBIDDEN DO NOT create new beads — report scope gaps in the thread, not as new beads. Never force-unlock a peer's reservation. No worktree. Stay inside SCOPE.
-REPORT status; commit sha (commit BEFORE close; the bead id {id} IN the commit message); verdict kind; what you actually ran; deviations; PRINCIPLES cited. After closing, mail the captain on thread_id={id} with subject [{id}] done and a BODY carrying the same REPORT fields (status, sha, verdict, the VERIFY command + result tail, deviations, PRINCIPLES) — one report, two channels: the close reason is the durable copy, the mail is the captain's copy. The captain has no push channel.
-PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only, no leaf text. REQUIRED for priority <= 2 beads — a name with no decision clause is a skip (cargo-cult citation; the reviewer marks the report incomplete).
-STANDING {project}/.flywheel/standing-orders.md layered on ~/.config/flywheel/standing-orders.md — the lifecycle (claim → reserve → announce → execute → verify → close → sync → commit) lives there; referenced BY PATH ONLY, never pasted here.
-DIRT POLICY only dirt under source/, tests/, benches/, Cargo.toml, Cargo.lock, and pinned toolchain files blocks a receipt. Tracker state (.beads/), orchestrator bookkeeping (.flywheel/), and editor artifacts are always-allowed dirt — note them in the receipt and proceed; anything else dirty: post-and-stop (bd-brief-dirt-policy-jfwa).
-CONTRACTS renew your own file reservations while working (toron `renew_file_reservations` — extend the TTL before it lapses; the orchestrator cannot renew on your behalf). When a message has ack_required=true, call `acknowledge_message` after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write {"context_pct": <pct>, "ts": "<now RFC3339>"} to .flywheel/agent-state/{AGENT_NAME}.json (best-effort, never block on it), then finish + sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."#;
+TIMEBOX ~90 min; expiry → partial findings + deviations, never a silent extension.
+FORBIDDEN DO NOT create new beads — report scope gaps in the thread. Never force-unlock a peer's reservation. No worktree. Stay inside SCOPE.
+REPORT status; commit sha (commit BEFORE close; bead id {id} IN the message); verdict; what you ran; deviations; PRINCIPLES. Then mail the captain thread_id={id}, subject [{id}] done, same fields — one report, two channels (close reason durable; mail = captain's).
+PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only. REQUIRED for priority <= 2 beads — a name with no decision clause is a skip (cargo-cult citation).
+STANDING {project}/.flywheel/standing-orders.md + ~/.config/flywheel/standing-orders.md (lifecycle: claim → reserve → announce → execute → verify → close → sync → commit) — BY PATH ONLY.
+DIRT POLICY dirt outside source/, tests/, benches/, Cargo.toml, Cargo.lock, and pinned toolchains blocks a receipt; .beads/, .flywheel/, and editor artifacts never do (note + proceed); anything else dirty: post-and-stop.
+CONTRACTS renew your own file reservations (toron `renew_file_reservations`; the orchestrator cannot renew on your behalf). When a message has ack_required=true, call `acknowledge_message` after acting — the orchestrator cannot ack on your behalf. Above ~80% context: write {"context_pct": <pct>, "ts": "<now RFC3339>"} to .flywheel/agent-state/{AGENT_NAME}.json (best-effort), finish + sync this bead, reply exactly CONTEXT_LIMIT."#;
+
+/// The pointer brief template: `{verb}` / `{id}` / `{project}` filled by
+/// [`pointer_brief`]. Keep the first line the `GOAL ` form and keep the
+/// `OVER CAP` marker — tests and operators read it as the degradation signal.
+const POINTER_TEMPLATE: &str = r#"GOAL {verb} {id}: full brief OVER CAP — read it with `br show {id}` (acceptance criteria + ## VERIFY fence).
+SCOPE may-write only paths you hold an exclusive reservation on (reason={id}).
+VERIFY run the bead's ## VERIFY command; REPORT status, commit sha (bead id {id} IN the commit message), verdict, what you ran, deviations, PRINCIPLES cited; then mail the captain on thread_id={id}, subject [{id}] done.
+STANDING {project}/.flywheel/standing-orders.md (lifecycle) — by path only.
+FORBIDDEN no new beads; never force-unlock a peer's reservation; no worktree; stay inside SCOPE. Above ~80% context → CONTEXT_LIMIT per standing orders."#;
 
 /// Convenience wrapper for call sites that must produce a brief as a plain
-/// String (sync-loop queue refresh). Over-cap is a LOOP BUG — panic loudly,
-/// never truncate (ADR-0019 Spec 2).
+/// String (sync-loop queue refresh). Over-cap degrades to the pointer brief;
+/// only a bead id too large for even the pointer form panics (ADR-0019
+/// Spec 2 loop bug).
 pub fn brief(id: &str, title: &str, project: &str, resume: bool) -> String {
-    build_brief(id, title, project, resume)
-        .expect("bead brief over dispatch cap (ADR-0019 Spec 2 loop bug)")
+    build_brief(id, title, project, resume).expect(
+        "bead brief cannot fit the dispatch cap even as a pointer (ADR-0019 Spec 2 loop bug)",
+    )
 }
 
-/// Queue a filled brief for a dispatched bead, or surface the loop bug
-/// loudly if the brief cannot fit the dispatch cap (ADR-0019 Spec 2: over
-/// cap fails loud, never silent truncation). `front` = re-queue at the head
-/// (claim-watch re-dispatches must stay ahead of fresh beads).
+/// Queue a filled brief for a dispatched bead. Over-cap degrades to the
+/// pointer brief inside [`build_brief`]; only the pathological case — an id
+/// so large even the pointer cannot fit — fails loud here (ADR-0019 Spec 2).
+/// `front` = re-queue at the head (claim-watch re-dispatches must stay ahead
+/// of fresh beads).
 fn queue_brief(
     queue: &mut Vec<String>,
     id: &str,
@@ -11032,30 +11073,80 @@ mod tests {
         }
     }
 
-    /// ADR-0019 Spec 2: the dispatched prompt (behavior + brief) has a hard
-    /// cap; over it is a LOOP BUG — fail loud, never silent truncation.
+    /// ADR-0019 Spec 2, amended by bd-dispatch-cap-conditioning-l7jh: over
+    /// the cap the dispatch DEGRADES to the pointer brief — never a drop,
+    /// never a silent truncation. Only a bead id so large it cannot fit even
+    /// the pointer form fails loud.
     #[test]
-    fn brief_cap_enforced_fails_loud() {
+    fn brief_cap_degrades_to_pointer() {
         let huge = "x".repeat(8192);
-        let err = build_brief("bd-1", &huge, "flywheel", false).unwrap_err();
+        let p = build_brief("bd-1", &huge, "flywheel", false).expect("degrades, not errors");
         assert!(
-            err.bytes > DISPATCH_PROMPT_CAP,
-            "over-cap brief reports its size"
+            p.len() <= DISPATCH_PROMPT_CAP,
+            "pointer fits: {} bytes",
+            p.len()
         );
+        assert!(p.contains("OVER CAP"), "pointer announces the degradation");
+        assert!(p.contains("br show bd-1"), "pointer names the read path");
+        let absurd = "b".repeat(DISPATCH_PROMPT_CAP + 64);
+        let err = build_brief(&absurd, "t", "flywheel", false).unwrap_err();
+        assert!(err.bytes > DISPATCH_PROMPT_CAP);
     }
 
-    /// The cap boundary: a brief landing exactly ON the cap is legal; one
-    /// byte more is a loud error.
+    /// The cap boundary: a full brief landing exactly ON the cap is legal;
+    /// one byte more degrades to the pointer (still ≤ cap), never a drop.
     #[test]
-    fn brief_cap_boundary() {
+    fn brief_cap_boundary_degrades() {
         let base = build_brief("bd-1", "", "flywheel", false).unwrap();
         let room = DISPATCH_PROMPT_CAP.saturating_sub(base.len());
         let fits = build_brief("bd-1", &"x".repeat(room), "flywheel", false).unwrap();
         assert!(fits.len() <= DISPATCH_PROMPT_CAP);
         assert!(
-            build_brief("bd-1", &"x".repeat(room + 1), "flywheel", false).is_err(),
-            "one byte over the cap fails loud"
+            !fits.contains("OVER CAP"),
+            "boundary brief is still the full one"
         );
+        let over = build_brief("bd-1", &"x".repeat(room + 1), "flywheel", false).unwrap();
+        assert!(
+            over.len() <= DISPATCH_PROMPT_CAP,
+            "degrades, never overshoots"
+        );
+        assert!(over.contains("OVER CAP"), "degraded to the pointer form");
+    }
+
+    /// bd-dispatch-cap-conditioning-l7jh: the cap must size the WHOLE send —
+    /// behavior preamble + skills prefix + brief — and degrade instead of
+    /// killing the loop. The old template filled to ~3.2 KiB with a 38-char
+    /// id, so template + the smallest profile preamble (1357 B) was always
+    /// over the 4 KiB cap; every composed-pane dispatch was rejected and four
+    /// rejects in a row hard-stopped the supervisor.
+    #[test]
+    fn dispatch_cap_accounts_for_conditioning() {
+        // 1) template + the worst built-in preamble (coder 1550 B, with slack
+        //    for the skills prefix) now fits: the full brief is what dispatches.
+        let id = "bd-reclaim-liveness-not-spelling-hn8b"; // 37 chars, report shape
+        let full = build_brief(id, "friction-report title", "proj", false).unwrap();
+        assert!(!full.contains("OVER CAP"), "full brief, not the pointer");
+        assert!(
+            full.len() + 1600 <= DISPATCH_PROMPT_CAP,
+            "brief {} bytes + worst preamble 1600 exceeds cap",
+            full.len()
+        );
+        // 2) with conditioning that cannot fit, the pointer form still fits
+        //    under the same preamble — the shape __send rebuilds on over-cap.
+        let pointer = pointer_brief("bd-dispatch-cap-conditioning-l7jh", "proj", false);
+        assert!(
+            pointer.len() + 1600 <= DISPATCH_PROMPT_CAP,
+            "pointer {} bytes + 1600 conditioning fits",
+            pointer.len()
+        );
+        // 3) one over-cap dispatch degrades the QUEUE entry instead of
+        //    dropping it — the loop survives (no reject, no fail-stop).
+        let mut q: Vec<String> = Vec::new();
+        let title = "y".repeat(DISPATCH_PROMPT_CAP);
+        queue_brief(&mut q, id, &title, "proj", false, false);
+        assert_eq!(q.len(), 1, "over-cap dispatch stays queued (pointer brief)");
+        assert!(q[0].starts_with("GOAL "), "pointer keeps the GOAL contract");
+        assert!(q[0].contains("OVER CAP") && q[0].contains(id));
     }
 
     /// The {AGENT_NAME} placeholder survives the fill — plan_actions
