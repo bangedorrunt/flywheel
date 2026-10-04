@@ -29991,14 +29991,17 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
-/// internal leaf (bd-627z.1, bd-qk9q): re-open stranded in_progress beads to
-/// ready. A bead is stranded when its assignee is NOT one of the `--live`
-/// agent names (captain, dead agent, unknown identity) — it would stall the
-/// batch forever. An in_progress bead with NO assignee is stranded too
-/// (bd-qk9q: nobody holds it, no agent works it, nothing else closes it —
-/// the bd-bvwf.1 strand). Presence-based, never status-based: an assignee in
-/// the live list is live regardless of status (bd-bvwf.5: no reclaim of
-/// unknown-but-present agents). Reclaim = `br update <id> --status open
+/// internal leaf (bd-627z.1, bd-qk9q, bd-reclaim-liveness-not-spelling-hn8b):
+/// re-open stranded in_progress beads to ready. The decision resolves the
+/// assignee through the spawn registry to its pane and asks herdr whether
+/// that pane is live (`durable::reclaim_decision`) — no spelling list. Kept
+/// under BOTH registry names of a live pane (herdr name and mail pin), and a
+/// live reservation for the bead itself (reason = bead id) is a lease no
+/// reclaim may break. A spelling the registry cannot resolve and pane
+/// evidence cannot refute is KEPT — the old name comparison reclaimed live
+/// workers whose claim used a different spelling for the same agent, which
+/// is the destructive race this fixes. An assignee-less bead with no lease is
+/// still reclaimed (bd-qk9q). Reclaim = `br update <id> --status open
 /// --assignee ""` so the bead returns to the ready pool and the loop
 /// re-dispatches it.
 ///
@@ -30011,12 +30014,6 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    // bd-bvwf.6 (2026-08-17): claims are written with the agent's MAIL
-    // IDENTITY pin (BlueRidge), but the loop passes herdr NAMES
-    // (flywheel-toron-coder) as --live — a live agent's claim looked
-    // stranded and got yanked every poll. A registry pin counts as live
-    // only when its pane is LIVE in herdr right now (a dead pane's pin
-    // must still strand — that is the reclaim's purpose).
     let dir = project_dir(cfg, project);
     let registry = state::load_spawn_registry(dir.to_str().unwrap_or(project));
     let live_panes: std::collections::HashSet<String> = {
@@ -30033,45 +30030,94 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
         }
         panes
     };
-    let live: Vec<String> = {
-        let mut s: std::collections::HashSet<String> = live_names.iter().cloned().collect();
-        for e in &registry {
-            if let Some(pin) = &e.mail_identity
-                && live_panes.contains(&e.pane_id)
-            {
-                s.insert(pin.clone());
+    // Every spelling a LIVE pane answers to: the polled herdr names the loop
+    // passed, plus each live registry row's herdr name AND mail pin
+    // (bd-bvwf.6: claims use the pin, the loop passes herdr names).
+    let mut live_identities: std::collections::HashSet<String> = live_names.into_iter().collect();
+    for e in &registry {
+        if live_panes.contains(&e.pane_id) {
+            live_identities.insert(e.name.clone());
+            if let Some(pin) = &e.mail_identity {
+                live_identities.insert(pin.clone());
             }
         }
-        s.into_iter().collect()
+    }
+    // A live lease on a bead is proof of life. A reading failure degrades to
+    // pane evidence alone (loudly), never to a blind reclaim.
+    let leased_beads: std::collections::HashSet<String> = {
+        let key = project_dir_str(cfg, project)?;
+        let rows = match mail_or_die(cfg) {
+            Ok(mail) => mail.list_active(&key, None, None).unwrap_or_else(|e| {
+                eprintln!(
+                    "flywheel: reclaim lease read failed (continuing without lease evidence): {e:#}"
+                );
+                json!({ "reservations": [] })
+            }),
+            Err(e) => {
+                eprintln!(
+                    "flywheel: reclaim lease read mail unavailable (continuing without lease evidence): {e:#}"
+                );
+                json!({ "reservations": [] })
+            }
+        };
+        rows.get("reservations")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get("reason").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let world = durable::ReclaimWorld {
+        live_identities: &live_identities,
+        registry: &registry,
+        live_panes: &live_panes,
+        leased_beads: &leased_beads,
     };
     let beads = load_inprogress_beads(cfg, project)?;
-    let stranded: Vec<durable::ReadyBead> = beads
-        .into_iter()
-        .filter(|b| match &b.assignee {
-            Some(a) => !live.iter().any(|l| l == a),
-            None => true,
-        })
-        .collect();
     let mut reclaimed: Vec<String> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
-    for b in &stranded {
-        let out = std::process::Command::new("br")
-            .args(["update", &b.id, "--status", "open", "--assignee", ""])
-            .current_dir(&dir)
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                eprintln!(
-                    "flywheel: reclaimed stranded bead {} (assignee {:?})",
-                    b.id, b.assignee
-                );
-                reclaimed.push(b.id.clone());
+    for b in &beads {
+        match durable::reclaim_decision(&b.id, b.assignee.as_deref(), &world) {
+            durable::ReclaimDecision::Keep { reason } => {
+                if matches!(
+                    reason,
+                    durable::ReclaimHold::LiveLease | durable::ReclaimHold::UnknownIdentity
+                ) {
+                    eprintln!(
+                        "flywheel: reclaim held for {} (assignee {:?}, {})",
+                        b.id,
+                        b.assignee,
+                        reason.as_str()
+                    );
+                }
             }
-            Ok(o) => failed.push(json!({
-                "id": b.id,
-                "error": String::from_utf8_lossy(&o.stderr).trim().to_string(),
-            })),
-            Err(e) => failed.push(json!({ "id": b.id, "error": format!("br not found: {e}") })),
+            durable::ReclaimDecision::Reclaim { reason } => {
+                let out = std::process::Command::new("br")
+                    .args(["update", &b.id, "--status", "open", "--assignee", ""])
+                    .current_dir(&dir)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => {
+                        eprintln!(
+                            "flywheel: reclaimed stranded bead {} (assignee {:?}, {})",
+                            b.id,
+                            b.assignee,
+                            reason.as_str()
+                        );
+                        reclaimed.push(b.id.clone());
+                    }
+                    Ok(o) => failed.push(json!({
+                        "id": b.id,
+                        "error": String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                    })),
+                    Err(e) => {
+                        failed.push(json!({ "id": b.id, "error": format!("br not found: {e}") }))
+                    }
+                }
+            }
         }
     }
     print_json(&json!({ "reclaimed": reclaimed, "failed": failed }));

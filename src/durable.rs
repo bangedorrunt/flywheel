@@ -5126,6 +5126,119 @@ pub fn blocking_inprogress<'a>(
         .collect()
 }
 
+/// Every input the reclaim decision may consult, built once per reclaim pass
+/// by the `__reclaim-stranded` leaf. The decision itself is pure — it only
+/// reads these sets (bd-reclaim-liveness-not-spelling-hn8b).
+pub struct ReclaimWorld<'a> {
+    /// Every name a LIVE pane answers to: the polled herdr names the loop
+    /// passed, plus each registry row's `name` and `mail_identity` when its
+    /// pane is still listed.
+    pub live_identities: &'a std::collections::HashSet<String>,
+    /// Spawn-registry rows, used to resolve an assignee spelling to its pane.
+    pub registry: &'a [crate::state::SpawnEntry],
+    /// Pane ids herdr lists right now.
+    pub live_panes: &'a std::collections::HashSet<String>,
+    /// Bead ids carrying a live reservation; the lease is proof of life.
+    pub leased_beads: &'a std::collections::HashSet<String>,
+}
+
+/// Why a bead is reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimReason {
+    /// No assignee and no lease — nobody holds it (bd-qk9q).
+    Unowned,
+    /// The assignee resolves to a registry pane herdr no longer lists.
+    DeadPane,
+}
+
+/// Why a bead is NOT reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimHold {
+    /// A live reservation for the bead itself (reason = bead id).
+    LiveLease,
+    /// The assignee resolves to a pane herdr lists right now.
+    LivePane,
+    /// No pane evidence either way — never race an unproven-dead worker.
+    UnknownIdentity,
+}
+
+impl ReclaimReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unowned => "unowned",
+            Self::DeadPane => "dead pane",
+        }
+    }
+}
+
+impl ReclaimHold {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveLease => "live lease",
+            Self::LivePane => "live pane",
+            Self::UnknownIdentity => "unknown identity",
+        }
+    }
+}
+
+/// The reclaim decision outcome (typed, so call sites cannot string-match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimDecision {
+    Reclaim { reason: ReclaimReason },
+    Keep { reason: ReclaimHold },
+}
+
+/// The reclaim decision for one in_progress bead: reclaim only when the
+/// evidence proves the worker cannot be on it.
+///
+/// The old predicate compared the assignee SPELLING against a name list, so a
+/// live claim written under any other name for the same agent (herdr slug vs
+/// pin vs registry row) read as stranded and got re-opened mid-work — racing
+/// the worker and resetting its claim every poll. This resolves the assignee
+/// through the registry to its pane and asks herdr. Kept under any of these
+/// proofs, in order: live lease on the bead, the assignee matches a live
+/// identity, or the assignee resolves to a live pane. An unresolvable spelling
+/// is KEPT: absence of evidence is not evidence of death.
+pub fn reclaim_decision(
+    bead_id: &str,
+    assignee: Option<&str>,
+    world: &ReclaimWorld<'_>,
+) -> ReclaimDecision {
+    if world.leased_beads.contains(bead_id) {
+        return ReclaimDecision::Keep {
+            reason: ReclaimHold::LiveLease,
+        };
+    }
+    let Some(assignee) = assignee else {
+        return ReclaimDecision::Reclaim {
+            reason: ReclaimReason::Unowned,
+        };
+    };
+    if world.live_identities.contains(assignee) {
+        return ReclaimDecision::Keep {
+            reason: ReclaimHold::LivePane,
+        };
+    }
+    let entry = world
+        .registry
+        .iter()
+        .find(|e| e.name == assignee || e.mail_identity.as_deref() == Some(assignee));
+    match entry {
+        Some(e) if !e.pane_id.is_empty() && world.live_panes.contains(&e.pane_id) => {
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::LivePane,
+            }
+        }
+        Some(e) if !e.pane_id.is_empty() => ReclaimDecision::Reclaim {
+            reason: ReclaimReason::DeadPane,
+        },
+        // A paneless registry row cannot prove death OR life; keep.
+        Some(_) | None => ReclaimDecision::Keep {
+            reason: ReclaimHold::UnknownIdentity,
+        },
+    }
+}
+
 /// Adaptive poll cadence: fast while the swarm is busy, slow when settled.
 ///
 /// A dispatch this iteration (`dispatched`) forces the active cadence: the
@@ -10274,6 +10387,80 @@ mod tests {
         assert!(
             !stranded_beads(&inprog, &live).is_empty(),
             "they ARE stranded"
+        );
+    }
+
+    /// bd-reclaim-liveness-not-spelling-hn8b: the reclaim decision resolves
+    /// the assignee through the registry to its PANE and asks whether that
+    /// pane is live, instead of comparing spelling against a name list. A
+    /// live pane is kept under any of its names; a proven-dead pane is
+    /// reclaimed; a live lease on the bead keeps it even when the pane is
+    /// gone; and a spelling with no pane evidence is kept — never race a
+    /// worker whose death is unproven.
+    #[test]
+    fn reclaim_requires_dead_pane() {
+        use std::collections::HashSet;
+        fn set(items: &[&str]) -> HashSet<String> {
+            items.iter().map(|s| s.to_string()).collect()
+        }
+        let registry = vec![
+            crate::state::SpawnEntry::with_mail_identity("pane-a", "crew-x-coder", "SilverPond"),
+            crate::state::SpawnEntry::with_mail_identity(
+                "pane-dead",
+                "crew-x-nurse",
+                "SlateHerder",
+            ),
+        ];
+        let live_panes = set(&["pane-a"]);
+        let live_identities = set(&["crew-x-coder", "SilverPond"]);
+        let leased = set(&["bd-lease"]);
+        let world = ReclaimWorld {
+            live_identities: &live_identities,
+            registry: &registry,
+            live_panes: &live_panes,
+            leased_beads: &leased,
+        };
+        // live pane + herdr-name assignee -> keep
+        assert_eq!(
+            reclaim_decision("bd-herdr", Some("crew-x-coder"), &world),
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::LivePane
+            }
+        );
+        // live pane + pin assignee -> keep
+        assert_eq!(
+            reclaim_decision("bd-pin", Some("SilverPond"), &world),
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::LivePane
+            }
+        );
+        // dead pane -> reclaim
+        assert_eq!(
+            reclaim_decision("bd-dead", Some("SlateHerder"), &world),
+            ReclaimDecision::Reclaim {
+                reason: ReclaimReason::DeadPane
+            }
+        );
+        // live lease -> keep even though the pane is dead
+        assert_eq!(
+            reclaim_decision("bd-lease", Some("SlateHerder"), &world),
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::LiveLease
+            }
+        );
+        // unowned, no lease -> reclaim (bd-qk9q)
+        assert_eq!(
+            reclaim_decision("bd-unowned", None, &world),
+            ReclaimDecision::Reclaim {
+                reason: ReclaimReason::Unowned
+            }
+        );
+        // no pane evidence either way -> keep
+        assert_eq!(
+            reclaim_decision("bd-ghost", Some("ghost"), &world),
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::UnknownIdentity
+            }
         );
     }
 
