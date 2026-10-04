@@ -4653,6 +4653,12 @@ pub enum WaitReason {
     Blocked,
     /// the bead serialized behind another in-flight bead's reservation
     Overlap,
+    /// bd-claim-watch-durable-signals-mixy: the bead itself is held by a
+    /// live toron reservation (reason == bead id) — a durable peer claim.
+    /// Redispatch arms wait for the lease to lapse; tracker nudges still
+    /// fire (claim hygiene + close escalation), but no second executor is
+    /// dispatched over live work.
+    LiveLease,
     /// the bead is a wave-N labeled bead held while an earlier wave-M (M<N)
     /// is still open/in_progress (bd-gnej) — not a stuck owner, the loop
     /// waits for the earlier wave to close
@@ -4821,6 +4827,16 @@ pub fn drain_prompt(bead_id: &str) -> String {
 /// reservation (ADR-0019 Spec 3.4). An overlap wait is NOT a stuck owner —
 /// no claim nudge, no close nudge, no resume re-dispatch; the wait reason is
 /// recorded and the loop waits for the holder to release.
+///
+/// bd-claim-watch-durable-signals-mixy: `live_leases` = bead ids with a
+/// live toron reservation on the active board (`reason == bead id`). The
+/// REDISPATCH arms (Bead/Resume) are suppressed while a live lease exists —
+/// the reserve-before-work lifecycle makes the lease the durable "work is
+/// taken" record, visible even when the angle's mail is silent or its pane
+/// is a non-herdr harness that `states` cannot see. The tracker nudges
+/// (claim/close) still fire: they target the bead's own lane, never a
+/// second executor. Consultation order: live lease → assignee pane state →
+/// mail guard (the dispatch scan the loop runs on redispatch).
 pub fn claim_watch_step(
     watch: &mut std::collections::HashMap<String, ClaimWatch>,
     ready: &[ReadyBead],
@@ -4828,6 +4844,7 @@ pub fn claim_watch_step(
     states: &[AgentState],
     nudge_after_polls: u32,
     overlap: &std::collections::HashSet<String>,
+    live_leases: &std::collections::HashSet<String>,
 ) -> Vec<ClaimWatchAction> {
     let mut actions = Vec::new();
     let mut drop = Vec::new();
@@ -4839,6 +4856,7 @@ pub fn claim_watch_step(
         wave_gate_held(ready, inprogress).into_iter().collect();
     for (bead_id, cw) in watch.iter_mut() {
         let waiting_on_overlap = overlap.contains(bead_id);
+        let waiting_on_lease = live_leases.contains(bead_id);
         let in_ready = ready.iter().find(|b| b.id == *bead_id);
         let claimed = inprogress.iter().find(|b| b.id == *bead_id);
         let waiting_on_wave = wave_held.contains(bead_id);
@@ -4891,6 +4909,15 @@ pub fn claim_watch_step(
                     }
                     // settled (idle/done) or agent gone → redispatch
                     _ => {
+                        // bd-claim-watch-durable-signals-mixy: a live lease
+                        // for THIS bead is a durable peer claim (the
+                        // reserve-before-work lifecycle) — never dispatch a
+                        // second executor over it; the lease lapsing
+                        // releases the hold on a later poll.
+                        if waiting_on_lease {
+                            cw.wait_reason = Some(WaitReason::LiveLease);
+                            continue;
+                        }
                         drop.push(bead_id.clone());
                         actions.push(ClaimWatchAction::RedispatchBead {
                             bead_id: bead_id.clone(),
@@ -4925,6 +4952,15 @@ pub fn claim_watch_step(
                             bead_id: bead_id.clone(),
                             title: cb.title.clone(),
                         });
+                    } else if waiting_on_lease {
+                        // bd-claim-watch-durable-signals-mixy: the close
+                        // nudge went to the assignee; the Resume arm waits
+                        // for the lease to lapse (observed incident: GOAL
+                        // Resume re-sent every pass while an unexpired
+                        // exclusive lease held the bead). close_polls does
+                        // not advance here — a lapsed lease gets a fresh
+                        // countdown before the resume fires.
+                        cw.wait_reason = Some(WaitReason::LiveLease);
                     } else {
                         cw.close_polls += 1;
                         if cw.close_polls >= nudge_after {
@@ -6924,6 +6960,24 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
                 bead_overlap_waits(&board, &in_flight)
             };
+            // bd-claim-watch-durable-signals-mixy: bead ids held by a LIVE
+            // toron reservation (reason == bead id) — the durable "work is
+            // taken" record, consulted BEFORE pane state and the mail guard.
+            // The reservation board is the reserve-before-work lifecycle's
+            // own ledger; an unexpired lease means an executor is attached
+            // even when its pane is idle between turns or lives on a harness
+            // `states` cannot see.
+            let live_leases: std::collections::HashSet<String> = board
+                .iter()
+                .filter_map(|(_, reason)| {
+                    let r = reason.trim();
+                    if r.is_empty() {
+                        None
+                    } else {
+                        Some(r.to_string())
+                    }
+                })
+                .collect();
             let serialize_all = always_serialize_held(&board);
             // ADR-0025 reclaim: pane-exited gate (step 0) + stale tick (7200/86400)
             {
@@ -7134,6 +7188,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 &states,
                 params.claim_nudge_after_polls,
                 &overlap,
+                &live_leases,
             );
             for a in watch_actions {
                 match a {
@@ -12542,6 +12597,11 @@ mod tests {
         std::collections::HashSet::new()
     }
 
+    /// An empty live-lease set — the default for legacy claim-watch tests.
+    fn empty_leases() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
     fn bead_id_from_prompt_extracts_goal_execute_and_resume() {
         assert_eq!(
@@ -12619,6 +12679,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert!(actions.is_empty(), "no nudge before threshold: {actions:?}");
         assert_eq!(watch.get("bd-12").unwrap().unclaimed_polls, 1);
@@ -12631,6 +12692,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert_eq!(actions.len(), 1, "{actions:?}");
         match &actions[0] {
@@ -12663,6 +12725,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(
@@ -12697,6 +12760,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert_eq!(actions.len(), 1, "{actions:?}");
         match &actions[0] {
@@ -12721,6 +12785,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert!(actions.is_empty(), "no repeat close nudge: {actions:?}");
 
@@ -12732,12 +12797,146 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(
             matches!(&actions[0], ClaimWatchAction::RedispatchResume { bead_id, title }
                 if bead_id == "bd-12" && title == "fix auth"),
             "{:?}",
+            actions[0]
+        );
+        assert!(watch.is_empty());
+    }
+
+    /// bd-claim-watch-durable-signals-mixy (acceptance): a claimed bead whose
+    /// assignee settled is NOT resume-redispatched while a live toron lease
+    /// holds it — the observed incident re-sent `GOAL Resume` every pass
+    /// over an in_progress bead with an unexpired exclusive lease. The close
+    /// nudge still fires (it targets the assignee's own lane); the resume
+    /// waits, with a fresh countdown, for the lease to lapse.
+    #[test]
+    fn resume_suppressed_by_live_lease() {
+        use std::collections::HashSet;
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![];
+        let inprogress = vec![rb_assignee("bd-12", "fix auth", "oc-1")];
+        let states = vec![st("oc-1", "done")]; // claimed, settled, unclosed
+
+        // First poll: the close nudge fires — the assignee must close or
+        // reopen; the lease does not silence that escalation.
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::NudgeClose { bead_id, .. }
+                if bead_id == "bd-12"),
+            "close nudge still fires: {actions:?}"
+        );
+
+        // The bead is held by a live lease: every later poll is a hold —
+        // no RedispatchResume, watch retained, lease named as the reason.
+        let live: HashSet<String> = HashSet::from(["bd-12".to_string()]);
+        for i in 0..3 {
+            let actions = claim_watch_step(
+                &mut watch,
+                &ready,
+                &inprogress,
+                &states,
+                2,
+                &empty_overlap(),
+                &live,
+            );
+            assert!(
+                actions.is_empty(),
+                "poll {i}: resume suppressed by live lease: {actions:?}"
+            );
+        }
+        assert_eq!(watch["bd-12"].wait_reason, Some(WaitReason::LiveLease));
+        assert_eq!(
+            watch["bd-12"].close_polls, 0,
+            "the resume countdown does not advance under a live lease"
+        );
+        assert!(watch.contains_key("bd-12"), "kept watching");
+
+        // Lease lapsed: fresh countdown, then the resume re-dispatch.
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(actions.is_empty(), "fresh countdown: {actions:?}");
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::RedispatchResume { bead_id, title }
+                if bead_id == "bd-12" && title == "fix auth"),
+            "lease lapsed → resume fires: {:?}",
+            actions[0]
+        );
+        assert!(watch.is_empty());
+    }
+
+    /// The unclaimed arm honors the lease too: an agent that settled (or
+    /// vanished) without claiming is not re-dispatched while a live lease
+    /// holds the bead; the hold releases when the lease lapses.
+    #[test]
+    fn redispatch_suppressed_by_live_lease() {
+        use std::collections::HashSet;
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![rb2("bd-12", "fix auth")];
+        let live: HashSet<String> = HashSet::from(["bd-12".to_string()]);
+
+        // settled without claim, lease live → hold
+        let states = vec![st("oc-1", "idle")];
+        let actions =
+            claim_watch_step(&mut watch, &ready, &[], &states, 2, &empty_overlap(), &live);
+        assert!(
+            actions.is_empty(),
+            "no redispatch over a lease: {actions:?}"
+        );
+        assert_eq!(watch["bd-12"].wait_reason, Some(WaitReason::LiveLease));
+
+        // agent gone, lease still live → still hold
+        let actions = claim_watch_step(&mut watch, &ready, &[], &[], 2, &empty_overlap(), &live);
+        assert!(actions.is_empty(), "leash outlives the pane: {actions:?}");
+        assert!(watch.contains_key("bd-12"));
+
+        // lease lapsed → the ordinary redispatch
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::RedispatchBead { bead_id, .. }
+                if bead_id == "bd-12"),
+            "lease lapsed → redispatch: {:?}",
             actions[0]
         );
         assert!(watch.is_empty());
@@ -12760,6 +12959,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert!(
             actions.is_empty(),
@@ -12775,7 +12975,15 @@ mod tests {
         let mut watch: std::collections::HashMap<String, ClaimWatch> =
             std::collections::HashMap::new();
         watch.insert("bd-12".into(), cw("oc-1"));
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
+        let actions = claim_watch_step(
+            &mut watch,
+            &[],
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
         assert!(watch.is_empty(), "closed bead drops from the watch");
         assert!(
             matches!(&actions[0], ClaimWatchAction::ReleaseReservations { bead_id }
@@ -12793,7 +13001,15 @@ mod tests {
         let mut watch: std::collections::HashMap<String, ClaimWatch> =
             std::collections::HashMap::new();
         watch.insert("bd-77".into(), cw("oc-1"));
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
+        let actions = claim_watch_step(
+            &mut watch,
+            &[],
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
         assert_eq!(actions.len(), 1, "one release action: {actions:?}");
         assert!(
             matches!(&actions[0], ClaimWatchAction::ReleaseReservations { bead_id }
@@ -12802,7 +13018,15 @@ mod tests {
             actions[0]
         );
         // Second poll: the entry is gone — no re-fire.
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
+        let actions = claim_watch_step(
+            &mut watch,
+            &[],
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
         assert!(actions.is_empty(), "no repeat release: {actions:?}");
         assert!(watch.is_empty());
     }
@@ -12815,7 +13039,15 @@ mod tests {
             std::collections::HashMap::new();
         watch.insert("bd-12".into(), cw("oc-1"));
         let ready = vec![rb2("bd-12", "fix auth")];
-        let actions = claim_watch_step(&mut watch, &ready, &[], &[], 2, &empty_overlap());
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
         assert!(
             matches!(&actions[0], ClaimWatchAction::RedispatchBead { bead_id, .. }
                 if bead_id == "bd-12"),
@@ -13145,7 +13377,15 @@ mod tests {
         let overlap: std::collections::HashSet<String> =
             std::collections::HashSet::from(["bd-b".to_string()]);
         // at/over the nudge threshold — still suppressed
-        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 2, &overlap);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &states,
+            2,
+            &overlap,
+            &empty_leases(),
+        );
         assert!(
             actions.is_empty(),
             "no claim nudge for an overlap wait: {actions:?}"
@@ -13168,7 +13408,15 @@ mod tests {
         let states = vec![st("oc-1", "idle")];
         let overlap: std::collections::HashSet<String> =
             std::collections::HashSet::from(["bd-b".to_string()]);
-        let actions = claim_watch_step(&mut watch, &[], &inprogress, &states, 2, &overlap);
+        let actions = claim_watch_step(
+            &mut watch,
+            &[],
+            &inprogress,
+            &states,
+            2,
+            &overlap,
+            &empty_leases(),
+        );
         assert!(
             actions.is_empty(),
             "no close nudge / redispatch for an overlap wait: {actions:?}"
@@ -13189,7 +13437,15 @@ mod tests {
         let ready = vec![rb_wave("bd-w1", 1), rb_wave("bd-w2", 2)];
         let states = vec![st("oc-1", "working")];
         let overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 1, &overlap);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &states,
+            1,
+            &overlap,
+            &empty_leases(),
+        );
         assert!(
             actions.is_empty(),
             "no claim nudge for a wave-gated wait: {actions:?}"
@@ -13212,7 +13468,15 @@ mod tests {
         let states = vec![st("oc-1", "working")];
         let overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
         // nudge_after=1 → immediate claim nudge for the non-overlap bead
-        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 1, &overlap);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &states,
+            1,
+            &overlap,
+            &empty_leases(),
+        );
         assert!(
             matches!(&actions[0], ClaimWatchAction::NudgeClaim { bead_id, .. }
                 if bead_id == "bd-a"),
