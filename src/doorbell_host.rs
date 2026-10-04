@@ -781,10 +781,13 @@ async fn run_embedded_async(
         doorbell_rt::interval_ticker("ack-sla", sla_tx, Duration::from_secs(60), || {
             BrainMsg::AckSlaTick { now: unix_now() }
         });
-    // Beads-ledger producer (bd-asr2.15, D7, flag-gated): read-only WAL
-    // poll emitting Fact Msgs. Repo root is the spawn-time cwd.
+    // Beads-ledger producer (bd-asr2.15, D7; ready-bead lane
+    // bd-ux-papercuts-t2u5): read-only WAL poll emitting Fact Msgs; default
+    // on, `beads_poller = false` opts out. Repo resolution is flywheel's own
+    // `project_dir` (absolute key = the repo, slug = workspace_root/<slug>) —
+    // never the process cwd, which says nothing about the project.
     let _beads_poller = cfg.doorbell_beads_poller().then(|| {
-        let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let repo = crate::project_dir(&cfg, project);
         doorbell_rt::pollers::spawn_beads_poller(tx.clone(), repo)
     });
     // External re-ring driver (E9, bd-4gco, flag-gated): read-only

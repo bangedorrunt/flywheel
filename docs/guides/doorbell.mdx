@@ -43,6 +43,7 @@ module. The live edges that feed `workspace::tick` (and the doorbell plane) are:
 | **Herdr** | `Msg::HerdrStatus` | Pane status observations (feeds presence verdict) |
 | **AckSla** | `Msg::AckSlaTick` | Ack SLA clock payload (clock enters as Msg only) |
 | **InboxSweep** | `Msg::InboxItems` / `Msg::InboxRows` / `FetchInbox` Cmd | Mail inbox drain → classified wakes |
+| **BeadsPoller** | `Msg::Fact` (`bead <id> ready`, hold expiry, status flips) | Read-only br sqlite poll (`sqlite3 --readonly`, 30s cadence). Ready-bead appearances ring an idle captain, so a supervisor is woken when work lands; runs in both the embedded host and the daemon, resolving the repo from the host's project key (absolute key exact, slug under `~/workspace`). Default on — `beads_poller = false` opts out. |
 
 **Presence is not a Sensor GenServer and not a primary sensor Msg arm.**
 Reachability / injectable|busy|dead is derived via **Herdr status + roles**

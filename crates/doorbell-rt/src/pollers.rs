@@ -6,11 +6,17 @@
 //! `br` command), so a sleepless daemon would miss them. This sensor polls
 //! the br sqlite read-only and emits `Fact` Msgs into the brain.
 //!
-//! READ-ONLY CONTRACT: `sqlite3 --readonly` + SELECT only. The poller never
-//! writes the ledger — no INSERT/UPDATE/DELETE/DROP/DDL, no `br` mutating
-//! verb, no JSONL flush. WAL + busy_timeout make concurrent reads safe.
+//! READ-ONLY CONTRACT: SELECT only, and the db is never modified — no
+//! INSERT/UPDATE/DELETE/DROP/DDL, no `br` mutating verb, no JSONL flush, no
+//! sidecar creation. WAL + busy_timeout make concurrent reads safe.
 //! `READONLY_ARGV0` + [`READONLY_PREFIXES`] pin the invocation shape; the
 //! allowlist test fails the build if a write verb ever appears.
+//!
+//! The open shape has TWO faces (bd-ux-papercuts-t2u5, found live): with a
+//! live `-wal`, plain `--readonly`; with no `-wal` (a cleanly closed br —
+//! the common state), SQLite REFUSES a read-only open because it may not
+//! create the missing `-shm`, so the poll reads through `immutable=1` —
+//! exact when no wal exists, stale if one did, hence the gate.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,8 +33,11 @@ pub const READONLY_PREFIXES: &[&str] = &["SELECT ", "select ", ".timeout "];
 /// Holds query: open captain holds with expiry (S1/E10/E17).
 pub const HOLDS_QUERY: &str = "SELECT issue_id, corr, expires_at FROM captain_holds WHERE open = 1";
 
-/// Issue change feed: id + status + updated stamp.
-pub const ISSUES_QUERY: &str = "SELECT id, status, updated_at FROM issues";
+/// Issue change feed: id + status + updated stamp + blocked flag. The join
+/// is the `br ready` predicate (open AND not in the blocked cache) — the
+/// poller reads the SAME materialized view `br ready` reads, so a ready
+/// appearance cannot disagree with the board.
+pub const ISSUES_QUERY: &str = "SELECT i.id, i.status, i.updated_at, (b.issue_id IS NOT NULL) FROM issues i LEFT JOIN blocked_issues_cache b ON b.issue_id = i.id";
 
 /// One open hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,15 +53,29 @@ pub struct IssueRow {
     pub id: String,
     pub status: String,
     pub updated_at: String,
+    /// in `blocked_issues_cache` (the same gate `br ready` applies)
+    pub blocked: bool,
+}
+
+/// Last-seen issue state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueState {
+    pub status: String,
+    pub updated_at: String,
+    pub blocked: bool,
 }
 
 /// Poller snapshot: previous pass state for change-detect. Hold rows carry
 /// the pass timestamp they were last seen at, so "newly expired" means
 /// expired-now-but-not-expired-then (never re-fires, never misses).
+///
+/// `primed` is the baseline gate: the first pass only records the board
+/// (a daemon restart must not re-announce every open bead as "ready").
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub holds: BTreeMap<(String, String), (Option<String>, String)>,
-    pub issues: BTreeMap<String, (String, String)>,
+    pub issues: BTreeMap<String, IssueState>,
+    pub primed: bool,
 }
 /// Deltas that become `Fact` summaries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,14 +84,21 @@ pub struct LedgerDelta {
     pub expired_holds: Vec<(String, String)>,
     /// Issues whose status changed since the last pass.
     pub status_changed: Vec<(String, String, String)>,
+    /// Ready-bead appearances (bd-ux-papercuts-t2u5): a bead that was not
+    /// ready before and is ready now — newly present (open, unblocked) or
+    /// unblocked in place. Gated by `primed` so only real transitions fire.
+    pub ready_appeared: Vec<String>,
     /// Issues updated (any field) since the last pass, excluding pure
-    /// status flips already reported above.
+    /// status flips and ready appearances already reported above.
     pub touched: Vec<String>,
 }
 
 impl LedgerDelta {
     pub fn is_empty(&self) -> bool {
-        self.expired_holds.is_empty() && self.status_changed.is_empty() && self.touched.is_empty()
+        self.expired_holds.is_empty()
+            && self.status_changed.is_empty()
+            && self.ready_appeared.is_empty()
+            && self.touched.is_empty()
     }
 
     /// Fact summaries for the brain (one per delta; the tick classifies).
@@ -79,6 +109,9 @@ impl LedgerDelta {
         }
         for (id, from, to) in &self.status_changed {
             out.push(format!("bead {id} status {from} -> {to}"));
+        }
+        for id in &self.ready_appeared {
+            out.push(format!("bead {id} ready"));
         }
         for id in &self.touched {
             out.push(format!("bead {id} updated"));
@@ -117,22 +150,44 @@ pub fn detect_changes(
             .insert(key, (h.expires_at.clone(), now_rfc3339.to_string()));
     }
     for issue in issues {
-        if let Some((old_status, old_updated)) = prev.issues.get(&issue.id) {
-            if old_status != &issue.status {
-                delta.status_changed.push((
-                    issue.id.clone(),
-                    old_status.clone(),
-                    issue.status.clone(),
-                ));
-            } else if old_updated != &issue.updated_at {
-                delta.touched.push(issue.id.clone());
+        let ready_now = issue.status == "open" && !issue.blocked;
+        match prev.issues.get(&issue.id) {
+            Some(old) => {
+                if old.status != issue.status {
+                    delta.status_changed.push((
+                        issue.id.clone(),
+                        old.status.clone(),
+                        issue.status.clone(),
+                    ));
+                } else if old.updated_at != issue.updated_at {
+                    delta.touched.push(issue.id.clone());
+                }
+                // A bead that was blocked and is now open+unblocked BECAME
+                // ready. One transition, one fact: a ready appearance
+                // outranks the weaker `updated` touch.
+                if prev.primed && ready_now && old.blocked && old.status == issue.status {
+                    delta.ready_appeared.push(issue.id.clone());
+                    delta.touched.retain(|t| t != &issue.id);
+                }
+            }
+            // New row: a fresh open+unblocked bead is a ready appearance.
+            None => {
+                if prev.primed && ready_now {
+                    delta.ready_appeared.push(issue.id.clone());
+                }
+                // First pass (`!primed`) stays silent: it is the baseline.
             }
         }
         next.issues.insert(
             issue.id.clone(),
-            (issue.status.clone(), issue.updated_at.clone()),
+            IssueState {
+                status: issue.status.clone(),
+                updated_at: issue.updated_at.clone(),
+                blocked: issue.blocked,
+            },
         );
     }
+    next.primed = true;
     (next, delta)
 }
 
@@ -158,9 +213,24 @@ pub fn poll_once(db_path: &Path) -> Option<(Vec<OpenHold>, Vec<IssueRow>)> {
             id: cols.next().unwrap_or("").to_string(),
             status: cols.next().unwrap_or("").to_string(),
             updated_at: cols.next().unwrap_or("").to_string(),
+            blocked: cols.next().map(|c| c.trim() == "1").unwrap_or(false),
         });
     }
     Some((holds, issues))
+}
+
+/// `<db>-wal`, the sidecar whose presence decides the open shape.
+fn wal_sidecar(db_path: &Path) -> PathBuf {
+    let mut s = db_path.as_os_str().to_os_string();
+    s.push("-wal");
+    PathBuf::from(s)
+}
+
+/// Percent-escape the three characters that would break a `file:` URI.
+fn uri_escape(path: &str) -> String {
+    path.replace('%', "%25")
+        .replace('?', "%3F")
+        .replace('#', "%23")
 }
 
 fn readonly_query(db_path: &Path, sql: &str) -> Option<String> {
@@ -168,12 +238,23 @@ fn readonly_query(db_path: &Path, sql: &str) -> Option<String> {
         READONLY_PREFIXES.iter().any(|p| sql.starts_with(p)),
         "poller query outside the read-only allowlist: {sql}"
     );
-    let out = std::process::Command::new(READONLY_ARGV0)
-        .arg("--readonly")
-        .arg(db_path)
-        .arg(sql)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(READONLY_ARGV0);
+    if wal_sidecar(db_path).exists() {
+        // Live (or un-recovered) WAL: read through it plainly. A plain
+        // read-only open still works because a writer's -shm exists.
+        cmd.arg("--readonly").arg(db_path);
+    } else {
+        // Cleanly closed WAL db: the wal is gone, so every committed page
+        // lives in the main file, and `--readonly` cannot open it at all
+        // (SQLite may not create the missing -shm — found live 2026-10-04).
+        // immutable=1 reads exactly this state; it would read STALE with a
+        // wal present, which is why it is gated on the sidecar above.
+        cmd.arg(format!(
+            "file:{}?immutable=1",
+            uri_escape(&db_path.to_string_lossy())
+        ));
+    }
+    let out = cmd.arg(sql).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -183,6 +264,21 @@ fn readonly_query(db_path: &Path, sql: &str) -> Option<String> {
 pub fn beads_db(repo: &Path) -> Option<PathBuf> {
     let p = repo.join(".beads").join("beads.db");
     p.exists().then_some(p)
+}
+
+/// Repo dir for the beads poller when hosting `project` (bd-ux-papercuts-t2u5).
+/// An absolute project key IS the repo (flywheel's `project_dir` shape); a
+/// slug resolves under `workspace_root`, where flywheel's default config
+/// (`~/workspace`) puts it. `None` = no board to poll — callers skip the
+/// sensor and say so, never point it at an unrelated cwd.
+pub fn beads_repo_for(project: &str, workspace_root: &Path) -> Option<PathBuf> {
+    let p = Path::new(project);
+    let cand = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        workspace_root.join(project)
+    };
+    cand.join(".beads").is_dir().then_some(cand)
 }
 /// Spawn the 30s poll loop (D7): read-only ledger poll, Fact Msgs into
 /// the brain. `br` is never written — see the read-only contract above.
@@ -376,20 +472,30 @@ mod tests {
     fn status_flips_and_touches_detected() {
         let prev = Snapshot {
             holds: Default::default(),
-            issues: [("bd-a".to_string(), ("open".to_string(), "t0".to_string()))]
-                .into_iter()
-                .collect(),
+            issues: [(
+                "bd-a".to_string(),
+                IssueState {
+                    status: "open".to_string(),
+                    updated_at: "t0".to_string(),
+                    blocked: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            primed: true,
         };
         let issues = vec![
             IssueRow {
                 id: "bd-a".into(),
                 status: "closed".into(),
                 updated_at: "t1".into(),
+                blocked: false,
             },
             IssueRow {
                 id: "bd-b".into(),
                 status: "open".into(),
                 updated_at: "t1".into(),
+                blocked: false,
             },
         ];
         let (snap, d) = detect_changes(&prev, &[], &issues, "t9");
@@ -398,15 +504,136 @@ mod tests {
             vec![("bd-a".to_string(), "open".to_string(), "closed".to_string())]
         );
         assert!(d.touched.is_empty(), "new rows are not touches");
+        assert_eq!(
+            d.ready_appeared,
+            vec!["bd-b".to_string()],
+            "a fresh open+unblocked row is a ready appearance"
+        );
         // Second pass with only a timestamp bump: touch, not flip.
         let issues2 = vec![IssueRow {
             id: "bd-a".into(),
             status: "closed".into(),
             updated_at: "t2".into(),
+            blocked: false,
         }];
         let (_snap2, d2) = detect_changes(&snap, &[], &issues2, "t9");
         assert!(d2.status_changed.is_empty());
         assert_eq!(d2.touched, vec!["bd-a".to_string()]);
+    }
+
+    fn issue(id: &str, status: &str, updated_at: &str, blocked: bool) -> IssueRow {
+        IssueRow {
+            id: id.into(),
+            status: status.into(),
+            updated_at: updated_at.into(),
+            blocked,
+        }
+    }
+
+    // bd-ux-papercuts-t2u5: the ready-bead sensor. The first pass is a
+    // baseline (no restart spam); afterwards a new open+unblocked bead is
+    // exactly one `bead <id> ready` fact, and it never re-fires.
+    #[test]
+    fn ready_appearance_after_prime_fires_once() {
+        let seed = vec![issue("bd-old", "closed", "t0", false)];
+        let (snap, d0) = detect_changes(&Snapshot::default(), &[], &seed, "t1");
+        assert!(d0.is_empty(), "first pass primes silently: {d0:?}");
+        assert!(snap.primed);
+        let board = vec![
+            issue("bd-old", "closed", "t0", false),
+            issue("bd-new", "open", "t2", false),
+        ];
+        let (snap2, d1) = detect_changes(&snap, &[], &board, "t2");
+        assert_eq!(d1.ready_appeared, vec!["bd-new".to_string()]);
+        assert_eq!(d1.fact_summaries(), vec!["bead bd-new ready".to_string()]);
+        // Same board next pass: silence — an appearance is a transition.
+        let (_snap3, d2) = detect_changes(&snap2, &[], &board, "t3");
+        assert!(d2.is_empty(), "appearance fires once: {d2:?}");
+    }
+
+    // A bead that appears BLOCKED is not ready; the moment it unblocks it is.
+    #[test]
+    fn blocked_bead_is_silent_until_unblocked() {
+        let (snap, _) = detect_changes(&Snapshot::default(), &[], &[], "t0");
+        let blocked = vec![issue("bd-x", "open", "t1", true)];
+        let (snap2, d1) = detect_changes(&snap, &[], &blocked, "t1");
+        assert!(d1.is_empty(), "blocked is not ready: {d1:?}");
+        let unblocked = vec![issue("bd-x", "open", "t2", false)];
+        let (_snap3, d2) = detect_changes(&snap2, &[], &unblocked, "t2");
+        assert_eq!(d2.ready_appeared, vec!["bd-x".to_string()]);
+        assert!(d2.touched.is_empty(), "one transition, one fact: {d2:?}");
+        assert_eq!(d2.fact_summaries(), vec!["bead bd-x ready".to_string()]);
+    }
+
+    // The first pass over an existing board must not announce it as new.
+    #[test]
+    fn prime_pass_does_not_announce_existing_board() {
+        let board = vec![
+            issue("bd-a", "open", "t0", false),
+            issue("bd-b", "open", "t0", false),
+            issue("bd-c", "closed", "t0", false),
+        ];
+        let (_snap, d) = detect_changes(&Snapshot::default(), &[], &board, "t1");
+        assert!(d.is_empty(), "baseline is silent: {d:?}");
+    }
+
+    #[test]
+    fn beads_repo_for_absolute_key_is_the_repo() {
+        let root = std::env::temp_dir().join(format!("dbll-repo-abs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("proj");
+        std::fs::create_dir_all(repo.join(".beads")).unwrap();
+        assert_eq!(
+            beads_repo_for(repo.to_str().unwrap(), &root),
+            Some(repo.clone()),
+            "an absolute project key IS the repo"
+        );
+        assert_eq!(
+            beads_repo_for("missing", &root),
+            None,
+            "a slug without a board resolves to nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn beads_repo_for_slug_resolves_under_workspace_root() {
+        let root = std::env::temp_dir().join(format!("dbll-repo-slug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("slugproj");
+        std::fs::create_dir_all(repo.join(".beads")).unwrap();
+        assert_eq!(beads_repo_for("slugproj", &root), Some(repo.clone()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // bd-ux-papercuts-t2u5, found live: a cleanly closed br leaves a WAL db
+    // with NO -shm, and SQLite refuses a read-only open of exactly that state
+    // ("unable to open database file") — every quiet project skipped every
+    // pass. The poller must read it via immutable=1, and must not
+    // materialize sidecars doing it.
+    #[test]
+    fn readonly_query_reads_cleanly_closed_wal_db() {
+        let base = std::env::temp_dir().join(format!("dbll-walro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let db = base.join("beads.db");
+        let st = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg("PRAGMA journal_mode=WAL; CREATE TABLE t(v TEXT); INSERT INTO t VALUES('x');")
+            .status()
+            .expect("sqlite3 CLI builds the fixture");
+        assert!(st.success(), "fixture setup failed");
+        // The raw CLI leaves a size-0 -wal/-shm pair; br removes both on
+        // clean close, so the sidecar-free db is the state a quiet project
+        // actually sits in (that live state is what the daemon failed on).
+        let wal = wal_sidecar(&db);
+        let _ = std::fs::remove_file(&wal);
+        let _ = std::fs::remove_file(db.with_file_name("beads.db-shm"));
+        assert!(!wal.exists(), "fixture must model the sidecar-free state");
+        let out = readonly_query(&db, "SELECT v FROM t");
+        assert_eq!(out.as_deref(), Some("x\n"));
+        assert!(!wal.exists(), "a read must not materialize a wal");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -465,7 +692,9 @@ mod tests {
         let db = beads.join("beads.db");
         let setup = format!(
             "CREATE TABLE captain_holds(issue_id TEXT, corr TEXT, expires_at TEXT, open INTEGER);\
-             CREATE TABLE issues(id TEXT, status TEXT, updated_at TEXT);{holds_sql}{issues_sql}"
+             CREATE TABLE issues(id TEXT, status TEXT, updated_at TEXT);\
+             CREATE TABLE blocked_issues_cache(issue_id TEXT PRIMARY KEY, blocked_by TEXT NOT NULL DEFAULT '');\
+             {holds_sql}{issues_sql}"
         );
         let st = std::process::Command::new("sqlite3")
             .arg(&db)
