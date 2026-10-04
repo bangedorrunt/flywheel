@@ -30,8 +30,8 @@ use serde_json::{Value, json};
 
 pub use toron_core::backend::error::{BackendError, BackendErrorCode};
 pub use toron_core::backend::herdr::{
-    AgentInfo, Client, HDR_PROTOCOL, PaneInfo, SendVerdict, Subscription, WaitOptions,
-    WorkspaceInfo, classify_send_result,
+    AgentInfo, AgentSessionInfo, AgentSessionRefKind, Client, HDR_PROTOCOL, PaneInfo, SendVerdict,
+    Subscription, WaitOptions, WorkspaceInfo, classify_send_result,
 };
 pub use toron_core::backend::types::AgentStatus;
 
@@ -2068,6 +2068,153 @@ pub fn read_session_log(
     Ok(out)
 }
 
+/// First line of `text`, trimmed, capped at 200 chars with an ellipsis.
+/// One detail line per action — a tail is for scanning, not for dumping a
+/// whole file edit. Pure.
+fn one_line_detail(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    if first.chars().count() <= 200 {
+        return first.to_string();
+    }
+    let mut out: String = first.chars().take(200).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// One legible line for a pi tool call: the argument a human would search
+/// for (`command` for bash, `path` for file tools, `query`/`pattern` for
+/// search). Unknown argument shapes fall back to the compact JSON so an
+/// unmodeled tool still reads. Pure.
+fn pi_tail_detail(arguments: &Value) -> String {
+    let text = ["command", "path", "query", "pattern", "code", "content"]
+        .iter()
+        .find_map(|k| arguments.get(*k).and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| arguments.to_string());
+    one_line_detail(&text)
+}
+
+/// Last `n` actions from a pi session JSONL: every assistant `toolCall`
+/// part is one action. Malformed lines are skipped — a live session's last
+/// line can be torn mid-write, and that is not a reason to show nothing.
+/// Pure.
+fn pi_tail_events(raw: &str, n: usize) -> Vec<Value> {
+    let mut events: Vec<Value> = Vec::new();
+    for line in raw.lines() {
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(msg) = row.get("message") else {
+            continue;
+        };
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(parts) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            events.push(json!({
+                "ts": row.get("timestamp").and_then(Value::as_str),
+                "kind": "tool",
+                "tool": part.get("name").and_then(Value::as_str).unwrap_or("?"),
+                "detail": pi_tail_detail(part.get("arguments").unwrap_or(&Value::Null)),
+            }));
+        }
+    }
+    if events.len() > n {
+        events.split_off(events.len() - n)
+    } else {
+        events
+    }
+}
+
+/// Map already-summarized opencode session parts (oldest-first, the
+/// [`summarize_part`] shape) to tail events — the newest `n` tool calls.
+/// Pure; the SQL fetch lives in `read_agent_session_tail`.
+fn opencode_tail_parts(parts: &[Value], n: usize) -> Vec<Value> {
+    let mut events: Vec<Value> = parts
+        .iter()
+        .filter(|p| p.get("kind").and_then(Value::as_str) == Some("tool"))
+        .map(|p| {
+            let input = p
+                .get("state")
+                .and_then(|s| s.get("input"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            json!({
+                // opencode parts carry no per-row timestamp in the summary
+                // shape; null reads "not recorded", never a fabricated now.
+                "ts": Value::Null,
+                "kind": "tool",
+                "tool": p.get("tool").and_then(Value::as_str).unwrap_or("?"),
+                "detail": one_line_detail(input),
+            })
+        })
+        .collect();
+    if events.len() > n {
+        events.split_off(events.len() - n)
+    } else {
+        events
+    }
+}
+
+/// bd-swarm-cockpit-pczs: the last `n` actions from the session herdr
+/// reports for a pane (`agent_session`). `path` sessions (pi JSONL) read the
+/// file; `id` sessions (opencode) run one DESC LIMIT query against the
+/// structured store. Both produce the same rows: `{ts, kind, tool, detail}`.
+/// A missing/unreadable source is a loud error, never a silent empty tail.
+pub fn read_agent_session_tail(session: &AgentSessionInfo, n: usize) -> Result<Value> {
+    let events = match session.kind {
+        AgentSessionRefKind::Path => {
+            let raw = std::fs::read_to_string(&session.value)
+                .map_err(|e| anyhow!("session {} at {}: {e}", session.agent, session.value))?;
+            pi_tail_events(&raw, n)
+        }
+        AgentSessionRefKind::Id => {
+            let db = opencode_db_path();
+            if !db.exists() {
+                bail!(
+                    "opencode session store not found: {} (run opencode first)",
+                    db.display()
+                );
+            }
+            // Overscan: text/reasoning parts are dropped below, so fetch more
+            // than n rows (bounded) before filtering to the newest tool calls.
+            let limit = n.saturating_mul(8).clamp(1, 400);
+            let raw = sqlite_json(
+                &db,
+                &format!(
+                    "SELECT data FROM part WHERE session_id='{}' \
+                     ORDER BY time_created DESC, id DESC LIMIT {limit}",
+                    sq(&session.value)
+                ),
+            )?;
+            let mut parts: Vec<Value> = raw
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|row| row["data"].as_str().and_then(summarize_part))
+                .collect();
+            parts.reverse(); // SQL walked newest-first
+            opencode_tail_parts(&parts, n)
+        }
+    };
+    Ok(json!({
+        "agent": session.agent,
+        "source": session.source,
+        "session": session.value,
+        "events": events,
+    }))
+}
+
 /// H4 (bd-harness-alt-screen-reads): alt-screen transcript read primitives.
 /// Two adapters implement this — `ClientAltScreenRead` (cmd_view) and
 /// `BackendAltScreenRead` (loop diagnostics) — so the shared ladder drives
@@ -2519,6 +2666,104 @@ mod session_log_tests {
     fn tool_without_state_renders_question_mark() {
         let v = summarize_part(r#"{"type":"tool","tool":"edit"}"#).unwrap();
         assert_eq!(v["state"]["status"], "?");
+    }
+}
+
+/// bd-swarm-cockpit-pczs: pi session JSONL -> recent tool-call actions.
+#[cfg(test)]
+mod pi_tail_tests {
+    use super::{opencode_tail_parts, pi_tail_detail, pi_tail_events, read_agent_session_tail};
+
+    const FIXTURE: &str = concat!(
+        r#"{"type":"session","id":"s1","cwd":"/tmp"}"#,
+        "\n",
+        r#"{"type":"message","timestamp":"2026-10-04T07:40:32.981Z","message":{"role":"user","content":[{"type":"text","text":"go"}]}}"#,
+        "\n",
+        r#"{"type":"message","timestamp":"2026-10-04T07:40:33.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"toolCall","name":"bash","arguments":{"command":"git status\n# not this line"}}]}}"#,
+        "\n",
+        r#"{"type":"message","timestamp":"2026-10-04T07:40:48.681Z","message":{"role":"assistant","content":[{"type":"toolCall","name":"edit","arguments":{"path":"src/lib.rs","edits":[]}}]}}"#,
+        "\n",
+        "not json at all",
+        "\n",
+        r#"{"type":"message","timestamp":"2026-10-04T07:41:00.000Z","message":{"role":"assistant","content":[{"type":"toolCall","name":"mystery_tool","arguments":{"blob":"x"}}]}}"#,
+        "\n",
+        r#"{"type":"message","timestamp":"2026-10-04T07:41:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","name":"where","arguments":{"query":"find me"}}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn pi_tail_events_takes_the_last_n_and_skips_non_actions() {
+        let events = pi_tail_events(FIXTURE, 10);
+        assert_eq!(events.len(), 4, "3 toolCalls + 1 unknown-arg toolCall");
+        assert_eq!(events[0]["tool"], "bash");
+        assert_eq!(events[0]["detail"], "git status", "first line only");
+        assert_eq!(events[0]["ts"], "2026-10-04T07:40:33.000Z");
+        assert_eq!(events[1]["tool"], "edit");
+        assert_eq!(events[1]["detail"], "src/lib.rs");
+        assert_eq!(events[2]["tool"], "mystery_tool");
+        assert!(
+            events[2]["detail"].as_str().unwrap().contains("\"blob\""),
+            "unknown args fall back to compact JSON: {}",
+            events[2]["detail"]
+        );
+        assert_eq!(events[3]["detail"], "find me");
+        let last2 = pi_tail_events(FIXTURE, 2);
+        assert_eq!(last2.len(), 2);
+        assert_eq!(last2[0]["tool"], "mystery_tool", "last n wins");
+    }
+
+    #[test]
+    fn pi_tail_detail_truncates_and_handles_missing_args() {
+        let long = pi_tail_detail(&serde_json::json!({"command": "x".repeat(500)}));
+        assert_eq!(long.chars().count(), 201, "200 chars + ellipsis");
+        assert!(long.ends_with('\u{2026}'));
+        assert_eq!(pi_tail_detail(&serde_json::json!({})), "{}");
+        assert_eq!(pi_tail_detail(&serde_json::Value::Null), "null");
+    }
+
+    fn path_session(p: &str) -> super::AgentSessionInfo {
+        super::AgentSessionInfo {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            kind: super::AgentSessionRefKind::Path,
+            value: p.into(),
+        }
+    }
+
+    #[test]
+    fn read_agent_session_tail_reads_a_path_session_and_refuses_missing() {
+        let dir = std::env::temp_dir().join(format!("fw-pi-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, FIXTURE).expect("fixture");
+        let out = read_agent_session_tail(&path_session(path.to_str().unwrap()), 2).expect("read");
+        assert_eq!(out["agent"], "pi");
+        assert_eq!(out["events"].as_array().unwrap().len(), 2);
+        assert_eq!(out["events"][1]["tool"], "where");
+        let missing = dir.join("missing.jsonl");
+        let err = read_agent_session_tail(&path_session(missing.to_str().unwrap()), 5)
+            .expect_err("missing file must error");
+        assert!(err.to_string().contains("missing.jsonl"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// opencode parts -> tail rows: only tool parts, newest n, one line of
+    /// input. Pure — no ambient opencode DB needed.
+    #[test]
+    fn opencode_tail_parts_maps_tool_parts_and_takes_newest_n() {
+        let parts = vec![
+            serde_json::json!({"kind":"text","text":"hi"}),
+            serde_json::json!({"kind":"tool","tool":"bash","state":{"status":"completed","input":"cargo test -p flywheel\nmore","output":"ok"}}),
+            serde_json::json!({"kind":"tool","tool":"edit","state":{"status":"completed","input":"src/main.rs","output":""}}),
+        ];
+        let events = opencode_tail_parts(&parts, 5);
+        assert_eq!(events.len(), 2, "text parts are not actions");
+        assert_eq!(events[0]["tool"], "bash");
+        assert_eq!(events[0]["detail"], "cargo test -p flywheel");
+        assert_eq!(events[0]["ts"], serde_json::Value::Null);
+        let one = opencode_tail_parts(&parts, 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["tool"], "edit", "newest one");
     }
 }
 

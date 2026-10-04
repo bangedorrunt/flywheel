@@ -1,6 +1,7 @@
 //! Command-group subcommand types, split from `main.rs` (bd-qbi8).
 //! `Commands` (dispatch) stays in `main.rs`; one module per group lives here.
 
+pub(crate) mod agent;
 pub(crate) mod artifacts;
 pub(crate) mod asset;
 pub(crate) mod backend;
@@ -32,6 +33,7 @@ pub(crate) mod workflow;
 pub(crate) mod worktree;
 pub(crate) mod xproj;
 
+pub(crate) use agent::{AgentCmd, cmd_agent};
 pub(crate) use artifacts::ArtifactsCmd;
 pub(crate) use asset::{AssetCmd, cmd_asset};
 pub(crate) use backend::{BackendCmd, cmd_backend};
