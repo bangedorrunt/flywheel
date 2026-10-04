@@ -54,6 +54,8 @@ Confirmed send is default (`__send --confirm` → working|blocked landing). `--n
 
 Work mode (`--work`): `br ready` → claim/execute prompts. Claim watchdog: unclaimed-while-working gets a claim nudge; settled-unclaimed is re-dispatched; completion requires an empty claim-watch. This is the bead-backed specialization of solo loop mode, not the definition of loop mode itself.
 
+bd-claim-watch-durable-signals-mixy: the watchdog reads durable claims **first**. A live toron reservation (`reason == bead id` on the active board) suppresses the Redispatch/Resume arms — nudges still target the bead's own lane, but no second executor is dispatched over live work; the hold releases when the lease lapses. After the lease, the assignee's pane state decides (settled vs working), and the mail guard scan runs last on every redispatch. The guard's scan also reads the kind-9 steer rooms (`steer-<project>` + `steer-<bead>`), so channel claims count as peer signals.
+
 Mail wake: idle agents with urgent mail get one MAIL WAKE per message id.
 
 ## State-file contract

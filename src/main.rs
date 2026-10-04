@@ -31982,6 +31982,14 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
                 }
                 Err(e) => eprintln!("flywheel: __dispatch-guard inbox scan failed: {e}"),
             }
+            // bd-claim-watch-durable-signals-mixy (wish 3): kind-9 room
+            // claims are peer signals too — crews claim on the steer rooms
+            // (the project room + the bead's own ADR-0020 room) and those
+            // posts never reach the mail-thread scan above. Best-effort:
+            // any failure contributes zero signals.
+            let mut signals: Vec<Value> = facts["signals"].as_array().cloned().unwrap_or_default();
+            signals.extend(channel_guard_signals(&key, bead, mail.agent_name()));
+            facts["signals"] = json!(signals);
         }
     }
     // Receipts freshness: newest mtime among receipt files naming this bead.
@@ -32007,6 +32015,131 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
     }
     print_json(&facts);
     Ok(())
+}
+
+/// bd-claim-watch-durable-signals-mixy (wish 3): classify kind-9 room
+/// messages as dispatch-guard peer signals. Reads `steer-<project>` plus the
+/// bead's own `steer-<bead>` room (ADR-0020) through the toron CLI — the
+/// channel plane is not on the mailbox surface, and flywheel already shells
+/// `toron` for plane-S reads (`plane_s_open_jobs_for`). The project room
+/// carries every bead so a signal must name THIS bead; the per-bead room is
+/// thread-scoped by construction. Soft-fail empty on every error (CLI
+/// missing, room absent, membership refused): a channel read must never
+/// block or spam a dispatch scan — the mail scan stays the primary channel.
+fn channel_guard_signals(project_key: &str, bead: &str, identity: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let rooms = [
+        (format!("steer-{project_key}"), true),
+        (format!("steer-{bead}"), false),
+    ];
+    for (room, require_mention) in rooms {
+        let out_cmd = std::process::Command::new("toron")
+            .args([
+                "channel",
+                "read",
+                &room,
+                "--project",
+                project_key,
+                "--as",
+                identity,
+                "--json",
+                "--limit",
+                "100",
+            ])
+            .output();
+        let Ok(o) = out_cmd else { continue };
+        if !o.status.success() {
+            continue;
+        }
+        let Ok(msgs) = serde_json::from_slice::<Value>(&o.stdout) else {
+            continue;
+        };
+        out.extend(channel_signals_from(&msgs, bead, require_mention));
+    }
+    out
+}
+
+/// Pure: project one `toron channel read --json` page into guard signals.
+/// `require_mention` = the room carries other beads' traffic (the project
+/// steer room), so a line counts only when it names THIS bead; false = the
+/// room is the bead's own (ADR-0020 `steer-<bead>`), thread-scoped by
+/// construction. `created_at` is unix SECONDS on the channel projection and
+/// the guard compares µs; a value already in µs (~1e15) passes through.
+fn channel_signals_from(msgs: &Value, bead: &str, require_mention: bool) -> Vec<Value> {
+    let Some(arr) = msgs.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in arr {
+        let Some(content) = m.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if require_mention && !content.contains(bead) {
+            continue;
+        }
+        let Some(kind) = durable::classify_guard_signal("", content, None) else {
+            continue;
+        };
+        let ts = m.get("created_at").and_then(Value::as_i64).unwrap_or(0);
+        let ts_us = if ts > 1_000_000_000_000 {
+            ts
+        } else {
+            ts.saturating_mul(1_000_000)
+        };
+        out.push(json!({ "ts_us": ts_us, "kind": kind.as_str() }));
+    }
+    out
+}
+
+#[cfg(test)]
+mod channel_guard_tests {
+    use super::*;
+
+    /// bd-claim-watch-durable-signals-mixy (wish 3): kind-9 room lines
+    /// classify into guard signals; the project room's lines must name the
+    /// bead, the per-bead room's are thread-scoped; seconds normalize to µs
+    /// and µs pass through unchanged.
+    #[test]
+    fn channel_lines_become_guard_signals() {
+        let page = json!([
+            {
+                "content": "claimed bd-12 — write-set src/durable.rs",
+                "created_at": 1_700_000_000,
+                "kind": 9
+            },
+            {
+                "content": "stand down bd-12: concurrent executor is live",
+                "created_at": 1_700_000_060,
+                "kind": 9
+            },
+            // Would classify as Handoff — but it names ANOTHER bead, so the
+            // project-room mention filter must drop it.
+            {
+                "content": "handoff bd-99: taking over",
+                "created_at": 1_700_000_120,
+                "kind": 9
+            },
+            { "content": 42, "created_at": 1 },
+            { "created_at": 1 }
+        ]);
+        let got = channel_signals_from(&page, "bd-12", true);
+        assert_eq!(got.len(), 2, "only bead-12 claim + stand-down: {got:?}");
+        assert_eq!(got[0]["kind"], "claim");
+        assert_eq!(got[0]["ts_us"], 1_700_000_000_000_000i64);
+        assert_eq!(got[1]["kind"], "stand_down");
+        // Per-bead room: thread-scoped, no mention needed.
+        let own_room =
+            json!([{ "content": "claiming — edits in src/main.rs", "created_at": 1_700_000_000 }]);
+        let got = channel_signals_from(&own_room, "bd-12", false);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["kind"], "claim");
+        // A µs timestamp passes through untouched.
+        let us = json!([{ "content": "claiming bd-12", "created_at": 1_700_000_000_000_000i64 }]);
+        let got = channel_signals_from(&us, "bd-12", true);
+        assert_eq!(got[0]["ts_us"], 1_700_000_000_000_000i64);
+        // Non-array garbage degrades to empty, never a panic.
+        assert!(channel_signals_from(&json!({"nope": true}), "bd-12", true).is_empty());
+    }
 }
 
 /// bd-a7j leaf: newest message id + author in `thread` BY `name` (or nulls).
