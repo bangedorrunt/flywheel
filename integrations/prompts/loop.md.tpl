@@ -24,7 +24,11 @@ On material mid-session triggers (new AUTHORITATIVE objective, explicit topology
    blank keeps the default; record the choice.
 
 1. SETUP: `flywheel loop-mode run <project> --work` after briefing
-   commits loop. Re-check the catalog on follow-ups; smallest vehicle
+   commits loop. If the durable run fails (nested-runtime panic, or a
+   replay storm of serialization errors), do not resume it bare: kill it,
+   `flywheel loop-mode doctor --fix`, then run supervised passes
+   (`flywheel loop-mode run <project> --work --force --once` on an interval)
+   until a clean durable run takes over. Re-check the catalog on follow-ups; smallest vehicle
    wins. Write the objective as a brief
    with GOAL / SCOPE / CONTEXT / ACCEPTANCE / VERIFY / TIMEBOX /
    FORBIDDEN / REPORT. Reserve files before edit (toron reserve acquire;
@@ -57,7 +61,9 @@ On material mid-session triggers (new AUTHORITATIVE objective, explicit topology
    artifact, not "it compiles" (prove-it-works).
 
 5. CLOSE: bead-backed -> commit-before-close with the bead id in the
-   message and the ## VERIFY output tail in the close reason. Non-bead:
+   message and the ## VERIFY output tail in the close reason. Release your
+   reservations once the close lands (`toron reserve release --project <p>
+   --as <pin>`); stale leases block the next dispatch. Non-bead:
    report the commit/result honestly. On
    TIMEBOX expiry: report partial state + exact resume point, then stop
    (outcome-oriented-execution).
