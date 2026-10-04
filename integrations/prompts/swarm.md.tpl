@@ -24,7 +24,9 @@ each lane verifiable.
    GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF; parks at SIGNOFF,
    resolve via `flywheel workflow approve`. DISPATCH briefs `--stage
    ce-execute`, never raw. Legacy alias: `workflow run wave-swarm
-   --execute`.
+   --execute`. Bind `--inputs '{"captain_pin": "<pin>"}'` so escalations
+   reach a live pin, and make sure the declared steer channel exists and
+   every spawned pin has joined it (join-before-post).
 
 2. GATE PREP: `br sync --flush-only`; clear stale assignees; commit
    tracker. Waves ONE AT A TIME; epics are gates.
@@ -42,7 +44,7 @@ each lane verifiable.
 5. BRIEF: lane dispatch authoritative. Peer wakes are signals, not
    tasks; peer-aware wake rides the doorbell.
    Loop is bead dispatch, not wake. Per lane: bead ids, files, pin,
-   claim, 4min reserve, build slot, TDD RED first, commit-before-close
+   claim with the pin as assignee, 4min reserve, build slot, TDD RED first, commit-before-close
    with VERIFY tail, stage ONLY reserved paths, on [doorbell] pull
    then act, blocked >10m mail captain, TIMEBOX 90m partial report,
    prove-it-works. Every dispatch ANNOUNCES its
