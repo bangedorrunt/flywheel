@@ -108,6 +108,12 @@ pub(crate) enum LoopCmd {
         /// agents to manage (forwarded to `loop-mode run`)
         #[arg(long, default_value = "all")]
         to: String,
+        /// bd-supervise-dead-stop-escalation-rweq: dead-stop window in minutes.
+        /// No pane working AND no commit past this window with work remaining
+        /// emits ONE loud escalation line and pages the captain once, not per
+        /// pass; a recovering fleet clears it without a second.
+        #[arg(long, default_value_t = crate::durable::DEAD_STOP_DEFAULT_MINUTES)]
+        stall_minutes: u64,
     },
     /// Query the state of a durable loop invocation on the Resonate server
     Status { project: String },

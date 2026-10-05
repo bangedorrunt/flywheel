@@ -87,7 +87,8 @@ fn created_us(row: &Value) -> Option<i64> {
     row.get("created_ts_us").and_then(Value::as_i64)
 }
 
-/// What one stall probe observed. Pure inputs so the verdict is testable.
+/// What one stall probe observed. Shared with `loop-mode supervise` (rweq),
+/// so the captain watch and the supervisor judge the same fleet the same way.
 pub(crate) struct StallProbe {
     /// any bead not closed/done
     pub work_remaining: bool,
@@ -232,7 +233,7 @@ fn cmd_captain_watch(
 }
 
 /// The live stall probe: fleet + lanes from the snapshot, commit age from git.
-fn probe_stall(
+pub(crate) fn probe_stall(
     cfg: &Config,
     project: &str,
     project_dir: &std::path::Path,
@@ -260,7 +261,7 @@ fn probe_stall(
 /// Seconds since the newest commit in the project. None when git is absent or
 /// the repo has no commit — never a fabricated "very old" age, which would
 /// alarm on a repo that simply has no history.
-fn last_commit_age_secs(project_dir: &std::path::Path, now: u64) -> Option<u64> {
+pub(crate) fn last_commit_age_secs(project_dir: &std::path::Path, now: u64) -> Option<u64> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(project_dir)

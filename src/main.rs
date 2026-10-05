@@ -2628,7 +2628,7 @@ fn main() {
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] (bd-captain-watch-poll-exit-bbwm: the captain's poll-exit door — blocks on the captain inbox's own water and exits with a preview when new mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms. One shot: re-arm after each resume)",
-            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
+            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
@@ -3057,7 +3057,8 @@ fn main() {
                 work,
                 interval,
                 to,
-            } => cmd_loop_supervise(&cfg, project, *work, *interval, to),
+                stall_minutes,
+            } => cmd_loop_supervise(&cfg, project, *work, *interval, to, *stall_minutes),
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
@@ -20704,18 +20705,28 @@ fn cmd_loop_prune() -> Result<()> {
 /// the once-pass cadence the operator would otherwise hand-roll. Each pass is
 /// a CHILD process (`loop-mode run --once`), so a crashed pass cannot kill the
 /// supervisor; 3 consecutive failed passes stop it with one actionable line.
+///
+/// bd-supervise-dead-stop-escalation-rweq: each pass also probes for a dead
+/// stop — no pane working AND no commit for `stall_minutes` with work
+/// remaining. A dead stop is invisible to the passes (they keep firing with
+/// nothing to do), so this emits ONE loud escalation line and pages the captain
+/// once per stall, never once per pass; a recovering fleet clears it silently.
 fn cmd_loop_supervise(
-    _cfg: &Config,
+    cfg: &Config,
     project: &str,
     work: bool,
     interval_secs: u64,
     to: &str,
+    stall_minutes: u64,
 ) -> Result<()> {
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
     }
     let exe = std::env::current_exe().context("resolve the flywheel executable")?;
+    let project_dir = crate::project_dir(cfg, project);
+    let stall_secs = stall_minutes.max(1) * 60;
     let mut consecutive_failures = 0u32;
+    let mut escalated = false;
     loop {
         let argv = durable::supervise_pass_argv(project, work, to);
         let mut cmd = std::process::Command::new(&exe);
@@ -20731,7 +20742,80 @@ fn cmd_loop_supervise(
                 if work { " --work" } else { "" }
             );
         }
+        // Dead-stop probe. A stall cannot be judged from one pass's exit code
+        // (the pass SUCCEEDS against an idle fleet), so it needs its own look.
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let probe = cmd::captain::probe_stall(cfg, project, &project_dir, now, stall_secs);
+        let action = durable::dead_stop_action(&durable::DeadStopInputs {
+            work_remaining: probe.work_remaining,
+            fleet_knowable: probe.fleet_knowable,
+            any_pane_working: probe.any_pane_working,
+            last_commit_age_secs: probe.last_commit_age_secs,
+            stall_secs,
+            already_escalated: escalated,
+        });
+        match action {
+            durable::DeadStopAction::Escalate(kind) => {
+                escalated = true;
+                let age = probe.last_commit_age_secs.unwrap_or(0);
+                let line = match kind {
+                    durable::DeadStopKind::SilentPanes => format!(
+                        "loop-mode supervise: DEAD STOP in {project} — no pane working and no commit for {age}s (>{stall_secs}s) with work remaining"
+                    ),
+                    durable::DeadStopKind::StuckWorking => format!(
+                        "loop-mode supervise: STUCK PANES in {project} — pane(s) report working but nothing moved for {age}s (>{stall_secs}s) with work remaining; a working verdict is not progress"
+                    ),
+                };
+                eprintln!(
+                    "{line} — paging the captain once (a recovering fleet clears this without a second)"
+                );
+                page_captain_dead_stop(cfg, project, &line);
+            }
+            durable::DeadStopAction::Hold | durable::DeadStopAction::Wait => {}
+            durable::DeadStopAction::Clear if escalated => {
+                escalated = false;
+                eprintln!(
+                    "loop-mode supervise: {project} recovered — work moved inside the window; dead-stop probe re-armed"
+                );
+            }
+            durable::DeadStopAction::Clear => {}
+        }
         std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+    }
+}
+
+/// Page the captain about a dead stop. Best-effort but LOUD: a failed page
+/// never swallows the escalation — the line on stderr stands on its own, and
+/// the failure names itself so the operator knows the page did not land.
+fn page_captain_dead_stop(cfg: &Config, project: &str, line: &str) {
+    let Ok(key) = crate::project_dir_str(cfg, project) else {
+        eprintln!(
+            "flywheel: captain page FAILED (resolve project dir) — escalation line above stands"
+        );
+        return;
+    };
+    let mail = match crate::mail_as(cfg, &key, None) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "flywheel: captain page FAILED (mail actor: {e:#}) — escalation line above stands"
+            );
+            return;
+        }
+    };
+    let target = crate::resolve_mail_target_registry(project, "captain");
+    let thread = format!("loop-supervise-{project}");
+    match mail.send(
+        &key,
+        &[target],
+        "[loop-mode supervise] dead stop",
+        line,
+        "urgent",
+        true,
+        Some(&thread),
+    ) {
+        Ok(_) => eprintln!("flywheel: paged captain on {thread}"),
+        Err(e) => eprintln!("flywheel: captain page FAILED ({e:#}) — escalation line above stands"),
     }
 }
 
