@@ -13,6 +13,11 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 | Beadless `--work` loop resolves `complete` instantly | Nothing to claim | Create lane beads first, or drop `--work` |
 | Fresh loop parks after first poll | Resonate promise wedged | `resonate promises reject <id>`, relaunch |
 | Held beads named `WaveGate` | Wave ordering, not a stuck owner | Close the lower wave; do not nudge |
+| A pane waits for a ledger holder that does not exist; flips never land | The pane requested flips instead of checking the board | `toron reserve list`; no conformance holder means acquire it yourself (both glob levels), flip, commit, release. The ledger is a flip-scoped lease, never held between batches |
+| Sibling beads in one crate are walled off | A blanket lease (`crate/**` or `crate/*`) | Release it and re-acquire exact files; never blanket a shared crate — siblings run in it |
+| A pane reports "blocked on live peer" forever | Phantom block: no holder, or the holder is idle with nothing left to finish | Verify leases + fence + tree; when the block is phantom the captain orders the close and the pane commits and closes |
+| Durable loop-mode panics or replay-storms | Poisoned invocation | `loop-mode doctor --fix`, then `loop-mode supervise <p> [--work]` (child `--once` passes, 3-strike stop) |
+| A close refuses with "no legal PASS gate row" | The bead's legal gate differs (fence shape + band) | Read the refusal's "Legal gate names for this bead: X" and record THAT gate; `br close --dry-run` names it up front |
 | Flood guard pause | More than 3 ready beads | One-poll pause, then dispatch resumes; not an error |
 | `unknown compose token` / `unknown stage` | Installed binary predates the feature | Rebuild: `mbx +nightly-aarch64-apple-darwin install --path . --force`; verify from a non-repo cwd |
 | `no flywheel swarm` | Wrong cwd or absolute path | Run `loop-mode run <slug> --work` from the parent workspace directory |
