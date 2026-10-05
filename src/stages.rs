@@ -171,6 +171,21 @@ const SEED_PHASE: &[(&str, &str)] = &[
     ("ce-compound", "compound"),
 ];
 
+/// bd-ceiling-report-template-vz8a: the stages that hit or carry a ceiling
+/// report gain [`CEILING_REPORT_TEMPLATE`]. `ce-execute` renders it (the
+/// executor), `wave-observe` escalates it to the captain, `wave-verify`
+/// accepts the amendment close that cites it. wave-gate/wave-dispatch
+/// dispatch work and never report a ceiling, so they do not carry it.
+const CEILING_TEMPLATE_STAGES: &[&str] = &["ce-execute", "wave-observe", "wave-verify"];
+
+/// bd-ceiling-report-template-vz8a (encode-lessons-in-structure,
+/// minimize-reader-load): ONE ceiling shape for every pane, so the captain's
+/// amendment close is mechanical — cite the inventory, file each residual as
+/// its own bead, close — instead of re-deriving from free-form prose each
+/// time. An honest ceiling is a report, never a falsified close.
+const CEILING_REPORT_TEMPLATE: &str = "\
+CEILING REPORT — an honest ceiling is a report, never a falsified close. When\nthe bead's acceptance is reachable only with work outside its scope, render\nEXACTLY this shape:\n  status: CEILING\n  done:\n    - <what shipped> (receipt <path>, commit <sha>)\n  residual inventory (one row per residual):\n    - <path> — <row or function> — <what remains> — enabler: module <the module that unblocks it> | machinery <the missing machinery> | none <no new structure needed; the next pass can finish it as-is>\n  recommendation: close with amendment + residual | continue\nThe captain's amendment close reads this inventory mechanically: cite it, file\neach residual as its own bead, close. A report missing any section is\nincomplete — the ceiling is the inventory, not the refusal.";
+
 impl StageLibrary {
     /// Build the library: compiled-in defaults, then the repo DATA tier
     /// (`repo-stages.toml`, promotion-gated), the user `stages.toml`
@@ -345,6 +360,14 @@ impl StageLibrary {
         for (name, phase) in SEED_PHASE {
             if let Some(stage) = stages.get_mut(*name) {
                 stage.phase = Some(phase.to_string());
+            }
+        }
+        // bd-ceiling-report-template-vz8a: append the ONE ceiling shape to the
+        // stages that hit or carry a ceiling report.
+        for name in CEILING_TEMPLATE_STAGES {
+            if let Some(stage) = stages.get_mut(*name) {
+                stage.prompt.push_str("\n\n");
+                stage.prompt.push_str(CEILING_REPORT_TEMPLATE);
             }
         }
         let tiers: BTreeMap<String, Tier> =
@@ -1221,6 +1244,44 @@ mod tests {
             review.contains("not two witnesses"),
             "ce-review carries the independence rule"
         );
+    }
+
+    /// bd-ceiling-report-template-vz8a: ONE ceiling shape, rendered into the
+    /// stages that hit (ce-execute) and carry (wave-observe escalates,
+    /// wave-verify accepts the amendment close) a ceiling. Pinned on
+    /// `compiled_in()` — the tier this change edits; a user-tier copy
+    /// legitimately differs and `load()` would flake on machines holding one.
+    #[test]
+    fn ceiling_template_renders() {
+        // Every section the captain's amendment close reads must be in the
+        // template, or the close goes back to per-report interpretation.
+        for needle in [
+            "status: CEILING",
+            "done:",
+            "residual inventory",
+            "enabler: module",
+            "| machinery ",
+            "| none ",
+            "recommendation: close with amendment + residual",
+            "| continue",
+        ] {
+            assert!(
+                CEILING_REPORT_TEMPLATE.contains(needle),
+                "ceiling template must carry {needle:?}: {CEILING_REPORT_TEMPLATE}"
+            );
+        }
+        // The template reaches the stages that render and consume it, from
+        // the one source — a stage missing it renders the old free-form report.
+        let lib = StageLibrary::compiled_in();
+        for stage in CEILING_TEMPLATE_STAGES {
+            let prompt = lib
+                .resolve(stage)
+                .unwrap_or_else(|| panic!("{stage} resolves"));
+            assert!(
+                prompt.contains(CEILING_REPORT_TEMPLATE),
+                "{stage} must render the ceiling template"
+            );
+        }
     }
 
     /// ADR-0009: the compiled-in library exposes the ce- loop — brainstorm,
