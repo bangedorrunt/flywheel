@@ -123,16 +123,16 @@ use serde_json::{Value, json};
 #[cfg(feature = "serve")]
 use cmd::DaemonCmd;
 use cmd::{
-    AgentCmd, ArtifactsCmd, AssetCmd, BackendCmd, CheckpointCmd, CoalitionCmd, ConfigCmd, CrewCmd,
-    CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd,
-    PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd,
-    ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics, cmd_asset,
-    cmd_audit, cmd_backend, cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest,
-    cmd_doorbell_inject, cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster,
-    cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe,
-    cmd_history, cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_models, cmd_policy,
-    cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline,
-    cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
+    AgentCmd, ArtifactsCmd, AssetCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd,
+    ConfigCmd, CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd,
+    PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd,
+    ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
+    cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
+    cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject, cmd_doorbell_introduce,
+    cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
+    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
+    cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot,
+    cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
@@ -1060,6 +1060,14 @@ enum Commands {
     Crew {
         #[command(subcommand)]
         cmd: CrewCmd,
+    },
+    /// Captain door (bd-captain-watch-poll-exit-bbwm): the captain's own
+    /// poll-exit watch. `captain watch <project>` blocks on the captain inbox
+    /// water (or a stall, with --stall), prints a preview, and exits so the
+    /// harness completion callback resumes the captain. One shot — re-arm.
+    Captain {
+        #[command(subcommand)]
+        cmd: CaptainCmd,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -2619,6 +2627,7 @@ fn main() {
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
+            "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] (bd-captain-watch-poll-exit-bbwm: the captain's poll-exit door — blocks on the captain inbox's own water and exits with a preview when new mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms. One shot: re-arm after each resume)",
             "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
@@ -2652,7 +2661,7 @@ fn main() {
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set by the TYPED `wave` field (bd-wave-gate-typed-authority-27et; schema-18 has shipped — the legacy `wave-N` label is read only as the fallback, and br ready itself holds every higher wave until lower waves close) and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged (ADR-0006 D2)",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … extend with --timeout'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
-            "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
+            "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)" }
         }));
         return;
     }
@@ -2885,6 +2894,7 @@ fn main() {
             force,
         }) => cmd_interrupt(&cfg, project, to, keys, *force),
         Some(Commands::Crew { cmd }) => cmd_crew(&cfg, cmd),
+        Some(Commands::Captain { cmd }) => cmd_captain(&cfg, cmd),
         Some(Commands::View {
             project,
             to,
