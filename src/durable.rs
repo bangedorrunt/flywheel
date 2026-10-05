@@ -2283,6 +2283,80 @@ pub fn supervise_failure_count(success: bool, consecutive: u32) -> u32 {
     }
 }
 
+/// bd-supervise-dead-stop-escalation-rweq: default dead-stop window (minutes).
+/// A dead stop older than this with work remaining pages the captain.
+pub const DEAD_STOP_DEFAULT_MINUTES: u64 = 45;
+
+/// Which dead stop was observed. Both are "no artifact movement past the
+/// window with work remaining"; they differ in what the panes claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadStopKind {
+    /// No pane reads Busy — the fleet is silent.
+    SilentPanes,
+    /// Pane(s) read Busy but nothing has moved: a working verdict alone is not
+    /// progress (a pane can sit hours inside a hang and still say working).
+    StuckWorking,
+}
+
+/// One supervise dead-stop probe. Pure inputs so the verdict is testable
+/// without a live fleet, repo, or clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadStopInputs {
+    /// any bead not closed/done (ready or in_progress)
+    pub work_remaining: bool,
+    /// herdr pins were readable. False → the fleet is UNKNOWABLE; never alarm
+    /// blind (a degraded read is neither calm nor a stall).
+    pub fleet_knowable: bool,
+    pub any_pane_working: bool,
+    /// seconds since the newest commit; None when git is absent or the repo
+    /// has no commit (never a fabricated "very old" age)
+    pub last_commit_age_secs: Option<u64>,
+    pub stall_secs: u64,
+    /// this stall has already paged once — do not page again, do not stay loud
+    pub already_escalated: bool,
+}
+
+/// The supervise dead-stop decision (bd-supervise-dead-stop-escalation-rweq).
+///
+/// `Clear` is emitted when work moved inside the window (the caller resets its
+/// escalated flag, so a SECOND stall can be reported); `Escalate` fires exactly
+/// once per stall; `Hold` is every pass after that until the fleet recovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadStopAction {
+    /// Not a stall: either no work left, or a commit landed inside the window.
+    Clear,
+    /// A stall cannot be judged (no commit history, or an unreadable fleet).
+    Wait,
+    /// First sighting of this stall — emit ONE loud line and page once.
+    Escalate(DeadStopKind),
+    /// Already escalated this stall — stay silent (not one page per pass).
+    Hold,
+}
+
+pub fn dead_stop_action(i: &DeadStopInputs) -> DeadStopAction {
+    if !i.work_remaining {
+        return DeadStopAction::Clear;
+    }
+    if !i.fleet_knowable {
+        return DeadStopAction::Wait;
+    }
+    match i.last_commit_age_secs {
+        // A commit inside the window is movement: the fleet is working.
+        Some(age) if age < i.stall_secs => DeadStopAction::Clear,
+        Some(_) => {
+            if i.already_escalated {
+                DeadStopAction::Hold
+            } else if i.any_pane_working {
+                DeadStopAction::Escalate(DeadStopKind::StuckWorking)
+            } else {
+                DeadStopAction::Escalate(DeadStopKind::SilentPanes)
+            }
+        }
+        // No commit history → cannot judge; never alarm blind.
+        None => DeadStopAction::Wait,
+    }
+}
+
 #[function]
 async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
     let exe = self_exe().map_err(map_err)?;
@@ -14171,6 +14245,80 @@ mod tests {
             n = supervise_failure_count(false, n);
         }
         assert_eq!(n, SUPERVISE_MAX_CONSECUTIVE_FAILURES);
+    }
+
+    /// bd-supervise-dead-stop-escalation-rweq: a dead stop escalates EXACTLY
+    /// once (not per pass), and a recovering fleet clears it so a later stall
+    /// can escalate again.
+    #[test]
+    fn supervise_escalates_on_dead_stop() {
+        let quiet = DeadStopInputs {
+            work_remaining: true,
+            fleet_knowable: true,
+            any_pane_working: false,
+            last_commit_age_secs: Some(3_000),
+            stall_secs: 2_700,
+            already_escalated: false,
+        };
+        // First sighting: one escalation, naming the silent fleet.
+        assert_eq!(
+            dead_stop_action(&quiet),
+            DeadStopAction::Escalate(DeadStopKind::SilentPanes)
+        );
+        // Every following pass of the SAME stall is silent — not one page per pass.
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                already_escalated: true,
+                ..quiet
+            }),
+            DeadStopAction::Hold
+        );
+        // A recovering fleet (a commit inside the window) clears it — and a
+        // second stall after that escalates again.
+        let recovered = DeadStopInputs {
+            last_commit_age_secs: Some(10),
+            already_escalated: true,
+            ..quiet
+        };
+        assert_eq!(dead_stop_action(&recovered), DeadStopAction::Clear);
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                already_escalated: false,
+                ..quiet
+            }),
+            DeadStopAction::Escalate(DeadStopKind::SilentPanes)
+        );
+        // A pane that SAYS working but moved nothing is a stuck pane, not calm.
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                any_pane_working: true,
+                ..quiet
+            }),
+            DeadStopAction::Escalate(DeadStopKind::StuckWorking)
+        );
+        // No work left is never a stall.
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                work_remaining: false,
+                ..quiet
+            }),
+            DeadStopAction::Clear
+        );
+        // An unreadable fleet, or a repo with no commit history, is not judged.
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                fleet_knowable: false,
+                ..quiet
+            }),
+            DeadStopAction::Wait
+        );
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                last_commit_age_secs: None,
+                ..quiet
+            }),
+            DeadStopAction::Wait
+        );
     }
 
     // ---- bd-event-dispatch-zero-latency: route_event ----
