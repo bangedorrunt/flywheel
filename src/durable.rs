@@ -3126,6 +3126,59 @@ pub fn clear_stale_landed_for_idle(project: &str, invocation: &str, states: &[Ag
     }
 }
 
+/// bd-resume-window-lease-sweep-4sa2: default resume window (15 min). The loop
+/// re-resumed the same in-progress bead every pass (~2 min) and every pane
+/// answered with a stand-down commit — churn, not progress. One resume per
+/// (bead, pane) inside this window; the watermark is persisted so it survives
+/// across passes and processes (the in-memory `assigned` set resets per run).
+pub const RESUME_WINDOW_DEFAULT_SECS: u64 = 900;
+
+/// Has this pane already been resumed for this bead inside the window?
+/// `last_resumed_us` is the persisted watermark (None = never resumed here).
+pub fn within_resume_window(last_resumed_us: Option<i64>, now_us: i64, window_secs: u64) -> bool {
+    match last_resumed_us {
+        Some(t) => now_us.saturating_sub(t) < (window_secs as i64).saturating_mul(1_000_000),
+        None => false,
+    }
+}
+
+/// A DIFFERENT live pane holds a reservation whose reason is this bead — a lane
+/// split mid-flight, not a stall, so resuming would collide. `reservations` are
+/// `(reason, holder)` pairs; a reservation's reason IS the bead id. An empty
+/// holder (an unstamped peer row) never counts as a peer.
+pub fn peer_held(bead_id: &str, reservations: &[(String, String)], self_pane: &str) -> bool {
+    reservations
+        .iter()
+        .any(|(reason, holder)| reason == bead_id && !holder.is_empty() && holder != self_pane)
+}
+
+/// Should the loop resume this (bead, pane) now? Suppressed inside the window
+/// and whenever a peer holds the bead's paths.
+pub fn should_resume_bead(
+    last_resumed_us: Option<i64>,
+    now_us: i64,
+    window_secs: u64,
+    peer_holds: bool,
+) -> bool {
+    !peer_holds && !within_resume_window(last_resumed_us, now_us, window_secs)
+}
+
+/// Leases to release because their reason bead is CLOSED — the pure rule behind
+/// the per-pass sweep (`reserve sweep --closed-beads` equivalent). `leases` are
+/// `(handle, reason_bead_id)` pairs; the handle is what the release call needs
+/// (a path pattern here). An empty closed set, or a lease whose reason is still
+/// open, is kept. Pure so the shipped sweep and its test cannot disagree.
+pub fn closed_reason_lease_ids(
+    leases: &[(String, String)],
+    closed_beads: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    leases
+        .iter()
+        .filter(|(_, reason)| !reason.is_empty() && closed_beads.contains(reason))
+        .map(|(handle, _)| handle.clone())
+        .collect()
+}
+
 /// Escalation tier for a blocked agent (bd-blocked-escalation-protocol, A6).
 ///
 /// Tiered by elapsed time since first_blocked (Resonate `ctx.now()` i64-µs,
@@ -14245,6 +14298,80 @@ mod tests {
             n = supervise_failure_count(false, n);
         }
         assert_eq!(n, SUPERVISE_MAX_CONSECUTIVE_FAILURES);
+    }
+
+    /// bd-resume-window-lease-sweep-4sa2: resumes dedupe per (bead, pane)
+    /// inside a window, a peer-held bead draws none, and a closed-reason lease
+    /// is swept while an open one is kept.
+    #[test]
+    fn resume_window_dedupes_and_respects_peer_holds() {
+        const W: u64 = RESUME_WINDOW_DEFAULT_SECS; // 900s
+        let now = 10_000_000_000_000i64;
+        let secs = |s: i64| now - s * 1_000_000;
+
+        // (1) window dedupe per (bead, pane). N passes over an unchanged bead
+        // resume at most once per window: the first pass resumes, every pass
+        // inside the window does not, and after the window it resumes again.
+        assert!(
+            should_resume_bead(None, now, W, false),
+            "never resumed → resume"
+        );
+        assert!(
+            !should_resume_bead(Some(now), now, W, false),
+            "just resumed → no second resume this pass"
+        );
+        assert!(!should_resume_bead(Some(secs(800)), now, W, false));
+        assert!(
+            should_resume_bead(Some(secs(1_000)), now, W, false),
+            "past the window"
+        );
+        assert!(within_resume_window(Some(secs(60)), now, W));
+
+        // (2) a peer-held bead draws none, even with no prior resume.
+        let reservations = vec![
+            ("bd-peer".to_string(), "PeerPane".to_string()),
+            ("bd-mine".to_string(), "MyPane".to_string()),
+            ("bd-unstamped".to_string(), String::new()),
+        ];
+        assert!(peer_held("bd-peer", &reservations, "MyPane"));
+        assert!(
+            !peer_held("bd-peer", &reservations, "PeerPane"),
+            "own lease is not a peer"
+        );
+        assert!(!peer_held("bd-mine", &reservations, "MyPane"));
+        assert!(!peer_held("bd-other", &reservations, "MyPane"));
+        assert!(
+            !peer_held("bd-unstamped", &reservations, "MyPane"),
+            "empty holder is not a peer"
+        );
+        assert!(
+            !should_resume_bead(None, now, W, peer_held("bd-peer", &reservations, "MyPane")),
+            "peer-held → no resume"
+        );
+
+        // (3) closed-reason leases are swept; an open-reason lease is kept.
+        let leases = vec![
+            ("src/a.rs".to_string(), "bd-closed".to_string()),
+            ("src/b.rs".to_string(), "bd-open".to_string()),
+            ("docs/c.md".to_string(), "bd-closed".to_string()),
+            ("src/d.rs".to_string(), String::new()),
+        ];
+        let closed = std::collections::HashSet::from(["bd-closed".to_string()]);
+        assert_eq!(
+            closed_reason_lease_ids(&leases, &closed),
+            vec!["src/a.rs".to_string(), "docs/c.md".to_string()]
+        );
+        // One pass later the closed leases are gone, so a second sweep is a
+        // no-op (idempotent) and the open lease is untouched.
+        let after = vec![
+            ("src/b.rs".to_string(), "bd-open".to_string()),
+            ("src/d.rs".to_string(), String::new()),
+        ];
+        assert!(closed_reason_lease_ids(&after, &closed).is_empty());
+        assert!(
+            closed_reason_lease_ids(&leases, &std::collections::HashSet::new()).is_empty(),
+            "no closed set → nothing"
+        );
     }
 
     /// bd-supervise-dead-stop-escalation-rweq: a dead stop escalates EXACTLY
