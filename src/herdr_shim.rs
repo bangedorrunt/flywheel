@@ -1171,7 +1171,11 @@ pub fn wait_shell_prompt(c: &mut Client, pane_id: &str, timeout: Duration) -> bo
 }
 
 /// Recent text of a pane (`pane.read`, source=recent, format=text).
-fn pane_recent_text(c: &mut Client, pane_id: &str) -> Result<String> {
+///
+/// `pub(crate)`: the pane-wedge probe (bd-pane-wedge-detect-respawn-pnyi)
+/// reads the same tail the shell-readiness gate does, so the two can never
+/// disagree about what a pane is showing.
+pub(crate) fn pane_recent_text(c: &mut Client, pane_id: &str) -> Result<String> {
     let res = c.call(
         "pane.read",
         json!({

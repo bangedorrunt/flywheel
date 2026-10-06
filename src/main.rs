@@ -2686,7 +2686,7 @@ fn main() {
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: the captain's poll-exit door — blocks on the captain inbox's own water and exits with a preview when new mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll, so a skewed store or missing binary wakes the captain instead of a watch that cannot act. One shot: re-arm after each resume)",
-            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
+            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — herdr exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
@@ -20968,6 +20968,65 @@ fn cmd_loop_prune() -> Result<()> {
     Ok(())
 }
 
+/// bd-pane-wedge-detect-respawn-pnyi: read every registered pin's pane for a
+/// wedge — the agent process still UP, parked on a fatal error line, with no
+/// commit movement inside the window. The verdict is `durable::pane_wedge_action`
+/// (pure); this is only the live read. Soft-fail everywhere: an unreachable
+/// herdr, an empty registry, or an unreadable pane yields no wedges — never a
+/// fabricated page.
+fn probe_pane_wedges(
+    cfg: &Config,
+    project: &str,
+    project_dir: &std::path::Path,
+    now: u64,
+    quiet_secs: u64,
+    already_paged: &std::collections::HashSet<String>,
+) -> Vec<durable::PaneWedgeAction> {
+    let entries = state::load_spawn_registry(project);
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut c) = Client::connect(Some(&cfg.socket_path())) else {
+        return Vec::new();
+    };
+    let Ok(agents) = c.agent_list() else {
+        return Vec::new();
+    };
+    let commit_age = cmd::captain::last_commit_age_secs(project_dir, now);
+    let mut out = Vec::new();
+    for e in &entries {
+        let Some(pin) = e.mail_identity.as_deref().filter(|p| !p.trim().is_empty()) else {
+            continue; // unpinned rows are invisible to the wake layer too
+        };
+        let Some(a) = agents.iter().find(|a| a.pane_id == e.pane_id) else {
+            continue; // pane gone — `recover`'s door, not this probe's
+        };
+        // The kind rides on the live agent (`agent` is the harness herdr
+        // launched), so the process probe needs no profile lookup. A pane herdr
+        // reports with no kind probes as inconclusive (`None`), never alive.
+        let kind = a.agent.as_deref().unwrap_or("");
+        let alive = herdr_shim::pane_process_info(&mut c, &e.pane_id)
+            .ok()
+            .and_then(|info| herdr_shim::pane_agent_alive(&info, kind));
+        let tail = herdr_shim::pane_recent_text(&mut c, &e.pane_id).ok();
+        let action = durable::pane_wedge_action(
+            &durable::PaneWedgeInputs {
+                pin,
+                pane_id: &e.pane_id,
+                process_alive: alive,
+                recent_output: tail.as_deref(),
+                last_commit_age_secs: commit_age,
+                quiet_secs,
+            },
+            already_paged.contains(pin),
+        );
+        if !matches!(action, durable::PaneWedgeAction::Quiet) {
+            out.push(action);
+        }
+    }
+    out
+}
+
 /// `flywheel loop-mode supervise` (bd-swarm-loop-durable-panic-atlo): own
 /// the once-pass cadence the operator would otherwise hand-roll. Each pass is
 /// a CHILD process (`loop-mode run --once`), so a crashed pass cannot kill the
@@ -20994,6 +21053,10 @@ fn cmd_loop_supervise(
     let stall_secs = stall_minutes.max(1) * 60;
     let mut consecutive_failures = 0u32;
     let mut escalated = false;
+    // bd-pane-wedge-detect-respawn-pnyi: pins already paged for a wedge. Kept
+    // across passes so a wedge pages ONCE; cleared when work moves again, so a
+    // later wedge (even in the same pane) pages again.
+    let mut wedge_paged: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let argv = durable::supervise_pass_argv(project, work, to);
         let mut cmd = std::process::Command::new(&exe);
@@ -21046,6 +21109,35 @@ fn cmd_loop_supervise(
                 );
             }
             durable::DeadStopAction::Clear => {}
+        }
+        // A commit inside the window re-arms the wedge probe as well, so a
+        // pane that recovers and wedges again is paged a second time.
+        if probe
+            .last_commit_age_secs
+            .is_some_and(|age| age < stall_secs)
+        {
+            wedge_paged.clear();
+        }
+        for action in probe_pane_wedges(cfg, project, &project_dir, now, stall_secs, &wedge_paged)
+        {
+            if let durable::PaneWedgeAction::Page {
+                pin,
+                pane_id,
+                error,
+            } = action
+            {
+                let line = format!(
+                    "loop-mode supervise: PANE WEDGE in {project} — {pin} ({pane_id}) is alive but \
+                     parked on: {error} (nothing committed for {}s)",
+                    probe.last_commit_age_secs.unwrap_or(0)
+                );
+                eprintln!(
+                    "{line} — paging the captain once (clear it with a fresh session: \
+                     `flywheel crew control {project} {pin} relaunch`)"
+                );
+                page_captain_dead_stop(cfg, project, &line);
+                wedge_paged.insert(pin);
+            }
         }
         std::thread::sleep(std::time::Duration::from_secs(interval_secs));
     }
