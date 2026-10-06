@@ -103,9 +103,7 @@ const PREFLIGHT_EXIT: i32 = 4;
 /// The FIRST failing check as `(name, message)`. Skips are advisory (the
 /// operation can proceed) and passes are silent; only a `Fail` arms the exit.
 /// Pure, so the arm's rule is pinned without a live herdr/resonate/toron.
-pub(crate) fn first_failing_check(
-    checks: &[preflight::Check],
-) -> Option<(&'static str, String)> {
+pub(crate) fn first_failing_check(checks: &[preflight::Check]) -> Option<(&'static str, String)> {
     checks.iter().find_map(|c| match &c.status {
         preflight::Status::Fail(msg) => Some((c.name, msg.clone())),
         _ => None,
@@ -420,8 +418,7 @@ mod tests {
         );
         // A fail-only set is still an exit even with every other check green.
         assert_eq!(
-            first_failing_check(&[Check::pass("a"), Check::fail("b", "boom")])
-                .map(|(n, _)| n),
+            first_failing_check(&[Check::pass("a"), Check::fail("b", "boom")]).map(|(n, _)| n),
             Some("b")
         );
         // Sanity: the discriminants the arm reads are the ones the renderer uses.

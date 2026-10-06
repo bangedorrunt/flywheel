@@ -1469,6 +1469,40 @@ pub fn record_resume(project: &str, bead: &str, pane: &str, now_us: i64) -> Resu
     Ok(())
 }
 
+/// bd-loop-feeds-idle-panes-rh2z: the per-pane starved-pass counter behind the
+/// idle-pane rotation's window exemption. A pane that is idle while its own
+/// stalled bead sits inside the resume window advances once per pass; a fed
+/// pane resets to zero. Persisted for the same reason as the resume window —
+/// `loop-mode supervise` runs each pass as a CHILD process, so an in-memory
+/// counter would restart every pass and the exemption would never fire.
+pub fn pane_starvation_file(project: &str) -> PathBuf {
+    state_dir()
+        .join("pane_starvation")
+        .join(format!("{}.json", state_key(project)))
+}
+
+/// Load the pane pin → starved-pass map. Missing or corrupt files yield an
+/// empty map — bookkeeping never breaks the loop.
+pub fn load_pane_starvation(project: &str) -> BTreeMap<String, u32> {
+    let raw = std::fs::read_to_string(pane_starvation_file(project)).unwrap_or_default();
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Persist the whole fleet's starvation snapshot atomically (temp + rename).
+/// Writing the whole map rather than one key means a pane that left the idle
+/// set drops out instead of carrying a stale count. Best-effort by contract:
+/// callers log and continue on error.
+pub fn record_pane_starvation(project: &str, starved: &BTreeMap<String, u32>) -> Result<()> {
+    let path = pane_starvation_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(starved)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// Keep the newest `LAST_SENT_CAP` records (FIFO: drop the oldest).
 pub fn trim_last_sent(records: &mut Vec<SentRecord>) {
     if records.len() > LAST_SENT_CAP {

@@ -38,7 +38,7 @@
 //!   written BEFORE spawning: one swarm per message id.
 //!   Pure read leaves (poll_*) need no dedup — re-running them is harmless.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3277,6 +3277,169 @@ pub fn closed_reason_lease_ids(
         .filter(|(_, reason)| !reason.is_empty() && closed_beads.contains(reason))
         .map(|(handle, _)| handle.clone())
         .collect()
+}
+
+/// bd-loop-feeds-idle-panes-rh2z: how many consecutive passes a pane may be
+/// starved — idle while its own stalled bead sits inside the resume window —
+/// before the idle-pane rotation exempts it. Two passes at the supervisor's
+/// 60s cadence is ~2 min of silence before the second nudge; the observed
+/// incident was 5 idle panes and 17 in-progress beads with zero sends for
+/// several passes, because the window (correctly) suppressed the repeat
+/// resume and nothing else fed the panes.
+pub const IDLE_PANE_EXEMPT_AFTER_PASSES: u32 = 2;
+
+/// Inputs to [`idle_pane_rotation`]. A struct (not eight positional args) so
+/// the call site names each fleet fact it passes.
+pub struct IdleRotationInputs<'a> {
+    /// Every live pane pin — the OWNER set. A bead a live pane owns is never
+    /// handed to a different pane.
+    pub live_pins: &'a [String],
+    /// The idle subset of `live_pins`, in fleet order. The rotation emits at
+    /// most one bead per entry, in this order — the caller keeps that order in
+    /// the dispatch queue so the positional pairing lands each pick on the
+    /// pane that chose it.
+    pub idle_pins: &'a [String],
+    /// In-progress beads (`br list --status in_progress`).
+    pub in_progress: &'a [ReadyBead],
+    /// Dispatchable ready beads, already narrowed by the wave gate + scope —
+    /// the rotation must not widen what the caller's filters held back.
+    pub ready: &'a [ReadyBead],
+    /// Live `(reason, holder)` reservation pairs.
+    pub peers: &'a [(String, String)],
+    /// Bead ids already queued this pass — never handed out twice.
+    pub taken: &'a [String],
+    /// Pane pin → consecutive starved passes (`state::load_pane_starvation`).
+    pub starved: &'a BTreeMap<String, u32>,
+    /// `(bead, pane)` → last-resume epoch µs (`state::load_resume_window`).
+    pub resume_window: &'a BTreeMap<String, i64>,
+    pub now_us: i64,
+    pub window_secs: u64,
+    /// Window exemptions after this many consecutive starved passes. 0 =
+    /// the window never gates an idle pane's own stalled work.
+    pub exempt_after_passes: u32,
+}
+
+/// One bead handed to one idle pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationPick {
+    pub pin: String,
+    pub bead: String,
+    /// True when the resume window was bypassed by the starvation exemption.
+    pub exempt: bool,
+}
+
+/// The rotation's output: the picks (in idle-pane order) and the starvation
+/// counters the caller persists for the next pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RotationPlan {
+    pub picks: Vec<RotationPick>,
+    /// Pane pin → consecutive starved passes. Every idle pane is represented
+    /// (0 = fed, unarmed, or never gated), so the caller can store the map as
+    /// the whole fleet's snapshot.
+    pub starved_after: BTreeMap<String, u32>,
+}
+
+/// bd-loop-feeds-idle-panes-rh2z: the idle-pane rotation.
+///
+/// The resume window stops the loop re-nudging a pane that is slow but alive.
+/// Left alone that suppression can idle the whole fleet while stalled beads
+/// sit unclaimed. Each idle pane now takes ONE bead, the first tier that
+/// matches:
+///
+/// 1. its own stalled in-progress bead (the window-gated tier),
+/// 2. a ready bead already assigned to it,
+/// 3. an unowned ready bead,
+/// 4. any other ready bead whose assignee is not a live pane.
+///
+/// Never a bead another live pane owns, never one a peer holds a reservation
+/// on (`peers` — a lane split, not a stall), never one already queued
+/// (`taken`), and never the same bead twice. A tier-1 hit inside the resume
+/// window still defers, for `exempt_after_passes` consecutive starved passes;
+/// from that pass the pick is marked `exempt` and the caller resumes it. A
+/// pane whose own stall is still gated takes NOTHING this pass — handing it
+/// unrelated free work would fork a lane that is merely slow, and the
+/// starvation counter is exactly what shortens that wait.
+///
+/// Pure: the clock arrives as `now_us`, the window as a map, no I/O.
+pub fn idle_pane_rotation(inputs: &IdleRotationInputs<'_>) -> RotationPlan {
+    let mut plan = RotationPlan::default();
+    // Ids already queued, extended with each pick, so no bead goes out twice.
+    let mut handed: BTreeSet<String> = inputs.taken.iter().cloned().collect();
+    let live: BTreeSet<&str> = inputs.live_pins.iter().map(String::as_str).collect();
+
+    for pin in inputs.idle_pins {
+        // (1) own stalled work — the only window-gated tier.
+        let own = inputs.in_progress.iter().find(|b| {
+            b.assignee.as_deref() == Some(pin.as_str())
+                && !handed.contains(&b.id)
+                && !peer_held(&b.id, inputs.peers, pin)
+        });
+        if let Some(b) = own {
+            let last = inputs
+                .resume_window
+                .get(&crate::state::resume_key(&b.id, pin))
+                .copied();
+            if !within_resume_window(last, inputs.now_us, inputs.window_secs) {
+                handed.insert(b.id.clone());
+                plan.starved_after.insert(pin.clone(), 0);
+                plan.picks.push(RotationPick {
+                    pin: pin.clone(),
+                    bead: b.id.clone(),
+                    exempt: false,
+                });
+                continue;
+            }
+            // Still inside the window. The pane is starved only while its own
+            // work stays suppressed; after N such passes the exemption fires.
+            let passes = inputs.starved.get(pin).copied().unwrap_or(0);
+            if passes >= inputs.exempt_after_passes {
+                handed.insert(b.id.clone());
+                plan.starved_after.insert(pin.clone(), 0);
+                plan.picks.push(RotationPick {
+                    pin: pin.clone(),
+                    bead: b.id.clone(),
+                    exempt: true,
+                });
+            } else {
+                plan.starved_after
+                    .insert(pin.clone(), passes.saturating_add(1));
+            }
+            continue;
+        }
+
+        // (2)-(4): free work. `free` carries the ownership rule — a bead
+        // assigned to another LIVE pane is that pane's, ready or not; an
+        // assignee that is gone is an orphan claim, not an owner.
+        let free = |b: &ReadyBead| {
+            !handed.contains(&b.id)
+                && !peer_held(&b.id, inputs.peers, pin)
+                && match b.assignee.as_deref() {
+                    None => true,
+                    Some(a) => a == pin.as_str() || !live.contains(a),
+                }
+        };
+        let pick = inputs
+            .ready
+            .iter()
+            .find(|b| b.assignee.as_deref() == Some(pin.as_str()) && free(b))
+            .or_else(|| {
+                inputs
+                    .ready
+                    .iter()
+                    .find(|b| b.assignee.is_none() && free(b))
+            })
+            .or_else(|| inputs.ready.iter().find(|b| free(b)));
+        plan.starved_after.insert(pin.clone(), 0);
+        if let Some(b) = pick {
+            handed.insert(b.id.clone());
+            plan.picks.push(RotationPick {
+                pin: pin.clone(),
+                bead: b.id.clone(),
+                exempt: false,
+            });
+        }
+    }
+    plan
 }
 
 /// Escalation tier for a blocked agent (bd-blocked-escalation-protocol, A6).
@@ -14471,6 +14634,273 @@ mod tests {
         assert!(
             closed_reason_lease_ids(&leases, &std::collections::HashSet::new()).is_empty(),
             "no closed set → nothing"
+        );
+    }
+
+    /// bd-loop-feeds-idle-panes-rh2z: the idle-pane rotation feeds a stalled
+    /// bead back through its OWN holder, never hands a bead to a non-owner,
+    /// and only exempts an own-work pair from the resume window after N
+    /// starved passes.
+    #[test]
+    fn loop_feeds_idle_panes_stalled_beads() {
+        let now = 10_000_000_000_000i64;
+        let secs = |s: i64| now - s * 1_000_000;
+        let bead = |id: &str, assignee: Option<&str>| ReadyBead {
+            id: id.into(),
+            title: format!("work {id}"),
+            assignee: assignee.map(str::to_string),
+            verify: Some("true".into()),
+            ..Default::default()
+        };
+        let pins = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pairs = |plan: &RotationPlan| {
+            plan.picks
+                .iter()
+                .map(|p| (p.pin.clone(), p.bead.clone()))
+                .collect::<Vec<_>>()
+        };
+        let empty = std::collections::BTreeMap::new();
+        let no_starved: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let window = std::collections::BTreeMap::from([(
+            crate::state::resume_key("fx-stalled", "GreenStream"),
+            secs(60),
+        )]);
+
+        // (1) acceptance: with every pane idle and a stalled bead whose holder
+        // maps to a pane, the next pass resumes EXACTLY that pane — one pick,
+        // naming the holder, with no send to the other idle pane.
+        let live = pins(&["GreenStream", "AmberMarlin"]);
+        let stalled = vec![bead("fx-stalled", Some("GreenStream"))];
+        let plan = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live,
+            idle_pins: &live,
+            in_progress: &stalled,
+            ready: &[],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            plan.picks,
+            vec![RotationPick {
+                pin: "GreenStream".into(),
+                bead: "fx-stalled".into(),
+                exempt: false,
+            }],
+            "the stalled bead goes to its own holder, and to nobody else"
+        );
+        assert_eq!(plan.starved_after.get("GreenStream"), Some(&0));
+
+        // (2) two panes, two stalls: each takes its own, in fleet order.
+        let two_stalls = vec![
+            bead("fx-g", Some("GreenStream")),
+            bead("fx-a", Some("AmberMarlin")),
+            bead("fx-extra", None),
+        ];
+        let plan = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live,
+            idle_pins: &live,
+            in_progress: &two_stalls,
+            ready: &[],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            pairs(&plan),
+            vec![
+                ("GreenStream".to_string(), "fx-g".to_string()),
+                ("AmberMarlin".to_string(), "fx-a".to_string()),
+            ],
+            "each pane resumes its own stall — never another pane's"
+        );
+
+        // (3) never a non-owner: a stalled bead owned by a THIRD live pane is
+        // handed to nobody, and a peer-held bead is skipped even when unowned.
+        let live3 = pins(&["GreenStream", "AmberMarlin", "QuietHeron"]);
+        let two_idle = pins(&["GreenStream", "AmberMarlin"]);
+        let foreign = vec![bead("fx-hers", Some("QuietHeron"))];
+        let nobody = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live3,
+            idle_pins: &two_idle,
+            in_progress: &foreign,
+            ready: &[],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert!(
+            nobody.picks.is_empty(),
+            "a bead owned by a live pane never moves to another pane"
+        );
+        let peer_lease = vec![("fx-held".to_string(), "QuietHeron".to_string())];
+        let held = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live3,
+            idle_pins: &two_idle,
+            in_progress: &[],
+            ready: &[bead("fx-held", None)],
+            peers: &peer_lease,
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert!(
+            held.picks.is_empty(),
+            "a peer-held bead draws no pick (lane split, not a stall)"
+        );
+        // A READY bead assigned to another live pane is that pane's too — the
+        // ownership rule is not just about in-progress rows.
+        let claimed = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live3,
+            idle_pins: &two_idle,
+            in_progress: &[],
+            ready: &[bead("fx-claimed", Some("QuietHeron"))],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert!(
+            claimed.picks.is_empty(),
+            "a ready bead assigned to a LIVE pane never moves to another pane"
+        );
+        // …but an assignee that is NOT in the live fleet is an orphan claim:
+        // the pane may take that work.
+        let orphaned = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live3,
+            idle_pins: &two_idle,
+            in_progress: &[],
+            ready: &[bead("fx-orphan", Some("DeadAgent"))],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            pairs(&orphaned),
+            vec![("GreenStream".to_string(), "fx-orphan".to_string())],
+            "an orphaned claim is free work, not somebody else's bead"
+        );
+
+        // (4) free work fills an otherwise-unarmed pane — one unowned ready
+        // bead feeds ONE pane, and an already-queued bead is never re-queued.
+        let fresh = vec![bead("fx-fresh", None)];
+        let plan = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &two_idle,
+            idle_pins: &two_idle,
+            in_progress: &[],
+            ready: &fresh,
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            pairs(&plan),
+            vec![("GreenStream".to_string(), "fx-fresh".to_string())],
+            "one unowned bead feeds one idle pane, once"
+        );
+        let taken = vec!["fx-fresh".to_string()];
+        let requeued = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &two_idle,
+            idle_pins: &two_idle,
+            in_progress: &stalled,
+            ready: &fresh,
+            peers: &[],
+            taken: &taken,
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            pairs(&requeued),
+            vec![("GreenStream".to_string(), "fx-stalled".to_string())],
+            "the queued bead is skipped; the pane's own stall still lands"
+        );
+
+        // (5) the window still wins — for N starved passes. A pair inside the
+        // window defers, the counter climbs, and the Nth pass exempts it.
+        let gated = |starved: &std::collections::BTreeMap<String, u32>| {
+            idle_pane_rotation(&IdleRotationInputs {
+                live_pins: &live,
+                idle_pins: &live,
+                in_progress: &stalled,
+                ready: &[],
+                peers: &[],
+                taken: &[],
+                starved,
+                resume_window: &window,
+                now_us: now,
+                window_secs: RESUME_WINDOW_DEFAULT_SECS,
+                exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+            })
+        };
+        // A 0 budget means the window never gates an idle pane's own stall.
+        let immediate = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live,
+            idle_pins: &live,
+            in_progress: &stalled,
+            ready: &[],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &window,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: 0,
+        });
+        assert_eq!(
+            immediate.picks.len(),
+            1,
+            "a 0 exemption budget resumes the pane on the first pass"
+        );
+
+        let pass1 = gated(&no_starved);
+        assert!(pass1.picks.is_empty(), "pass 1: the window still holds");
+        assert_eq!(pass1.starved_after.get("GreenStream"), Some(&1));
+        let pass2 = gated(&pass1.starved_after);
+        assert!(pass2.picks.is_empty(), "pass 2: still inside the window");
+        assert_eq!(pass2.starved_after.get("GreenStream"), Some(&2));
+        let pass3 = gated(&pass2.starved_after);
+        assert_eq!(
+            pass3.picks,
+            vec![RotationPick {
+                pin: "GreenStream".into(),
+                bead: "fx-stalled".into(),
+                exempt: true,
+            }],
+            "the Nth starved pass releases the window (a stalled pane outranks it)"
+        );
+        assert_eq!(
+            pass3.starved_after.get("GreenStream"),
+            Some(&0),
+            "a released pick ends the starvation run"
         );
     }
 
