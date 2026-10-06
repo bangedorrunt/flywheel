@@ -1747,6 +1747,32 @@ impl Mail {
         }
     }
 
+    /// bd-reserve-yield-taqf: the LIVE yield pairs `(bead_id, holder)` — a
+    /// structured stand-down (toron `reserve yield`) says "that bead is this
+    /// live pane's work", which the loop's peer-hold rule consumes as one
+    /// more peer. Read through the SAME toron-core join that `reserve yields`
+    /// prints (markers x live lease board), so a released holder stops
+    /// suppressing on its own and no caller re-derives either half.
+    ///
+    /// Ceiling: a `[mail.toron] url` remote plane carries no yield tool (the
+    /// toron-side verb is CLI-only by design), so this returns no pairs
+    /// there. That is the absence of a read, never a fabricated hold — the
+    /// same shape as an unreadable reservation board.
+    pub fn yielded_pairs(&self, project_key: &str) -> Result<Vec<(String, String)>> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let (views, _suppressed) =
+                    block_on(mailbox().reservation_yield_board(project_key))?;
+                Ok(views
+                    .into_iter()
+                    .filter(|v| v.holder_live)
+                    .map(|v| (v.bead_id, v.holder))
+                    .collect())
+            }
+            BackendKind::Remote(_) => Ok(Vec::new()),
+        }
+    }
+
     /// `renew_file_reservations`. The response keeps the `file_reservations`
     /// envelope `list_own_reservations` parses (ids are toron hex event ids).
     pub fn renew(
@@ -2779,6 +2805,76 @@ mod tests {
         });
         let out = list_own_reservations(&resp);
         assert_eq!(out[0].id, "42");
+    }
+
+    /// bd-reserve-yield-taqf: the flywheel read of toron's structured
+    /// stand-downs. Only yields whose holder is LIVE come back, a yield
+    /// naming a holder with no lease claims nothing, and a release clears the
+    /// pair with no delete path (suppression is derived from the board).
+    #[test]
+    fn yielded_pairs_reads_the_live_board() {
+        // Reads the shared mail root — serialize under the crate-wide env
+        // lock; sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = "yield-pairs-board";
+        mail.ensure_project(project).expect("ensure");
+        for name in ["BlueLake", "RoseDune"] {
+            mail.register_agent(project, name, "test", "test", "yield-read test")
+                .expect("register");
+        }
+        mail.reserve(
+            project,
+            "RoseDune",
+            &["src/**".into()],
+            3600,
+            true,
+            "lane-work",
+        )
+        .expect("RoseDune holds the lane");
+
+        // No marker yet: a live lease alone yields no pair.
+        assert!(
+            mail.yielded_pairs(project).expect("read").is_empty(),
+            "a live lease is not a stand-down"
+        );
+
+        block_on(mailbox().record_reservation_yield(
+            project,
+            "BlueLake",
+            "lane-bead",
+            "RoseDune",
+            "peer works it",
+        ))
+        .expect("record yield");
+        assert_eq!(
+            mail.yielded_pairs(project).expect("read"),
+            vec![("lane-bead".to_string(), "RoseDune".to_string())],
+            "a yield naming a live holder is a peer pair"
+        );
+
+        // A yield naming a holder who holds nothing is inert.
+        block_on(mailbox().record_reservation_yield(
+            project,
+            "BlueLake",
+            "ghost-bead",
+            "GhostPane",
+            "no lease",
+        ))
+        .expect("record yield");
+        assert_eq!(
+            mail.yielded_pairs(project).expect("read").len(),
+            1,
+            "an unresolvable holder claims nothing"
+        );
+
+        // Release: the pair clears, so the loop resumes the bead again.
+        mail.release_paths(project, "RoseDune", &["src/**".into()])
+            .expect("release");
+        assert!(
+            mail.yielded_pairs(project).expect("read").is_empty(),
+            "a released holder stops suppressing with no delete path"
+        );
     }
 
     /// bd-dsu1: the operator lock board dumps every active lease (id +

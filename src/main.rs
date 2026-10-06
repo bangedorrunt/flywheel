@@ -20674,6 +20674,17 @@ fn live_reservation_holders(cfg: &Config, project: &str) -> Vec<(String, String)
         .unwrap_or_default()
 }
 
+/// bd-reserve-yield-taqf: live `(bead, holder)` yield pairs — toron's
+/// structured stand-down (`reserve yield`), read through the same join as the
+/// lease board. Same soft-fail contract as the reservation board: a hiccup
+/// yields no pairs, and an unread board cannot invent a hold.
+fn live_yielded_pairs(cfg: &Config, project: &str) -> Vec<(String, String)> {
+    let Ok(mail) = mail_or_die(cfg) else {
+        return Vec::new();
+    };
+    mail.yielded_pairs(project).unwrap_or_default()
+}
+
 /// Unregisters this process's loop-pid entry on exit (any path). Only ever
 /// removes the entry when it still belongs to THIS pid — a newer loop that
 /// took over (--force) is never unregistered by the older process exiting
@@ -21369,7 +21380,12 @@ fn cmd_loop(
                     // re-resumed the same in-progress bead every pass and every
                     // pane answered with a stand-down commit.
                     let window = state::load_resume_window(project);
-                    let holders = live_reservation_holders(cfg, project);
+                    // bd-reserve-yield-taqf: a structured stand-down is one
+                    // more peer source, so the SAME pure peer-hold rule
+                    // decides both. A yield whose holder released drops out
+                    // on the toron side, so no clear path exists here.
+                    let mut peers = live_reservation_holders(cfg, project);
+                    peers.extend(live_yielded_pairs(cfg, project));
                     let now_us = chrono::Utc::now().timestamp_micros();
                     let resumable: Vec<durable::ReadyBead> = inprog
                         .iter()
@@ -21380,7 +21396,7 @@ fn cmd_loop(
                                 last,
                                 now_us,
                                 durable::RESUME_WINDOW_DEFAULT_SECS,
-                                durable::peer_held(&b.id, &holders, pane),
+                                durable::peer_held(&b.id, &peers, pane),
                             )
                         })
                         .cloned()
