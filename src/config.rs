@@ -336,6 +336,10 @@ pub struct LoopConfig {
     /// sends a claim-focused nudge. Default 2 (~60s at the 30s active
     /// cadence). 0/absent → the default.
     pub claim_nudge_after_polls: Option<u32>,
+    /// bd-loop-feeds-idle-panes-rh2z: consecutive passes an idle pane may be
+    /// starved (its own stalled bead inside the resume window) before the
+    /// idle-pane rotation exempts it. Absent → the default (2).
+    pub resume_exempt_passes: Option<u32>,
     /// verifier-family override (ADR-0019 Spec 4 single-family degrade):
     /// when the model registry cannot supply a second model family for the
     /// independent verifier, this family is explicitly allowed. Absent =
@@ -384,6 +388,15 @@ impl Config {
             .as_ref()
             .and_then(|l| l.claim_nudge_after_polls)
             .unwrap_or(crate::durable::DEFAULT_CLAIM_NUDGE_AFTER_POLLS)
+    }
+
+    /// Idle-pane starvation budget before the resume window is exempted
+    /// (default 2 — see [`crate::durable::IDLE_PANE_EXEMPT_AFTER_PASSES`]).
+    pub fn resume_exempt_passes(&self) -> u32 {
+        self.r#loop
+            .as_ref()
+            .and_then(|l| l.resume_exempt_passes)
+            .unwrap_or(crate::durable::IDLE_PANE_EXEMPT_AFTER_PASSES)
     }
 
     /// Verifier-family override (ADR-0019 Spec 4): absent = strict

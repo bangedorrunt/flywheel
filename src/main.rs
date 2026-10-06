@@ -634,7 +634,10 @@ mod send_dispatch_header_tests {
         // A raw nudge (no stage) is unchanged: it defers to its message text.
         let raw = dispatch_header("task-1", None, None);
         assert!(raw.contains("follow the message text"), "{raw}");
-        assert!(!raw.contains("br ready"), "raw nudges do not bootstrap: {raw}");
+        assert!(
+            !raw.contains("br ready"),
+            "raw nudges do not bootstrap: {raw}"
+        );
         // Every shape disclaims the task id as a bead id.
         for h in [&bound, &unbound, &raw] {
             assert!(h.contains("not a bead id"), "{h}");
@@ -2717,7 +2720,7 @@ fn main() {
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set by the TYPED `wave` field (bd-wave-gate-typed-authority-27et; schema-18 has shipped — the legacy `wave-N` label is read only as the fallback, and br ready itself holds every higher wave until lower waves close) and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged (ADR-0006 D2)",
-            "loop_resume_window": "loop/loop-mode run --work (bd-resume-window-lease-sweep-4sa2): an in-progress bead resumes at most ONCE per (bead, pane) in a 15-min window (the watermark persists per project under the state dir, so it survives passes and processes — the in-memory `assigned` set does not); a peer-held bead (a DIFFERENT live pane's reservation reasons to it — a lane split, not a stall) draws NO resume; each pass releases leases whose reason bead is closed via the one pure rule durable::closed_reason_lease_ids. Pure: durable::{within_resume_window, peer_held, should_resume_bead, closed_reason_lease_ids}; fence: resume_window_dedupes_and_respects_peer_holds",
+            "loop_resume_window": "loop/loop-mode run --work (resume-window sweep, bead 4sa2): an in-progress bead resumes at most ONCE per (bead, pane) in a 15-min window (the watermark persists per project under the state dir, so it survives passes and processes — the in-memory `assigned` set does not); a peer-held bead (a DIFFERENT live pane's reservation reasons to it — a lane split, not a stall) draws NO resume; each pass releases leases whose reason bead is closed via the one pure rule durable::closed_reason_lease_ids. bd-loop-feeds-idle-panes-rh2z adds the idle-pane rotation: each IDLE pane takes ONE bead — its own stalled in-progress bead first, then a ready bead assigned to it, then an unowned ready bead, then any ready bead whose assignee is not a live pane — never a bead another live pane owns or a peer holds, never one already queued, and the picks go at the HEAD of the queue in fleet order (plan_actions pairs the k-th idle agent with the k-th item, so that order is what lands the pick on the pane the rotation chose). A tier-1 hit inside the window still defers for `resume_exempt_passes` consecutive starved passes (config [loop], default 2, counters persisted via state::load_pane_starvation/record_pane_starvation because loop-mode supervise runs each pass as a child process); from that pass the pick is marked window-exempt. Pure: durable::{within_resume_window, peer_held, should_resume_bead, closed_reason_lease_ids, idle_pane_rotation}; fences: resume_window_dedupes_and_respects_peer_holds, loop_feeds_idle_panes_stalled_beads",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … extend with --timeout'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)", "4": "captain watch --preflight: the project's preflight failed (the failing check is named; bd-captain-watch-preflight-arm-snak)" }
@@ -15800,7 +15803,8 @@ fn cmd_send(
                 .filter(|a| a.workspace_id == ws_id && a.name.is_none())
             {
                 if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id)
-                    && c.agent_rename(&a.pane_id, &herdr_agent_name(&e.name)).is_ok()
+                    && c.agent_rename(&a.pane_id, &herdr_agent_name(&e.name))
+                        .is_ok()
                 {
                     rebound = true;
                 }
@@ -21118,8 +21122,7 @@ fn cmd_loop_supervise(
         {
             wedge_paged.clear();
         }
-        for action in probe_pane_wedges(cfg, project, &project_dir, now, stall_secs, &wedge_paged)
-        {
+        for action in probe_pane_wedges(cfg, project, &project_dir, now, stall_secs, &wedge_paged) {
             if let durable::PaneWedgeAction::Page {
                 pin,
                 pane_id,
@@ -21680,6 +21683,28 @@ fn cmd_loop(
             );
         }
 
+        // The fleet snapshot. Read BEFORE the --work refresh: the idle-pane
+        // rotation needs the live/idle pane split, and it must be the SAME
+        // list (same order) `plan_actions` walks when it pairs queue items
+        // with agents.
+        let agents = c
+            .agent_list()?
+            .into_iter()
+            .filter(|a| a.workspace_id == ws_id)
+            .collect::<Vec<_>>();
+        let managed: Vec<(String, AgentStatus)> = if to == "all" {
+            agents
+                .iter()
+                .map(|a| (agent_target(a).to_string(), a.agent_status))
+                .collect()
+        } else {
+            let resolved = resolve_agents(&mut c, &ws_id, project, to)?;
+            resolved
+                .iter()
+                .map(|a| (agent_target(a).to_string(), a.agent_status))
+                .collect()
+        };
+
         // bead-driven mode (parity with the durable loop): refresh the queue
         // from the tracker each poll — interrupted work first, then fresh
         // ready beads. Soft-fail: a tracker hiccup yields no new work this
@@ -21688,20 +21713,26 @@ fn cmd_loop(
             // bd-gnej: in-progress beads feed the wave-gate (an earlier
             // wave's in_progress bead holds later waves).
             let mut inprog_now: Vec<durable::ReadyBead> = Vec::new();
+            // bd-loop-feeds-idle-panes-rh2z: the resume filter, the wave gate
+            // and the idle-pane rotation all read the same window, peers and
+            // clock — resolved ONCE per pass so the three cannot disagree.
+            let window = state::load_resume_window(project);
+            // A toron reserve-yield (bead taqf) is one more peer source, so
+            // the SAME pure peer-hold rule decides both. A yield whose holder
+            // released drops out on the toron side, so no clear path exists
+            // here.
+            let mut peers = live_reservation_holders(cfg, project);
+            peers.extend(live_yielded_pairs(cfg, project));
+            let now_us = chrono::Utc::now().timestamp_micros();
+            // Prompts queued by the ordinary paths. The rotation's picks go
+            // AHEAD of them (see the rotation block at the end of this scope).
+            let mut inprog_items: Vec<String> = Vec::new();
+            let mut ready_items: Vec<String> = Vec::new();
+            // Ready beads that survived the wave/scope filters — the rotation
+            // must not re-offer what those filters held back.
+            let mut ready_now: Vec<durable::ReadyBead> = Vec::new();
             match load_inprogress_beads(cfg, project) {
                 Ok(inprog) => {
-                    // bd-resume-window-lease-sweep-4sa2: resume only what the
-                    // window and peer-holds allow. Without this the loop
-                    // re-resumed the same in-progress bead every pass and every
-                    // pane answered with a stand-down commit.
-                    let window = state::load_resume_window(project);
-                    // bd-reserve-yield-taqf: a structured stand-down is one
-                    // more peer source, so the SAME pure peer-hold rule
-                    // decides both. A yield whose holder released drops out
-                    // on the toron side, so no clear path exists here.
-                    let mut peers = live_reservation_holders(cfg, project);
-                    peers.extend(live_yielded_pairs(cfg, project));
-                    let now_us = chrono::Utc::now().timestamp_micros();
                     let resumable: Vec<durable::ReadyBead> = inprog
                         .iter()
                         .filter(|b| {
@@ -21733,7 +21764,7 @@ fn cmd_loop(
                             );
                         }
                     }
-                    queue_items.extend(to_resume);
+                    inprog_items.extend(to_resume);
                     inprog_now = inprog;
                 }
                 Err(e) => eprintln!("flywheel: br inprogress failed (continuing): {e:#}"),
@@ -21789,9 +21820,10 @@ fn cmd_loop(
                         })
                         .cloned()
                         .collect();
+                    ready_now.clone_from(&to_assign);
                     let to_assign: Vec<String> =
                         work_prompts(&[], &to_assign, &mut assigned, project);
-                    queue_items.extend(to_assign);
+                    ready_items.extend(to_assign);
                     for bead in &not_ready {
                         if not_ready_mailed.insert(bead.id.clone())
                             && let Err(e) = cmd_internal_mail_not_ready(
@@ -21818,25 +21850,78 @@ fn cmd_loop(
                 }
                 Err(e) => eprintln!("flywheel: br ready failed (continuing): {e:#}"),
             }
-        }
 
-        let agents = c
-            .agent_list()?
-            .into_iter()
-            .filter(|a| a.workspace_id == ws_id)
-            .collect::<Vec<_>>();
-        let managed: Vec<(String, AgentStatus)> = if to == "all" {
-            agents
+            // bd-loop-feeds-idle-panes-rh2z: the idle-pane rotation. The
+            // resume window plus the per-pass `assigned` set can leave every
+            // pane idle while stalled beads sit unclaimed (the incident: 17
+            // in_progress, 5 idle panes, zero sends for several passes). Each
+            // idle pane now takes ONE bead — its own stalled work first, never
+            // another live pane's — and the picks go at the HEAD of the queue
+            // in fleet order, because `plan_actions` pairs the k-th idle agent
+            // with the k-th queue item: that order is what makes the pick land
+            // on the pane the rotation chose.
+            let live_pins: Vec<String> = managed.iter().map(|(n, _)| n.clone()).collect();
+            let idle_pins: Vec<String> = managed
                 .iter()
-                .map(|a| (agent_target(a).to_string(), a.agent_status))
-                .collect()
-        } else {
-            let resolved = resolve_agents(&mut c, &ws_id, project, to)?;
-            resolved
-                .iter()
-                .map(|a| (agent_target(a).to_string(), a.agent_status))
-                .collect()
-        };
+                .filter(|(_, s)| matches!(s, AgentStatus::Idle | AgentStatus::Done))
+                .map(|(n, _)| n.clone())
+                .collect();
+            let starved = state::load_pane_starvation(project);
+            let plan = durable::idle_pane_rotation(&durable::IdleRotationInputs {
+                live_pins: &live_pins,
+                idle_pins: &idle_pins,
+                in_progress: &inprog_now,
+                ready: &ready_now,
+                peers: &peers,
+                taken: &assigned,
+                starved: &starved,
+                resume_window: &window,
+                now_us,
+                window_secs: durable::RESUME_WINDOW_DEFAULT_SECS,
+                exempt_after_passes: cfg.resume_exempt_passes(),
+            });
+            if let Err(e) = state::record_pane_starvation(project, &plan.starved_after) {
+                eprintln!("flywheel: pane-starvation record failed (continuing): {e:#}");
+            }
+            if !plan.picks.is_empty() {
+                let mut pick_items: Vec<String> = Vec::new();
+                for pick in &plan.picks {
+                    // The bead is in one of the two lists loaded above — the
+                    // rotation picked it out of them.
+                    let held = inprog_now.iter().find(|b| b.id == pick.bead);
+                    let title = held
+                        .or_else(|| ready_now.iter().find(|b| b.id == pick.bead))
+                        .map(|b| b.title.as_str())
+                        .unwrap_or("");
+                    pick_items.push(durable::brief(&pick.bead, title, project, held.is_some()));
+                    println!(
+                        "{} {} ← {}{}",
+                        dim("[loop] idle-pane"),
+                        dim(&pick.pin),
+                        dim(&pick.bead),
+                        if pick.exempt {
+                            format!(
+                                " (window-exempt: starved {} passes)",
+                                starved.get(&pick.pin).copied().unwrap_or(0)
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                    // Queue the bead once: the ordinary paths skip it next pass.
+                    // Ceiling (named, not hidden): the pairing below is
+                    // positional, so a pane that starts WORKING between the
+                    // fleet read and dispatch shifts the pick to the next idle
+                    // pane, and a failed send re-inserts its item at the front
+                    // (the existing retry path) for the rest of that pass. Both
+                    // self-correct on the next poll.
+                    assigned.push(pick.bead.clone());
+                }
+                queue_items.splice(0..0, pick_items);
+            }
+            queue_items.extend(inprog_items);
+            queue_items.extend(ready_items);
+        }
 
         // bd-w4-delete-dup-sbh8: the sync path DELEGATES to the single
         // durable planner (one plan_actions — the duplicate was deleted).
@@ -23754,8 +23839,9 @@ fn cmd_preflight(
     json: bool,
 ) -> Result<()> {
     // One mapping, shared with the captain-watch preflight arm (Mode::named).
-    let pf_mode = preflight::Mode::named(mode, work)
-        .ok_or_else(|| anyhow::anyhow!("unknown preflight mode: {mode} (steer|loop|workflow|cron)"))?;
+    let pf_mode = preflight::Mode::named(mode, work).ok_or_else(|| {
+        anyhow::anyhow!("unknown preflight mode: {mode} (steer|loop|workflow|cron)")
+    })?;
     let checks = preflight::run(cfg, pf_mode, project);
     if json {
         print_json(&preflight::to_json(&checks));

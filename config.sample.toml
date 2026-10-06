@@ -57,6 +57,9 @@
 # unknown_detect_grace_polls = 6
 # drain_grace_polls = 1
 # claim_nudge_after_polls = 2
+# resume_exempt_passes = 2        # idle-pane rotation: passes an idle pane may be
+#                                # starved (own stalled bead inside the resume window)
+#                                # before the window is exempted for it
 # verifier_family_override = ""  # absent = strict different-family rule
 
 # parent-death policy (default stop): stop | continue | adopt (recover = adopt).
