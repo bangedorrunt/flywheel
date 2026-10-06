@@ -1431,6 +1431,44 @@ pub fn save_last_sent(project: &str, records: &[SentRecord]) -> Result<()> {
     Ok(())
 }
 
+/// bd-resume-window-lease-sweep-4sa2: the (bead, pane) resume watermark — the
+/// last time the loop resumed this pane for this bead. Persisted so the window
+/// survives across passes and processes; the loop's in-memory `assigned` set
+/// resets per run, which is exactly the churn the window fixes.
+pub fn resume_window_file(project: &str) -> PathBuf {
+    state_dir()
+        .join("resume_window")
+        .join(format!("{}.json", state_key(project)))
+}
+
+/// The map key. `U+001F` (unit separator) so a bead id that happens to contain
+/// the joiner cannot collide with a different (bead, pane) pair.
+pub fn resume_key(bead: &str, pane: &str) -> String {
+    format!("{bead}\u{1f}{pane}")
+}
+
+/// Load the (bead, pane) → last-resume epoch-µs map. Missing or corrupt files
+/// yield an empty map — bookkeeping never breaks the loop.
+pub fn load_resume_window(project: &str) -> BTreeMap<String, i64> {
+    let raw = std::fs::read_to_string(resume_window_file(project)).unwrap_or_default();
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Record one resume and persist atomically (temp + rename). Best-effort by
+/// contract: callers log and continue on error.
+pub fn record_resume(project: &str, bead: &str, pane: &str, now_us: i64) -> Result<()> {
+    let mut map = load_resume_window(project);
+    map.insert(resume_key(bead, pane), now_us);
+    let path = resume_window_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&map)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// Keep the newest `LAST_SENT_CAP` records (FIFO: drop the oldest).
 pub fn trim_last_sent(records: &mut Vec<SentRecord>) {
     if records.len() > LAST_SENT_CAP {

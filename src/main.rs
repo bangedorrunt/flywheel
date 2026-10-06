@@ -2659,6 +2659,7 @@ fn main() {
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set by the TYPED `wave` field (bd-wave-gate-typed-authority-27et; schema-18 has shipped — the legacy `wave-N` label is read only as the fallback, and br ready itself holds every higher wave until lower waves close) and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged (ADR-0006 D2)",
+            "loop_resume_window": "loop/loop-mode run --work (bd-resume-window-lease-sweep-4sa2): an in-progress bead resumes at most ONCE per (bead, pane) in a 15-min window (the watermark persists per project under the state dir, so it survives passes and processes — the in-memory `assigned` set does not); a peer-held bead (a DIFFERENT live pane's reservation reasons to it — a lane split, not a stall) draws NO resume; each pass releases leases whose reason bead is closed via the one pure rule durable::closed_reason_lease_ids. Pure: durable::{within_resume_window, peer_held, should_resume_bead, closed_reason_lease_ids}; fence: resume_window_dedupes_and_respects_peer_holds",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … extend with --timeout'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)" }
@@ -20641,6 +20642,38 @@ fn work_prompts(
     prompts
 }
 
+/// bd-resume-window-lease-sweep-4sa2: live `(reason, holder)` pairs from the
+/// project's reservation board. Feeds the resume peer-hold check. A mail
+/// hiccup yields an empty board — never a loop crash, and never a false
+/// peer-hold (an unread board cannot invent a competing holder).
+fn live_reservation_holders(cfg: &Config, project: &str) -> Vec<(String, String)> {
+    let Ok(key) = project_dir_str(cfg, project) else {
+        return Vec::new();
+    };
+    let Ok(mail) = mail_or_die(cfg) else {
+        return Vec::new();
+    };
+    let Ok(v) = mail.list_active(&key, None, None) else {
+        return Vec::new();
+    };
+    v.get("reservations")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let reason = r.get("reason").and_then(Value::as_str)?.to_string();
+                    let holder = r
+                        .get("holder")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Some((reason, holder))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Unregisters this process's loop-pid entry on exit (any path). Only ever
 /// removes the entry when it still belongs to THIS pid — a newer loop that
 /// took over (--force) is never unregistered by the older process exiting
@@ -21331,7 +21364,44 @@ fn cmd_loop(
             let mut inprog_now: Vec<durable::ReadyBead> = Vec::new();
             match load_inprogress_beads(cfg, project) {
                 Ok(inprog) => {
-                    let to_resume: Vec<String> = work_prompts(&inprog, &[], &mut assigned, project);
+                    // bd-resume-window-lease-sweep-4sa2: resume only what the
+                    // window and peer-holds allow. Without this the loop
+                    // re-resumed the same in-progress bead every pass and every
+                    // pane answered with a stand-down commit.
+                    let window = state::load_resume_window(project);
+                    let holders = live_reservation_holders(cfg, project);
+                    let now_us = chrono::Utc::now().timestamp_micros();
+                    let resumable: Vec<durable::ReadyBead> = inprog
+                        .iter()
+                        .filter(|b| {
+                            let pane = b.assignee.as_deref().unwrap_or("");
+                            let last = window.get(&state::resume_key(&b.id, pane)).copied();
+                            durable::should_resume_bead(
+                                last,
+                                now_us,
+                                durable::RESUME_WINDOW_DEFAULT_SECS,
+                                durable::peer_held(&b.id, &holders, pane),
+                            )
+                        })
+                        .cloned()
+                        .collect();
+                    // Record only what this call actually queues — a bead
+                    // already assigned this run draws no prompt, so it draws no
+                    // watermark either.
+                    let to_record: Vec<(String, String)> = resumable
+                        .iter()
+                        .filter(|b| !assigned.contains(&b.id))
+                        .map(|b| (b.id.clone(), b.assignee.clone().unwrap_or_default()))
+                        .collect();
+                    let to_resume: Vec<String> =
+                        work_prompts(&resumable, &[], &mut assigned, project);
+                    for (bead, pane) in &to_record {
+                        if let Err(e) = state::record_resume(project, bead, pane, now_us) {
+                            eprintln!(
+                                "flywheel: resume-window record for {bead} failed (continuing): {e:#}"
+                            );
+                        }
+                    }
                     queue_items.extend(to_resume);
                     inprog_now = inprog;
                 }
@@ -34574,16 +34644,20 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
     // keeps today's behavior (renew all, no sweep).
     let mut released_closed: Vec<String> = Vec::new();
     if let Ok(closed) = load_closed_bead_ids(cfg, project) {
-        let stale: Vec<String> = v
+        // bd-resume-window-lease-sweep-4sa2: the ONE sweep rule
+        // (`durable::closed_reason_lease_ids`), so the shipped sweep and its
+        // test cannot disagree about which leases are stale.
+        let leases: Vec<(String, String)> = v
             .reservations
             .iter()
-            .filter(|r| {
-                bead_id_from_reason(&r.reason)
-                    .map(|id| closed.contains(id))
-                    .unwrap_or(false)
+            .map(|r| {
+                (
+                    r.path_pattern.clone(),
+                    bead_id_from_reason(&r.reason).unwrap_or("").to_string(),
+                )
             })
-            .map(|r| r.path_pattern.clone())
             .collect();
+        let stale: Vec<String> = durable::closed_reason_lease_ids(&leases, &closed);
         for path in &stale {
             match backend::run_mail(mail.release_reservations(
                 &key,
