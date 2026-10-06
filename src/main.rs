@@ -7299,8 +7299,14 @@ mod spawn_boot_reliability_tests {
         ] {
             assert!(src.contains(needle), "{needle} wired into the surface");
         }
+        // Slice the WHOLE function, like `status` below: the fixed +6000
+        // window silently stopped covering the tail once cmd_recover shrank
+        // (bd-recover-accepts-camelcase-pins-z5fz folded the match arms
+        // through `binding_state`), so the needle fell outside and this
+        // assertion read green-then-red on an unrelated edit.
         let recover = crate::tripwire::find_fn(src, "cmd_recover");
-        let recover_body = &src[recover..recover + 6000];
+        let recover_end = crate::tripwire::find_fn(src, "rebind_from_registry");
+        let recover_body = &src[recover..recover_end];
         assert!(
             recover_body.contains("doorbell::ensure_running"),
             "recover must heal dead dispatchers"
@@ -11809,6 +11815,152 @@ fn agent_mail_name(herdr_name: &str) -> String {
     adjnoun_from_fnv(h)
 }
 
+/// bd-recover-accepts-camelcase-pins-z5fz: the herdr agent-name rule, quoted
+/// from herdr's own refusal — 1..=32 chars of lowercase ASCII letters, digits,
+/// `-` or `_`.
+pub(crate) fn is_herdr_legal_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// bd-recover-accepts-camelcase-pins-z5fz: map a spawn-registry `name` to the
+/// herdr-legal agent name to restore/launch under.
+///
+/// A registry row's `name` may hold a CamelCase adjective+noun PIN — an
+/// adopted/captain pane registered by pin rather than by kind short — and
+/// passing that verbatim to `agent.start`/`agent.rename` is refused with
+/// `invalid_agent_name`, so the recovery door was unusable exactly when a
+/// swarm needed it. A name already legal passes through untouched, so a
+/// healthy pane draws no rename churn. Recovery, rebind, and the send-path
+/// auto-heal all route through this one mapping.
+///
+/// Ceiling: two pins that lowercase to the same string collide on ONE herdr
+/// name (`QuietHeron`/`quietheron`). A herdr name is a display index, not
+/// identity — the pin (`mail_identity`) is identity — so a collision is a
+/// naming nuisance, never a misroute.
+pub(crate) fn herdr_agent_name(name: &str) -> String {
+    if is_herdr_legal_name(name) {
+        return name.to_string();
+    }
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(32);
+    out
+}
+
+/// The state of one registry row against the live pane listing — the ONE rule
+/// `flywheel recover` and `flywheel rebind` act on.
+///
+/// `Intact` compares the row's name to the pane's herdr name through the SAME
+/// mapping the restore uses, so a CamelCase pin whose pane already carries the
+/// legal form reads `Intact` (no rename churn, no `invalid_agent_name`).
+/// Comparing the raw pin would read `Lost` forever and re-rename each pass —
+/// the bd-recover-accepts-camelcase-pins-z5fz bug. `None` means herdr does not
+/// list the pane at all; `Some(None)` means the pane exists with no name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingState {
+    /// pane present, name already the legal form of the row's name
+    Intact,
+    /// pane present, name is something else (restore it)
+    Lost { was: String },
+    /// pane absent from herdr's listing
+    Gone,
+}
+
+pub(crate) fn binding_state(registry_name: &str, live: Option<Option<&str>>) -> BindingState {
+    match live {
+        None => BindingState::Gone,
+        Some(Some(actual)) if actual == herdr_agent_name(registry_name) => BindingState::Intact,
+        Some(other) => BindingState::Lost {
+            was: other.unwrap_or("<null>").to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod herdr_agent_name_tests {
+    use super::{BindingState, binding_state, herdr_agent_name, is_herdr_legal_name};
+
+    /// bd-recover-accepts-camelcase-pins-z5fz: a CamelCase pin is accepted by
+    /// recover (mapped to a legal herdr name); an already-legal herdr name is
+    /// passed through byte-for-byte so a healthy pane is never renamed.
+    #[test]
+    fn recover_accepts_camelcase_pins() {
+        // The observed swarm pins: registered as `name`, illegal for herdr.
+        assert!(!is_herdr_legal_name("QuietHeron"));
+        assert_eq!(herdr_agent_name("QuietHeron"), "quietheron");
+        assert_eq!(herdr_agent_name("Buffy"), "buffy");
+        assert_eq!(herdr_agent_name("CobaltMaple"), "cobaltmaple");
+        // Already-legal names are identity (no rename churn, no case damage).
+        for legal in [
+            "flywheel-beads-oc2",
+            "crew-plan-coder",
+            "flywheel_oc3",
+            "a1",
+        ] {
+            assert!(is_herdr_legal_name(legal), "{legal} is herdr-legal");
+            assert_eq!(herdr_agent_name(legal), legal);
+        }
+        // Every output satisfies the rule herdr enforces (the only thing that
+        // makes the restore succeed): non-empty, starts lowercase, legal bytes,
+        // <=32 chars.
+        for pin in [
+            "QuietHeron",
+            "LavenderSalmon",
+            "BrightBadger",
+            "w22:p1",
+            "A Very Long CamelCase Pin Name That Exceeds Thirty Two",
+        ] {
+            let h = herdr_agent_name(pin);
+            assert!(is_herdr_legal_name(&h), "{pin} -> {h:?} must be legal");
+            assert!(h.len() <= 32, "{pin} -> {h:?} is over 32 chars");
+            assert!(
+                h.chars().next().is_some_and(|c| c.is_ascii_lowercase()),
+                "{pin} -> {h:?} must start lowercase (herdr's rule)"
+            );
+        }
+        // A non-alnum byte never survives to reach herdr.
+        assert_eq!(herdr_agent_name("w22:p1"), "w22-p1");
+
+        // The recover/rebind DECISION: a CamelCase pin whose pane already
+        // carries the legal form is INTACT — never mistaken for a lost binding
+        // (which would re-rename every pass and trip herdr's refusal).
+        assert_eq!(
+            binding_state("QuietHeron", Some(Some("quietheron"))),
+            BindingState::Intact
+        );
+        assert_eq!(
+            binding_state("flywheel-beads-oc2", Some(Some("flywheel-beads-oc2"))),
+            BindingState::Intact
+        );
+        // A pane holding a different name is lost, and names the old one.
+        assert_eq!(
+            binding_state("QuietHeron", Some(Some("flywheel-x-oc"))),
+            BindingState::Lost {
+                was: "flywheel-x-oc".to_string()
+            }
+        );
+        // A nameless pane is lost (restore), an unlisted pane is gone.
+        assert_eq!(
+            binding_state("Buffy", Some(None)),
+            BindingState::Lost {
+                was: "<null>".to_string()
+            }
+        );
+        assert_eq!(binding_state("Buffy", None), BindingState::Gone);
+    }
+}
+
 /// The legacy whitelist pair for a hash: ADJECTIVES[h % 75] +
 /// NOUNS[(h >> 32) % 132], PascalCase. This is the pair shape agent-mail
 /// validates (bd-odc) — the "legacy generator" the captain's adj+noun pins
@@ -15102,6 +15254,9 @@ fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
     let mut stale = 0usize;
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
+        // bd-recover-accepts-camelcase-pins-z5fz: `flywheel rebind` shares the
+        // recover door's CamelCase-pin mapping (herdr rejects the pin shape).
+        let hname = herdr_agent_name(name);
         let Some(a) = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id)
@@ -15109,12 +15264,12 @@ fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
             stale += 1; // pane gone (respawned) — a fresh pane carries its name
             continue;
         };
-        if a.name.as_deref() == Some(name) {
+        if binding_state(name, Some(a.name.as_deref())) == BindingState::Intact {
             ok_count += 1;
             continue;
         }
         let was = a.name.clone().unwrap_or_else(|| "<null>".to_string());
-        if let Err(e) = backend.agent_rename(pane_id, Some(name)) {
+        if let Err(e) = backend.agent_rename(pane_id, Some(&hname)) {
             eprintln!("flywheel: rebind {pane_id} → {name} failed: {e:#}");
         } else {
             rebound.push(json!({ "pane_id": pane_id, "was": was, "now": name }));
@@ -15269,14 +15424,18 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     let mut healthy = 0usize;
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
+        // bd-recover-accepts-camelcase-pins-z5fz: herdr refuses a CamelCase
+        // pin as an agent name, so restore/launch under the legal form and
+        // compare against THAT (what herdr will actually hold).
+        let hname = herdr_agent_name(name);
         let kind = recover_probe_kind(entry, &kinds);
         let live = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
-        let decision = match live {
-            Some(a) if a.name.as_deref() == Some(name) => {
+        let decision = match binding_state(name, live.map(|a| a.name.as_deref())) {
+            BindingState::Intact => {
                 // pane + binding intact — liveness-probe the process inside.
-                match probe_agent_liveness(&mut probe, pane_id, kind, name) {
+                match probe_agent_liveness(&mut probe, pane_id, kind, &hname) {
                     // provably dead: respawn in the same pane (its shell is
                     // back at the prompt). Some(false) is the bd-1np signal.
                     Some(false) => RecoverDecision::Respawn {
@@ -15313,13 +15472,11 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                     None => RecoverDecision::Healthy,
                 }
             }
-            Some(a) => {
+            BindingState::Lost { was } => {
                 // pane survived, binding lost → restore it (7rc path)
-                RecoverDecision::Rebind {
-                    was: a.name.clone().unwrap_or_else(|| "<null>".to_string()),
-                }
+                RecoverDecision::Rebind { was }
             }
-            None => RecoverDecision::Respawn {
+            BindingState::Gone => RecoverDecision::Respawn {
                 reason: "agent-gone",
             },
         };
@@ -15328,15 +15485,16 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                 healthy += 1; // pane + binding + live process
             }
             RecoverDecision::Rebind { was } => {
-                backend.agent_rename(pane_id, Some(name))?;
+                backend.agent_rename(pane_id, Some(&hname))?;
                 recovered.push(json!({
-                    "name": name, "pane_id": pane_id, "action": "rebound", "was": was
+                    "name": name, "pane_id": pane_id, "action": "rebound", "was": was,
+                    "herdr_name": hname
                 }));
             }
             RecoverDecision::Respawn { reason } => {
                 // agent died (or its process died — bd-1np) → respawn with
                 // spawn-time kind, reusing the surviving pane.
-                match start_agent_with_retry_dyn(&*backend, name, kind, pane_id, &[]) {
+                match start_agent_with_retry_dyn(&*backend, &hname, kind, pane_id, &[]) {
                     Ok(a) => recovered.push(json!({
                         "name": name, "pane_id": a.pane_id, "action": "respawned",
                         "kind": kind, "reason": reason
@@ -15408,10 +15566,14 @@ fn rebind_from_registry(
     else {
         return Ok(false); // pane gone (respawned) — normal resolution finds the new pane
     };
-    if a.name.as_deref() == Some(name) {
+    // bd-recover-accepts-camelcase-pins-z5fz: a CamelCase registry name is a
+    // legal identity but an illegal herdr name — map it, or the auto-heal
+    // itself trips `invalid_agent_name`.
+    let target = herdr_agent_name(&entry.name);
+    if a.name.as_deref() == Some(target.as_str()) {
         return Ok(true);
     }
-    backend.agent_rename(pane_id, Some(name))?;
+    backend.agent_rename(pane_id, Some(&target))?;
     Ok(true)
 }
 
@@ -15578,7 +15740,7 @@ fn cmd_send(
                 .filter(|a| a.workspace_id == ws_id && a.name.is_none())
             {
                 if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id)
-                    && c.agent_rename(&a.pane_id, &e.name).is_ok()
+                    && c.agent_rename(&a.pane_id, &herdr_agent_name(&e.name)).is_ok()
                 {
                     rebound = true;
                 }
@@ -15772,7 +15934,7 @@ fn cmd_send(
                         .cloned();
                     match entry {
                         Some(en) => {
-                            let _ = c.agent_rename(&en.pane_id, &name);
+                            let _ = c.agent_rename(&en.pane_id, &herdr_agent_name(&name));
                             std::thread::sleep(Duration::from_millis(400));
                             pane_retried = true;
                             eprintln!(
