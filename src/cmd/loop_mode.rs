@@ -112,6 +112,9 @@ pub(crate) enum LoopCmd {
         /// No pane working AND no commit past this window with work remaining
         /// emits ONE loud escalation line and pages the captain once, not per
         /// pass; a recovering fleet clears it without a second.
+        /// bd-pane-wedge-detect-respawn-pnyi: the same window gates the
+        /// per-pane wedge probe (process alive but parked on a fatal error
+        /// line) — one page per wedge, cleared when a commit lands.
         #[arg(long, default_value_t = crate::durable::DEAD_STOP_DEFAULT_MINUTES)]
         stall_minutes: u64,
     },

@@ -2357,6 +2357,106 @@ pub fn dead_stop_action(i: &DeadStopInputs) -> DeadStopAction {
     }
 }
 
+/// Fatal-error markers a harness PARKS on when a turn dies and will not
+/// recover by itself. Observed (2026-10-06): all five panes wedged for ~2h on
+/// `opencode-go` HTTP 400 with a reasoning-replay refusal; each turn failed
+/// silently, CPU at 0, no commits, no mail. Matched against the pane's LAST
+/// non-empty output line, so a marker that merely scrolled past a working pane
+/// is not a wedge.
+pub const WEDGE_ERROR_MARKERS: &[&str] = &[
+    "reasoning replay",
+    "api error",
+    "api_error",
+    "rate limit",
+    "too many requests",
+    "unauthorized",
+    "forbidden",
+    "insufficient",
+    "quota",
+];
+
+/// The pane's parked error line: its last non-empty output line when that line
+/// carries a fatal marker. `None` when the tail is empty or the last line is
+/// ordinary output. Bounded, so a page stays one line. Pure.
+pub fn parked_error_line(recent_output: &str) -> Option<String> {
+    let last = recent_output.lines().rev().find(|l| !l.trim().is_empty())?;
+    let lower = last.to_ascii_lowercase();
+    WEDGE_ERROR_MARKERS.iter().find(|m| lower.contains(*m))?;
+    Some(last.trim().chars().take(300).collect())
+}
+
+/// One pane's wedge evidence. Pure inputs so the verdict is testable without a
+/// live fleet, a herdr socket, or a clock.
+#[derive(Debug, Clone)]
+pub struct PaneWedgeInputs<'a> {
+    pub pin: &'a str,
+    pub pane_id: &'a str,
+    /// herdr's process probe: `Some(true)` = the agent process is ALIVE — the
+    /// wedge shape (a pane whose process exited is `recover`'s job, never this
+    /// probe's); `None` = inconclusive, never judged.
+    pub process_alive: Option<bool>,
+    /// the pane's recent terminal text; `None` = unreadable, never judged.
+    pub recent_output: Option<&'a str>,
+    /// seconds since the newest commit; `None` when git is absent or the repo
+    /// has no commit (never a fabricated "very old" age).
+    pub last_commit_age_secs: Option<u64>,
+    /// the no-movement window in seconds
+    pub quiet_secs: u64,
+}
+
+/// The pane-wedge decision. `Page` is emitted on the FIRST sighting of a
+/// wedge; `Hold` is every later pass while it persists — one page per wedge,
+/// never one per pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneWedgeAction {
+    /// not wedged, or not judgeable
+    Quiet,
+    /// first sighting — emit ONE loud line and page once
+    Page {
+        pin: String,
+        pane_id: String,
+        error: String,
+    },
+    /// already paged this wedge — stay silent
+    Hold,
+}
+
+/// bd-pane-wedge-detect-respawn-pnyi: is this pane WEDGED — alive but making
+/// no progress because it is parked on a fatal error?
+///
+/// The bead asks for "zero-CPU plus error output". herdr exposes no CPU
+/// counter (`pane.process_info` lists processes only), so the observable
+/// equivalent is used and named honestly: the agent process is still UP (a
+/// dead one is `recover`'s job) AND the newest commit is older than the
+/// window. An unreadable pane, an inconclusive process probe, a repo with no
+/// commit history, and a tail whose last line is ordinary output all read
+/// `Quiet` — a wedge alarm must never fire blind.
+pub fn pane_wedge_action(i: &PaneWedgeInputs<'_>, already_paged: bool) -> PaneWedgeAction {
+    if i.process_alive != Some(true) {
+        return PaneWedgeAction::Quiet;
+    }
+    let Some(tail) = i.recent_output else {
+        return PaneWedgeAction::Quiet;
+    };
+    let Some(error) = parked_error_line(tail) else {
+        return PaneWedgeAction::Quiet;
+    };
+    match i.last_commit_age_secs {
+        Some(age) if age >= i.quiet_secs => {}
+        // A commit inside the window is movement, and no history is not
+        // evidence of a stall.
+        _ => return PaneWedgeAction::Quiet,
+    }
+    if already_paged {
+        return PaneWedgeAction::Hold;
+    }
+    PaneWedgeAction::Page {
+        pin: i.pin.to_string(),
+        pane_id: i.pane_id.to_string(),
+        error,
+    }
+}
+
 #[function]
 async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
     let exe = self_exe().map_err(map_err)?;
@@ -14371,6 +14471,119 @@ mod tests {
         assert!(
             closed_reason_lease_ids(&leases, &std::collections::HashSet::new()).is_empty(),
             "no closed set → nothing"
+        );
+    }
+
+    /// bd-pane-wedge-detect-respawn-pnyi: a simulated wedge — a pane parked on
+    /// a fatal error line, process alive, nothing moving — produces ONE page
+    /// naming the pane and the error, and every un-judgeable shape stays quiet.
+    #[test]
+    fn pane_wedge_detected_and_paged() {
+        // The observed incident: opencode-go HTTP 400 / reasoning replay, the
+        // pane alive but parked on the error and no commit for 9000s.
+        let wedge = PaneWedgeInputs {
+            pin: "EmberOtter",
+            pane_id: "w1:p1",
+            process_alive: Some(true),
+            recent_output: Some("streaming tokens…\nError: API error 400 (reasoning replay)\n"),
+            last_commit_age_secs: Some(9_000),
+            quiet_secs: 2_700,
+        };
+        match pane_wedge_action(&wedge, false) {
+            PaneWedgeAction::Page {
+                pin,
+                pane_id,
+                error,
+            } => {
+                assert_eq!(pin, "EmberOtter", "the page names the pin");
+                assert_eq!(pane_id, "w1:p1", "the page names the pane");
+                assert!(
+                    error.contains("reasoning replay") && error.contains("400"),
+                    "the page carries the error line: {error}"
+                );
+            }
+            other => panic!("a simulated wedge must page: {other:?}"),
+        }
+        // ONE page per wedge — every later pass of the same wedge is silent.
+        assert_eq!(
+            pane_wedge_action(&wedge, true),
+            PaneWedgeAction::Hold,
+            "never one page per pass"
+        );
+        // A pane whose process exited is `recover`'s job, not a wedge.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    process_alive: Some(false),
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // An inconclusive process probe never alarms.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    process_alive: None,
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // An unreadable pane is never judged.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    recent_output: None,
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // Output that merely SCROLLED PAST an error is not a parked wedge:
+        // the last line is ordinary work.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    recent_output: Some("Error: API error 400\nwork resumed; committing\n"),
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // A commit inside the window is movement.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    last_commit_age_secs: Some(60),
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // No commit history → never alarm blind.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    last_commit_age_secs: None,
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // The parked-line recognizer is bounded and needs the marker on the
+        // LAST non-empty line.
+        assert_eq!(parked_error_line("\n\n"), None);
+        assert_eq!(parked_error_line("all good\n"), None);
+        assert_eq!(
+            parked_error_line("noise\nError: rate limit exceeded\n"),
+            Some("Error: rate limit exceeded".to_string())
         );
     }
 
