@@ -543,15 +543,26 @@ fn combine_stage_message(rendered: String, msg: Option<&str>) -> String {
 }
 
 /// Dispatch header: the TASK-ID is routing metadata, never the work order.
-/// Names the bound bead, or states plainly that none is bound (do not act).
-fn dispatch_header(task_id: &str, bead: Option<&str>) -> String {
+/// Names the bound bead — or, for a STAGE dispatch with none, states the
+/// bootstrap contract the pane can act on by itself (bd-stage-dispatch-
+/// binds-bead-roul). A raw nudge (no stage) still defers to its message text.
+fn dispatch_header(task_id: &str, bead: Option<&str>, stage: Option<&str>) -> String {
     match bead {
         Some(b) => format!(
             "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: {b} (the bound work order; `br show {b}` is the contract)"
         ),
-        None => format!(
-            "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound by this dispatch — follow the message text; if it carries no actionable content, ask the captain for the bead id."
-        ),
+        // The observed failure: a ce-execute stage dispatch carried a task-id
+        // and no BEAD line, so every disciplined fresh pane refused it and
+        // asked for a bead id — one round trip per pane. A stage dispatch
+        // always has an actionable work order available: the ready queue.
+        None => match stage {
+            Some(s) => format!(
+                "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound — bootstrap: stage dispatch `{s}` names no target bead, so take your own work order now: `br ready --json` (dispatchable beads only), `br update <id> --status in_progress --assignee <your pin>`, then do that bead. If `br ready` is empty, say exactly that in your completion mail and stop — never invent work and never wait for a bead id."
+            ),
+            None => format!(
+                "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound by this dispatch — follow the message text; if it carries no actionable content, ask the captain for the bead id."
+            ),
+        },
     }
 }
 
@@ -567,13 +578,13 @@ mod send_dispatch_header_tests {
             "stage\n\nbrief"
         );
         assert_eq!(combine_stage_message("stage".to_string(), None), "stage");
-        let bound = dispatch_header("task-1", Some("bd-2"));
+        let bound = dispatch_header("task-1", Some("bd-2"), Some("ce-execute"));
         assert!(bound.contains("bd-2"), "names the bead: {bound}");
         assert!(
             bound.contains("not a bead"),
             "disclaims the task id: {bound}"
         );
-        let unbound = dispatch_header("task-1", None);
+        let unbound = dispatch_header("task-1", None, None);
         assert!(
             unbound.contains("follow the message text"),
             "unbound dispatch defers to message text (raw nudges stay actionable): {unbound}"
@@ -582,6 +593,52 @@ mod send_dispatch_header_tests {
             !unbound.contains("Do NOT act"),
             "must not self-negate raw messages: {unbound}"
         );
+    }
+
+    /// bd-stage-dispatch-binds-bead-roul: a fresh pane receiving a STAGE
+    /// dispatch can act without asking which bead it belongs to. A bound bead
+    /// is named as the work order; an unbound stage dispatch carries the
+    /// bootstrap contract (pick from `br ready`), never "ask the captain".
+    #[test]
+    fn stage_dispatch_binds_bead() {
+        // Bound: the bead is the work order, with its `br show` contract.
+        let bound = dispatch_header("task-1", Some("bd-abc"), Some("ce-execute"));
+        assert!(bound.contains("BEAD: bd-abc"), "names the bead: {bound}");
+        assert!(
+            bound.contains("the bound work order"),
+            "names the contract: {bound}"
+        );
+        assert!(
+            !bound.contains("br ready"),
+            "a bound dispatch never leaks the bootstrap text: {bound}"
+        );
+        // Unbound STAGE dispatch: the pane can act — it takes its own work
+        // order from the ready queue instead of costing a round trip.
+        let unbound = dispatch_header("task-1", None, Some("ce-execute"));
+        assert!(
+            unbound.contains("br ready"),
+            "bootstrap names the picker: {unbound}"
+        );
+        assert!(
+            unbound.contains("stage dispatch `ce-execute`"),
+            "names the stage that carried no bead: {unbound}"
+        );
+        assert!(
+            unbound.contains("br update <id> --status in_progress"),
+            "the claim step rides along so the pane is self-contained: {unbound}"
+        );
+        assert!(
+            !unbound.contains("ask the captain"),
+            "no round trip for a stage dispatch: {unbound}"
+        );
+        // A raw nudge (no stage) is unchanged: it defers to its message text.
+        let raw = dispatch_header("task-1", None, None);
+        assert!(raw.contains("follow the message text"), "{raw}");
+        assert!(!raw.contains("br ready"), "raw nudges do not bootstrap: {raw}");
+        // Every shape disclaims the task id as a bead id.
+        for h in [&bound, &unbound, &raw] {
+            assert!(h.contains("not a bead id"), "{h}");
+        }
     }
 }
 /// Build the filtered-inbox filter for `mail inbox` (bd-ursy): every
@@ -15704,7 +15761,10 @@ fn cmd_send(
         .find(|p| p.starts_with("bead="))
         .map(|kv| kv.trim_start_matches("bead=").to_string())
         .filter(|b| !b.is_empty());
-    let text = format!("{}\n\n{text}", dispatch_header(&task_id, bead.as_deref()));
+    let text = format!(
+        "{}\n\n{text}",
+        dispatch_header(&task_id, bead.as_deref(), stage)
+    );
 
     // safety guard: refuse destructive prompts unless --force
     if !force {
