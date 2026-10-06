@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::mail_shim::MailInboxFilter;
 use crate::output::print_json;
+use crate::preflight;
 
 #[derive(Subcommand)]
 pub(crate) enum CaptainCmd {
@@ -44,6 +45,14 @@ pub(crate) enum CaptainCmd {
         /// act as this registered agent (adjective+noun or herdr short name)
         #[arg(long = "as")]
         as_agent: Option<String>,
+        /// also exit when the project's preflight fails (store skew, missing
+        /// binary, unreachable relay, unallocated panes): one shot, names the
+        /// failing check. Exit 4. Off by default.
+        #[arg(long)]
+        preflight: bool,
+        /// preflight mode for the arm (steer|loop|workflow|cron)
+        #[arg(long, default_value = "loop")]
+        preflight_mode: String,
     },
 }
 
@@ -56,21 +65,75 @@ pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
             stall,
             stall_minutes,
             as_agent,
-        } => cmd_captain_watch(
-            cfg,
-            project,
-            *interval,
-            *json,
-            *stall,
-            *stall_minutes,
-            as_agent.as_deref(),
-        ),
+            preflight,
+            preflight_mode,
+        } => {
+            // An unknown mode must refuse loudly, not silently arm nothing.
+            let pf = if *preflight {
+                Some(preflight::Mode::named(preflight_mode, true).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown preflight mode: {preflight_mode} (steer|loop|workflow|cron)"
+                    )
+                })?)
+            } else {
+                None
+            };
+            cmd_captain_watch(
+                cfg,
+                project,
+                *interval,
+                *json,
+                *stall,
+                *stall_minutes,
+                as_agent.as_deref(),
+                pf,
+            )
+        }
     }
 }
 
 /// Exit code for a stall alarm. Distinct from 1 (usage/runtime error) so the
 /// re-arming wrapper can tell a real stall from a failed poll.
 const STALL_EXIT: i32 = 3;
+
+/// Exit code for a preflight-arm failure. Its own code (not 3, not 1) so the
+/// re-arming wrapper tells a broken environment from a stalled fleet.
+const PREFLIGHT_EXIT: i32 = 4;
+
+/// The FIRST failing check as `(name, message)`. Skips are advisory (the
+/// operation can proceed) and passes are silent; only a `Fail` arms the exit.
+/// Pure, so the arm's rule is pinned without a live herdr/resonate/toron.
+pub(crate) fn first_failing_check(
+    checks: &[preflight::Check],
+) -> Option<(&'static str, String)> {
+    checks.iter().find_map(|c| match &c.status {
+        preflight::Status::Fail(msg) => Some((c.name, msg.clone())),
+        _ => None,
+    })
+}
+
+/// Print the preflight-arm failure once (JSON or human) and return the exit
+/// code. `None` when every check passed or skipped — the watch keeps polling.
+fn preflight_arm_exit(
+    cfg: &Config,
+    project: &str,
+    mode: preflight::Mode,
+    json_out: bool,
+) -> Option<i32> {
+    let checks = preflight::run(cfg, mode, Some(project));
+    let (name, msg) = first_failing_check(&checks)?;
+    if json_out {
+        print_json(&json!({
+            "reason": "preflight",
+            "project": project,
+            "check": name,
+            "message": msg,
+        }));
+    } else {
+        println!("PREFLIGHT FAILURE in {project}: {name} — {msg}");
+    }
+    Some(PREFLIGHT_EXIT)
+}
 
 /// The newest row strictly newer than `baseline_us`, or None. Strict-newer
 /// matches the toron `since` contract (equal timestamps are not new), so a row
@@ -126,6 +189,7 @@ fn stall_verdict(p: &StallProbe) -> StallVerdict {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one param per CLI flag (clap handler).
 fn cmd_captain_watch(
     cfg: &Config,
     project: &str,
@@ -134,7 +198,17 @@ fn cmd_captain_watch(
     stall: bool,
     stall_minutes: u64,
     as_agent: Option<&str>,
+    preflight: Option<preflight::Mode>,
 ) -> Result<()> {
+    // The preflight arm runs FIRST: a project whose environment is already
+    // broken (skewed store, missing binary, unreachable relay) must not arm a
+    // watch that cannot do anything with the wake it would receive. Re-checked
+    // each poll so a fault that develops after arming still exits once.
+    if let Some(mode) = preflight
+        && let Some(code) = preflight_arm_exit(cfg, project, mode, json_out)
+    {
+        std::process::exit(code);
+    }
     let interval = interval.max(1);
     let key = crate::project_dir_str(cfg, project)?;
     let mail = crate::mail_as(cfg, &key, as_agent)?;
@@ -189,7 +263,14 @@ fn cmd_captain_watch(
             return Ok(());
         }
 
-        // 2) Stall — only when asked; the mail exit above is the common case.
+        // 2) Preflight — opt-in, re-checked each poll.
+        if let Some(mode) = preflight
+            && let Some(code) = preflight_arm_exit(cfg, project, mode, json_out)
+        {
+            std::process::exit(code);
+        }
+
+        // 3) Stall — only when asked; the mail exit above is the common case.
         if !stall {
             continue;
         }
@@ -297,6 +378,54 @@ mod tests {
 
     fn row(us: i64, subject: &str) -> Value {
         json!({ "created_ts_us": us, "subject": subject, "sender": "S" })
+    }
+
+    /// bd-captain-watch-preflight-arm-snak: the watch's preflight arm names
+    /// EXACTLY the first failing check and fires only on a `Fail`. A skip is
+    /// advisory, a pass is silent, and the message carries the remedy evidence
+    /// (a store-skew refusal names the ceiling and its marker).
+    #[test]
+    fn captain_watch_exits_on_preflight_failure() {
+        use crate::preflight::{Check, Status};
+        // Path clear: passes and skips only → the arm never fires.
+        let clean = vec![
+            Check::pass("resonate"),
+            Check::skip("doorbell", "embedded (no [doorbell] url configured)"),
+        ];
+        assert!(
+            first_failing_check(&clean).is_none(),
+            "a clean preflight must not exit the watch"
+        );
+        // The skew the bead observed: the toron store is ahead of the binary.
+        let skewed = vec![
+            Check::pass("herdr-socket"),
+            Check::fail(
+                "toron-mail",
+                "migration 17 is applied in the store but this toron build resolves at most 16 \
+                 [toron-error=store_skew] — reinstall toron from the source that wrote the store",
+            ),
+            Check::fail("project-dir", "proj does not exist"),
+        ];
+        let (name, msg) = first_failing_check(&skewed).expect("a failing check arms the exit");
+        assert_eq!(name, "toron-mail", "the FIRST failure is the one named");
+        assert!(
+            msg.contains("store_skew") && msg.contains("reinstall toron"),
+            "the message carries the failing check's remedy line: {msg}"
+        );
+        // Status is the only discriminator — a Skip whose reason reads like a
+        // failure is not a failure.
+        assert!(
+            first_failing_check(&[Check::skip("x", "preflight failed")]).is_none(),
+            "skip is advisory, never an exit"
+        );
+        // A fail-only set is still an exit even with every other check green.
+        assert_eq!(
+            first_failing_check(&[Check::pass("a"), Check::fail("b", "boom")])
+                .map(|(n, _)| n),
+            Some("b")
+        );
+        // Sanity: the discriminants the arm reads are the ones the renderer uses.
+        assert!(matches!(skewed[1].status, Status::Fail(_)));
     }
 
     /// The poll-exit contract: the mail door reports EXACTLY the newest row
