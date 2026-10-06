@@ -38,19 +38,19 @@ pub enum Status {
 }
 
 impl Check {
-    fn pass(name: &'static str) -> Self {
+    pub(crate) fn pass(name: &'static str) -> Self {
         Self {
             name,
             status: Status::Pass,
         }
     }
-    fn fail(name: &'static str, msg: impl Into<String>) -> Self {
+    pub(crate) fn fail(name: &'static str, msg: impl Into<String>) -> Self {
         Self {
             name,
             status: Status::Fail(msg.into()),
         }
     }
-    fn skip(name: &'static str, reason: &'static str) -> Self {
+    pub(crate) fn skip(name: &'static str, reason: &'static str) -> Self {
         Self {
             name,
             status: Status::Skip(reason),
@@ -81,6 +81,21 @@ pub struct Mode {
 }
 
 impl Mode {
+    /// The ONE name→mode mapping, shared by `flywheel preflight --mode` and the
+    /// captain-watch preflight arm, so the two doors can never disagree about
+    /// what `loop` means. `work` selects the `--work` loop variant; `None` is an
+    /// unknown mode (the caller refuses loudly, never arms a silent no-op).
+    pub fn named(mode: &str, work: bool) -> Option<Self> {
+        Some(match mode {
+            "steer" => Self::steer(),
+            "loop" if work => Self::loop_work(),
+            "loop" => Self::loop_queue(),
+            "workflow" => Self::workflow(),
+            "cron" => Self::cron(),
+            _ => return None,
+        })
+    }
+
     /// Steer: needs herdr, resonate, mail, project dir.
     pub fn steer() -> Self {
         Self {

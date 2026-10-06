@@ -1063,8 +1063,9 @@ enum Commands {
     },
     /// Captain door (bd-captain-watch-poll-exit-bbwm): the captain's own
     /// poll-exit watch. `captain watch <project>` blocks on the captain inbox
-    /// water (or a stall, with --stall), prints a preview, and exits so the
-    /// harness completion callback resumes the captain. One shot — re-arm.
+    /// water (or a stall, with --stall, or a preflight failure, with
+    /// --preflight), prints a preview, and exits so the harness completion
+    /// callback resumes the captain. One shot — re-arm.
     Captain {
         #[command(subcommand)]
         cmd: CaptainCmd,
@@ -2627,7 +2628,7 @@ fn main() {
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
-            "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] (bd-captain-watch-poll-exit-bbwm: the captain's poll-exit door — blocks on the captain inbox's own water and exits with a preview when new mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms. One shot: re-arm after each resume)",
+            "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: the captain's poll-exit door — blocks on the captain inbox's own water and exits with a preview when new mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll, so a skewed store or missing binary wakes the captain instead of a watch that cannot act. One shot: re-arm after each resume)",
             "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
@@ -2662,7 +2663,7 @@ fn main() {
             "loop_resume_window": "loop/loop-mode run --work (bd-resume-window-lease-sweep-4sa2): an in-progress bead resumes at most ONCE per (bead, pane) in a 15-min window (the watermark persists per project under the state dir, so it survives passes and processes — the in-memory `assigned` set does not); a peer-held bead (a DIFFERENT live pane's reservation reasons to it — a lane split, not a stall) draws NO resume; each pass releases leases whose reason bead is closed via the one pure rule durable::closed_reason_lease_ids. Pure: durable::{within_resume_window, peer_held, should_resume_bead, closed_reason_lease_ids}; fence: resume_window_dedupes_and_respects_peer_holds",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … extend with --timeout'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
-            "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)" }
+            "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)", "4": "captain watch --preflight: the project's preflight failed (the failing check is named; bd-captain-watch-preflight-arm-snak)" }
         }));
         return;
     }
@@ -23438,14 +23439,9 @@ fn cmd_preflight(
     work: bool,
     json: bool,
 ) -> Result<()> {
-    let pf_mode = match mode {
-        "steer" => preflight::Mode::steer(),
-        "loop" if work => preflight::Mode::loop_work(),
-        "loop" => preflight::Mode::loop_queue(),
-        "workflow" => preflight::Mode::workflow(),
-        "cron" => preflight::Mode::cron(),
-        other => bail!("unknown preflight mode: {other} (steer|loop|workflow|cron)"),
-    };
+    // One mapping, shared with the captain-watch preflight arm (Mode::named).
+    let pf_mode = preflight::Mode::named(mode, work)
+        .ok_or_else(|| anyhow::anyhow!("unknown preflight mode: {mode} (steer|loop|workflow|cron)"))?;
     let checks = preflight::run(cfg, pf_mode, project);
     if json {
         print_json(&preflight::to_json(&checks));
