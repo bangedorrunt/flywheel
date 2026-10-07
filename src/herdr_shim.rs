@@ -1283,6 +1283,20 @@ pub fn kind_process_names(kind: &str) -> &'static [&'static str] {
     }
 }
 
+/// Does a foreground process name name the expected agent binary?
+///
+/// Exact match, or the same name carrying an executable suffix — an
+/// npm/mise-installed CLI bins its entry point as `<name>.exe` on every
+/// platform (measured live 2026-10-07: mise npm-opencode-cli 2.0.24 runs
+/// `opencode.exe`), and an exact-name test read those LIVE panes as dead
+/// shells (bd-oc-launch-chdir-enoent-1l30).
+fn process_name_matches(candidate: &str, expected: &str) -> bool {
+    candidate == expected
+        || candidate
+            .strip_suffix(".exe")
+            .is_some_and(|stem| stem == expected)
+}
+
 /// Pure liveness verdict from a `pane.process_info` snapshot (bd-1np).
 ///
 /// The agent process is alive iff its binary appears in the pane's foreground
@@ -1303,7 +1317,7 @@ pub fn pane_agent_alive(info: &PaneProcessInfo, kind: &str) -> Option<bool> {
     let binary_hit = names.iter().any(|n| {
         info.foreground_processes
             .iter()
-            .any(|p| p.name == *n || p.argv0.as_deref() == Some(*n))
+            .any(|p| process_name_matches(&p.name, n) || p.argv0.as_deref() == Some(*n))
     });
     if binary_hit {
         return Some(true);
@@ -1587,7 +1601,7 @@ mod process_liveness_tests {
     /// exact process shape (and its original comment) it was pinned on.
     #[test]
     fn pane_agent_alive_rows() {
-        let cases: [(&str, &str, PaneProcessInfo, Option<bool>); 8] = [
+        let cases: [(&str, &str, PaneProcessInfo, Option<bool>); 9] = [
             // Live agent: the agent binary leads the foreground group (pid == fgpgid).
             (
                 "live_opencode_classified_alive",
@@ -1646,6 +1660,22 @@ mod process_liveness_tests {
                 "kind_alias_matches",
                 "grok",
                 info(Some(300), Some(50), vec![proc("grok-build", 300)]),
+                Some(true),
+            ),
+            // bd-oc-launch-chdir-enoent-1l30: npm/mise-installed CLIs bin
+            // opencode as `opencode.exe` (measured live 2026-10-07: mise
+            // npm-opencode-cli 2.0.24, process name `opencode.exe`), so an
+            // exact-name match read every LIVE oc pane as a dead shell —
+            // `add --oc 1` bailed "agent process gone" while the TUI sat
+            // interactive in the pane.
+            (
+                "live_opencode_npm_exe_suffix_classified_alive",
+                "opencode",
+                info(
+                    Some(100),
+                    Some(50),
+                    vec![proc("opencode.exe", 100), proc("node", 101)],
+                ),
                 Some(true),
             ),
             // Argv0-only match (name may be a comm name like python3.14t).

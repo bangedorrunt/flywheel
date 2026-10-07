@@ -5895,6 +5895,43 @@ mod workspace_origin_tests {
             "cmd_add must write the project-local agent-names.json mirror (bd-add-missing-mail-identity-16le)"
         );
     }
+
+    // bd-oc-launch-chdir-enoent-1l30: launch text must NEVER ride agent.start
+    // args on the add path either. opencode v2's ROOT command reads a
+    // positional arg as a project DIRECTORY, so `add --oc 1` typed
+    // `opencode <identity line>` and the pane died with a chdir ENOENT,
+    // leaving an undriven shell. Spawn was fixed for this
+    // (bd-peeraware-enametoolong-iswg); add still pushed it. The identity is
+    // TYPED after the settle, never passed.
+    #[test]
+    fn add_never_passes_launch_text_as_agent_start_args() {
+        let src = include_str!("main.rs");
+        let add = crate::tripwire::find_fn(src, "cmd_add");
+        let add_end = crate::tripwire::find_fn(src, "cmd_list");
+        let add_body = &src[add..add_end];
+        // (a) the identity line is not an agent.start arg.
+        assert!(
+            !add_body.contains("add_args.push(doorbell::identity_prime"),
+            "cmd_add must not push the identity line into agent.start args — opencode \
+             reads a positional arg as a directory and dies chdir ENOENT"
+        );
+        // (b) it is still delivered — TYPED via pane.send_text.
+        let typed = add_body
+            .find("prime_line_via_send_text(")
+            .expect("cmd_add must type the identity line via pane.send_text");
+        assert!(
+            add_body[typed..].contains("doorbell::identity_prime("),
+            "the typed prime must carry the pane's identity line"
+        );
+        // (c) typed AFTER the settle (bd-eign.6 L2), like spawn.
+        let settle = add_body
+            .find("if settle_secs > 0")
+            .expect("settle sleep in cmd_add");
+        assert!(
+            settle < typed,
+            "cmd_add must settle BEFORE typing the identity prime (bd-eign.6 L2)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -13122,18 +13159,22 @@ fn cmd_add(
                 Some(&pane_env),
             )?;
             prev = p.pane_id.clone();
-            let mut add_args: Vec<String> = Vec::new();
             // H2 (bd-harness-pane-send-text-7fe8): same boot-prime contract
-            // as spawn — the prime is typed via pane.send_text after the TUI
+            // as spawn — every prime is typed via pane.send_text after the TUI
             // owns the foreground (below), not pushed as a positional
             // MESSAGES arg. In-arg secondary kept for kinds that need it.
+            //
+            // bd-oc-launch-chdir-enoent-1l30: the identity line used to ride
+            // these args unconditionally, and opencode v2's root command reads
+            // a positional as a project DIRECTORY — `add --oc 1` typed
+            // `opencode <identity line>`, so opencode died on a chdir ENOENT
+            // to the repo it was already standing in, leaving an undriven
+            // shell. Flags only; the identity is typed below (same fix spawn
+            // got in bd-peeraware-enametoolong-iswg).
+            let mut add_args: Vec<String> = Vec::new();
             if needs_in_arg_prime(&kind) {
                 add_args.push(boot_prime_line().to_string());
             }
-            add_args.push(doorbell::identity_prime(
-                &name,
-                mail_identity.as_deref().unwrap_or(&name),
-            ));
             // bd-pattern-peer-triggered: same shell-readiness gate as spawn —
             // typing into a booting shell mangles long single-quoted args.
             let shell_ready = herdr_shim::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15));
@@ -13188,6 +13229,14 @@ fn cmd_add(
                 std::thread::sleep(Duration::from_secs(settle_secs));
             }
             if !needs_in_arg_prime(&kind) {
+                // Identity first (mail identity + guard note), then the boot
+                // ready check — the spawn path's order, and now its channel
+                // too (bd-oc-launch-chdir-enoent-1l30).
+                prime_line_via_send_text(
+                    &mut c,
+                    &prev,
+                    &doorbell::identity_prime(&name, mail_identity.as_deref().unwrap_or(&name)),
+                );
                 // bd-umb3: retried prime — a transiently-busy pane must not
                 // silently stay unpromptable; on final failure the helper
                 // warns with the manual socket one-liner.
