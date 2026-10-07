@@ -6758,6 +6758,69 @@ mod spawn_boot_reliability_tests {
         );
     }
 
+    /// bd-rename-clear-name-too-long-oxd7: the rename-clear escape hatch must
+    /// mint a herdr-LEGAL label for ANY name herdr itself accepted.
+    ///
+    /// The bare `{name}-stale-{attempts}` concat overflows herdr's 32-char cap
+    /// for a long project slug (`flywheel-elm-effect-rs-oc` (25) + `-stale-1`
+    /// = 33), and herdr answers `invalid_agent_name` — so the one door that
+    /// frees a taken name wedges shut exactly when it is needed.
+    #[test]
+    fn stale_rename_label_stays_herdr_legal() {
+        // The bead's witness: the pre-fix concat really was 33 chars.
+        assert_eq!(
+            "flywheel-elm-effect-rs-oc-stale-1".len(),
+            33,
+            "the pre-fix label overflowed the 32-char cap"
+        );
+        let long = "flywheel-elm-effect-rs-oc";
+        for attempts in [1u32, 2, 7, 19, u32::MAX] {
+            let label = stale_rename_label(long, attempts);
+            assert!(
+                is_herdr_legal_name(&label),
+                "{label:?} ({} chars) must be herdr-legal for attempts={attempts}",
+                label.len()
+            );
+            // The attempt stays readable: a stale row must say WHICH pass it
+            // was, which a tail-truncating `herdr_agent_name()` would eat.
+            assert!(
+                label.ends_with(&format!("stale-{attempts}")),
+                "{label:?} must keep the attempt number"
+            );
+        }
+        // The exact bytes herdr is asked for in the live witness (keep this
+        // literal and the live run's label in sync).
+        assert_eq!(stale_rename_label(long, 1), "flywheel-elm-effect-rs-o-stale-1");
+        // Distinct attempts never collide.
+        assert_ne!(stale_rename_label(long, 1), stale_rename_label(long, 2));
+        // A name that already fits keeps its old shape (no rename churn).
+        assert_eq!(
+            stale_rename_label("flywheel-be-oc", 3),
+            "flywheel-be-oc-stale-3"
+        );
+        // A name already AT the cap still yields a legal label.
+        let capped = "a".repeat(32);
+        assert!(is_herdr_legal_name(&stale_rename_label(&capped, 1)));
+    }
+
+    /// The wiring gate: `verify_or_respawn_pane` must mint the stale label
+    /// through the bounded helper, never the raw concat (a helper nobody calls
+    /// fixes nothing).
+    #[test]
+    fn rename_clear_mints_its_label_through_the_bounded_helper() {
+        let src = include_str!("main.rs");
+        let helper = crate::tripwire::find_fn(src, "verify_or_respawn_pane");
+        let body = &src[helper..];
+        assert!(
+            body.contains("stale_rename_label(name, attempts)"),
+            "verify_or_respawn_pane must mint the rename-clear label via stale_rename_label"
+        );
+        assert!(
+            !body.contains("format!(\"{name}-stale-{attempts}\")"),
+            "the raw `{{name}}-stale-{{attempts}}` concat overflows herdr's 32-char cap"
+        );
+    }
+
     /// GS-037: send receipt honesty + wake observe-only + presence + compose retire.
     #[test]
     fn gs037_send_wake_presence_folds_present() {
@@ -7890,6 +7953,31 @@ impl Default for SpawnOpts {
     }
 }
 
+/// bd-rename-clear-name-too-long-oxd7: the herdr-legal label for a dead
+/// binding that the rename-clear frees.
+///
+/// herdr caps agent names at 32 chars, and a spawn name can already sit most of
+/// the way there (`flywheel-elm-effect-rs-oc` is 25), so the bare
+/// `{name}-stale-{attempts}` concat mints 33 and herdr refuses with
+/// `invalid_agent_name` — the one door that frees a taken name wedges shut
+/// exactly when it is needed. Truncate the BASE, never the tail:
+/// [`herdr_agent_name`]'s `truncate(32)` would eat the attempt number instead,
+/// and that number is what tells two stale rows apart.
+fn stale_rename_label(name: &str, attempts: u32) -> String {
+    let suffix = format!("-stale-{attempts}");
+    // A u32 renders at most 10 digits, so the suffix never exceeds 17 chars
+    // and `keep` is always >= 15 — the 32-char cap is met by construction.
+    let keep = 32usize.saturating_sub(suffix.len());
+    let base = name.chars().take(keep).collect::<String>();
+    let base = base.trim_end_matches('-');
+    if base.is_empty() {
+        // A name that is nothing but hyphens leaves no stem to keep.
+        format!("stale-{attempts}")
+    } else {
+        format!("{base}{suffix}")
+    }
+}
+
 /// bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell verification for
 /// one spawned pane — assert the LIVE agent process (`pane_agent_alive`),
 /// never the herdr `launch_pending` flag. A pane can leave the launch window
@@ -7975,7 +8063,7 @@ fn verify_or_respawn_pane(
                 // the same taken name. Rename-clear once, then fail-fast if
                 // still taken — never invent green by spinning the budget.
                 if msg.contains("agent_name_taken") {
-                    let stale = format!("{name}-stale-{attempts}");
+                    let stale = stale_rename_label(name, attempts);
                     match c.agent_rename(pane_id, &stale) {
                         Ok(_) => {
                             eprintln!(
