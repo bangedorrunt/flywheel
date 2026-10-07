@@ -3922,7 +3922,19 @@ fn spawn_item_kind(
 /// the pair), an unregistered id passes through verbatim. The strict check
 /// stays profile-only: the operator named this pair explicitly, so there is
 /// no profile indirection to protect. Empty model -> no flags.
-fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<Vec<String>> {
+/// bd-oc-bare-spawn-model-argv-zbzt: the bare kind/count lane launches through
+/// `herdr agent start --kind <harness>` — the same interactive entrypoint the
+/// profile lane uses — so it must deliver the model the same way: argv where
+/// the harness takes a flag, pane env where it does not (opencode's root
+/// command rejects `--model`). Returns `(argv, env_model_pin)`; the caller must
+/// pin a non-empty `env_model_pin` into the pane env at creation time (a
+/// process's env is fixed when it starts), including the workspace env of a
+/// first agent on the root pane.
+fn bare_model_launch(
+    harness: &str,
+    model: &str,
+    provider: &str,
+) -> Result<(Vec<String>, Option<String>)> {
     let registry = models::ModelRegistry::load_routing()?;
     // ADR-0007 D1 (implicit): a bare kind/count spawn with NO --model uses
     // the harness's implied slot's model (opencode→cheap, pi→standard,
@@ -3950,7 +3962,8 @@ fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<
                     .and_then(|n| registry.effective_slot_model(n))
                 {
                     Some(m) if !m.is_empty() => m,
-                    _ => return Ok(vec![]),
+                    // No implied slot for this kind: launch model-less.
+                    _ => return Ok((vec![], None)),
                 }
             }
         }
@@ -3962,11 +3975,11 @@ fn bare_model_launch_args(harness: &str, model: &str, provider: &str) -> Result<
     } else {
         format!("{provider}/{model}")
     };
-    Ok(headless::model_args(
-        harness,
-        &registry.resolve(&lookup, harness),
-        None,
-    ))
+    // bd-crlx / headless::interactive_model_plan: ONE delivery rule for every
+    // pane launch. opencode's root command takes no model flag, so its pin
+    // moves to `env_model_pin`; every other harness keeps `model_args`.
+    let plan = headless::interactive_model_plan(harness, &registry.resolve(&lookup, harness), None);
+    Ok((plan.args().to_vec(), plan.env_pin().map(str::to_string)))
 }
 
 fn expand_slot_model(registry: &models::ModelRegistry, id: &str) -> Result<String> {
@@ -4100,6 +4113,39 @@ pub(crate) fn profile_launch_args(
         );
     }
     Ok(plan.args)
+}
+
+/// The argv an INTERACTIVE pane launch may carry for a concrete model — the
+/// model-driven sibling of [`profile_launch_args`], for callers that hold a
+/// route rather than a profile (the rate-limit fallback hops).
+///
+/// bd-oc-bare-spawn-model-argv-zbzt: ONE delivery rule for every pane launch.
+/// `herdr agent start --kind <harness>` runs the harness's interactive
+/// entrypoint, so a model flag the headless form emits (`headless::model_args`
+/// → opencode `--model`) must never reach it — opencode's root command answers
+/// it with `ERROR Unrecognized flag: --model in command opencode` and the pane
+/// dies (measured live 2026-10-07, v2.0.24).
+///
+/// An env-delivered pin is a REFUSAL here, never a silent bare launch: this
+/// caller re-launches into a pane that already exists, and a process's env was
+/// fixed when it started, so it cannot carry the pin. Launching bare would run
+/// whatever model that pane was created with, under a journaled rebind to a
+/// model the pane never got.
+pub(crate) fn interactive_pane_args(
+    harness: &str,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<Vec<String>> {
+    let plan = headless::interactive_model_plan(harness, model, effort);
+    if let Some(m) = plan.env_pin() {
+        anyhow::bail!(
+            "harness {harness:?} takes no model flag on its interactive entrypoint, so model \
+             {m:?} cannot be delivered as argv into a pane that already exists — a process's env \
+             is fixed when it starts, so there is no way to pin it now; re-spawn the pane (its \
+             env is built at creation) instead"
+        );
+    }
+    Ok(plan.args().to_vec())
 }
 
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
@@ -4494,14 +4540,15 @@ mod spawn_profile_plan_tests {
         )
         .expect("models.toml");
         // Bare model id: registered -> default-provider route.
-        let args = bare_model_launch_args("pi", "glm-5.2", "").expect("bare id");
+        let (args, pin) = bare_model_launch("pi", "glm-5.2", "").expect("bare id");
         assert_eq!(
             args,
             vec!["--model", "aaa/glm-5.2"],
             "registered bare id routes"
         );
+        assert_eq!(pin, None, "pi carries no env pin");
         // Explicit provider pins the other provider carrying the same id.
-        let args = bare_model_launch_args("pi", "glm-5.2", "zzz").expect("pinned");
+        let (args, _) = bare_model_launch("pi", "glm-5.2", "zzz").expect("pinned");
         assert_eq!(
             args,
             vec!["--model", "zzz/glm-5.2"],
@@ -4509,16 +4556,95 @@ mod spawn_profile_plan_tests {
         );
         // Unregistered pair: LENIENT passthrough (never a strict failure —
         // the strict check is for profile-sourced ids only).
-        let args = bare_model_launch_args("pi", "ghost-model", "").expect("lenient passthrough");
+        let (args, _) = bare_model_launch("pi", "ghost-model", "").expect("lenient passthrough");
         assert_eq!(args, vec!["--model", "ghost-model"]);
-        let args = bare_model_launch_args("pi", "ghost-model", "qqq").expect("pair passthrough");
+        let (args, _) = bare_model_launch("pi", "ghost-model", "qqq").expect("pair passthrough");
         assert_eq!(args, vec!["--model", "qqq/ghost-model"]);
         // Empty model: pi rides the standard slot, so a bare spawn with no
         // --model resolves the compiled-in standard pair.
         assert_eq!(
-            bare_model_launch_args("pi", "", "").expect("empty model"),
+            bare_model_launch("pi", "", "").expect("empty model").0,
             vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
             "bare pi without --model uses the standard slot"
+        );
+    }
+
+    /// bd-oc-bare-spawn-model-argv-zbzt: the bare kind/count lane launches
+    /// through `herdr agent start --kind <harness>` exactly like the profile
+    /// lane, so it must deliver the model the SAME way — argv for harnesses
+    /// that take a flag, pane env for opencode, whose ROOT command rejects
+    /// `--model` outright (`ERROR Unrecognized flag: --model in command
+    /// opencode`, measured live 2026-10-07 on v2.0.24; the corpse pane died
+    /// before it could draw its TUI).
+    #[test]
+    fn bare_opencode_spawn_never_emits_model_argv() {
+        let _g = lock_env();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cfg_home = dir.path().join("config");
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+        let (args, env_pin) =
+            bare_model_launch("opencode", "", "").expect("opencode cheap implied");
+        assert!(
+            !args.iter().any(|a| a == "--model"),
+            "opencode's root command rejects --model; argv must carry none: {args:?}"
+        );
+        assert_eq!(
+            args,
+            [] as [String; 0],
+            "no argv at all reaches the opencode root command: {args:?}"
+        );
+        assert_eq!(
+            env_pin.as_deref(),
+            Some("opencode/big-pickle"),
+            "the implied cheap slot must still reach the pane, by env"
+        );
+        // An explicit bare pair for opencode travels the same channel —
+        // provider-prefixed, which is the form its env pin requires.
+        let (args, env_pin) =
+            bare_model_launch("opencode", "muse-spark-1.3-contributor", "opencode-go")
+                .expect("explicit bare pair");
+        assert_eq!(args, [] as [String; 0], "still no argv: {args:?}");
+        assert_eq!(
+            env_pin.as_deref(),
+            Some("opencode-go/muse-spark-1.3-contributor")
+        );
+        // A pi seat keeps the argv delivery — the split is per-harness, never
+        // a blanket loss of the pin.
+        let (pi_args, pi_env) = bare_model_launch("pi", "", "").expect("pi standard implied");
+        assert_eq!(
+            pi_args,
+            vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
+            "pi takes its model as argv"
+        );
+        assert_eq!(pi_env, None, "pi needs no env pin");
+    }
+
+    /// bd-oc-bare-spawn-model-argv-zbzt: the rate-limit fallback hops re-launch
+    /// INTO an existing pane, so they use the argv-only view — which must be
+    /// the INTERACTIVE form (opencode takes no model flag on the command herdr
+    /// starts) and must REFUSE an env-delivered pin instead of silently
+    /// launching a seat whose env already says something else.
+    #[test]
+    fn interactive_pane_args_is_argv_only_and_refuses_env_pins() {
+        // Harnesses that take the flag: unchanged.
+        assert_eq!(
+            interactive_pane_args("pi", "opencode-go/muse-spark-1.3-contributor", None)
+                .expect("pi argv"),
+            vec!["--model", "opencode-go/muse-spark-1.3-contributor"]
+        );
+        assert_eq!(
+            interactive_pane_args("grok", "grok-4.5", None).expect("grok argv"),
+            vec!["-m", "grok-4.5"]
+        );
+        // opencode's root command rejects `--model`; the pin belongs to pane
+        // env, and this caller cannot set it — refuse, naming the remedy.
+        let err = interactive_pane_args("opencode", "opencode/big-pickle", None)
+            .expect_err("an env pin cannot ride argv into an existing pane");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no model flag") && msg.contains("re-spawn the pane"),
+            "the refusal must name the reason and the remedy: {msg}"
         );
     }
 
@@ -4532,31 +4658,35 @@ mod spawn_profile_plan_tests {
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
         // Zero-config: compiled-in slots carry the implied models.
-        let args = bare_model_launch_args("opencode", "", "").expect("cheap implied");
-        assert_eq!(
-            args,
-            vec!["--model", "opencode/big-pickle"],
-            "opencode spawn without --model uses the cheap slot: {args:?}"
+        // bd-oc-bare-spawn-model-argv-zbzt: opencode's implied cheap slot is
+        // resolved by the same ladder, and delivered by env — its root command
+        // rejects the flag (`bare_opencode_spawn_never_emits_model_argv` pins
+        // the delivery; this pins the SLOT the ladder picks).
+        let (args, env_pin) = bare_model_launch("opencode", "", "").expect("cheap implied");
+        assert!(
+            args.is_empty() && env_pin.as_deref() == Some("opencode/big-pickle"),
+            "opencode spawn without --model uses the cheap slot, by env: {args:?} {env_pin:?}"
         );
-        let args = bare_model_launch_args("pi", "", "").expect("standard implied");
+        let (args, env_pin) = bare_model_launch("pi", "", "").expect("standard implied");
         assert_eq!(
             args,
             vec!["--model", "opencode-go/muse-spark-1.3-contributor"],
             "pi spawn without --model uses the standard slot: {args:?}"
         );
+        assert_eq!(env_pin, None, "pi rides argv");
         // bd-47fu: omp WAS the premium harness and is gone. The remaining
         // premium-slot harness is Closed (grok), and its bare-spawn refusal
         // is now the contract: never launch model-less, never guess.
-        let err = bare_model_launch_args("grok", "", "").expect_err("closed premium");
+        let err = bare_model_launch("grok", "", "").expect_err("closed premium");
         assert!(
             err.to_string().contains("grok"),
             "the refusal names the harness that cannot be routed: {err}"
         );
-        // Unknown kind: no implied slot → no flags (unchanged).
+        // Unknown kind: no implied slot → no flags, no pin (unchanged).
         assert_eq!(
-            bare_model_launch_args("kind-without-slot", "", "")
+            bare_model_launch("kind-without-slot", "", "")
                 .expect("unknown kind has no implied slot"),
-            [] as [String; 0]
+            (vec![], None)
         );
     }
 
@@ -4572,7 +4702,7 @@ mod spawn_profile_plan_tests {
         std::fs::create_dir_all(cfg_home.join("flywheel")).expect("config dir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
         // Zero-config: no grok-family id exists — fail loud, never zai.
-        let err = bare_model_launch_args("grok", "", "")
+        let err = bare_model_launch("grok", "", "")
             .expect_err("bare grok without a registered grok model must fail loud");
         let msg = format!("{err:#}");
         assert!(
@@ -4585,12 +4715,13 @@ mod spawn_profile_plan_tests {
             "[models.\"grok/grok-4.5\"]\n",
         )
         .expect("models.toml");
-        let args = bare_model_launch_args("grok", "", "").expect("grok routed");
+        let (args, pin) = bare_model_launch("grok", "", "").expect("grok routed");
         assert_eq!(
             args,
             vec!["-m", "grok-4.5"],
             "registered grok id routes, no premium leak: {args:?}"
         );
+        assert_eq!(pin, None, "grok rides argv");
     }
 
     /// bd-ll3k: the reconfirm table resolves profile and kind lanes
@@ -8271,6 +8402,10 @@ projects available: {}",
     // spawn BEFORE creating a workspace rather than after. The error is
     // propagated, never swallowed into `None` — a swallowed failure would
     // resurface later as a misleading "internal: plan no longer available".
+    // The first item's BARE (argv, env pin) — `Some` only when the first item
+    // has no profile. Threaded into the loop so the root pane's pin is resolved
+    // once (and so argv and env can never disagree about it).
+    let mut first_bare: Option<(Vec<String>, Option<String>)> = None;
     let mut first_plan: Option<ProfileLaunchPlan> = match items.first() {
         Some(item) => {
             let kind = spawn_item_kind(cfg, item, &catalog, &model_reg)?;
@@ -8280,13 +8415,30 @@ projects available: {}",
                 // resolves this item itself, so there is no root-pane pin to
                 // carry here. An unknown profile name still fails in the loop
                 // with the real reason.
-                _ => None,
+                //
+                // bd-oc-bare-spawn-model-argv-zbzt: a BARE first item still has
+                // a pin to carry when its harness delivers by env — that pin
+                // must be in the workspace env, for the same reason the profile
+                // plan is resolved above. `None` means "no profile plan", not
+                // "nothing to pin".
+                _ => {
+                    first_bare = Some(bare_model_launch(
+                        &kind,
+                        &opts.bare_model,
+                        &opts.bare_provider,
+                    )?);
+                    None
+                }
             }
         }
         None => None,
     };
     let mut herdr_env = herdr_shim::herdr_integration_env(cfg, first_pin.as_deref());
-    if let Some(m) = first_plan.as_ref().and_then(|p| p.env_model_pin.clone()) {
+    if let Some(m) = first_plan
+        .as_ref()
+        .and_then(|p| p.env_model_pin.clone())
+        .or_else(|| first_bare.as_ref().and_then(|(_, pin)| pin.clone()))
+    {
         herdr_shim::apply_opencode_model_pin(&mut herdr_env, &m)?;
     }
     // D9 (ADR-0013 Wave B): the spawn is an EFFECTFUL dispatch — the intent is
@@ -8412,11 +8564,23 @@ projects available: {}",
                 // bd-j3so: bare harness+model override for kind/count spawns
                 // (no --profile) — lenient registry routing. No profile, so
                 // no pin to record (P1-7 is a profile-provenance row).
-                None => (
-                    bare_model_launch_args(&kind, &opts.bare_model, &opts.bare_provider)?,
-                    None,
-                    None,
-                ),
+                // bd-oc-bare-spawn-model-argv-zbzt: the pin still has to be
+                // DELIVERED — the first agent reuses the plan resolved before
+                // workspace.create (its env is fixed there), later agents
+                // resolve their own (their pane env is built just below).
+                None => {
+                    let (args, env_pin) = if first {
+                        first_bare.take().ok_or_else(|| {
+                            anyhow!(
+                                "internal: the first agent's bare model plan was resolved before \
+                                 workspace.create but is no longer available"
+                            )
+                        })?
+                    } else {
+                        bare_model_launch(&kind, &opts.bare_model, &opts.bare_provider)?
+                    };
+                    (args, None, env_pin)
+                }
             };
             let mut pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
             if let Some(m) = &env_model_pin {

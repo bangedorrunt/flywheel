@@ -895,11 +895,25 @@ fn spawn_crew_into(
                                 },
                             );
                             let Some(route) = route else { return Err(e) };
-                            let fallback_args = headless::model_args(
+                            // bd-oc-bare-spawn-model-argv-zbzt: argv for the
+                            // interactive re-launch, never the headless form.
+                            // A route this pane cannot carry (opencode's pin
+                            // travels by env, and this pane's env is already
+                            // fixed) refuses here, before the rebind journal.
+                            let fallback_args = crate::interactive_pane_args(
                                 &route.harness,
                                 &route.model,
                                 (!profile.effort.is_empty()).then_some(profile.effort.as_str()),
-                            );
+                            )
+                            .map_err(|why| {
+                                anyhow!(
+                                    "pane crew: @{role} rate-limited on {} and the fallback {} \
+                                     cannot be delivered into this pane: {why:#} (original \
+                                     failure: {e:#})",
+                                    profile.model,
+                                    route.model_id
+                                )
+                            })?;
                             // GS-043 I4: journal before ModelEntry.fallback hop.
                             let intent = model_fallback_intent(
                                 project,
@@ -2049,8 +2063,23 @@ pub fn launch_spawn_job(
                 };
                 // argv shape preserved from the hand-rolled hop: no effort
                 // flag and no role flags, unlike the crew hop in
-                // `spawn_crew_into`.
-                let fallback_args = crate::headless::model_args(&route.harness, &route.model, None);
+                // `spawn_crew_into`. bd-oc-bare-spawn-model-argv-zbzt: the
+                // argv must be the INTERACTIVE form — the headless one types
+                // `--model` into opencode's root command, which rejects it (and
+                // this pane's env is already fixed, so the pin cannot ride
+                // there either): refuse rather than kill the pane or run an
+                // unpinned seat.
+                let fallback_args =
+                    crate::interactive_pane_args(&route.harness, &route.model, None).map_err(
+                        |why| {
+                            anyhow!(
+                                "pane spawn: {} rate-limited and the fallback {} cannot be \
+                                 delivered into this pane: {why:#}",
+                                plan.profile,
+                                route.model_id
+                            )
+                        },
+                    )?;
                 // GS-043 I4: journal before ModelEntry.fallback hop.
                 let intent = model_fallback_intent(
                     project,
