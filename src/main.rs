@@ -5020,6 +5020,7 @@ mod internal_respawn_tests {
             pane_id: pane.to_string(),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term".into(),
@@ -5309,6 +5310,7 @@ mod steer_safety_tests {
                 pane_id: format!("p-{name}"),
                 revision: 0,
                 state_change_seq: 0,
+                completion_seq: None,
                 state_labels: serde_json::Map::new(),
                 tab_id: "t".into(),
                 terminal_id: "term".into(),
@@ -5689,6 +5691,7 @@ mod workspace_origin_tests {
             pane_id: format!("{workspace_id}:p1"),
             revision: 1,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term_1".into(),
@@ -7471,24 +7474,35 @@ fn boot_prime_policy() -> crate::retry::RetryPolicy {
     }
 }
 
-fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) {
-    // P1: boot-prime loop rides the shared RetryPolicy (was: fixed 2s x3).
+/// Settle before Enter so a TUI that detects paste-by-timing does not treat
+/// an immediate Enter as a newline (tuios/herdr lesson; herdr plane harden).
+const PRIME_ENTER_SETTLE: Duration = Duration::from_millis(100);
+
+/// Type `line` into `pane_id` and submit. Prefers `agent.prompt` (no wait)
+/// when the pane can take it; otherwise `pane.send_text` + settle + Enter.
+/// Returns whether delivery was confirmed. If text landed but Enter failed,
+/// retries Enter only — never re-types the text (no invent-green, no double
+/// paste). Callers that need honesty (doorbell / recipe send) must check the
+/// bool; boot-prime paths may still warn-and-continue.
+fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) -> bool {
+    // Prefer agent.prompt when the pane accepts it (idle / ready gate).
+    if c.agent_prompt(pane_id, line, None).is_ok() {
+        return true;
+    }
     let policy = boot_prime_policy();
     let max = policy.max_attempts;
-    let res = policy.retry_with_backoff(
-        || {
-            c.pane_send_text(pane_id, line)
-                .and_then(|_| c.pane_send_input(pane_id, &["Enter"]))
-        },
+    // Land the text once (retry send_text only on failure).
+    let text_res = policy.retry_with_backoff(
+        || c.pane_send_text(pane_id, line),
         |_| true,
         |attempt, e| {
             eprintln!(
-                "flywheel: warn: boot-prime attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying"
+                "flywheel: warn: boot-prime send_text attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying"
             );
         },
         std::thread::sleep,
     );
-    if let Err(e) = res {
+    if let Err(e) = text_res {
         eprintln!(
             "flywheel: warn: boot-prime via pane.send_text failed for {pane_id} after {max} attempts: {e:#}"
         );
@@ -7496,7 +7510,27 @@ fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) {
             "flywheel:   manual socket prime: herdr pane send-text {pane_id} '{}' then send Enter (or herdr agent prompt {pane_id})",
             line
         );
+        return false;
     }
+    // Text landed — settle, then Enter. Retry Enter only (never re-type).
+    std::thread::sleep(PRIME_ENTER_SETTLE);
+    let enter_res = policy.retry_with_backoff(
+        || c.pane_send_input(pane_id, &["Enter"]),
+        |_| true,
+        |attempt, e| {
+            eprintln!(
+                "flywheel: warn: boot-prime Enter attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying Enter only"
+            );
+        },
+        std::thread::sleep,
+    );
+    if let Err(e) = enter_res {
+        eprintln!(
+            "flywheel: warn: boot-prime Enter failed for {pane_id} after text landed ({e:#}) — not re-typing text"
+        );
+        return false;
+    }
+    true
 }
 
 /// H3 (bd-harness-integration-preflight): lifecycle-hook-authority harness
@@ -15933,6 +15967,16 @@ fn cmd_send(
             );
         }
         let mut stalls_seen = 0usize;
+        // Baseline for read-before-retry: stall is not proof of non-delivery.
+        // Compare state_change_seq + agent.read against this after a stall.
+        let baseline_seq = a.state_change_seq;
+        let baseline_completion = a.completion_seq.unwrap_or(0);
+        // One delivery key for the whole send (fire-and-forget id, or none):
+        // stall resend keeps the same key so the journal shows one effect
+        // with two attempts, never a second mint.
+        let delivery_key = delivery_id_of(&fire_and_forget)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("send:{name}:{baseline_seq}"));
         // bd-4pxy: a still-booting agent rejects name-addressed prompts with
         // `agent_not_ready`; herdr accepts pane ids, so retry once via the
         // pane before giving up (bounded — never an infinite loop).
@@ -16050,11 +16094,41 @@ fn cmd_send(
                             return Err(e.into());
                         }
                         Some(StallStep::Retry) => {
-                            eprintln!(
-                                "flywheel: {target} agent_prompt_stalled — retrying once in {STALL_RETRY_DELAY_SECS}s"
+                            // toron wait.rs / herdr: read before retry, never
+                            // blind resubmit. Same delivery_key across attempts.
+                            let probe = probe_prompt_after_stall(
+                                &mut c,
+                                &target,
+                                &send_text,
+                                baseline_seq,
+                                baseline_completion,
                             );
-                            std::thread::sleep(Duration::from_secs(STALL_RETRY_DELAY_SECS));
                             stalls_seen += 1;
+                            if stall_may_resend(probe) {
+                                eprintln!(
+                                    "flywheel: {target} agent_prompt_stalled — prompt proven absent (delivery_key={delivery_key}); one resend"
+                                );
+                                // brief settle only; do NOT sleep-and-blind-resend
+                                std::thread::sleep(Duration::from_millis(200));
+                            } else {
+                                eprintln!(
+                                    "flywheel: {target} agent_prompt_stalled — refusing blind resubmit (probe={probe:?}, delivery_key={delivery_key}; read-before-retry)"
+                                );
+                                if wait {
+                                    return wait_failure_exit(
+                                        &mut c,
+                                        &target,
+                                        &name,
+                                        a,
+                                        cond_profile.as_deref(),
+                                        project,
+                                        &mut results,
+                                        &e,
+                                        &emit_rows,
+                                    );
+                                }
+                                return Err(stall_giveup_error(&target, project));
+                            }
                         }
                         Some(StallStep::Respawn) => {
                             let kinds = spawn_kinds_from_log(project);
@@ -16231,6 +16305,10 @@ fn cmd_send(
 // ---- send --wait stall recovery (bd-rdy) ----
 
 /// Delay before the single automatic retry after `agent_prompt_stalled`.
+/// Legacy name kept only as documentation of the old blind-sleep budget.
+/// Stall recovery no longer sleeps this long before a blind resend; it reads
+/// first (see [`probe_prompt_after_stall`]).
+#[allow(dead_code)]
 const STALL_RETRY_DELAY_SECS: u64 = 10;
 
 /// One step of the send --wait stall-recovery ladder.
@@ -16629,6 +16707,68 @@ fn stall_step(
     }
 }
 
+/// Outcome of the post-stall pane read (toron wait.rs: read → decide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallProbe {
+    /// Text absent from pane read AND no state_change_seq advance — may resend.
+    ProvenAbsent,
+    /// Prompt text visible and/or seq advanced — do NOT resubmit.
+    PresentOrActive,
+    /// Could not read the pane / seq — fail closed (no blind resend).
+    Unreadable,
+}
+
+/// Pure classifier for stall read-before-retry.
+/// `read`: None = read failed; Some(true) = needle visible; Some(false) = absent.
+/// `seq_advanced`: None = could not observe seq; Some(bool) = compared to baseline.
+fn classify_stall_probe(read: Option<bool>, seq_advanced: Option<bool>) -> StallProbe {
+    match (read, seq_advanced) {
+        (Some(true), _) | (_, Some(true)) => StallProbe::PresentOrActive,
+        (Some(false), Some(false)) | (Some(false), None) => StallProbe::ProvenAbsent,
+        (None, Some(false)) | (None, None) => StallProbe::Unreadable,
+    }
+}
+
+/// Resend only when the prompt is proven absent.
+fn stall_may_resend(probe: StallProbe) -> bool {
+    matches!(probe, StallProbe::ProvenAbsent)
+}
+
+/// Distinctive needle for presence checks (UTF-8 safe, bounded).
+fn prompt_presence_needle(text: &str) -> String {
+    text.chars().take(48).collect()
+}
+
+/// I/O boundary: read pane + seq, then classify. Never blind-resubmits.
+fn probe_prompt_after_stall(
+    c: &mut Client,
+    target: &str,
+    send_text: &str,
+    baseline_seq: u64,
+    baseline_completion: u64,
+) -> StallProbe {
+    let needle = prompt_presence_needle(send_text);
+    let read = match c.agent_read(target, "screen", Some(120)) {
+        Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
+        Err(_) => {
+            // Fallback: raw pane output via agent.read "output" if screen fails.
+            match c.agent_read(target, "output", Some(80)) {
+                Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
+                Err(_) => None,
+            }
+        }
+    };
+    let seq_advanced = c.agent_list().ok().and_then(|list| {
+        list.into_iter()
+            .find(|ag| ag.pane_id == target || ag.name.as_deref() == Some(target))
+            .map(|ag| {
+                ag.state_change_seq > baseline_seq
+                    || ag.completion_seq.unwrap_or(0) > baseline_completion
+            })
+    });
+    classify_stall_probe(read, seq_advanced)
+}
+
 /// bd-rdy: the give-up error for a twice-stalled send — names the recovery
 /// commands instead of silently dropping the prompt.
 fn stall_giveup_error(target: &str, project: &str) -> anyhow::Error {
@@ -16703,8 +16843,8 @@ fn try_send_text_delivery(
     eprintln!(
         "flywheel: {name} ({pane_id}) is a recipe-harness pane (kind {kind}) — delivering via pane.send_text"
     );
-    prime_line_via_send_text(c, pane_id, text);
-    true
+    // No invent-green: return the real confirmed-delivery result of prime.
+    prime_line_via_send_text(c, pane_id, text)
 }
 
 /// bd-4pxy: a launch_pending agent is NOT idle — it is still booting
@@ -16765,6 +16905,7 @@ mod bd_4pxy_tests {
             pane_id: format!("{ws}:p1"),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term".into(),
@@ -16837,6 +16978,41 @@ mod bd_4pxy_tests {
         assert!(out.is_ok());
         assert_eq!(calls, 3);
         assert_eq!(sleeps, 2);
+    }
+
+    /// herdr plane harden: prime prefers agent.prompt, settles before Enter,
+    /// retries Enter only, and try_send_text_delivery returns the real bool.
+    #[test]
+    fn prime_and_try_send_delivery_honesty_tripwire() {
+        let src = include_str!("main.rs");
+        let prime = crate::tripwire::find_fn(src, "prime_line_via_send_text");
+        let prime_body = &src[prime..prime + 2800];
+        assert!(
+            prime_body.contains("agent_prompt(pane_id, line, None)")
+                && prime_body.contains("PRIME_ENTER_SETTLE")
+                && prime_body.contains("retrying Enter only")
+                && prime_body.contains("-> bool"),
+            "prime_line_via_send_text must prefer agent.prompt, settle, Enter-only retry, return bool"
+        );
+        let try_fn = crate::tripwire::find_fn(src, "try_send_text_delivery");
+        let try_end = crate::tripwire::find_fn(src, "status_label");
+        let try_body = &src[try_fn..try_end];
+        assert!(
+            try_body.contains("prime_line_via_send_text(c, pane_id, text)"),
+            "try_send_text_delivery must call prime"
+        );
+        // Negative control: invent-green was `prime(...);\n    true`.
+        assert!(
+            !try_body.contains("prime_line_via_send_text(c, pane_id, text);\n    true"),
+            "try_send must not discard prime result then return true"
+        );
+        assert!(
+            try_body.contains("No invent-green")
+                && try_body
+                    .lines()
+                    .any(|l| l.trim() == "prime_line_via_send_text(c, pane_id, text)"),
+            "try_send return must be the prime bool"
+        );
     }
 
     #[test]
@@ -17319,6 +17495,89 @@ mod send_stall_recovery_tests {
         assert!(msg.contains("flywheel recover demo"), "{msg}");
         assert!(msg.contains("flywheel kill demo --force"), "{msg}");
         assert!(msg.contains("--respawn-on-stall"), "{msg}");
+    }
+
+    /// Read-before-retry: resend only when proven absent.
+    #[test]
+    fn stall_resend_only_when_proven_absent() {
+        assert!(stall_may_resend(StallProbe::ProvenAbsent));
+        assert!(!stall_may_resend(StallProbe::PresentOrActive));
+        assert!(!stall_may_resend(StallProbe::Unreadable));
+    }
+
+    #[test]
+    fn classify_stall_probe_table() {
+        assert_eq!(
+            classify_stall_probe(Some(true), Some(false)),
+            StallProbe::PresentOrActive
+        );
+        assert_eq!(
+            classify_stall_probe(Some(false), Some(true)),
+            StallProbe::PresentOrActive
+        );
+        assert_eq!(
+            classify_stall_probe(Some(false), Some(false)),
+            StallProbe::ProvenAbsent
+        );
+        assert_eq!(
+            classify_stall_probe(None, None),
+            StallProbe::Unreadable
+        );
+        assert_eq!(
+            classify_stall_probe(None, Some(false)),
+            StallProbe::Unreadable
+        );
+        assert_eq!(
+            classify_stall_probe(Some(false), None),
+            StallProbe::ProvenAbsent
+        );
+    }
+
+    /// Negative control: if classify always returned ProvenAbsent, the
+    /// PresentOrActive cases above would also pass — prove they do not.
+    #[test]
+    fn classify_stall_probe_negative_control_present_blocks_resend() {
+        let probe = classify_stall_probe(Some(true), Some(false));
+        assert_ne!(probe, StallProbe::ProvenAbsent);
+        assert!(!stall_may_resend(probe));
+    }
+
+    #[test]
+    fn prompt_presence_needle_utf8_safe_and_bounded() {
+        let n = prompt_presence_needle("abcdefghij");
+        assert_eq!(n, "abcdefghij");
+        let long = "x".repeat(100);
+        assert_eq!(prompt_presence_needle(&long).chars().count(), 48);
+        // multibyte: take chars, not bytes
+        let multi = "日本語テスト文字列ですよ追加";
+        let needle = prompt_presence_needle(multi);
+        assert!(needle.chars().count() <= 48);
+        assert!(multi.starts_with(&needle) || needle.len() <= multi.len());
+    }
+
+    /// Tripwire: first-stall path must read-before-retry, not blind sleep.
+    #[test]
+    fn send_stall_retry_reads_before_resend_tripwire() {
+        let src = include_str!("main.rs");
+        let send = crate::tripwire::find_fn(src, "cmd_send");
+        let send_end = crate::tripwire::find_fn(src, "stall_step");
+        let send_body = &src[send..send_end];
+        assert!(
+            send_body.contains("probe_prompt_after_stall")
+                && send_body.contains("stall_may_resend")
+                && send_body.contains("delivery_key"),
+            "cmd_send stall Retry must probe before resend and keep delivery_key"
+        );
+        assert!(
+            !send_body.contains("retrying once in {STALL_RETRY_DELAY_SECS}s"),
+            "must not blind sleep-and-resend on first stall"
+        );
+        // Negative control: a body that only slept would fail the probe assert.
+        assert!(
+            send_body.contains("refusing blind resubmit")
+                || send_body.contains("proven absent"),
+            "stall path must name the read-before-retry decision"
+        );
     }
 }
 
@@ -30633,7 +30892,9 @@ fn summarize_status_event(
     ev: &toron_core::backend::BackendEvent,
     seq: &mut u64,
 ) -> Option<StatusEventItem> {
-    use toron_core::backend::BackendEvent::{AgentDetected, AgentStatusChanged, PaneExited, Raw};
+    use toron_core::backend::BackendEvent::{
+        AgentDetected, AgentStatusChanged, EventsLost, PaneExited, Raw,
+    };
     let (event_type, pane_id, agent, status) = match ev {
         AgentStatusChanged {
             pane,
@@ -30661,6 +30922,8 @@ fn summarize_status_event(
             None,
             "exited".to_string(),
         ),
+        // events_lost is not a status push — caller must resubscribe + snapshot.
+        EventsLost => return None,
         Raw(_) => return None,
     };
     *seq = seq.saturating_add(1);
@@ -35833,6 +36096,7 @@ mod wait_output_tests {
             pane_id: pane.to_string(),
             revision: 1,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term_1".into(),
@@ -37901,6 +38165,7 @@ mod first_dispatch_gate_tests {
             pane_id: "w9:p1".to_string(),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "w9:t1".to_string(),
             terminal_id: "term-1".to_string(),

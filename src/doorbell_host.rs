@@ -9,11 +9,12 @@
 //! (removed); behavioral deltas are marked DELTA with their reason.
 
 use crate::config::Config;
-use crate::herdr_shim::{Client, Subscription};
+use crate::herdr_shim::{Client, StreamOutcome, Subscription};
 use crate::{config, doorbell, state, workspace};
 use doorbell_rt::{BrainMsg, Effect, FileStore, Host};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -77,7 +78,11 @@ pub struct RtHost {
     generation: Option<doorbell::WatcherGen>,
     exe_path: PathBuf,
     brain_tx: mpsc::Sender<BrainMsg>,
-    covered_panes: HashSet<String>,
+    /// Panes with an active multiplexed events.subscribe forwarder.
+    /// Shared with the reader thread so stream death can clear coverage and
+    /// the next sweep re-arms (herdr/tuios: stream death must not leave a
+    /// pane stuck "covered" forever).
+    covered_panes: Arc<Mutex<HashSet<String>>>,
     /// Shared with the delivery path. bd-kz54 follow-up: `WatchRetry::reset()`
     /// had exactly one caller in the whole tree — its own unit test — so four
     /// failures anywhere in a host's life latched the 16s gate permanently and
@@ -198,7 +203,7 @@ impl RtHost {
             generation: None,
             exe_path,
             brain_tx,
-            covered_panes: HashSet::new(),
+            covered_panes: Arc::new(Mutex::new(HashSet::new())),
             retry: std::sync::Arc::new(std::sync::Mutex::new(doorbell_rt::WatchRetry::default())),
             authority: crate::authority::RuntimeAuthority::resolve(),
             index_refreshed_at: now,
@@ -227,62 +232,190 @@ impl RtHost {
 
     /// Spawn push forwarders for registry panes without coverage (bd-8hv0):
     /// late crew panes get push coverage instead of the polling fallback.
+    ///
+    /// Multiplex: one `events.subscribe` covering all uncovered crew panes
+    /// (herdr/tuios per-caller stream cap). On stream death, clear covered
+    /// so the next sweep re-arms. If subscribe rejects because a listed pane
+    /// died, refresh the pane list and retry. `events_lost` stays TODO until
+    /// toron-core surfaces it as a typed signal (see hook below).
     fn cover_new_panes(&mut self) {
         let registry = state::load_spawn_registry(&self.project);
+        let covered = self
+            .covered_panes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let pane_ids: Vec<(String, String)> = registry
             .iter()
             .filter(|e| !e.pane_id.is_empty())
-            .filter(|e| !self.covered_panes.contains(&e.pane_id))
+            .filter(|e| !covered.contains(&e.pane_id))
             .filter_map(|e| e.mail_identity.clone().map(|pin| (e.pane_id.clone(), pin)))
             .collect();
+        drop(covered);
         if pane_ids.is_empty() {
             return;
         }
         let tx = self.brain_tx.clone();
         let socket = self.cfg.socket_path();
-        let mut ok_panes = Vec::new();
-        // One long-lived events.subscribe socket per call would be ideal;
-        // per-pane threads match the old topology exactly (proven live).
-        for (pane_id, _pin) in &pane_ids {
-            let tx_p = tx.clone();
-            let map = snapshot_pin(&registry, pane_id);
+        let pin_by_pane: HashMap<String, String> = pane_ids.iter().cloned().collect();
+        let mut attempt_ids: Vec<String> = pane_ids.iter().map(|(p, _)| p.clone()).collect();
+
+        let mut stream = None;
+        for _round in 0..3 {
             let Ok(mut sub_client) = Client::connect(Some(&socket)) else {
-                continue;
+                return;
             };
-            let subs = vec![Subscription::agent_status_changed(pane_id.clone())];
-            let Ok(mut stream) = crate::herdr_shim::subscribe(&mut sub_client, &subs) else {
-                continue;
-            };
-            ok_panes.push(pane_id.clone());
-            std::thread::spawn(move || {
-                while let Ok(Some(ev)) = stream.read_event() {
-                    if let crate::herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
-                    | crate::herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) =
-                        ev.data
-                    {
-                        // Resolve the pin at send time from the spawn-time
-                        // snapshot (registry reloads ride the next sweep).
-                        let pin = map.clone().unwrap_or_else(|| change.pane_id.clone());
-                        let msg = BrainMsg::HerdrStatus {
-                            pin,
-                            status: change.agent_status.as_str().to_string(),
-                        };
-                        if tx_p.blocking_send(msg).is_err() {
-                            break;
-                        }
+            let subs = Subscription::agent_status_changed_many(attempt_ids.iter().cloned());
+            match crate::herdr_shim::subscribe(&mut sub_client, &subs) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    // herdr rejects the whole request if any listed pane is gone.
+                    eprintln!(
+                        "flywheel doorbell: multiplex subscribe rejected ({e:#}) — refreshing pane list"
+                    );
+                    let live: HashSet<String> = Client::connect(Some(&socket))
+                        .ok()
+                        .and_then(|c| c.pane_list(None).ok())
+                        .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
+                        .unwrap_or_default();
+                    attempt_ids.retain(|id| live.contains(id));
+                    if attempt_ids.is_empty() {
+                        return;
                     }
                 }
-            });
+            }
         }
-        self.covered_panes.extend(ok_panes);
+        let Some(mut stream) = stream else {
+            return;
+        };
+
+        {
+            let mut covered = self
+                .covered_panes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            covered.extend(attempt_ids.iter().cloned());
+        }
+
+        let covered_shared = Arc::clone(&self.covered_panes);
+        let clear_ids = attempt_ids.clone();
+        let socket_for_reconcile = socket.clone();
+        std::thread::spawn(move || {
+            loop {
+                match stream.read_outcome() {
+                    Ok(StreamOutcome::Event(ev)) => {
+                        if let crate::herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
+                        | crate::herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) =
+                            ev.data
+                        {
+                            let pin = pin_by_pane
+                                .get(&change.pane_id)
+                                .cloned()
+                                .unwrap_or_else(|| change.pane_id.clone());
+                            let msg = BrainMsg::HerdrStatus {
+                                pin,
+                                status: change.agent_status.as_str().to_string(),
+                            };
+                            if tx.blocking_send(msg).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(StreamOutcome::EventsLost) => {
+                        // Typed events_lost: clear covered, snapshot-reconcile,
+                        // then exit so the next sweep re-subscribes.
+                        eprintln!(
+                            "flywheel doorbell: events_lost — clearing coverage and reconciling via session.snapshot"
+                        );
+                        clear_covered(&covered_shared, &clear_ids);
+                        reconcile_status_after_events_lost(
+                            &socket_for_reconcile,
+                            &pin_by_pane,
+                            &tx,
+                        );
+                        break;
+                    }
+                    Ok(StreamOutcome::Closed) | Err(_) => {
+                        // Stream death: clear coverage so the next sweep re-arms.
+                        clear_covered(&covered_shared, &clear_ids);
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 
-fn snapshot_pin(registry: &[state::SpawnEntry], pane_id: &str) -> Option<String> {
-    registry
-        .iter()
-        .find(|e| e.pane_id == pane_id)
-        .and_then(|e| e.mail_identity.clone())
+fn clear_covered(covered: &Mutex<HashSet<String>>, ids: &[String]) {
+    if let Ok(mut g) = covered.lock() {
+        for id in ids {
+            g.remove(id);
+        }
+    }
+}
+
+/// After `events_lost`: pull authoritative status via `session.snapshot`
+/// (fall back to `agent.list`) and re-enter as HerdrStatus Msgs. Does not
+/// invent delivery — only status facts for covered pins.
+fn reconcile_status_after_events_lost(
+    socket: &str,
+    pin_by_pane: &HashMap<String, String>,
+    tx: &mpsc::Sender<BrainMsg>,
+) {
+    let Ok(c) = Client::connect(Some(socket)) else {
+        eprintln!("flywheel doorbell: events_lost reconcile — connect failed");
+        return;
+    };
+    let agents = match c.call("session.snapshot", serde_json::json!({})) {
+        Ok(snap) => agents_from_session_snapshot(&snap).unwrap_or_else(|| {
+            c.agent_list().unwrap_or_default()
+        }),
+        Err(e) => {
+            eprintln!(
+                "flywheel doorbell: session.snapshot failed ({e:#}) — falling back to agent.list"
+            );
+            c.agent_list().unwrap_or_default()
+        }
+    };
+    for ag in agents {
+        let Some(pin) = pin_by_pane.get(&ag.pane_id) else {
+            continue;
+        };
+        let msg = BrainMsg::HerdrStatus {
+            pin: pin.clone(),
+            status: ag.agent_status.as_str().to_string(),
+        };
+        if tx.blocking_send(msg).is_err() {
+            break;
+        }
+    }
+}
+
+/// Pull AgentInfo rows out of a session.snapshot payload when present.
+fn agents_from_session_snapshot(
+    snap: &serde_json::Value,
+) -> Option<Vec<crate::herdr_shim::AgentInfo>> {
+    // Common shapes: { agents: [...] } or { panes: [...] } with agent fields,
+    // or nested under tabs. Prefer an agents array; else try panes.
+    if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {
+        let parsed: Result<Vec<_>, _> = arr
+            .iter()
+            .cloned()
+            .map(serde_json::from_value)
+            .collect();
+        return parsed.ok();
+    }
+    if let Some(arr) = snap.get("panes").and_then(|v| v.as_array()) {
+        let parsed: Result<Vec<_>, _> = arr
+            .iter()
+            .cloned()
+            .map(serde_json::from_value)
+            .collect();
+        return parsed.ok();
+    }
+    None
 }
 
 fn build_index(cfg: &Config, project: &str) -> doorbell::SelfIndex {

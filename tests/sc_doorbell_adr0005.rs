@@ -221,11 +221,58 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         brain.contains("take_allowed") && brain.contains("sync_journal"),
         "brain must enforce 5/30/3 budget behind the write-ahead journal"
     );
-    // Push-only status spine: no snapshot poll fallback (sweep retries
-    // coverage instead — DELTA vs the old refresh_status, same guarantee).
+    // Push-only status spine: no periodic agent_list poll. agent_list may
+    // appear only as the events_lost session.snapshot fallback (item 4),
+    // never as the live coverage driver.
+    let cover = host
+        .find("fn cover_new_panes")
+        .map(|i| &host[i..i + 3500])
+        .unwrap_or("");
     assert!(
-        !host.contains("agent_list"),
-        "no snapshot poll; forwarder push + per-sweep respawn cover status"
+        !cover.contains("agent_list") && cover.contains("agent_status_changed_many"),
+        "cover_new_panes must multiplex-subscribe, not poll agent_list"
+    );
+    assert!(
+        host.contains("reconcile_status_after_events_lost")
+            || !host.contains("refresh_status"),
+        "no retired refresh_status poll spine"
+    );
+}
+
+/// herdr plane harden item 4: one multiplexed events.subscribe for crew panes;
+/// stream death clears covered; events_lost stays compile-gated until toron.
+#[test]
+fn sc_d1_doorbell_multiplex_subscribe_and_stream_death_rearm() {
+    let host = read("src/doorbell_host.rs");
+    assert!(
+        host.contains("agent_status_changed_many")
+            && host.contains("cover_new_panes")
+            && host.contains("multiplex subscribe"),
+        "cover_new_panes must use one multiplexed subscribe for crew panes"
+    );
+    assert!(
+        host.contains("covered.remove")
+            || (host.contains("Stream death") && host.contains("covered_shared")),
+        "stream death must clear covered so the next sweep re-arms"
+    );
+    assert!(
+        host.contains("refreshing pane list") && host.contains("pane_list"),
+        "subscribe reject on dead pane must refresh pane list and retry"
+    );
+    assert!(
+        host.contains("StreamOutcome::EventsLost")
+            && host.contains("reconcile_status_after_events_lost")
+            && host.contains("session.snapshot"),
+        "events_lost must clear coverage and reconcile via session.snapshot"
+    );
+    assert!(
+        host.contains("read_outcome"),
+        "multiplex reader must use typed read_outcome (not string-match events_lost)"
+    );
+    // Negative control: per-pane one-thread-per-pane loop must be gone.
+    assert!(
+        !host.contains("per-pane threads match the old topology"),
+        "old per-pane subscribe topology must not remain"
     );
 }
 

@@ -115,6 +115,7 @@ mod tests {
             pane_id: "wT:p1".into(),
             revision: 1,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term_1".into(),
