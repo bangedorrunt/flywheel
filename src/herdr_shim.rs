@@ -1442,7 +1442,17 @@ pub fn probe_agent_responsiveness(
 enum StreamItem {
     Event(PushEvent),
     Closed,
+    /// herdr subscriber fell behind — typed `events_lost` (toron surfaces it).
+    EventsLost,
     Error(String),
+}
+
+/// Outcome of one stream read, distinguishing `events_lost` from EOF / I/O.
+#[derive(Debug)]
+pub enum StreamOutcome {
+    Event(PushEvent),
+    Closed,
+    EventsLost,
 }
 
 /// A bounded subscription stream. The toron-core `EventStream` runs on a
@@ -1493,6 +1503,10 @@ pub fn subscribe(c: &mut Client, subscriptions: &[Subscription]) -> Result<Event
                     let _ = tx.send(StreamItem::Closed);
                     break;
                 }
+                Err(e) if e.code == BackendErrorCode::EventsLost => {
+                    let _ = tx.send(StreamItem::EventsLost);
+                    break;
+                }
                 Err(e) => {
                     let _ = tx.send(StreamItem::Error(format!("herdr read failed: {e}")));
                     break;
@@ -1505,8 +1519,20 @@ pub fn subscribe(c: &mut Client, subscriptions: &[Subscription]) -> Result<Event
 
 impl EventStream {
     /// Read one pushed event. `Ok(None)` when the server closes the stream;
-    /// `Err` on a read timeout (when a deadline was set) or transient I/O.
+    /// `Err` on a read timeout (when a deadline was set), transient I/O, or
+    /// typed `events_lost` (message contains the code — prefer
+    /// [`Self::read_outcome`] to classify without string matching).
     pub fn read_event(&mut self) -> Result<Option<PushEvent>> {
+        match self.read_outcome()? {
+            StreamOutcome::Event(e) => Ok(Some(e)),
+            StreamOutcome::Closed => Ok(None),
+            StreamOutcome::EventsLost => Err(anyhow!("events_lost")),
+        }
+    }
+
+    /// Like [`Self::read_event`] but surfaces `events_lost` as a typed
+    /// outcome so callers can clear coverage and snapshot-reconcile.
+    pub fn read_outcome(&mut self) -> Result<StreamOutcome> {
         let item = match self.timeout {
             Some(d) => self.rx.recv_timeout(d).map_err(|e| match e {
                 std::sync::mpsc::RecvTimeoutError::Timeout => {
@@ -1519,8 +1545,9 @@ impl EventStream {
             None => self.rx.recv().map_err(|_| anyhow!("herdr stream closed")),
         }?;
         match item {
-            StreamItem::Event(e) => Ok(Some(e)),
-            StreamItem::Closed => Ok(None),
+            StreamItem::Event(e) => Ok(StreamOutcome::Event(e)),
+            StreamItem::Closed => Ok(StreamOutcome::Closed),
+            StreamItem::EventsLost => Ok(StreamOutcome::EventsLost),
             StreamItem::Error(msg) => Err(anyhow!("{msg}")),
         }
     }
@@ -3034,6 +3061,7 @@ mod gs049_launch_pending_tests {
             pane_id: "p1".into(),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term".into(),
