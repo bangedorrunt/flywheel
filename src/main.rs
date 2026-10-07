@@ -8007,34 +8007,34 @@ fn is_taken_name_error(e: &herdr_shim::BackendError) -> bool {
 /// rename-clear is only legal when the pane's OWN binding holds the contested
 /// name; a blind clear would rename a stranger. Pure, so the own/foreign
 /// split is unit-testable without herdr.
+///
+/// WHO ELSE holds the name is deliberately not an input: it shapes only the
+/// refusal MESSAGE, while the decision is the pane's own binding — so the
+/// effect layer reads the holder only when it has to refuse (`agent.list`
+/// twice per taken-name event would be one read of pure waste on the ordinary
+/// clear path).
 #[derive(Debug, PartialEq, Eq)]
 enum TakenNameAction {
     /// The pane's own binding holds the contested name — free it, retry once.
     FreeOwnBinding { label: String },
-    /// Anything else holds it — refuse, naming the holder (may be unknown).
-    ForeignHolder { holder: Option<String> },
+    /// Anything else holds it — refuse, naming the holder in the message.
+    ForeignHolder,
 }
 
 /// The decision behind [`start_agent_with_taken_name_clear`]. `attempt` only
 /// shapes the stale label; it never widens WHAT may be renamed.
-fn taken_name_action(
-    pane_binding: Option<&str>,
-    contested: &str,
-    holder_pane: Option<&str>,
-    attempt: u32,
-) -> TakenNameAction {
+fn taken_name_action(pane_binding: Option<&str>, contested: &str, attempt: u32) -> TakenNameAction {
     if pane_binding == Some(contested) {
         TakenNameAction::FreeOwnBinding {
             label: stale_rename_label(contested, attempt),
         }
     } else {
-        TakenNameAction::ForeignHolder {
-            holder: holder_pane.map(str::to_string),
-        }
+        TakenNameAction::ForeignHolder
     }
 }
 
 /// Outcome of one `agent.start` attempt through the shared recovery.
+#[derive(Debug)]
 enum StartAttempt {
     /// Accepted — first try, or after freeing the pane's own binding.
     Started,
@@ -8181,9 +8181,9 @@ fn start_agent_with_taken_name_clear(
         Ok(_) => StartAttempt::Started,
         Err(e) if !is_taken_name_error(&e) => StartAttempt::NotTaken(e),
         Err(_) => {
+            // The taken-name refusal: only the pane's OWN binding may be freed.
             let binding = ops.pane_binding(pane_id);
-            let holder = ops.holder_pane(name);
-            match taken_name_action(binding.as_deref(), name, holder.as_deref(), attempt) {
+            match taken_name_action(binding.as_deref(), name, attempt) {
                 TakenNameAction::FreeOwnBinding { label } => match ops.rename_pane(pane_id, &label)
                 {
                     Ok(()) => {
@@ -8197,15 +8197,28 @@ fn start_agent_with_taken_name_clear(
                                     "{name} ({pane_id}) agent_name_taken after rename-clear — refusing to burn the recovery budget. Close the workspace (flywheel kill <project> --force) or `herdr agent rename` the stale binding, then re-spawn."
                                 ))
                             }
-                            Err(e) => StartAttempt::NotTaken(e),
+                            Err(e) => {
+                                // The free did not buy a start (the pane
+                                // turned out to be occupied after all): put
+                                // the name BACK, so no door is left holding a
+                                // pane it renamed for nothing. Best-effort —
+                                // the caller must still see the real error.
+                                if let Err(back) = ops.rename_pane(pane_id, name) {
+                                    eprintln!(
+                                        "flywheel: could not restore name {name} on {pane_id} after a failed re-launch ({back:#}) — the binding stays {label}"
+                                    );
+                                }
+                                StartAttempt::NotTaken(e)
+                            }
                         }
                     }
                     Err(re) => StartAttempt::Refused(anyhow::anyhow!(
                         "{name} ({pane_id}) agent_name_taken and rename-clear failed ({re:#}) — fail-fast (GS-037 P0-3), not a ~120s burn. Close the workspace or release the name, then re-spawn."
                     )),
                 },
-                TakenNameAction::ForeignHolder { holder } => {
+                TakenNameAction::ForeignHolder => {
                     let own = binding.as_deref().unwrap_or("<no binding>");
+                    let holder = ops.holder_pane(name);
                     let held = holder.as_deref().map_or_else(
                         || "no live agent row holds it".to_string(),
                         |p| format!("held by pane {p}"),
@@ -8404,26 +8417,208 @@ mod taken_name_recovery_tests {
     #[test]
     fn taken_name_action_frees_only_the_panes_own_binding() {
         assert_eq!(
-            taken_name_action(Some("flywheel-demo-oc"), "flywheel-demo-oc", None, 3),
+            taken_name_action(Some("flywheel-demo-oc"), "flywheel-demo-oc", 3),
             TakenNameAction::FreeOwnBinding {
                 label: "flywheel-demo-oc-stale-3".into()
             }
         );
-        assert_eq!(
-            taken_name_action(None, "flywheel-demo-oc", Some("wA:p9"), 1),
-            TakenNameAction::ForeignHolder {
-                holder: Some("wA:p9".into())
+        // An absent binding, a different one, and a near miss all refuse.
+        for binding in [None, Some("other-agent"), Some("flywheel-demo-o")] {
+            assert_eq!(
+                taken_name_action(binding, "flywheel-demo-oc", 1),
+                TakenNameAction::ForeignHolder,
+                "binding {binding:?} is not this pane's own"
+            );
+        }
+    }
+
+    /// A scripted `TakenNameOps`: the sequence of `agent.start` outcomes, the
+    /// pane's binding, the visible holder, and an ordered call log. Lets a
+    /// fence drive [`start_agent_with_taken_name_clear`] branch by branch —
+    /// including the restore path, which needs a retry that fails for a reason
+    /// OTHER than the name.
+    struct ScriptedOps {
+        /// Popped per `agent_start`: `None` = accepted, `Some(code)` = refusal.
+        starts: Mutex<Vec<Option<&'static str>>>,
+        binding: Option<String>,
+        holder: Option<String>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedOps {
+        fn new(
+            starts: Vec<Option<&'static str>>,
+            binding: Option<&str>,
+            holder: Option<&str>,
+        ) -> Self {
+            Self {
+                starts: Mutex::new(starts.into_iter().rev().collect()),
+                binding: binding.map(str::to_string),
+                holder: holder.map(str::to_string),
+                calls: Mutex::new(Vec::new()),
             }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl TakenNameOps for ScriptedOps {
+        fn start_agent(
+            &mut self,
+            _name: &str,
+            _kind: &str,
+            _pane_id: &str,
+            _args: &[String],
+        ) -> std::result::Result<AgentInfo, BackendError> {
+            self.calls.lock().expect("calls lock").push("start".into());
+            let next = self
+                .starts
+                .lock()
+                .expect("starts lock")
+                .pop()
+                .expect("start_agent called more times than scripted");
+            match next {
+                None => Ok(row("flywheel-demo-oc", "wA:p1")),
+                Some(code) => Err(BackendError {
+                    code: BackendErrorCode::Other(code.into()),
+                    message: format!("scripted {code}"),
+                }),
+            }
+        }
+        fn pane_binding(&mut self, _pane_id: &str) -> Option<String> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push("pane_binding".into());
+            self.binding.clone()
+        }
+        fn holder_pane(&mut self, _name: &str) -> Option<String> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push("holder_pane".into());
+            self.holder.clone()
+        }
+        fn rename_pane(
+            &mut self,
+            _pane_id: &str,
+            label: &str,
+        ) -> std::result::Result<(), BackendError> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(format!("rename:{label}"));
+            Ok(())
+        }
+    }
+
+    /// The clear path is one read of the pane's OWN binding: no holder scan.
+    /// (Fresh-eyes fix — the holder shaped nothing but the refusal message.)
+    #[test]
+    fn successful_clear_reads_only_the_panes_own_binding() {
+        let mut ops = ScriptedOps::new(
+            vec![Some("agent_name_taken"), None],
+            Some("flywheel-demo-oc"),
+            Some("wA:p9"),
+        );
+        let outcome = start_agent_with_taken_name_clear(
+            &mut ops,
+            "flywheel-demo-oc",
+            "opencode",
+            "wA:p1",
+            &[],
+            1,
+        );
+        assert!(
+            matches!(outcome, StartAttempt::Started),
+            "the retry lands: {outcome:?}"
         );
         assert_eq!(
-            taken_name_action(Some("other-agent"), "flywheel-demo-oc", Some("wA:p9"), 1),
-            TakenNameAction::ForeignHolder {
-                holder: Some("wA:p9".into())
-            }
+            ops.calls(),
+            vec![
+                "start".to_string(),
+                "pane_binding".to_string(),
+                "rename:flywheel-demo-oc-stale-1".to_string(),
+                "start".to_string(),
+            ],
+            "one binding read, one free, one retry — and no holder scan"
         );
+    }
+
+    /// A free that does not buy a start is UNDONE: the pane gets its own name
+    /// back instead of being left renamed for the rest of the caller's loop
+    /// (measured live, where the retry answered `agent_pane_busy`). The caller
+    /// still sees the retry's real error.
+    #[test]
+    fn failed_retry_restores_the_renamed_binding() {
+        let mut ops = ScriptedOps::new(
+            vec![Some("agent_name_taken"), Some("agent_pane_busy")],
+            Some("flywheel-demo-oc"),
+            None,
+        );
+        let outcome = start_agent_with_taken_name_clear(
+            &mut ops,
+            "flywheel-demo-oc",
+            "opencode",
+            "wA:p1",
+            &[],
+            1,
+        );
+        match outcome {
+            StartAttempt::NotTaken(e) => assert_eq!(
+                e.code().as_str(),
+                "agent_pane_busy",
+                "the caller must see the retry's own error"
+            ),
+            other => panic!("expected the retry's error to reach the caller, got {other:?}"),
+        }
         assert_eq!(
-            taken_name_action(Some("other-agent"), "flywheel-demo-oc", None, 1),
-            TakenNameAction::ForeignHolder { holder: None }
+            ops.calls(),
+            vec![
+                "start".to_string(),
+                "pane_binding".to_string(),
+                "rename:flywheel-demo-oc-stale-1".to_string(),
+                "start".to_string(),
+                "rename:flywheel-demo-oc".to_string(),
+            ],
+            "the free is transactional: the binding comes back when the retry fails"
+        );
+    }
+
+    /// The refusal branch reads the holder FOR THE MESSAGE and renames nothing.
+    #[test]
+    fn foreign_refusal_names_the_holder_and_renames_nothing() {
+        let mut ops = ScriptedOps::new(vec![Some("agent_name_taken")], None, Some("wA:p9"));
+        match start_agent_with_taken_name_clear(
+            &mut ops,
+            "flywheel-demo-oc",
+            "opencode",
+            "wA:p1",
+            &[],
+            1,
+        ) {
+            StartAttempt::Refused(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("wA:p9"),
+                    "the refusal must name the holder: {msg}"
+                );
+                assert!(
+                    msg.contains("will not rename a stranger"),
+                    "the refusal must say why it did not clear the name: {msg}"
+                );
+            }
+            other => panic!("a foreign holder must refuse, got {other:?}"),
+        }
+        assert_eq!(
+            ops.calls(),
+            vec![
+                "start".to_string(),
+                "pane_binding".to_string(),
+                "holder_pane".to_string()
+            ],
+            "the holder is read for the message only — never a rename"
         );
     }
 
