@@ -6790,7 +6790,10 @@ mod spawn_boot_reliability_tests {
         }
         // The exact bytes herdr is asked for in the live witness (keep this
         // literal and the live run's label in sync).
-        assert_eq!(stale_rename_label(long, 1), "flywheel-elm-effect-rs-o-stale-1");
+        assert_eq!(
+            stale_rename_label(long, 1),
+            "flywheel-elm-effect-rs-o-stale-1"
+        );
         // Distinct attempts never collide.
         assert_ne!(stale_rename_label(long, 1), stale_rename_label(long, 2));
         // A name that already fits keeps its old shape (no rename churn).
