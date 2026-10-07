@@ -47,9 +47,10 @@ use crate::mcp_http::{McpClient, ServerKind};
 
 /// Shared tokio runtime: ONE per process (c3b.1 / se2.1 Phase A), built by
 /// `init_mailbox` — never a fresh `Runtime::new` per op. Construction failure
-/// is captured in the `Result`, so it propagates as an error at
-/// `Mail::from_config`, never a panic mid-op.
-static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+/// propagates as an error at `Mail::from_config`, never a panic mid-op. The
+/// cell holds the runtime, not a `Result`: bd-tg4n, a memoised failure would
+/// outlive its own cause and take mail down for the rest of the process.
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// The single shared in-process mailbox every `Mail` instance operates on
 /// (ADR-0003 Decision 3A). Mirrors `toron_mcp::demo_mailbox` (InProcessBus +
@@ -58,15 +59,65 @@ static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 /// every `ensure_project` on first use. Root dirs follow the durable D3
 /// resolution (bd-t9ey): `$XDG_DATA_HOME/toron` / `~/.local/share/toron` by
 /// default, `TORON_DATA_DIR` / `TORON_MCP_DATA_DIR` override.
-static MAILBOX: OnceLock<Result<toron_core::mailbox::Mailbox, String>> = OnceLock::new();
+static MAILBOX: OnceLock<toron_core::mailbox::Mailbox> = OnceLock::new();
 
 fn runtime() -> Result<&'static Runtime> {
-    RUNTIME
-        .get_or_init(|| {
-            Runtime::new().map_err(|e| format!("failed to initialize tokio runtime: {e}"))
-        })
-        .as_ref()
-        .map_err(|e| anyhow!("{e}"))
+    init_once(&RUNTIME, &INIT_GATE, || {
+        Runtime::new().map_err(|e| format!("failed to initialize tokio runtime: {e}"))
+    })
+    .map_err(|e| anyhow!("{e}"))
+}
+
+/// Serialises the two one-time builds. The fast path never takes it; only the
+/// cold build does, and there are exactly two of those per process.
+static INIT_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Memoise a successful build; never memoise a failure.
+///
+/// bd-tg4n: `OnceLock::get_or_init` stores the `Err` PERMANENTLY, so one failed
+/// build made mail unavailable for the rest of the process even after the cause
+/// was gone — the error outlived the condition and read as a bug somewhere else.
+/// `get_or_try_init` is the obvious fix and is UNSTABLE (`once_cell_try`), so
+/// this is the stable equivalent: the cell holds `T`, not `Result<T, String>`,
+/// and a builder that returns `Err` returns before the `set`. The next call
+/// therefore retries and a transient failure heals itself.
+///
+/// WHAT THIS DOES NOT DO: it does not fix the `wake_identity_tests` flake it was
+/// found through. Two `register_spawned_agent_*` tests still go red together
+/// roughly 2 runs in 8 under the module filter (measured after this change), so
+/// the trigger is NOT a stale cached error — a retry re-resolves whatever caused
+/// the failure and fails again. Two earlier theories were measured and
+/// REJECTED rather than shipped: a `test_state_home()` fix on the two tests
+/// (3/8 red), and a `cleanup_test_data_dir` that refuses to delete the dir the
+/// singleton was built on (5/10 red, worse). Deleting the temp dir is therefore
+/// not the trigger. The chain up to "a test can poison the process-global
+/// mailbox" is verified link by link; the trigger itself is still open.
+///
+/// The fast path is a lock-free `get`. `gate` is taken only while building, and
+/// the second `get` after acquiring it means a thread that lost the race reads
+/// the winner's value instead of building a duplicate.
+///
+/// Takes the cell rather than reaching for the statics so a test can drive a
+/// FRESH one; the process-global cells are already initialised by the time any
+/// unit test runs, so testing through them would prove nothing.
+fn init_once<T: Send + Sync + 'static>(
+    cell: &'static OnceLock<T>,
+    gate: &std::sync::Mutex<()>,
+    build: impl FnOnce() -> Result<T, String>,
+) -> Result<&'static T, String> {
+    if let Some(v) = cell.get() {
+        return Ok(v);
+    }
+    let _held = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(v) = cell.get() {
+        return Ok(v); // lost the race; the winner's value is the answer
+    }
+    let built = build()?; // a failure returns HERE, leaving the cell empty
+    let _ = cell.set(built);
+    cell.get()
+        .ok_or_else(|| "init_once: value lost to a concurrent build".to_string())
 }
 
 /// Build the shared runtime + mailbox eagerly, propagating failures as errors
@@ -74,7 +125,7 @@ fn runtime() -> Result<&'static Runtime> {
 /// `Mail::from_config`; every in-process op then reads the pre-built statics.
 fn init_mailbox() -> Result<()> {
     let _rt = runtime()?;
-    match MAILBOX.get_or_init(build_mailbox_once) {
+    match init_once(&MAILBOX, &INIT_GATE, build_mailbox_once) {
         Ok(_) => Ok(()),
         Err(e) => bail!("flywheel mail: in-process mailbox: {e}"),
     }
@@ -109,22 +160,81 @@ fn build_mailbox_once() -> Result<toron_core::mailbox::Mailbox, String> {
 /// The shared in-process mailbox. Only reachable after a successful
 /// `init_mailbox` (via `Mail::from_config`) — an unreachable panic here means
 /// a call path skipped construction, which is a programming error.
+///
+/// bd-tg4n: there is no `Some(Err(..))` arm any more, and that is the point of
+/// the change. The cell used to hold `Result<Mailbox, String>`, so a failed
+/// build was readable here FOREVER — an error that outlived its own cause. A
+/// failure now never reaches the cell; it surfaces once, at `Mail::from_config`,
+/// and the next call retries.
 pub fn mailbox() -> &'static toron_core::mailbox::Mailbox {
     match MAILBOX.get() {
-        Some(Ok(mb)) => mb,
-        Some(Err(e)) => {
-            unreachable!("mailbox init failure must surface via Mail::from_config: {e}")
-        }
+        Some(mb) => mb,
         None => unreachable!("mailbox() before Mail::from_config"),
     }
 }
 
 /// Non-panicking mailbox access for background ticks (GS-006 Ack-SLA).
 pub fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
-    match MAILBOX.get() {
-        Some(Ok(mb)) => Some(mb),
-        _ => None,
+    MAILBOX.get()
+}
+
+/// The data dir the process-global mailbox was actually BUILT on, or `None` if
+/// it has not been built yet (bd-tg4n).
+///
+/// This is [`BUILT_ROOTS`], NOT a fresh [`mailbox_roots`] call. Those differ
+/// exactly when it matters: `BUILT_ROOTS` is memoised when the singleton is
+/// first constructed, so by the time a later test asks, `TORON_DATA_DIR` may
+/// point somewhere else entirely. A first attempt at the cleanup helper
+/// compared against the live env and made the flake WORSE (5-in-10 red against
+/// a 2-in-8 baseline) for precisely that reason — it deleted the singleton's
+/// own directory while believing it was someone else's.
+#[cfg(test)]
+pub fn built_mail_root() -> Option<&'static std::path::Path> {
+    BUILT_ROOTS.get().map(|(dir, _)| dir.as_path())
+}
+
+/// bd-tg4n: remove a test's temp dir, UNLESS it is the directory the
+/// process-global mailbox was built on.
+///
+/// The mailbox is a process-wide singleton on a per-process SQLite store, and
+/// `pin_test_mail_root_set` only pins a root when NEITHER `TORON_MCP_DATA_DIR`
+/// nor `TORON_DATA_DIR` is set — so a test that sets `TORON_DATA_DIR` wins, and
+/// whichever test first reaches `Mail::from_config` owns the store for every
+/// later test in the process. Its closing `remove_dir_all` then pulls the
+/// directory out from under live pooled connections.
+///
+/// The measured symptom, verbatim from a failing run:
+/// `mail error subscription rejected: replay failure: error returned from
+/// database: (code: 1) no such table: bus_events` — the pool is still open but
+/// the store underneath it is gone. Every `register_spawned_agent*`,
+/// `bind_pane_mail_identity_stamps` and `add_panes_get_distinct_*` test that
+/// shared that process then returned `None` and failed on its `.expect`,
+/// roughly 2 runs in 8 under the module filter and 0 in 6 with
+/// `--test-threads=1`.
+///
+/// bd-gpaa: the equality guard this shipped with could never fire. Callers hand
+/// it the DURABLE ROOT they set `TORON_DATA_DIR` to, but [`built_mail_root`]
+/// returns the Mailbox DATA dir — `{root}/projects` (see [`mailbox_data_dir`]).
+/// Two different paths, so the guard was a permanent no-op that read like a fix.
+/// [`dir_holds_live_store`] is at-or-under for that reason.
+#[cfg(test)]
+pub fn cleanup_test_data_dir(dir: &std::path::Path) {
+    if dir_holds_live_store(built_mail_root(), dir) {
+        return;
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Would removing `dir` take the process-global mailbox's store with it?
+///
+/// At-or-under, not equality: `built` is `{root}/projects` and callers pass
+/// `{root}`, so only the ancestor form fires. Component-wise `starts_with`, so
+/// a sibling sharing a string prefix (`fw-bind-stamp-XY` against
+/// `fw-bind-stamp-X`) is NOT protected. `None` means no mailbox exists yet, so
+/// nothing is protected — the dir is still removed.
+#[cfg(test)]
+fn dir_holds_live_store(built: Option<&std::path::Path>, dir: &std::path::Path) -> bool {
+    matches!(built, Some(root) if root.starts_with(dir))
 }
 
 /// Root dirs for the in-process mailbox (se2.1 Phase B, bd-t9ey): the
@@ -1637,6 +1747,32 @@ impl Mail {
         }
     }
 
+    /// bd-reserve-yield-taqf: the LIVE yield pairs `(bead_id, holder)` — a
+    /// structured stand-down (toron `reserve yield`) says "that bead is this
+    /// live pane's work", which the loop's peer-hold rule consumes as one
+    /// more peer. Read through the SAME toron-core join that `reserve yields`
+    /// prints (markers x live lease board), so a released holder stops
+    /// suppressing on its own and no caller re-derives either half.
+    ///
+    /// Ceiling: a `[mail.toron] url` remote plane carries no yield tool (the
+    /// toron-side verb is CLI-only by design), so this returns no pairs
+    /// there. That is the absence of a read, never a fabricated hold — the
+    /// same shape as an unreadable reservation board.
+    pub fn yielded_pairs(&self, project_key: &str) -> Result<Vec<(String, String)>> {
+        match &self.backend {
+            BackendKind::InProcess => {
+                let (views, _suppressed) =
+                    block_on(mailbox().reservation_yield_board(project_key))?;
+                Ok(views
+                    .into_iter()
+                    .filter(|v| v.holder_live)
+                    .map(|v| (v.bead_id, v.holder))
+                    .collect())
+            }
+            BackendKind::Remote(_) => Ok(Vec::new()),
+        }
+    }
+
     /// `renew_file_reservations`. The response keeps the `file_reservations`
     /// envelope `list_own_reservations` parses (ids are toron hex event ids).
     pub fn renew(
@@ -2671,6 +2807,76 @@ mod tests {
         assert_eq!(out[0].id, "42");
     }
 
+    /// bd-reserve-yield-taqf: the flywheel read of toron's structured
+    /// stand-downs. Only yields whose holder is LIVE come back, a yield
+    /// naming a holder with no lease claims nothing, and a release clears the
+    /// pair with no delete path (suppression is derived from the board).
+    #[test]
+    fn yielded_pairs_reads_the_live_board() {
+        // Reads the shared mail root — serialize under the crate-wide env
+        // lock; sibling env tests swap TORON_*_DATA_DIR.
+        let _g = crate::config::lock_env();
+        let mail = Mail::from_config(None).expect("ok").expect("Some");
+        let project = "yield-pairs-board";
+        mail.ensure_project(project).expect("ensure");
+        for name in ["BlueLake", "RoseDune"] {
+            mail.register_agent(project, name, "test", "test", "yield-read test")
+                .expect("register");
+        }
+        mail.reserve(
+            project,
+            "RoseDune",
+            &["src/**".into()],
+            3600,
+            true,
+            "lane-work",
+        )
+        .expect("RoseDune holds the lane");
+
+        // No marker yet: a live lease alone yields no pair.
+        assert!(
+            mail.yielded_pairs(project).expect("read").is_empty(),
+            "a live lease is not a stand-down"
+        );
+
+        block_on(mailbox().record_reservation_yield(
+            project,
+            "BlueLake",
+            "lane-bead",
+            "RoseDune",
+            "peer works it",
+        ))
+        .expect("record yield");
+        assert_eq!(
+            mail.yielded_pairs(project).expect("read"),
+            vec![("lane-bead".to_string(), "RoseDune".to_string())],
+            "a yield naming a live holder is a peer pair"
+        );
+
+        // A yield naming a holder who holds nothing is inert.
+        block_on(mailbox().record_reservation_yield(
+            project,
+            "BlueLake",
+            "ghost-bead",
+            "GhostPane",
+            "no lease",
+        ))
+        .expect("record yield");
+        assert_eq!(
+            mail.yielded_pairs(project).expect("read").len(),
+            1,
+            "an unresolvable holder claims nothing"
+        );
+
+        // Release: the pair clears, so the loop resumes the bead again.
+        mail.release_paths(project, "RoseDune", &["src/**".into()])
+            .expect("release");
+        assert!(
+            mail.yielded_pairs(project).expect("read").is_empty(),
+            "a released holder stops suppressing with no delete path"
+        );
+    }
+
     /// bd-dsu1: the operator lock board dumps every active lease (id +
     /// holder) and filters by holder / path-glob overlap. Read-only — no
     /// project creation, no identity registration.
@@ -3687,6 +3893,169 @@ mod tests {
             "no stamp, no file → file-miss shape"
         );
         unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+    }
+}
+
+#[cfg(test)]
+mod cleanup_test_data_dir_tests {
+    use super::{cleanup_test_data_dir, dir_holds_live_store};
+    use std::path::Path;
+
+    /// bd-tg4n: a test temp dir that is NOT the singleton's root is removed, or
+    /// every run leaves a directory behind.
+    #[test]
+    fn an_unrelated_temp_dir_is_still_removed() {
+        let dir = std::env::temp_dir().join(format!("fw-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create");
+        std::fs::write(dir.join("marker"), b"x").expect("write");
+        assert!(dir.exists());
+
+        cleanup_test_data_dir(&dir);
+
+        assert!(
+            !dir.exists(),
+            "a dir that is not the singleton's root must be cleaned up, or every \
+             test run leaves one behind"
+        );
+    }
+
+    /// And it must not remove anything when handed a path that never existed —
+    /// a cleanup that can fail must stay quiet about it.
+    #[test]
+    fn a_missing_dir_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("fw-cleanup-none-{}", uuid::Uuid::new_v4()));
+        cleanup_test_data_dir(&dir); // must not panic
+    }
+
+    /// bd-gpaa: THE defect. `BUILT_ROOTS` holds the Mailbox DATA dir
+    /// (`{root}/projects`) while every caller passes the DURABLE ROOT (`{root}`)
+    /// it set `TORON_DATA_DIR` to. The equality guard this replaced never
+    /// matched, so the singleton's own store was deleted out from under its
+    /// pooled connections and `wake_identity_tests` kept failing 2 runs in 12
+    /// with `no such table: bus_events`.
+    #[test]
+    fn the_durable_root_holding_the_store_is_protected() {
+        let root = std::env::temp_dir().join(format!("fw-root-{}", uuid::Uuid::new_v4()));
+        let built = root.join("projects");
+        assert!(
+            dir_holds_live_store(Some(&built), &root),
+            "deleting {{root}} deletes {{root}}/projects — the live store. This is \
+             the exact shape every wake_identity_tests caller passes."
+        );
+    }
+
+    /// The data dir itself, so protecting the ancestor does not regress into
+    /// protecting only that one spelling.
+    #[test]
+    fn the_store_dir_itself_is_protected() {
+        let built = std::env::temp_dir()
+            .join(format!("fw-self-{}", uuid::Uuid::new_v4()))
+            .join("projects");
+        assert!(
+            dir_holds_live_store(Some(&built), &built),
+            "the store dir is protected"
+        );
+    }
+
+    /// Further up: `remove_dir_all(&tmp_root)` in a test that never set
+    /// `TORON_DATA_DIR` still takes a pinned per-process root with it.
+    #[test]
+    fn an_ancestor_of_the_store_is_protected() {
+        let built = Path::new("/tmp/fw-anc/store/projects");
+        assert!(
+            dir_holds_live_store(Some(built), Path::new("/tmp/fw-anc")),
+            "an ancestor holds the store too"
+        );
+        assert!(
+            dir_holds_live_store(Some(built), Path::new("/tmp")),
+            "and so does the temp root every one of these lives under"
+        );
+    }
+
+    /// `Path::starts_with` is component-wise, so a sibling sharing a STRING
+    /// prefix is not protected. A text-prefix guard would leak every temp dir
+    /// whose sibling name shares a few characters, and would look correct.
+    #[test]
+    fn a_string_prefix_sibling_is_not_protected() {
+        assert!(
+            !dir_holds_live_store(
+                Some(Path::new("/tmp/fw-bind-stamp-XYZ/projects")),
+                Path::new("/tmp/fw-bind-stamp-XY")
+            ),
+            "fw-bind-stamp-XY does not contain fw-bind-stamp-XYZ"
+        );
+    }
+
+    /// An unrelated dir, and no mailbox at all: neither is protected, or every
+    /// temp dir on the box survives the suite.
+    #[test]
+    fn an_unrelated_dir_and_a_missing_store_are_unprotected() {
+        let built = Path::new("/tmp/fw-some-other/store/projects");
+        assert!(!dir_holds_live_store(
+            Some(built),
+            Path::new("/tmp/fw-unrelated")
+        ));
+        assert!(!dir_holds_live_store(None, Path::new("/tmp/fw-unrelated")));
+    }
+}
+
+#[cfg(test)]
+mod init_once_tests {
+    use super::init_once;
+    use std::sync::OnceLock;
+
+    /// bd-tg4n: the defect this exists for. `get_or_init` stores the `Err`
+    /// permanently, so one failed build turned mail off for the rest of the
+    /// process — the error outliving its own cause. The fixture drives a FRESH
+    /// cell, because the process-global `MAILBOX` is long since initialised by
+    /// the time any unit test runs and would prove nothing here.
+    #[test]
+    fn a_failed_build_is_retried_and_a_later_success_sticks() {
+        static CELL: OnceLock<u32> = OnceLock::new();
+        static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A fresh cell per test would need a `&'static`; statics in a test fn
+        // are per-test-binary, so each test names its own pair.
+
+        let first = init_once(&CELL, &GATE, || Err("no such directory".to_string()));
+        assert_eq!(
+            first.err().as_deref(),
+            Some("no such directory"),
+            "a failed build reports its own error"
+        );
+        assert!(
+            CELL.get().is_none(),
+            "a failure must not be memoised, or it outlives its cause"
+        );
+
+        let second = init_once(&CELL, &GATE, || Ok(7));
+        assert_eq!(*second.expect("a later build succeeds"), 7);
+        assert!(
+            CELL.get().is_some(),
+            "a success is memoised — the whole point of the cell"
+        );
+    }
+
+    /// The other half: once a success lands, the builder does not run again.
+    /// Without this, "memoise success" would be indistinguishable from "retry
+    /// forever", and the shared mailbox would be rebuilt on every op.
+    #[test]
+    fn a_successful_build_runs_exactly_once() {
+        static CELL: OnceLock<u32> = OnceLock::new();
+        static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        for _ in 0..3 {
+            let seen = init_once(&CELL, &GATE, || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            });
+            assert_eq!(*seen.expect("memoised"), 1);
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the builder must not run again after a success"
+        );
     }
 }
 

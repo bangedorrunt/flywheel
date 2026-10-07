@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# captain-notify.sh (bd-xenf) — toast on urgent captain-pane transitions.
+# captain-notify.sh — toast on urgent captain-pane transitions.
 # Hooked to pane.agent_status_changed only. A blocked captain pane gets
 # `notification.show` with sound=request (mention/urgent proxy: lifecycle
 # edges carry no message content, so a blocked status IS the urgent
@@ -24,7 +24,7 @@ PIN="$("$HERDR" agent list 2>/dev/null | jq -r --arg p "$PANE_ID" '.result.agent
 [ -n "$PIN" ] || exit 0
 
 "$HERDR" notification show "Captain pane $PIN blocked" \
-  --body "pane $PANE_ID needs the captain (bd-xenf toast)" \
+  --body "pane $PANE_ID needs the captain" \
   --sound request 2>/dev/null \
   && echo "captain-notify: toasted $PIN ($PANE_ID)" \
   || echo "captain-notify: toast failed for $PIN (headless?)" >&2

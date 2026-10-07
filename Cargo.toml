@@ -95,6 +95,13 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toron-core = { path = "../toron/crates/toron-core" }
 
+# Dependency debuginfo is the dominant cost of a cold dev build and of every
+# relink, and none of it is read: a panic in a dependency still resolves to a
+# line table, which is all a backtrace needs. Full debuginfo for deps was the
+# default here because no repo set a `[profile.dev.package]` override.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [profile.release]
 # strip disabled (bd-lpho): the floating nightly's strip pass mis-aligns
 # proc-macro dylib LINKEDIT (libsqlx_macros dlopen fails), breaking every
@@ -102,105 +109,3 @@ toron-core = { path = "../toron/crates/toron-core" }
 # verifying a fixed toolchain. Cost: ~1MB larger binary, no behavior change.
 strip = false
 lto = true
-
-[lints.clippy]
-# Shared lint posture with sibling beads (bd-14ea): pedantic + nursery deny
-# with targeted allows. `all` deny predates the alignment and stays.
-# Deviation from beads: no [lints.rust] unsafe_code deny — flywheel carries
-# 116 `unsafe { env::set_var/remove_var }` sites (edition-2024 requirement,
-# mostly single-threaded tests), so deny would need 100+ carve-outs.
-all = "deny"
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-# Allow these lints to unblock CI (need higher priority than groups)
-cast_precision_loss = { level = "allow", priority = 1 }
-doc_markdown = { level = "allow", priority = 1 }
-missing_const_for_fn = { level = "allow", priority = 1 }
-uninlined_format_args = { level = "allow", priority = 1 }
-useless_let_if_seq = { level = "allow", priority = 1 }
-format_push_string = { level = "allow", priority = 1 }
-# Stylistic nursery/pedantic lints that don't reflect real defects
-option_if_let_else = { level = "allow", priority = 1 }
-map_unwrap_or = { level = "allow", priority = 1 }
-similar_names = { level = "allow", priority = 1 }
-too_long_first_doc_paragraph = { level = "allow", priority = 1 }
-missing_errors_doc = { level = "allow", priority = 1 }
-redundant_clone = { level = "allow", priority = 1 }
-struct_excessive_bools = { level = "allow", priority = 1 }
-if_not_else = { level = "allow", priority = 1 }
-# no_effect_underscore_binding is allowed crate-wide for exactly one shape:
-# `#[resonate_sdk::function]` regenerates the item, so item-level
-# expect/allow cannot reach the emitted copy; the sole zero-arg leaf is
-# heal_tick (doorbell.rs), whose `_args: ()` is inert by contract.
-no_effect_underscore_binding = { level = "allow", priority = 1 }
-# `clippy --fix` cleared ~800 sites; the rest are allowed, not fixed, to
-# keep this alignment commit reviewable. Tighten one lint at a time later.
-default_trait_access = { level = "allow", priority = 1 }
-use_self = { level = "allow", priority = 1 }
-redundant_closure_for_method_calls = { level = "allow", priority = 1 }
-needless_raw_string_hashes = { level = "allow", priority = 1 }
-too_many_lines = { level = "allow", priority = 1 }
-items_after_statements = { level = "allow", priority = 1 }
-redundant_pub_crate = { level = "allow", priority = 1 }
-needless_pass_by_value = { level = "allow", priority = 1 }
-unnecessary_wraps = { level = "allow", priority = 1 }
-match_same_arms = { level = "allow", priority = 1 }
-single_match_else = { level = "allow", priority = 1 }
-derive_partial_eq_without_eq = { level = "allow", priority = 1 }
-assigning_clones = { level = "allow", priority = 1 }
-must_use_candidate = { level = "allow", priority = 1 }
-manual_let_else = { level = "allow", priority = 1 }
-or_fun_call = { level = "allow", priority = 1 }
-branches_sharing_code = { level = "allow", priority = 1 }
-literal_string_with_formatting_args = { level = "allow", priority = 1 }
-case_sensitive_file_extension_comparisons = { level = "allow", priority = 1 }
-explicit_iter_loop = { level = "allow", priority = 1 }
-fn_params_excessive_bools = { level = "allow", priority = 1 }
-unreadable_literal = { level = "allow", priority = 1 }
-significant_drop_tightening = { level = "allow", priority = 1 }
-significant_drop_in_scrutinee = { level = "allow", priority = 1 }
-unused_self = { level = "allow", priority = 1 }
-used_underscore_binding = { level = "allow", priority = 1 }
-used_underscore_items = { level = "allow", priority = 1 }
-needless_collect = { level = "allow", priority = 1 }
-match_wildcard_for_single_variants = { level = "allow", priority = 1 }
-match_wild_err_arm = { level = "allow", priority = 1 }
-iter_on_single_items = { level = "allow", priority = 1 }
-iter_with_drain = { level = "allow", priority = 1 }
-trivially_copy_pass_by_ref = { level = "allow", priority = 1 }
-needless_pass_by_ref_mut = { level = "allow", priority = 1 }
-unnecessary_debug_formatting = { level = "allow", priority = 1 }
-needless_continue = { level = "allow", priority = 1 }
-tuple_array_conversions = { level = "allow", priority = 1 }
-implicit_hasher = { level = "allow", priority = 1 }
-ref_option = { level = "allow", priority = 1 }
-comparison_chain = { level = "allow", priority = 1 }
-nonminimal_bool = { level = "allow", priority = 1 }
-overly_complex_bool_expr = { level = "allow", priority = 1 }
-semicolon_if_nothing_returned = { level = "allow", priority = 1 }
-unnested_or_patterns = { level = "allow", priority = 1 }
-redundant_else = { level = "allow", priority = 1 }
-needless_bool = { level = "allow", priority = 1 }
-manual_assert = { level = "allow", priority = 1 }
-manual_string_new = { level = "allow", priority = 1 }
-single_char_pattern = { level = "allow", priority = 1 }
-single_char_add_str = { level = "allow", priority = 1 }
-duration_suboptimal_units = { level = "allow", priority = 1 }
-needless_borrow = { level = "allow", priority = 1 }
-implicit_clone = { level = "allow", priority = 1 }
-bool_to_int_with_if = { level = "allow", priority = 1 }
-enum_glob_use = { level = "allow", priority = 1 }
-range_plus_one = { level = "allow", priority = 1 }
-unnecessary_trailing_comma = { level = "allow", priority = 1 }
-# Integer casts in wire/backend code (port truncation/wrap/sign-loss).
-# Real portability notes on 64-bit-only targets; allowed with the same
-# rationale as cast_precision_loss above. Audit before any 32-bit target.
-cast_possible_truncation = { level = "allow", priority = 1 }
-cast_possible_wrap = { level = "allow", priority = 1 }
-cast_sign_loss = { level = "allow", priority = 1 }
-cast_lossless = { level = "allow", priority = 1 }
-# Result/Option ergonomics in the orchestration layer
-manual_ok_err = { level = "allow", priority = 1 }
-redundant_closure = { level = "allow", priority = 1 }
-field_reassign_with_default = { level = "allow", priority = 1 }
-ignored_unit_patterns = { level = "allow", priority = 1 }

@@ -1,11 +1,9 @@
 # Workflow Composition — the Agent's Guide to Optimizing Flywheel Work
 
-<!-- governed-by: ADR-0022 (proposed), ADR-0005, ADR-0010, ADR-0019 -->
+<!-- governed-by: ADR-0022, ADR-0005, ADR-0010, ADR-0019 -->
 <!--
-Agent-facing tutorial. SHIPPED = works today at this commit. PROPOSED =
-ADR-0022 wave not yet implemented — do NOT attempt these flags; the command
-will reject them. Every command block below marked SHIPPED was verified
-against the CLI surface.
+Agent-facing tutorial. SHIPPED = works today at this commit. Every command
+block below marked SHIPPED was verified against the CLI surface.
 -->
 
 You are a captain or crew agent driving flywheel. This document teaches you
@@ -45,7 +43,7 @@ Door map (one door per intent):
 | Supervise a solo durable lane | topology `loop-mode` | "run the loop workflow" |
 | Human gate on outer wave | SIGNOFF = `request_approval` on **outer** run only | nested crew inventing signoff |
 
-Invariants (each stated once): **preview ≠ started** — compose without `--run` only lints + previews the crew. **SIGNOFF outer-only** — nested captain+crew via `call_workflow` / `dispatch_job` never open a second `request_approval`. Ordinary builtins enter via `workflow run <name> --execute` — never bare `--parts`. Open mode may run a bounded ordinary workflow or stage in the current pane; that procedure does not change topology or grant delegation permission. On every follow-up/material context change, re-check `workflow list --brief --json` and `stage list`, choose the smallest vehicle, or announce `none: raw` rather than replaying a stale first-prompt choice.
+Invariants (each stated once): **preview ≠ started** — compose without `--run` only lints + previews the crew. **SIGNOFF outer-only** — nested captain+crew via `call_workflow` / `dispatch_job` never open a second `request_approval`, and a parked SIGNOFF is announced by the run's approval drainer (`flywheel workflow approve` resolves it; a resumed run re-issues it). **wave-swarm sequences on completion artifacts** — each gated pair (gate→dispatch→execute→review→verify) is separated by an await step that retries a `verify` of `.flywheel/wave/<label>-<stage>.done`, the marker the predecessor writes; per-step budget 240 x 30s, and exhaustion fails at that step with `wave in flight … extend with --timeout` (`--timeout` / `FLYWHEEL_COMPOSE_MAX_SECONDS` stays the run's outer bound). **join-before-post** — `compose --run` ensures the token's declared `steer_channel` (refusing up front when the channel cannot be resolved) and joins every spawned pin before any stage posts; briefing binds `captain_pin` to the arriving pin in the emitted `--inputs`, and names it in `questions` when it cannot derive it. Ordinary builtins enter via `workflow run <name> --execute` — never bare `--parts`. Open mode may run a bounded ordinary workflow or stage in the current pane; that procedure does not change topology or grant delegation permission. On every follow-up/material context change, re-check `workflow list --brief --json` and `stage list`, choose the smallest vehicle, or announce `none: raw` rather than replaying a stale first-prompt choice.
 
 Recursive `call_workflow` is durable Inception-style composition, but host-bounded: serialized lineage rejects cycles, depth beyond 8 (root included), and exhausted 32-child budget per lineage branch before `ctx.run` creates the child. The guard is an engine contract, not a prompt suggestion.
 
@@ -57,7 +55,7 @@ Evaluation contract: `ce-evaluate` is a fresh-context, read-only reviewer stage 
 catalog + built-ins          your first stop — something already fits
         │  doesn't fit
         ▼
-arrive + briefing            the session door (ADR-0011) — picks the vehicle
+arrive + briefing            the session door — picks the vehicle
         │  decide is the leaf
         │  compose arm
         ▼
@@ -171,7 +169,7 @@ pin that harness on the dispatch. Parts comma-separate. Nested control forms are
 `each:<param>:<part>`, `parallel:<param>:<part>`, `when:<guard>:<part>`, and
 `retry(n):<part>`. Wrappers fail the run. A false `when` guard skips.
 
-SHIPPED (ADR-0022 waves, 2026-08-21/22): phase metadata is carried on dispatch
+SHIPPED (2026-08-21/22): phase metadata is carried on dispatch
 specs (omp `--plan-yolo`, opencode `--agent plan`; unsupported mechanics fail
 loudly), stage-first bare-name parts resolve through stage affinity, `--keep
 <name>` graduates only after a GREEN run, and `cron run --live` performs the
@@ -189,7 +187,7 @@ flywheel workflow drift --json
 means no user copy, `current` means byte-equivalent semantics, `stale` means a
 user copy shadows a changed builtin, and `custom` means a user-only entry.
 
-SHIPPED (bd-adr22-t1-grammar-residual-zjk0): `each:`/`when:`/
+SHIPPED: `each:`/`when:`/
 `retry(n)`/`parallel:` part forms, `--from-yaml -`, `--dry-run`
 first-class, compose budget caps.
 
@@ -281,7 +279,7 @@ into `~/.config/opencode/commands/` — plural):
 
 Mail steering (any harness): crews ack, read, and reply through the toron
 mailbox; replies must land in the thread before you claim a response
-(bd-debate-reply-routing lesson: verify delivery, do not assume).
+(lesson: verify delivery, do not assume).
 
 ### 5a. Coordination and steering, by boundary
 
@@ -307,7 +305,7 @@ not coordination evidence.
 
 ## 5b. Principles — the awareness contract (SHIPPED)
 
-The 21 engineering principles (ADR-0019 Spec 5/6) are a closed registry.
+The 21 engineering principles are a closed registry.
 They are not decoration; two mechanisms consume them:
 
 1. **Workflow YAML**: declare `principles: [name, ...]` on any workflow
@@ -334,7 +332,7 @@ flywheel principles show <name>    # full text of one principle
   2026-08-17 mislabel class — the loop's refusal is correct; fix the work
   or the citation, never the check.
 
-Phase affinities (guidance until ADR-0022 mechanizes injection): resolve →
+Phase affinities (guidance; not yet machine-enforced): resolve →
 `foundational-thinking`, `model-the-domain`, `boundary-discipline`; plan →
 `sequence-verifiable-units`, `subtract-before-you-add`; implement →
 `prove-it-works`, `fix-root-causes`, `make-operations-idempotent`; review →
@@ -358,7 +356,7 @@ a from-zero graph is not.
 
 ---
 
-## 7. Phases (ADR-0022)
+## 7. Phases
 
 Every dispatch may carry a typed phase
 (`resolve|plan|implement|review|verify|compound`); the harness applies the
@@ -372,7 +370,7 @@ claim.
 
 1. **Lint is fail-stop.** No exceptions, no "temporary".
 2. **Dry-run before execute.** Always. Even the third time.
-3. **Read the run before claiming outcome.** Evidence-based done (ADR-0019).
+3. **Read the run before claiming outcome.** Evidence-based done.
 4. **No live-run mutation.** A running workflow is never edited mid-run
    (breaks durable replay). Abort → compose v2 seeded from v1 → run v2.
 5. **Budget your fan-outs.** The A7 semaphore bounds in-flight per agent; a
@@ -420,6 +418,5 @@ flywheel loop run <project> --work
 SHIPPED: `phase:` in specs; `stage {list,show,new,lint,promote}` + stage-first parts;
 `--keep` graduation; `cron run --live`; delegated compose via mail (W7
 allowlist-gated); `each:`/`when:`/`retry(n)`/`parallel:` parts; `--from-yaml -`;
-`--dry-run`; budget caps. Known deviations tracked in bd-adr22-phase-enum-lint-ahfh
-(open String phase, R-P lint absent) and bd-adr22-local-resonate-tx8q
-(engine is in-memory — no cross-process crash resume yet).
+`--dry-run`; budget caps. Known deviations: an open String phase and no R-P lint; the engine is
+in-memory, so there is no cross-process crash resume yet.

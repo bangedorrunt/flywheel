@@ -287,9 +287,20 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
     if mail_degraded {
         degraded.push("mail".to_string());
     }
-    let (held_paths, res_degraded) = read_held_paths(cfg, project);
+    // bd-swarm-cockpit-pczs: the board is read ONCE — `held_paths` and the
+    // per-pin `bead`/`reservations` binding are two projections of it.
+    let (board, res_degraded) = read_reservation_board(cfg, project);
     if res_degraded {
         degraded.push("reservations".to_string());
+    }
+    let held_paths = board.as_ref().map(parse_held_paths).unwrap_or_default();
+    if let Some(board) = &board {
+        let identities: std::collections::BTreeMap<String, String> =
+            crate::state::load_spawn_registry(&project_dir.to_string_lossy())
+                .into_iter()
+                .filter_map(|e| e.mail_identity.map(|id| (e.name, id)))
+                .collect();
+        bind_pins_to_board(&mut pins, board, &|name| identities.get(name).cloned());
     }
 
     let dispatcher =
@@ -404,15 +415,65 @@ fn parse_held_paths(board: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn read_held_paths(cfg: &crate::config::Config, project: &str) -> (Vec<String>, bool) {
+/// bd-swarm-cockpit-pczs: ONE live board read feeds `held_paths` AND the
+/// per-pin bead/reservation binding below. `Ok(None)` on a miss (the caller
+/// degrades loudly, never fabricating a calm board).
+fn read_reservation_board(
+    cfg: &crate::config::Config,
+    project: &str,
+) -> (Option<serde_json::Value>, bool) {
     // Mail facade covers remote daemon AND in-process. try_mailbox() is
     // in-process only — a configured URL never fills it, so helm degraded.
     match crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
         Ok(Some(mail)) => match mail.list_active(project, None, None) {
-            Ok(v) => (parse_held_paths(&v), false),
-            Err(_) => (Vec::new(), true),
+            Ok(v) => (Some(v), false),
+            Err(_) => (None, true),
         },
-        _ => (Vec::new(), true),
+        _ => (None, true),
+    }
+}
+
+/// bd-swarm-cockpit-pczs: bind each pane to its current bead claim and held
+/// reservations from the LIVE reservation board. A row's `reason` is the
+/// reserve-before-work lifecycle's bead id (the same rule `claim_watch_step`
+/// consults), and the row's `holder` is the resolved actor: a pane matches
+/// when the holder equals its herdr name OR the mail identity the caller
+/// resolves for that name (leases bind the MAIL pin, not the pane title). A
+/// pin with no row keeps empty bead/reservations — absence, never a default.
+/// Pure over the parsed board and an injected identity lookup.
+pub fn bind_pins_to_board(
+    pins: &mut [PinRow],
+    board: &serde_json::Value,
+    identity_of: &dyn Fn(&str) -> Option<String>,
+) {
+    let Some(rows) = board.get("reservations").and_then(|r| r.as_array()) else {
+        return;
+    };
+    for pin in pins.iter_mut() {
+        let mail_pin = identity_of(&pin.pin);
+        for row in rows {
+            let holder = row.get("holder").and_then(|h| h.as_str()).unwrap_or("");
+            let matches = holder == pin.pin || mail_pin.as_deref() == Some(holder);
+            if !matches {
+                continue;
+            }
+            if let Some(path) = row.get("path").and_then(|p| p.as_str()) {
+                let path = path.to_string();
+                if !pin.reservations.contains(&path) {
+                    pin.reservations.push(path);
+                }
+            }
+            if pin.bead.is_none() {
+                let reason = row.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+                if let Some(bead) = reason
+                    .split_whitespace()
+                    .next()
+                    .filter(|s| s.starts_with("bd-"))
+                {
+                    pin.bead = Some(bead.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -745,5 +806,59 @@ mod adr0010_d10_tests {
         assert!(!coalition_is_live("2026-08-10T00:28:26Z", 1_788_840_000));
         assert!(coalition_is_live("2026-09-07T12:00:00Z", 1_788_840_000));
         assert!(!coalition_is_live("not-a-date", 1_788_840_000));
+    }
+
+    /// bd-swarm-cockpit-pczs Acceptance: a pane's bead claim and held
+    /// reservations come from the LIVE reservation board — a row's `reason`
+    /// is the reserve-before-work bead id (the rule `claim_watch_step`
+    /// consults), and it matches the pane either by its herdr name or by the
+    /// mail identity the caller resolves for it (leases bind the MAIL pin,
+    /// not the pane title). A pane with no row stays empty: absence, never a
+    /// fabricated claim.
+    #[test]
+    fn status_binds_pane_to_bead() {
+        let mut pins = vec![
+            PinRow {
+                pin: "crew-1-amberelk".into(),
+                verdict: "Busy(herdr-evidence)".into(),
+                source: "herdr".into(),
+                since: String::new(),
+                bead: None,
+                reservations: vec![],
+            },
+            PinRow {
+                pin: "wP:p9".into(),
+                verdict: "Idle(herdr)".into(),
+                source: "herdr".into(),
+                since: String::new(),
+                bead: None,
+                reservations: vec![],
+            },
+        ];
+        let board = serde_json::json!({
+            "count": 3,
+            "reservations": [
+                {"path": "src/crew.rs", "holder": "AmberElk", "reason": "bd-zgi9"},
+                {"path": "CHANGELOG.md", "holder": "AmberElk", "reason": "bd-zgi9"},
+                {"path": "docs/x.md", "holder": "wP:p9", "reason": ""}
+            ]
+        });
+        // The registry resolves the herdr name to the mail pin the lease binds.
+        let identities = |name: &str| (name == "crew-1-amberelk").then(|| "AmberElk".to_string());
+        bind_pins_to_board(&mut pins, &board, &identities);
+        assert_eq!(pins[0].bead.as_deref(), Some("bd-zgi9"));
+        assert_eq!(pins[0].reservations, vec!["src/crew.rs", "CHANGELOG.md"]);
+        // A no-reason row binds reservations but invents no claim.
+        assert_eq!(pins[1].bead, None);
+        assert_eq!(pins[1].reservations, vec!["docs/x.md"]);
+        // Re-binding is idempotent; a boardless read binds nothing.
+        bind_pins_to_board(&mut pins, &board, &identities);
+        assert_eq!(
+            pins[0].reservations.len(),
+            2,
+            "no duplicate rows on re-bind"
+        );
+        bind_pins_to_board(&mut pins, &serde_json::json!({}), &identities);
+        assert_eq!(pins[0].bead.as_deref(), Some("bd-zgi9"));
     }
 }

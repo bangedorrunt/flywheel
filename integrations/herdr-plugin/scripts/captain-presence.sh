@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# captain-presence.sh (bd-xenf) — upsert captain-pane presence on every
+# captain-presence.sh — upsert captain-pane presence on every
 # lifecycle edge. Read-and-notify only: publishes toron presence rows,
 # writes the last snapshot. Never dispatches, closes, or writes beads.
 # Always exits 0 — a hook must never break herdr's event loop.
@@ -37,7 +37,7 @@ printf '%s\n' "$CAPTAIN_ROWS" | while IFS= read -r row; do
   project="$(printf '%s' "$row" | cut -f3)"
   [ "$pane" = "$PANE_ID" ] || continue
   if gone_now; then state="gone"; else state="live"; fi
-  # toron_pin token + live/gone rides the presence row bd-3vr9 consumes.
+  # toron_pin token + live/gone rides the presence row the captain reads.
   # Env (incl. TORON_MCP_URL) inherits untouched; toron failure warns only.
   if ! toron presence publish \
       --project "$project" --as "$pin" --state working --status "$state" 2>/dev/null; then

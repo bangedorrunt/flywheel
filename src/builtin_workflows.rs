@@ -61,7 +61,7 @@ pub const BUILTIN_WORKFLOWS_YAML: &[(&str, &str)] = &[
         "phase-resolve",
         r#"
 name: phase-resolve
-description: "ADR-0022 §3.3 phase built-in (resolve): reduce ambiguity to a goal statement. The resolver posts the statement to the project thread (plane P) and replies with the machine-checkable §4.5 report: target, non_goals, blast_radius, open_questions."
+description: "Phase built-in (resolve): reduce ambiguity to a goal statement. The resolver posts the statement to the project thread (plane P) and replies with the machine-checkable §4.5 report: target, non_goals, blast_radius, open_questions."
 trigger:
   type: webhook
 crew: auto
@@ -82,7 +82,7 @@ steps:
         "phase-plan",
         r#"
 name: phase-plan
-description: "ADR-0022 §3.3 phase built-in (plan): decompose into verifiable beads. §4.5 contract: ≥1 bead with non-empty acceptance, br-verified dep_cycles=0 (the chain runner injects it; do not self-report)."
+description: "Phase built-in (plan): decompose into verifiable beads. §4.5 contract: ≥1 bead with non-empty acceptance, br-verified dep_cycles=0 (the chain runner injects it; do not self-report)."
 trigger:
   type: webhook
 crew: auto
@@ -105,7 +105,7 @@ steps:
         "phase-implement",
         r#"
 name: phase-implement
-description: "ADR-0022 §3.3 phase built-in (implement): build against a bead. §4.5 contract: a commit whose message cites the bead id + the bead's acceptance gate exit 0 with output recorded."
+description: "Phase built-in (implement): build against a bead. §4.5 contract: a commit whose message cites the bead id + the bead's acceptance gate exit 0 with output recorded."
 trigger:
   type: webhook
 crew: auto
@@ -130,7 +130,7 @@ steps:
         "phase-review",
         r#"
 name: phase-review
-description: "ADR-0022 §3.3 phase built-in (review): adversarial falsification, n=2 fanout (R-P3). §4.5 contract: findings posted + verdict ∈ {AGREE, AGREE-WITH-CHANGES, REJECT}."
+description: "Phase built-in (review): adversarial falsification, n=2 fanout (R-P3). §4.5 contract: findings posted + verdict ∈ {AGREE, AGREE-WITH-CHANGES, REJECT}."
 trigger:
   type: webhook
 crew: auto
@@ -158,7 +158,7 @@ steps:
         "phase-verify",
         r#"
 name: phase-verify
-description: "ADR-0022 §3.3 phase built-in (verify): prove the contract by running the named gate. §4.5 contract: gate exit 0 with output recorded."
+description: "Phase built-in (verify): prove the contract by running the named gate. §4.5 contract: gate exit 0 with output recorded."
 trigger:
   type: webhook
 crew: auto
@@ -180,7 +180,7 @@ steps:
         "ship",
         r#"
 name: ship
-description: "ADR-0022 §3.3 chain built-in: resolve → plan → implement → review → verify with the §4.5 completion-contract gates between links. `flywheel workflow run ship --execute` routes through the gated chain runner (phase_chain::run_ship_chain); a plain engine invoke runs the links without gates. crew: auto."
+description: "Chain built-in: resolve → plan → implement → review → verify with the §4.5 completion-contract gates between links. `flywheel workflow run ship --execute` routes through the gated chain runner (phase_chain::run_ship_chain); a plain engine invoke runs the links without gates. crew: auto."
 trigger:
   type: webhook
 crew: auto
@@ -215,7 +215,7 @@ steps:
         "ce-brainstorm",
         r#"
 name: ce-brainstorm
-description: "Requirements-first divergent ideation (ADR-0009) — three independent lenses diverge in parallel, the planner reduces to a requirements-only artifact via the ce-brainstorm stage."
+description: "Requirements-first divergent ideation — three independent lenses diverge in parallel, the planner reduces to a requirements-only artifact via the ce-brainstorm stage."
 trigger:
   type: webhook
 crew: auto
@@ -352,7 +352,7 @@ steps:
         "goal-direct",
         r#"
 name: goal-direct
-description: "Captain-free DIRECT arm of goal (bd-t86p) — ce-brainstorm → plan → build → review → ship with NO bead tracking and NO plan approval gate: non-bead targets flow straight to the coder. `flywheel steer \"<target>\" --direct` runs this."
+description: "Captain-free DIRECT arm of goal — ce-brainstorm → plan → build → review → ship with NO bead tracking and NO plan approval gate: non-bead targets flow straight to the coder. `flywheel steer \"<target>\" --direct` runs this."
 trigger:
   type: webhook
 crew: auto
@@ -388,7 +388,7 @@ steps:
         "plan-direct",
         r#"
 name: plan-direct
-description: "Goal → execution plan WITHOUT the approval gate (bd-t86p): the captain-free companion to `ce-plan`. The plan gate is the one interactive checkpoint; a steer --direct run must not park on it — the captain already stated the target."
+description: "Goal → execution plan WITHOUT the approval gate: the captain-free companion to `ce-plan`. The plan gate is the one interactive checkpoint; a steer --direct run must not park on it — the captain already stated the target."
 trigger:
   type: webhook
 crew: auto
@@ -495,7 +495,7 @@ steps:
         "captain-audit",
         r#"
 name: captain-audit
-description: "Captain audit (bd-wsui) — read-only analysis of a topic within a scope: scout gathers evidence, oracle synthesizes, reviewer challenges. ANALYSIS ONLY: no beads, no repo edits; the final report is written to report_path."
+description: "Captain audit — read-only analysis of a topic within a scope: scout gathers evidence, oracle synthesizes, reviewer challenges. ANALYSIS ONLY: no beads, no repo edits; the final report is written to report_path."
 trigger:
   type: webhook
 crew: auto
@@ -535,7 +535,7 @@ graph:
         "ce-compound",
         r#"
 name: ce-compound
-description: "ADR-0009 standalone compound gate: capture the durable learning from a verified bead/wave/session into docs/learnings/inbox/ as tier-perishable (bd-iqte) — usable from ANY topology (open/loop/swarm). One learning per run; clean_skip is a success."
+description: "Standalone compound gate: capture the durable learning from a verified bead/wave/session into docs/learnings/inbox/ as tier-perishable — usable from ANY topology (open/loop/swarm). One learning per run; clean_skip is a success."
 trigger:
   type: webhook
 crew: auto
@@ -556,7 +556,7 @@ steps:
       profile: "@housekeeper"
       phase: compound
       stage: ce-compound
-      task: 'Run the compound gate (ADR-0009, bd-iqte) over: bead {{inputs.bead}} {{inputs.source}}. Depth {{inputs.depth}}: "full" (default) runs the complete gate with all read lanes; "lightweight" captures one learning with minimal probes. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Read lanes are rg + chie qmd search + chie memory recall (labeled, offline-safe). Qualifying learnings are memory-recorded and filed to docs/learnings/inbox/ as tier: perishable with expires: and provenance (reinforced: stamped today) — never straight to docs/learnings/, never gated on a human at write time. Reply with ONLY the terminal JSON. The terminal signal (inboxed|clean_skip) IS the run verdict — never prose around it. One learning per run.'
+      task: 'Run the compound gate over: bead {{inputs.bead}} {{inputs.source}}. Depth {{inputs.depth}}: "full" (default) runs the complete gate with all read lanes; "lightweight" captures one learning with minimal probes. Ground in the commit at HEAD, the steer-channel lessons (lesson: lines), and the receipts under .flywheel/receipts/. Read lanes are rg + chie qmd search + chie memory recall (labeled, offline-safe). Qualifying learnings are memory-recorded and filed to docs/learnings/inbox/ as tier: perishable with expires: and provenance (reinforced: stamped today) — never straight to docs/learnings/, never gated on a human at write time. Reply with ONLY the terminal JSON. The terminal signal (inboxed|clean_skip) IS the run verdict — never prose around it. One learning per run.'
     on_error: continue
 "#,
     ),
@@ -564,7 +564,7 @@ steps:
         "ce-sweep",
         r#"
 name: ce-sweep
-description: "ADR-0009 learnings maintenance sweep (compound-refresh): Keep / Update / Consolidate / Replace / Delete over docs/learnings/ — a learning contradicting standing-orders or AGENTS.md guidance outranks ordinary staleness; resolve by which side the code follows. Cron-able."
+description: "Learnings maintenance sweep (compound-refresh): Keep / Update / Consolidate / Replace / Delete over docs/learnings/ — a learning contradicting standing-orders or AGENTS.md guidance outranks ordinary staleness; resolve by which side the code follows. Cron-able."
 trigger:
   type: webhook
 crew: auto
@@ -579,7 +579,7 @@ steps:
     assignee: x
     spec:
       profile: "@housekeeper"
-      task: 'SWEEP docs/learnings/ (ADR-0009, bd-iqte): FIRST triage docs/learnings/inbox/ — the human gate sits here, not at write time. Per inbox entry: PROMOTE (move into docs/learnings/, re-tier aging — pinned ONLY for never-decay invariants — re-stamp reinforced: <today>) or ARCHIVE (expired or untrue; archival, never destructive). Then for EACH entry, classify Keep / Update / Consolidate / Replace / Archive (ADR-0010 D12: Delete is retired — decay is archival, never destructive). Evidence per verdict: cited paths still exist, cited SHAs still reachable, guidance-layer contradictions (standing-orders / AGENTS.md / skill) named explicitly — a contradiction resolves by which side current code follows, and a wrong guidance FILE is reported, never edited here. High-overlap pairs become ONE canonical doc (oldest path wins, last_updated stamped). TIER RULES (ADR-0010 D12): MIGRATION — every entry missing tier/reinforced gains `tier: aging` + `reinforced: <today>` so the GATE projection does not empty on day one. tier: pinned never archives (invariants); tier: aging archives after 30d unreinforced; tier: perishable archives after 7d unreinforced and MUST name a checkable expiry (expires: field in frontmatter). REINFORCE on re-verification: re-stamp `reinforced: <today>` instead of archiving a still-true entry. ARCHIVE = `git mv` to docs/learnings/archive/ (still rg-able, out of the GATE projection) in the same commit. Output a JSON array [{path, verdict, evidence}] and apply the Archives/Consolidates directly in git (one commit, message cites ce-sweep).'
+      task: 'SWEEP docs/learnings/: FIRST triage docs/learnings/inbox/ — the human gate sits here, not at write time. Per inbox entry: PROMOTE (move into docs/learnings/, re-tier aging — pinned ONLY for never-decay invariants — re-stamp reinforced: <today>) or ARCHIVE (expired or untrue; archival, never destructive). Then for EACH entry, classify Keep / Update / Consolidate / Replace / Archive (Delete is retired — decay is archival, never destructive). Evidence per verdict: cited paths still exist, cited SHAs still reachable, guidance-layer contradictions (standing-orders / AGENTS.md / skill) named explicitly — a contradiction resolves by which side current code follows, and a wrong guidance FILE is reported, never edited here. High-overlap pairs become ONE canonical doc (oldest path wins, last_updated stamped). TIER RULES: MIGRATION — every entry missing tier/reinforced gains `tier: aging` + `reinforced: <today>` so the GATE projection does not empty on day one. tier: pinned never archives (invariants); tier: aging archives after 30d unreinforced; tier: perishable archives after 7d unreinforced and MUST name a checkable expiry (expires: field in frontmatter). REINFORCE on re-verification: re-stamp `reinforced: <today>` instead of archiving a still-true entry. ARCHIVE = `git mv` to docs/learnings/archive/ (still rg-able, out of the GATE projection) in the same commit. Output a JSON array [{path, verdict, evidence}] and apply the Archives/Consolidates directly in git (one commit, message cites ce-sweep).'
     on_error: fail_run
 "#,
     ),
@@ -587,7 +587,7 @@ steps:
         "weekly-review",
         r#"
 name: weekly-review
-description: "Weekly repo review — scout fan-out, oracle synthesis, exactly ONE follow-up bead (bd-m7ac)."
+description: "Weekly repo review — scout fan-out, oracle synthesis, exactly ONE follow-up bead."
 trigger:
   type: schedule
   cron: "0 4 * * 0"
@@ -612,7 +612,7 @@ graph:
         assignee: x
         spec:
           profile: "@scout"
-          task: "Scout the toron + flywheel repos: (1) internal gaps — code health, deferred ADR-0005/0010/0011 items still open, open seams, test gaps; (2) upstream parity — the docs/upstream-parity.toml pins (compound-engineering, pstack) plus block/buzz patterns not yet ported. Return COMPRESSED findings JSON: [{area, finding, evidence, ev}]. No academic literature."
+          task: "Scout the toron + flywheel repos: (1) internal gaps — code health, deferred design items still open, open seams, test gaps; (2) upstream parity — the docs/upstream-parity.toml pins (compound-engineering, pstack) plus block/buzz patterns not yet ported. Return COMPRESSED findings JSON: [{area, finding, evidence, ev}]. No academic literature."
     oracle:
       action: dispatch_job
       assignee: x
@@ -635,7 +635,7 @@ graph:
         "bug-fix",
         r#"
 name: bug-fix
-description: "Fix-path playbook (ADR-0019 Spec 7.2): repro → repair-until-verified fix loop → independent proof. No fix node without a repro predecessor (lint). ADR-0024 Scenario B: fix path via repair-until-verified."
+description: "Fix-path playbook: repro → repair-until-verified fix loop → independent proof. No fix node without a repro predecessor (lint). Scenario B: fix path via repair-until-verified."
 trigger:
   type: webhook
 crew: auto
@@ -670,7 +670,7 @@ graph:
       spec:
         profile: "@reviewer"
         harness: "opencode"
-        task: "Independently prove the fix for {{inputs.symptom}} (different model family, ADR-0019 Spec 4). VERIFY from the bead: test green + repro gone. Record unit-test-verified. Do not re-fix."
+        task: "Independently prove the fix for {{inputs.symptom}} (different model family). VERIFY from the bead: test green + repro gone. Record unit-test-verified. Do not re-fix."
       needs: [fix]
       on_error: fail_run
 "#,
@@ -679,7 +679,7 @@ graph:
         "feature",
         r#"
 name: feature
-description: "Feature playbook (ADR-0019 Spec 7.2): shape the domain type/state machine → TDD build → independent proof. data_shape is REQUIRED."
+description: "Feature playbook: shape the domain type/state machine → TDD build → independent proof. data_shape is REQUIRED."
 trigger:
   type: webhook
 crew: auto
@@ -720,7 +720,7 @@ steps:
         "refactoring",
         r#"
 name: refactoring
-description: "Refactoring playbook (ADR-0019 Spec 7.2): baseline invariant → delete first → behavior-preserving reshape → invariant still green, no *V2* files."
+description: "Refactoring playbook: baseline invariant → delete first → behavior-preserving reshape → invariant still green, no *V2* files."
 trigger:
   type: webhook
 crew: auto
@@ -770,7 +770,7 @@ steps:
         "perf",
         r#"
 name: perf
-description: "Measured-improvement playbook (ADR-0019 Spec 7.2): baseline → ONE change → same-command measure → KEEP (commit) or DISCARD (a revert, never a leftover) via an explicit control-flow branch."
+description: "Measured-improvement playbook: baseline → ONE change → same-command measure → KEEP (commit) or DISCARD (a revert, never a leftover) via an explicit control-flow branch."
 trigger:
   type: webhook
 crew: auto
@@ -832,7 +832,7 @@ steps:
         "hillclimb",
         r#"
 name: hillclimb
-description: "Sustained measured-improvement loop (ADR-0019 Spec 7.2): each pass hypothesizes, applies the smallest change, measures, KEEPS (ledger row + one commit) or DISCARDS (a revert). max_iters is the cap. The loop stops only when the reply's improved field is true. Exhaustion fails the run."
+description: "Sustained measured-improvement loop: each pass hypothesizes, applies the smallest change, measures, KEEPS (ledger row + one commit) or DISCARDS (a revert). max_iters is the cap. The loop stops only when the reply's improved field is true. Exhaustion fails the run."
 trigger:
   type: webhook
 crew: auto
@@ -866,7 +866,7 @@ steps:
         "prototype",
         r#"
 name: prototype
-description: "Exhaust-the-design-space (ADR-0019 Spec 7.2, as amended 2026-08-15 — no /tmp crate-copy): n arms (2-3) prototype the question, an @oracle judge picks ONE. Sketch mode (default): arms run PARALLEL and write NON-COMPILING design sketches — API shapes, state machines, tradeoff table — TEXT ONLY to /tmp/flywheel-proto-<run>-<arm>/; no crate copy, no br, no tracker writes. Compile mode: arms run SEQUENTIALLY (one at a time) in the primary tree on a scratch git ref under the build slot; arm N+1 starts only after arm N is measured and reset. Judge compares on named criteria, picks one, discards the rest; no merge of a bit-of-each unless the oracle writes a graft bead. Principles: exhaust-the-design-space, separate-before-serializing-shared-state."
+description: "Exhaust-the-design-space (as amended 2026-08-15 — no /tmp crate-copy): n arms (2-3) prototype the question, an @oracle judge picks ONE. Sketch mode (default): arms run PARALLEL and write NON-COMPILING design sketches — API shapes, state machines, tradeoff table — TEXT ONLY to /tmp/flywheel-proto-<run>-<arm>/; no crate copy, no br, no tracker writes. Compile mode: arms run SEQUENTIALLY (one at a time) in the primary tree on a scratch git ref under the build slot; arm N+1 starts only after arm N is measured and reset. Judge compares on named criteria, picks one, discards the rest; no merge of a bit-of-each unless the oracle writes a graft bead. Principles: exhaust-the-design-space, separate-before-serializing-shared-state."
 trigger:
   type: webhook
 crew: auto
@@ -916,7 +916,7 @@ graph:
         "arena",
         r#"
 name: arena
-description: "Model race (ADR-0019 Spec 7.2 arena): same shape as prototype but the arms may run the SAME brief on DIFFERENT models — the race is in the models, not the tree. Selection rule declared UP FRONT via the `selection` input: first-pass (pick the first arm that clears the bar) | rank-all (rank every arm) | best-of (pick the best). Sketch arms: parallel, text-only under /tmp/flywheel-proto-<run>-<arm>/; compile arms: SEQUENTIAL on the build slot, one arm at a time on a scratch ref, measure + reset between arms. The @oracle judge keeps the comparison TABLE, not raw dumps (guard-the-context-window). Principles: exhaust-the-design-space, guard-the-context-window."
+description: "Model race (arena): same shape as prototype but the arms may run the SAME brief on DIFFERENT models — the race is in the models, not the tree. Selection rule declared UP FRONT via the `selection` input: first-pass (pick the first arm that clears the bar) | rank-all (rank every arm) | best-of (pick the best). Sketch arms: parallel, text-only under /tmp/flywheel-proto-<run>-<arm>/; compile arms: SEQUENTIAL on the build slot, one arm at a time on a scratch ref, measure + reset between arms. The @oracle judge keeps the comparison TABLE, not raw dumps (guard-the-context-window). Principles: exhaust-the-design-space, guard-the-context-window."
 trigger:
   type: webhook
 crew: auto
@@ -1030,7 +1030,7 @@ graph:
         "babysit-bead",
         r#"
 name: babysit-bead
-description: "Drive ONE bead to a legal ledger row (ADR-0019 Spec 7.2, pstack babysit without PRs): claim-watch nudge, reservation renew, T0-T3 mail, verifier spawn when required. NEVER starts new beads. Principles: never-block-on-the-human, prove-it-works."
+description: "Drive ONE bead to a legal ledger row (pstack babysit without PRs): claim-watch nudge, reservation renew, T0-T3 mail, verifier spawn when required. NEVER starts new beads. Principles: never-block-on-the-human, prove-it-works."
 trigger:
   type: webhook
 crew: auto
@@ -1046,7 +1046,7 @@ steps:
     spec:
       profile: "@housekeeper"
       harness: "opencode"
-      task: "BABYSIT ONE BEAD {{inputs.bead_id}} to a legal ledger row (ADR-0019): (1) `br show {{inputs.bead_id}} --json` — status in_progress / blocked / unverified-closed; (2) claim-watch: if the dispatched agent never claimed, nudge it (loop claim-watch); if it is unclaimed and free, claim it; (3) RENEW its file reservations (reason={{inputs.bead_id}}, toron renew_file_reservations) before the TTL lapses; (4) if blocked: drive the T0-T3 escalation mail through the loop machinery — never fabricate a verdict; (5) if closed but unverified: `flywheel ledger check {{inputs.bead_id}}` — missing/illegal verdict → the LOOP reopens it (never force-unlock a peer); if a verifier is required (P0/P1/judgment AC), spawn the reviewer dispatch on a different model family. NEVER start new beads; NEVER write a verdict yourself — only the loop records gate rows. Report: status before/after, what you drove, the legal ledger row."
+      task: "BABYSIT ONE BEAD {{inputs.bead_id}} to a legal ledger row: (1) `br show {{inputs.bead_id}} --json` — status in_progress / blocked / unverified-closed; (2) claim-watch: if the dispatched agent never claimed, nudge it (loop claim-watch); if it is unclaimed and free, claim it; (3) RENEW its file reservations (reason={{inputs.bead_id}}, toron renew_file_reservations) before the TTL lapses; (4) if blocked: drive the T0-T3 escalation mail through the loop machinery — never fabricate a verdict; (5) if closed but unverified: `flywheel ledger check {{inputs.bead_id}}` — missing/illegal verdict → the LOOP reopens it (never force-unlock a peer); if a verifier is required (P0/P1/judgment AC), spawn the reviewer dispatch on a different model family. NEVER start new beads; NEVER write a verdict yourself — only the loop records gate rows. Report: status before/after, what you drove, the legal ledger row."
     on_error: fail_run
 "#,
     ),
@@ -1054,7 +1054,7 @@ steps:
         "ship-beads",
         r#"
 name: ship-beads
-description: "Ship beads (ADR-0019 Spec 7.2, pstack shipping without merge-when-ready): predicate = no ready beads AND claim-watch empty AND every newly closed bead legal on the ledger -> @housekeeper commit-and-push. Principles: prove-it-works, sequence-verifiable-units."
+description: "Ship beads (pstack shipping without merge-when-ready): predicate = no ready beads AND claim-watch empty AND every newly closed bead legal on the ledger -> @housekeeper commit-and-push. Principles: prove-it-works, sequence-verifiable-units."
 trigger:
   type: webhook
 crew: auto
@@ -1070,7 +1070,7 @@ steps:
     spec:
       profile: "@housekeeper"
       harness: "opencode"
-      task: "SHIP-BEADS PREDICATE for {{inputs.project}} (ADR-0019) — verify ALL THREE before any commit: (1) `br list --status ready --json` in the project repo is EMPTY (no ready beads); (2) claim-watch is EMPTY — no dispatched-but-unclosed beads (`flywheel loop status --project {{inputs.project}}`); (3) every newly closed bead is LEGAL on the ledger — `flywheel ledger check <bead-id>` exits 0 for each close since the last ship (commit BEFORE close; bead id IN the commit message). If ANY predicate fails, STOP and report exactly what blocks — do NOT commit. If all three hold, report PREDICATE-PASS."
+      task: "SHIP-BEADS PREDICATE for {{inputs.project}} — verify ALL THREE before any commit: (1) `br list --status ready --json` in the project repo is EMPTY (no ready beads); (2) claim-watch is EMPTY — no dispatched-but-unclosed beads (`flywheel loop status --project {{inputs.project}}`); (3) every newly closed bead is LEGAL on the ledger — `flywheel ledger check <bead-id>` exits 0 for each close since the last ship (commit BEFORE close; bead id IN the commit message). If ANY predicate fails, STOP and report exactly what blocks — do NOT commit. If all three hold, report PREDICATE-PASS."
     on_error: fail_run
   - name: ship
     action: dispatch_job
@@ -1087,7 +1087,7 @@ steps:
         "autonomous-work",
         r#"
 name: autonomous-work
-description: "Autonomous overnight work (ADR-0019 Spec 7.2): runs `flywheel loop run --work --on-blocked mail` — the REAL loop, this workflow does NOT reimplement it — then a terminal ship-beads check (predicate default = ship-beads). Documented so decide can point at it. Principles: never-block-on-the-human, make-operations-idempotent."
+description: "Autonomous overnight work: runs `flywheel loop run --work --on-blocked mail` — the REAL loop, this workflow does NOT reimplement it — then a terminal ship-beads check (predicate default = ship-beads). Documented so decide can point at it. Principles: never-block-on-the-human, make-operations-idempotent."
 trigger:
   type: webhook
 crew: auto
@@ -1105,7 +1105,7 @@ steps:
     spec:
       profile: "@housekeeper"
       harness: "opencode"
-      task: "AUTONOMOUS WORK for {{inputs.project}} (ADR-0019): run the REAL loop — `flywheel loop run --work --on-blocked mail --project {{inputs.project}}` — do NOT reimplement the loop (no hand-rolled polling, no bespoke dispatch, no new beads). Idempotent: the loop resumes its persisted invocation; taking over a live loop requires --force. When the loop settles (predicate reached or stall), run the terminal ship-beads check (predicate: {{inputs.predicate}}, default ship-beads): no ready beads, claim-watch empty, every newly closed bead legal on the ledger (`flywheel ledger check` per close since the last ship). Report: loop outcome, beads processed, ledger state."
+      task: "AUTONOMOUS WORK for {{inputs.project}}: run the REAL loop — `flywheel loop run --work --on-blocked mail --project {{inputs.project}}` — do NOT reimplement the loop (no hand-rolled polling, no bespoke dispatch, no new beads). Idempotent: the loop resumes its persisted invocation; taking over a live loop requires --force. When the loop settles (predicate reached or stall), run the terminal ship-beads check (predicate: {{inputs.predicate}}, default ship-beads): no ready beads, claim-watch empty, every newly closed bead legal on the ledger (`flywheel ledger check` per close since the last ship). Report: loop outcome, beads processed, ledger state."
     on_error: fail_run
   - name: ship
     action: call_workflow
@@ -1117,7 +1117,7 @@ steps:
         "pickup",
         r#"
 name: pickup
-description: "Session pickup (ADR-0019 Spec 7.2): read .flywheel/agent-state/, br list --status in_progress, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Principles: make-operations-idempotent, guard-the-context-window."
+description: "Session pickup: read .flywheel/agent-state/, br list --status in_progress, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Principles: make-operations-idempotent, guard-the-context-window."
 trigger:
   type: webhook
 crew: auto
@@ -1142,7 +1142,7 @@ steps:
         "pause",
         r#"
 name: pause
-description: "Pause safely (ADR-0019 Spec 7.2): `flywheel checkpoint save` + standing handoff (what is in flight, ledger gaps, the EXACT resume command). Kills nothing that is working unless --force-working is explicit. Principles: make-operations-idempotent, never-block-on-the-human."
+description: "Pause safely: `flywheel checkpoint save` + standing handoff (what is in flight, ledger gaps, the EXACT resume command). Kills nothing that is working unless --force-working is explicit. Principles: make-operations-idempotent, never-block-on-the-human."
 trigger:
   type: webhook
 crew: auto
@@ -1161,7 +1161,7 @@ steps:
     spec:
       profile: "@housekeeper"
       harness: "opencode"
-      task: "PAUSE {{inputs.project}} (ADR-0019): (1) `flywheel checkpoint save --project {{inputs.project}}` — durable state snapshot; (2) write the STANDING HANDOFF: what is in flight (in_progress beads + held reservations), ledger gaps (closed-but-unverified beads), and the EXACT resume command (e.g. `flywheel loop run --work --on-blocked mail --project {{inputs.project}}` or the pickup workflow); (3) kill NOTHING that is working unless force_working={{inputs.force_working}} was explicit — a working agent keeps running through the pause. Operator message: {{inputs.msg}}. Report: checkpoint id, handoff path, what stayed alive."
+      task: "PAUSE {{inputs.project}}: (1) `flywheel checkpoint save --project {{inputs.project}}` — durable state snapshot; (2) write the STANDING HANDOFF: what is in flight (in_progress beads + held reservations), ledger gaps (closed-but-unverified beads), and the EXACT resume command (e.g. `flywheel loop run --work --on-blocked mail --project {{inputs.project}}` or the pickup workflow); (3) kill NOTHING that is working unless force_working={{inputs.force_working}} was explicit — a working agent keeps running through the pause. Operator message: {{inputs.msg}}. Report: checkpoint id, handoff path, what stayed alive."
     on_error: fail_run
 "#,
     ),
@@ -1173,7 +1173,7 @@ steps:
         "wave-swarm",
         r#"
 name: wave-swarm
-description: "ADR-0006 D3 + ADR-0009: the compounded wave swarm. GATE scopes br ready to one wave label (grounding-reads docs/learnings/), holds on any open lower wave; DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
+description: "The compounded wave swarm. GATE scopes br ready to one wave via the TYPED wave field (grounding-reads docs/learnings/), holds on any open lower wave, and treats an empty ready with in-flight beads as WORK IN FLIGHT (bd-wave-gate-typed-authority-27et); DISPATCH emits send --stage ce-execute --param payloads (bead/scope/exit/channel/pin/report_file/learnings); OBSERVE escalates to the captain (lesson: line on every escalation) and never adjudicates; REVIEW audits each closed bead's diff against its brief (detection conditions, quoted evidence, autofix classes); VERIFY checks receipts at committed HEAD + VERIFY tails + principles citations + the residual gate (every finding fixed or filed as a bead); COMPOUND captures durable learnings to docs/learnings/ (never blocks); SIGNOFF suspends for captain-only approval. bd-compose-stage-sequencing-zgi9: stages are SEQUENCED by completion markers under .flywheel/wave/ (<label>-<stage>.done) — each dispatch waits (retry, per-step budget 240 x 30s) for its predecessor's marker before the next stage fires; the outer --timeout remains the run bound. Default crew is planner+coder+reviewer; remix with --crew role:n,role:n (scout/housekeeper optional)."
 trigger:
   type: webhook
 crew:
@@ -1202,24 +1202,51 @@ steps:
     spec:
       profile: "@planner"
       stage: wave-gate
-      task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` to the label; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. Objective: {{inputs.objective}}'
+      task: 'Gate the wave {{inputs.wave_label}}: preflight + scope `br ready` for this wave; write .flywheel/wave/{{inputs.wave_label}}-ready.json (the DISPATCH binding artifact); a lower open wave holds. bd-wave-gate-typed-authority-27et: the TYPED `wave` field is the authority (br ready is already wave-gated by it natively) — select rows whose typed `wave` == N, falling back to the legacy `wave-N` label only when the typed field is null; hold when ANY bead with an earlier wave-M (M<N) is open or in_progress, naming the blockers. An EMPTY ready with NO bead of this wave in flight is a LOUD FAILURE — post [gate] blocked: wave <label> matched zero beads and STOP. An EMPTY ready WITH in-flight beads is held:false + in_flight — the wave is WORK IN FLIGHT, report it and continue (never a held/empty-wave failure, never re-dispatch). Write the artifact as {wave_label, held, blockers, ready, in_flight}. When the gate is GREEN (artifact written, held:false, ready non-empty OR in flight), write .flywheel/wave/{{inputs.wave_label}}-gate.done so DISPATCH may start; when held or blocked, post [gate] held and write NO marker. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_gate
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: gate_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-gate.done || { echo 'wave in flight: gate has not written .flywheel/wave/{{inputs.wave_label}}-gate.done after the step budget (240 x 30s) — the wave waits for real work; extend with a larger --timeout or fix the planner, never dispatch over a held gate'; exit 1; }"
   - name: dispatch
     action: dispatch_job
     assignee: x
     spec:
       profile: "@planner"
       stage: wave-dispatch
-      task: 'Dispatch ONLY the beads in .flywheel/wave/{{inputs.wave_label}}-ready.json — one send --stage ce-execute --param payload per bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. Objective: {{inputs.objective}}'
+      task: 'Dispatch the wave beads: read .flywheel/wave/{{inputs.wave_label}}-ready.json for held + learnings, then take the bead list LIVE — `br ready --json` scoped to this wave at dispatch time (typed `wave` == N, legacy `wave-N` label fallback); the artifact ready[] is a snapshot that may be stale (bd-wave-gate-typed-authority-27et). One send --stage ce-execute --param payload per LIVE bead, each naming its bead id + the claim/close contract (+ learnings when the gate matched); onto {{inputs.steer_channel}}. The crew escalates to orchestrator pin {{inputs.captain_pin}}. If the artifact is missing or held:true, post [dispatch] held and STOP (write NO marker). If the live ready set is empty and the artifact names in_flight[], post [dispatch] work in flight: <ids> and write .flywheel/wave/{{inputs.wave_label}}-dispatch.done — nothing to dispatch, a live crew owns the wave; never duplicate it. After every payload is posted, write the marker so EXECUTE may start. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_dispatch
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: dispatch_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-dispatch.done || { echo 'wave in flight: dispatch has not written .flywheel/wave/{{inputs.wave_label}}-dispatch.done after the step budget (240 x 30s) — EXECUTE must not start until every payload is posted; extend with a larger --timeout if the dispatcher is really working'; exit 1; }"
   - name: execute
     action: dispatch_job
     assignee: x
     spec:
       profile: "{{inputs.coder_profile}}"
       stage: ce-execute
-      task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). Objective: {{inputs.objective}}'
+      task: 'Execute the wave beads listed in .flywheel/wave/{{inputs.wave_label}}-ready.json (claim -> run each bead''s VERIFY -> commit before close -> ledger-legal close with VERIFY tail + principles citations). When ready is empty and in_flight[] is non-empty, do NOT claim or close — a live crew owns those beads; wait (poll `br show <id> --json`) until every in-flight bead is closed, then write the marker. After the LAST bead of the wave is closed, write .flywheel/wave/{{inputs.wave_label}}-execute.done so REVIEW reads closes and never revises an open wave. When ready AND in_flight are both empty, post [execute] blocked: nothing to execute and write NO marker (a wave that runs nothing must not report success). Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_execute
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: execute_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-execute.done || { echo 'wave in flight: execute has not written .flywheel/wave/{{inputs.wave_label}}-execute.done after the step budget (240 x 30s) — REVIEW must not start with closes still landing; extend with a larger --timeout if the wave is really working'; exit 1; }"
   - name: observe
     action: dispatch_job
     assignee: x
@@ -1234,16 +1261,34 @@ steps:
     spec:
       profile: "@reviewer"
       stage: ce-review
-      task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. Objective: {{inputs.objective}}'
+      task: 'Review every closed bead of {{inputs.wave_label}} for {{inputs.objective}}: audit the committed diff against each brief''s ACCEPTANCE/VERIFY — detection conditions, quoted file:line evidence, severity + autofix class per finding; single-lens pass (no corroboration claims). Findings JSON to {{inputs.steer_channel}}. After the findings are posted, write .flywheel/wave/{{inputs.wave_label}}-review.done. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_review
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: review_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-review.done || { echo 'wave in flight: review has not written .flywheel/wave/{{inputs.wave_label}}-review.done after the step budget (240 x 30s) — VERIFY needs the findings first; extend with a larger --timeout if the reviewer is really working'; exit 1; }"
   - name: verify
     action: dispatch_job
     assignee: x
     spec:
       profile: "@reviewer"
       stage: wave-verify
-      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). Objective: {{inputs.objective}}'
+      task: 'Verify every close claim: receipt at committed HEAD + VERIFY tail + principles citations + the residual gate (each REVIEW finding from {{steps.review}} fixed in the diff or filed as a bead id). After the verification report, write .flywheel/wave/{{inputs.wave_label}}-verify.done so COMPOUND reads verified solutions. Objective: {{inputs.objective}}'
     on_error: fail_run
+  - name: await_verify
+    action: retry
+    max_attempts: 240
+    backoff_secs: 30
+    on_error: fail_run
+    step:
+      name: verify_marker
+      action: verify
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-verify.done || { echo 'wave in flight: verify has not written .flywheel/wave/{{inputs.wave_label}}-verify.done after the step budget (240 x 30s) — COMPOUND must not run before the wave is verified; extend with a larger --timeout if the verifier is really working'; exit 1; }"
   - name: compound
     action: dispatch_job
     assignee: x
@@ -1251,7 +1296,7 @@ steps:
       profile: "@planner"
       phase: compound
       stage: ce-compound
-      task: 'Run the compound gate over {{inputs.wave_label}} for {{inputs.objective}}: the wave''s verified solutions + the OBSERVE escalation lessons — memory-record and file what qualifies to docs/learnings/inbox/ (tier: perishable, bd-iqte), clean_skip the rest. Report inboxed/clean_skip counts.'
+      task: 'Run the compound gate over {{inputs.wave_label}} for {{inputs.objective}}: the wave''s verified solutions + the OBSERVE escalation lessons — memory-record and file what qualifies to docs/learnings/inbox/ (tier: perishable), clean_skip the rest. Report inboxed/clean_skip counts.'
     on_error: continue
   - name: signoff
     action: request_approval
@@ -1262,7 +1307,7 @@ steps:
         "repair-until-verified",
         r#"
 name: repair-until-verified
-description: "Repair loop (ADR-0024 Spec 2): bounded fresh-context repair, evaluate, VERIFY. max_iterations caps the passes (default 3, hard cap 32). A passing verify stops the loop. Exhaustion fails the run. A failed verify continues to the next pass. GS-039 P0-3: explicit crew coder:1 reviewer:1 — remix with --crew role:n; --allow-crew-expand is a no-op (cap is crew.max)."
+description: "Repair loop: bounded fresh-context repair, evaluate, VERIFY. max_iterations caps the passes (default 3, hard cap 32). A passing verify stops the loop. Exhaustion fails the run. A failed verify continues to the next pass. GS-039 P0-3: explicit crew coder:1 reviewer:1 — remix with --crew role:n; --allow-crew-expand is a no-op (cap is crew.max)."
 trigger:
   type: webhook
 crew:
@@ -1335,7 +1380,7 @@ steps:
         "beads-lifecycle",
         r#"
 name: beads-lifecycle
-description: "ADR-0008 §6.7: the beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (ADR/goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer ce-plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement hands off to wave-swarm (new graph) or babysit-bead (existing_bead); verify proves with evidence; signoff suspends for captain-only approval. inputs.from=none|session|adr|bead skips grill→integrate when from=bead or existing_bead is set. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
+description: "The beads authoring lifecycle. grill (ce-brainstorm) sharpens the objective (goal JSON); create nests phase-plan via call_workflow; review1 (@reviewer ce-plan-review) + review2 (@oracle judge-arms) are two bead-graph passes; integrate folds AGREE-WITH-CHANGES and re-checks cycles; implement hands off to wave-swarm (new graph) or babysit-bead (existing_bead); verify proves with evidence; signoff suspends for captain-only approval. inputs.from=none|session|adr|bead skips grill→integrate when from=bead or existing_bead is set. inputs.until early-exits SUCCESS after any phase; gate_before_implement adds one outer approval between integrate and implement."
 trigger:
   type: webhook
 crew: auto
@@ -1451,7 +1496,7 @@ graph:
         "reflect",
         r#"
 name: reflect
-description: "Corrections become structure (ADR-0019 Spec 7.2 reflect, wave 6): scan standing orders + ledger + mail threads; the SAME instruction twice -> emit ONE hook-adding bead (a lint, a preflight, or a principle-registry line) + delete the superseded lines from the PROJECT standing orders (the global regenerates from the registry). The output is a hook bead, NEVER an AGENTS.md paragraph. Principles: encode-lessons-in-structure."
+description: "Corrections become structure (reflect, wave 6): scan standing orders + ledger + mail threads; the SAME instruction twice -> emit ONE hook-adding bead (a lint, a preflight, or a principle-registry line) + delete the superseded lines from the PROJECT standing orders (the global regenerates from the registry). The output is a hook bead, NEVER an AGENTS.md paragraph. Principles: encode-lessons-in-structure."
 trigger:
   type: webhook
 crew: auto
@@ -1489,7 +1534,7 @@ steps:
         "awareness-digest",
         r#"
 name: awareness-digest
-description: "ADR-0005 captain digest (no loop): presence + reservations + expired request-release + guard denials. First line MUST be dispatcher: up|down <since>. Post kind 9 on the steer channel; DM captain on conflict only."
+description: "Captain digest (no loop): presence + reservations + expired request-release + guard denials. First line MUST be dispatcher: up|down <since>. Post kind 9 on the steer channel; DM captain on conflict only."
 trigger:
   type: schedule
   cron: "*/15 * * * *"
@@ -1507,7 +1552,7 @@ steps:
     spec:
       profile: "@housekeeper"
       harness: "opencode"
-      task: "AWARENESS DIGEST for {{inputs.project}} (ADR-0005 D1.4, no loop run). First lines MUST be `flywheel status {{inputs.project}}` JSON `dispatcher` + `unanswered` (or `flywheel __doorbell --project {{inputs.project}} --workspace <label> --report`): `dispatcher: up|down …` then `doorbell: ok` or `doorbell: unanswered pin=…`. Then snapshot: presence list, active reservations, expired request-release, guard denials. Post the digest as one kind-9 on the project steer channel. DM the captain on conflict: dispatcher down, unanswered doorbell (deaf pane), hard reservation overlap, unanswered request-release. No beads, no repo edits. Per-project cron YAML lives at {{inputs.project}}/.flywheel/crons/ (builtin is the default)."
+      task: "AWARENESS DIGEST for {{inputs.project}} (no loop run). First lines MUST be `flywheel status {{inputs.project}}` JSON `dispatcher` + `unanswered` (or `flywheel __doorbell --project {{inputs.project}} --workspace <label> --report`): `dispatcher: up|down …` then `doorbell: ok` or `doorbell: unanswered pin=…`. Then snapshot: presence list, active reservations, expired request-release, guard denials. Post the digest as one kind-9 on the project steer channel. DM the captain on conflict: dispatcher down, unanswered doorbell (deaf pane), hard reservation overlap, unanswered request-release. No beads, no repo edits. Per-project cron YAML lives at {{inputs.project}}/.flywheel/crons/ (builtin is the default)."
     on_error: fail_run
 "#,
     ),

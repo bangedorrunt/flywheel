@@ -362,10 +362,9 @@ pub fn dispatch_spec_phase(spec: &DispatchSpec) -> Option<&str> {
 
 /// `build_argv_roles` + the ADR-0022 phase registry: when `phase` is set,
 /// the registry args are INSERTED BEFORE the trailing prompt positional
-/// (every harness arm ends its argv with the prompt; flags after it would
-/// be swallowed as prompt text). Returns `(argv, phase_degraded)` —
-/// degraded=true means the harness has no native mechanic for the phase
-/// and the caller must warn + tag the run log (never silent).
+/// (flags after it would be swallowed as prompt text). Returns `(argv,
+/// phase_degraded)` — degraded=true means the harness has no native mechanic
+/// for the phase and the caller must warn + tag the run log (never silent).
 #[allow(clippy::too_many_arguments)]
 pub fn build_argv_roles_phase(
     harness: &str,
@@ -388,10 +387,35 @@ pub fn build_argv_roles_phase(
         );
     }
     if !extra.is_empty() {
-        let insert_at = argv.len().saturating_sub(1); // before the prompt positional
+        let insert_at = phase_argv_insert_at(&argv, prompt);
         argv.splice(insert_at..insert_at, extra.drain(..));
     }
     Ok((argv, degraded))
+}
+
+/// Where the phase-registry args belong in an argv (bd-vbrj).
+///
+/// "Before the trailing prompt positional" is only a position when the LAST
+/// element IS the prompt. It is not, for grok: that arm returns early with the
+/// prompt embedded in `--single=<prompt>`, so the last element is
+/// `--output-format`'s VALUE. Splicing at `len - 1` there lands between the flag
+/// and its value, and grok reads the phase flag as the output format.
+///
+/// So the rule is conditional on the shape, not assumed: before the prompt when
+/// the prompt is the trailing positional, otherwise append — correct for grok,
+/// where flags may follow `--single=`. The `saturating_sub` this replaces made
+/// the wrong answer look safe; it clamped instead of revealing that the assumed
+/// shape was wrong.
+///
+/// Pure, so both shapes are testable without a grok arm in the phase registry.
+/// Today the bug is latent ONLY because `phase_launch_args` returns empty for
+/// grok — an invariant held by another table's contents rather than by this
+/// code.
+fn phase_argv_insert_at(argv: &[String], prompt: &str) -> usize {
+    match argv.last() {
+        Some(last) if last == prompt => argv.len() - 1,
+        _ => argv.len(),
+    }
 }
 
 /// ADR-0022 §3.2 R3 (bd-adr22-w2-phase-registry-igya): the preflight
@@ -899,6 +923,74 @@ mod tests {
             build_argv_roles_phase("pi", None, None, "", "", "", "hi", Some("plan")).expect("argv");
         assert!(degraded);
         assert!(!argv.iter().any(|a| a.contains("plan")));
+    }
+
+    /// bd-vbrj: THE shape. grok does NOT end its argv with the prompt — the
+    /// prompt rides `--single=<prompt>`, so the trailing element is
+    /// `--output-format`'s value. Every other arm pushes the prompt last.
+    ///
+    /// This is the fact the phase splice got wrong, and it is asserted about
+    /// the REAL builder rather than a hand-written argv, so it fails if grok's
+    /// arm is ever changed to append a positional.
+    #[test]
+    fn grok_argv_does_not_end_with_the_prompt() {
+        let prompt = "do the thing";
+        let argv = build_argv_roles("grok", None, None, "", "", "", prompt).expect("argv");
+        assert_ne!(
+            argv.last().map(String::as_str),
+            Some(prompt),
+            "grok embeds the prompt in --single=, so the trailing element is \
+             --output-format's value. If this arm ever appends a positional \
+             prompt, the phase splice below changes shape and this test says so: \
+             {argv:?}"
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("streaming-messages-json")
+        );
+
+        // The contrast that makes the rule necessary: pi/opencode DO end with
+        // the prompt, so len-1 is right for them.
+        for harness in ["pi", "opencode"] {
+            let argv = build_argv_roles(harness, None, None, "", "", "", prompt).expect("argv");
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some(prompt),
+                "{harness} ends with the prompt positional: {argv:?}"
+            );
+        }
+    }
+
+    /// bd-vbrj: the insertion rule under both shapes. grok's arm reaches the
+    /// splice only once `phase_launch_args` grows a grok mechanic, so this tests
+    /// the rule directly — the splice must never land between a flag and its
+    /// value, whichever shape it is handed.
+    #[test]
+    fn phase_args_never_split_a_flag_from_its_value() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+
+        // opencode shape: before the trailing prompt positional.
+        let oc = s(&["opencode", "run", "--agent", "plan", "PROMPT"]);
+        assert_eq!(phase_argv_insert_at(&oc, "PROMPT"), oc.len() - 1);
+
+        // grok shape: appended, because there is no trailing prompt positional
+        // and `len - 1` would put the args between --output-format and its
+        // value.
+        let gk = s(&[
+            "grok",
+            "--single=PROMPT",
+            "--output-format",
+            "streaming-messages-json",
+        ]);
+        assert_eq!(phase_argv_insert_at(&gk, "PROMPT"), gk.len());
+
+        // A harness whose last element merely CONTAINS the prompt is not a
+        // trailing positional prompt either.
+        let inline = s(&["grok", "--single=PROMPT"]);
+        assert_eq!(phase_argv_insert_at(&inline, "PROMPT"), inline.len());
+
+        // Empty argv cannot underflow: nothing is a trailing prompt, so append.
+        assert_eq!(phase_argv_insert_at(&[], "PROMPT"), 0);
     }
 
     /// ADR-0022 W2: spec.phase reaches the runner through the typed spec.

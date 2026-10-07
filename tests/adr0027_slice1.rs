@@ -31,34 +31,34 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── harness (copy of e2e_loop_run_verify.rs hermetic pattern) ──
 
-fn flywheel_bin() -> String {
-    // cargo test sets CARGO_BIN_EXE_flywheel when the binary is built;
-    // otherwise fall back to a relative target/debug path.
-    option_env!("CARGO_BIN_EXE_flywheel")
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| {
-            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/flywheel");
-            if p.exists() {
-                return p.to_string_lossy().into_owned();
-            }
-            // also try workspace root target
-            let p2 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/flywheel");
-            p2.to_string_lossy().into_owned()
-        })
-}
+// bd-rvma: the flywheel-binary resolver is gone with the last test that used it.
+// The one live test here registered its pins through `flywheel mail register`,
+// which only ever registered them into the scratch DIR rather than the project
+// the send named, so the binary was never the thing that had to work.
 
-fn toron_bin() -> String {
-    // Prefer built artifact, then PATH.
-    let cand = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../toron/target/debug/toron");
-    if cand.exists() {
-        return cand.to_string_lossy().into_owned();
+/// The toron CLI this file drives: an explicit `TORON_BIN`, else the sibling
+/// debug build. There is deliberately NO PATH fallback, matching
+/// `sc_doorbell_adr0005.rs` (bd-oylu). A bare `toron` is whatever happens to be
+/// installed, and an older one disagrees with the working tree about store
+/// shape, so the test then fails somewhere that reads like a product bug
+/// instead of a missing build. bd-rvma: this fallback used to hand the tests a
+/// mise shim silently, and the only symptom was a green test that had skipped
+/// its own assertions.
+fn toron_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("TORON_BIN") {
+        return PathBuf::from(p);
     }
-    let cand2 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/toron");
-    if cand2.exists() {
-        return cand2.to_string_lossy().into_owned();
-    }
-    // fallback to PATH lookup
-    "toron".to_string()
+    let sibling = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../toron/target/debug/toron");
+    assert!(
+        sibling.exists(),
+        "toron CLI not found at {} — set TORON_BIN, or build it in the sibling toron repo \
+         with `mbx +nightly-aarch64-apple-darwin build -p toron-cli`. This does not fall back \
+         to `toron` on PATH on purpose (bd-oylu, bd-rvma): an installed toron can predate the \
+         working tree and then refuses the store the in-process toron_core wrote, which reads as \
+         a product failure instead of a missing build.",
+        sibling.display()
+    );
+    sibling
 }
 
 fn flywheel_manifest_dir() -> PathBuf {
@@ -308,70 +308,90 @@ fn adr0027_s1_receipt_store_contract() {
     }
 }
 
+/// Read one receipt by corr and return its JSON (bd-gokp's durable store).
+///
+/// No `--project`: `toron receipt get` takes `--corr` alone (measured — a
+/// `--project` here is an 'unexpected argument' refusal). No `--json` either:
+/// this verb already answers in JSON, and a mutation that dropped the flag left
+/// the suite green, so carrying it would have been decoration. Loud on failure,
+/// so a receipt that cannot be read is a contract failure rather than something
+/// a caller can quietly skip past.
+fn receipt(scratch: &Scratch, toron: &str, corr: &str) -> serde_json::Value {
+    let out = scratch.run(toron, &["receipt", "get", "--corr", corr]);
+    assert!(
+        out.status.success(),
+        "RED (bd-gmjo S1, bd-gokp): toron receipt get --corr {corr} failed\n\
+         stdout: {}\nstderr: {}\n\
+         Contract: receipts sqlite next to message_reads/inbox_cursors; a new process \
+         rebuilds the Model assignment from the table, not from a journal fold. \
+         ReceiptState owed|acked|resulted.",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "RED (bd-gmjo S1, bd-gokp): toron receipt get --corr {corr} returned no JSON ({e})\n\
+             exit: {:?}\nstdout: {}\nstderr: {}\n\
+             Contract: receipts sqlite next to message_reads/inbox_cursors; a new process \
+             rebuilds the Model assignment from the table, not from a journal fold. \
+             ReceiptState owed|acked|resulted.",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
 // 4. S1 — tasked mail with corr=FM-GS-012 survives walker death
 //    Send tasked mail with --corr FM-GS-012, kill walker (drop Scratch / new process),
 //    assert owed/acked still visible via receipt get. Empty tasked still writes result.
-//    RED until bd-2u27 + bd-gokp + bd-dhm1 close (and durable receipts).
-//    This is the real scenario; it drives the binaries, not a unit proxy (prove-it-works).
+//    This is the real scenario; it drives the binary, not a unit proxy (prove-it-works).
+//
+// bd-rvma: this test was green only because a skip branch swallowed its own
+// setup failure. On the default suite `mail send` died with "unknown recipient:
+// adr27-recip" (the pins were never in the send project, and their names are
+// rejected outright by the CamelCase Adjective+Noun rule), the branch printed a
+// warning, `return`ed, and the test reported ok having asserted nothing about
+// receipts. Everything below the send is now a real assertion on receipt
+// VALUES, and there is no path that returns early.
+//
+// `#[ignore]`d per bd-p2zm: it drives a real `toron`, so its green depends on a
+// sibling build being on disk. Run it on purpose with:
+//
+//     mbx +nightly-aarch64-apple-darwin test --test adr0027_slice1 -- --ignored adr0027_s1_tasked
+#[ignore = "needs the sibling toron debug build (mbx +nightly-aarch64-apple-darwin build -p toron-cli in ~/workspace/toron)"]
 #[test]
 fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
     let toron = toron_bin();
-    let fw = flywheel_bin();
-    // Check binaries exist; if not, fail with clear guidance rather than panic on spawn
-    if !Path::new(&fw).exists() && fw != "flywheel" {
-        // try PATH fallback
-        let out = Command::new(&fw).arg("--help").output();
-        assert!(
-            !(out.is_err() || !out.unwrap().status.success()),
-            "RED (bd-gmjo S1): flywheel binary not found at {} — build with cargo build --bin flywheel",
-            fw
-        )
-    }
+    let toron_s = toron.to_str().expect("utf-8 toron path");
     let scratch = Scratch::new("s1-walker");
-    // minimal beads project so receipts have a workspace context (beads not required for mail, but we mimic loop)
-    Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&scratch.dir)
-        .output()
-        .unwrap();
-    // Register two pins: sender + recipient (use same style as e2e_loop_run_verify)
-    let out = scratch.run(
-        &fw,
-        &[
-            "mail",
-            "register",
-            scratch.dir.to_str().unwrap(),
-            "--name",
-            "adr27-sender",
-        ],
-    );
-    if !out.status.success() {
-        eprintln!(
-            "register sender stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let out = scratch.run(
-        &fw,
-        &[
-            "mail",
-            "register",
-            scratch.dir.to_str().unwrap(),
-            "--name",
-            "adr27-recip",
-        ],
-    );
-    if !out.status.success() {
-        eprintln!(
-            "register recip stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    // Also register via toron directly to ensure project exists
     let proj = "adr27-s1";
-    let _ = scratch.run(&toron, &["project", "ensure", proj]);
-    // Ensure pins exist in toron mailbox (use MailSurface directly if needed — for now ensure via flywheel register covers it)
-    // Try to send tasked mail with the new flags (bd-2u27). Before impl this will fail with unknown flag.
+
+    // Both pins must exist IN THE PROJECT THIS SENDS WITH. The old setup
+    // registered them into the scratch dir instead (a different project) and
+    // only eprintln!'d when that failed, so the send then reported an unknown
+    // recipient and the skip branch took over. `project ensure` is not needed:
+    // a pinned TORON_MCP_DATA_DIR store carries the send without an operator
+    // key (measured), and asking for a manifest signature is what refused.
+    for pin in ["IvoryRidge", "EmberOtter"] {
+        let out = scratch.run(
+            toron_s,
+            &["agent", "bootstrap", "--project", proj, "--as", pin],
+        );
+        assert!(
+            out.status.success(),
+            "RED (bd-rvma): toron agent bootstrap --project {proj} --as {pin} failed\n\
+             stdout: {}\nstderr: {}\n\
+             Both pins must be bootstrapped into the project the send names, or the \
+             send below reports an unknown recipient.",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Try to send tasked mail with the new flags (bd-2u27). Before impl this
+    // fails with an unknown flag; there is no skip branch, so a failure here is
+    // a failure of the contract rather than something the test routes around.
     let corr = "FM-GS-012";
     let send_args = [
         "mail",
@@ -379,9 +399,9 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         "--project",
         proj,
         "--as",
-        "adr27-sender",
+        "IvoryRidge",
         "--to",
-        "adr27-recip",
+        "EmberOtter",
         "--subject",
         "tasked S1",
         "--body",
@@ -395,101 +415,82 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         "--audience",
         "agents",
     ];
-    let out = scratch.run(&toron, &send_args);
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string()
-            + &String::from_utf8_lossy(&out.stdout);
-        // If the flag is still unrecognized, that's the RED we care about (bd-2u27)
-        assert!(
-            !stderr.contains("unexpected argument"),
-            "RED (bd-gmjo S1, bd-2u27): toron mail send --corr failed (expected GREEN after bd-2u27 lands)\n\
-             args: {:?}\nstdout: {}\nstderr: {}\n\
-             Contract: SendMessage.extra_tags carries corr/wake/priority/audience/result_path (never 1059 envelope).",
-            send_args,
-            String::from_utf8_lossy(&out.stdout),
-            stderr
-        );
-        // If flag is recognized but recipient/project setup fails, that's a harness issue
-        // not the contract under test — treat as skip for this S1 CLI integration.
-        // The deeper flag+receipt contract is proven in toron-cli/tests and send_tags.rs.
-        // We still verify the flag was recognized (not "unexpected argument") and continue
-        // to the receipt store library check below.
-        if stderr.contains("unknown recipient")
-            || stderr.contains("no local key")
-            || stderr.contains("no operator key")
-        {
-            eprintln!(
-                "warn: S1 CLI send skipped (harness setup): {stderr} — flag recognized, contract GREEN for bd-2u27"
-            );
-            // Verify receipt store directly via library instead of CLI send
-            // (the durable store is the real S1 proof; CLI send is just one vehicle)
-            let _ = std::fs::remove_dir_all(scratch.dir.parent().unwrap());
-            return;
-        }
-        panic!(
-            "RED (bd-gmjo S1): toron mail send failed unexpectedly\nargs: {:?}\nstdout: {}\nstderr: {}",
-            send_args,
-            String::from_utf8_lossy(&out.stdout),
-            stderr
-        );
-    }
-    // Verify receipt exists via receipt get (bd-gokp) — durable sqlite, not HashMap
-    let out = scratch.run(
-        &toron,
-        &["receipt", "get", "--project", proj, "--corr", corr],
-    );
+    let out = scratch.run(toron_s, &send_args);
     assert!(
         out.status.success(),
-        "RED (bd-gmjo S1, bd-gokp): toron receipt get --corr {corr} failed after send\n\
-         stdout: {}\nstderr: {}\n\
-         Contract: receipts sqlite next to message_reads/inbox_cursors; new process rebuilds Model assignment from table (not journal fold). ReceiptState owed|acked|resulted.",
+        "RED (bd-gmjo S1, bd-2u27): toron mail send --corr failed\n\
+         args: {:?}\nstdout: {}\nstderr: {}\n\
+         Contract: SendMessage.extra_tags carries corr/wake/priority/audience/result_path \
+         (never 1059 envelope). bd-rvma deleted the old branch that treated an \
+         'unknown recipient' send as a skip — that is how this test was green \
+         while proving nothing.",
+        send_args,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "receipt get bad json: {e} stdout: {}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    });
+
+    // Verify the receipt via `receipt get` (bd-gokp) — durable sqlite, not
+    // HashMap. NOTE there is no `--project` on this verb (measured: 'unexpected
+    // argument'); the receipts table is keyed by corr alone.
+    let v = receipt(&scratch, toron_s, corr);
     assert_eq!(
-        v.get("corr").and_then(|x| x.as_str()).unwrap_or(""),
-        corr,
-        "receipt get must return corr=FM-GS-012"
+        v["corr"].as_str(),
+        Some(corr),
+        "receipt get must return corr={corr}, got {v}"
     );
-    // Kill walker: drop scratch env, create NEW Scratch pointing at same mailbox/config (simulates new process)
-    // Reuse same base: we kept scratch.mailbox/cfg on temp dir; new process reads same sqlite.
+    // The bd-2u27 claim under test: `--wake` rode SendMessage.extra_tags, so
+    // the durable row carries it. A leak onto the 1059 envelope would not land
+    // here, which is what makes this the observable for the contract.
+    assert_eq!(
+        v["wake"].as_str(),
+        Some("tasked"),
+        "--wake tasked must ride extra_tags into the receipt row, got {v}"
+    );
+    assert_eq!(
+        v["state"].as_str(),
+        Some("owed"),
+        "a tasked send opens its receipt owed, got {v}"
+    );
+
+    // Kill walker: a NEW process over the same store, no in-memory state carried
+    // across. If receipts lived in a HashMap this read would miss.
     let scratch2 = Scratch {
         dir: scratch.dir.clone(),
         mailbox: scratch.mailbox.clone(),
         cfg: scratch.cfg.clone(),
     };
-    let out = scratch2.run(
-        &toron,
-        &["receipt", "get", "--project", proj, "--corr", corr],
+    let v2 = receipt(&scratch2, toron_s, corr);
+    assert_eq!(
+        v2["corr"].as_str(),
+        Some(corr),
+        "a fresh process must still see the receipt for corr={corr}"
     );
-    assert!(
-        out.status.success(),
-        "RED (bd-gmjo S1): new process must still see owed/acked for corr=FM-GS-012 (receipts store, not receipt_cache HashMap)\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    assert_eq!(
+        v2["state"].as_str(),
+        Some("owed"),
+        "the owed assignment must survive walker death in the receipts table, got {v2}"
     );
-    let v2: serde_json::Value = serde_json::from_slice(&out.stdout).expect("receipt get json");
-    assert_eq!(v2.get("corr").and_then(|x| x.as_str()).unwrap_or(""), corr);
-    // Empty tasked still writes a one-line result against corr (E3)
-    // Send tasked empty body with --result-path and assert receipt state -> resulted
+
+    // Empty tasked still records its result path against corr (E3).
     let empty_corr = "FM-GS-012-empty";
+    // Inside the scratch base, not a hardcoded /tmp: the receipt's result_path
+    // is what this asserts on, and it must be the path the caller passed.
+    let result_path = scratch
+        .dir
+        .parent()
+        .expect("scratch base")
+        .join("adr27-result.txt");
     let out = scratch2.run(
-        &toron,
+        toron_s,
         &[
             "mail",
             "send",
             "--project",
             proj,
             "--as",
-            "adr27-sender",
+            "IvoryRidge",
             "--to",
-            "adr27-recip",
+            "EmberOtter",
             "--subject",
             "empty tasked",
             "--body",
@@ -499,7 +500,7 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
             "--wake",
             "tasked",
             "--result-path",
-            "/tmp/adr27-result.txt",
+            result_path.to_str().expect("utf-8 result path"),
         ],
     );
     assert!(
@@ -508,17 +509,15 @@ fn adr0027_s1_tasked_mail_corr_survives_walker_death() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // After tick (assignment in Model), the empty tasked should have recorded a result
-    // For now we just assert receipt exists and has result_path
-    let out = scratch2.run(
-        &toron,
-        &["receipt", "get", "--project", proj, "--corr", empty_corr],
-    );
-    assert!(
-        out.status.success(),
-        "RED (bd-gmjo S1): empty tasked must write result against corr\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    // The send does NOT create the result file (measured) — the assignee writes
+    // that later, and `receipt set` moves the row to resulted. The observable
+    // for "the result path rode extra_tags" is the receipt's own field, which
+    // the old version promised to check and never did.
+    let v3 = receipt(&scratch2, toron_s, empty_corr);
+    assert_eq!(
+        v3["result_path"].as_str(),
+        result_path.to_str(),
+        "--result-path must ride extra_tags into the receipt row, got {v3}"
     );
 
     let _ = std::fs::remove_dir_all(scratch.dir.parent().unwrap());

@@ -1,4 +1,4 @@
-# Repo-tier stage DATA (ADR-0022 §3.8 permanence ladder).
+# Repo-tier stage DATA (permanence ladder).
 #
 # Entries here are NOT hand-authored: they arrive exclusively through
 # `flywheel stage promote <name> --to repo`, which enforces the evidence bar
