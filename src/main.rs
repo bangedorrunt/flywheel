@@ -6736,9 +6736,15 @@ mod spawn_boot_reliability_tests {
             helper_body.contains("pane_agent_alive"),
             "verify_or_respawn_pane must probe the LIVE process via pane_agent_alive"
         );
+        // bd-s91y: the re-launch (and GS-037 P0-3's rename-clear/fail-fast)
+        // routes through the shared taken-name recovery — the raw `agent.start`
+        // call and the taken-name handling live in its ConcreteTakenOps impl /
+        // `start_agent_with_taken_name_clear`, which
+        // `every_start_door_routes_through_the_shared_recovery` bounds to the
+        // call site (this slice runs to EOF and would match a later door).
         assert!(
-            helper_body.contains("c.agent_start(name, kind, pane_id, 45_000, args)"),
-            "verify_or_respawn_pane must re-launch via agent.start (not the registry short-circuit)"
+            helper_body.contains("start_agent_with_taken_name_clear"),
+            "verify_or_respawn_pane must re-launch through the shared taken-name recovery (bd-s91y)"
         );
         assert!(
             helper_body.contains("pane_send_input(pane_id, &[\"CTRL_C\"])"),
@@ -6751,10 +6757,13 @@ mod spawn_boot_reliability_tests {
                 && spawn_body.contains("no live agent process after spawn + recovery"),
             "dead-shell must bail with GS-037 P0-1 marker (nonzero exit)"
         );
-        // GS-037 P0-3: agent_name_taken fail-fast / rename-clear, not ~120s burn.
+        // GS-037 P0-3's taken-name rename-clear / fail-fast moved into
+        // `start_agent_with_taken_name_clear` (bd-s91y) — the bounded wiring
+        // proof is `every_start_door_routes_through_the_shared_recovery`, and
+        // the branch behavior is pinned by `recover_frees_a_taken_name`.
         assert!(
-            helper_body.contains("agent_name_taken") && helper_body.contains("rename-clear"),
-            "verify_or_respawn_pane must rename-clear / fail-fast on agent_name_taken"
+            helper_body.contains("rename-clear") || helper_body.contains("taken-name recovery"),
+            "verify_or_respawn_pane must route the rename-clear path (bd-s91y)"
         );
     }
 
@@ -6806,20 +6815,25 @@ mod spawn_boot_reliability_tests {
         assert!(is_herdr_legal_name(&stale_rename_label(&capped, 1)));
     }
 
-    /// The wiring gate: `verify_or_respawn_pane` must mint the stale label
-    /// through the bounded helper, never the raw concat (a helper nobody calls
-    /// fixes nothing).
+    /// The wiring gate: the stale label must be minted through the bounded
+    /// helper, never the raw concat (a helper nobody calls fixes nothing).
+    /// bd-s91y re-pointed this at the shared recovery's pure decision, where
+    /// the mint moved — `verify_or_respawn_pane` no longer mints it itself.
     #[test]
     fn rename_clear_mints_its_label_through_the_bounded_helper() {
         let src = include_str!("main.rs");
-        let helper = crate::tripwire::find_fn(src, "verify_or_respawn_pane");
-        let body = &src[helper..];
+        let helper = crate::tripwire::find_fn(src, "taken_name_action");
+        let rest = &src[helper..];
+        // Bound at the next column-0 fn so a later helper's mint cannot
+        // satisfy this one.
+        let end = rest[1..].find("\nfn ").map_or(rest.len(), |i| i + 1);
+        let body = &rest[..end];
         assert!(
-            body.contains("stale_rename_label(name, attempts)"),
-            "verify_or_respawn_pane must mint the rename-clear label via stale_rename_label"
+            body.contains("stale_rename_label(contested, attempt)"),
+            "the shared taken-name decision must mint the label via stale_rename_label"
         );
         assert!(
-            !body.contains("format!(\"{name}-stale-{attempts}\")"),
+            !src.contains("format!(\"{name}-stale-{attempts}\")"),
             "the raw `{{name}}-stale-{{attempts}}` concat overflows herdr's 32-char cap"
         );
     }
@@ -7981,6 +7995,486 @@ fn stale_rename_label(name: &str, attempts: u32) -> String {
     }
 }
 
+/// ADR-0003 discipline: classify on the machine code, never the message text.
+/// `agent_name_taken` is herdr's wire code passed through as
+/// `BackendErrorCode::Other` — the one check every start door shares.
+fn is_taken_name_error(e: &herdr_shim::BackendError) -> bool {
+    e.code().as_str() == "agent_name_taken"
+}
+
+/// bd-s91y: may the taken-name recovery free the binding? herdr's
+/// `agent rename <pane> <new>` renames whatever agent that pane HOLDS, so the
+/// rename-clear is only legal when the pane's OWN binding holds the contested
+/// name; a blind clear would rename a stranger. Pure, so the own/foreign
+/// split is unit-testable without herdr.
+#[derive(Debug, PartialEq, Eq)]
+enum TakenNameAction {
+    /// The pane's own binding holds the contested name — free it, retry once.
+    FreeOwnBinding { label: String },
+    /// Anything else holds it — refuse, naming the holder (may be unknown).
+    ForeignHolder { holder: Option<String> },
+}
+
+/// The decision behind [`start_agent_with_taken_name_clear`]. `attempt` only
+/// shapes the stale label; it never widens WHAT may be renamed.
+fn taken_name_action(
+    pane_binding: Option<&str>,
+    contested: &str,
+    holder_pane: Option<&str>,
+    attempt: u32,
+) -> TakenNameAction {
+    if pane_binding == Some(contested) {
+        TakenNameAction::FreeOwnBinding {
+            label: stale_rename_label(contested, attempt),
+        }
+    } else {
+        TakenNameAction::ForeignHolder {
+            holder: holder_pane.map(str::to_string),
+        }
+    }
+}
+
+/// Outcome of one `agent.start` attempt through the shared recovery.
+enum StartAttempt {
+    /// Accepted — first try, or after freeing the pane's own binding.
+    Started,
+    /// Refused for a reason that is NOT `agent_name_taken` — the caller's own
+    /// error policy (logging, classification, retry) still applies.
+    NotTaken(herdr_shim::BackendError),
+    /// The name is taken and the recovery may not (or could not) free it —
+    /// fail loud NOW; keeping the name costs the retry budget and clears
+    /// nothing.
+    Refused(anyhow::Error),
+}
+
+/// bd-s91y: the four backend reads/writes the taken-name recovery needs —
+/// implemented once over the concrete herdr client, once over the trait-object
+/// backend, so the recovery logic and its messages live in ONE place.
+trait TakenNameOps {
+    fn start_agent(
+        &mut self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        args: &[String],
+    ) -> std::result::Result<AgentInfo, herdr_shim::BackendError>;
+    /// Name the pane's OWN binding currently holds. An unreadable list reads
+    /// as `None` — the safe side, because `None` never authorizes a rename.
+    fn pane_binding(&mut self, pane_id: &str) -> Option<String>;
+    /// The pane a live agent row shows holding `name`, when one is visible.
+    fn holder_pane(&mut self, name: &str) -> Option<String>;
+    /// Rename THIS pane's own binding away — never a foreign holder's.
+    fn rename_pane(
+        &mut self,
+        pane_id: &str,
+        label: &str,
+    ) -> std::result::Result<(), herdr_shim::BackendError>;
+}
+
+/// The concrete-client implementation (spawn's dead-shell re-launch, both
+/// retry loops, the crew / rate-limit hops).
+struct ConcreteTakenOps<'a> {
+    c: &'a herdr_shim::Client,
+}
+
+impl TakenNameOps for ConcreteTakenOps<'_> {
+    fn start_agent(
+        &mut self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        args: &[String],
+    ) -> std::result::Result<AgentInfo, herdr_shim::BackendError> {
+        self.c.agent_start(name, kind, pane_id, 45_000, args)
+    }
+    fn pane_binding(&mut self, pane_id: &str) -> Option<String> {
+        self.c
+            .agent_list()
+            .ok()?
+            .into_iter()
+            .find(|a| a.pane_id == pane_id)?
+            .name
+    }
+    fn holder_pane(&mut self, name: &str) -> Option<String> {
+        self.c
+            .agent_list()
+            .ok()?
+            .into_iter()
+            .find(|a| a.name.as_deref() == Some(name))
+            .map(|a| a.pane_id)
+    }
+    fn rename_pane(
+        &mut self,
+        pane_id: &str,
+        label: &str,
+    ) -> std::result::Result<(), herdr_shim::BackendError> {
+        self.c.agent_rename(pane_id, label).map(|_| ())
+    }
+}
+
+/// The trait-object implementation (`cmd_recover`'s Respawn arm, the durable
+/// respawn leaf).
+struct DynTakenOps<'a> {
+    backend: &'a dyn backend::MultiplexerBackend,
+}
+
+impl TakenNameOps for DynTakenOps<'_> {
+    fn start_agent(
+        &mut self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        args: &[String],
+    ) -> std::result::Result<AgentInfo, herdr_shim::BackendError> {
+        self.backend.agent_start(name, kind, pane_id, args)
+    }
+    fn pane_binding(&mut self, pane_id: &str) -> Option<String> {
+        self.backend
+            .agent_list()
+            .ok()?
+            .into_iter()
+            .find(|a| a.pane_id == pane_id)?
+            .name
+    }
+    fn holder_pane(&mut self, name: &str) -> Option<String> {
+        self.backend
+            .agent_list()
+            .ok()?
+            .into_iter()
+            .find(|a| a.name.as_deref() == Some(name))
+            .map(|a| a.pane_id)
+    }
+    fn rename_pane(
+        &mut self,
+        pane_id: &str,
+        label: &str,
+    ) -> std::result::Result<(), herdr_shim::BackendError> {
+        self.backend.agent_rename(pane_id, Some(label))
+    }
+}
+
+/// bd-s91y (GS-037 P0-3): the ONE home of the `agent_name_taken` recovery.
+///
+/// Before this, the start doors disagreed: the dead-shell verify path
+/// (`verify_or_respawn_pane`) rename-cleared and failed fast, while both retry
+/// loops — `cmd_recover`'s Respawn arm included — burned 30 x 3s (~90s) on a
+/// name they never freed, even though `recover` is the documented rescue door
+/// (found while closing bd-rename-clear-name-too-long-oxd7). The recovery:
+/// start once; on a taken-name refusal read the pane's OWN binding, free it
+/// with the bounded [`stale_rename_label`], retry ONCE, and refuse loud if it
+/// is still taken — or if the holder is not this pane (herdr renames whatever
+/// the pane holds, so a blind clear would rename a stranger).
+///
+/// The clear is keyed on the pane's own BINDING, never on process liveness:
+/// the trait-object backend carries no `pane.process_info` (cmd_recover's own
+/// constraint), and every door reaches this state only after its own liveness
+/// gate (a dead shell, a process-dead/unresponsive/agent-gone verdict).
+fn start_agent_with_taken_name_clear(
+    ops: &mut dyn TakenNameOps,
+    name: &str,
+    kind: &str,
+    pane_id: &str,
+    args: &[String],
+    attempt: u32,
+) -> StartAttempt {
+    match ops.start_agent(name, kind, pane_id, args) {
+        Ok(_) => StartAttempt::Started,
+        Err(e) if !is_taken_name_error(&e) => StartAttempt::NotTaken(e),
+        Err(_) => {
+            let binding = ops.pane_binding(pane_id);
+            let holder = ops.holder_pane(name);
+            match taken_name_action(binding.as_deref(), name, holder.as_deref(), attempt) {
+                TakenNameAction::FreeOwnBinding { label } => match ops.rename_pane(pane_id, &label)
+                {
+                    Ok(()) => {
+                        eprintln!(
+                            "flywheel: freed name {name} by renaming dead binding to {label} — retrying start once"
+                        );
+                        match ops.start_agent(name, kind, pane_id, args) {
+                            Ok(_) => StartAttempt::Started,
+                            Err(e) if is_taken_name_error(&e) => {
+                                StartAttempt::Refused(anyhow::anyhow!(
+                                    "{name} ({pane_id}) agent_name_taken after rename-clear — refusing to burn the recovery budget. Close the workspace (flywheel kill <project> --force) or `herdr agent rename` the stale binding, then re-spawn."
+                                ))
+                            }
+                            Err(e) => StartAttempt::NotTaken(e),
+                        }
+                    }
+                    Err(re) => StartAttempt::Refused(anyhow::anyhow!(
+                        "{name} ({pane_id}) agent_name_taken and rename-clear failed ({re:#}) — fail-fast (GS-037 P0-3), not a ~120s burn. Close the workspace or release the name, then re-spawn."
+                    )),
+                },
+                TakenNameAction::ForeignHolder { holder } => {
+                    let own = binding.as_deref().unwrap_or("<no binding>");
+                    let held = holder.as_deref().map_or_else(
+                        || "no live agent row holds it".to_string(),
+                        |p| format!("held by pane {p}"),
+                    );
+                    StartAttempt::Refused(anyhow::anyhow!(
+                        "{name} ({pane_id}) agent_name_taken, but this pane's own binding is {own} and the name is {held} — flywheel only frees a pane's OWN binding, so it will not rename a stranger's agent. Release {name} where it is held (close or rename that pane), then re-spawn."
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// bd-s91y (GS-037 P0-3): the shared taken-name recovery. `cmd_recover`'s
+/// respawn arm used to burn 30 x 3s on a name it could have freed — or must
+/// refuse — in one read.
+#[cfg(test)]
+mod taken_name_recovery_tests {
+    use super::*;
+    use crate::backend::MultiplexerBackend;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The error a herdr name collision really surfaces as: the wire code
+    /// (no typed variant) plus the name in the message.
+    fn taken(name: &str) -> BackendError {
+        BackendError {
+            code: BackendErrorCode::Other("agent_name_taken".into()),
+            message: format!("agent name '{name}' is already taken"),
+        }
+    }
+
+    fn row(name: &str, pane: &str) -> AgentInfo {
+        AgentInfo {
+            agent: Some(name.to_string()),
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: Some(name.to_string()),
+            pane_id: pane.to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: "t1".into(),
+            terminal_id: "term".into(),
+            terminal_title: None,
+            workspace_id: "wA".into(),
+        }
+    }
+
+    /// The `(name, pane)` binding table a live herdr would show, with call
+    /// counters. `agent_start` refuses while ANY row holds the name (herdr's
+    /// own semantics); `agent_rename` rewrites the row whose pane matches —
+    /// exactly what "renames whatever agent that pane holds" means.
+    struct NameMux {
+        bindings: Mutex<Vec<(String, String)>>,
+        starts: AtomicUsize,
+        renames: Mutex<Vec<(String, String)>>,
+    }
+
+    impl NameMux {
+        fn new(rows: &[(&str, &str)]) -> Self {
+            Self {
+                bindings: Mutex::new(
+                    rows.iter()
+                        .map(|(n, p)| (n.to_string(), p.to_string()))
+                        .collect(),
+                ),
+                starts: AtomicUsize::new(0),
+                renames: Mutex::new(Vec::new()),
+            }
+        }
+        fn starts(&self) -> usize {
+            self.starts.load(Ordering::SeqCst)
+        }
+        fn renames(&self) -> Vec<(String, String)> {
+            self.renames.lock().expect("renames lock").clone()
+        }
+    }
+
+    impl MultiplexerBackend for NameMux {
+        fn name(&self) -> &'static str {
+            "name-taken-mux"
+        }
+        fn agent_list(&self) -> std::result::Result<Vec<AgentInfo>, BackendError> {
+            Ok(self
+                .bindings
+                .lock()
+                .expect("bindings lock")
+                .iter()
+                .map(|(n, p)| row(n, p))
+                .collect())
+        }
+        fn agent_start(
+            &self,
+            name: &str,
+            _kind: &str,
+            pane_id: &str,
+            _args: &[String],
+        ) -> std::result::Result<AgentInfo, BackendError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let mut bindings = self.bindings.lock().expect("bindings lock");
+            if bindings.iter().any(|(n, _)| n == name) {
+                return Err(taken(name));
+            }
+            bindings.push((name.to_string(), pane_id.to_string()));
+            Ok(row(name, pane_id))
+        }
+        fn agent_rename(
+            &self,
+            target: &str,
+            new_name: Option<&str>,
+        ) -> std::result::Result<(), BackendError> {
+            let Some(new_name) = new_name else {
+                return Ok(());
+            };
+            let mut bindings = self.bindings.lock().expect("bindings lock");
+            for (n, p) in bindings.iter_mut() {
+                if p == target {
+                    *n = new_name.to_string();
+                }
+            }
+            self.renames
+                .lock()
+                .expect("renames lock")
+                .push((target.to_string(), new_name.to_string()));
+            Ok(())
+        }
+    }
+
+    /// bd-s91y, the bead's fence: recover's respawn call shape — the exact
+    /// `start_agent_with_retry_dyn` invocation `cmd_recover`'s Respawn arm
+    /// makes — must FREE the pane's own dead binding and really restart the
+    /// agent. Pre-fix the loop reported success WITHOUT restarting, because
+    /// the registry short-circuit matched the stale row the refused
+    /// `agent.start` had just failed to replace: asserted as one refused start
+    /// + one rename + one successful start.
+    #[test]
+    fn recover_frees_a_taken_name() {
+        let mux = NameMux::new(&[("flywheel-demo-oc", "wA:p1")]);
+        let agent = start_agent_with_retry_dyn(&mux, "flywheel-demo-oc", "opencode", "wA:p1", &[])
+            .expect("recover's respawn must free its own stale binding and restart");
+        assert_eq!(agent.pane_id, "wA:p1");
+        assert_eq!(
+            mux.starts(),
+            2,
+            "one refused start + one retry after the clear — never a 30-attempt burn"
+        );
+        assert_eq!(
+            mux.renames(),
+            vec![("wA:p1".to_string(), "flywheel-demo-oc-stale-1".to_string())],
+            "the dead binding is freed with the bounded stale label"
+        );
+    }
+
+    /// bd-s91y: a name held by ANOTHER pane's binding refuses in one read —
+    /// never rename a stranger, never burn ~90s — and names the real holder.
+    #[test]
+    fn recover_refuses_a_foreign_holder_without_burning_the_budget() {
+        let mux = NameMux::new(&[("flywheel-demo-oc", "wA:p9")]);
+        let started = std::time::Instant::now();
+        let err = start_agent_with_retry_dyn(&mux, "flywheel-demo-oc", "opencode", "wA:p1", &[])
+            .expect_err("a foreign holder is a refusal, not a retry");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wA:p9"),
+            "the refusal must name the real holder: {msg}"
+        );
+        assert!(
+            msg.contains("will not rename a stranger"),
+            "the refusal must say WHY it did not clear the name: {msg}"
+        );
+        assert_eq!(
+            mux.starts(),
+            1,
+            "one start attempt — the 3s-per-attempt burn is gone"
+        );
+        assert!(
+            mux.renames().is_empty(),
+            "a foreign holder's binding must never be renamed"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the refusal is immediate (no retry sleep ran): {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The pure split: only the pane's OWN binding may be freed; every other
+    /// shape refuses (an unreadable/absent binding included).
+    #[test]
+    fn taken_name_action_frees_only_the_panes_own_binding() {
+        assert_eq!(
+            taken_name_action(Some("flywheel-demo-oc"), "flywheel-demo-oc", None, 3),
+            TakenNameAction::FreeOwnBinding {
+                label: "flywheel-demo-oc-stale-3".into()
+            }
+        );
+        assert_eq!(
+            taken_name_action(None, "flywheel-demo-oc", Some("wA:p9"), 1),
+            TakenNameAction::ForeignHolder {
+                holder: Some("wA:p9".into())
+            }
+        );
+        assert_eq!(
+            taken_name_action(Some("other-agent"), "flywheel-demo-oc", Some("wA:p9"), 1),
+            TakenNameAction::ForeignHolder {
+                holder: Some("wA:p9".into())
+            }
+        );
+        assert_eq!(
+            taken_name_action(Some("other-agent"), "flywheel-demo-oc", None, 1),
+            TakenNameAction::ForeignHolder { holder: None }
+        );
+    }
+
+    /// ADR-0003: the taken-name check reads the CODE. A different code whose
+    /// message merely mentions `agent_name_taken` must not classify — that
+    /// string-matching is what the refactor removed.
+    #[test]
+    fn taken_name_error_classifies_on_the_code_never_the_message() {
+        assert!(is_taken_name_error(&taken("flywheel-demo-oc")));
+        let lookalike = BackendError {
+            code: BackendErrorCode::Other("invalid_agent_name".into()),
+            message: "agent_name_taken is a different code".into(),
+        };
+        assert!(
+            !is_taken_name_error(&lookalike),
+            "message text must never classify a backend error"
+        );
+    }
+
+    /// Wiring (bd-s91y): the recovery exists ONCE and every start door uses it
+    /// — spawn's dead-shell verify plus both retry loops, the dyn one being
+    /// `cmd_recover`'s respawn path. Each door's body is bounded at the next
+    /// door so a later door's call cannot satisfy an earlier door's check (the
+    /// older tripwire slice ran to EOF).
+    #[test]
+    fn every_start_door_routes_through_the_shared_recovery() {
+        let src = include_str!("main.rs");
+        let doors = [
+            "verify_or_respawn_pane",
+            "start_agent_with_retry_profile",
+            "start_agent_with_retry_dyn_profile",
+        ];
+        let mut bounds: Vec<usize> = doors
+            .iter()
+            .map(|d| crate::tripwire::find_fn(src, d))
+            .collect();
+        bounds.push(src.len());
+        for (door, w) in doors.iter().zip(bounds.windows(2)) {
+            let body = &src[w[0]..w[1]];
+            assert!(
+                body.contains("start_agent_with_taken_name_clear"),
+                "{door} must route agent.start through the shared taken-name recovery"
+            );
+            assert!(
+                !body.contains("format!(\"{name}-stale-{attempts}\")"),
+                "{door} must not mint a raw stale label (herdr's 32-char cap)"
+            );
+        }
+    }
+}
+
 /// bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell verification for
 /// one spawned pane — assert the LIVE agent process (`pane_agent_alive`),
 /// never the herdr `launch_pending` flag. A pane can leave the launch window
@@ -8052,49 +8546,20 @@ fn verify_or_respawn_pane(
             let _ = c.pane_send_input(pane_id, &["CTRL_C"]);
             std::thread::sleep(Duration::from_millis(500));
         }
-        // Re-launch into the SAME pane. Direct agent.start (not
-        // start_agent_with_retry): herdr still lists the dead agent, so the
-        // registry short-circuit would no-op instead of re-typing the launch.
-        match c.agent_start(name, kind, pane_id, 45_000, args) {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = format!("{e:#}");
+        // Re-launch into the SAME pane through the shared taken-name recovery
+        // (bd-s91y). Direct agent.start, not start_agent_with_retry: herdr
+        // still lists the dead agent, so the registry short-circuit would
+        // no-op instead of re-typing the launch — and a taken name is freed
+        // only when THIS pane's own (dead) binding holds it.
+        let mut ops = ConcreteTakenOps { c: &*c };
+        match start_agent_with_taken_name_clear(&mut ops, name, kind, pane_id, args, attempts) {
+            StartAttempt::Started => {}
+            StartAttempt::NotTaken(e) => {
                 eprintln!(
-                    "flywheel: re-launch of {name} ({pane_id}) attempt {attempts} failed: {msg}"
+                    "flywheel: re-launch of {name} ({pane_id}) attempt {attempts} failed: {e:#}"
                 );
-                // GS-037 P0-3: agent_name_taken burns ~120s if we keep retrying
-                // the same taken name. Rename-clear once, then fail-fast if
-                // still taken — never invent green by spinning the budget.
-                if msg.contains("agent_name_taken") {
-                    let stale = stale_rename_label(name, attempts);
-                    match c.agent_rename(pane_id, &stale) {
-                        Ok(_) => {
-                            eprintln!(
-                                "flywheel: freed name {name} by renaming dead binding to {stale} — retrying start once"
-                            );
-                            match c.agent_start(name, kind, pane_id, 45_000, args) {
-                                Ok(_) => {}
-                                Err(e2) => {
-                                    let m2 = format!("{e2:#}");
-                                    eprintln!(
-                                        "flywheel: re-launch after rename-clear still failed: {m2}"
-                                    );
-                                    if m2.contains("agent_name_taken") {
-                                        bail!(
-                                            "{name} ({pane_id}) agent_name_taken after rename-clear — refusing to burn the recovery budget. Close the workspace (flywheel kill <project> --force) or `herdr agent rename` the stale binding, then re-spawn."
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(re) => {
-                            bail!(
-                                "{name} ({pane_id}) agent_name_taken and rename-clear failed ({re:#}) — fail-fast (GS-037 P0-3), not a ~120s burn. Close the workspace or release the name, then re-spawn."
-                            );
-                        }
-                    }
-                }
             }
+            StartAttempt::Refused(e) => return Err(e),
         }
         // bd-eign.6 L1: readiness gate again (the TUI owns the foreground
         // exactly when it is input-ready).
@@ -11360,9 +11825,22 @@ pub(crate) fn start_agent_with_retry_profile(
     let mut already_rerouted = false;
     for attempt in 0..30 {
         if !recipe_launched {
-            match c.agent_start(name, &current_kind, pane_id, 45_000, &current_args) {
-                Ok(_) => {}
-                Err(e) => {
+            // bd-s91y: a taken name is not a model/profile failure — it routes
+            // through the shared recovery FIRST (freed once when it is this
+            // pane's own dead binding, retried once, or refused loud), never
+            // into a retry arm that burns ~90s and clears nothing.
+            let mut ops = ConcreteTakenOps { c: &*c };
+            match start_agent_with_taken_name_clear(
+                &mut ops,
+                name,
+                &current_kind,
+                pane_id,
+                &current_args,
+                attempt as u32 + 1,
+            ) {
+                StartAttempt::Started => {}
+                StartAttempt::Refused(e) => return Err(e),
+                StartAttempt::NotTaken(e) => {
                     if attempt == 0 {
                         eprintln!("agent.start error: {e:#}");
                         let cf = failure::classify(&e.to_string(), None, None);
@@ -11560,9 +12038,23 @@ fn start_agent_with_retry_dyn_profile(
     let mut already_rerouted = false;
     for attempt in 0..30 {
         if !recipe_launched {
-            match backend.agent_start(name, &current_kind, pane_id, &current_args) {
-                Ok(_) => {}
-                Err(e) => {
+            // bd-s91y: a taken name is not a model/profile failure — it routes
+            // through the shared recovery FIRST (freed once when it is this
+            // pane's own dead binding, retried once, or refused loud), never
+            // into the classify/reroute arm, which burns ~90s and clears
+            // nothing.
+            let mut ops = DynTakenOps { backend };
+            match start_agent_with_taken_name_clear(
+                &mut ops,
+                name,
+                &current_kind,
+                pane_id,
+                &current_args,
+                attempt as u32 + 1,
+            ) {
+                StartAttempt::Started => {}
+                StartAttempt::Refused(e) => return Err(e),
+                StartAttempt::NotTaken(e) => {
                     if attempt == 0 {
                         eprintln!("agent.start error: {e:#}");
                         let cf = failure::classify(&e.to_string(), None, None);
