@@ -45,7 +45,7 @@ A profile with an empty harness is one whose route comes from a slot alias
 (`@standard`, `@premium`) rather than a pinned harness, so the effective
 harness is resolved at spawn time and recorded in the ledger.
 
-Unsure of the role: list first. Bare harness flags (`--oc/--pi/--gk`) count only under an explicit captain harness constraint, recorded in the trail. `--join-channel` auto-joins every spawned pin at pane creation (join-before-post: a non-member post fails loud and names the remedy).
+Unsure of the role: list first. Bare harness flags (`--oc/--pi/--gk`) count only under an explicit captain harness constraint, recorded in the trail. `--join-channel` auto-joins every spawned pin at pane creation (join-before-post: a non-member post fails loud and names the remedy). Extending a live swarm is `flywheel add <project> --pi N` (or `--kind <kind=N>`): it splits new panes into the running workspace. `spawn --join` only attaches and arrives — it does not add panes.
 
 **Identity is immutable; the binding is not.** The pin and npub (`AgentRef`) never change. Profile, harness, and model are a replaceable, journaled `AgentBinding`: move them with `flywheel binding-rebind <project> --pin <pin> [--profile|--harness|--note]`, which updates the live binding and does not edit `profiles.toml`. Never re-mint a pin to change a role. `--model` here is fail-loud, because no spawn/pane/headless consumer reads it yet.
 

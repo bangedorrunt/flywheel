@@ -1,4 +1,4 @@
-# Captain-pane herdr plugin (bd-xenf)
+# Captain-pane herdr plugin
 
 Read-and-notify only: captain-pane presence, toast, and binding
 reconcile. Never dispatches, closes, or writes beads. Terminology is
@@ -14,7 +14,7 @@ reconcile. Never dispatches, closes, or writes beads. Terminology is
 
 Captain pane = a herdr pane carrying a `toron_pin` token (`herdr agent
 list` → `tokens.toron_pin`). The pin + project ride the presence row
-that bd-3vr9 consumes.
+that the captain reads.
 
 ## Env (all inherited, all optional)
 

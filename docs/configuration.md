@@ -42,7 +42,7 @@ or leave it; there is no "disable builtin" flag. Exact merge points:
 ```toml
 [doorbell]
 url = "http://127.0.0.1:18980"  # presence selects the daemon host; absent = embedded
-beads_poller = false             # Phase-4 flags, all default off
+beads_poller = true              # ready-bead/hold sensor, default on (false opts out)
 cron_doorbell_sink = false
 ```
 

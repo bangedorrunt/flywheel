@@ -221,11 +221,58 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         brain.contains("take_allowed") && brain.contains("sync_journal"),
         "brain must enforce 5/30/3 budget behind the write-ahead journal"
     );
-    // Push-only status spine: no snapshot poll fallback (sweep retries
-    // coverage instead — DELTA vs the old refresh_status, same guarantee).
+    // Push-only status spine: no periodic agent_list poll. agent_list may
+    // appear only as the events_lost session.snapshot fallback (item 4),
+    // never as the live coverage driver.
+    let cover = host
+        .find("fn cover_new_panes")
+        .map(|i| &host[i..i + 3500])
+        .unwrap_or("");
     assert!(
-        !host.contains("agent_list"),
-        "no snapshot poll; forwarder push + per-sweep respawn cover status"
+        !cover.contains("agent_list") && cover.contains("agent_status_changed_many"),
+        "cover_new_panes must multiplex-subscribe, not poll agent_list"
+    );
+    assert!(
+        host.contains("reconcile_status_after_events_lost")
+            || !host.contains("refresh_status"),
+        "no retired refresh_status poll spine"
+    );
+}
+
+/// herdr plane harden item 4: one multiplexed events.subscribe for crew panes;
+/// stream death clears covered; events_lost stays compile-gated until toron.
+#[test]
+fn sc_d1_doorbell_multiplex_subscribe_and_stream_death_rearm() {
+    let host = read("src/doorbell_host.rs");
+    assert!(
+        host.contains("agent_status_changed_many")
+            && host.contains("cover_new_panes")
+            && host.contains("multiplex subscribe"),
+        "cover_new_panes must use one multiplexed subscribe for crew panes"
+    );
+    assert!(
+        host.contains("covered.remove")
+            || (host.contains("Stream death") && host.contains("covered_shared")),
+        "stream death must clear covered so the next sweep re-arms"
+    );
+    assert!(
+        host.contains("refreshing pane list") && host.contains("pane_list"),
+        "subscribe reject on dead pane must refresh pane list and retry"
+    );
+    assert!(
+        host.contains("StreamOutcome::EventsLost")
+            && host.contains("reconcile_status_after_events_lost")
+            && host.contains("session.snapshot"),
+        "events_lost must clear coverage and reconcile via session.snapshot"
+    );
+    assert!(
+        host.contains("read_outcome"),
+        "multiplex reader must use typed read_outcome (not string-match events_lost)"
+    );
+    // Negative control: per-pane one-thread-per-pane loop must be gone.
+    assert!(
+        !host.contains("per-pane threads match the old topology"),
+        "old per-pane subscribe topology must not remain"
     );
 }
 
@@ -531,6 +578,22 @@ async fn live_mailbox(data_dir: &Path, project: &str, names: &[&str]) {
 
 /// SC-D1 live: real kind-9 `--mention` post, real `toron watch` NDJSON
 /// (npub `p` tag), then `__doorbell --once` injects `[doorbell]` for the pin.
+///
+/// bd-p2zm: `#[ignore]`d because it drives a REAL `toron` subprocess, so it
+/// cannot pass unless the sibling repo has been built — `toron_bin()` resolves
+/// `../toron/target/debug/toron` and asserts it exists. Un-ignored, `mbx test`
+/// was green or red depending on whether a sibling build happened to be on
+/// disk: measured this session, a full-suite run failed on exactly this after
+/// cache eviction removed the artifact, with an unrelated change in the tree.
+/// A suite that goes red for a reason unrelated to the diff teaches the reader
+/// to ignore red.
+///
+/// The loud `toron_bin()` assert is KEPT, not replaced with a skip: it is the
+/// better diagnostic, and a deliberate run should name its own prerequisite.
+/// Run it on purpose with:
+///
+///     mbx +nightly-aarch64-apple-darwin test --test sc_doorbell_adr0005 -- --ignored sc_d1_live
+#[ignore = "needs the sibling toron debug build (mbx +nightly-aarch64-apple-darwin build -p toron-cli in ~/workspace/toron)"]
 #[tokio::test]
 async fn sc_d1_live_kind9_channel_post_rings() {
     let poster = "LiveWillow";

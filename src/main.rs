@@ -123,16 +123,16 @@ use serde_json::{Value, json};
 #[cfg(feature = "serve")]
 use cmd::DaemonCmd;
 use cmd::{
-    ArtifactsCmd, AssetCmd, BackendCmd, CheckpointCmd, CoalitionCmd, ConfigCmd, CrewCmd, CronCmd,
-    DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd, PolicyCmd, PrinciplesCmd,
-    ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd, ToronCmd, ToronMailCmd,
-    WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_analytics, cmd_asset, cmd_audit, cmd_backend,
-    cmd_changes, cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject,
-    cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start,
-    cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history,
-    cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_models, cmd_policy,
-    cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline,
-    cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
+    AgentCmd, ArtifactsCmd, AssetCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd,
+    ConfigCmd, CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, ModelCmd,
+    PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd,
+    ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
+    cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
+    cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject, cmd_doorbell_introduce,
+    cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
+    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history, cmd_internal_doorbell, cmd_judgment,
+    cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot,
+    cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
 use herdr_shim::{
@@ -543,15 +543,26 @@ fn combine_stage_message(rendered: String, msg: Option<&str>) -> String {
 }
 
 /// Dispatch header: the TASK-ID is routing metadata, never the work order.
-/// Names the bound bead, or states plainly that none is bound (do not act).
-fn dispatch_header(task_id: &str, bead: Option<&str>) -> String {
+/// Names the bound bead — or, for a STAGE dispatch with none, states the
+/// bootstrap contract the pane can act on by itself (bd-stage-dispatch-
+/// binds-bead-roul). A raw nudge (no stage) still defers to its message text.
+fn dispatch_header(task_id: &str, bead: Option<&str>, stage: Option<&str>) -> String {
     match bead {
         Some(b) => format!(
             "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: {b} (the bound work order; `br show {b}` is the contract)"
         ),
-        None => format!(
-            "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound by this dispatch — follow the message text; if it carries no actionable content, ask the captain for the bead id."
-        ),
+        // The observed failure: a ce-execute stage dispatch carried a task-id
+        // and no BEAD line, so every disciplined fresh pane refused it and
+        // asked for a bead id — one round trip per pane. A stage dispatch
+        // always has an actionable work order available: the ready queue.
+        None => match stage {
+            Some(s) => format!(
+                "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound — bootstrap: stage dispatch `{s}` names no target bead, so take your own work order now: `br ready --json` (dispatchable beads only), `br update <id> --status in_progress --assignee <your pin>`, then do that bead. If `br ready` is empty, say exactly that in your completion mail and stop — never invent work and never wait for a bead id."
+            ),
+            None => format!(
+                "TASK-ID: {task_id} (routing metadata only — not a bead id, never `br show` it)\nBEAD: none bound by this dispatch — follow the message text; if it carries no actionable content, ask the captain for the bead id."
+            ),
+        },
     }
 }
 
@@ -567,13 +578,13 @@ mod send_dispatch_header_tests {
             "stage\n\nbrief"
         );
         assert_eq!(combine_stage_message("stage".to_string(), None), "stage");
-        let bound = dispatch_header("task-1", Some("bd-2"));
+        let bound = dispatch_header("task-1", Some("bd-2"), Some("ce-execute"));
         assert!(bound.contains("bd-2"), "names the bead: {bound}");
         assert!(
             bound.contains("not a bead"),
             "disclaims the task id: {bound}"
         );
-        let unbound = dispatch_header("task-1", None);
+        let unbound = dispatch_header("task-1", None, None);
         assert!(
             unbound.contains("follow the message text"),
             "unbound dispatch defers to message text (raw nudges stay actionable): {unbound}"
@@ -582,6 +593,55 @@ mod send_dispatch_header_tests {
             !unbound.contains("Do NOT act"),
             "must not self-negate raw messages: {unbound}"
         );
+    }
+
+    /// bd-stage-dispatch-binds-bead-roul: a fresh pane receiving a STAGE
+    /// dispatch can act without asking which bead it belongs to. A bound bead
+    /// is named as the work order; an unbound stage dispatch carries the
+    /// bootstrap contract (pick from `br ready`), never "ask the captain".
+    #[test]
+    fn stage_dispatch_binds_bead() {
+        // Bound: the bead is the work order, with its `br show` contract.
+        let bound = dispatch_header("task-1", Some("bd-abc"), Some("ce-execute"));
+        assert!(bound.contains("BEAD: bd-abc"), "names the bead: {bound}");
+        assert!(
+            bound.contains("the bound work order"),
+            "names the contract: {bound}"
+        );
+        assert!(
+            !bound.contains("br ready"),
+            "a bound dispatch never leaks the bootstrap text: {bound}"
+        );
+        // Unbound STAGE dispatch: the pane can act — it takes its own work
+        // order from the ready queue instead of costing a round trip.
+        let unbound = dispatch_header("task-1", None, Some("ce-execute"));
+        assert!(
+            unbound.contains("br ready"),
+            "bootstrap names the picker: {unbound}"
+        );
+        assert!(
+            unbound.contains("stage dispatch `ce-execute`"),
+            "names the stage that carried no bead: {unbound}"
+        );
+        assert!(
+            unbound.contains("br update <id> --status in_progress"),
+            "the claim step rides along so the pane is self-contained: {unbound}"
+        );
+        assert!(
+            !unbound.contains("ask the captain"),
+            "no round trip for a stage dispatch: {unbound}"
+        );
+        // A raw nudge (no stage) is unchanged: it defers to its message text.
+        let raw = dispatch_header("task-1", None, None);
+        assert!(raw.contains("follow the message text"), "{raw}");
+        assert!(
+            !raw.contains("br ready"),
+            "raw nudges do not bootstrap: {raw}"
+        );
+        // Every shape disclaims the task id as a bead id.
+        for h in [&bound, &unbound, &raw] {
+            assert!(h.contains("not a bead id"), "{h}");
+        }
     }
 }
 /// Build the filtered-inbox filter for `mail inbox` (bd-ursy): every
@@ -827,6 +887,15 @@ enum Commands {
     },
     /// Show one swarm's agents and states
     Status { project: Option<String> },
+    /// bd-swarm-cockpit-pczs: wave progress — beads grouped by `wave-N`
+    /// label (closed/in_progress/ready) and the wave currently in flight.
+    /// `br list --json` is the source (the labels live there).
+    Progress {
+        project: Option<String>,
+        /// machine-readable rows
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the fleet snapshot contract (flywheel-snapshot.v1) as robot JSON
     Snapshot { project: String },
     /// bd-3uqz: LABEL the pins in the doorbell's `.unanswered` files as
@@ -1052,6 +1121,15 @@ enum Commands {
         #[command(subcommand)]
         cmd: CrewCmd,
     },
+    /// Captain door (bd-captain-watch-poll-exit-bbwm): the captain's own
+    /// poll-exit watch. `captain watch <project>` blocks on the captain inbox
+    /// water (or a stall, with --stall, or a preflight failure, with
+    /// --preflight), prints a preview, and exits so the harness completion
+    /// callback resumes the captain. One shot — re-arm.
+    Captain {
+        #[command(subcommand)]
+        cmd: CaptainCmd,
+    },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
     /// REFUSED unless --force: they terminate the agent process and drop the
@@ -1094,6 +1172,14 @@ enum Commands {
         /// max parts to read from the session
         #[arg(long, default_value = "200")]
         limit: u32,
+    },
+    /// bd-swarm-cockpit-pczs: agent-session reads. `agent tail <pin>` shows
+    /// the pin's recent actions (tool calls / commands) from the session
+    /// herdr reports (`agent_session`) — the debugging surface that used to
+    /// require finding the raw pi session JSONL by hand.
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
     },
     /// Watch a swarm: stream agent state changes until --until or timeout
     Watch {
@@ -2512,7 +2598,11 @@ fn settle_retry<T, E>(
 ) -> Result<T, E> {
     let base = Duration::from_millis(sleep_ms);
     let policy = crate::retry::RetryPolicy {
-        max_attempts: retries.saturating_add(1).max(1),
+        // bd-9w95: `.max(1)` was dead. `retries` is a `u32`, so
+        // `saturating_add(1)` is >= 1 for every input — including
+        // `u32::MAX`, which saturates to `u32::MAX` rather than to 0. Two
+        // mechanisms each guaranteed the floor and only one was needed.
+        max_attempts: retries.saturating_add(1),
         base,
         cap: base,
     };
@@ -2598,11 +2688,14 @@ fn main() {
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
-            "loop-mode (alias: loop) run/status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
+            "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: the captain's poll-exit door — blocks on the captain inbox's own water and exits with a preview when new mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll, so a skewed store or missing binary wakes the captain instead of a watch that cannot act. One shot: re-arm after each resume)",
+            "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — herdr exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
+            "status <project> + progress [<project>] [--json] (bd-swarm-cockpit-pczs cockpit reads: status rows carry pin/npub/pane/verdict/bead/reservations/last_active_ts_us and print JSON when not a TTY; progress groups beads by wave-N label — closed/in_progress/ready/blocked/unknown — and names dispatching_wave, the lowest ready/in-progress wave; project defaults to the workspace cwd)",
+            "agent tail <pin> [--project <p>] [--json] [--n N] (bd-swarm-cockpit-pczs: the pin's recent actions — tool calls / commands — from the session herdr reports on the pane's agent_session; path sessions read the pi JSONL, id sessions read the opencode store; no newest-file guessing)",
             "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
                 "coalition debate plan-review profile squad model slot catalog runs list/show/pending/digest/reconcile",
                 "workflow cron recipes workflows pipeline template stage ensemble",
@@ -2626,10 +2719,11 @@ fn main() {
                 "squads": "flywheel squad list/show/spawn/create/remove — compiled-ins: default/plan/review/recon; user recipes.toml overrides per name (ADR-0007 D3)",
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
-            "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set to that label and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged; label-based transitional until beads ADR-0001 schema-18 (ADR-0006 D2)",
-            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF (ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify); SIGNOFF=request_approval (captain-only). Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Bounded by FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
+            "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set by the TYPED `wave` field (bd-wave-gate-typed-authority-27et; schema-18 has shipped — the legacy `wave-N` label is read only as the fallback, and br ready itself holds every higher wave until lower waves close) and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged (ADR-0006 D2)",
+            "loop_resume_window": "loop/loop-mode run --work (resume-window sweep, bead 4sa2): an in-progress bead resumes at most ONCE per (bead, pane) in a 15-min window (the watermark persists per project under the state dir, so it survives passes and processes — the in-memory `assigned` set does not); a peer-held bead (a DIFFERENT live pane's reservation reasons to it — a lane split, not a stall) draws NO resume; each pass releases leases whose reason bead is closed via the one pure rule durable::closed_reason_lease_ids. bd-loop-feeds-idle-panes-rh2z adds the idle-pane rotation: each IDLE pane takes ONE bead — its own stalled in-progress bead first, then a ready bead assigned to it, then an unowned ready bead, then any ready bead whose assignee is not a live pane — never a bead another live pane owns or a peer holds, never one already queued, and the picks go at the HEAD of the queue in fleet order (plan_actions pairs the k-th idle agent with the k-th item, so that order is what lands the pick on the pane the rotation chose). A tier-1 hit inside the window still defers for `resume_exempt_passes` consecutive starved passes (config [loop], default 2, counters persisted via state::load_pane_starvation/record_pane_starvation because loop-mode supervise runs each pass as a child process); from that pass the pick is marked window-exempt. Pure: durable::{within_resume_window, peer_held, should_resume_bead, closed_reason_lease_ids, idle_pane_rotation}; fences: resume_window_dedupes_and_respects_peer_holds, loop_feeds_idle_panes_stalled_beads",
+            "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … extend with --timeout'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
-            "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error" }
+            "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)", "4": "captain watch --preflight: the project's preflight failed (the failing check is named; bd-captain-watch-preflight-arm-snak)" }
         }));
         return;
     }
@@ -2725,6 +2819,7 @@ fn main() {
         }) => cmd_add(&cfg, project, counts, kinds, *settle_secs),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
+        Some(Commands::Progress { project, json }) => cmd_progress(&cfg, project.as_deref(), *json),
         Some(Commands::Snapshot { project }) => cmd_snapshot(&cfg, project),
         Some(Commands::UnansweredTriage {
             flywheel_state_dir,
@@ -2861,6 +2956,7 @@ fn main() {
             force,
         }) => cmd_interrupt(&cfg, project, to, keys, *force),
         Some(Commands::Crew { cmd }) => cmd_crew(&cfg, cmd),
+        Some(Commands::Captain { cmd }) => cmd_captain(&cfg, cmd),
         Some(Commands::View {
             project,
             to,
@@ -2873,6 +2969,7 @@ fn main() {
             session,
             limit,
         }) => cmd_output(&cfg, project, role.as_deref(), session.as_deref(), *limit),
+        Some(Commands::Agent { cmd }) => cmd_agent(&cfg, cmd),
         Some(Commands::Watch {
             project,
             to,
@@ -2971,6 +3068,7 @@ fn main() {
                 confirm_timeout_ms,
                 engine,
                 force,
+                resume,
                 allow_worktree,
                 strict,
             } => {
@@ -3010,11 +3108,19 @@ fn main() {
                             *confirm_timeout_ms,
                             *engine,
                             *force,
+                            *resume,
                             *strict,
                         )
                     },
                 )
             }
+            LoopCmd::Supervise {
+                project,
+                work,
+                interval,
+                to,
+                stall_minutes,
+            } => cmd_loop_supervise(&cfg, project, *work, *interval, to, *stall_minutes),
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
@@ -4914,6 +5020,7 @@ mod internal_respawn_tests {
             pane_id: pane.to_string(),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term".into(),
@@ -5203,6 +5310,7 @@ mod steer_safety_tests {
                 pane_id: format!("p-{name}"),
                 revision: 0,
                 state_change_seq: 0,
+                completion_seq: None,
                 state_labels: serde_json::Map::new(),
                 tab_id: "t".into(),
                 terminal_id: "term".into(),
@@ -5583,6 +5691,7 @@ mod workspace_origin_tests {
             pane_id: format!("{workspace_id}:p1"),
             revision: 1,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term_1".into(),
@@ -7253,14 +7362,25 @@ mod spawn_boot_reliability_tests {
         ] {
             assert!(src.contains(needle), "{needle} wired into the surface");
         }
+        // Slice the WHOLE function, like `status` below: the fixed +6000
+        // window silently stopped covering the tail once cmd_recover shrank
+        // (bd-recover-accepts-camelcase-pins-z5fz folded the match arms
+        // through `binding_state`), so the needle fell outside and this
+        // assertion read green-then-red on an unrelated edit.
         let recover = crate::tripwire::find_fn(src, "cmd_recover");
-        let recover_body = &src[recover..recover + 6000];
+        let recover_end = crate::tripwire::find_fn(src, "rebind_from_registry");
+        let recover_body = &src[recover..recover_end];
         assert!(
             recover_body.contains("doorbell::ensure_running"),
             "recover must heal dead dispatchers"
         );
+        // Slice the WHOLE function: a fixed byte window silently stops
+        // covering the tail as cmd_status grows (it did — the needles sat at
+        // ~5.4-5.7 KB after bd-spawn-identity-divergence-2vzw, outside a
+        // 5000-byte window that had passed for months).
         let status = crate::tripwire::find_fn(src, "cmd_status");
-        let status_body = &src[status..status + 5000];
+        let status_end = crate::tripwire::find_fn(src, "cmd_binding_rebind");
+        let status_body = &src[status..status_end];
         assert!(
             status_body.contains("doorbell::ensure_running") && status_body.contains("wake_state"),
             "status shows last_wake and lazy-heals"
@@ -7354,24 +7474,35 @@ fn boot_prime_policy() -> crate::retry::RetryPolicy {
     }
 }
 
-fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) {
-    // P1: boot-prime loop rides the shared RetryPolicy (was: fixed 2s x3).
+/// Settle before Enter so a TUI that detects paste-by-timing does not treat
+/// an immediate Enter as a newline (tuios/herdr lesson; herdr plane harden).
+const PRIME_ENTER_SETTLE: Duration = Duration::from_millis(100);
+
+/// Type `line` into `pane_id` and submit. Prefers `agent.prompt` (no wait)
+/// when the pane can take it; otherwise `pane.send_text` + settle + Enter.
+/// Returns whether delivery was confirmed. If text landed but Enter failed,
+/// retries Enter only — never re-types the text (no invent-green, no double
+/// paste). Callers that need honesty (doorbell / recipe send) must check the
+/// bool; boot-prime paths may still warn-and-continue.
+fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) -> bool {
+    // Prefer agent.prompt when the pane accepts it (idle / ready gate).
+    if c.agent_prompt(pane_id, line, None).is_ok() {
+        return true;
+    }
     let policy = boot_prime_policy();
     let max = policy.max_attempts;
-    let res = policy.retry_with_backoff(
-        || {
-            c.pane_send_text(pane_id, line)
-                .and_then(|_| c.pane_send_input(pane_id, &["Enter"]))
-        },
+    // Land the text once (retry send_text only on failure).
+    let text_res = policy.retry_with_backoff(
+        || c.pane_send_text(pane_id, line),
         |_| true,
         |attempt, e| {
             eprintln!(
-                "flywheel: warn: boot-prime attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying"
+                "flywheel: warn: boot-prime send_text attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying"
             );
         },
         std::thread::sleep,
     );
-    if let Err(e) = res {
+    if let Err(e) = text_res {
         eprintln!(
             "flywheel: warn: boot-prime via pane.send_text failed for {pane_id} after {max} attempts: {e:#}"
         );
@@ -7379,7 +7510,27 @@ fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) {
             "flywheel:   manual socket prime: herdr pane send-text {pane_id} '{}' then send Enter (or herdr agent prompt {pane_id})",
             line
         );
+        return false;
     }
+    // Text landed — settle, then Enter. Retry Enter only (never re-type).
+    std::thread::sleep(PRIME_ENTER_SETTLE);
+    let enter_res = policy.retry_with_backoff(
+        || c.pane_send_input(pane_id, &["Enter"]),
+        |_| true,
+        |attempt, e| {
+            eprintln!(
+                "flywheel: warn: boot-prime Enter attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying Enter only"
+            );
+        },
+        std::thread::sleep,
+    );
+    if let Err(e) = enter_res {
+        eprintln!(
+            "flywheel: warn: boot-prime Enter failed for {pane_id} after text landed ({e:#}) — not re-typing text"
+        );
+        return false;
+    }
+    true
 }
 
 /// H3 (bd-harness-integration-preflight): lifecycle-hook-authority harness
@@ -7713,6 +7864,93 @@ fn dead_panes(
         .collect()
 }
 
+/// bd-compose-plumbing-zdzi: ensure the given channels exist (captain owns
+/// creation, idempotently — a crew pin must never become creator via a join
+/// race) and join every given pin with `--if-missing`. Join-before-post:
+/// membership is the only gate and a non-member post is a refused write, so
+/// the `spawn` join flags AND `workflow compose --run`'s declared steer
+/// channel go through THIS one implementation (the compose path had skipped
+/// it; spawn's inline copy was the only one — the divergence this bead
+/// records). Best-effort by contract: each failure warns with the exact
+/// remedy and a failed join never fails the run.
+fn ensure_and_join_channels(project: &str, channels: &[String], pins: &[String]) {
+    if channels.is_empty() {
+        return;
+    }
+    let captain = operator_pin();
+    for ch in channels {
+        let ensured = Command::new("toron")
+            .args([
+                "channel",
+                "create",
+                "--name",
+                ch,
+                "--project",
+                project,
+                "--as",
+                &captain,
+                ch,
+            ])
+            .output();
+        match ensured {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => eprintln!(
+                "flywheel: warn: channel ensure {ch} failed for {captain}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => eprintln!("flywheel: warn: channel ensure {ch} failed: {e}"),
+        }
+    }
+    for pin in pins {
+        for ch in channels {
+            let status = Command::new("toron")
+                .args([
+                    "channel",
+                    "join",
+                    ch,
+                    "--project",
+                    project,
+                    "--as",
+                    pin,
+                    "--if-missing",
+                ])
+                .output();
+            match status {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!(
+                    "flywheel: warn: channel join {ch} failed for {pin}: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => eprintln!("flywheel: warn: channel join {ch} failed for {pin}: {e}"),
+            }
+        }
+    }
+}
+
+/// bd-ux-papercuts-t2u5: the `spawn --join` refusal must name the verb that
+/// actually ADDS panes. "JOINING — not spawning" alone sent the operator
+/// hunting for `flywheel add` (three attempts, live friction 2026-10-03).
+fn spawn_join_notice(project: &str, live: &str) -> String {
+    format!(
+        "JOINING — not spawning  project={project} live={live}  (ADR-0011 D5; reuse first workspace)\nto ADD panes to a live swarm use `flywheel add {project} --pi N`"
+    )
+}
+
+#[cfg(test)]
+mod spawn_join_notice_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_join_refusal_names_add() {
+        let msg = spawn_join_notice("proj", "w1 (label \"proj\", 2 panes)");
+        assert!(msg.contains("JOINING — not spawning"), "{msg}");
+        assert!(
+            msg.contains("flywheel add proj --pi N"),
+            "the refusal must name `flywheel add <project> --pi N`: {msg}"
+        );
+    }
+}
+
 fn cmd_spawn(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi: "" defeats the
     // dir.exists() bail below (the workspace root always exists) — panes
@@ -7954,10 +8192,7 @@ projects available: {}",
             // bd-bfwj: retired panes are dead — reap their registry rows now.
             pane::reap_dead_registry_rows(project, &mut c);
         } else if opts.join {
-            eprintln!(
-                "JOINING — not spawning  project={project} live={}  (ADR-0011 D5; reuse first workspace)",
-                detail.join(", ")
-            );
+            eprintln!("{}", spawn_join_notice(project, &detail.join(", ")));
             let pin = std::env::var("AGENT_NAME")
                 .ok()
                 .or_else(|| std::env::var("TORON_AGENT").ok())
@@ -8660,64 +8895,14 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
     // bd-kbl1c join-before-post: auto-join every --join-channel for every
     // spawned identity BEFORE first doorbell — membership is the only gate,
     // and a non-member post is a refused write (the 2026-08-22 silent-drop
-    // incident class). --if-missing keeps re-spawns idempotent (no duplicate
-    // bus event). Best-effort: a failed join never fails the spawn (the
-    // gate's remedy error still names the exact join command).
-    // bd-ka0w: ensure the room exists FIRST, idempotently, as the operator
-    // (captain owns creation; a crew pin must never become creator via a
-    // join race). Create-on-existing is a no-op preserving the creator.
+    // incident class). bd-compose-plumbing-zdzi: the ensure+join loop lives
+    // in `ensure_and_join_channels`, shared with `workflow compose --run`.
     if !opts.join_channels.is_empty() {
-        let captain = operator_pin();
-        for ch in &opts.join_channels {
-            let ensured = Command::new("toron")
-                .args([
-                    "channel",
-                    "create",
-                    "--name",
-                    ch,
-                    "--project",
-                    project,
-                    "--as",
-                    &captain,
-                    ch,
-                ])
-                .output();
-            match ensured {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => eprintln!(
-                    "flywheel: warn: channel ensure {ch} failed for {captain}: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => eprintln!("flywheel: warn: channel ensure {ch} failed: {e}"),
-            }
-        }
-        for e in &registry {
-            let Some(pin) = &e.mail_identity else {
-                continue;
-            };
-            for ch in &opts.join_channels {
-                let status = Command::new("toron")
-                    .args([
-                        "channel",
-                        "join",
-                        ch,
-                        "--project",
-                        project,
-                        "--as",
-                        pin,
-                        "--if-missing",
-                    ])
-                    .output();
-                match status {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => eprintln!(
-                        "flywheel: warn: channel join {ch} failed for {pin}: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ),
-                    Err(e) => eprintln!("flywheel: warn: channel join {ch} failed for {pin}: {e}"),
-                }
-            }
-        }
+        let pins: Vec<String> = registry
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
+        ensure_and_join_channels(project, &opts.join_channels, &pins);
     }
 
     // ADR-0005 D1: detached doorbell dispatcher. Spawn fails if it cannot
@@ -11471,7 +11656,13 @@ pub(crate) fn pinned_mail_identity(
     let key = project_dir(cfg, project).to_str().map(str::to_string)?;
     let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
-        Err(_) => return None, // mail not configured — silent skip
+        Err(e) => {
+            // bd-tg4n: NOT silent. This used to discard the error and hand
+            // back a bare None, which surfaced one layer up as an opaque
+            // "first spawn pins an identity" expect with nothing in it.
+            eprintln!("flywheel: mail backend unavailable for {name} ({kind}): {e}");
+            return None;
+        }
     };
     // bd-627z.2: configured-remote (a [mail.toron] url is set) but the
     // daemon is unreachable → loud warning, not the old silent eprintln.
@@ -11532,6 +11723,14 @@ pub(crate) fn pinned_mail_identity(
                 .iter()
                 .filter_map(|e| e.mail_identity.clone())
                 .collect();
+            // bd-spawn-identity-divergence-2vzw: the captain pin is never a
+            // valid identity for a spawned pane — reserve it out of the pool
+            // even when the alias is not visible in the agents table.
+            let (captain_pin, _) = lookup_captain_holder(project);
+            if let Some(captain) = captain_pin {
+                taken.insert(captain);
+            }
+            taken.insert("captain".to_string());
             match backend::run_mail(mail.list_agents(&key, None)) {
                 Ok(agents) => {
                     taken.extend(agents.into_iter().map(|a| a.name));
@@ -11708,6 +11907,152 @@ fn agent_mail_name(herdr_name: &str) -> String {
     // Module-scope: the S9 pin draw (unique_adjnoun_pin) shares the whitelist.
     let h = state::fnv1a64(herdr_name);
     adjnoun_from_fnv(h)
+}
+
+/// bd-recover-accepts-camelcase-pins-z5fz: the herdr agent-name rule, quoted
+/// from herdr's own refusal — 1..=32 chars of lowercase ASCII letters, digits,
+/// `-` or `_`.
+pub(crate) fn is_herdr_legal_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// bd-recover-accepts-camelcase-pins-z5fz: map a spawn-registry `name` to the
+/// herdr-legal agent name to restore/launch under.
+///
+/// A registry row's `name` may hold a CamelCase adjective+noun PIN — an
+/// adopted/captain pane registered by pin rather than by kind short — and
+/// passing that verbatim to `agent.start`/`agent.rename` is refused with
+/// `invalid_agent_name`, so the recovery door was unusable exactly when a
+/// swarm needed it. A name already legal passes through untouched, so a
+/// healthy pane draws no rename churn. Recovery, rebind, and the send-path
+/// auto-heal all route through this one mapping.
+///
+/// Ceiling: two pins that lowercase to the same string collide on ONE herdr
+/// name (`QuietHeron`/`quietheron`). A herdr name is a display index, not
+/// identity — the pin (`mail_identity`) is identity — so a collision is a
+/// naming nuisance, never a misroute.
+pub(crate) fn herdr_agent_name(name: &str) -> String {
+    if is_herdr_legal_name(name) {
+        return name.to_string();
+    }
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(32);
+    out
+}
+
+/// The state of one registry row against the live pane listing — the ONE rule
+/// `flywheel recover` and `flywheel rebind` act on.
+///
+/// `Intact` compares the row's name to the pane's herdr name through the SAME
+/// mapping the restore uses, so a CamelCase pin whose pane already carries the
+/// legal form reads `Intact` (no rename churn, no `invalid_agent_name`).
+/// Comparing the raw pin would read `Lost` forever and re-rename each pass —
+/// the bd-recover-accepts-camelcase-pins-z5fz bug. `None` means herdr does not
+/// list the pane at all; `Some(None)` means the pane exists with no name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingState {
+    /// pane present, name already the legal form of the row's name
+    Intact,
+    /// pane present, name is something else (restore it)
+    Lost { was: String },
+    /// pane absent from herdr's listing
+    Gone,
+}
+
+pub(crate) fn binding_state(registry_name: &str, live: Option<Option<&str>>) -> BindingState {
+    match live {
+        None => BindingState::Gone,
+        Some(Some(actual)) if actual == herdr_agent_name(registry_name) => BindingState::Intact,
+        Some(other) => BindingState::Lost {
+            was: other.unwrap_or("<null>").to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod herdr_agent_name_tests {
+    use super::{BindingState, binding_state, herdr_agent_name, is_herdr_legal_name};
+
+    /// bd-recover-accepts-camelcase-pins-z5fz: a CamelCase pin is accepted by
+    /// recover (mapped to a legal herdr name); an already-legal herdr name is
+    /// passed through byte-for-byte so a healthy pane is never renamed.
+    #[test]
+    fn recover_accepts_camelcase_pins() {
+        // The observed swarm pins: registered as `name`, illegal for herdr.
+        assert!(!is_herdr_legal_name("QuietHeron"));
+        assert_eq!(herdr_agent_name("QuietHeron"), "quietheron");
+        assert_eq!(herdr_agent_name("Buffy"), "buffy");
+        assert_eq!(herdr_agent_name("CobaltMaple"), "cobaltmaple");
+        // Already-legal names are identity (no rename churn, no case damage).
+        for legal in [
+            "flywheel-beads-oc2",
+            "crew-plan-coder",
+            "flywheel_oc3",
+            "a1",
+        ] {
+            assert!(is_herdr_legal_name(legal), "{legal} is herdr-legal");
+            assert_eq!(herdr_agent_name(legal), legal);
+        }
+        // Every output satisfies the rule herdr enforces (the only thing that
+        // makes the restore succeed): non-empty, starts lowercase, legal bytes,
+        // <=32 chars.
+        for pin in [
+            "QuietHeron",
+            "LavenderSalmon",
+            "BrightBadger",
+            "w22:p1",
+            "A Very Long CamelCase Pin Name That Exceeds Thirty Two",
+        ] {
+            let h = herdr_agent_name(pin);
+            assert!(is_herdr_legal_name(&h), "{pin} -> {h:?} must be legal");
+            assert!(h.len() <= 32, "{pin} -> {h:?} is over 32 chars");
+            assert!(
+                h.chars().next().is_some_and(|c| c.is_ascii_lowercase()),
+                "{pin} -> {h:?} must start lowercase (herdr's rule)"
+            );
+        }
+        // A non-alnum byte never survives to reach herdr.
+        assert_eq!(herdr_agent_name("w22:p1"), "w22-p1");
+
+        // The recover/rebind DECISION: a CamelCase pin whose pane already
+        // carries the legal form is INTACT — never mistaken for a lost binding
+        // (which would re-rename every pass and trip herdr's refusal).
+        assert_eq!(
+            binding_state("QuietHeron", Some(Some("quietheron"))),
+            BindingState::Intact
+        );
+        assert_eq!(
+            binding_state("flywheel-beads-oc2", Some(Some("flywheel-beads-oc2"))),
+            BindingState::Intact
+        );
+        // A pane holding a different name is lost, and names the old one.
+        assert_eq!(
+            binding_state("QuietHeron", Some(Some("flywheel-x-oc"))),
+            BindingState::Lost {
+                was: "flywheel-x-oc".to_string()
+            }
+        );
+        // A nameless pane is lost (restore), an unlisted pane is gone.
+        assert_eq!(
+            binding_state("Buffy", Some(None)),
+            BindingState::Lost {
+                was: "<null>".to_string()
+            }
+        );
+        assert_eq!(binding_state("Buffy", None), BindingState::Gone);
+    }
 }
 
 /// The legacy whitelist pair for a hash: ADJECTIVES[h % 75] +
@@ -13673,6 +14018,15 @@ fn cmd_briefing(
         held_paths: snap.held_paths.clone(),
         coalition_id: snap.coalitions.first().cloned(),
         launch_pending: snap.launch_pending,
+        // bd-compose-plumbing-zdzi: the arriving pin — the ONE identity
+        // ladder (env over config name), so the emitted wave-swarm argv can
+        // bind `captain_pin` to the agent actually briefing.
+        agent_pin: select_reservation_identity(None, &|k| std::env::var(k).ok()).or_else(|| {
+            cfg.agent_mail
+                .as_ref()
+                .and_then(|m| m.name.clone())
+                .filter(|s| !s.trim().is_empty())
+        }),
     };
     if world.joinable {
         eprintln!("{}", briefing::join_banner(&world));
@@ -13966,6 +14320,78 @@ fn arrive_maybe_bind_pane(cfg: &Config, project: &str, pin: &str) {
     }
 }
 
+/// bd-spawn-identity-divergence-2vzw: what arrive may do with `--as`, judged
+/// against the identity the pane was SPAWNED with.
+///
+/// Sources, strongest first: the spawn-registry row for this pane id (written
+/// by spawn before the pane existed) and `FLYWHEEL_MAIL_AS` (injected into the
+/// pane env at create; herdr injects env only at split/create). A
+/// user-exported `AGENT_NAME` is deliberately NOT read here — it is the mail
+/// ladder's operator fallback, not spawn evidence. A spawned pane may only
+/// arrive as its injected pin, and the captain pin is never a valid arrival
+/// target for one: the measured 2026-10-03 incident had a planner pane arrive
+/// as the CAPTAIN pin (derivable from the brief text) until mail corrected it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArriveIdentityVerdict {
+    /// Not a spawned pane (no registry row): explicit --as is an operator
+    /// choice and is honored.
+    Unbound,
+    /// The request matches the injected identity (or nothing contradicts it).
+    Match,
+    /// The request contradicts the spawn evidence — refuse.
+    Refused {
+        injected: Option<String>,
+        reason: &'static str,
+    },
+}
+
+pub(crate) fn arrive_identity_verdict(
+    requested: &str,
+    registry_pin: Option<&str>,
+    env_pin: Option<&str>,
+    captain_pin: Option<&str>,
+) -> ArriveIdentityVerdict {
+    fn clean(p: Option<&str>) -> Option<&str> {
+        p.filter(|s: &&str| !s.trim().is_empty())
+    }
+    let registry_pin = clean(registry_pin);
+    let env_pin = clean(env_pin);
+    let injected = registry_pin.or(env_pin);
+    if registry_pin.is_some() && captain_pin == Some(requested) {
+        return ArriveIdentityVerdict::Refused {
+            injected: injected.map(str::to_string),
+            reason: "the captain pin is not a valid arrival target for a spawned pane",
+        };
+    }
+    match injected {
+        Some(pin) if pin != requested => ArriveIdentityVerdict::Refused {
+            injected: Some(pin.to_string()),
+            reason: "pin contradicts the identity injected at spawn",
+        },
+        Some(_) => ArriveIdentityVerdict::Match,
+        None if registry_pin.is_some() => ArriveIdentityVerdict::Match,
+        None => ArriveIdentityVerdict::Unbound,
+    }
+}
+
+/// bd-spawn-identity-divergence-2vzw: the pane's recorded identity (spawn
+/// registry) vs the identity it actually acted as (the pane identity bridge /
+/// pane token resolve). Both sides known and different = divergent; a missing
+/// side is not evidence. Returns an `expected != observed` message.
+pub(crate) fn identity_divergence(
+    expected: Option<&str>,
+    observed: Option<&str>,
+) -> Option<String> {
+    let (expected, observed) = (
+        expected.filter(|s| !s.trim().is_empty()),
+        observed.filter(|s| !s.trim().is_empty()),
+    );
+    match (expected, observed) {
+        (Some(e), Some(o)) if e != o => Some(format!("{e} != {o}")),
+        _ => None,
+    }
+}
+
 fn cmd_arrive(
     cfg: &Config,
     project: &str,
@@ -13975,6 +14401,60 @@ fn cmd_arrive(
     captain_override: Option<&str>,
 ) -> Result<()> {
     check_project_spelling(project, "arrive")?;
+    // bd-spawn-identity-divergence-2vzw: refuse an arrival that contradicts
+    // the identity injected at spawn — BEFORE any mail-registration or
+    // heartbeat effect, so a wrong pin cannot fork the pane's identity or
+    // overwrite the pane binding. The captain pin is never a valid target for
+    // a spawned pane.
+    if let Some(requested) = as_agent {
+        let dir = project_dir(cfg, project);
+        let registry = state::load_spawn_registry(dir.to_str().unwrap_or(project));
+        let pane_id = std::env::var("HERDR_PANE_ID")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        let registry_pin = pane_id.as_ref().and_then(|pane| {
+            registry
+                .iter()
+                .find(|e| &e.pane_id == pane)
+                .and_then(|e| e.mail_identity.clone())
+        });
+        let env_pin = std::env::var("FLYWHEEL_MAIL_AS").ok();
+        let (captain_pin, _) = lookup_captain_holder(project);
+        if let ArriveIdentityVerdict::Refused { injected, reason } = arrive_identity_verdict(
+            requested,
+            registry_pin.as_deref(),
+            env_pin.as_deref(),
+            captain_pin.as_deref(),
+        ) {
+            bail!(
+                "flywheel: arrive --as {requested} refused: {reason}{}. Re-run with `arrive --as {}` (or unset the stray pin).",
+                injected
+                    .as_deref()
+                    .map(|p| format!(" (injected: {p})"))
+                    .unwrap_or_default(),
+                injected.as_deref().unwrap_or(requested),
+            );
+        }
+        // Divergence report (never a refusal — a correct re-arrive heals the
+        // binding): the pane identity bridge says the pane last acted under
+        // another pin than its spawn row names.
+        if let Some(pane) = pane_id.as_deref()
+            && let Ok(key) = project_dir_str(cfg, project)
+            && let Ok(mail) = mail_or_die(cfg)
+        {
+            let bridge = mail
+                .resolve_pane_identity(&key, pane)
+                .get("agent_name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(msg) = identity_divergence(registry_pin.as_deref(), bridge.as_deref()) {
+                eprintln!(
+                    "RECORD DIVERGENCE: identity_divergent pane={pane} registry={msg} — the pane previously acted under another identity; this arrival re-binds it."
+                );
+            }
+        }
+    }
     let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
     let world = briefing::World {
@@ -14346,6 +14826,45 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     if agents.is_empty() {
         bail!("no agents in {project} — is the swarm spawned?");
     }
+    // bd-spawn-identity-divergence-2vzw: registry pin vs the identity the
+    // pane actually acted as (pane token / identity bridge). Both sides known
+    // and different = identity_divergent; a missing side is not evidence
+    // (mail down degrades to silence, never a fabricated divergence).
+    let key = crate::project_dir_str(cfg, project)?;
+    let registry = state::load_spawn_registry(&project_dir(cfg, project).to_string_lossy());
+    // bd-swarm-cockpit-pczs: one facade for the identity bridge AND the
+    // per-pin whois below (npub + last activity), and one snapshot call
+    // whose pins already carry the live bead/reservation binding.
+    let mail = crate::mail_or_die(cfg).ok();
+    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
+    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    let actual_by_pane: std::collections::HashMap<String, String> = {
+        agents
+            .iter()
+            .filter_map(|a| {
+                let mail = mail.as_ref()?;
+                mail.resolve_pane_identity(&key, &a.pane_id)
+                    .get("agent_name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| (a.pane_id.clone(), s.to_string()))
+            })
+            .collect()
+    };
+    let identity_divergent: Vec<String> = agents
+        .iter()
+        .filter_map(|a| {
+            let expected = registry
+                .iter()
+                .find(|e| e.pane_id == a.pane_id)
+                .and_then(|e| e.mail_identity.as_deref());
+            let observed = actual_by_pane.get(&a.pane_id).map(String::as_str);
+            identity_divergence(expected, observed).map(|m| format!("pane {}: {m}", a.pane_id))
+        })
+        .collect();
+    for line in &identity_divergent {
+        eprintln!("flywheel: identity_divergent {line}");
+    }
     let rows: Vec<Value> = agents
         .iter()
         .map(|a| {
@@ -14357,6 +14876,30 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             let herdr_status = a.agent_status.as_str();
             let verdict = crate::workspace::verdict_for(None, herdr_status, herdr_status != "dead")
                 .status_token();
+            let expected_pin = registry
+                .iter()
+                .find(|e| e.pane_id == a.pane_id)
+                .and_then(|e| e.mail_identity.clone());
+            let observed_pin = actual_by_pane.get(&a.pane_id).cloned();
+            let divergent =
+                identity_divergence(expected_pin.as_deref(), observed_pin.as_deref()).is_some();
+            // bd-swarm-cockpit-pczs: cockpit fields — who the pin is on the
+            // mail plane (npub + last activity, soft-fail null when the
+            // roster cannot answer) and which bead/reservations the LIVE
+            // board binds it to (snapshot projection; no row = empty, never
+            // a default).
+            let herdr_name = a.name.clone().unwrap_or_else(|| a.pane_id.clone());
+            let who = expected_pin
+                .as_deref()
+                .and_then(|pin| mail.as_ref()?.whois(&key, pin).ok());
+            let npub = who
+                .as_ref()
+                .and_then(|w| w.get("npub").and_then(Value::as_str))
+                .map(str::to_string);
+            let last_active_ts_us = who
+                .as_ref()
+                .and_then(|w| w.get("last_active_ts_us").and_then(Value::as_u64));
+            let snap_pin = snap.pins.iter().find(|p| p.pin == herdr_name);
             json!({
                 "name": a.name, "kind": a.agent,
                 // bd-4pxy: a launch_pending agent is NOT idle — still booting.
@@ -14364,6 +14907,13 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 "verdict": verdict,
                 "pane_id": a.pane_id, "cwd": a.cwd, "workspace_id": ws_id,
                 "launch_pending": pending,
+                "identity_pin": expected_pin,
+                "observed_pin": observed_pin,
+                "identity_divergent": divergent,
+                "npub": npub,
+                "last_active_ts_us": last_active_ts_us,
+                "bead": snap_pin.and_then(|p| p.bead.clone()),
+                "reservations": snap_pin.map(|p| p.reservations.clone()).unwrap_or_default(),
             })
         })
         .collect();
@@ -14384,13 +14934,12 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
             (k.to_string(), st)
         })
         .collect();
-    let ws_label = state::load_spawn_meta(project).unwrap_or_else(|| swarm_label(project));
     let dispatcher = doorbell::dispatcher_status_line(&config::state_dir(), &ws_label);
     // ADR-0010 D10 (bd-67qg): OPEN DECISIONS from the one snapshot call —
     // the journal fold lives in snapshot::assemble (same replay rule as
-    // cmd_doorbell_why), not inline here. Renders on every status until
-    // an answer/--verdict clears the call.
-    let snap = snapshot::assemble(cfg, project, &ws_label, doorbell_now_unix());
+    // cmd_doorbell_why), not inline here (the call itself is hoisted above,
+    // bd-swarm-cockpit-pczs). Renders on every status until an answer/
+    // --verdict clears the call.
     let open_decision_rows: Vec<Value> = snap
         .decisions
         .iter()
@@ -14494,7 +15043,201 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
                 "last": last_fact,
             },
             "open_decisions": open_decision_rows,
+            "identity_divergent": identity_divergent,
         }));
+    }
+    Ok(())
+}
+
+// ---- bd-swarm-cockpit-pczs: wave progress ----
+
+/// Per-wave progress counts. `unknown` exists so a row whose `status` field
+/// is missing/unrecognized reads unknown — never a default `done` (the same
+/// honesty rule as `history_row_status`).
+#[derive(Debug, Default)]
+struct WaveCounts {
+    closed: u64,
+    in_progress: u64,
+    ready: u64,
+    blocked: u64,
+    unknown: u64,
+    total: u64,
+}
+
+impl WaveCounts {
+    fn add(&mut self, status: &str, ready: bool) {
+        match status {
+            "closed" => self.closed += 1,
+            "in_progress" => self.in_progress += 1,
+            // An open bead is `ready` only when `br ready` listed it — a
+            // blocked open bead is not dispatchable and says so.
+            "open" if ready => self.ready += 1,
+            "open" => self.blocked += 1,
+            _ => self.unknown += 1,
+        }
+        self.total += 1;
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "closed": self.closed,
+            "in_progress": self.in_progress,
+            "ready": self.ready,
+            "blocked": self.blocked,
+            "unknown": self.unknown,
+            "total": self.total,
+        })
+    }
+}
+
+/// Fold `br list --status all` rows + the `br ready` id set into per-wave
+/// counts. A bead's wave is its TYPED `wave` field, with the legacy `wave-N`
+/// label as fallback (bd-wave-gate-typed-authority-27et); neither present
+/// lands in the `unlabeled` bucket — a wave is never invented. The
+/// dispatching wave is the LOWEST wave holding a ready or in-progress bead,
+/// the same floor `wave_gate_held` applies (ADR-0006 D2). Pure.
+fn progress_waves(rows: &[Value], ready_ids: &HashSet<String>) -> Value {
+    let mut waves: BTreeMap<u64, WaveCounts> = BTreeMap::new();
+    let mut unlabeled = WaveCounts::default();
+    for row in rows {
+        let status = row.get("status").and_then(Value::as_str).unwrap_or("");
+        let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+        let wave = row.get("wave").and_then(Value::as_u64).or_else(|| {
+            row.get("labels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u64>().ok()))
+        });
+        let counts = match wave {
+            Some(w) => waves.entry(w).or_default(),
+            None => &mut unlabeled,
+        };
+        counts.add(status, ready_ids.contains(id));
+    }
+    let dispatching = waves
+        .iter()
+        .find(|(_, c)| c.in_progress > 0 || c.ready > 0)
+        .map(|(w, _)| *w);
+    json!({
+        "dispatching_wave": dispatching,
+        "waves": waves
+            .iter()
+            .map(|(w, c)| {
+                let mut v = c.to_json();
+                v["wave"] = json!(w);
+                v
+            })
+            .collect::<Vec<_>>(),
+        "unlabeled": unlabeled.to_json(),
+    })
+}
+
+/// `br list --json` / `br ready --json` issue rows, envelope-tolerant (bare
+/// array or `{"issues":[...]}`, the schema-18 pagination envelope). An
+/// unrecognized object shape is loud — a progress board must never read
+/// empty because a shape changed.
+fn parse_issue_rows_json(raw: &str, what: &str) -> Result<Vec<Value>> {
+    let v: Value =
+        serde_json::from_str(raw.trim()).map_err(|e| anyhow!("{what} bad JSON: {e}: {raw}"))?;
+    match &v {
+        Value::Array(items) => Ok(items.clone()),
+        Value::Object(obj) => {
+            let issues = obj.get("issues").cloned().unwrap_or_default();
+            anyhow::ensure!(
+                issues.is_array(),
+                "{what}: unrecognized object shape (expected issues array): {raw}"
+            );
+            Ok(issues.as_array().cloned().unwrap_or_default())
+        }
+        _ => bail!("{what}: expected array or issues object: {raw}"),
+    }
+}
+
+/// bd-swarm-cockpit-pczs: `flywheel progress` — beads grouped by their
+/// `wave-N` label with the wave currently dispatching. The project comes from
+/// the positional / `--project`, or the workspace cwd (same inherit rule as
+/// `steer`), so `flywheel progress --json` works from inside a project.
+fn cmd_progress(cfg: &Config, project: Option<&str>, json_out: bool) -> Result<()> {
+    ensure_project_opt(project, "progress")?;
+    let project = crate::cron::detect_project(cfg, project).ok_or_else(|| {
+        anyhow!(
+            "progress: no project — pass <project>/--project <slug> or run from a \
+             workspace/<project> cwd"
+        )
+    })?;
+    check_project_spelling(&project, "progress")?;
+    let dir = project_dir(cfg, &project);
+    let run_br = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("br")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .map_err(|e| anyhow!("br not found: {e}"))?;
+        if !out.status.success() {
+            bail!(
+                "br {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let rows = parse_issue_rows_json(&run_br(&["list", "--status", "all", "--json"])?, "br list")?;
+    let ready_ids: HashSet<String> = parse_ready_beads_json(&run_br(&["ready", "--json"])?)?
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    let mut out = progress_waves(&rows, &ready_ids);
+    out["project"] = json!(project);
+    if json_out || !std::io::stdout().is_terminal() {
+        print_json(&out);
+        return Ok(());
+    }
+    let cell = |v: &Value| v.as_u64().unwrap_or(0);
+    println!(
+        "{:<8} {:>7} {:>12} {:>6} {:>8}",
+        "WAVE", "CLOSED", "IN-PROGRESS", "READY", "BLOCKED"
+    );
+    for w in out["waves"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "{:<8} {:>7} {:>12} {:>6} {:>8}",
+            format!("wave-{}", cell(&w["wave"])),
+            cell(&w["closed"]),
+            cell(&w["in_progress"]),
+            cell(&w["ready"]),
+            cell(&w["blocked"])
+        );
+    }
+    let u = &out["unlabeled"];
+    if cell(&u["total"]) > 0 {
+        println!(
+            "{:<8} {:>7} {:>12} {:>6} {:>8}",
+            "-",
+            cell(&u["closed"]),
+            cell(&u["in_progress"]),
+            cell(&u["ready"]),
+            cell(&u["blocked"])
+        );
+    }
+    match out["dispatching_wave"].as_u64() {
+        Some(w) => println!("dispatching: wave-{w}"),
+        None => println!("dispatching: none (no ready or in-progress wave beads)"),
+    }
+    let unknown = cell(&out["unlabeled"]["unknown"])
+        + out["waves"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|w| cell(&w["unknown"]))
+            .sum::<u64>();
+    if unknown > 0 {
+        println!(
+            "{} {unknown} row(s) carry no recognized status — not counted as done",
+            crate::output::warn("warn:")
+        );
     }
     Ok(())
 }
@@ -14605,6 +15348,9 @@ fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
     let mut stale = 0usize;
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
+        // bd-recover-accepts-camelcase-pins-z5fz: `flywheel rebind` shares the
+        // recover door's CamelCase-pin mapping (herdr rejects the pin shape).
+        let hname = herdr_agent_name(name);
         let Some(a) = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id)
@@ -14612,12 +15358,12 @@ fn cmd_rebind(cfg: &Config, project: &str) -> Result<()> {
             stale += 1; // pane gone (respawned) — a fresh pane carries its name
             continue;
         };
-        if a.name.as_deref() == Some(name) {
+        if binding_state(name, Some(a.name.as_deref())) == BindingState::Intact {
             ok_count += 1;
             continue;
         }
         let was = a.name.clone().unwrap_or_else(|| "<null>".to_string());
-        if let Err(e) = backend.agent_rename(pane_id, Some(name)) {
+        if let Err(e) = backend.agent_rename(pane_id, Some(&hname)) {
             eprintln!("flywheel: rebind {pane_id} → {name} failed: {e:#}");
         } else {
             rebound.push(json!({ "pane_id": pane_id, "was": was, "now": name }));
@@ -14772,14 +15518,18 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
     let mut healthy = 0usize;
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
+        // bd-recover-accepts-camelcase-pins-z5fz: herdr refuses a CamelCase
+        // pin as an agent name, so restore/launch under the legal form and
+        // compare against THAT (what herdr will actually hold).
+        let hname = herdr_agent_name(name);
         let kind = recover_probe_kind(entry, &kinds);
         let live = agents
             .iter()
             .find(|a| a.pane_id == *pane_id && a.workspace_id == ws_id);
-        let decision = match live {
-            Some(a) if a.name.as_deref() == Some(name) => {
+        let decision = match binding_state(name, live.map(|a| a.name.as_deref())) {
+            BindingState::Intact => {
                 // pane + binding intact — liveness-probe the process inside.
-                match probe_agent_liveness(&mut probe, pane_id, kind, name) {
+                match probe_agent_liveness(&mut probe, pane_id, kind, &hname) {
                     // provably dead: respawn in the same pane (its shell is
                     // back at the prompt). Some(false) is the bd-1np signal.
                     Some(false) => RecoverDecision::Respawn {
@@ -14816,13 +15566,11 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                     None => RecoverDecision::Healthy,
                 }
             }
-            Some(a) => {
+            BindingState::Lost { was } => {
                 // pane survived, binding lost → restore it (7rc path)
-                RecoverDecision::Rebind {
-                    was: a.name.clone().unwrap_or_else(|| "<null>".to_string()),
-                }
+                RecoverDecision::Rebind { was }
             }
-            None => RecoverDecision::Respawn {
+            BindingState::Gone => RecoverDecision::Respawn {
                 reason: "agent-gone",
             },
         };
@@ -14831,15 +15579,16 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                 healthy += 1; // pane + binding + live process
             }
             RecoverDecision::Rebind { was } => {
-                backend.agent_rename(pane_id, Some(name))?;
+                backend.agent_rename(pane_id, Some(&hname))?;
                 recovered.push(json!({
-                    "name": name, "pane_id": pane_id, "action": "rebound", "was": was
+                    "name": name, "pane_id": pane_id, "action": "rebound", "was": was,
+                    "herdr_name": hname
                 }));
             }
             RecoverDecision::Respawn { reason } => {
                 // agent died (or its process died — bd-1np) → respawn with
                 // spawn-time kind, reusing the surviving pane.
-                match start_agent_with_retry_dyn(&*backend, name, kind, pane_id, &[]) {
+                match start_agent_with_retry_dyn(&*backend, &hname, kind, pane_id, &[]) {
                     Ok(a) => recovered.push(json!({
                         "name": name, "pane_id": a.pane_id, "action": "respawned",
                         "kind": kind, "reason": reason
@@ -14911,10 +15660,14 @@ fn rebind_from_registry(
     else {
         return Ok(false); // pane gone (respawned) — normal resolution finds the new pane
     };
-    if a.name.as_deref() == Some(name) {
+    // bd-recover-accepts-camelcase-pins-z5fz: a CamelCase registry name is a
+    // legal identity but an illegal herdr name — map it, or the auto-heal
+    // itself trips `invalid_agent_name`.
+    let target = herdr_agent_name(&entry.name);
+    if a.name.as_deref() == Some(target.as_str()) {
         return Ok(true);
     }
-    backend.agent_rename(pane_id, Some(name))?;
+    backend.agent_rename(pane_id, Some(&target))?;
     Ok(true)
 }
 
@@ -15045,7 +15798,10 @@ fn cmd_send(
         .find(|p| p.starts_with("bead="))
         .map(|kv| kv.trim_start_matches("bead=").to_string())
         .filter(|b| !b.is_empty());
-    let text = format!("{}\n\n{text}", dispatch_header(&task_id, bead.as_deref()));
+    let text = format!(
+        "{}\n\n{text}",
+        dispatch_header(&task_id, bead.as_deref(), stage)
+    );
 
     // safety guard: refuse destructive prompts unless --force
     if !force {
@@ -15081,7 +15837,8 @@ fn cmd_send(
                 .filter(|a| a.workspace_id == ws_id && a.name.is_none())
             {
                 if let Some(e) = entries.iter().find(|e| e.pane_id == a.pane_id)
-                    && c.agent_rename(&a.pane_id, &e.name).is_ok()
+                    && c.agent_rename(&a.pane_id, &herdr_agent_name(&e.name))
+                        .is_ok()
                 {
                     rebound = true;
                 }
@@ -15210,6 +15967,16 @@ fn cmd_send(
             );
         }
         let mut stalls_seen = 0usize;
+        // Baseline for read-before-retry: stall is not proof of non-delivery.
+        // Compare state_change_seq + agent.read against this after a stall.
+        let baseline_seq = a.state_change_seq;
+        let baseline_completion = a.completion_seq.unwrap_or(0);
+        // One delivery key for the whole send (fire-and-forget id, or none):
+        // stall resend keeps the same key so the journal shows one effect
+        // with two attempts, never a second mint.
+        let delivery_key = delivery_id_of(&fire_and_forget)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("send:{name}:{baseline_seq}"));
         // bd-4pxy: a still-booting agent rejects name-addressed prompts with
         // `agent_not_ready`; herdr accepts pane ids, so retry once via the
         // pane before giving up (bounded — never an infinite loop).
@@ -15275,7 +16042,7 @@ fn cmd_send(
                         .cloned();
                     match entry {
                         Some(en) => {
-                            let _ = c.agent_rename(&en.pane_id, &name);
+                            let _ = c.agent_rename(&en.pane_id, &herdr_agent_name(&name));
                             std::thread::sleep(Duration::from_millis(400));
                             pane_retried = true;
                             eprintln!(
@@ -15327,11 +16094,41 @@ fn cmd_send(
                             return Err(e.into());
                         }
                         Some(StallStep::Retry) => {
-                            eprintln!(
-                                "flywheel: {target} agent_prompt_stalled — retrying once in {STALL_RETRY_DELAY_SECS}s"
+                            // toron wait.rs / herdr: read before retry, never
+                            // blind resubmit. Same delivery_key across attempts.
+                            let probe = probe_prompt_after_stall(
+                                &mut c,
+                                &target,
+                                &send_text,
+                                baseline_seq,
+                                baseline_completion,
                             );
-                            std::thread::sleep(Duration::from_secs(STALL_RETRY_DELAY_SECS));
                             stalls_seen += 1;
+                            if stall_may_resend(probe) {
+                                eprintln!(
+                                    "flywheel: {target} agent_prompt_stalled — prompt proven absent (delivery_key={delivery_key}); one resend"
+                                );
+                                // brief settle only; do NOT sleep-and-blind-resend
+                                std::thread::sleep(Duration::from_millis(200));
+                            } else {
+                                eprintln!(
+                                    "flywheel: {target} agent_prompt_stalled — refusing blind resubmit (probe={probe:?}, delivery_key={delivery_key}; read-before-retry)"
+                                );
+                                if wait {
+                                    return wait_failure_exit(
+                                        &mut c,
+                                        &target,
+                                        &name,
+                                        a,
+                                        cond_profile.as_deref(),
+                                        project,
+                                        &mut results,
+                                        &e,
+                                        &emit_rows,
+                                    );
+                                }
+                                return Err(stall_giveup_error(&target, project));
+                            }
                         }
                         Some(StallStep::Respawn) => {
                             let kinds = spawn_kinds_from_log(project);
@@ -15508,6 +16305,10 @@ fn cmd_send(
 // ---- send --wait stall recovery (bd-rdy) ----
 
 /// Delay before the single automatic retry after `agent_prompt_stalled`.
+/// Legacy name kept only as documentation of the old blind-sleep budget.
+/// Stall recovery no longer sleeps this long before a blind resend; it reads
+/// first (see [`probe_prompt_after_stall`]).
+#[allow(dead_code)]
 const STALL_RETRY_DELAY_SECS: u64 = 10;
 
 /// One step of the send --wait stall-recovery ladder.
@@ -15906,6 +16707,68 @@ fn stall_step(
     }
 }
 
+/// Outcome of the post-stall pane read (toron wait.rs: read → decide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallProbe {
+    /// Text absent from pane read AND no state_change_seq advance — may resend.
+    ProvenAbsent,
+    /// Prompt text visible and/or seq advanced — do NOT resubmit.
+    PresentOrActive,
+    /// Could not read the pane / seq — fail closed (no blind resend).
+    Unreadable,
+}
+
+/// Pure classifier for stall read-before-retry.
+/// `read`: None = read failed; Some(true) = needle visible; Some(false) = absent.
+/// `seq_advanced`: None = could not observe seq; Some(bool) = compared to baseline.
+fn classify_stall_probe(read: Option<bool>, seq_advanced: Option<bool>) -> StallProbe {
+    match (read, seq_advanced) {
+        (Some(true), _) | (_, Some(true)) => StallProbe::PresentOrActive,
+        (Some(false), Some(false)) | (Some(false), None) => StallProbe::ProvenAbsent,
+        (None, Some(false)) | (None, None) => StallProbe::Unreadable,
+    }
+}
+
+/// Resend only when the prompt is proven absent.
+fn stall_may_resend(probe: StallProbe) -> bool {
+    matches!(probe, StallProbe::ProvenAbsent)
+}
+
+/// Distinctive needle for presence checks (UTF-8 safe, bounded).
+fn prompt_presence_needle(text: &str) -> String {
+    text.chars().take(48).collect()
+}
+
+/// I/O boundary: read pane + seq, then classify. Never blind-resubmits.
+fn probe_prompt_after_stall(
+    c: &mut Client,
+    target: &str,
+    send_text: &str,
+    baseline_seq: u64,
+    baseline_completion: u64,
+) -> StallProbe {
+    let needle = prompt_presence_needle(send_text);
+    let read = match c.agent_read(target, "screen", Some(120)) {
+        Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
+        Err(_) => {
+            // Fallback: raw pane output via agent.read "output" if screen fails.
+            match c.agent_read(target, "output", Some(80)) {
+                Ok(content) => Some(!needle.is_empty() && content.contains(&needle)),
+                Err(_) => None,
+            }
+        }
+    };
+    let seq_advanced = c.agent_list().ok().and_then(|list| {
+        list.into_iter()
+            .find(|ag| ag.pane_id == target || ag.name.as_deref() == Some(target))
+            .map(|ag| {
+                ag.state_change_seq > baseline_seq
+                    || ag.completion_seq.unwrap_or(0) > baseline_completion
+            })
+    });
+    classify_stall_probe(read, seq_advanced)
+}
+
 /// bd-rdy: the give-up error for a twice-stalled send — names the recovery
 /// commands instead of silently dropping the prompt.
 fn stall_giveup_error(target: &str, project: &str) -> anyhow::Error {
@@ -15980,8 +16843,8 @@ fn try_send_text_delivery(
     eprintln!(
         "flywheel: {name} ({pane_id}) is a recipe-harness pane (kind {kind}) — delivering via pane.send_text"
     );
-    prime_line_via_send_text(c, pane_id, text);
-    true
+    // No invent-green: return the real confirmed-delivery result of prime.
+    prime_line_via_send_text(c, pane_id, text)
 }
 
 /// bd-4pxy: a launch_pending agent is NOT idle — it is still booting
@@ -16042,6 +16905,7 @@ mod bd_4pxy_tests {
             pane_id: format!("{ws}:p1"),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term".into(),
@@ -16114,6 +16978,41 @@ mod bd_4pxy_tests {
         assert!(out.is_ok());
         assert_eq!(calls, 3);
         assert_eq!(sleeps, 2);
+    }
+
+    /// herdr plane harden: prime prefers agent.prompt, settles before Enter,
+    /// retries Enter only, and try_send_text_delivery returns the real bool.
+    #[test]
+    fn prime_and_try_send_delivery_honesty_tripwire() {
+        let src = include_str!("main.rs");
+        let prime = crate::tripwire::find_fn(src, "prime_line_via_send_text");
+        let prime_body = &src[prime..prime + 2800];
+        assert!(
+            prime_body.contains("agent_prompt(pane_id, line, None)")
+                && prime_body.contains("PRIME_ENTER_SETTLE")
+                && prime_body.contains("retrying Enter only")
+                && prime_body.contains("-> bool"),
+            "prime_line_via_send_text must prefer agent.prompt, settle, Enter-only retry, return bool"
+        );
+        let try_fn = crate::tripwire::find_fn(src, "try_send_text_delivery");
+        let try_end = crate::tripwire::find_fn(src, "status_label");
+        let try_body = &src[try_fn..try_end];
+        assert!(
+            try_body.contains("prime_line_via_send_text(c, pane_id, text)"),
+            "try_send_text_delivery must call prime"
+        );
+        // Negative control: invent-green was `prime(...);\n    true`.
+        assert!(
+            !try_body.contains("prime_line_via_send_text(c, pane_id, text);\n    true"),
+            "try_send must not discard prime result then return true"
+        );
+        assert!(
+            try_body.contains("No invent-green")
+                && try_body
+                    .lines()
+                    .any(|l| l.trim() == "prime_line_via_send_text(c, pane_id, text)"),
+            "try_send return must be the prime bool"
+        );
     }
 
     #[test]
@@ -16596,6 +17495,89 @@ mod send_stall_recovery_tests {
         assert!(msg.contains("flywheel recover demo"), "{msg}");
         assert!(msg.contains("flywheel kill demo --force"), "{msg}");
         assert!(msg.contains("--respawn-on-stall"), "{msg}");
+    }
+
+    /// Read-before-retry: resend only when proven absent.
+    #[test]
+    fn stall_resend_only_when_proven_absent() {
+        assert!(stall_may_resend(StallProbe::ProvenAbsent));
+        assert!(!stall_may_resend(StallProbe::PresentOrActive));
+        assert!(!stall_may_resend(StallProbe::Unreadable));
+    }
+
+    #[test]
+    fn classify_stall_probe_table() {
+        assert_eq!(
+            classify_stall_probe(Some(true), Some(false)),
+            StallProbe::PresentOrActive
+        );
+        assert_eq!(
+            classify_stall_probe(Some(false), Some(true)),
+            StallProbe::PresentOrActive
+        );
+        assert_eq!(
+            classify_stall_probe(Some(false), Some(false)),
+            StallProbe::ProvenAbsent
+        );
+        assert_eq!(
+            classify_stall_probe(None, None),
+            StallProbe::Unreadable
+        );
+        assert_eq!(
+            classify_stall_probe(None, Some(false)),
+            StallProbe::Unreadable
+        );
+        assert_eq!(
+            classify_stall_probe(Some(false), None),
+            StallProbe::ProvenAbsent
+        );
+    }
+
+    /// Negative control: if classify always returned ProvenAbsent, the
+    /// PresentOrActive cases above would also pass — prove they do not.
+    #[test]
+    fn classify_stall_probe_negative_control_present_blocks_resend() {
+        let probe = classify_stall_probe(Some(true), Some(false));
+        assert_ne!(probe, StallProbe::ProvenAbsent);
+        assert!(!stall_may_resend(probe));
+    }
+
+    #[test]
+    fn prompt_presence_needle_utf8_safe_and_bounded() {
+        let n = prompt_presence_needle("abcdefghij");
+        assert_eq!(n, "abcdefghij");
+        let long = "x".repeat(100);
+        assert_eq!(prompt_presence_needle(&long).chars().count(), 48);
+        // multibyte: take chars, not bytes
+        let multi = "日本語テスト文字列ですよ追加";
+        let needle = prompt_presence_needle(multi);
+        assert!(needle.chars().count() <= 48);
+        assert!(multi.starts_with(&needle) || needle.len() <= multi.len());
+    }
+
+    /// Tripwire: first-stall path must read-before-retry, not blind sleep.
+    #[test]
+    fn send_stall_retry_reads_before_resend_tripwire() {
+        let src = include_str!("main.rs");
+        let send = crate::tripwire::find_fn(src, "cmd_send");
+        let send_end = crate::tripwire::find_fn(src, "stall_step");
+        let send_body = &src[send..send_end];
+        assert!(
+            send_body.contains("probe_prompt_after_stall")
+                && send_body.contains("stall_may_resend")
+                && send_body.contains("delivery_key"),
+            "cmd_send stall Retry must probe before resend and keep delivery_key"
+        );
+        assert!(
+            !send_body.contains("retrying once in {STALL_RETRY_DELAY_SECS}s"),
+            "must not blind sleep-and-resend on first stall"
+        );
+        // Negative control: a body that only slept would fail the probe assert.
+        assert!(
+            send_body.contains("refusing blind resubmit")
+                || send_body.contains("proven absent"),
+            "stall path must name the read-before-retry decision"
+        );
     }
 }
 
@@ -18102,6 +19084,11 @@ pub(crate) fn wake_identity_pin(
 /// the wire may deliver rows oldest-first, so `.first()` cited stale ids
 /// and misdirected the mandated reply to the wrong thread. Deterministic
 /// fallback: the first raw row when nothing urgent survives the filter.
+///
+/// bd-9w95: the timestamp alone leaves a tie to iteration order, and the point
+/// of this function is that the wire order is NOT trusted. A burst can land two
+/// urgent rows in the same microsecond; the event id breaks it, the same way a
+/// Nostr timestamp breaks a same-second tie.
 pub(crate) fn newest_urgent<'a>(
     urgent: &[&'a serde_json::Value],
     fallback: Option<&'a serde_json::Value>,
@@ -18110,9 +19097,14 @@ pub(crate) fn newest_urgent<'a>(
         .iter()
         .copied()
         .max_by_key(|m| {
-            m.get("created_ts_us")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
+            (
+                m.get("created_ts_us")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                m.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            )
         })
         .or(fallback)
 }
@@ -18479,6 +19471,64 @@ pub(crate) fn spawn_agent_profile(name: &str, kind: &str, project: &str) -> back
 }
 
 #[cfg(test)]
+mod spawn_identity_divergence_tests {
+    use super::*;
+
+    /// bd-spawn-identity-divergence-2vzw: a spawned pane may only arrive as
+    /// its injected pin; the captain pin is refused for spawned panes; an
+    /// operator pane (no spawn row) keeps explicit --as. Plus the divergence
+    /// detector and the captain-pin pool exclusion.
+    #[test]
+    fn spawn_identity_matches_registry() {
+        // spawned pane: registry pin wins, matching arrival passes
+        assert_eq!(
+            arrive_identity_verdict("SilverPond", Some("SilverPond"), None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Match
+        );
+        // spawned pane arriving as the wrong pin is refused
+        assert!(matches!(
+            arrive_identity_verdict("SlateHerder", Some("SilverPond"), None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Refused { .. }
+        ));
+        // the measured incident: a spawned planner pane arriving as the
+        // CAPTAIN pin is refused (captain-for-a-spawned-pane)
+        assert!(matches!(
+            arrive_identity_verdict("EmberOtter", Some("SilverPond"), None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Refused { .. }
+        ));
+        // env-injected pin (FLYWHEEL_MAIL_AS) is spawn evidence even before
+        // the registry row exists
+        assert!(matches!(
+            arrive_identity_verdict("SlateHerder", None, Some("SilverPond"), None),
+            ArriveIdentityVerdict::Refused { .. }
+        ));
+        // operator pane: no spawn row, no injected env — explicit --as is an
+        // operator choice (the captain may arrive as itself here)
+        assert_eq!(
+            arrive_identity_verdict("EmberOtter", None, None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Unbound
+        );
+        // divergence detector: both sides known and different
+        assert_eq!(
+            identity_divergence(Some("SilverPond"), Some("SlateHerder")),
+            Some("SilverPond != SlateHerder".to_string())
+        );
+        assert_eq!(
+            identity_divergence(Some("SilverPond"), Some("SilverPond")),
+            None
+        );
+        assert_eq!(identity_divergence(None, Some("SlateHerder")), None);
+        assert_eq!(identity_divergence(Some(""), Some("SlateHerder")), None);
+        // pool exclusion: a seed that would draw the captain pin redraws
+        let captain_pin = adjnoun_from_fnv(7);
+        let mut taken = std::collections::HashSet::new();
+        taken.insert(captain_pin.clone());
+        let drawn = unique_adjnoun_pin(&taken, 7);
+        assert_ne!(drawn, captain_pin, "captain pin must never be drawn");
+    }
+}
+
+#[cfg(test)]
 mod wake_identity_tests {
     use super::*;
     use crate::state::SpawnEntry;
@@ -18789,6 +19839,36 @@ mod wake_identity_tests {
         );
     }
 
+    /// bd-9w95: `created_ts_us` is microseconds, but a burst can still land two
+    /// urgent rows in the same one, and with the timestamp alone the winner is
+    /// whichever row the slice ends on — the exact "trust the wire order"
+    /// failure bd-vbf2 removed from the timestamp axis. The fixture is
+    /// adversarial by construction: the two orders disagree, so a last-wins
+    /// selector fails one of them.
+    #[test]
+    fn vbf2_a_shared_microsecond_resolves_by_id_in_either_order() {
+        let low = json!({
+            "id": "1111aaaa", "sender": "PinkCastle", "subject": "a", "body_md": "x",
+            "importance": "high", "thread_id": "c43357a1", "created_ts_us": 1_787_300_794u64,
+        });
+        let high = json!({
+            "id": "9999zzzz", "sender": "SandySparrow", "subject": "b", "body_md": "x",
+            "importance": "high", "thread_id": "c43357a1", "created_ts_us": 1_787_300_794u64,
+        });
+        assert_eq!(
+            low["created_ts_us"], high["created_ts_us"],
+            "precondition: a shared timestamp or the tie never happens"
+        );
+        for order in [vec![low.clone(), high.clone()], vec![high, low]] {
+            let picked = newest_urgent(&wake_urgent(&order), None).expect("pick");
+            assert_eq!(
+                picked.get("id").and_then(|i| i.as_str()),
+                Some("9999zzzz"),
+                "the higher event id wins the shared microsecond in either order"
+            );
+        }
+    }
+
     #[test]
     fn vbf2_falls_back_to_first_raw_row_when_nothing_urgent() {
         let normal = json!({
@@ -18986,6 +20066,52 @@ mod wake_identity_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// bd-9w95: `incarnation` counts relaunches of ONE pane, so two fresh panes
+    /// serving the same name BOTH sit at 0 — the tie is the common case, and the
+    /// old comment claimed "highest generation wins" as if it were not. Among
+    /// equal incarnations the answer is the later registry row, because
+    /// `max_by_key` returns the last maximum and the registry is append-ordered.
+    /// This test states that rule instead of leaving it incidental; the hazard it
+    /// does NOT settle (folded legacy rows sort last) is in the learnings note.
+    #[test]
+    fn skills_injected_reads_the_later_registry_row_when_incarnations_tie() {
+        // `test_state_home`, not a bare `set_var`: this module has neighbours
+        // that set XDG_STATE_HOME without restoring it, so whichever test ran
+        // last decides where THEIR registries land. A raw setter here made
+        // `register_spawned_agent_pins_unique_adjnoun_identity` collide with its
+        // own `/tmp/fw-s9-mail-proj` leftovers and fail intermittently.
+        let _home = crate::config::test_state_home();
+        let project = "/tmp/fw-skills-tie-proj";
+        let name = "flywheel-toron-oc";
+        let injected = |pane: &str| {
+            let mut e = state::SpawnEntry::legacy(pane, name);
+            e.incarnation = 0;
+            e.skills_injected = true;
+            e
+        };
+        let pending = |pane: &str| {
+            let mut e = state::SpawnEntry::legacy(pane, name);
+            e.incarnation = 0;
+            e.skills_injected = false;
+            e
+        };
+        // The LAST row is the one the prefix is still owed on, so a last-wins
+        // read and an injected-first read disagree and the test can fail.
+        state::save_spawn_registry(project, &[injected("w1:p1"), pending("w2:p2")])
+            .expect("save registry");
+        assert!(
+            !skills_injected_for(project, name),
+            "the later row wins the shared incarnation, so the skill prefix is still owed"
+        );
+        state::save_spawn_registry(project, &[pending("w2:p2"), injected("w1:p1")])
+            .expect("save registry");
+        assert!(
+            skills_injected_for(project, name),
+            "and the rule is the registry's order, not the pane id: reversing the \
+             rows reverses the answer"
+        );
+    }
+
     /// S9 (ADR-0018 D1a) integration (embedded mailbox): spawn registers a
     /// UNIQUE adj+noun pin — never the slug — keeps it on re-spawn
     /// (idempotent), and redraws when the agents table already holds the
@@ -19008,7 +20134,7 @@ mod wake_identity_tests {
             .expect("registry entry");
         assert_eq!(entry.pane_id, "w9:p1");
         assert_eq!(entry.mail_identity.as_deref(), Some(pin.as_str()));
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     /// bd-gpj0: arrive with HERDR_PANE_ID records the open-mode pane so
@@ -19034,11 +20160,24 @@ mod wake_identity_tests {
             Some(v) => unsafe { std::env::set_var("HERDR_PANE_ID", v) },
             None => unsafe { std::env::remove_var("HERDR_PANE_ID") },
         }
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     #[test]
     fn register_spawned_agent_pins_unique_adjnoun_identity() {
+        // bd-9w95 FLAKY, PRE-EXISTING, NOT FIXED HERE. This test sets only
+        // TORON_DATA_DIR, so its spawn registry lands in whatever XDG_STATE_HOME
+        // happens to be — and when no sibling has set one, in the operator's
+        // REAL ~/.local/state/flywheel (measured: 43 `fw-*` fixture files there,
+        // including `agents/fw-s9-mail-proj-*.json`). The "first spawn" then
+        // finds that row instead of minting a pin, and the colliding-name search
+        // — which can only match inside the 9900-pair space — comes up empty.
+        // Measured red roughly 1 run in 3 under `-- wake_identity_tests`, green
+        // 4/4 when run as `-- register_spawned_agent`. Adding `test_state_home()`
+        // here and to `register_spawned_agent_folds_slug_to_pin` was tried and
+        // did NOT fix it (still 3/8 red), so it was reverted rather than shipped
+        // as a non-fix. The real cause is the module-wide env coupling between
+        // these tests; see the sweep note before touching either test again.
         let _g = crate::config::lock_env();
         let data = std::env::temp_dir().join(format!("fw-s9-mail-{}", uuid::Uuid::new_v4()));
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
@@ -19067,7 +20206,7 @@ mod wake_identity_tests {
             .expect("colliding spawn draws a fresh pin");
         assert_ne!(pin2, pin, "collision with the agents table redraws");
         assert!(valid_pair(&pin2, &ADJECTIVES, &NOUNS).is_some(), "{pin2}");
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     /// bd-add-missing-mail-identity-16le: the ADD path's identity step mints
@@ -19134,7 +20273,7 @@ mod wake_identity_tests {
                 "registered pin {p} resolves via the agents table (whois)"
             );
         }
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     /// bd-pin-public-plane-s-easy.2: register_spawned_agent writes the
@@ -19143,6 +20282,8 @@ mod wake_identity_tests {
     /// second identity.
     #[test]
     fn register_spawned_agent_folds_slug_to_pin() {
+        // bd-9w95: flaky alongside the sibling above for the same reason. Same
+        // verdict — the `test_state_home()` fix was tried and did not hold.
         let _g = crate::config::lock_env();
         let data = std::env::temp_dir().join(format!("fw-fold-{}", uuid::Uuid::new_v4()));
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
@@ -19169,7 +20310,7 @@ mod wake_identity_tests {
             who_slug.npub, who_pin.npub,
             "whois(slug) resolves to the pin's npub after the fold"
         );
-        let _ = std::fs::remove_dir_all(&data);
+        crate::mail_shim::cleanup_test_data_dir(&data);
     }
 
     /// S9 (ADR-0018 D1a): the peer-aware spawn template injects the mail
@@ -19843,6 +20984,9 @@ fn parse_ready_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // bd-wave-gate-typed-authority-27et: the typed `wave` field is
+            // the authority; the label above is the legacy fallback.
+            wave: durable::bead_wave_field(&b),
             // bd-4spn: priority + the typed `principles` citations feed the
             // dispatch gate (PRINCIPLES required for P<=2).
             priority: b
@@ -19904,6 +21048,9 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // bd-wave-gate-typed-authority-27et: the typed `wave` field is
+            // the authority; the label above is the legacy fallback.
+            wave: durable::bead_wave_field(b),
             // bd-4spn: priority + the typed `principles` citations (the
             // resume path reads the same gate fields as the ready path).
             priority: b
@@ -19981,6 +21128,49 @@ fn work_prompts(
     prompts
 }
 
+/// bd-resume-window-lease-sweep-4sa2: live `(reason, holder)` pairs from the
+/// project's reservation board. Feeds the resume peer-hold check. A mail
+/// hiccup yields an empty board — never a loop crash, and never a false
+/// peer-hold (an unread board cannot invent a competing holder).
+fn live_reservation_holders(cfg: &Config, project: &str) -> Vec<(String, String)> {
+    let Ok(key) = project_dir_str(cfg, project) else {
+        return Vec::new();
+    };
+    let Ok(mail) = mail_or_die(cfg) else {
+        return Vec::new();
+    };
+    let Ok(v) = mail.list_active(&key, None, None) else {
+        return Vec::new();
+    };
+    v.get("reservations")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let reason = r.get("reason").and_then(Value::as_str)?.to_string();
+                    let holder = r
+                        .get("holder")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Some((reason, holder))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// bd-reserve-yield-taqf: live `(bead, holder)` yield pairs — toron's
+/// structured stand-down (`reserve yield`), read through the same join as the
+/// lease board. Same soft-fail contract as the reservation board: a hiccup
+/// yields no pairs, and an unread board cannot invent a hold.
+fn live_yielded_pairs(cfg: &Config, project: &str) -> Vec<(String, String)> {
+    let Ok(mail) = mail_or_die(cfg) else {
+        return Vec::new();
+    };
+    mail.yielded_pairs(project).unwrap_or_default()
+}
+
 /// Unregisters this process's loop-pid entry on exit (any path). Only ever
 /// removes the entry when it still belongs to THIS pid — a newer loop that
 /// took over (--force) is never unregistered by the older process exiting
@@ -20039,6 +21229,215 @@ fn cmd_loop_prune() -> Result<()> {
         "pruned": before - pids.len(),
     }));
     Ok(())
+}
+
+/// bd-pane-wedge-detect-respawn-pnyi: read every registered pin's pane for a
+/// wedge — the agent process still UP, parked on a fatal error line, with no
+/// commit movement inside the window. The verdict is `durable::pane_wedge_action`
+/// (pure); this is only the live read. Soft-fail everywhere: an unreachable
+/// herdr, an empty registry, or an unreadable pane yields no wedges — never a
+/// fabricated page.
+fn probe_pane_wedges(
+    cfg: &Config,
+    project: &str,
+    project_dir: &std::path::Path,
+    now: u64,
+    quiet_secs: u64,
+    already_paged: &std::collections::HashSet<String>,
+) -> Vec<durable::PaneWedgeAction> {
+    let entries = state::load_spawn_registry(project);
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut c) = Client::connect(Some(&cfg.socket_path())) else {
+        return Vec::new();
+    };
+    let Ok(agents) = c.agent_list() else {
+        return Vec::new();
+    };
+    let commit_age = cmd::captain::last_commit_age_secs(project_dir, now);
+    let mut out = Vec::new();
+    for e in &entries {
+        let Some(pin) = e.mail_identity.as_deref().filter(|p| !p.trim().is_empty()) else {
+            continue; // unpinned rows are invisible to the wake layer too
+        };
+        let Some(a) = agents.iter().find(|a| a.pane_id == e.pane_id) else {
+            continue; // pane gone — `recover`'s door, not this probe's
+        };
+        // The kind rides on the live agent (`agent` is the harness herdr
+        // launched), so the process probe needs no profile lookup. A pane herdr
+        // reports with no kind probes as inconclusive (`None`), never alive.
+        let kind = a.agent.as_deref().unwrap_or("");
+        let alive = herdr_shim::pane_process_info(&mut c, &e.pane_id)
+            .ok()
+            .and_then(|info| herdr_shim::pane_agent_alive(&info, kind));
+        let tail = herdr_shim::pane_recent_text(&mut c, &e.pane_id).ok();
+        let action = durable::pane_wedge_action(
+            &durable::PaneWedgeInputs {
+                pin,
+                pane_id: &e.pane_id,
+                process_alive: alive,
+                recent_output: tail.as_deref(),
+                last_commit_age_secs: commit_age,
+                quiet_secs,
+            },
+            already_paged.contains(pin),
+        );
+        if !matches!(action, durable::PaneWedgeAction::Quiet) {
+            out.push(action);
+        }
+    }
+    out
+}
+
+/// `flywheel loop-mode supervise` (bd-swarm-loop-durable-panic-atlo): own
+/// the once-pass cadence the operator would otherwise hand-roll. Each pass is
+/// a CHILD process (`loop-mode run --once`), so a crashed pass cannot kill the
+/// supervisor; 3 consecutive failed passes stop it with one actionable line.
+///
+/// bd-supervise-dead-stop-escalation-rweq: each pass also probes for a dead
+/// stop — no pane working AND no commit for `stall_minutes` with work
+/// remaining. A dead stop is invisible to the passes (they keep firing with
+/// nothing to do), so this emits ONE loud escalation line and pages the captain
+/// once per stall, never once per pass; a recovering fleet clears it silently.
+fn cmd_loop_supervise(
+    cfg: &Config,
+    project: &str,
+    work: bool,
+    interval_secs: u64,
+    to: &str,
+    stall_minutes: u64,
+) -> Result<()> {
+    if interval_secs < 5 {
+        bail!("--interval must be >= 5 seconds");
+    }
+    let exe = std::env::current_exe().context("resolve the flywheel executable")?;
+    let project_dir = crate::project_dir(cfg, project);
+    let stall_secs = stall_minutes.max(1) * 60;
+    let mut consecutive_failures = 0u32;
+    let mut escalated = false;
+    // bd-pane-wedge-detect-respawn-pnyi: pins already paged for a wedge. Kept
+    // across passes so a wedge pages ONCE; cleared when work moves again, so a
+    // later wedge (even in the same pane) pages again.
+    let mut wedge_paged: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let argv = durable::supervise_pass_argv(project, work, to);
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&argv);
+        let status = cmd
+            .status()
+            .with_context(|| format!("spawn `{}`", argv.join(" ")))?;
+        consecutive_failures =
+            durable::supervise_failure_count(status.success(), consecutive_failures);
+        if consecutive_failures >= durable::SUPERVISE_MAX_CONSECUTIVE_FAILURES {
+            bail!(
+                "loop-mode supervise stopping after {consecutive_failures} consecutive failed passes — see the failing pass above, or run one by hand: `flywheel loop-mode run {project} --once{}`, then re-run supervise",
+                if work { " --work" } else { "" }
+            );
+        }
+        // Dead-stop probe. A stall cannot be judged from one pass's exit code
+        // (the pass SUCCEEDS against an idle fleet), so it needs its own look.
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let probe = cmd::captain::probe_stall(cfg, project, &project_dir, now, stall_secs);
+        let action = durable::dead_stop_action(&durable::DeadStopInputs {
+            work_remaining: probe.work_remaining,
+            fleet_knowable: probe.fleet_knowable,
+            any_pane_working: probe.any_pane_working,
+            last_commit_age_secs: probe.last_commit_age_secs,
+            stall_secs,
+            already_escalated: escalated,
+        });
+        match action {
+            durable::DeadStopAction::Escalate(kind) => {
+                escalated = true;
+                let age = probe.last_commit_age_secs.unwrap_or(0);
+                let line = match kind {
+                    durable::DeadStopKind::SilentPanes => format!(
+                        "loop-mode supervise: DEAD STOP in {project} — no pane working and no commit for {age}s (>{stall_secs}s) with work remaining"
+                    ),
+                    durable::DeadStopKind::StuckWorking => format!(
+                        "loop-mode supervise: STUCK PANES in {project} — pane(s) report working but nothing moved for {age}s (>{stall_secs}s) with work remaining; a working verdict is not progress"
+                    ),
+                };
+                eprintln!(
+                    "{line} — paging the captain once (a recovering fleet clears this without a second)"
+                );
+                page_captain_dead_stop(cfg, project, &line);
+            }
+            durable::DeadStopAction::Hold | durable::DeadStopAction::Wait => {}
+            durable::DeadStopAction::Clear if escalated => {
+                escalated = false;
+                eprintln!(
+                    "loop-mode supervise: {project} recovered — work moved inside the window; dead-stop probe re-armed"
+                );
+            }
+            durable::DeadStopAction::Clear => {}
+        }
+        // A commit inside the window re-arms the wedge probe as well, so a
+        // pane that recovers and wedges again is paged a second time.
+        if probe
+            .last_commit_age_secs
+            .is_some_and(|age| age < stall_secs)
+        {
+            wedge_paged.clear();
+        }
+        for action in probe_pane_wedges(cfg, project, &project_dir, now, stall_secs, &wedge_paged) {
+            if let durable::PaneWedgeAction::Page {
+                pin,
+                pane_id,
+                error,
+            } = action
+            {
+                let line = format!(
+                    "loop-mode supervise: PANE WEDGE in {project} — {pin} ({pane_id}) is alive but \
+                     parked on: {error} (nothing committed for {}s)",
+                    probe.last_commit_age_secs.unwrap_or(0)
+                );
+                eprintln!(
+                    "{line} — paging the captain once (clear it with a fresh session: \
+                     `flywheel crew control {project} {pin} relaunch`)"
+                );
+                page_captain_dead_stop(cfg, project, &line);
+                wedge_paged.insert(pin);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+    }
+}
+
+/// Page the captain about a dead stop. Best-effort but LOUD: a failed page
+/// never swallows the escalation — the line on stderr stands on its own, and
+/// the failure names itself so the operator knows the page did not land.
+fn page_captain_dead_stop(cfg: &Config, project: &str, line: &str) {
+    let Ok(key) = crate::project_dir_str(cfg, project) else {
+        eprintln!(
+            "flywheel: captain page FAILED (resolve project dir) — escalation line above stands"
+        );
+        return;
+    };
+    let mail = match crate::mail_as(cfg, &key, None) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "flywheel: captain page FAILED (mail actor: {e:#}) — escalation line above stands"
+            );
+            return;
+        }
+    };
+    let target = crate::resolve_mail_target_registry(project, "captain");
+    let thread = format!("loop-supervise-{project}");
+    match mail.send(
+        &key,
+        &[target],
+        "[loop-mode supervise] dead stop",
+        line,
+        "urgent",
+        true,
+        Some(&thread),
+    ) {
+        Ok(_) => eprintln!("flywheel: paged captain on {thread}"),
+        Err(e) => eprintln!("flywheel: captain page FAILED ({e:#}) — escalation line above stands"),
+    }
 }
 
 /// `flywheel loop doctor`: health report for loop infrastructure (bd-eign.4).
@@ -20370,6 +21769,7 @@ fn cmd_loop(
     confirm_timeout_ms: Option<u64>,
     engine: bool,
     force: bool,
+    resume: bool,
     strict: bool,
 ) -> Result<()> {
     if interval_secs < 5 {
@@ -20465,6 +21865,7 @@ fn cmd_loop(
             claim_nudge_after_polls: cfg.claim_nudge_after_polls(),
             resonate_url: String::new(),
             force,
+            resume,
             strict,
         };
         let rt = tokio::runtime::Runtime::new()?;
@@ -20541,6 +21942,28 @@ fn cmd_loop(
             );
         }
 
+        // The fleet snapshot. Read BEFORE the --work refresh: the idle-pane
+        // rotation needs the live/idle pane split, and it must be the SAME
+        // list (same order) `plan_actions` walks when it pairs queue items
+        // with agents.
+        let agents = c
+            .agent_list()?
+            .into_iter()
+            .filter(|a| a.workspace_id == ws_id)
+            .collect::<Vec<_>>();
+        let managed: Vec<(String, AgentStatus)> = if to == "all" {
+            agents
+                .iter()
+                .map(|a| (agent_target(a).to_string(), a.agent_status))
+                .collect()
+        } else {
+            let resolved = resolve_agents(&mut c, &ws_id, project, to)?;
+            resolved
+                .iter()
+                .map(|a| (agent_target(a).to_string(), a.agent_status))
+                .collect()
+        };
+
         // bead-driven mode (parity with the durable loop): refresh the queue
         // from the tracker each poll — interrupted work first, then fresh
         // ready beads. Soft-fail: a tracker hiccup yields no new work this
@@ -20549,10 +21972,58 @@ fn cmd_loop(
             // bd-gnej: in-progress beads feed the wave-gate (an earlier
             // wave's in_progress bead holds later waves).
             let mut inprog_now: Vec<durable::ReadyBead> = Vec::new();
+            // bd-loop-feeds-idle-panes-rh2z: the resume filter, the wave gate
+            // and the idle-pane rotation all read the same window, peers and
+            // clock — resolved ONCE per pass so the three cannot disagree.
+            let window = state::load_resume_window(project);
+            // A toron reserve-yield (bead taqf) is one more peer source, so
+            // the SAME pure peer-hold rule decides both. A yield whose holder
+            // released drops out on the toron side, so no clear path exists
+            // here.
+            let mut peers = live_reservation_holders(cfg, project);
+            peers.extend(live_yielded_pairs(cfg, project));
+            let now_us = chrono::Utc::now().timestamp_micros();
+            // Prompts queued by the ordinary paths. The rotation's picks go
+            // AHEAD of them (see the rotation block at the end of this scope).
+            let mut inprog_items: Vec<String> = Vec::new();
+            let mut ready_items: Vec<String> = Vec::new();
+            // Ready beads that survived the wave/scope filters — the rotation
+            // must not re-offer what those filters held back.
+            let mut ready_now: Vec<durable::ReadyBead> = Vec::new();
             match load_inprogress_beads(cfg, project) {
                 Ok(inprog) => {
-                    let to_resume: Vec<String> = work_prompts(&inprog, &[], &mut assigned, project);
-                    queue_items.extend(to_resume);
+                    let resumable: Vec<durable::ReadyBead> = inprog
+                        .iter()
+                        .filter(|b| {
+                            let pane = b.assignee.as_deref().unwrap_or("");
+                            let last = window.get(&state::resume_key(&b.id, pane)).copied();
+                            durable::should_resume_bead(
+                                last,
+                                now_us,
+                                durable::RESUME_WINDOW_DEFAULT_SECS,
+                                durable::peer_held(&b.id, &peers, pane),
+                            )
+                        })
+                        .cloned()
+                        .collect();
+                    // Record only what this call actually queues — a bead
+                    // already assigned this run draws no prompt, so it draws no
+                    // watermark either.
+                    let to_record: Vec<(String, String)> = resumable
+                        .iter()
+                        .filter(|b| !assigned.contains(&b.id))
+                        .map(|b| (b.id.clone(), b.assignee.clone().unwrap_or_default()))
+                        .collect();
+                    let to_resume: Vec<String> =
+                        work_prompts(&resumable, &[], &mut assigned, project);
+                    for (bead, pane) in &to_record {
+                        if let Err(e) = state::record_resume(project, bead, pane, now_us) {
+                            eprintln!(
+                                "flywheel: resume-window record for {bead} failed (continuing): {e:#}"
+                            );
+                        }
+                    }
+                    inprog_items.extend(to_resume);
                     inprog_now = inprog;
                 }
                 Err(e) => eprintln!("flywheel: br inprogress failed (continuing): {e:#}"),
@@ -20608,9 +22079,10 @@ fn cmd_loop(
                         })
                         .cloned()
                         .collect();
+                    ready_now.clone_from(&to_assign);
                     let to_assign: Vec<String> =
                         work_prompts(&[], &to_assign, &mut assigned, project);
-                    queue_items.extend(to_assign);
+                    ready_items.extend(to_assign);
                     for bead in &not_ready {
                         if not_ready_mailed.insert(bead.id.clone())
                             && let Err(e) = cmd_internal_mail_not_ready(
@@ -20637,25 +22109,78 @@ fn cmd_loop(
                 }
                 Err(e) => eprintln!("flywheel: br ready failed (continuing): {e:#}"),
             }
-        }
 
-        let agents = c
-            .agent_list()?
-            .into_iter()
-            .filter(|a| a.workspace_id == ws_id)
-            .collect::<Vec<_>>();
-        let managed: Vec<(String, AgentStatus)> = if to == "all" {
-            agents
+            // bd-loop-feeds-idle-panes-rh2z: the idle-pane rotation. The
+            // resume window plus the per-pass `assigned` set can leave every
+            // pane idle while stalled beads sit unclaimed (the incident: 17
+            // in_progress, 5 idle panes, zero sends for several passes). Each
+            // idle pane now takes ONE bead — its own stalled work first, never
+            // another live pane's — and the picks go at the HEAD of the queue
+            // in fleet order, because `plan_actions` pairs the k-th idle agent
+            // with the k-th queue item: that order is what makes the pick land
+            // on the pane the rotation chose.
+            let live_pins: Vec<String> = managed.iter().map(|(n, _)| n.clone()).collect();
+            let idle_pins: Vec<String> = managed
                 .iter()
-                .map(|a| (agent_target(a).to_string(), a.agent_status))
-                .collect()
-        } else {
-            let resolved = resolve_agents(&mut c, &ws_id, project, to)?;
-            resolved
-                .iter()
-                .map(|a| (agent_target(a).to_string(), a.agent_status))
-                .collect()
-        };
+                .filter(|(_, s)| matches!(s, AgentStatus::Idle | AgentStatus::Done))
+                .map(|(n, _)| n.clone())
+                .collect();
+            let starved = state::load_pane_starvation(project);
+            let plan = durable::idle_pane_rotation(&durable::IdleRotationInputs {
+                live_pins: &live_pins,
+                idle_pins: &idle_pins,
+                in_progress: &inprog_now,
+                ready: &ready_now,
+                peers: &peers,
+                taken: &assigned,
+                starved: &starved,
+                resume_window: &window,
+                now_us,
+                window_secs: durable::RESUME_WINDOW_DEFAULT_SECS,
+                exempt_after_passes: cfg.resume_exempt_passes(),
+            });
+            if let Err(e) = state::record_pane_starvation(project, &plan.starved_after) {
+                eprintln!("flywheel: pane-starvation record failed (continuing): {e:#}");
+            }
+            if !plan.picks.is_empty() {
+                let mut pick_items: Vec<String> = Vec::new();
+                for pick in &plan.picks {
+                    // The bead is in one of the two lists loaded above — the
+                    // rotation picked it out of them.
+                    let held = inprog_now.iter().find(|b| b.id == pick.bead);
+                    let title = held
+                        .or_else(|| ready_now.iter().find(|b| b.id == pick.bead))
+                        .map(|b| b.title.as_str())
+                        .unwrap_or("");
+                    pick_items.push(durable::brief(&pick.bead, title, project, held.is_some()));
+                    println!(
+                        "{} {} ← {}{}",
+                        dim("[loop] idle-pane"),
+                        dim(&pick.pin),
+                        dim(&pick.bead),
+                        if pick.exempt {
+                            format!(
+                                " (window-exempt: starved {} passes)",
+                                starved.get(&pick.pin).copied().unwrap_or(0)
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                    // Queue the bead once: the ordinary paths skip it next pass.
+                    // Ceiling (named, not hidden): the pairing below is
+                    // positional, so a pane that starts WORKING between the
+                    // fleet read and dispatch shifts the pick to the next idle
+                    // pane, and a failed send re-inserts its item at the front
+                    // (the existing retry path) for the rest of that pass. Both
+                    // self-correct on the next poll.
+                    assigned.push(pick.bead.clone());
+                }
+                queue_items.splice(0..0, pick_items);
+            }
+            queue_items.extend(inprog_items);
+            queue_items.extend(ready_items);
+        }
 
         // bd-w4-delete-dup-sbh8: the sync path DELEGATES to the single
         // durable planner (one plan_actions — the duplicate was deleted).
@@ -21542,6 +23067,16 @@ mod loop_tests {
         assert!(beads[1].labels.is_empty(), "absent labels -> empty");
     }
 
+    /// bd-wave-gate-typed-authority-27et: br's typed `wave` field flows
+    /// through the ready parser (number; absent/null -> None, never 0).
+    #[test]
+    fn parse_ready_beads_json_carries_typed_wave() {
+        let raw = r#"[{"id":"bd-w","title":"w","wave":3},{"id":"bd-n","title":"n","wave":null}]"#;
+        let beads = parse_ready_beads_json(raw).unwrap();
+        assert_eq!(beads[0].wave, Some(3));
+        assert_eq!(beads[1].wave, None, "null -> no wave, not 0");
+    }
+
     #[test]
     fn parse_inprogress_beads_json_handles_issues_wrapper() {
         let raw = r#"{"issues":[{"id":"bd-c","title":"three"}],"total":1}"#;
@@ -21551,6 +23086,86 @@ mod loop_tests {
         // bare-array fallback (some br versions)
         let beads = parse_inprogress_beads_json(r#"[{"id":"bd-d","title":"four"}]"#).unwrap();
         assert_eq!(beads[0].id, "bd-d");
+    }
+
+    /// bd-swarm-cockpit-pczs: `progress_waves` groups by `wave-N`, counts an
+    /// open bead `ready` only when `br ready` listed it, and names the LOWEST
+    /// wave holding ready/in-progress work as dispatching. Unlabeled beads
+    /// never invent a wave; an unknown status reads unknown, never a default.
+    #[test]
+    fn progress_waves_groups_and_names_the_dispatching_wave() {
+        use std::collections::HashSet;
+        let rows = json!([
+            {"id": "bd-a", "status": "closed", "labels": ["wave-1"]},
+            {"id": "bd-b", "status": "in_progress", "labels": ["wave-1"]},
+            {"id": "bd-c", "status": "open", "labels": ["wave-1"]},
+            {"id": "bd-d", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-e", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-f", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-g", "status": "open"},
+            {"id": "bd-h", "status": "open", "labels": ["wave-2"]},
+            {"id": "bd-i", "status": "mystery", "labels": ["wave-2"]},
+            // Typed-only row (no label): the field is the authority
+            // (bd-wave-gate-typed-authority-27et).
+            {"id": "bd-j", "status": "open", "wave": 2},
+        ]);
+        let ready: HashSet<String> = ["bd-h".to_string(), "bd-j".to_string()]
+            .into_iter()
+            .collect();
+        let out = progress_waves(rows.as_array().unwrap(), &ready);
+        assert_eq!(
+            out["dispatching_wave"],
+            json!(1),
+            "wave 1 holds in-progress work"
+        );
+        let waves = out["waves"].as_array().unwrap();
+        assert_eq!(waves.len(), 2, "two labeled waves");
+        assert_eq!(waves[0]["wave"], json!(1));
+        assert_eq!(waves[0]["closed"], json!(1));
+        assert_eq!(waves[0]["in_progress"], json!(1));
+        assert_eq!(
+            waves[0]["ready"],
+            json!(0),
+            "bd-c is open but not in br ready"
+        );
+        assert_eq!(waves[0]["blocked"], json!(1));
+        assert_eq!(
+            waves[1]["ready"],
+            json!(2),
+            "bd-h by label, bd-j by the typed field — both dispatchable"
+        );
+        assert_eq!(waves[1]["blocked"], json!(3));
+        assert_eq!(waves[1]["unknown"], json!(1), "no default status");
+        assert_eq!(out["unlabeled"]["blocked"], json!(1));
+        assert_eq!(out["unlabeled"]["total"], json!(1));
+
+        // A wave with only READY beads still dispatches before a later wave's
+        // in-progress work — the gate floor is the lowest ready/in-progress wave.
+        let rows2 = json!([
+            {"id": "bd-r1", "status": "open", "labels": ["wave-1"]},
+            {"id": "bd-r2", "status": "in_progress", "labels": ["wave-2"]},
+        ]);
+        let ready2: HashSet<String> = ["bd-r1".to_string()].into_iter().collect();
+        let out2 = progress_waves(rows2.as_array().unwrap(), &ready2);
+        assert_eq!(out2["dispatching_wave"], json!(1));
+
+        // Every wave closed -> nothing is dispatching.
+        let rows3 = json!([{"id": "bd-z", "status": "closed", "labels": ["wave-1"]}]);
+        let out3 = progress_waves(rows3.as_array().unwrap(), &HashSet::<String>::new());
+        assert_eq!(out3["dispatching_wave"], Value::Null);
+    }
+
+    /// bd-swarm-cockpit-pczs: both br envelopes parse; an unrecognized object
+    /// shape fails loud (a progress board must not read empty on a shape drift).
+    #[test]
+    fn parse_issue_rows_json_accepts_both_envelopes_and_refuses_unknown() {
+        let bare = parse_issue_rows_json(r#"[{"id":"bd-a","status":"open"}]"#, "br list").unwrap();
+        assert_eq!(bare.len(), 1);
+        let wrapped =
+            parse_issue_rows_json(r#"{"issues":[{"id":"bd-b"}],"total":1}"#, "br list").unwrap();
+        assert_eq!(wrapped.len(), 1);
+        assert!(parse_issue_rows_json(r#"{"rows":[]}"#, "br list").is_err());
+        assert!(parse_issue_rows_json("not json", "br list").is_err());
     }
 
     /// bd-627z.1: the in-progress parser carries the assignee (drives the
@@ -22482,14 +24097,10 @@ fn cmd_preflight(
     work: bool,
     json: bool,
 ) -> Result<()> {
-    let pf_mode = match mode {
-        "steer" => preflight::Mode::steer(),
-        "loop" if work => preflight::Mode::loop_work(),
-        "loop" => preflight::Mode::loop_queue(),
-        "workflow" => preflight::Mode::workflow(),
-        "cron" => preflight::Mode::cron(),
-        other => bail!("unknown preflight mode: {other} (steer|loop|workflow|cron)"),
-    };
+    // One mapping, shared with the captain-watch preflight arm (Mode::named).
+    let pf_mode = preflight::Mode::named(mode, work).ok_or_else(|| {
+        anyhow::anyhow!("unknown preflight mode: {mode} (steer|loop|workflow|cron)")
+    })?;
     let checks = preflight::run(cfg, pf_mode, project);
     if json {
         print_json(&preflight::to_json(&checks));
@@ -26986,6 +28597,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 }
             }
             let inputs_c = Value::Object(inputs_value);
+            // bd-compose-plumbing-zdzi: resolve the declared stage channel
+            // BEFORE anything spawns. An unresolvable channel refuses here —
+            // never a mid-run strict-render failure with panes already up.
+            let steer_channel = crew::resolve_steer_channel(&composed, &inputs_c)?;
             let run_id =
                 if let Some(k) = idempotency_key.as_deref().filter(|s| !s.trim().is_empty()) {
                     format!(
@@ -27040,6 +28655,18 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 *retire_orphans,
             )?;
             let entries = ctx.entries.clone();
+            // bd-compose-plumbing-zdzi: join-before-post for the run's OWN
+            // crew — every spawned pin joins the declared steer channel so a
+            // stage's first post is a member post, not a refused write (the
+            // friction's operator had to create + join by hand).
+            if let Some(channel) = steer_channel.as_deref() {
+                let pins: Vec<String> = entries
+                    .entries()
+                    .iter()
+                    .filter_map(|e| e.mail_identity.clone())
+                    .collect();
+                ensure_and_join_channels(project_name, &[channel.to_string()], &pins);
+            }
             let project_c = project_name.to_string();
             let wf_name_c = wf_name.clone();
             let runner: toron_workflow::engine::EffectRunner = {
@@ -27108,6 +28735,20 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                 engine.clone(),
                 stop.clone(),
             )?;
+            // bd-compose-stage-sequencing-zgi9: a composed run can park on
+            // `request_approval` (SIGNOFF), so it starts the SAME approval
+            // drainer as the workflow-run arm. Without it the promise parks
+            // with nobody listening — SIGNOFF never surfaces. The drainer
+            // announces `flywheel workflow approve …` and scans the inbox for
+            // the decision token; a resumed run starts a fresh drainer, so the
+            // SIGNOFF is re-issued until it is resolved.
+            let approval_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let approval_drainer = pane::start_approval_drainer(
+                cfg.clone(),
+                project_name.to_string(),
+                engine.clone(),
+                approval_stop.clone(),
+            )?;
             let policy_receipts_count;
             let output = {
                 // bd-compose-not-durable-oxjy: composed runs carry the same
@@ -27141,6 +28782,8 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
                         // every future retry of the same key.
                         lifecycle.fail(&e.to_string());
                         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = approval_drainer.join();
                         return Err(e);
                     }
                 };
@@ -27170,6 +28813,10 @@ fn cmd_workflow(cfg: &Config, cmd: &WorkflowCmd) -> Result<()> {
             spawn_receipts = drainer
                 .join()
                 .map_err(|_| anyhow!("spawn drainer thread panicked"))??;
+            approval_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = approval_drainer
+                .join()
+                .map_err(|_| anyhow!("approval drainer thread panicked"));
             let mut reaped = false;
             if !ctx.retained {
                 let mut c = Client::connect(Some(&cfg.socket_path()))?;
@@ -29245,7 +30892,9 @@ fn summarize_status_event(
     ev: &toron_core::backend::BackendEvent,
     seq: &mut u64,
 ) -> Option<StatusEventItem> {
-    use toron_core::backend::BackendEvent::{AgentDetected, AgentStatusChanged, PaneExited, Raw};
+    use toron_core::backend::BackendEvent::{
+        AgentDetected, AgentStatusChanged, EventsLost, PaneExited, Raw,
+    };
     let (event_type, pane_id, agent, status) = match ev {
         AgentStatusChanged {
             pane,
@@ -29273,6 +30922,8 @@ fn summarize_status_event(
             None,
             "exited".to_string(),
         ),
+        // events_lost is not a status push — caller must resubscribe + snapshot.
+        EventsLost => return None,
         Raw(_) => return None,
     };
     *seq = seq.saturating_add(1);
@@ -29391,8 +31042,17 @@ fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
 /// Absent registry or entry reads as not-injected (fail toward gating —
 /// the gate is a no-op wait on already-booted panes).
 fn skills_injected_for(project: &str, name: &str) -> bool {
-    // bd-rkx8: highest generation wins — a stale row must not speak for a
-    // fresh pane sharing its name.
+    // bd-rkx8: a stale row must not speak for a fresh pane sharing its name.
+    // bd-9w95: the rule is NARROWER than that comment used to claim.
+    // `incarnation` counts relaunches of ONE pane, so two fresh panes serving
+    // the same name both sit at 0 — the common case, not an edge case. Among
+    // equal incarnations `max_by_key` returns the LAST such row, and the
+    // registry is append-ordered, so that is the latest registration. Stated
+    // here because it is load-bearing and was previously incidental:
+    // `fold_legacy_alias` appends the legacy file's rows AFTER the canonical
+    // ones, so for equal incarnations this can still pick a folded legacy row.
+    // Fixing that needs a freshness key the entry does not carry; see the
+    // bd-9w95 note in docs/learnings before changing the selection.
     state::load_spawn_registry(project)
         .iter()
         .filter(|e| e.name == name)
@@ -29541,22 +31201,51 @@ fn cmd_internal_send(
             eprintln!("flywheel: cannot persist skills_injected for {name}: {e:#}");
         }
     }
-    let send_text = match &profile_obj {
+    let mut send_text = match &profile_obj {
         Some((_, _, _, behavior, _)) => headless::conditioned_prompt(behavior, &send_base),
-        None => send_base,
+        // cloned so the degrade path below can still read the skills prefix
+        None => send_base.clone(),
     };
 
-    // ADR-0019 Spec 2: a dispatched bead brief (behavior + skills prefix +
-    // brief) over the 4 KiB cap is a LOOP BUG — fail loud, never silent
-    // truncation. Only briefs are capped (first line `GOAL ...`); captain
-    // steers, nudges, and mail wakes are raw text and exempt.
+    // ADR-0019 Spec 2, amended by bd-dispatch-cap-conditioning-l7jh: a
+    // dispatched bead brief (behavior + skills prefix + brief) over the
+    // 4 KiB cap DEGRADES to the pointer brief and sends — an over-cap class
+    // must not balloon into four rejects that hard-stop the loop. Only
+    // briefs are capped (first line `GOAL ...`); captain steers, nudges, and
+    // mail wakes are raw text and exempt. Errors only when even the pointer
+    // form cannot fit the cap with this conditioning.
     if text.starts_with("GOAL ") && send_text.len() > durable::DISPATCH_PROMPT_CAP {
-        bail!(
-            "flywheel: dispatched prompt for bead {} is {} bytes — over the {} byte cap (loop bug; NOT sent, never truncated)",
-            durable::bead_id_from_prompt(text).unwrap_or("<unknown>"),
-            send_text.len(),
-            durable::DISPATCH_PROMPT_CAP,
-        );
+        let bead = durable::bead_id_from_prompt(text).map(str::to_string);
+        let rebuilt = bead.as_deref().map(|id| {
+            // Preserve the exact skills prefix already prepended to send_base
+            // (base = prefix + text), so the degraded send keeps its
+            // conditioning and loses only the embedded brief.
+            let prefix = send_base.strip_suffix(text).unwrap_or_default();
+            let pointer = durable::pointer_brief(id, project, text.starts_with("GOAL Resume "));
+            let base = format!("{prefix}{pointer}");
+            match &profile_obj {
+                Some((_, _, _, behavior, _)) => headless::conditioned_prompt(behavior, &base),
+                None => base,
+            }
+        });
+        match rebuilt {
+            Some(degraded) if degraded.len() <= durable::DISPATCH_PROMPT_CAP => {
+                eprintln!(
+                    "flywheel: WARN dispatched prompt for bead {} is {} bytes — over the {} byte cap; degraded to the pointer brief ({} bytes)",
+                    bead.as_deref().unwrap_or("<unknown>"),
+                    send_text.len(),
+                    durable::DISPATCH_PROMPT_CAP,
+                    degraded.len(),
+                );
+                send_text = degraded;
+            }
+            _ => bail!(
+                "flywheel: dispatched prompt for bead {} is {} bytes — over the {} byte cap even as the pointer brief (loop bug; NOT sent, never truncated)",
+                bead.as_deref().unwrap_or("<unknown>"),
+                send_text.len(),
+                durable::DISPATCH_PROMPT_CAP,
+            ),
+        }
     }
 
     // review-fix F6: __send routes through the backend factory (ADR-0002).
@@ -29871,14 +31560,17 @@ fn cmd_internal_inprogress(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
-/// internal leaf (bd-627z.1, bd-qk9q): re-open stranded in_progress beads to
-/// ready. A bead is stranded when its assignee is NOT one of the `--live`
-/// agent names (captain, dead agent, unknown identity) — it would stall the
-/// batch forever. An in_progress bead with NO assignee is stranded too
-/// (bd-qk9q: nobody holds it, no agent works it, nothing else closes it —
-/// the bd-bvwf.1 strand). Presence-based, never status-based: an assignee in
-/// the live list is live regardless of status (bd-bvwf.5: no reclaim of
-/// unknown-but-present agents). Reclaim = `br update <id> --status open
+/// internal leaf (bd-627z.1, bd-qk9q, bd-reclaim-liveness-not-spelling-hn8b):
+/// re-open stranded in_progress beads to ready. The decision resolves the
+/// assignee through the spawn registry to its pane and asks herdr whether
+/// that pane is live (`durable::reclaim_decision`) — no spelling list. Kept
+/// under BOTH registry names of a live pane (herdr name and mail pin), and a
+/// live reservation for the bead itself (reason = bead id) is a lease no
+/// reclaim may break. A spelling the registry cannot resolve and pane
+/// evidence cannot refute is KEPT — the old name comparison reclaimed live
+/// workers whose claim used a different spelling for the same agent, which
+/// is the destructive race this fixes. An assignee-less bead with no lease is
+/// still reclaimed (bd-qk9q). Reclaim = `br update <id> --status open
 /// --assignee ""` so the bead returns to the ready pool and the loop
 /// re-dispatches it.
 ///
@@ -29891,12 +31583,6 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    // bd-bvwf.6 (2026-08-17): claims are written with the agent's MAIL
-    // IDENTITY pin (BlueRidge), but the loop passes herdr NAMES
-    // (flywheel-toron-coder) as --live — a live agent's claim looked
-    // stranded and got yanked every poll. A registry pin counts as live
-    // only when its pane is LIVE in herdr right now (a dead pane's pin
-    // must still strand — that is the reclaim's purpose).
     let dir = project_dir(cfg, project);
     let registry = state::load_spawn_registry(dir.to_str().unwrap_or(project));
     let live_panes: std::collections::HashSet<String> = {
@@ -29913,45 +31599,94 @@ fn cmd_internal_reclaim_stranded(cfg: &Config, project: &str, live: &str) -> Res
         }
         panes
     };
-    let live: Vec<String> = {
-        let mut s: std::collections::HashSet<String> = live_names.iter().cloned().collect();
-        for e in &registry {
-            if let Some(pin) = &e.mail_identity
-                && live_panes.contains(&e.pane_id)
-            {
-                s.insert(pin.clone());
+    // Every spelling a LIVE pane answers to: the polled herdr names the loop
+    // passed, plus each live registry row's herdr name AND mail pin
+    // (bd-bvwf.6: claims use the pin, the loop passes herdr names).
+    let mut live_identities: std::collections::HashSet<String> = live_names.into_iter().collect();
+    for e in &registry {
+        if live_panes.contains(&e.pane_id) {
+            live_identities.insert(e.name.clone());
+            if let Some(pin) = &e.mail_identity {
+                live_identities.insert(pin.clone());
             }
         }
-        s.into_iter().collect()
+    }
+    // A live lease on a bead is proof of life. A reading failure degrades to
+    // pane evidence alone (loudly), never to a blind reclaim.
+    let leased_beads: std::collections::HashSet<String> = {
+        let key = project_dir_str(cfg, project)?;
+        let rows = match mail_or_die(cfg) {
+            Ok(mail) => mail.list_active(&key, None, None).unwrap_or_else(|e| {
+                eprintln!(
+                    "flywheel: reclaim lease read failed (continuing without lease evidence): {e:#}"
+                );
+                json!({ "reservations": [] })
+            }),
+            Err(e) => {
+                eprintln!(
+                    "flywheel: reclaim lease read mail unavailable (continuing without lease evidence): {e:#}"
+                );
+                json!({ "reservations": [] })
+            }
+        };
+        rows.get("reservations")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get("reason").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let world = durable::ReclaimWorld {
+        live_identities: &live_identities,
+        registry: &registry,
+        live_panes: &live_panes,
+        leased_beads: &leased_beads,
     };
     let beads = load_inprogress_beads(cfg, project)?;
-    let stranded: Vec<durable::ReadyBead> = beads
-        .into_iter()
-        .filter(|b| match &b.assignee {
-            Some(a) => !live.iter().any(|l| l == a),
-            None => true,
-        })
-        .collect();
     let mut reclaimed: Vec<String> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
-    for b in &stranded {
-        let out = std::process::Command::new("br")
-            .args(["update", &b.id, "--status", "open", "--assignee", ""])
-            .current_dir(&dir)
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                eprintln!(
-                    "flywheel: reclaimed stranded bead {} (assignee {:?})",
-                    b.id, b.assignee
-                );
-                reclaimed.push(b.id.clone());
+    for b in &beads {
+        match durable::reclaim_decision(&b.id, b.assignee.as_deref(), &world) {
+            durable::ReclaimDecision::Keep { reason } => {
+                if matches!(
+                    reason,
+                    durable::ReclaimHold::LiveLease | durable::ReclaimHold::UnknownIdentity
+                ) {
+                    eprintln!(
+                        "flywheel: reclaim held for {} (assignee {:?}, {})",
+                        b.id,
+                        b.assignee,
+                        reason.as_str()
+                    );
+                }
             }
-            Ok(o) => failed.push(json!({
-                "id": b.id,
-                "error": String::from_utf8_lossy(&o.stderr).trim().to_string(),
-            })),
-            Err(e) => failed.push(json!({ "id": b.id, "error": format!("br not found: {e}") })),
+            durable::ReclaimDecision::Reclaim { reason } => {
+                let out = std::process::Command::new("br")
+                    .args(["update", &b.id, "--status", "open", "--assignee", ""])
+                    .current_dir(&dir)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => {
+                        eprintln!(
+                            "flywheel: reclaimed stranded bead {} (assignee {:?}, {})",
+                            b.id,
+                            b.assignee,
+                            reason.as_str()
+                        );
+                        reclaimed.push(b.id.clone());
+                    }
+                    Ok(o) => failed.push(json!({
+                        "id": b.id,
+                        "error": String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                    })),
+                    Err(e) => {
+                        failed.push(json!({ "id": b.id, "error": format!("br not found: {e}") }))
+                    }
+                }
+            }
         }
     }
     print_json(&json!({ "reclaimed": reclaimed, "failed": failed }));
@@ -31500,6 +33235,14 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
                 }
                 Err(e) => eprintln!("flywheel: __dispatch-guard inbox scan failed: {e}"),
             }
+            // bd-claim-watch-durable-signals-mixy (wish 3): kind-9 room
+            // claims are peer signals too — crews claim on the steer rooms
+            // (the project room + the bead's own ADR-0020 room) and those
+            // posts never reach the mail-thread scan above. Best-effort:
+            // any failure contributes zero signals.
+            let mut signals: Vec<Value> = facts["signals"].as_array().cloned().unwrap_or_default();
+            signals.extend(channel_guard_signals(&key, bead, mail.agent_name()));
+            facts["signals"] = json!(signals);
         }
     }
     // Receipts freshness: newest mtime among receipt files naming this bead.
@@ -31525,6 +33268,131 @@ fn cmd_internal_dispatch_guard(cfg: &Config, project: &str, bead: &str) -> Resul
     }
     print_json(&facts);
     Ok(())
+}
+
+/// bd-claim-watch-durable-signals-mixy (wish 3): classify kind-9 room
+/// messages as dispatch-guard peer signals. Reads `steer-<project>` plus the
+/// bead's own `steer-<bead>` room (ADR-0020) through the toron CLI — the
+/// channel plane is not on the mailbox surface, and flywheel already shells
+/// `toron` for plane-S reads (`plane_s_open_jobs_for`). The project room
+/// carries every bead so a signal must name THIS bead; the per-bead room is
+/// thread-scoped by construction. Soft-fail empty on every error (CLI
+/// missing, room absent, membership refused): a channel read must never
+/// block or spam a dispatch scan — the mail scan stays the primary channel.
+fn channel_guard_signals(project_key: &str, bead: &str, identity: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let rooms = [
+        (format!("steer-{project_key}"), true),
+        (format!("steer-{bead}"), false),
+    ];
+    for (room, require_mention) in rooms {
+        let out_cmd = std::process::Command::new("toron")
+            .args([
+                "channel",
+                "read",
+                &room,
+                "--project",
+                project_key,
+                "--as",
+                identity,
+                "--json",
+                "--limit",
+                "100",
+            ])
+            .output();
+        let Ok(o) = out_cmd else { continue };
+        if !o.status.success() {
+            continue;
+        }
+        let Ok(msgs) = serde_json::from_slice::<Value>(&o.stdout) else {
+            continue;
+        };
+        out.extend(channel_signals_from(&msgs, bead, require_mention));
+    }
+    out
+}
+
+/// Pure: project one `toron channel read --json` page into guard signals.
+/// `require_mention` = the room carries other beads' traffic (the project
+/// steer room), so a line counts only when it names THIS bead; false = the
+/// room is the bead's own (ADR-0020 `steer-<bead>`), thread-scoped by
+/// construction. `created_at` is unix SECONDS on the channel projection and
+/// the guard compares µs; a value already in µs (~1e15) passes through.
+fn channel_signals_from(msgs: &Value, bead: &str, require_mention: bool) -> Vec<Value> {
+    let Some(arr) = msgs.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in arr {
+        let Some(content) = m.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if require_mention && !content.contains(bead) {
+            continue;
+        }
+        let Some(kind) = durable::classify_guard_signal("", content, None) else {
+            continue;
+        };
+        let ts = m.get("created_at").and_then(Value::as_i64).unwrap_or(0);
+        let ts_us = if ts > 1_000_000_000_000 {
+            ts
+        } else {
+            ts.saturating_mul(1_000_000)
+        };
+        out.push(json!({ "ts_us": ts_us, "kind": kind.as_str() }));
+    }
+    out
+}
+
+#[cfg(test)]
+mod channel_guard_tests {
+    use super::*;
+
+    /// bd-claim-watch-durable-signals-mixy (wish 3): kind-9 room lines
+    /// classify into guard signals; the project room's lines must name the
+    /// bead, the per-bead room's are thread-scoped; seconds normalize to µs
+    /// and µs pass through unchanged.
+    #[test]
+    fn channel_lines_become_guard_signals() {
+        let page = json!([
+            {
+                "content": "claimed bd-12 — write-set src/durable.rs",
+                "created_at": 1_700_000_000,
+                "kind": 9
+            },
+            {
+                "content": "stand down bd-12: concurrent executor is live",
+                "created_at": 1_700_000_060,
+                "kind": 9
+            },
+            // Would classify as Handoff — but it names ANOTHER bead, so the
+            // project-room mention filter must drop it.
+            {
+                "content": "handoff bd-99: taking over",
+                "created_at": 1_700_000_120,
+                "kind": 9
+            },
+            { "content": 42, "created_at": 1 },
+            { "created_at": 1 }
+        ]);
+        let got = channel_signals_from(&page, "bd-12", true);
+        assert_eq!(got.len(), 2, "only bead-12 claim + stand-down: {got:?}");
+        assert_eq!(got[0]["kind"], "claim");
+        assert_eq!(got[0]["ts_us"], 1_700_000_000_000_000i64);
+        assert_eq!(got[1]["kind"], "stand_down");
+        // Per-bead room: thread-scoped, no mention needed.
+        let own_room =
+            json!([{ "content": "claiming — edits in src/main.rs", "created_at": 1_700_000_000 }]);
+        let got = channel_signals_from(&own_room, "bd-12", false);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["kind"], "claim");
+        // A µs timestamp passes through untouched.
+        let us = json!([{ "content": "claiming bd-12", "created_at": 1_700_000_000_000_000i64 }]);
+        let got = channel_signals_from(&us, "bd-12", true);
+        assert_eq!(got[0]["ts_us"], 1_700_000_000_000_000i64);
+        // Non-array garbage degrades to empty, never a panic.
+        assert!(channel_signals_from(&json!({"nope": true}), "bd-12", true).is_empty());
+    }
 }
 
 /// bd-a7j leaf: newest message id + author in `thread` BY `name` (or nulls).
@@ -33451,16 +35319,20 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
     // keeps today's behavior (renew all, no sweep).
     let mut released_closed: Vec<String> = Vec::new();
     if let Ok(closed) = load_closed_bead_ids(cfg, project) {
-        let stale: Vec<String> = v
+        // bd-resume-window-lease-sweep-4sa2: the ONE sweep rule
+        // (`durable::closed_reason_lease_ids`), so the shipped sweep and its
+        // test cannot disagree about which leases are stale.
+        let leases: Vec<(String, String)> = v
             .reservations
             .iter()
-            .filter(|r| {
-                bead_id_from_reason(&r.reason)
-                    .map(|id| closed.contains(id))
-                    .unwrap_or(false)
+            .map(|r| {
+                (
+                    r.path_pattern.clone(),
+                    bead_id_from_reason(&r.reason).unwrap_or("").to_string(),
+                )
             })
-            .map(|r| r.path_pattern.clone())
             .collect();
+        let stale: Vec<String> = durable::closed_reason_lease_ids(&leases, &closed);
         for path in &stale {
             match backend::run_mail(mail.release_reservations(
                 &key,
@@ -34224,6 +36096,7 @@ mod wait_output_tests {
             pane_id: pane.to_string(),
             revision: 1,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "t1".into(),
             terminal_id: "term_1".into(),
@@ -36292,6 +38165,7 @@ mod first_dispatch_gate_tests {
             pane_id: "w9:p1".to_string(),
             revision: 0,
             state_change_seq: 0,
+            completion_seq: None,
             state_labels: serde_json::Map::new(),
             tab_id: "w9:t1".to_string(),
             terminal_id: "term-1".to_string(),

@@ -102,6 +102,25 @@ async fn host_workspace(
             now: doorbell_rt::lease::unix_now(),
         },
     );
+    // Ready-bead sensor (bd-ux-papercuts-t2u5): the embedded flywheel host
+    // runs the beads poller, so the daemon must too — the daemon hosts the
+    // live loops, and without this lane a ready bead never rings a paned
+    // supervisor. Repo resolution: an absolute project key IS the repo
+    // (flywheel's shape); a slug resolves under the default workspace root
+    // `~/workspace`. No board → the lane is off for this host, said LOUDLY.
+    let beads_root = dirs::home_dir().map(|h| h.join("workspace"));
+    let _beads_poller = match beads_root
+        .as_deref()
+        .and_then(|root| doorbell_rt::pollers::beads_repo_for(&project, root))
+    {
+        Some(repo) => Some(doorbell_rt::pollers::spawn_beads_poller(tx.clone(), repo)),
+        None => {
+            eprintln!(
+                "doorbell serve: {project}/{workspace} — beads poller off (no .beads board at an absolute project key or ~/workspace/<project>)"
+            );
+            None
+        }
+    };
     let brain =
         Brain::new(BrainConfig::new(&workspace), host, store, sinks).with_liveness(liveness);
     let report = brain.run(rx).await;

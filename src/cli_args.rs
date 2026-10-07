@@ -10,7 +10,16 @@
 /// The same rule applies to `loop-mode`, while explicit subcommands and help
 /// flags remain byte-for-byte unchanged.
 pub(crate) fn rewrite_legacy_loop_args(args: &[String]) -> Vec<String> {
-    const SUBCOMMANDS: [&str; 7] = ["run", "status", "list", "prune", "doctor", "replay", "why"];
+    const SUBCOMMANDS: [&str; 8] = [
+        "run",
+        "supervise",
+        "status",
+        "list",
+        "prune",
+        "doctor",
+        "replay",
+        "why",
+    ];
     if args.len() >= 2
         && matches!(args[1].as_str(), "loop" | "loop-mode")
         && let Some(next) = args.get(2)
@@ -46,7 +55,16 @@ mod tests {
 
     #[test]
     fn preserves_explicit_subcommands_and_help() {
-        for subcommand in ["run", "status", "list", "prune", "doctor", "replay", "why"] {
+        for subcommand in [
+            "run",
+            "supervise",
+            "status",
+            "list",
+            "prune",
+            "doctor",
+            "replay",
+            "why",
+        ] {
             let input = args(&["flywheel", "loop", subcommand]);
             assert_eq!(rewrite_legacy_loop_args(&input), input);
         }

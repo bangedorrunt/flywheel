@@ -31,6 +31,8 @@ A command is an effect value. Interpret it with the effect-oriented stack: fallb
 
 Read `docs/agent-instructions/effect-kernel.md` before editing. Rationale and phase status are in `docs/decisions/0016-functional-effect-kernel-redesign.md`.
 
+The paradigm-level rules behind the laws (defer, four outcomes, policy on the value, the reducer fold, map-reduce fan-out, durable intent, substitution testing) live in the effect-oriented skill: `~/.agents/skills/effect-oriented/SKILL.md` and its `references/architecture.md`. This skill is their enforcement in this repo.
+
 ## Verification
 
 ```bash

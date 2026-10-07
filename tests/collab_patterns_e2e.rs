@@ -21,11 +21,23 @@ fn herdr_up() -> bool {
         .unwrap_or(false)
 }
 
+/// Is the mail surface usable?
+///
+/// bd-3mjv: this used to be `curl -sf http://127.0.0.1:8765/health` — the LEGACY
+/// agentmail server. This stack ships toron (ADR-0003 flipped the default), and an
+/// absent `[mail.toron] url` means embedded, so there is no 8765 server left to
+/// find: measured on this machine, nothing listened on it while toron served
+/// 18080, and no toron source mentions the port at all. A probe that can never
+/// succeed is not a guard, it is a permanent skip — two named tests below ran
+/// nothing and reported ok.
+///
+/// So ask the product instead of a port constant. One `mail agents` read reaches
+/// whichever surface is actually configured, and it exits 0 for ANY project
+/// (measured against a real slug, a fresh one, and a nonexistent one), so it
+/// cannot be fooled by a project name — the check is the surface, not the slug.
 fn mail_up() -> bool {
-    // flywheel mail agents on a dummy path still needs a configured token;
-    // health endpoint is enough for "server is up".
-    Command::new("curl")
-        .args(["-sf", "http://127.0.0.1:8765/health"])
+    Command::new(flywheel())
+        .args(["mail", "agents", "--project", "flywheel-mail-probe"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -309,19 +321,26 @@ fn cross_project_xproj_and_product_surface() {
     assert_eq!(v["recipe"], "soak");
 
     if !mail_up() {
-        eprintln!("mail down — skip product ensure");
+        eprintln!("mail down — skip the product surface");
         return;
     }
-    // ensure product (idempotent when mail works)
-    let out = Command::new(exe)
-        .args(["mail", "product", "ensure", "--name", "trading-research"])
-        .output()
-        .expect("product ensure");
-    // ok or soft fail — not panic
-    assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("panic"),
-        "product ensure panicked"
-    );
+    // bd-3mjv: the `mail product ensure --name trading-research` call that used
+    // to sit here is gone. Two reasons, both measured.
+    //
+    // 1. It asserted only `!stderr.contains("panic")` — a tautology that says a
+    //    process did not print one word, and it is the only reason the block
+    //    existed at all.
+    // 2. It MUTATED the operator's live state. `ensure_product` signs a
+    //    kind-30011 manifest with the OPERATOR key and publishes it, and the verb
+    //    takes no --project and no store override, so there is no way to aim it at
+    //    a scratch dir. The row is still there: the live index.sqlite carries
+    //    product id=1 `trading-research`, created 2026-08-08T21:31:25Z by a suite
+    //    run. It is idempotent (re-reads if present), which is why it never
+    //    failed — a test that writes to the operator's identity store and is
+    //    green either way.
+    //
+    // The cross-project PARSE contract above is the real subject of this test and
+    // it is hermetic; the xproj-inbox leaf below still runs.
 
     // xproj-inbox leaf soft-empty
     let out = Command::new(exe)

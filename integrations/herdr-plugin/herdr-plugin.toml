@@ -1,10 +1,10 @@
-# Flywheel captain-pane plugin manifest (bd-xenf).
+# Flywheel captain-pane plugin manifest.
 
 id = "flywheel.captain-pane"
 name = "Captain Pane"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
-# Floor note (bd-xenf): installed binary is 0.9.1-preview but the running
+# Floor note: installed binary is 0.9.1-preview but the running
 # daemon reports 0.9.0, and the link gate enforces the daemon version.
 # 0.9.0 stands only because every surface below is proven against the
 # live daemon by simulated events (presence, toast, reconcile); if any

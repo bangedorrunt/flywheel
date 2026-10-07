@@ -38,7 +38,7 @@
 //!   written BEFORE spawning: one swarm per message id.
 //!   Pure read leaves (poll_*) need no dedup — re-running them is harmless.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -99,14 +99,16 @@ pub struct LoopParams {
     pub max_iterations: Option<u64>,
     /// bead-driven mode: source work from `br ready` instead of a static queue
     pub work: bool,
-    /// bd-gnej kill-switch: disable the wave-gate (wave-N label ordering)
-    /// for graphs that do not use wave labels. Default false = gating ON.
+    /// bd-gnej kill-switch: disable the wave-gate (typed `wave` ordering,
+    /// legacy `wave-N` labels as fallback) for graphs that do not use
+    /// waves. Default false = gating ON.
     #[serde(default)]
     pub no_wave_gates: bool,
     /// ADR-0006 D2 wave-scoped dispatch (`--wave-label wave-N`): restrict
-    /// --work to ready beads labeled `wave-N`, held while any lower wave is
-    /// open/in_progress. None = default behavior, unchanged. `#[serde(default)]`
-    /// keeps pre-D2 saved params loadable.
+    /// --work to ready beads in wave N (typed field, legacy label fallback),
+    /// held while any lower wave is open/in_progress. None = default
+    /// behavior, unchanged. `#[serde(default)]` keeps pre-D2 saved params
+    /// loadable.
     #[serde(default)]
     pub wave_label: Option<String>,
     /// send every prompt via `__send --confirm` (landing confirmation).
@@ -156,6 +158,13 @@ pub struct LoopParams {
     /// params loadable.
     #[serde(default)]
     pub force: bool,
+    /// bd-swarm-loop-durable-panic-atlo: opt IN to replaying a killed run's
+    /// pending invocation. Default false — a pending invocation at start
+    /// belongs to a dead owner (the pid registry refuses two live loops), and
+    /// replaying its checkpoints against a newer binary's leaf shapes storms
+    /// serialization errors. `#[serde(default)]` keeps saved params loadable.
+    #[serde(default)]
+    pub resume: bool,
     /// bd-p4oc strict vacuous gate: refuse 0-test VERIFY (also FLYWHEEL_VERIFY_STRICT=1)
     #[serde(default)]
     pub strict: bool,
@@ -929,6 +938,14 @@ pub struct ReadyBead {
     /// by wave order). `br ready --json` / `br list --json` emit them.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// bd-wave-gate-typed-authority-27et: br's typed `wave` field
+    /// (`br create --wave N` / `br update --wave N`) — the wave-order
+    /// authority since schema-18. `br ready` itself holds every higher wave
+    /// until all lower waves close, so the typed field is what a live wave
+    /// advance actually follows. `None` when unset, and also on the
+    /// `br list` read path, which does not project the field.
+    #[serde(default)]
+    pub wave: Option<u32>,
     /// bd-4spn: the bead's priority (0=P0 … 3=P3). Default 3 (exempt) so a
     /// missing field in a foreign br JSON never gates a bead.
     #[serde(default = "default_priority")]
@@ -959,6 +976,7 @@ impl Default for ReadyBead {
             assignee: None,
             verify: None,
             labels: Vec::new(),
+            wave: None,
             priority: 3,
             principles: String::new(),
             updated_at: None,
@@ -1099,18 +1117,35 @@ pub fn parse_principles_field(description: &str) -> String {
     out.join("\n").trim().to_string()
 }
 
-/// Parse a bead's `wave-N` label into its wave number (bd-gnej). A bead
-/// carrying `wave-3` → `Some(3)`. No wave label → `None` (no gating).
-pub fn bead_wave(b: &ReadyBead) -> Option<u32> {
-    b.labels
-        .iter()
-        .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()))
+/// The typed `wave` field from a br JSON row (bd-wave-gate-typed-authority-27et).
+/// `br ready --json` emits it as a number; `br list` emits `null`. A
+/// non-number reads as `None`, so a malformed value falls back to the legacy
+/// label instead of fabricating a wave. Pure.
+pub fn bead_wave_field(b: &serde_json::Value) -> Option<u32> {
+    b.get("wave")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|w| u32::try_from(w).ok())
 }
 
-/// bd-gnej wave-gate: a bead labeled `wave-N` is HELD while ANY bead with a
-/// `wave-M` label (M<N) is open or in_progress — earlier waves run first.
-/// No wave labels anywhere → no gating (identity). Pure — the single
-/// decision both dispatch paths (sync loop + durable loop) share.
+/// A bead's wave number. bd-wave-gate-typed-authority-27et: br's TYPED
+/// `wave` field is the authority (schema-18 shipped; `br ready` gates by it
+/// natively) — the legacy `wave-N` label is read only as the fallback, for
+/// beads that predate the field and for the `br list` path, which does not
+/// project it. When both are present the typed value wins, so a stale label
+/// can never overrule the tracker. No wave → `None` (no gating).
+pub fn bead_wave(b: &ReadyBead) -> Option<u32> {
+    b.wave.or_else(|| {
+        b.labels
+            .iter()
+            .find_map(|l| l.strip_prefix("wave-").and_then(|n| n.parse::<u32>().ok()))
+    })
+}
+
+/// bd-gnej wave-gate: a bead in wave N (typed `wave` field first, `wave-N`
+/// label fallback — [`bead_wave`]) is HELD while ANY bead with a lower wave
+/// (M<N) is open or in_progress — earlier waves run first. No wave anywhere
+/// → no gating (identity). Pure — the single decision both dispatch paths
+/// (sync loop + durable loop) share.
 pub fn wave_gate_held(ready: &[ReadyBead], inprogress: &[ReadyBead]) -> Vec<String> {
     // Lowest wave among ALL open/in-progress beads. A ready bead is held iff
     // its wave is strictly higher than that floor.
@@ -1130,15 +1165,13 @@ pub fn wave_gate_held(ready: &[ReadyBead], inprogress: &[ReadyBead]) -> Vec<Stri
 }
 
 /// ADR-0006 D2 wave-scoped dispatch (`loop run --work --wave-label wave-N`):
-/// the ready set is `br ready` ∩ labels containing exactly `label`, AND a
-/// hold ASSERT when any open (ready, unclaimed) or in_progress bead carries
-/// `wave-M` with M < N — earlier waves run to completion first. The error
+/// the ready set is `br ready` scoped to wave N via [`bead_wave`] — the
+/// TYPED `wave` field is the authority (bd-wave-gate-typed-authority-27et;
+/// schema-18 has shipped), the legacy `wave-N` label the fallback — AND a
+/// hold ASSERT when any open (ready, unclaimed) or in_progress bead has
+/// wave-M with M < N — earlier waves run to completion first. The error
 /// names every blocking bead so the operator sees the full hold. Pure —
 /// shared by both dispatch paths.
-///
-// TODO(beads ADR-0001 schema-18): label parsing here is TRANSITIONAL. When
-// beads ships the typed `wave` field in ready JSON, read that field and keep
-// this label path only as fallback (ADR-0006 §D2).
 pub fn wave_scope_filter(
     ready: &[ReadyBead],
     inprogress: &[ReadyBead],
@@ -1165,7 +1198,7 @@ pub fn wave_scope_filter(
     }
     Ok(ready
         .iter()
-        .filter(|b| b.labels.iter().any(|l| l == label))
+        .filter(|b| bead_wave(b) == Some(wave_n))
         .cloned()
         .collect())
 }
@@ -1508,14 +1541,32 @@ pub struct LoopRunVerifyArgs {
     pub strict: bool,
 }
 
+/// The verdict row's timestamp, read from injected authority.
+///
+/// A free function rather than an inline call so the leaf body holds no
+/// ambient read at all (the `bd_lf1u` guard scans leaf bodies) and so the
+/// conversion is testable against a fixed clock.
+fn verdict_at(authority: &crate::authority::RuntimeAuthority) -> chrono::DateTime<chrono::Utc> {
+    authority.now_datetime()
+}
+
 /// Checkpointed leaf — close-detect loop-run VERIFY (cheap band): the LOOP
 /// is the verifier. Executes the bead's VERIFY (TIMEBOX timeout, cargo under
 /// the build slot), then IN-PROCESS (armed) writes the machine receipt and
 /// records `command-verified`. Non-zero exit / timeout -> failed-head marker
 /// (NEVER re-verify the same broken head) + reopen. Returns
 /// `{band: loop-runnable|non-runnable, recorded?|reopened?}`.
+///
+/// bd-lf1u: takes `&Info` and stamps the verdict row's `at` from the
+/// INJECTED authority rather than sampling `chrono::Utc::now()`. That row is
+/// durable DATA — a replay re-reads it — so ambient time made the recorded
+/// proof depend on when the replay happened. The SDK's `LeafWithInfo` kind is
+/// the seam: `&Info` as the first parameter leaves the durable args (and the
+/// replay key built from them) untouched, because `&Info` is supplied by the
+/// runtime and is not serialized.
 #[function]
-async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
+async fn loop_run_verify(info: &Info, args: LoopRunVerifyArgs) -> Result<Value> {
+    let authority = info.get_dependency::<crate::authority::RuntimeAuthority>();
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
     cmd.args(["__loop-run-verify", &args.project, &args.bead_id]);
@@ -1639,7 +1690,7 @@ async fn loop_run_verify(args: LoopRunVerifyArgs) -> Result<Value> {
                     kind: crate::verdict::VerdictKind::CommandVerified,
                     bead_id: args.bead_id.clone(),
                     sha: sha.clone(),
-                    at: chrono::Utc::now(),
+                    at: verdict_at(&authority),
                     actor: crate::verdict::AgentName::new("flywheel-toron-loop1"),
                     receipt_path,
                     verify_cmd,
@@ -2130,6 +2181,15 @@ async fn run_leaf_cmd_bounded(
             let _ = err.read_to_string(&mut buf);
             buf
         });
+        // bd-lf1u classification: this monotonic read is a HOST-side deadline
+        // on a real subprocess, not a decision input, so it is deliberately NOT
+        // migrated to an injected clock. The child runs in real time; polling a
+        // supplied clock would never advance relative to it, so the watchdog
+        // would either never fire or fire immediately. Same class as a
+        // `timeout` wrapped around a live effect: the bound is part of the
+        // effect, so it must be measured in real time. What the lens forbids is
+        // an ambient read feeding a DURABLE RESULT; `Instant::now()` here only
+        // decides when to stop waiting, and nothing it selects is recorded.
         let deadline = std::time::Instant::now() + watchdog;
         let status = loop {
             match child.try_wait() {
@@ -2187,6 +2247,214 @@ async fn run_leaf_cmd_bounded(
 /// the leaf must poll the project passed in the loop args — never a default.
 pub fn poll_swarm_argv(project: &str, to: &str) -> Vec<String> {
     vec!["__poll".to_string(), project.to_string(), to.to_string()]
+}
+
+/// bd-swarm-loop-durable-panic-atlo: consecutive failed `--once` passes that
+/// stop `loop-mode supervise` with one actionable line.
+pub const SUPERVISE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// argv for one supervised pass (pure; the CLI spawns it as a child process
+/// so a crashed pass cannot kill the supervisor). Deliberately NO `--force`:
+/// a crashed pass leaves a DEAD pid entry which the next pass replaces
+/// silently, while a LIVE loop still owns the project — the pass must refuse
+/// loudly instead of taking the project over.
+pub fn supervise_pass_argv(project: &str, work: bool, to: &str) -> Vec<String> {
+    let mut args = vec![
+        "loop-mode".to_string(),
+        "run".to_string(),
+        project.to_string(),
+        "--once".to_string(),
+        "--to".to_string(),
+        to.to_string(),
+    ];
+    if work {
+        args.push("--work".to_string());
+    }
+    args
+}
+
+/// Consecutive-failed-pass accounting for supervise: a success resets the
+/// count, a non-zero pass exit accumulates. Pure so the stop rule is tested.
+pub fn supervise_failure_count(success: bool, consecutive: u32) -> u32 {
+    if success {
+        0
+    } else {
+        consecutive.saturating_add(1)
+    }
+}
+
+/// bd-supervise-dead-stop-escalation-rweq: default dead-stop window (minutes).
+/// A dead stop older than this with work remaining pages the captain.
+pub const DEAD_STOP_DEFAULT_MINUTES: u64 = 45;
+
+/// Which dead stop was observed. Both are "no artifact movement past the
+/// window with work remaining"; they differ in what the panes claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadStopKind {
+    /// No pane reads Busy — the fleet is silent.
+    SilentPanes,
+    /// Pane(s) read Busy but nothing has moved: a working verdict alone is not
+    /// progress (a pane can sit hours inside a hang and still say working).
+    StuckWorking,
+}
+
+/// One supervise dead-stop probe. Pure inputs so the verdict is testable
+/// without a live fleet, repo, or clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadStopInputs {
+    /// any bead not closed/done (ready or in_progress)
+    pub work_remaining: bool,
+    /// herdr pins were readable. False → the fleet is UNKNOWABLE; never alarm
+    /// blind (a degraded read is neither calm nor a stall).
+    pub fleet_knowable: bool,
+    pub any_pane_working: bool,
+    /// seconds since the newest commit; None when git is absent or the repo
+    /// has no commit (never a fabricated "very old" age)
+    pub last_commit_age_secs: Option<u64>,
+    pub stall_secs: u64,
+    /// this stall has already paged once — do not page again, do not stay loud
+    pub already_escalated: bool,
+}
+
+/// The supervise dead-stop decision (bd-supervise-dead-stop-escalation-rweq).
+///
+/// `Clear` is emitted when work moved inside the window (the caller resets its
+/// escalated flag, so a SECOND stall can be reported); `Escalate` fires exactly
+/// once per stall; `Hold` is every pass after that until the fleet recovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadStopAction {
+    /// Not a stall: either no work left, or a commit landed inside the window.
+    Clear,
+    /// A stall cannot be judged (no commit history, or an unreadable fleet).
+    Wait,
+    /// First sighting of this stall — emit ONE loud line and page once.
+    Escalate(DeadStopKind),
+    /// Already escalated this stall — stay silent (not one page per pass).
+    Hold,
+}
+
+pub fn dead_stop_action(i: &DeadStopInputs) -> DeadStopAction {
+    if !i.work_remaining {
+        return DeadStopAction::Clear;
+    }
+    if !i.fleet_knowable {
+        return DeadStopAction::Wait;
+    }
+    match i.last_commit_age_secs {
+        // A commit inside the window is movement: the fleet is working.
+        Some(age) if age < i.stall_secs => DeadStopAction::Clear,
+        Some(_) => {
+            if i.already_escalated {
+                DeadStopAction::Hold
+            } else if i.any_pane_working {
+                DeadStopAction::Escalate(DeadStopKind::StuckWorking)
+            } else {
+                DeadStopAction::Escalate(DeadStopKind::SilentPanes)
+            }
+        }
+        // No commit history → cannot judge; never alarm blind.
+        None => DeadStopAction::Wait,
+    }
+}
+
+/// Fatal-error markers a harness PARKS on when a turn dies and will not
+/// recover by itself. Observed (2026-10-06): all five panes wedged for ~2h on
+/// `opencode-go` HTTP 400 with a reasoning-replay refusal; each turn failed
+/// silently, CPU at 0, no commits, no mail. Matched against the pane's LAST
+/// non-empty output line, so a marker that merely scrolled past a working pane
+/// is not a wedge.
+pub const WEDGE_ERROR_MARKERS: &[&str] = &[
+    "reasoning replay",
+    "api error",
+    "api_error",
+    "rate limit",
+    "too many requests",
+    "unauthorized",
+    "forbidden",
+    "insufficient",
+    "quota",
+];
+
+/// The pane's parked error line: its last non-empty output line when that line
+/// carries a fatal marker. `None` when the tail is empty or the last line is
+/// ordinary output. Bounded, so a page stays one line. Pure.
+pub fn parked_error_line(recent_output: &str) -> Option<String> {
+    let last = recent_output.lines().rev().find(|l| !l.trim().is_empty())?;
+    let lower = last.to_ascii_lowercase();
+    WEDGE_ERROR_MARKERS.iter().find(|m| lower.contains(*m))?;
+    Some(last.trim().chars().take(300).collect())
+}
+
+/// One pane's wedge evidence. Pure inputs so the verdict is testable without a
+/// live fleet, a herdr socket, or a clock.
+#[derive(Debug, Clone)]
+pub struct PaneWedgeInputs<'a> {
+    pub pin: &'a str,
+    pub pane_id: &'a str,
+    /// herdr's process probe: `Some(true)` = the agent process is ALIVE — the
+    /// wedge shape (a pane whose process exited is `recover`'s job, never this
+    /// probe's); `None` = inconclusive, never judged.
+    pub process_alive: Option<bool>,
+    /// the pane's recent terminal text; `None` = unreadable, never judged.
+    pub recent_output: Option<&'a str>,
+    /// seconds since the newest commit; `None` when git is absent or the repo
+    /// has no commit (never a fabricated "very old" age).
+    pub last_commit_age_secs: Option<u64>,
+    /// the no-movement window in seconds
+    pub quiet_secs: u64,
+}
+
+/// The pane-wedge decision. `Page` is emitted on the FIRST sighting of a
+/// wedge; `Hold` is every later pass while it persists — one page per wedge,
+/// never one per pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneWedgeAction {
+    /// not wedged, or not judgeable
+    Quiet,
+    /// first sighting — emit ONE loud line and page once
+    Page {
+        pin: String,
+        pane_id: String,
+        error: String,
+    },
+    /// already paged this wedge — stay silent
+    Hold,
+}
+
+/// bd-pane-wedge-detect-respawn-pnyi: is this pane WEDGED — alive but making
+/// no progress because it is parked on a fatal error?
+///
+/// The bead asks for "zero-CPU plus error output". herdr exposes no CPU
+/// counter (`pane.process_info` lists processes only), so the observable
+/// equivalent is used and named honestly: the agent process is still UP (a
+/// dead one is `recover`'s job) AND the newest commit is older than the
+/// window. An unreadable pane, an inconclusive process probe, a repo with no
+/// commit history, and a tail whose last line is ordinary output all read
+/// `Quiet` — a wedge alarm must never fire blind.
+pub fn pane_wedge_action(i: &PaneWedgeInputs<'_>, already_paged: bool) -> PaneWedgeAction {
+    if i.process_alive != Some(true) {
+        return PaneWedgeAction::Quiet;
+    }
+    let Some(tail) = i.recent_output else {
+        return PaneWedgeAction::Quiet;
+    };
+    let Some(error) = parked_error_line(tail) else {
+        return PaneWedgeAction::Quiet;
+    };
+    match i.last_commit_age_secs {
+        Some(age) if age >= i.quiet_secs => {}
+        // A commit inside the window is movement, and no history is not
+        // evidence of a stall.
+        _ => return PaneWedgeAction::Quiet,
+    }
+    if already_paged {
+        return PaneWedgeAction::Hold;
+    }
+    PaneWedgeAction::Page {
+        pin: i.pin.to_string(),
+        pane_id: i.pane_id.to_string(),
+        error,
+    }
 }
 
 #[function]
@@ -2410,6 +2678,8 @@ pub fn parse_bead_list(v: &serde_json::Value, what: &str) -> anyhow::Result<Vec<
                         .collect()
                 })
                 .unwrap_or_default(),
+            // bd-wave-gate-typed-authority-27et: the typed `wave` field.
+            wave: bead_wave_field(b),
             // bd-4spn: priority for the PRINCIPLES dispatch gate; the
             // `## PRINCIPLES` section from the description (fall back to a
             // direct `principles` field if the br shape carries one).
@@ -2553,49 +2823,90 @@ pub fn build_brief(
     project: &str,
     resume: bool,
 ) -> std::result::Result<String, BriefError> {
+    let full = fill_brief(id, title, project, resume);
+    if full.len() <= DISPATCH_PROMPT_CAP {
+        return Ok(full);
+    }
+    // Over the cap: DEGRADE to the pointer brief (bd-dispatch-cap-conditioning-l7jh).
+    // Never truncate the full brief, never drop the dispatch.
+    let pointer = pointer_brief(id, project, resume);
+    if pointer.len() <= DISPATCH_PROMPT_CAP {
+        return Ok(pointer);
+    }
+    Err(BriefError {
+        bytes: pointer.len(),
+    })
+}
+
+/// Fill the full brief template. No cap check here — [`build_brief`] owns the
+/// degrade decision.
+fn fill_brief(id: &str, title: &str, project: &str, resume: bool) -> String {
     let goal = if resume {
         format!("Resume {id}: {title}")
     } else {
         format!("Execute {id}: {title}")
     };
-    let brief = BRIEF_TEMPLATE
+    BRIEF_TEMPLATE
         .replace("{goal}", &goal)
         .replace("{id}", id)
-        .replace("{project}", project);
-    if brief.len() > DISPATCH_PROMPT_CAP {
-        return Err(BriefError { bytes: brief.len() });
-    }
-    Ok(brief)
+        .replace("{project}", project)
+}
+
+/// The pointer brief (bd-dispatch-cap-conditioning-l7jh): the degraded form
+/// used when the full brief cannot fit the dispatch cap together with the
+/// agent's conditioning (behavior preamble + skills prefix). It names the
+/// bead, the `br show` read path that carries the full acceptance criteria,
+/// and the report contract — everything else is reachable, not embedded.
+/// Never truncated, and the `GOAL ` first line keeps the claim-watch bead-id
+/// extractor working ([`bead_id_from_prompt`]).
+pub fn pointer_brief(id: &str, project: &str, resume: bool) -> String {
+    let verb = if resume { "Resume" } else { "Execute" };
+    POINTER_TEMPLATE
+        .replace("{verb}", verb)
+        .replace("{id}", id)
+        .replace("{project}", project)
 }
 
 /// The brief template (ADR-0019 Spec 2 fields). `{id}` / `{goal}` /
 /// `{project}` are filled by [`build_brief`]; `{AGENT_NAME}` is substituted
 /// at dispatch time (plan_actions) so the state-file path is concrete.
 const BRIEF_TEMPLATE: &str = r#"GOAL {goal}.
-SCOPE may-write: only paths you hold an exclusive reservation on (reason={id}); may-not-write: everything else — no scope leak.
-CONTEXT pointers only (never paste file contents): bead {id} description (acceptance criteria + ## VERIFY fence); thread-id {id} for peer mail; .flywheel/agent-state/{AGENT_NAME}.json (state file); .flywheel/receipts/ (verification receipts).
-ACCEPTANCE close only when every acceptance criterion in the bead description holds — one checkable criterion per line in the close reason.
+SCOPE may-write only paths you hold an exclusive reservation on (reason={id}); anything else is may-not-write — no scope leak.
+CONTEXT pointers only, never paste file contents: br show {id} (acceptance criteria + ## VERIFY fence); thread-id {id}; state .flywheel/agent-state/{AGENT_NAME}.json; receipts .flywheel/receipts/.
+ACCEPTANCE close only when every acceptance criterion holds — one checkable line per criterion in the close reason.
 VERIFY run the bead's ## VERIFY command from its description; include its stdout in the REPORT. No ## VERIFY fence → say so explicitly; never substitute a whole-workspace matrix script.
-TIMEBOX about 90 minutes; on expiry return partial findings + deviations — never silently extend.
-FORBIDDEN DO NOT create new beads — report scope gaps in the thread, not as new beads. Never force-unlock a peer's reservation. No worktree. Stay inside SCOPE.
-REPORT status; commit sha (commit BEFORE close; the bead id {id} IN the commit message); verdict kind; what you actually ran; deviations; PRINCIPLES cited. After closing, mail the captain on thread_id={id} with subject [{id}] done and a BODY carrying the same REPORT fields (status, sha, verdict, the VERIFY command + result tail, deviations, PRINCIPLES) — one report, two channels: the close reason is the durable copy, the mail is the captain's copy. The captain has no push channel.
-PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only, no leaf text. REQUIRED for priority <= 2 beads — a name with no decision clause is a skip (cargo-cult citation; the reviewer marks the report incomplete).
-STANDING {project}/.flywheel/standing-orders.md layered on ~/.config/flywheel/standing-orders.md — the lifecycle (claim → reserve → announce → execute → verify → close → sync → commit) lives there; referenced BY PATH ONLY, never pasted here.
-DIRT POLICY only dirt under source/, tests/, benches/, Cargo.toml, Cargo.lock, and pinned toolchain files blocks a receipt. Tracker state (.beads/), orchestrator bookkeeping (.flywheel/), and editor artifacts are always-allowed dirt — note them in the receipt and proceed; anything else dirty: post-and-stop (bd-brief-dirt-policy-jfwa).
-CONTRACTS renew your own file reservations while working (toron `renew_file_reservations` — extend the TTL before it lapses; the orchestrator cannot renew on your behalf). When a message has ack_required=true, call `acknowledge_message` after acting on it — the orchestrator cannot ack on your behalf. If your session context usage exceeds about 80%: write {"context_pct": <pct>, "ts": "<now RFC3339>"} to .flywheel/agent-state/{AGENT_NAME}.json (best-effort, never block on it), then finish + sync the current bead, then reply exactly CONTEXT_LIMIT so the orchestrator can respawn you."#;
+TIMEBOX ~90 min; expiry → partial findings + deviations, never a silent extension.
+FORBIDDEN DO NOT create new beads — report scope gaps in the thread. Never force-unlock a peer's reservation. No worktree. Stay inside SCOPE.
+REPORT status; commit sha (commit BEFORE close; bead id {id} IN the message); verdict; what you ran; deviations; PRINCIPLES. Then mail the captain thread_id={id}, subject [{id}] done, same fields — one report, two channels (close reason durable; mail = captain's).
+PRINCIPLES each line `<principle-name> — <the decision it changed>`; names only. REQUIRED for priority <= 2 beads — a name with no decision clause is a skip (cargo-cult citation).
+STANDING {project}/.flywheel/standing-orders.md + ~/.config/flywheel/standing-orders.md (lifecycle: claim → reserve → announce → execute → verify → close → sync → commit) — BY PATH ONLY.
+DIRT POLICY dirt outside source/, tests/, benches/, Cargo.toml, Cargo.lock, and pinned toolchains blocks a receipt; .beads/, .flywheel/, and editor artifacts never do (note + proceed); anything else dirty: post-and-stop.
+CONTRACTS renew your own file reservations (toron `renew_file_reservations`; the orchestrator cannot renew on your behalf). When a message has ack_required=true, call `acknowledge_message` after acting — the orchestrator cannot ack on your behalf. Above ~80% context: write {"context_pct": <pct>, "ts": "<now RFC3339>"} to .flywheel/agent-state/{AGENT_NAME}.json (best-effort), finish + sync this bead, reply exactly CONTEXT_LIMIT."#;
+
+/// The pointer brief template: `{verb}` / `{id}` / `{project}` filled by
+/// [`pointer_brief`]. Keep the first line the `GOAL ` form and keep the
+/// `OVER CAP` marker — tests and operators read it as the degradation signal.
+const POINTER_TEMPLATE: &str = r#"GOAL {verb} {id}: full brief OVER CAP — read it with `br show {id}` (acceptance criteria + ## VERIFY fence).
+SCOPE may-write only paths you hold an exclusive reservation on (reason={id}).
+VERIFY run the bead's ## VERIFY command; REPORT status, commit sha (bead id {id} IN the commit message), verdict, what you ran, deviations, PRINCIPLES cited; then mail the captain on thread_id={id}, subject [{id}] done.
+STANDING {project}/.flywheel/standing-orders.md (lifecycle) — by path only.
+FORBIDDEN no new beads; never force-unlock a peer's reservation; no worktree; stay inside SCOPE. Above ~80% context → CONTEXT_LIMIT per standing orders."#;
 
 /// Convenience wrapper for call sites that must produce a brief as a plain
-/// String (sync-loop queue refresh). Over-cap is a LOOP BUG — panic loudly,
-/// never truncate (ADR-0019 Spec 2).
+/// String (sync-loop queue refresh). Over-cap degrades to the pointer brief;
+/// only a bead id too large for even the pointer form panics (ADR-0019
+/// Spec 2 loop bug).
 pub fn brief(id: &str, title: &str, project: &str, resume: bool) -> String {
-    build_brief(id, title, project, resume)
-        .expect("bead brief over dispatch cap (ADR-0019 Spec 2 loop bug)")
+    build_brief(id, title, project, resume).expect(
+        "bead brief cannot fit the dispatch cap even as a pointer (ADR-0019 Spec 2 loop bug)",
+    )
 }
 
-/// Queue a filled brief for a dispatched bead, or surface the loop bug
-/// loudly if the brief cannot fit the dispatch cap (ADR-0019 Spec 2: over
-/// cap fails loud, never silent truncation). `front` = re-queue at the head
-/// (claim-watch re-dispatches must stay ahead of fresh beads).
+/// Queue a filled brief for a dispatched bead. Over-cap degrades to the
+/// pointer brief inside [`build_brief`]; only the pathological case — an id
+/// so large even the pointer cannot fit — fails loud here (ADR-0019 Spec 2).
+/// `front` = re-queue at the head (claim-watch re-dispatches must stay ahead
+/// of fresh beads).
 fn queue_brief(
     queue: &mut Vec<String>,
     id: &str,
@@ -2913,6 +3224,222 @@ pub fn clear_stale_landed_for_idle(project: &str, invocation: &str, states: &[Ag
     if records.len() != before {
         let _ = crate::state::save_last_sent(project, &records);
     }
+}
+
+/// bd-resume-window-lease-sweep-4sa2: default resume window (15 min). The loop
+/// re-resumed the same in-progress bead every pass (~2 min) and every pane
+/// answered with a stand-down commit — churn, not progress. One resume per
+/// (bead, pane) inside this window; the watermark is persisted so it survives
+/// across passes and processes (the in-memory `assigned` set resets per run).
+pub const RESUME_WINDOW_DEFAULT_SECS: u64 = 900;
+
+/// Has this pane already been resumed for this bead inside the window?
+/// `last_resumed_us` is the persisted watermark (None = never resumed here).
+pub fn within_resume_window(last_resumed_us: Option<i64>, now_us: i64, window_secs: u64) -> bool {
+    match last_resumed_us {
+        Some(t) => now_us.saturating_sub(t) < (window_secs as i64).saturating_mul(1_000_000),
+        None => false,
+    }
+}
+
+/// A DIFFERENT live pane holds a reservation whose reason is this bead — a lane
+/// split mid-flight, not a stall, so resuming would collide. `reservations` are
+/// `(reason, holder)` pairs; a reservation's reason IS the bead id. An empty
+/// holder (an unstamped peer row) never counts as a peer.
+pub fn peer_held(bead_id: &str, reservations: &[(String, String)], self_pane: &str) -> bool {
+    reservations
+        .iter()
+        .any(|(reason, holder)| reason == bead_id && !holder.is_empty() && holder != self_pane)
+}
+
+/// Should the loop resume this (bead, pane) now? Suppressed inside the window
+/// and whenever a peer holds the bead's paths.
+pub fn should_resume_bead(
+    last_resumed_us: Option<i64>,
+    now_us: i64,
+    window_secs: u64,
+    peer_holds: bool,
+) -> bool {
+    !peer_holds && !within_resume_window(last_resumed_us, now_us, window_secs)
+}
+
+/// Leases to release because their reason bead is CLOSED — the pure rule behind
+/// the per-pass sweep (`reserve sweep --closed-beads` equivalent). `leases` are
+/// `(handle, reason_bead_id)` pairs; the handle is what the release call needs
+/// (a path pattern here). An empty closed set, or a lease whose reason is still
+/// open, is kept. Pure so the shipped sweep and its test cannot disagree.
+pub fn closed_reason_lease_ids(
+    leases: &[(String, String)],
+    closed_beads: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    leases
+        .iter()
+        .filter(|(_, reason)| !reason.is_empty() && closed_beads.contains(reason))
+        .map(|(handle, _)| handle.clone())
+        .collect()
+}
+
+/// bd-loop-feeds-idle-panes-rh2z: how many consecutive passes a pane may be
+/// starved — idle while its own stalled bead sits inside the resume window —
+/// before the idle-pane rotation exempts it. Two passes at the supervisor's
+/// 60s cadence is ~2 min of silence before the second nudge; the observed
+/// incident was 5 idle panes and 17 in-progress beads with zero sends for
+/// several passes, because the window (correctly) suppressed the repeat
+/// resume and nothing else fed the panes.
+pub const IDLE_PANE_EXEMPT_AFTER_PASSES: u32 = 2;
+
+/// Inputs to [`idle_pane_rotation`]. A struct (not eight positional args) so
+/// the call site names each fleet fact it passes.
+pub struct IdleRotationInputs<'a> {
+    /// Every live pane pin — the OWNER set. A bead a live pane owns is never
+    /// handed to a different pane.
+    pub live_pins: &'a [String],
+    /// The idle subset of `live_pins`, in fleet order. The rotation emits at
+    /// most one bead per entry, in this order — the caller keeps that order in
+    /// the dispatch queue so the positional pairing lands each pick on the
+    /// pane that chose it.
+    pub idle_pins: &'a [String],
+    /// In-progress beads (`br list --status in_progress`).
+    pub in_progress: &'a [ReadyBead],
+    /// Dispatchable ready beads, already narrowed by the wave gate + scope —
+    /// the rotation must not widen what the caller's filters held back.
+    pub ready: &'a [ReadyBead],
+    /// Live `(reason, holder)` reservation pairs.
+    pub peers: &'a [(String, String)],
+    /// Bead ids already queued this pass — never handed out twice.
+    pub taken: &'a [String],
+    /// Pane pin → consecutive starved passes (`state::load_pane_starvation`).
+    pub starved: &'a BTreeMap<String, u32>,
+    /// `(bead, pane)` → last-resume epoch µs (`state::load_resume_window`).
+    pub resume_window: &'a BTreeMap<String, i64>,
+    pub now_us: i64,
+    pub window_secs: u64,
+    /// Window exemptions after this many consecutive starved passes. 0 =
+    /// the window never gates an idle pane's own stalled work.
+    pub exempt_after_passes: u32,
+}
+
+/// One bead handed to one idle pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationPick {
+    pub pin: String,
+    pub bead: String,
+    /// True when the resume window was bypassed by the starvation exemption.
+    pub exempt: bool,
+}
+
+/// The rotation's output: the picks (in idle-pane order) and the starvation
+/// counters the caller persists for the next pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RotationPlan {
+    pub picks: Vec<RotationPick>,
+    /// Pane pin → consecutive starved passes. Every idle pane is represented
+    /// (0 = fed, unarmed, or never gated), so the caller can store the map as
+    /// the whole fleet's snapshot.
+    pub starved_after: BTreeMap<String, u32>,
+}
+
+/// bd-loop-feeds-idle-panes-rh2z: the idle-pane rotation.
+///
+/// The resume window stops the loop re-nudging a pane that is slow but alive.
+/// Left alone that suppression can idle the whole fleet while stalled beads
+/// sit unclaimed. Each idle pane now takes ONE bead, the first tier that
+/// matches:
+///
+/// 1. its own stalled in-progress bead (the window-gated tier),
+/// 2. a ready bead already assigned to it,
+/// 3. an unowned ready bead,
+/// 4. any other ready bead whose assignee is not a live pane.
+///
+/// Never a bead another live pane owns, never one a peer holds a reservation
+/// on (`peers` — a lane split, not a stall), never one already queued
+/// (`taken`), and never the same bead twice. A tier-1 hit inside the resume
+/// window still defers, for `exempt_after_passes` consecutive starved passes;
+/// from that pass the pick is marked `exempt` and the caller resumes it. A
+/// pane whose own stall is still gated takes NOTHING this pass — handing it
+/// unrelated free work would fork a lane that is merely slow, and the
+/// starvation counter is exactly what shortens that wait.
+///
+/// Pure: the clock arrives as `now_us`, the window as a map, no I/O.
+pub fn idle_pane_rotation(inputs: &IdleRotationInputs<'_>) -> RotationPlan {
+    let mut plan = RotationPlan::default();
+    // Ids already queued, extended with each pick, so no bead goes out twice.
+    let mut handed: BTreeSet<String> = inputs.taken.iter().cloned().collect();
+    let live: BTreeSet<&str> = inputs.live_pins.iter().map(String::as_str).collect();
+
+    for pin in inputs.idle_pins {
+        // (1) own stalled work — the only window-gated tier.
+        let own = inputs.in_progress.iter().find(|b| {
+            b.assignee.as_deref() == Some(pin.as_str())
+                && !handed.contains(&b.id)
+                && !peer_held(&b.id, inputs.peers, pin)
+        });
+        if let Some(b) = own {
+            let last = inputs
+                .resume_window
+                .get(&crate::state::resume_key(&b.id, pin))
+                .copied();
+            if !within_resume_window(last, inputs.now_us, inputs.window_secs) {
+                handed.insert(b.id.clone());
+                plan.starved_after.insert(pin.clone(), 0);
+                plan.picks.push(RotationPick {
+                    pin: pin.clone(),
+                    bead: b.id.clone(),
+                    exempt: false,
+                });
+                continue;
+            }
+            // Still inside the window. The pane is starved only while its own
+            // work stays suppressed; after N such passes the exemption fires.
+            let passes = inputs.starved.get(pin).copied().unwrap_or(0);
+            if passes >= inputs.exempt_after_passes {
+                handed.insert(b.id.clone());
+                plan.starved_after.insert(pin.clone(), 0);
+                plan.picks.push(RotationPick {
+                    pin: pin.clone(),
+                    bead: b.id.clone(),
+                    exempt: true,
+                });
+            } else {
+                plan.starved_after
+                    .insert(pin.clone(), passes.saturating_add(1));
+            }
+            continue;
+        }
+
+        // (2)-(4): free work. `free` carries the ownership rule — a bead
+        // assigned to another LIVE pane is that pane's, ready or not; an
+        // assignee that is gone is an orphan claim, not an owner.
+        let free = |b: &ReadyBead| {
+            !handed.contains(&b.id)
+                && !peer_held(&b.id, inputs.peers, pin)
+                && match b.assignee.as_deref() {
+                    None => true,
+                    Some(a) => a == pin.as_str() || !live.contains(a),
+                }
+        };
+        let pick = inputs
+            .ready
+            .iter()
+            .find(|b| b.assignee.as_deref() == Some(pin.as_str()) && free(b))
+            .or_else(|| {
+                inputs
+                    .ready
+                    .iter()
+                    .find(|b| b.assignee.is_none() && free(b))
+            })
+            .or_else(|| inputs.ready.iter().find(|b| free(b)));
+        plan.starved_after.insert(pin.clone(), 0);
+        if let Some(b) = pick {
+            handed.insert(b.id.clone());
+            plan.picks.push(RotationPick {
+                pin: pin.clone(),
+                bead: b.id.clone(),
+                exempt: false,
+            });
+        }
+    }
+    plan
 }
 
 /// Escalation tier for a blocked agent (bd-blocked-escalation-protocol, A6).
@@ -3844,29 +4371,50 @@ pub struct RenewFilteredArgs {
     pub extend_seconds: u64,
 }
 
-#[function]
-async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
-    if args.paths.is_empty() {
-        return Ok(json!({ "renewed": 0, "paths": [] }));
-    }
-    let cfg = Config::load().map_err(map_err)?;
-    let mail = crate::backend::mail_backend(&cfg).map_err(|e| map_err(anyhow::anyhow!("{e}")))?;
-    let key = crate::utf8_path(&crate::project_dir(&cfg, &args.project), "project path")
-        .map_err(map_err)?;
+/// The renew leaf's synchronous body: one mail block that must run OFF the
+/// durable loop's async worker. Split out so the acceptance test can drive
+/// the real block through the bridge on a runtime
+/// (`loop_mode_durable_survives_reclaim`) instead of a copy of it.
+fn renew_filtered_sync(
+    project: &str,
+    paths: &[String],
+    extend_seconds: u64,
+) -> anyhow::Result<Value> {
+    let cfg = Config::load()?;
+    let mail = crate::backend::mail_backend(&cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let key = crate::utf8_path(&crate::project_dir(&cfg, project), "project path")?;
     let _ = crate::backend::run_mail(mail.ensure_project(&key));
     let agent = cfg
         .agent_mail
         .as_ref()
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "flywheel".to_string());
-    let v = crate::backend::run_mail(mail.renew_reservations(
-        &key,
-        &agent,
-        &args.paths,
+    let v = crate::backend::run_mail(mail.renew_reservations(&key, &agent, paths, extend_seconds))
+        .map_err(|e| anyhow::anyhow!("mail backend: {e}"))?;
+    Ok(json!({ "renewed": v.renewed, "paths": paths }))
+}
+
+#[function]
+async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
+    if args.paths.is_empty() {
+        return Ok(json!({ "renewed": 0, "paths": [] }));
+    }
+    // bd-swarm-loop-durable-panic-atlo: this leaf body runs on the durable
+    // loop's tokio worker, where `run_mail`'s shared-runtime block_on panics
+    // ("Cannot start a runtime from within a runtime") — observed once per
+    // poll, before every dispatch. The whole sync mail block moves to a
+    // blocking thread through the async-safe bridge; there block_on is the
+    // documented thread→runtime bridge (backend::run_mail_off_runtime).
+    let (project, paths, extend_seconds) = (
+        args.project.clone(),
+        args.paths.clone(),
         args.extend_seconds,
-    ))
-    .map_err(|e| map_err(anyhow::anyhow!("mail backend: {e}")))?;
-    Ok(json!({ "renewed": v.renewed, "paths": args.paths }))
+    );
+    crate::backend::run_mail_off_runtime(move || {
+        renew_filtered_sync(&project, &paths, extend_seconds)
+    })
+    .await
+    .map_err(map_err)
 }
 
 /// Args for the [`release_bead_locks`] leaf.
@@ -4523,6 +5071,12 @@ pub enum WaitReason {
     Blocked,
     /// the bead serialized behind another in-flight bead's reservation
     Overlap,
+    /// bd-claim-watch-durable-signals-mixy: the bead itself is held by a
+    /// live toron reservation (reason == bead id) — a durable peer claim.
+    /// Redispatch arms wait for the lease to lapse; tracker nudges still
+    /// fire (claim hygiene + close escalation), but no second executor is
+    /// dispatched over live work.
+    LiveLease,
     /// the bead is a wave-N labeled bead held while an earlier wave-M (M<N)
     /// is still open/in_progress (bd-gnej) — not a stuck owner, the loop
     /// waits for the earlier wave to close
@@ -4691,6 +5245,16 @@ pub fn drain_prompt(bead_id: &str) -> String {
 /// reservation (ADR-0019 Spec 3.4). An overlap wait is NOT a stuck owner —
 /// no claim nudge, no close nudge, no resume re-dispatch; the wait reason is
 /// recorded and the loop waits for the holder to release.
+///
+/// bd-claim-watch-durable-signals-mixy: `live_leases` = bead ids with a
+/// live toron reservation on the active board (`reason == bead id`). The
+/// REDISPATCH arms (Bead/Resume) are suppressed while a live lease exists —
+/// the reserve-before-work lifecycle makes the lease the durable "work is
+/// taken" record, visible even when the angle's mail is silent or its pane
+/// is a non-herdr harness that `states` cannot see. The tracker nudges
+/// (claim/close) still fire: they target the bead's own lane, never a
+/// second executor. Consultation order: live lease → assignee pane state →
+/// mail guard (the dispatch scan the loop runs on redispatch).
 pub fn claim_watch_step(
     watch: &mut std::collections::HashMap<String, ClaimWatch>,
     ready: &[ReadyBead],
@@ -4698,6 +5262,7 @@ pub fn claim_watch_step(
     states: &[AgentState],
     nudge_after_polls: u32,
     overlap: &std::collections::HashSet<String>,
+    live_leases: &std::collections::HashSet<String>,
 ) -> Vec<ClaimWatchAction> {
     let mut actions = Vec::new();
     let mut drop = Vec::new();
@@ -4709,6 +5274,7 @@ pub fn claim_watch_step(
         wave_gate_held(ready, inprogress).into_iter().collect();
     for (bead_id, cw) in watch.iter_mut() {
         let waiting_on_overlap = overlap.contains(bead_id);
+        let waiting_on_lease = live_leases.contains(bead_id);
         let in_ready = ready.iter().find(|b| b.id == *bead_id);
         let claimed = inprogress.iter().find(|b| b.id == *bead_id);
         let waiting_on_wave = wave_held.contains(bead_id);
@@ -4761,6 +5327,15 @@ pub fn claim_watch_step(
                     }
                     // settled (idle/done) or agent gone → redispatch
                     _ => {
+                        // bd-claim-watch-durable-signals-mixy: a live lease
+                        // for THIS bead is a durable peer claim (the
+                        // reserve-before-work lifecycle) — never dispatch a
+                        // second executor over it; the lease lapsing
+                        // releases the hold on a later poll.
+                        if waiting_on_lease {
+                            cw.wait_reason = Some(WaitReason::LiveLease);
+                            continue;
+                        }
                         drop.push(bead_id.clone());
                         actions.push(ClaimWatchAction::RedispatchBead {
                             bead_id: bead_id.clone(),
@@ -4795,6 +5370,15 @@ pub fn claim_watch_step(
                             bead_id: bead_id.clone(),
                             title: cb.title.clone(),
                         });
+                    } else if waiting_on_lease {
+                        // bd-claim-watch-durable-signals-mixy: the close
+                        // nudge went to the assignee; the Resume arm waits
+                        // for the lease to lapse (observed incident: GOAL
+                        // Resume re-sent every pass while an unexpired
+                        // exclusive lease held the bead). close_polls does
+                        // not advance here — a lapsed lease gets a fresh
+                        // countdown before the resume fires.
+                        cw.wait_reason = Some(WaitReason::LiveLease);
                     } else {
                         cw.close_polls += 1;
                         if cw.close_polls >= nudge_after {
@@ -5099,6 +5683,119 @@ pub fn blocking_inprogress<'a>(
         .collect()
 }
 
+/// Every input the reclaim decision may consult, built once per reclaim pass
+/// by the `__reclaim-stranded` leaf. The decision itself is pure — it only
+/// reads these sets (bd-reclaim-liveness-not-spelling-hn8b).
+pub struct ReclaimWorld<'a> {
+    /// Every name a LIVE pane answers to: the polled herdr names the loop
+    /// passed, plus each registry row's `name` and `mail_identity` when its
+    /// pane is still listed.
+    pub live_identities: &'a std::collections::HashSet<String>,
+    /// Spawn-registry rows, used to resolve an assignee spelling to its pane.
+    pub registry: &'a [crate::state::SpawnEntry],
+    /// Pane ids herdr lists right now.
+    pub live_panes: &'a std::collections::HashSet<String>,
+    /// Bead ids carrying a live reservation; the lease is proof of life.
+    pub leased_beads: &'a std::collections::HashSet<String>,
+}
+
+/// Why a bead is reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimReason {
+    /// No assignee and no lease — nobody holds it (bd-qk9q).
+    Unowned,
+    /// The assignee resolves to a registry pane herdr no longer lists.
+    DeadPane,
+}
+
+/// Why a bead is NOT reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimHold {
+    /// A live reservation for the bead itself (reason = bead id).
+    LiveLease,
+    /// The assignee resolves to a pane herdr lists right now.
+    LivePane,
+    /// No pane evidence either way — never race an unproven-dead worker.
+    UnknownIdentity,
+}
+
+impl ReclaimReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unowned => "unowned",
+            Self::DeadPane => "dead pane",
+        }
+    }
+}
+
+impl ReclaimHold {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveLease => "live lease",
+            Self::LivePane => "live pane",
+            Self::UnknownIdentity => "unknown identity",
+        }
+    }
+}
+
+/// The reclaim decision outcome (typed, so call sites cannot string-match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimDecision {
+    Reclaim { reason: ReclaimReason },
+    Keep { reason: ReclaimHold },
+}
+
+/// The reclaim decision for one in_progress bead: reclaim only when the
+/// evidence proves the worker cannot be on it.
+///
+/// The old predicate compared the assignee SPELLING against a name list, so a
+/// live claim written under any other name for the same agent (herdr slug vs
+/// pin vs registry row) read as stranded and got re-opened mid-work — racing
+/// the worker and resetting its claim every poll. This resolves the assignee
+/// through the registry to its pane and asks herdr. Kept under any of these
+/// proofs, in order: live lease on the bead, the assignee matches a live
+/// identity, or the assignee resolves to a live pane. An unresolvable spelling
+/// is KEPT: absence of evidence is not evidence of death.
+pub fn reclaim_decision(
+    bead_id: &str,
+    assignee: Option<&str>,
+    world: &ReclaimWorld<'_>,
+) -> ReclaimDecision {
+    if world.leased_beads.contains(bead_id) {
+        return ReclaimDecision::Keep {
+            reason: ReclaimHold::LiveLease,
+        };
+    }
+    let Some(assignee) = assignee else {
+        return ReclaimDecision::Reclaim {
+            reason: ReclaimReason::Unowned,
+        };
+    };
+    if world.live_identities.contains(assignee) {
+        return ReclaimDecision::Keep {
+            reason: ReclaimHold::LivePane,
+        };
+    }
+    let entry = world
+        .registry
+        .iter()
+        .find(|e| e.name == assignee || e.mail_identity.as_deref() == Some(assignee));
+    match entry {
+        Some(e) if !e.pane_id.is_empty() && world.live_panes.contains(&e.pane_id) => {
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::LivePane,
+            }
+        }
+        Some(e) if !e.pane_id.is_empty() => ReclaimDecision::Reclaim {
+            reason: ReclaimReason::DeadPane,
+        },
+        // A paneless registry row cannot prove death OR life; keep.
+        Some(_) | None => ReclaimDecision::Keep {
+            reason: ReclaimHold::UnknownIdentity,
+        },
+    }
+}
+
 /// Adaptive poll cadence: fast while the swarm is busy, slow when settled.
 ///
 /// A dispatch this iteration (`dispatched`) forces the active cadence: the
@@ -5345,6 +6042,37 @@ fn blind_completion_count(complete_now: bool, leaf_failed: bool, consecutive: u3
         consecutive.saturating_add(1)
     } else {
         0
+    }
+}
+
+/// bd-swarm-loop-durable-panic-atlo: the outcome marker a RESUMED invocation
+/// returns when the stale-checkpoint signature trips. `run_durable_loop` sees
+/// it, starts one fresh invocation, and the operator gets one loud line.
+pub const STALE_CHECKPOINT_DEGRADE: &str = "stale-checkpoint-degrade";
+
+/// bd-swarm-loop-durable-panic-atlo: what the blind-completion door does once
+/// [`blind_completion_count`] reaches the abort threshold (pure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindCompletion {
+    /// Below the threshold — keep polling (the WARN prints each pass).
+    Continue,
+    /// Threshold on a RESUMED invocation: its checkpointed leaf results no
+    /// longer fit this binary. Degrade to a fresh run instead of aborting.
+    DegradeFresh,
+    /// Threshold on a fresh run: nothing to degrade to. Abort with the fix.
+    Abort,
+}
+
+/// Pure: the blind-completion outcome for (resumed, failures, threshold).
+/// A resumed invocation degrades to a fresh run; only a fresh invocation
+/// (which cannot be replaying stale checkpoints) aborts.
+pub fn blind_completion_outcome(resumed: bool, failures: u32, threshold: u32) -> BlindCompletion {
+    if failures < threshold {
+        BlindCompletion::Continue
+    } else if resumed {
+        BlindCompletion::DegradeFresh
+    } else {
+        BlindCompletion::Abort
     }
 }
 
@@ -6014,7 +6742,10 @@ pub fn spawn_graph_vehicle(
 
 #[function]
 async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
-    let authority = crate::authority::RuntimeAuthority::resolve();
+    // bd-0fvb: the host edge resolves the authority once and injects it;
+    // the durable function reads it from the invocation context, so a
+    // replay never re-resolves ambient process state behind the checkpoint.
+    let authority = ctx.get_dependency::<crate::authority::RuntimeAuthority>();
     // bd-bpd9: beads whose graph vehicle was already spawned this process.
     let mut graph_invoked: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ADR-0026 W2: loop-identity fail-loud — hard-error at start if no usable key
@@ -6647,6 +7378,24 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 let in_flight: Vec<String> = inprog.iter().map(|b| b.id.clone()).collect();
                 bead_overlap_waits(&board, &in_flight)
             };
+            // bd-claim-watch-durable-signals-mixy: bead ids held by a LIVE
+            // toron reservation (reason == bead id) — the durable "work is
+            // taken" record, consulted BEFORE pane state and the mail guard.
+            // The reservation board is the reserve-before-work lifecycle's
+            // own ledger; an unexpired lease means an executor is attached
+            // even when its pane is idle between turns or lives on a harness
+            // `states` cannot see.
+            let live_leases: std::collections::HashSet<String> = board
+                .iter()
+                .filter_map(|(_, reason)| {
+                    let r = reason.trim();
+                    if r.is_empty() {
+                        None
+                    } else {
+                        Some(r.to_string())
+                    }
+                })
+                .collect();
             let serialize_all = always_serialize_held(&board);
             // ADR-0025 reclaim: pane-exited gate (step 0) + stale tick (7200/86400)
             {
@@ -6669,7 +7418,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         }
                     }
                 }
-                let now_secs = chrono::Utc::now().timestamp();
+                let now_secs = authority.now_unix() as i64;
                 // ADR-0025 / ADR-0016: thresholds ride the loop params
                 // (serialized with the invocation) so a replay reclaims by
                 // the same policy the original run used.
@@ -6857,6 +7606,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 &states,
                 params.claim_nudge_after_polls,
                 &overlap,
+                &live_leases,
             );
             for a in watch_actions {
                 match a {
@@ -7270,7 +8020,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         }
         // bd-cy0s: tick stall detection — bead in_progress + pane listed + idle past threshold
         {
-            let now_secs = chrono::Utc::now().timestamp();
+            let now_secs = authority.now_unix() as i64;
             let threshold = params.pane_stall_secs;
             let inprog_for_stall: Vec<ReadyBead> = if params.work {
                 // reuse already-fetched inprog_for_renew if available, else fetch
@@ -7360,7 +8110,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         swarm.states = states.clone();
         // done_mailed + heal_states deliberately untouched: they persist on
         // swarm across polls (seeded from ActiveLoop at startup).
-        let now = chrono::Utc::now().timestamp() as u64;
+        let now = authority.now_unix();
         let fold = |swarm: &mut LoopModel,
                     ws_msg: crate::workspace::Msg,
                     journal: LoopMsg|
@@ -8361,16 +9111,30 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             );
             if critical_leaf_failed_this_iter {
                 complete_holds = 0;
-                if blind_complete_failures >= DEFAULT_LEAF_FAILURE_ABORT_POLLS {
-                    return Err(map_err(anyhow::anyhow!(
-                        "loop abort: {blind_complete_failures} consecutive critical-leaf failures while the world looked empty (poll_events/poll_swarm/poll_ready/poll_inprogress/expected-replies). This is the stale-checkpoint signature — a previous binary's checkpointed leaf results no longer deserialize. Re-run with --force to reject the stale invocation and start fresh."
-                    )));
+                match blind_completion_outcome(
+                    params.resume,
+                    blind_complete_failures,
+                    DEFAULT_LEAF_FAILURE_ABORT_POLLS,
+                ) {
+                    BlindCompletion::Continue => {
+                        eprintln!(
+                            "flywheel: WARN {blind_complete_failures}/{} consecutive critical-leaf failures with an empty world — refusing to declare complete while blind (stale checkpointed invocation?).",
+                            DEFAULT_LEAF_FAILURE_ABORT_POLLS
+                        );
+                        wait_secs = params.active_interval_secs.clamp(5, 30);
+                    }
+                    BlindCompletion::DegradeFresh => {
+                        eprintln!(
+                            "flywheel: {blind_complete_failures} consecutive critical-leaf failures with an empty world on a RESUMED invocation — the checkpointed leaf results do not fit this binary (stale-checkpoint signature). Degrading to a fresh run; checkpoints are not replayed."
+                        );
+                        return Ok(STALE_CHECKPOINT_DEGRADE.to_string());
+                    }
+                    BlindCompletion::Abort => {
+                        return Err(map_err(anyhow::anyhow!(
+                            "loop abort: {blind_complete_failures} consecutive critical-leaf failures while the world looked empty (poll_events/poll_swarm/poll_ready/poll_inprogress/expected-replies) — the loop cannot see the tracker or the swarm. Fix: `flywheel loop-mode doctor --fix` (diagnose loop infrastructure), then re-run."
+                        )));
+                    }
                 }
-                eprintln!(
-                    "flywheel: WARN {blind_complete_failures}/{} consecutive critical-leaf failures with an empty world — refusing to declare complete while blind (stale checkpointed invocation?); aborting after the threshold. Re-run with --force.",
-                    DEFAULT_LEAF_FAILURE_ABORT_POLLS
-                );
-                wait_secs = params.active_interval_secs.clamp(5, 30);
             } else {
                 complete_holds += 1;
                 if complete_holds > params.drain_grace_polls {
@@ -8424,11 +9188,16 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // result → serialization errors) and cross-project dispatch. A
     // per-project group scopes the worker to its own task.
     let base = params.project.rsplit('/').next().unwrap_or(&params.project);
+    // bd-0fvb: resolve the host authority ONCE here and inject it into the
+    // durable world — swarm_loop takes it from the invocation context, so
+    // the checkpointed function never resolves ambient process state.
+    let authority = crate::authority::RuntimeAuthority::resolve();
     let resonate = Resonate::new(ResonateConfig {
         url: Some(url.clone()),
         group: Some(format!("flywheel-{base}")),
         ..Default::default()
-    });
+    })
+    .with_dependency(authority.clone());
 
     resonate
         .register(swarm_loop)
@@ -8518,40 +9287,54 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         .register(respawn_agent)
         .map_err(|e| anyhow::anyhow!("register respawn_agent: {e}"))?;
 
-    // Resume semantics: the persisted invocation id is reused while its promise
-    // is still pending (crash resume); once it settles (complete/blocked/failed),
-    // a fresh id starts a new run. SDK 0.6.0 does not support version-based
-    // re-invocation, so ids must change.
+    // Resume semantics (bd-swarm-loop-durable-panic-atlo): resuming a pending
+    // invocation is OPT-IN via --resume. A pending promise at start belongs to
+    // a DEAD owner (the pid registry refuses two live loops), so an automatic
+    // resume replays a killed run's checkpoints against the current binary's
+    // leaf shapes — the serialization storm this bead fixes. Default: start
+    // FRESH and let the stale sweep reject the zombie; --resume replays it;
+    // --force starts fresh and rejects it explicitly (bd-e131 takeover).
+    // SDK 0.6.0 does not support version-based re-invocation, so ids change.
     //
-    // bd-bvwf.4/bd-e131 force-takeover: with --force the loop REJECTS a stale
-    // pending invocation instead of resuming it. A killed loop (SIGKILL/crash)
-    // never settles its promise — it stays pending on the server, and a plain
-    // resume REPLAYS the killed run's checkpointed state (stranded beads, no
-    // agent knowledge from the fresh spawn) instead of starting clean. --force
-    // means "take over deliberately" — fresh state, not a zombie replay.
-    // (stale-loop clearing happens after the id is chosen, below, so the
-    // resumed invocation itself is preserved — bd-87hq.)
     // bd-6si7: the host edge is the ONE place allowed to read the clock, and
     // it reads it once, then hands the value down. Every leaf below is
     // therefore a pure function of its arguments plus this stamp.
-    let now_nanos = crate::authority::RuntimeAuthority::resolve()
-        .clock
-        .now_nanos();
-    let id = match crate::state::load_active_loop(&params.project)? {
-        Some(al) if !params.force && promise_pending(&resonate, &al.id).await? => {
-            eprintln!("flywheel: resuming existing loop {}", dim_id(&al.id));
-            al.id
-        }
-        Some(al) if params.force && promise_pending(&resonate, &al.id).await? => {
+    // bd-0fvb: stamped from the same authority instance that was injected.
+    let now_nanos = authority.clock.now_nanos();
+    let prior = crate::state::load_active_loop(&params.project)?;
+    let prior_pending = match &prior {
+        Some(al) => promise_pending(&resonate, &al.id).await?,
+        None => false,
+    };
+    let start = loop_start_decision(prior_pending, params.force, params.resume);
+    // the workflow body must know whether THIS invocation resumed — the
+    // stale-checkpoint degrade keys off it
+    params.resume = start == LoopStart::Resume;
+    let mut id = match (start, prior) {
+        (LoopStart::Resume, Some(al)) => {
             eprintln!(
-                "flywheel: --force rejecting stale loop invocation {} (fresh run)",
+                "flywheel: resuming existing loop {} (--resume)",
                 dim_id(&al.id)
             );
-            let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
-                "rejected": "force-takeover",
-            }))
-            .unwrap_or_default();
-            let _ = resonate.promises.reject(&al.id, v).await;
+            al.id
+        }
+        (LoopStart::Fresh, Some(al)) if prior_pending => {
+            if params.force {
+                eprintln!(
+                    "flywheel: --force rejecting stale loop invocation {} (fresh run)",
+                    dim_id(&al.id)
+                );
+                let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
+                    "rejected": "force-takeover",
+                }))
+                .unwrap_or_default();
+                let _ = resonate.promises.reject(&al.id, v).await;
+            } else {
+                eprintln!(
+                    "flywheel: previous loop invocation {} is still pending but its run is dead — starting FRESH (checkpoints are NOT replayed; pass --resume to replay the killed run)",
+                    dim_id(&al.id)
+                );
+            }
             fresh_loop_id(
                 &params.project,
                 &serde_json::to_value(&params)?,
@@ -8576,23 +9359,49 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // `flywheel loop run` is safe, not only --force.
     clear_stale_loop_invocations(&resonate, base, Some(&id)).await;
 
-    // the workflow must know its own invocation id for the last-sent registry
-    // (bd-resume-dedup filters records to the SAME invocation)
-    params.invocation = id.clone();
-
-    // bd-bvwf.4: verify ownership right before the durable run — a newer
-    // process may have taken over the pid registry while this one resolved
-    // its invocation; the loser must never resume the same promise (two
-    // loops = double sends).
+    // bd-bvwf.4: verify ownership before the durable run — a newer process may
+    // have taken over the pid registry while this one resolved its
+    // invocation; the loser must never run it (two loops = double sends).
     crate::state::ensure_loop_owner(&params.project)?;
 
-    let task = resonate.run(&id, swarm_loop, params.clone());
-    let result: String = task
-        .await
-        .map_err(|e| anyhow::anyhow!("durable loop invocation failed: {e}"))?;
-
-    let _ = resonate.stop().await;
-    Ok(result)
+    // bd-swarm-loop-durable-panic-atlo: a resumed invocation whose replay hits
+    // the stale-checkpoint signature returns STALE_CHECKPOINT_DEGRADE instead
+    // of aborting; take it over with ONE fresh invocation. The fresh run
+    // cannot replay stale checkpoints, so a second marker means the
+    // environment (tracker/swarm) is genuinely unreadable — abort.
+    let mut can_degrade = start == LoopStart::Resume;
+    loop {
+        // the workflow must know its own invocation id for the last-sent
+        // registry (bd-resume-dedup filters records to the SAME invocation)
+        params.invocation = id.clone();
+        let task = resonate.run(&id, swarm_loop, params.clone());
+        let result: String = task
+            .await
+            .map_err(|e| anyhow::anyhow!("durable loop invocation failed: {e}"))?;
+        if result == STALE_CHECKPOINT_DEGRADE {
+            if can_degrade {
+                eprintln!(
+                    "flywheel: invocation {} hit the stale-checkpoint signature — starting a FRESH run; checkpoints are not replayed",
+                    dim_id(&id)
+                );
+                can_degrade = false;
+                params.resume = false;
+                id = fresh_loop_id(
+                    &params.project,
+                    &serde_json::to_value(&params)?,
+                    "swarm-loop",
+                    authority.clock.now_nanos(),
+                )?;
+                continue;
+            }
+            let _ = resonate.stop().await;
+            anyhow::bail!(
+                "loop is blind on a fresh run (critical leaf failures with an empty world) — fix: `flywheel loop-mode doctor --fix`, then re-run"
+            );
+        }
+        let _ = resonate.stop().await;
+        return Ok(result);
+    }
 }
 
 fn dim_id(id: &str) -> String {
@@ -8620,6 +9429,34 @@ fn fresh_loop_id(
     )?;
     Ok(fresh)
 }
+
+/// bd-swarm-loop-durable-panic-atlo: how a durable loop start treats a
+/// persisted active-loop invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopStart {
+    /// Start a fresh invocation id. A pending prior is rejected by the
+    /// stale sweep (or explicitly, with --force).
+    Fresh,
+    /// Reuse the pending invocation and replay its checkpoints (--resume).
+    Resume,
+}
+
+/// Pure start decision: resuming a dead run's checkpoints is OPT-IN.
+///
+/// bd-swarm-loop-durable-panic-atlo: a pending invocation whose owner process
+/// is gone is a zombie — replaying its checkpointed leaf results against the
+/// current binary's leaf shapes storms serialization errors (measured on
+/// elm-effect-rs). So a pending prior with no explicit `--resume` starts
+/// FRESH; `--force` also starts fresh (and rejects the prior explicitly, the
+/// bd-e131 takeover). No pending prior → always fresh.
+pub fn loop_start_decision(prior_pending: bool, force: bool, resume: bool) -> LoopStart {
+    if force || !prior_pending || !resume {
+        LoopStart::Fresh
+    } else {
+        LoopStart::Resume
+    }
+}
+
 /// Does a durable-promise id belong to `base`'s loop invocations? Both the
 /// durable and engine loops build their invocation id via `fresh_loop_id`,
 /// which uses the project's last path segment (`base`) — so ids are exactly
@@ -9687,15 +10524,30 @@ mod tests {
         assert!(!id_is_project_loop("wf-graph-fanout-1", "toron"));
     }
 
-    /// bd-6si7: the fresh-id leaf is a PURE function of its inputs plus the
-    /// injected stamp. Two calls with the same stamp MUST produce the same
-    /// id (replay determinism) and the source must not name a clock at all —
-    /// a leaf that samples time is neither replayable nor substitutable.
+    /// bd-6si7: the fresh-id leaf derives its id from its inputs plus the
+    /// INJECTED stamp, never from a clock it samples. Two calls with the same
+    /// stamp MUST produce the same id (replay determinism).
+    ///
+    /// Scope, stated honestly: the RETURNED id is a pure function of its
+    /// inputs. The call is not side-effect free -- `fresh_loop_id` persists an
+    /// active-loop sidecar and stamps that record with `now_iso()`. That stamp
+    /// is an observation on the record, not an input to the id, which is why
+    /// determinism still holds. An earlier version of this comment claimed the
+    /// source "must not name a clock at all"; nothing enforced that, and it
+    /// was not true.
+    ///
+    /// Hermetic by construction: the sidecar goes to `XDG_STATE_HOME`, so this
+    /// test points that at a per-run uuid directory. It previously created a
+    /// `fw-fresh-<pid>` directory, never pointed the state dir at it, and so
+    /// wrote to the SHARED real loops dir -- a latent flake under parallel
+    /// execution, and ambient state in a unit test besides. `lock_env`
+    /// serialises the env mutation, and the uuid keeps parallel runs apart (a
+    /// pid is identical for every test in one binary).
     #[test]
     fn fresh_loop_id_is_a_pure_function_of_its_stamp() {
-        let dir = std::env::temp_dir().join(format!("fw-fresh-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _g = crate::config::lock_env();
+        let dir = std::env::temp_dir().join(format!("fw-fresh-mt-{}", uuid::Uuid::new_v4()));
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
         let project = "ns/loopproj";
         let params = serde_json::json!({"project": project});
 
@@ -9999,6 +10851,17 @@ mod tests {
         }
     }
 
+    /// bd-wave-gate-typed-authority-27et: rb + ONLY the typed field — the
+    /// schema-18 shape a `br create --wave N` bead has (NO `wave-N` label).
+    fn rb_typed(id: &str, wave: u32) -> ReadyBead {
+        ReadyBead {
+            id: id.into(),
+            verify: Some("true".into()),
+            wave: Some(wave),
+            ..Default::default()
+        }
+    }
+
     // ---- bd-gnej: wave-gate (wave-N label ordering) -----------------------
 
     /// A wave-2 bead is HELD while a wave-1 bead is open/in_progress —
@@ -10151,6 +11014,72 @@ mod tests {
         assert_eq!(ids, vec!["bd-w2b"], "{ids:?}");
     }
 
+    // ---- bd-wave-gate-typed-authority-27et: typed wave is the authority ----
+
+    /// Acceptance: the gate reads the TYPED `wave` field. A hold and a
+    /// release driven by beads carrying NO `wave-N` label at all — the
+    /// schema-18 shape. Proven red by making `bead_wave` label-only.
+    #[test]
+    fn wave_gate_reads_typed_field() {
+        let ready = vec![rb_typed("bd-w1", 1), rb_typed("bd-w3", 3)];
+        let inprog: Vec<ReadyBead> = Vec::new();
+        let held = wave_gate_held(&ready, &inprog);
+        assert_eq!(
+            held,
+            vec!["bd-w3"],
+            "typed wave 3 is held while typed wave 1 is open: {held:?}"
+        );
+        // wave-1 closes: its row drops out of ready AND in_progress.
+        let ready = vec![rb_typed("bd-w3", 3)];
+        assert!(
+            wave_gate_held(&ready, &inprog).is_empty(),
+            "typed wave 3 releases when typed wave 1 closes"
+        );
+        // An in-progress lower typed wave also holds.
+        let inprog = vec![rb_typed("bd-w1", 1)];
+        assert_eq!(wave_gate_held(&ready, &inprog), vec!["bd-w3"]);
+    }
+
+    /// The typed field beats a conflicting legacy label — labels are legacy,
+    /// and a stale label must never overrule the tracker.
+    #[test]
+    fn typed_wave_beats_conflicting_label() {
+        let mut b = rb_typed("bd-x", 1);
+        b.labels = vec!["wave-2".into()];
+        assert_eq!(bead_wave(&b), Some(1), "typed field is the authority");
+    }
+
+    /// Legacy label beads still gate (migration fallback): no typed field ->
+    /// the `wave-N` label decides, exactly as before.
+    #[test]
+    fn label_wave_still_gates_without_typed_field() {
+        assert_eq!(bead_wave(&rb_wave("bd-legacy", 2)), Some(2));
+    }
+
+    /// `bead_wave_field` reads a numeric `wave` and refuses a malformed one
+    /// (so a bad value falls back to the label, never fabricates a wave).
+    #[test]
+    fn bead_wave_field_parses_numbers_only() {
+        assert_eq!(bead_wave_field(&serde_json::json!({"wave": 3})), Some(3));
+        assert_eq!(bead_wave_field(&serde_json::json!({"wave": null})), None);
+        assert_eq!(bead_wave_field(&serde_json::json!({"wave": "3"})), None);
+        assert_eq!(bead_wave_field(&serde_json::json!({})), None);
+    }
+
+    /// `--wave-label wave-2` SCOPE reads the typed field too (selection, not
+    /// just the hold): typed-wave rows are dispatched with no label present,
+    /// and a lower typed wave blocks with its id named.
+    #[test]
+    fn wave_scope_selects_typed_wave() {
+        let ready = vec![rb_typed("bd-w2", 2), rb_typed("bd-w3", 3)];
+        let scoped = wave_scope_filter(&ready, &[], "wave-2").expect("no lower wave open");
+        let ids: Vec<&str> = scoped.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-w2"], "{ids:?}");
+        let err = wave_scope_filter(&ready, &[rb_typed("bd-w1", 1)], "wave-2")
+            .expect_err("lower typed wave open");
+        assert!(err.contains("bd-w1"), "must name the blocker: {err}");
+    }
+
     /// A bead held by a NON-live assignee (captain, dead agent, unknown
     /// identity) is stranded — reclaim it.
     #[test]
@@ -10225,6 +11154,80 @@ mod tests {
         assert!(
             !stranded_beads(&inprog, &live).is_empty(),
             "they ARE stranded"
+        );
+    }
+
+    /// bd-reclaim-liveness-not-spelling-hn8b: the reclaim decision resolves
+    /// the assignee through the registry to its PANE and asks whether that
+    /// pane is live, instead of comparing spelling against a name list. A
+    /// live pane is kept under any of its names; a proven-dead pane is
+    /// reclaimed; a live lease on the bead keeps it even when the pane is
+    /// gone; and a spelling with no pane evidence is kept — never race a
+    /// worker whose death is unproven.
+    #[test]
+    fn reclaim_requires_dead_pane() {
+        use std::collections::HashSet;
+        fn set(items: &[&str]) -> HashSet<String> {
+            items.iter().map(|s| s.to_string()).collect()
+        }
+        let registry = vec![
+            crate::state::SpawnEntry::with_mail_identity("pane-a", "crew-x-coder", "SilverPond"),
+            crate::state::SpawnEntry::with_mail_identity(
+                "pane-dead",
+                "crew-x-nurse",
+                "SlateHerder",
+            ),
+        ];
+        let live_panes = set(&["pane-a"]);
+        let live_identities = set(&["crew-x-coder", "SilverPond"]);
+        let leased = set(&["bd-lease"]);
+        let world = ReclaimWorld {
+            live_identities: &live_identities,
+            registry: &registry,
+            live_panes: &live_panes,
+            leased_beads: &leased,
+        };
+        // live pane + herdr-name assignee -> keep
+        assert_eq!(
+            reclaim_decision("bd-herdr", Some("crew-x-coder"), &world),
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::LivePane
+            }
+        );
+        // live pane + pin assignee -> keep
+        assert_eq!(
+            reclaim_decision("bd-pin", Some("SilverPond"), &world),
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::LivePane
+            }
+        );
+        // dead pane -> reclaim
+        assert_eq!(
+            reclaim_decision("bd-dead", Some("SlateHerder"), &world),
+            ReclaimDecision::Reclaim {
+                reason: ReclaimReason::DeadPane
+            }
+        );
+        // live lease -> keep even though the pane is dead
+        assert_eq!(
+            reclaim_decision("bd-lease", Some("SlateHerder"), &world),
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::LiveLease
+            }
+        );
+        // unowned, no lease -> reclaim (bd-qk9q)
+        assert_eq!(
+            reclaim_decision("bd-unowned", None, &world),
+            ReclaimDecision::Reclaim {
+                reason: ReclaimReason::Unowned
+            }
+        );
+        // no pane evidence either way -> keep
+        assert_eq!(
+            reclaim_decision("bd-ghost", Some("ghost"), &world),
+            ReclaimDecision::Keep {
+                reason: ReclaimHold::UnknownIdentity
+            }
         );
     }
 
@@ -10796,30 +11799,80 @@ mod tests {
         }
     }
 
-    /// ADR-0019 Spec 2: the dispatched prompt (behavior + brief) has a hard
-    /// cap; over it is a LOOP BUG — fail loud, never silent truncation.
+    /// ADR-0019 Spec 2, amended by bd-dispatch-cap-conditioning-l7jh: over
+    /// the cap the dispatch DEGRADES to the pointer brief — never a drop,
+    /// never a silent truncation. Only a bead id so large it cannot fit even
+    /// the pointer form fails loud.
     #[test]
-    fn brief_cap_enforced_fails_loud() {
+    fn brief_cap_degrades_to_pointer() {
         let huge = "x".repeat(8192);
-        let err = build_brief("bd-1", &huge, "flywheel", false).unwrap_err();
+        let p = build_brief("bd-1", &huge, "flywheel", false).expect("degrades, not errors");
         assert!(
-            err.bytes > DISPATCH_PROMPT_CAP,
-            "over-cap brief reports its size"
+            p.len() <= DISPATCH_PROMPT_CAP,
+            "pointer fits: {} bytes",
+            p.len()
         );
+        assert!(p.contains("OVER CAP"), "pointer announces the degradation");
+        assert!(p.contains("br show bd-1"), "pointer names the read path");
+        let absurd = "b".repeat(DISPATCH_PROMPT_CAP + 64);
+        let err = build_brief(&absurd, "t", "flywheel", false).unwrap_err();
+        assert!(err.bytes > DISPATCH_PROMPT_CAP);
     }
 
-    /// The cap boundary: a brief landing exactly ON the cap is legal; one
-    /// byte more is a loud error.
+    /// The cap boundary: a full brief landing exactly ON the cap is legal;
+    /// one byte more degrades to the pointer (still ≤ cap), never a drop.
     #[test]
-    fn brief_cap_boundary() {
+    fn brief_cap_boundary_degrades() {
         let base = build_brief("bd-1", "", "flywheel", false).unwrap();
         let room = DISPATCH_PROMPT_CAP.saturating_sub(base.len());
         let fits = build_brief("bd-1", &"x".repeat(room), "flywheel", false).unwrap();
         assert!(fits.len() <= DISPATCH_PROMPT_CAP);
         assert!(
-            build_brief("bd-1", &"x".repeat(room + 1), "flywheel", false).is_err(),
-            "one byte over the cap fails loud"
+            !fits.contains("OVER CAP"),
+            "boundary brief is still the full one"
         );
+        let over = build_brief("bd-1", &"x".repeat(room + 1), "flywheel", false).unwrap();
+        assert!(
+            over.len() <= DISPATCH_PROMPT_CAP,
+            "degrades, never overshoots"
+        );
+        assert!(over.contains("OVER CAP"), "degraded to the pointer form");
+    }
+
+    /// bd-dispatch-cap-conditioning-l7jh: the cap must size the WHOLE send —
+    /// behavior preamble + skills prefix + brief — and degrade instead of
+    /// killing the loop. The old template filled to ~3.2 KiB with a 38-char
+    /// id, so template + the smallest profile preamble (1357 B) was always
+    /// over the 4 KiB cap; every composed-pane dispatch was rejected and four
+    /// rejects in a row hard-stopped the supervisor.
+    #[test]
+    fn dispatch_cap_accounts_for_conditioning() {
+        // 1) template + the worst built-in preamble (coder 1550 B, with slack
+        //    for the skills prefix) now fits: the full brief is what dispatches.
+        let id = "bd-reclaim-liveness-not-spelling-hn8b"; // 37 chars, report shape
+        let full = build_brief(id, "friction-report title", "proj", false).unwrap();
+        assert!(!full.contains("OVER CAP"), "full brief, not the pointer");
+        assert!(
+            full.len() + 1600 <= DISPATCH_PROMPT_CAP,
+            "brief {} bytes + worst preamble 1600 exceeds cap",
+            full.len()
+        );
+        // 2) with conditioning that cannot fit, the pointer form still fits
+        //    under the same preamble — the shape __send rebuilds on over-cap.
+        let pointer = pointer_brief("bd-dispatch-cap-conditioning-l7jh", "proj", false);
+        assert!(
+            pointer.len() + 1600 <= DISPATCH_PROMPT_CAP,
+            "pointer {} bytes + 1600 conditioning fits",
+            pointer.len()
+        );
+        // 3) one over-cap dispatch degrades the QUEUE entry instead of
+        //    dropping it — the loop survives (no reject, no fail-stop).
+        let mut q: Vec<String> = Vec::new();
+        let title = "y".repeat(DISPATCH_PROMPT_CAP);
+        queue_brief(&mut q, id, &title, "proj", false, false);
+        assert_eq!(q.len(), 1, "over-cap dispatch stays queued (pointer brief)");
+        assert!(q[0].starts_with("GOAL "), "pointer keeps the GOAL contract");
+        assert!(q[0].contains("OVER CAP") && q[0].contains(id));
     }
 
     /// The {AGENT_NAME} placeholder survives the fill — plan_actions
@@ -12039,6 +13092,11 @@ mod tests {
         std::collections::HashSet::new()
     }
 
+    /// An empty live-lease set — the default for legacy claim-watch tests.
+    fn empty_leases() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
     fn bead_id_from_prompt_extracts_goal_execute_and_resume() {
         assert_eq!(
@@ -12116,6 +13174,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert!(actions.is_empty(), "no nudge before threshold: {actions:?}");
         assert_eq!(watch.get("bd-12").unwrap().unclaimed_polls, 1);
@@ -12128,6 +13187,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert_eq!(actions.len(), 1, "{actions:?}");
         match &actions[0] {
@@ -12160,6 +13220,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(
@@ -12194,6 +13255,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert_eq!(actions.len(), 1, "{actions:?}");
         match &actions[0] {
@@ -12218,6 +13280,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert!(actions.is_empty(), "no repeat close nudge: {actions:?}");
 
@@ -12229,12 +13292,146 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(
             matches!(&actions[0], ClaimWatchAction::RedispatchResume { bead_id, title }
                 if bead_id == "bd-12" && title == "fix auth"),
             "{:?}",
+            actions[0]
+        );
+        assert!(watch.is_empty());
+    }
+
+    /// bd-claim-watch-durable-signals-mixy (acceptance): a claimed bead whose
+    /// assignee settled is NOT resume-redispatched while a live toron lease
+    /// holds it — the observed incident re-sent `GOAL Resume` every pass
+    /// over an in_progress bead with an unexpired exclusive lease. The close
+    /// nudge still fires (it targets the assignee's own lane); the resume
+    /// waits, with a fresh countdown, for the lease to lapse.
+    #[test]
+    fn resume_suppressed_by_live_lease() {
+        use std::collections::HashSet;
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![];
+        let inprogress = vec![rb_assignee("bd-12", "fix auth", "oc-1")];
+        let states = vec![st("oc-1", "done")]; // claimed, settled, unclosed
+
+        // First poll: the close nudge fires — the assignee must close or
+        // reopen; the lease does not silence that escalation.
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::NudgeClose { bead_id, .. }
+                if bead_id == "bd-12"),
+            "close nudge still fires: {actions:?}"
+        );
+
+        // The bead is held by a live lease: every later poll is a hold —
+        // no RedispatchResume, watch retained, lease named as the reason.
+        let live: HashSet<String> = HashSet::from(["bd-12".to_string()]);
+        for i in 0..3 {
+            let actions = claim_watch_step(
+                &mut watch,
+                &ready,
+                &inprogress,
+                &states,
+                2,
+                &empty_overlap(),
+                &live,
+            );
+            assert!(
+                actions.is_empty(),
+                "poll {i}: resume suppressed by live lease: {actions:?}"
+            );
+        }
+        assert_eq!(watch["bd-12"].wait_reason, Some(WaitReason::LiveLease));
+        assert_eq!(
+            watch["bd-12"].close_polls, 0,
+            "the resume countdown does not advance under a live lease"
+        );
+        assert!(watch.contains_key("bd-12"), "kept watching");
+
+        // Lease lapsed: fresh countdown, then the resume re-dispatch.
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(actions.is_empty(), "fresh countdown: {actions:?}");
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &inprogress,
+            &states,
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::RedispatchResume { bead_id, title }
+                if bead_id == "bd-12" && title == "fix auth"),
+            "lease lapsed → resume fires: {:?}",
+            actions[0]
+        );
+        assert!(watch.is_empty());
+    }
+
+    /// The unclaimed arm honors the lease too: an agent that settled (or
+    /// vanished) without claiming is not re-dispatched while a live lease
+    /// holds the bead; the hold releases when the lease lapses.
+    #[test]
+    fn redispatch_suppressed_by_live_lease() {
+        use std::collections::HashSet;
+        let mut watch: std::collections::HashMap<String, ClaimWatch> =
+            std::collections::HashMap::new();
+        watch.insert("bd-12".into(), cw("oc-1"));
+        let ready = vec![rb2("bd-12", "fix auth")];
+        let live: HashSet<String> = HashSet::from(["bd-12".to_string()]);
+
+        // settled without claim, lease live → hold
+        let states = vec![st("oc-1", "idle")];
+        let actions =
+            claim_watch_step(&mut watch, &ready, &[], &states, 2, &empty_overlap(), &live);
+        assert!(
+            actions.is_empty(),
+            "no redispatch over a lease: {actions:?}"
+        );
+        assert_eq!(watch["bd-12"].wait_reason, Some(WaitReason::LiveLease));
+
+        // agent gone, lease still live → still hold
+        let actions = claim_watch_step(&mut watch, &ready, &[], &[], 2, &empty_overlap(), &live);
+        assert!(actions.is_empty(), "leash outlives the pane: {actions:?}");
+        assert!(watch.contains_key("bd-12"));
+
+        // lease lapsed → the ordinary redispatch
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
+        assert!(
+            matches!(&actions[0], ClaimWatchAction::RedispatchBead { bead_id, .. }
+                if bead_id == "bd-12"),
+            "lease lapsed → redispatch: {:?}",
             actions[0]
         );
         assert!(watch.is_empty());
@@ -12257,6 +13454,7 @@ mod tests {
             &states,
             2,
             &empty_overlap(),
+            &empty_leases(),
         );
         assert!(
             actions.is_empty(),
@@ -12272,7 +13470,15 @@ mod tests {
         let mut watch: std::collections::HashMap<String, ClaimWatch> =
             std::collections::HashMap::new();
         watch.insert("bd-12".into(), cw("oc-1"));
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
+        let actions = claim_watch_step(
+            &mut watch,
+            &[],
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
         assert!(watch.is_empty(), "closed bead drops from the watch");
         assert!(
             matches!(&actions[0], ClaimWatchAction::ReleaseReservations { bead_id }
@@ -12290,7 +13496,15 @@ mod tests {
         let mut watch: std::collections::HashMap<String, ClaimWatch> =
             std::collections::HashMap::new();
         watch.insert("bd-77".into(), cw("oc-1"));
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
+        let actions = claim_watch_step(
+            &mut watch,
+            &[],
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
         assert_eq!(actions.len(), 1, "one release action: {actions:?}");
         assert!(
             matches!(&actions[0], ClaimWatchAction::ReleaseReservations { bead_id }
@@ -12299,7 +13513,15 @@ mod tests {
             actions[0]
         );
         // Second poll: the entry is gone — no re-fire.
-        let actions = claim_watch_step(&mut watch, &[], &[], &[], 2, &empty_overlap());
+        let actions = claim_watch_step(
+            &mut watch,
+            &[],
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
         assert!(actions.is_empty(), "no repeat release: {actions:?}");
         assert!(watch.is_empty());
     }
@@ -12312,7 +13534,15 @@ mod tests {
             std::collections::HashMap::new();
         watch.insert("bd-12".into(), cw("oc-1"));
         let ready = vec![rb2("bd-12", "fix auth")];
-        let actions = claim_watch_step(&mut watch, &ready, &[], &[], 2, &empty_overlap());
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &[],
+            2,
+            &empty_overlap(),
+            &empty_leases(),
+        );
         assert!(
             matches!(&actions[0], ClaimWatchAction::RedispatchBead { bead_id, .. }
                 if bead_id == "bd-12"),
@@ -12355,6 +13585,202 @@ mod tests {
         assert!(
             src.contains("async fn reservation_board(args: ReservationBoardArgs)"),
             "checkpointed leaf retained for external/detached callers"
+        );
+    }
+
+    /// bd-0fvb: the durable function takes host authority from the invocation
+    /// context (injected once at the host edge via `with_dependency`), never
+    /// resolving or sampling the clock ambiently — an ambient read inside a
+    /// `#[function]` body is the replay-determinism bug the effect law bans.
+    /// Needles reaching into the host region are split so this test's own
+    /// source cannot satisfy them.
+    #[test]
+    fn bd_0fvb_authority_injected_not_ambient() {
+        let src = include_str!("durable.rs");
+        let loop_start = src.find("async fn swarm_loop(").expect("swarm_loop exists");
+        let loop_body = &src[loop_start..];
+        let loop_end = loop_body
+            .find("pub async fn run_durable_loop")
+            .expect("run_durable_loop after swarm_loop");
+        let body = &loop_body[..loop_end];
+        assert!(
+            body.contains(
+                "let authority = ctx.get_dependency::<crate::authority::RuntimeAuthority>();"
+            ),
+            "bd-0fvb: swarm_loop must take RuntimeAuthority from ctx.get_dependency (host DI)"
+        );
+        assert!(
+            !body.contains(&["RuntimeAuthority::", "resolve()"].concat()),
+            "bd-0fvb: no ambient RuntimeAuthority::resolve() inside the durable function"
+        );
+        for ambient in ["chrono::Utc::now", "SystemTime::now", "Instant::now"] {
+            assert!(
+                !body.contains(ambient),
+                "bd-0fvb: the durable function must not sample {ambient} directly"
+            );
+        }
+        let host = &loop_body[loop_end..];
+        let inject = [".with_dependency(", "authority.clone())"].concat();
+        let stamp = ["let now_nanos = authority", ".clock.now_nanos();"].concat();
+        assert!(
+            host.contains(&inject) && host.contains(&stamp),
+            "bd-0fvb: the host edge must inject the resolved authority and stamp time from it"
+        );
+    }
+
+    /// bd-lf1u: every `#[function]` body in this file must take its time from
+    /// INJECTED authority, never from an ambient read.
+    ///
+    /// bd-0fvb closed this for `swarm_loop` alone and guarded it by slicing
+    /// the source between two function names, so the one leaf that still
+    /// stamped durable DATA with wall time (`loop_run_verify`, the
+    /// `command-verified` verdict row) stayed green. This walks every
+    /// `#[function]` body instead: a new leaf cannot regress without the
+    /// guard noticing, wherever it is added.
+    ///
+    /// Two ways a source scan lies about its own extent, both hit while
+    /// writing this, and both fixed here rather than worked around:
+    ///
+    /// 1. Counting braces from the signature runs past the body, because a
+    ///    brace inside a string literal (`format!("{e}")`, `r#"{"ok":true}"#`)
+    ///    counts. The first version walked 2400 lines past `swarm_loop`'s end
+    ///    and reported three violations bd-0fvb had already proven absent. A
+    ///    top-level `fn`'s closing brace is the one at column 0, and rustfmt
+    ///    guarantees every nested one is indented — so the line shape is the
+    ///    reliable signal, not the bracket count.
+    /// 2. Scanning the whole file matches the `#[function]` TEXT inside this
+    ///    module's own fixtures, so the guard's self-test fed it phantom
+    ///    leaves. The scan stops at the first `#[cfg(test)] mod`, which is
+    ///    where test-only code begins; a `#[function]` in a test module is not
+    ///    a leaf the SDK ever registers, so it is not in scope.
+    fn ambient_clock_reads_in_durable_leaves(src: &str) -> Vec<String> {
+        let needles = ["chrono::Utc::now", "SystemTime::now", "Instant::now"];
+        let mut hits = Vec::new();
+        let scan_end = src.find("#[cfg(test)]\nmod ").unwrap_or(src.len());
+        let scan = &src[..scan_end];
+        let mut cursor = 0usize;
+        // `#[function]` may carry other attributes before the signature, so
+        // search forward rather than assuming adjacency.
+        while let Some(attr) = scan[cursor..].find("#[function]") {
+            let after = cursor + attr + "#[function]".len();
+            let Some(sig_off) = scan[after..].find("async fn ") else {
+                break;
+            };
+            let sig_at = after + sig_off;
+            let Some(line_off) = scan[sig_at..].find('\n') else {
+                break;
+            };
+            let sig_line_end = sig_at + line_off;
+            let name = scan[sig_at..sig_line_end]
+                .trim_start_matches("async fn ")
+                .split(['(', '<', ' '])
+                .next()
+                .unwrap_or("<unknown>")
+                .to_string();
+            // Body ends at the next column-0 `}`.
+            let body_end = match scan[sig_line_end..].find("\n}") {
+                Some(p) => sig_line_end + p + 2,
+                None => break,
+            };
+            let body = &scan[sig_line_end..body_end];
+            for needle in needles {
+                if body.contains(needle) {
+                    hits.push(format!("{name}: {needle}"));
+                }
+            }
+            cursor = body_end;
+        }
+        hits
+    }
+
+    #[test]
+    fn bd_lf1u_no_durable_leaf_samples_an_ambient_clock() {
+        let src = include_str!("durable.rs");
+        let hits = ambient_clock_reads_in_durable_leaves(src);
+        assert!(
+            hits.is_empty(),
+            "bd-lf1u: these #[function] bodies read wall time ambiently, which is the \
+             replay-determinism bug the effect law bans. A durable leaf that stamps DATA \
+             must take time from injected authority: add `&Info` as the first parameter \
+             and read `info.get_dependency::<RuntimeAuthority>()`:\n  {}\n\
+             (a host-side deadline on a live subprocess is a different thing and belongs \
+             in a plain helper, never in a #[function] body)",
+            hits.join("\n  ")
+        );
+    }
+
+    /// The scanner is the thing under test, so it gets its own proof. Three
+    /// ways it could be vacuous, each checked: a clean source must come back
+    /// empty, a planted violation must be found AND NAMED, and the extractor
+    /// must not run past a body whose braces live inside string literals —
+    /// the exact defect that made the first version of this guard report three
+    /// violations in a function bd-0fvb had already proven clean.
+    #[test]
+    fn bd_lf1u_leaf_scanner_actually_walks_bodies() {
+        let clean = "#[function]\nasync fn a_leaf(args: A) -> Result<Value> { Ok(json!(1)) }\n";
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(clean),
+            Vec::<String>::new()
+        );
+
+        // Attributes between `#[function]` and the signature must not hide it.
+        let planted = "#[function]\n#[allow(clippy::too_many_arguments)]\nasync fn b_leaf(args: A) -> Result<Value> {\n    let at = chrono::Utc::now();\n    Ok(json!(at))\n}\n";
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(planted),
+            vec!["b_leaf: chrono::Utc::now".to_string()],
+            "the walk must reach a body behind intervening attributes and name it"
+        );
+
+        for (needle, why) in [
+            ("chrono::Utc::now", "wall clock"),
+            ("SystemTime::now", "system time"),
+            ("Instant::now", "monotonic"),
+        ] {
+            let src = format!(
+                "#[function]\nasync fn c_leaf(args: A) -> Result<Value> {{\n    let _ = {needle}();\n    Ok(json!(0))\n}}\n"
+            );
+            assert_eq!(
+                ambient_clock_reads_in_durable_leaves(&src),
+                vec![format!("c_leaf: {needle}")],
+                "the scanner must catch a {why} read"
+            );
+        }
+
+        // The regression that made this guard lie. Braces inside string
+        // literals must not extend the body: a leaf whose last statement is
+        // `format!("{e}")` ends at its own `}`, and the clean leaf that follows
+        // must be scanned as its own body, not swallowed as a continuation.
+        let tricky = concat!(
+            "#[function]\n",
+            "async fn d_leaf(args: A) -> Result<Value> {\n",
+            "    let msg = format!(\"{} {}\", args.a, args.b);\n",
+            "    let raw = r#\"{\"ok\": true}\"#;\n",
+            "    Ok(json!(msg))\n",
+            "}\n",
+            "#[function]\n",
+            "async fn e_leaf(args: A) -> Result<Value> { Ok(json!(1)) }\n",
+        );
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(tricky),
+            Vec::<String>::new(),
+            "string-literal braces must not extend a leaf body past its own closing brace"
+        );
+
+        // A `#[function]` after a test module is out of scope: the SDK never
+        // registers it, and this module's own fixtures carry the attribute as
+        // text, which is how the first version scanned itself.
+        let after_tests = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { let _ = \"#[function]\\nasync fn phantom(a: A) -> Result<Value> {\\n let _ = chrono::Utc::now();\\n\"; }\n}\n";
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(after_tests),
+            Vec::<String>::new(),
+            "test-module code is out of scope, including the #[function] text inside fixtures"
+        );
+
+        let helper = "async fn plain_helper() { let _ = std::time::Instant::now(); }\n";
+        assert_eq!(
+            ambient_clock_reads_in_durable_leaves(helper),
+            Vec::<String>::new(),
+            "a non-#[function] helper is not a durable leaf and must not be flagged"
         );
     }
 
@@ -12446,7 +13872,15 @@ mod tests {
         let overlap: std::collections::HashSet<String> =
             std::collections::HashSet::from(["bd-b".to_string()]);
         // at/over the nudge threshold — still suppressed
-        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 2, &overlap);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &states,
+            2,
+            &overlap,
+            &empty_leases(),
+        );
         assert!(
             actions.is_empty(),
             "no claim nudge for an overlap wait: {actions:?}"
@@ -12469,7 +13903,15 @@ mod tests {
         let states = vec![st("oc-1", "idle")];
         let overlap: std::collections::HashSet<String> =
             std::collections::HashSet::from(["bd-b".to_string()]);
-        let actions = claim_watch_step(&mut watch, &[], &inprogress, &states, 2, &overlap);
+        let actions = claim_watch_step(
+            &mut watch,
+            &[],
+            &inprogress,
+            &states,
+            2,
+            &overlap,
+            &empty_leases(),
+        );
         assert!(
             actions.is_empty(),
             "no close nudge / redispatch for an overlap wait: {actions:?}"
@@ -12490,7 +13932,15 @@ mod tests {
         let ready = vec![rb_wave("bd-w1", 1), rb_wave("bd-w2", 2)];
         let states = vec![st("oc-1", "working")];
         let overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 1, &overlap);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &states,
+            1,
+            &overlap,
+            &empty_leases(),
+        );
         assert!(
             actions.is_empty(),
             "no claim nudge for a wave-gated wait: {actions:?}"
@@ -12513,7 +13963,15 @@ mod tests {
         let states = vec![st("oc-1", "working")];
         let overlap: std::collections::HashSet<String> = std::collections::HashSet::new();
         // nudge_after=1 → immediate claim nudge for the non-overlap bead
-        let actions = claim_watch_step(&mut watch, &ready, &[], &states, 1, &overlap);
+        let actions = claim_watch_step(
+            &mut watch,
+            &ready,
+            &[],
+            &states,
+            1,
+            &overlap,
+            &empty_leases(),
+        );
         assert!(
             matches!(&actions[0], ClaimWatchAction::NudgeClaim { bead_id, .. }
                 if bead_id == "bd-a"),
@@ -12569,6 +14027,7 @@ mod tests {
             claim_nudge_after_polls: 2,
             resonate_url: String::new(),
             force: false,
+            resume: false,
             strict: false,
             reclaim: crate::durable_policy::ReclaimPolicy::new(10, 20),
             pane_stall_secs: 1800,
@@ -13027,6 +14486,609 @@ mod tests {
                 "abort is not instant"
             );
         };
+    }
+
+    /// bd-swarm-loop-durable-panic-atlo: a resumed invocation facing the
+    /// stale-checkpoint signature DEGRADES to a fresh run; only a fresh one
+    /// (which cannot be replaying stale checkpoints) aborts.
+    #[test]
+    fn blind_completion_degrades_resumed_and_aborts_fresh() {
+        let t = DEFAULT_LEAF_FAILURE_ABORT_POLLS;
+        assert_eq!(
+            blind_completion_outcome(true, t - 1, t),
+            BlindCompletion::Continue
+        );
+        assert_eq!(
+            blind_completion_outcome(false, t - 1, t),
+            BlindCompletion::Continue
+        );
+        assert_eq!(
+            blind_completion_outcome(true, t, t),
+            BlindCompletion::DegradeFresh
+        );
+        // stays degradable beyond the threshold (no abort storm)
+        assert_eq!(
+            blind_completion_outcome(true, t + 5, t),
+            BlindCompletion::DegradeFresh
+        );
+        assert_eq!(
+            blind_completion_outcome(false, t, t),
+            BlindCompletion::Abort
+        );
+        assert_eq!(
+            blind_completion_outcome(false, t + 5, t),
+            BlindCompletion::Abort
+        );
+    }
+
+    /// bd-swarm-loop-durable-panic-atlo: replaying a dead run's checkpoints is
+    /// OPT-IN via `--resume`; a pending prior with no flag starts FRESH (the
+    /// zombie is rejected by the stale sweep, never replayed).
+    #[test]
+    fn loop_start_decision_fresh_unless_explicit_resume() {
+        assert_eq!(loop_start_decision(false, false, true), LoopStart::Fresh);
+        assert_eq!(loop_start_decision(true, false, false), LoopStart::Fresh);
+        assert_eq!(loop_start_decision(true, false, true), LoopStart::Resume);
+        // --force starts fresh and rejects the prior; it beats --resume
+        assert_eq!(loop_start_decision(true, true, true), LoopStart::Fresh);
+        assert_eq!(loop_start_decision(false, true, false), LoopStart::Fresh);
+    }
+
+    /// bd-swarm-loop-durable-panic-atlo: a supervised pass must never take a
+    /// live loop over (no `--force`), and the stop rule counts consecutive
+    /// failures, resetting on any success.
+    #[test]
+    fn supervise_pass_argv_never_forces_and_stops_after_consecutive_failures() {
+        let argv = supervise_pass_argv("proj", true, "all");
+        assert_eq!(argv[0], "loop-mode");
+        assert_eq!(argv[1], "run");
+        assert_eq!(argv[2], "proj");
+        assert!(argv.contains(&"--once".to_string()));
+        assert!(argv.contains(&"--work".to_string()));
+        assert!(
+            !argv.contains(&"--force".to_string()),
+            "a supervised pass must refuse loudly, not take over a live loop: {argv:?}"
+        );
+        let no_work = supervise_pass_argv("proj", false, "all");
+        assert!(!no_work.contains(&"--work".to_string()));
+        assert!(!no_work.contains(&"--force".to_string()));
+
+        assert_eq!(supervise_failure_count(true, 0), 0);
+        assert_eq!(supervise_failure_count(true, 2), 0);
+        assert_eq!(supervise_failure_count(false, 0), 1);
+        let mut n = 0;
+        for _ in 0..SUPERVISE_MAX_CONSECUTIVE_FAILURES {
+            n = supervise_failure_count(false, n);
+        }
+        assert_eq!(n, SUPERVISE_MAX_CONSECUTIVE_FAILURES);
+    }
+
+    /// bd-resume-window-lease-sweep-4sa2: resumes dedupe per (bead, pane)
+    /// inside a window, a peer-held bead draws none, and a closed-reason lease
+    /// is swept while an open one is kept.
+    #[test]
+    fn resume_window_dedupes_and_respects_peer_holds() {
+        const W: u64 = RESUME_WINDOW_DEFAULT_SECS; // 900s
+        let now = 10_000_000_000_000i64;
+        let secs = |s: i64| now - s * 1_000_000;
+
+        // (1) window dedupe per (bead, pane). N passes over an unchanged bead
+        // resume at most once per window: the first pass resumes, every pass
+        // inside the window does not, and after the window it resumes again.
+        assert!(
+            should_resume_bead(None, now, W, false),
+            "never resumed → resume"
+        );
+        assert!(
+            !should_resume_bead(Some(now), now, W, false),
+            "just resumed → no second resume this pass"
+        );
+        assert!(!should_resume_bead(Some(secs(800)), now, W, false));
+        assert!(
+            should_resume_bead(Some(secs(1_000)), now, W, false),
+            "past the window"
+        );
+        assert!(within_resume_window(Some(secs(60)), now, W));
+
+        // (2) a peer-held bead draws none, even with no prior resume.
+        let reservations = vec![
+            ("bd-peer".to_string(), "PeerPane".to_string()),
+            ("bd-mine".to_string(), "MyPane".to_string()),
+            ("bd-unstamped".to_string(), String::new()),
+        ];
+        assert!(peer_held("bd-peer", &reservations, "MyPane"));
+        assert!(
+            !peer_held("bd-peer", &reservations, "PeerPane"),
+            "own lease is not a peer"
+        );
+        assert!(!peer_held("bd-mine", &reservations, "MyPane"));
+        assert!(!peer_held("bd-other", &reservations, "MyPane"));
+        assert!(
+            !peer_held("bd-unstamped", &reservations, "MyPane"),
+            "empty holder is not a peer"
+        );
+        assert!(
+            !should_resume_bead(None, now, W, peer_held("bd-peer", &reservations, "MyPane")),
+            "peer-held → no resume"
+        );
+
+        // (3) closed-reason leases are swept; an open-reason lease is kept.
+        let leases = vec![
+            ("src/a.rs".to_string(), "bd-closed".to_string()),
+            ("src/b.rs".to_string(), "bd-open".to_string()),
+            ("docs/c.md".to_string(), "bd-closed".to_string()),
+            ("src/d.rs".to_string(), String::new()),
+        ];
+        let closed = std::collections::HashSet::from(["bd-closed".to_string()]);
+        assert_eq!(
+            closed_reason_lease_ids(&leases, &closed),
+            vec!["src/a.rs".to_string(), "docs/c.md".to_string()]
+        );
+        // One pass later the closed leases are gone, so a second sweep is a
+        // no-op (idempotent) and the open lease is untouched.
+        let after = vec![
+            ("src/b.rs".to_string(), "bd-open".to_string()),
+            ("src/d.rs".to_string(), String::new()),
+        ];
+        assert!(closed_reason_lease_ids(&after, &closed).is_empty());
+        assert!(
+            closed_reason_lease_ids(&leases, &std::collections::HashSet::new()).is_empty(),
+            "no closed set → nothing"
+        );
+    }
+
+    /// bd-loop-feeds-idle-panes-rh2z: the idle-pane rotation feeds a stalled
+    /// bead back through its OWN holder, never hands a bead to a non-owner,
+    /// and only exempts an own-work pair from the resume window after N
+    /// starved passes.
+    #[test]
+    fn loop_feeds_idle_panes_stalled_beads() {
+        let now = 10_000_000_000_000i64;
+        let secs = |s: i64| now - s * 1_000_000;
+        let bead = |id: &str, assignee: Option<&str>| ReadyBead {
+            id: id.into(),
+            title: format!("work {id}"),
+            assignee: assignee.map(str::to_string),
+            verify: Some("true".into()),
+            ..Default::default()
+        };
+        let pins = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pairs = |plan: &RotationPlan| {
+            plan.picks
+                .iter()
+                .map(|p| (p.pin.clone(), p.bead.clone()))
+                .collect::<Vec<_>>()
+        };
+        let empty = std::collections::BTreeMap::new();
+        let no_starved: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let window = std::collections::BTreeMap::from([(
+            crate::state::resume_key("fx-stalled", "GreenStream"),
+            secs(60),
+        )]);
+
+        // (1) acceptance: with every pane idle and a stalled bead whose holder
+        // maps to a pane, the next pass resumes EXACTLY that pane — one pick,
+        // naming the holder, with no send to the other idle pane.
+        let live = pins(&["GreenStream", "AmberMarlin"]);
+        let stalled = vec![bead("fx-stalled", Some("GreenStream"))];
+        let plan = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live,
+            idle_pins: &live,
+            in_progress: &stalled,
+            ready: &[],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            plan.picks,
+            vec![RotationPick {
+                pin: "GreenStream".into(),
+                bead: "fx-stalled".into(),
+                exempt: false,
+            }],
+            "the stalled bead goes to its own holder, and to nobody else"
+        );
+        assert_eq!(plan.starved_after.get("GreenStream"), Some(&0));
+
+        // (2) two panes, two stalls: each takes its own, in fleet order.
+        let two_stalls = vec![
+            bead("fx-g", Some("GreenStream")),
+            bead("fx-a", Some("AmberMarlin")),
+            bead("fx-extra", None),
+        ];
+        let plan = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live,
+            idle_pins: &live,
+            in_progress: &two_stalls,
+            ready: &[],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            pairs(&plan),
+            vec![
+                ("GreenStream".to_string(), "fx-g".to_string()),
+                ("AmberMarlin".to_string(), "fx-a".to_string()),
+            ],
+            "each pane resumes its own stall — never another pane's"
+        );
+
+        // (3) never a non-owner: a stalled bead owned by a THIRD live pane is
+        // handed to nobody, and a peer-held bead is skipped even when unowned.
+        let live3 = pins(&["GreenStream", "AmberMarlin", "QuietHeron"]);
+        let two_idle = pins(&["GreenStream", "AmberMarlin"]);
+        let foreign = vec![bead("fx-hers", Some("QuietHeron"))];
+        let nobody = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live3,
+            idle_pins: &two_idle,
+            in_progress: &foreign,
+            ready: &[],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert!(
+            nobody.picks.is_empty(),
+            "a bead owned by a live pane never moves to another pane"
+        );
+        let peer_lease = vec![("fx-held".to_string(), "QuietHeron".to_string())];
+        let held = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live3,
+            idle_pins: &two_idle,
+            in_progress: &[],
+            ready: &[bead("fx-held", None)],
+            peers: &peer_lease,
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert!(
+            held.picks.is_empty(),
+            "a peer-held bead draws no pick (lane split, not a stall)"
+        );
+        // A READY bead assigned to another live pane is that pane's too — the
+        // ownership rule is not just about in-progress rows.
+        let claimed = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live3,
+            idle_pins: &two_idle,
+            in_progress: &[],
+            ready: &[bead("fx-claimed", Some("QuietHeron"))],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert!(
+            claimed.picks.is_empty(),
+            "a ready bead assigned to a LIVE pane never moves to another pane"
+        );
+        // …but an assignee that is NOT in the live fleet is an orphan claim:
+        // the pane may take that work.
+        let orphaned = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live3,
+            idle_pins: &two_idle,
+            in_progress: &[],
+            ready: &[bead("fx-orphan", Some("DeadAgent"))],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            pairs(&orphaned),
+            vec![("GreenStream".to_string(), "fx-orphan".to_string())],
+            "an orphaned claim is free work, not somebody else's bead"
+        );
+
+        // (4) free work fills an otherwise-unarmed pane — one unowned ready
+        // bead feeds ONE pane, and an already-queued bead is never re-queued.
+        let fresh = vec![bead("fx-fresh", None)];
+        let plan = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &two_idle,
+            idle_pins: &two_idle,
+            in_progress: &[],
+            ready: &fresh,
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            pairs(&plan),
+            vec![("GreenStream".to_string(), "fx-fresh".to_string())],
+            "one unowned bead feeds one idle pane, once"
+        );
+        let taken = vec!["fx-fresh".to_string()];
+        let requeued = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &two_idle,
+            idle_pins: &two_idle,
+            in_progress: &stalled,
+            ready: &fresh,
+            peers: &[],
+            taken: &taken,
+            starved: &no_starved,
+            resume_window: &empty,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+        });
+        assert_eq!(
+            pairs(&requeued),
+            vec![("GreenStream".to_string(), "fx-stalled".to_string())],
+            "the queued bead is skipped; the pane's own stall still lands"
+        );
+
+        // (5) the window still wins — for N starved passes. A pair inside the
+        // window defers, the counter climbs, and the Nth pass exempts it.
+        let gated = |starved: &std::collections::BTreeMap<String, u32>| {
+            idle_pane_rotation(&IdleRotationInputs {
+                live_pins: &live,
+                idle_pins: &live,
+                in_progress: &stalled,
+                ready: &[],
+                peers: &[],
+                taken: &[],
+                starved,
+                resume_window: &window,
+                now_us: now,
+                window_secs: RESUME_WINDOW_DEFAULT_SECS,
+                exempt_after_passes: IDLE_PANE_EXEMPT_AFTER_PASSES,
+            })
+        };
+        // A 0 budget means the window never gates an idle pane's own stall.
+        let immediate = idle_pane_rotation(&IdleRotationInputs {
+            live_pins: &live,
+            idle_pins: &live,
+            in_progress: &stalled,
+            ready: &[],
+            peers: &[],
+            taken: &[],
+            starved: &no_starved,
+            resume_window: &window,
+            now_us: now,
+            window_secs: RESUME_WINDOW_DEFAULT_SECS,
+            exempt_after_passes: 0,
+        });
+        assert_eq!(
+            immediate.picks.len(),
+            1,
+            "a 0 exemption budget resumes the pane on the first pass"
+        );
+
+        let pass1 = gated(&no_starved);
+        assert!(pass1.picks.is_empty(), "pass 1: the window still holds");
+        assert_eq!(pass1.starved_after.get("GreenStream"), Some(&1));
+        let pass2 = gated(&pass1.starved_after);
+        assert!(pass2.picks.is_empty(), "pass 2: still inside the window");
+        assert_eq!(pass2.starved_after.get("GreenStream"), Some(&2));
+        let pass3 = gated(&pass2.starved_after);
+        assert_eq!(
+            pass3.picks,
+            vec![RotationPick {
+                pin: "GreenStream".into(),
+                bead: "fx-stalled".into(),
+                exempt: true,
+            }],
+            "the Nth starved pass releases the window (a stalled pane outranks it)"
+        );
+        assert_eq!(
+            pass3.starved_after.get("GreenStream"),
+            Some(&0),
+            "a released pick ends the starvation run"
+        );
+    }
+
+    /// bd-pane-wedge-detect-respawn-pnyi: a simulated wedge — a pane parked on
+    /// a fatal error line, process alive, nothing moving — produces ONE page
+    /// naming the pane and the error, and every un-judgeable shape stays quiet.
+    #[test]
+    fn pane_wedge_detected_and_paged() {
+        // The observed incident: opencode-go HTTP 400 / reasoning replay, the
+        // pane alive but parked on the error and no commit for 9000s.
+        let wedge = PaneWedgeInputs {
+            pin: "EmberOtter",
+            pane_id: "w1:p1",
+            process_alive: Some(true),
+            recent_output: Some("streaming tokens…\nError: API error 400 (reasoning replay)\n"),
+            last_commit_age_secs: Some(9_000),
+            quiet_secs: 2_700,
+        };
+        match pane_wedge_action(&wedge, false) {
+            PaneWedgeAction::Page {
+                pin,
+                pane_id,
+                error,
+            } => {
+                assert_eq!(pin, "EmberOtter", "the page names the pin");
+                assert_eq!(pane_id, "w1:p1", "the page names the pane");
+                assert!(
+                    error.contains("reasoning replay") && error.contains("400"),
+                    "the page carries the error line: {error}"
+                );
+            }
+            other => panic!("a simulated wedge must page: {other:?}"),
+        }
+        // ONE page per wedge — every later pass of the same wedge is silent.
+        assert_eq!(
+            pane_wedge_action(&wedge, true),
+            PaneWedgeAction::Hold,
+            "never one page per pass"
+        );
+        // A pane whose process exited is `recover`'s job, not a wedge.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    process_alive: Some(false),
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // An inconclusive process probe never alarms.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    process_alive: None,
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // An unreadable pane is never judged.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    recent_output: None,
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // Output that merely SCROLLED PAST an error is not a parked wedge:
+        // the last line is ordinary work.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    recent_output: Some("Error: API error 400\nwork resumed; committing\n"),
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // A commit inside the window is movement.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    last_commit_age_secs: Some(60),
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // No commit history → never alarm blind.
+        assert_eq!(
+            pane_wedge_action(
+                &PaneWedgeInputs {
+                    last_commit_age_secs: None,
+                    ..wedge.clone()
+                },
+                false
+            ),
+            PaneWedgeAction::Quiet
+        );
+        // The parked-line recognizer is bounded and needs the marker on the
+        // LAST non-empty line.
+        assert_eq!(parked_error_line("\n\n"), None);
+        assert_eq!(parked_error_line("all good\n"), None);
+        assert_eq!(
+            parked_error_line("noise\nError: rate limit exceeded\n"),
+            Some("Error: rate limit exceeded".to_string())
+        );
+    }
+
+    /// bd-supervise-dead-stop-escalation-rweq: a dead stop escalates EXACTLY
+    /// once (not per pass), and a recovering fleet clears it so a later stall
+    /// can escalate again.
+    #[test]
+    fn supervise_escalates_on_dead_stop() {
+        let quiet = DeadStopInputs {
+            work_remaining: true,
+            fleet_knowable: true,
+            any_pane_working: false,
+            last_commit_age_secs: Some(3_000),
+            stall_secs: 2_700,
+            already_escalated: false,
+        };
+        // First sighting: one escalation, naming the silent fleet.
+        assert_eq!(
+            dead_stop_action(&quiet),
+            DeadStopAction::Escalate(DeadStopKind::SilentPanes)
+        );
+        // Every following pass of the SAME stall is silent — not one page per pass.
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                already_escalated: true,
+                ..quiet
+            }),
+            DeadStopAction::Hold
+        );
+        // A recovering fleet (a commit inside the window) clears it — and a
+        // second stall after that escalates again.
+        let recovered = DeadStopInputs {
+            last_commit_age_secs: Some(10),
+            already_escalated: true,
+            ..quiet
+        };
+        assert_eq!(dead_stop_action(&recovered), DeadStopAction::Clear);
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                already_escalated: false,
+                ..quiet
+            }),
+            DeadStopAction::Escalate(DeadStopKind::SilentPanes)
+        );
+        // A pane that SAYS working but moved nothing is a stuck pane, not calm.
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                any_pane_working: true,
+                ..quiet
+            }),
+            DeadStopAction::Escalate(DeadStopKind::StuckWorking)
+        );
+        // No work left is never a stall.
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                work_remaining: false,
+                ..quiet
+            }),
+            DeadStopAction::Clear
+        );
+        // An unreadable fleet, or a repo with no commit history, is not judged.
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                fleet_knowable: false,
+                ..quiet
+            }),
+            DeadStopAction::Wait
+        );
+        assert_eq!(
+            dead_stop_action(&DeadStopInputs {
+                last_commit_age_secs: None,
+                ..quiet
+            }),
+            DeadStopAction::Wait
+        );
     }
 
     // ---- bd-event-dispatch-zero-latency: route_event ----
@@ -15520,6 +17582,7 @@ mod reclaim_tests {
 #[cfg(test)]
 mod mail_health_tests {
 
+    use super::*;
     use crate::state::{ActiveLoop, MailHealth};
 
     #[test]
@@ -15596,6 +17659,84 @@ mod mail_health_tests {
         assert_eq!(al4.mail_health.consecutive_failures, 0);
         assert!(!al4.mail_degraded);
         let _ = crate::state::remove_active_loop(&project);
+    }
+
+    /// bd-swarm-loop-durable-panic-atlo acceptance: the renew/reclaim leaf
+    /// runs ON the durable loop's tokio worker. Pre-fix, its inline `run_mail`
+    /// nested the shared runtime's `block_on` inside a runtime — "Cannot
+    /// start a runtime from within a runtime" once per poll, before every
+    /// dispatch (`reclaimed stranded bead ... (re-dispatching)` storm). This
+    /// drives the REAL sync block through the async-safe bridge on a real
+    /// runtime, with a real (hermetic, in-process) mail op, and asserts it
+    /// completes. The inline canary below keeps the red evidence in-tree.
+    #[test]
+    fn loop_mode_durable_survives_reclaim() {
+        let _home = crate::config::test_state_home();
+        // Hermetic config: an existing XDG file stops Config::load from
+        // reading (and migrating) the operator's legacy config; empty means
+        // all defaults (in-process toron, agent "flywheel").
+        let cfg_home = std::env::temp_dir().join(format!("fw-reclaim-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(cfg_home.join("flywheel")).expect("temp XDG config dir");
+        std::fs::write(cfg_home.join("flywheel/config.toml"), "").expect("empty config");
+        let prev_cfg_home = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_home) };
+
+        let project = format!("loop-reclaim-{}", std::process::id());
+        // Register the identity the leaf renews AS (default "flywheel") under
+        // the same project key the leaf derives, so the renewal is a real Ok
+        // rather than an unregistered-agent error.
+        {
+            let cfg = Config::load().expect("config");
+            let key =
+                crate::utf8_path(&crate::project_dir(&cfg, &project), "project path").expect("key");
+            let mail = crate::backend::mail_backend(&cfg).expect("mail backend");
+            crate::backend::run_mail(mail.ensure_project(&key))
+                .map(|_| ())
+                .expect("ensure project");
+            crate::backend::run_mail(mail.register_agent(
+                &key,
+                &crate::spawn_agent_profile("flywheel", "flywheel", &project),
+            ))
+            .map(|_| ())
+            .expect("register agent");
+        }
+
+        // The loop's exact context: a multi-threaded tokio runtime driving
+        // the leaf. Inside it the sync mail block must go off-runtime.
+        let rt = tokio::runtime::Runtime::new().expect("loop runtime");
+        let paths = vec!["src/durable.rs".to_string()];
+        let (leaf_project, leaf_paths) = (project.clone(), paths.clone());
+        let out: anyhow::Result<serde_json::Value> = rt.block_on(async move {
+            crate::backend::run_mail_off_runtime(move || {
+                renew_filtered_sync(&leaf_project, &leaf_paths, 60)
+            })
+            .await
+        });
+
+        // The pre-fix shape, kept as a canary: an INLINE shared-runtime
+        // block_on from inside this runtime panics — the bd-atlo class.
+        let inline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                let _ = crate::backend::run_mail(async { 1i32 });
+            });
+        }));
+
+        unsafe {
+            match prev_cfg_home {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&cfg_home);
+
+        assert!(
+            inline.is_err(),
+            "inline shared-runtime block_on was expected to panic; if tokio ever permits \
+             the nesting, the bridge's reason is gone and this test needs revisiting"
+        );
+        let v =
+            out.expect("renew leaf must complete on the loop runtime (no nested-runtime panic)");
+        assert_eq!(v["renewed"], 0, "fresh project has no leases to renew: {v}");
     }
 }
 

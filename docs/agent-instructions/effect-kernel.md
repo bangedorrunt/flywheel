@@ -46,6 +46,53 @@ wire / CLI / timer / process observation
 
 **12. Close authority is singular.** Beads close beads. Toron owns mailbox and reservation truth. The host owns run/effect journaling. A worker, Jev result, or report cannot self-admit completion.
 
+## Delivery cursors
+
+A cursor is a persisted position that gates delivery: everything before it
+is handled. It is the one durable value whose failure can be silent: a
+cursor that jumps drops work with no error. The honesty laws above apply
+to it with extra force. The contract for any code that reads or
+advances one:
+
+- **One cursor per consumer and scope, one owner.** The agent's toron
+  `--since last` cursor and the sweep's `since_by_pin` are two consumers
+  with two positions, not two copies of one. Do not add a second cursor
+  path for one consumer or join two cursors with gap-skip logic, because
+  that is two failure modes and no arbiter.
+- **Advance on what it could read, never past what it could not.**
+  `inbox_high_water_from_values` takes the newest time over rows whose
+  timestamp parses, and `None` when none do; `on_inbox_fetched` advances
+  `since_by_pin` only on that result, so a batch it cannot read stays in
+  place and re-sweeps. Re-reading is safe because redelivery is absorbed
+  by the dedup lattice; the cursor itself is at-least-once, never
+  at-most-once.
+- **Write the position before the effect it gates.** The plane-S cursor
+  is persisted (`flush_wake("watch-cursor")`) before the line is
+  classified, so a crash right after cannot re-ring history. The decided
+  journal row is flushed before any Prompt intent reaches a sink;
+  when that flush fails it is named in the audit, and the
+  prompt still goes out. The cursor has already moved, so withholding
+  would lose the wake.
+- **Backfill from a bounded floor.** A consumer with no cursor starts at
+  the 24h redelivery floor (`redelivery_floor_rfc3339`), never at
+  wall-clock now: a strictly-newer-than-now fetch is empty forever and
+  the high-water initializes only on a non-empty batch, so a fresh or
+  state-lost pin would be deaf permanently.
+- **Monotonic, and restored by merge.** `plane_s_cursor_us` moves only by
+  `max`; `note_wake` is the same shape for the liveness stamp: a
+  same-second or older stamp is refused, never minted. Toron's durable
+  workflow cursors (`delivery_cursors`)
+  snapshot without in-flight marks and restore by union + max, never by a
+  smaller overwrite: marks are written after success and the delivery is
+  journaled before it, so a restart replays only what followed the last
+  saved tick.
+- **Name retention, never jump it.** A position older than journal
+  retention gets an explicit answer instead of a partial fold: `why`
+  reports the first foldable seq, SSE reconnects get
+  `Replay::Gone { first_replayable }`, rotation records what it dropped
+  (`journal_rotated{dropped_lines}`), and a torn tail stops the fold
+  loudly (D4.4).
+
 ## Review checklist
 
 Before merging a change touching a reducer or interpreter, check:
@@ -55,6 +102,7 @@ Before merging a change touching a reducer or interpreter, check:
 - Is there one interpreter and one journal identity for the command?
 - Can a crash between prepare, provider call, and settle leave an honest state?
 - Are accepted, delivered, shed, unavailable, failed, and unknown distinct?
+- Does every persisted cursor have one owner, advance only on input that could be read, and name a retention gap instead of jumping it?
 - Does replay avoid duplicate provider calls and terminal-row regression?
 - Does a Jev change remain advisory and evidence-bearing?
 - Is output ordering stable?
@@ -92,11 +140,19 @@ A green compile is not enough. A phase is complete only when its behavior witnes
 
 ## Current audit status
 
-As of 2026-09-22, the reducer/Tick Law and serialized-policy boundaries pass fresh audit and the full workspace gates are green. The kernel remains **conditionally compliant** until legacy Jev authority helpers are fully threaded from the entrypoint and durable effect leaves receive injected wall/monotonic clocks instead of sampling them directly. Those reads are outside reducers and do not invalidate replay witnesses, but they are still migration work under the strict authority contract.
+As of 2026-10-02, the reducer/Tick Law and serialized-policy boundaries pass fresh audit and the full workspace gates are green. The kernel remains **conditionally compliant**, and the residual is now narrow and named rather than a general "leaves sample time" claim.
+
+What is migrated: the durable loop workflow (`swarm_loop`) resolves `RuntimeAuthority` once at the host edge and takes it from `ctx.get_dependency`. The leaf-level equivalent is closed too: a `#[function]` may take `&Info` as its first parameter (the SDK's `LeafWithInfo` kind), and `loop_run_verify` now does, reading its verdict-row timestamp through `RuntimeAuthority::now_datetime()`. `&Info` is supplied by the runtime and never serialized, so the durable args and the replay key built from them are unchanged — the earlier concern that injecting would rewrite a durable signature was wrong.
+
+Two guards hold this, because one was not enough. `bd_lf1u_no_durable_leaf_samples_an_ambient_clock` walks **every** `#[function]` body in `src/durable.rs` and fails on any `chrono::Utc::now` / `SystemTime::now` / `Instant::now`; it replaces the older bd-0fvb assertion, which only sliced one function's body by name and so could not see a second leaf. That guard is a source-shape fact and is not sufficient alone: rewriting `now_datetime` to call `SystemTime::now()` behind the injection point left it green, because the ambient read had only moved one call away. `bd_lf1u_now_datetime_derives_from_the_injected_clock` is therefore behavioural — a fixed clock must yield that exact instant, two fixed clocks must yield two different values, and the value must agree with `now_unix()` off the same authority. Legacy Jev authority helpers are the remaining piece.
+
+What is deliberately NOT migrated: a host-side deadline on a real subprocess (`run_leaf_cmd_bounded`) keeps `Instant::now()`. The child runs in real time, so a supplied clock would never advance relative to it and the watchdog would be inert or immediate. A bound around a live effect is part of the effect and must be measured in real time; what the law forbids is an ambient read feeding a durable **result**. That helper is a plain function, not a `#[function]` body, so the leaf guard exempts it structurally rather than by an allowlist entry.
 
 ## Related sources
 
 - [Effect kernel decision record](../decisions/0016-functional-effect-kernel-redesign.md)
+- [Doorbell plane decision record](../decisions/0012-doorbell-plane-independent-runtime.md)
 - [Doorbell guide](../guides/doorbell.mdx)
 - [Session door](../guides/session-door.mdx)
 - [Judgment packs](../guides/judgment-packs.mdx)
+- [Delivery cursor persistence](../learnings/delivery-cursor-persist-bd-8nyh-2026-09-29.md)

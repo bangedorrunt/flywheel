@@ -5,8 +5,24 @@ topology `loop` is what runs this command. Do not start a second loop on a
 joinable fleet.
 
 `flywheel loop-mode run <project> [--work]` is the durable **solo execution
-loop**, implemented with Resonate workflow machinery. Re-run the same command
-to resume. One live loop per project (`loop-mode list` / `loop-mode prune`).
+loop**, implemented with Resonate workflow machinery. One live loop per
+project (`loop-mode list` / `loop-mode prune`).
+
+Re-running is FRESH by default. A pending invocation whose owner process is
+gone is a zombie: its checkpointed leaf results were written by another
+binary, and replaying them against the current leaf shapes storms
+serialization errors. So the default start rejects the zombie and begins
+fresh; `--resume` replays a killed run's checkpoints on purpose. A resumed run
+that still hits the stale-checkpoint signature (every critical leaf failing
+while the world looks empty) degrades to ONE fresh invocation instead of
+aborting; a fresh invocation that stays blind aborts naming the fix
+(`flywheel loop-mode doctor --fix`).
+
+For a cadence, `flywheel loop-mode supervise <project> [--work] [--interval N]`
+runs `loop-mode run --once` as a CHILD process per pass (a crashed pass cannot
+kill the supervisor), never passes `--force` (a live loop must refuse loudly,
+not be taken over), and stops after 3 consecutive failed passes naming the
+manual pass to run.
 
 Solo is the topology; the work source is separate:
 
@@ -17,7 +33,8 @@ Solo is the topology; the work source is separate:
 
 `--work` therefore requires beads; loop mode itself does not. Loop mode does
 not spawn a parallel crew. A reviewer may be summoned explicitly, but that is
-not swarm execution. `--force` takes over a corrupted invocation.
+not swarm execution. `--force` takes over a live/corrupted invocation (it
+rejects the prior explicitly and starts fresh).
 
 State: `~/.local/state/flywheel/loops.json` (schema 2) + `last_sent/<project>.json`.
 
@@ -36,6 +53,8 @@ Confirmed send is default (`__send --confirm` → working|blocked landing). `--n
 - unknown → never dispatch; 2+ consecutive polls → respawn
 
 Work mode (`--work`): `br ready` → claim/execute prompts. Claim watchdog: unclaimed-while-working gets a claim nudge; settled-unclaimed is re-dispatched; completion requires an empty claim-watch. This is the bead-backed specialization of solo loop mode, not the definition of loop mode itself.
+
+bd-claim-watch-durable-signals-mixy: the watchdog reads durable claims **first**. A live toron reservation (`reason == bead id` on the active board) suppresses the Redispatch/Resume arms — nudges still target the bead's own lane, but no second executor is dispatched over live work; the hold releases when the lease lapses. After the lease, the assignee's pane state decides (settled vs working), and the mail guard scan runs last on every redispatch. The guard's scan also reads the kind-9 steer rooms (`steer-<project>` + `steer-<bead>`), so channel claims count as peer signals.
 
 Mail wake: idle agents with urgent mail get one MAIL WAKE per message id.
 
