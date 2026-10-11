@@ -96,6 +96,12 @@ pub struct RtHost {
     /// The one live wake-socket consumer. Shared with the restart task so a
     /// replacement aborts its predecessor instead of littering watchers.
     wake_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    /// mcc9: exact wake → brain counters for this workspace, shared by every
+    /// watch source this host arms (bus watch and each wake-sock consumer).
+    wake_counters: Arc<doorbell_rt::wake_brain::WakeBrainCounters>,
+    /// mcc9: the last line the brain accepted; a replacement consumer resumes
+    /// there instead of replaying from origin.
+    wake_resume: Arc<Mutex<Option<String>>>,
     /// bd-b2b3: the run-state recorder, `None` unless explicitly attached.
     /// The recorder is an EFFECT-layer component (it owns a store handle and a
     /// clock) and is therefore held HERE, beside the model, and never touched
@@ -116,16 +122,20 @@ pub struct RtHost {
 /// watchbeat, transport death re-enters as `Died`.
 fn wake_outcome_to_brain(
     out: doorbell_rt::wake_sock::WakeOutcome,
+    fw: &doorbell_rt::wake_brain::WatchForwarder,
     tx: &mpsc::Sender<BrainMsg>,
     workspace: &str,
     retry: &std::sync::Mutex<doorbell_rt::WatchRetry>,
 ) {
+    use doorbell_rt::wake_brain::Forwarded;
     use doorbell_rt::wake_sock::WakeOutcome;
-    // GS062-ADV-5 (ported onto wake-sock): try_send Watch; stamp .event only
-    // after Ok; Died via blocking_send so Full cannot drop restart_wake.
+    // mcc9: Watch goes through the forwarder (backpressure on a full channel,
+    // then an exact-count drop + ONE death + cursor resume — never one death
+    // per line, never a silent shed). Stamp .event only once the brain has the
+    // line; Died via blocking_send so Full cannot drop restart_wake.
     match out {
-        WakeOutcome::Watch(l) => match tx.try_send(BrainMsg::Watch(l)) {
-            Ok(()) => {
+        WakeOutcome::Watch(l) => match fw.forward(l) {
+            f if f.reached_brain() => {
                 doorbell_rt::watchbeat::touch_event(&config::state_dir(), workspace);
                 // A delivered event is the only trustworthy evidence the socket
                 // is live again, so it is the only thing that may reopen the
@@ -135,9 +145,11 @@ fn wake_outcome_to_brain(
                     r.reset();
                 }
             }
-            Err(_) => {
-                doorbell_rt::msg::deliver_died_blocking(tx);
-            }
+            Forwarded::Dropped {
+                report_death: true, ..
+            } => doorbell_rt::msg::deliver_died_blocking(tx),
+            // Counted by the forwarder; the consumer is already condemned.
+            _ => {}
         },
         WakeOutcome::Heartbeat => {
             doorbell_rt::watchbeat::touch_heartbeat(&config::state_dir(), workspace);
@@ -146,6 +158,31 @@ fn wake_outcome_to_brain(
             doorbell_rt::msg::deliver_died_blocking(tx);
         }
     }
+}
+
+/// mcc9: one forwarder per watch source, sharing the host's counters and
+/// resume cursor; sampled audit rows land in the workspace audit and the
+/// snapshot under `<state>/doorbell/<ws>.wake-brain.json`.
+fn wake_forwarder(
+    tx: &mpsc::Sender<BrainMsg>,
+    workspace: &str,
+    counters: Arc<doorbell_rt::wake_brain::WakeBrainCounters>,
+    resume: Arc<Mutex<Option<String>>>,
+) -> doorbell_rt::wake_brain::WatchForwarder {
+    let state = config::state_dir();
+    let ws = workspace.to_string();
+    doorbell_rt::wake_brain::WatchForwarder::new(tx.clone(), counters, resume)
+        .with_audit(Arc::new(move |kind, detail| {
+            doorbell::audit_append(
+                &state,
+                &ws,
+                serde_json::json!({ "kind": kind, "detail": detail }),
+            );
+        }))
+        .persist_to(doorbell_rt::wake_brain::snapshot_path(
+            &config::state_dir(),
+            workspace,
+        ))
 }
 
 impl RtHost {
@@ -209,6 +246,8 @@ impl RtHost {
             index_refreshed_at: now,
             index_pins,
             wake_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            wake_counters: doorbell_rt::wake_brain::counters_for(workspace),
+            wake_resume: Arc::new(Mutex::new(None)),
             // bd-b2b3: opt-in. Recording a boundary per tick changes the
             // dispatcher's storage and latency profile, so it is an explicit
             // operator choice (`FLYWHEEL_RUN_STATE_LOG=1`) rather than a silent
@@ -702,6 +741,8 @@ impl Host for RtHost {
         let slot = self.wake_task.clone();
         // Hoisted out of the 'static future so no borrow of `self` escapes.
         let retry = self.retry.clone();
+        let counters = self.wake_counters.clone();
+        let resume = self.wake_resume.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Abort the predecessor first: one live consumer per host.
@@ -713,12 +754,27 @@ impl Host for RtHost {
             let tx_g = tx.clone();
             let beat_workspace = workspace.clone();
             let retry = retry.clone();
+            // mcc9: resume where the brain last accepted a line.
+            let resume_from = resume.lock().ok().and_then(|g| g.clone());
+            if let Some(from) = &resume_from {
+                counters.note_resume();
+                doorbell::audit_append(
+                    &config::state_dir(),
+                    &workspace,
+                    serde_json::json!({
+                        "kind": doorbell_rt::wake_brain::AUDIT_WAKE_RESUMED,
+                        "detail": { "resume_from": from },
+                    }),
+                );
+            }
+            let fw = wake_forwarder(&tx_g, &workspace, counters.clone(), resume.clone());
             let handle = crate::spawn_wake_consumer(
                 &project,
                 &workspace,
                 &config::state_dir(),
+                resume_from,
                 move |out| {
-                    wake_outcome_to_brain(out, &tx_g, &beat_workspace, &retry);
+                    wake_outcome_to_brain(out, &fw, &tx_g, &beat_workspace, &retry);
                 },
             );
             if let Ok(mut g) = slot.lock() {
@@ -875,15 +931,32 @@ async fn run_embedded_async(
     // Both stamp the watchbeat (event/hb split, GS-062); the socket task goes
     // through the host's slot so the restart path aborts its predecessor.
     let watch_slot = host.wake_task.clone();
-    if !spawn_bus_watch(&cfg, project, workspace, tx.clone()) {
+    let bus_fw = wake_forwarder(
+        &tx,
+        workspace,
+        host.wake_counters.clone(),
+        host.wake_resume.clone(),
+    );
+    if !spawn_bus_watch(&cfg, project, workspace, tx.clone(), bus_fw) {
         let tx_w = tx.clone();
         let project = project.to_string();
         let beat_workspace = workspace.to_string();
         let retry_w = host.retry.clone();
-        let handle =
-            crate::spawn_wake_consumer(&project, workspace, &config::state_dir(), move |out| {
-                wake_outcome_to_brain(out, &tx_w, &beat_workspace, &retry_w);
-            });
+        let fw = wake_forwarder(
+            &tx,
+            workspace,
+            host.wake_counters.clone(),
+            host.wake_resume.clone(),
+        );
+        let handle = crate::spawn_wake_consumer(
+            &project,
+            workspace,
+            &config::state_dir(),
+            None,
+            move |out| {
+                wake_outcome_to_brain(out, &fw, &tx_w, &beat_workspace, &retry_w);
+            },
+        );
         if let Ok(mut g) = watch_slot.lock() {
             *g = Some(handle);
         }
@@ -979,6 +1052,7 @@ fn spawn_bus_watch(
     project: &str,
     workspace: &str,
     tx: mpsc::Sender<BrainMsg>,
+    fw: doorbell_rt::wake_brain::WatchForwarder,
 ) -> bool {
     (|| -> Option<()> {
         let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
@@ -1026,17 +1100,19 @@ fn spawn_bus_watch(
                             "tags": tags,
                             "created_at": e.created_at.as_secs(),
                         });
-                        // GS062-ADV-5: try_send Watch; on Full/Closed stop hb +
-                        // blocking_send Died (Full must not drop restart). Stamp
-                        // .event only after Watch Ok.
+                        // mcc9: the forwarder backpressures this reader thread
+                        // on a full channel (a slow brain parks the sensor);
+                        // only a wedged/closed brain drops the line (counted)
+                        // and ends the watch with ONE Died — the wake-sock
+                        // replacement resumes from the last accepted cursor.
+                        // Stamp .event only once the brain has the line.
                         if let Ok(line) = serde_json::to_string(&v) {
-                            match tx.try_send(BrainMsg::Watch(line)) {
-                                Ok(()) => stamps.on_event(),
-                                Err(_) => {
-                                    stamps.stop();
-                                    doorbell_rt::msg::deliver_died_blocking(&tx);
-                                    break;
-                                }
+                            if fw.forward(line).reached_brain() {
+                                stamps.on_event();
+                            } else {
+                                stamps.stop();
+                                doorbell_rt::msg::deliver_died_blocking(&tx);
+                                break;
                             }
                         }
                     }

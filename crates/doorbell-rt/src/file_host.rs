@@ -138,29 +138,6 @@ pub const AUDIT_HERDR_FULL: &str = "herdr_brain_full";
 /// trail, and the only way to measure it afterwards was to count rows by hand.
 pub const AUDIT_DIED_RELAYED: &str = "wake_died_relayed";
 
-/// What one un-enqueueable watch line does.
-#[derive(Debug, PartialEq, Eq)]
-enum FullChannelAction {
-    /// The first failure for this consumer: report one death so the restart
-    /// still happens (GS062-ADV-5's intent), and audit it loudly.
-    ReportDeath,
-    /// Subsequent failures: count only. Same fault, same consumer — reporting
-    /// each as a death is what turned a full channel into a Died storm
-    /// (live: 1,928 rows in four minutes, peaking at 127 per second, and every
-    /// one of them advanced the retry backoff as if the child had died).
-    CountDropped,
-}
-
-/// One consumer may report at most one death, however many lines it fails to
-/// enqueue.
-fn full_channel_action(reported: &std::sync::atomic::AtomicBool) -> FullChannelAction {
-    if reported.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        FullChannelAction::CountDropped
-    } else {
-        FullChannelAction::ReportDeath
-    }
-}
-
 /// Which of the counted drops also carry an audit row: the first, and then
 /// every power of two. Bounded (a 10,000-line flood leaves ~13 rows) and never
 /// silent, which is the whole point — the flood this replaces was invisible.
@@ -376,6 +353,11 @@ pub struct FileHostConfig {
     /// Registry file override (tests/sandbox). `None` resolves
     /// `agents/{key}.json` under the flywheel state dir.
     pub registry_file: Option<PathBuf>,
+    /// mcc9: how long a wake forwarder parks on a full brain channel before
+    /// it drops (counted) and condemns its consumer. Default
+    /// [`crate::wake_brain::BACKPRESSURE_WAIT`]; the daemon takes
+    /// [`crate::wake_brain::WAIT_ENV`] at its boundary (fixtures only).
+    pub wake_brain_wait: std::time::Duration,
 }
 
 impl FileHostConfig {
@@ -392,6 +374,7 @@ impl FileHostConfig {
             toron_bin: "toron".into(),
             herdr_bin: "herdr".into(),
             registry_file: None,
+            wake_brain_wait: crate::wake_brain::BACKPRESSURE_WAIT,
         }
     }
 }
@@ -846,6 +829,12 @@ pub struct FileHost {
     /// Host-wide like died_relayed: the sweep recomputes `changed` every tick,
     /// so the count survives across sweeps by construction.
     herdr_dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// mcc9: exact wake → brain counters for this workspace, shared by every
+    /// consumer this host arms (see [`crate::wake_brain`]).
+    wake_counters: std::sync::Arc<crate::wake_brain::WakeBrainCounters>,
+    /// mcc9: the last line the brain accepted, so a replacement consumer
+    /// resumes there instead of replaying from origin.
+    wake_resume: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     daemon_exe: PathBuf,
     generation: Option<GenRecord>,
     /// Status-change outbox: the poll loop `tell`s `HerdrStatus` back
@@ -895,6 +884,7 @@ impl FileHost {
         )
         .ok()
         .and_then(|raw| serde_json::from_slice(&raw).ok());
+        let wake_counters = crate::wake_brain::counters_for(&cfg.workspace);
         Self {
             cfg,
             reducer: CoreReducer::default(),
@@ -919,6 +909,8 @@ impl FileHost {
             absent_rows: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             died_relayed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             herdr_dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_counters,
+            wake_resume: std::sync::Arc::new(std::sync::Mutex::new(None)),
             daemon_exe,
             generation,
             tx: None,
@@ -1859,6 +1851,9 @@ impl Host for FileHost {
         // Hoisted out of the 'static future so no borrow of `self` escapes.
         let pending = self.restart_pending.clone();
         let absent = self.absent_rows.clone();
+        let wake_counters = self.wake_counters.clone();
+        let wake_resume = self.wake_resume.clone();
+        let wake_wait = self.cfg.wake_brain_wait;
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
             // The slot frees the moment we are about to ACT, so the next death
@@ -1879,11 +1874,24 @@ impl Host for FileHost {
                 retire.store(true, std::sync::atomic::Ordering::SeqCst);
                 h.abort();
             }
-            let opts = crate::wake_sock::WakeOpts::new(
+            let mut opts = crate::wake_sock::WakeOpts::new(
                 crate::wake_sock::wake_sock_path(),
                 crate::wake_sock::parse_kinds(WATCH_KINDS),
                 Some(project),
             );
+            // mcc9: resume where the brain last accepted a line, so whatever
+            // the predecessor dropped is replayed rather than lost — and a
+            // restart no longer re-floods the channel with the whole history.
+            opts.resume_from = wake_resume.lock().ok().and_then(|g| g.clone());
+            if let Some(from) = &opts.resume_from {
+                wake_counters.note_resume();
+                FileHost::append_audit_row(
+                    &fw_state,
+                    &workspace,
+                    crate::wake_brain::AUDIT_WAKE_RESUMED,
+                    serde_json::json!({ "resume_from": from }),
+                );
+            }
             let audit_state = fw_state.clone();
             let audit_workspace = workspace.clone();
             // `audit_state`/`audit_workspace` are moved into the on_audit
@@ -1893,10 +1901,25 @@ impl Host for FileHost {
             let full_workspace = workspace.clone();
             let beat_state = fw_state.clone();
             let beat_workspace = workspace.clone();
-            // One death report per consumer: the flood was one consumer hitting
-            // one full channel, reported as a death per line.
-            let reported_death = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // mcc9: ONE forwarder per consumer under the documented policy
+            // (backpressure, then exact-count drop + one death + cursor
+            // resume). The counters and the resume cursor are host-wide.
+            let forwarder = {
+                let (st, ws) = (full_state.clone(), full_workspace.clone());
+                crate::wake_brain::WatchForwarder::new(
+                    tx.clone(),
+                    wake_counters.clone(),
+                    wake_resume.clone(),
+                )
+                .with_wait(wake_wait)
+                .with_audit(std::sync::Arc::new(move |kind, detail| {
+                    FileHost::append_audit_row(&st, &ws, kind, detail);
+                }))
+                .persist_to(crate::wake_brain::snapshot_path(
+                    &full_state,
+                    &full_workspace,
+                ))
+            };
             // `retry` is hoisted before the spawn; re-reading `self` here would
             // let the borrow escape the 'static future.
             let absent_rows = absent.clone();
@@ -1921,12 +1944,13 @@ impl Host for FileHost {
                 },
                 move |out| {
                     use crate::wake_sock::WakeOutcome;
-                    // GS062-ADV-5 (ported onto wake-sock): try_send Watch (never
-                    // park); stamp .event only after Ok; Died via blocking_send
-                    // so Full cannot drop restart_wake.
+                    // mcc9: Watch goes through the forwarder (backpressure on a
+                    // full channel, never a silent shed); stamp .event only
+                    // once the brain has the line; Died via blocking_send so
+                    // Full cannot drop restart_wake.
                     match out {
-                        WakeOutcome::Watch(l) => match tx.try_send(BrainMsg::Watch(l)) {
-                            Ok(()) => {
+                        WakeOutcome::Watch(l) => match forwarder.forward(l) {
+                            f if f.reached_brain() => {
                                 crate::watchbeat::touch_event(&beat_state, &beat_workspace);
                                 // A delivered event is the only trustworthy
                                 // evidence the socket is live again, so it is
@@ -1941,41 +1965,17 @@ impl Host for FileHost {
                                 // the last outage left high.
                                 absent_rows.fetch_and(0, std::sync::atomic::Ordering::SeqCst);
                             }
-                            Err(_) => {
-                                // The line could not be enqueued. Report ONE
-                                // death for this consumer so a restart still
-                                // happens and the socket's cursor replays what
-                                // was missed, then count the rest instead of
-                                // manufacturing a death per line.
-                                match full_channel_action(&reported_death) {
-                                    FullChannelAction::ReportDeath => {
-                                        FileHost::append_audit_row(
-                                            &full_state,
-                                            &full_workspace,
-                                            AUDIT_BRAIN_FULL,
-                                            serde_json::json!({
-                                                "reason": "watch line could not be enqueued (brain channel full); reporting one death so the consumer restarts and replays from the cursor",
-                                            }),
-                                        );
-                                        crate::msg::deliver_died_blocking(&tx);
-                                    }
-                                    FullChannelAction::CountDropped => {
-                                        let prior = dropped
-                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                        if should_audit_count(prior) {
-                                            FileHost::append_audit_row(
-                                                &full_state,
-                                                &full_workspace,
-                                                AUDIT_BRAIN_FULL,
-                                                serde_json::json!({
-                                                    "reason": "further watch lines could not be enqueued",
-                                                    "dropped": prior + 1,
-                                                }),
-                                            );
-                                        }
-                                    }
-                                }
+                            crate::wake_brain::Forwarded::Dropped {
+                                report_death: true, ..
+                            } => {
+                                // ONE death for this consumer so it is
+                                // replaced; the replacement resumes from the
+                                // last accepted line, replaying the drops.
+                                crate::msg::deliver_died_blocking(&tx);
                             }
+                            // Counted by the forwarder; the consumer is
+                            // already condemned.
+                            _ => {}
                         },
                         WakeOutcome::Heartbeat => {
                             crate::watchbeat::touch_heartbeat(&beat_state, &beat_workspace);
@@ -3526,14 +3526,33 @@ mod tests {
     /// every few seconds for three minutes — each one claiming the child had
     /// died, each one advancing the retry backoff, and not one audit row to
     /// show for any of it.
+    ///
+    /// mcc9: the rule now lives in the shared forwarder, so this pins it there
+    /// on a wedged 1-slot channel (zero backpressure window, so no waiting).
     #[test]
     fn a_full_channel_reports_one_death_not_one_per_line() {
-        let reported = std::sync::atomic::AtomicBool::new(false);
-        let actions: Vec<FullChannelAction> =
-            (0..200).map(|_| full_channel_action(&reported)).collect();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(BrainMsg::Watch("fill".into())).unwrap();
+        let counters = std::sync::Arc::new(crate::wake_brain::WakeBrainCounters::default());
+        let fw = crate::wake_brain::WatchForwarder::new(
+            tx,
+            counters.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        )
+        .with_wait(std::time::Duration::ZERO);
+        let actions: Vec<crate::wake_brain::Forwarded> =
+            (0..200).map(|n| fw.forward(format!("line-{n}"))).collect();
         let deaths = actions
             .iter()
-            .filter(|action| **action == FullChannelAction::ReportDeath)
+            .filter(|a| {
+                matches!(
+                    a,
+                    crate::wake_brain::Forwarded::Dropped {
+                        report_death: true,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(
             deaths, 1,
@@ -3541,12 +3560,9 @@ mod tests {
              the same consumer hitting the same full channel"
         );
         assert_eq!(
-            actions
-                .iter()
-                .filter(|a| **a == FullChannelAction::CountDropped)
-                .count(),
-            199,
-            "the rest must be counted, not turned into deaths"
+            counters.snapshot().dropped,
+            200,
+            "every line is counted exactly, none turned into a death"
         );
     }
 
