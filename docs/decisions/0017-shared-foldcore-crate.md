@@ -1,6 +1,6 @@
 <!-- governed-by: ADR-0015, ADR-0016 -->
 ---
-status: proposed
+status: rejected
 date: 2026-09-22
 decision-makers: bangedorrunt
 consulted: effect-oriented skill; flywheel ADR-0015 and ADR-0016; toron ADR-0034 and ADR-0035; chiebukuro ADR-0050
@@ -9,7 +9,13 @@ informed: flywheel, toron, beads, chiebukuro maintainers
 
 # ADR-0017: A shared fold crate in toron
 
-**Status:** Proposed. The crate is not created by this record. Nothing depends on it until the preconditions in §7 are fixed in place and this status is flipped to accepted.
+**Status:** Rejected — superseded by elm-effect-rs ADR-0002 + toron ADR-0040 (captain word 2026-10-11 18:44 AEDT, stack-comms redesign §9A, relayed by the flywheel bot for factory task `23283d6f`). `foldcore` was never created and nothing depends on it, so this record retires it without deleting code. The comms kernel builds on elm-effect-rs's Elm loop and effect journal instead, through one port module, `toron_core::kernel` (toron ADR-0040). The text below is kept as the historical proposal.
+
+**Why rejected (summary):** the four values this crate would have shipped (`fold_log`, `Gate`, `Breaker`, `RetryPolicy`) are a subset of what elm-effect-rs already ships or specifies (`replay::Player`; the journal states, `plan_attempt` and `may_settle`; `policy::remote`), and beads had already adopted elm-effect for its close fold. A second small kernel beside it would be the "third spelling" elm-effect-rs ADR-0002 forbids (:463).
+
+**§7 preconditions:** they were interpreter bugs, not crate prerequisites, and all five are already fixed in place: toron `dispatch_core::Release`, the receipts prune tombstone, `ask_judgment` journal-before-call and `send_armor` half-open single probe are closed with named witness tests (toron AGENTS.md "Effect law" section); chiebukuro `finish_queue` resurrection/TOCTOU is chiebukuro bead `bd-gq2`, closed. Nothing is moved into beads.
+
+**Migration that replaces §5** (redesign §9A.2): comms Phases 1-3 land in toron-core on the port; the doorbell's `DoorbellModel` + `WakeModel` become one `InboxProgram` (Phase 3); `SupervisorProgram` replaces `loop-mode supervise` (Phase 4a); flywheel's `effect_journal` runner becomes `Interpret` over `JournalStore`; `breaker.rs` moves to `policy::remote` once elm-effect matches it.
 
 **Decision in one sentence:** Do not build an Elm or Effect runtime. Add one zero-dependency Rust crate, `foldcore`, inside the toron repo.
 
