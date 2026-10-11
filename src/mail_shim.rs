@@ -173,6 +173,15 @@ pub fn mailbox() -> &'static toron_core::mailbox::Mailbox {
     }
 }
 
+/// The in-process mailbox for the comms inbox (ADR-0041): the shared durable
+/// root's index, whatever mail transport the config selects. Builds it once.
+pub fn comms_mailbox() -> Result<&'static toron_core::mailbox::Mailbox> {
+    #[cfg(test)]
+    pin_test_mail_root_once();
+    init_mailbox()?;
+    Ok(mailbox())
+}
+
 /// Non-panicking mailbox access for background ticks (GS-006 Ack-SLA).
 pub fn try_mailbox() -> Option<&'static toron_core::mailbox::Mailbox> {
     MAILBOX.get()

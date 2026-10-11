@@ -68,6 +68,9 @@ backend-herdr = []
 backend-superlogical = []
 # Mail backends (ADR-0002, bd-euav single-backend: toron only)
 mail-toron = []
+# Live-test only (build-plan §5): toron's outbox crash points,
+# `TORON_FAULT=after_intent|after_append` aborts between journal and append.
+fault-injection = ["toron-core/fault-injection"]
 
 [dependencies.axum]
 version = "0.8"
