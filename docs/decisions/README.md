@@ -20,7 +20,7 @@ This directory contains records of the major architectural decisions made for th
 | [0014](0014-jev-system-one-judgment-adapter.md) | Jev / System One as host-side judgment adapter | **Proposed** (2026-09-19; GS-055; HOLD merge; W1–W3 HOLD implement; companion toron ADR-0033 / beads ADR-0006) |
 | [0015](0015-effect-oriented-adoption.md) | Effect-oriented discipline across the stack | **Accepted** (2026-09-19; wrap order superseded by ADR-0016 §5) |
 | [0016](0016-functional-effect-kernel-redesign.md) | Adopt one typed functional effect kernel across flywheel | **Accepted** (2026-09-21; sequential implementation Phases 0–7) |
-| [0017](0017-shared-foldcore-crate.md) | Shared fold crate lives in toron | **Proposed** (2026-09-22; crate not created) |
+| [0017](0017-shared-foldcore-crate.md) | Shared fold crate lives in toron | **Rejected** (2026-10-11; never created; superseded by elm-effect-rs ADR-0002 + toron ADR-0040) |
 
 ## Related toron ADRs
 
