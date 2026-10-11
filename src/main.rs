@@ -33,6 +33,7 @@ mod catalog_tui;
 mod cli_args;
 mod cmd;
 mod coalition;
+mod comms_send;
 mod config;
 mod control;
 mod crew;
@@ -76,6 +77,7 @@ mod mcp_http;
 mod models;
 mod output;
 mod pane;
+mod pane_write;
 mod phase_chain;
 mod phase_contracts;
 mod plane_route;
@@ -1113,6 +1115,16 @@ enum Commands {
         /// `--raw` never bypasses.
         #[arg(long = "unsafe-plane")]
         unsafe_plane: bool,
+        /// ADR-0041 / build-plan §5: deliver as one `task@1` envelope in each
+        /// recipient's comms inbox (`--to` takes npubs, pins or pin@project);
+        /// the pane gets ONLY the constant wake line. Needs
+        /// `TORON_COMMS_INBOX=1` or `[comms] inbox_log = true`.
+        #[arg(long = "via-inbox")]
+        via_inbox: bool,
+        /// Sender pin or npub for --via-inbox (default: FLYWHEEL_MAIL_AS,
+        /// then AGENT_NAME).
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Crew plane: preview + lifecycle control (ADR-0010 D7). Control has
     /// NO arbitrary-text entry point — the verbs are interrupt|exit|relaunch
@@ -2933,6 +2945,43 @@ fn main() {
             fire_and_forget,
             plane,
             unsafe_plane,
+            via_inbox: true,
+            from,
+        }) => cmd_send_via_inbox(
+            &cfg,
+            project,
+            msg.as_deref(),
+            to,
+            stage.as_deref(),
+            params,
+            *force,
+            from.as_deref(),
+            (
+                *wait,
+                *respawn_on_stall,
+                *raw,
+                fire_and_forget.is_some(),
+                plane.is_some(),
+                *unsafe_plane,
+                *timeout_ms,
+            ),
+        ),
+        Some(Commands::Send {
+            project,
+            msg,
+            to,
+            stage,
+            params,
+            wait,
+            timeout_ms,
+            force,
+            respawn_on_stall,
+            raw,
+            fire_and_forget,
+            plane,
+            unsafe_plane,
+            via_inbox: false,
+            from: _,
         }) => cmd_send(
             &cfg,
             project,
@@ -16746,6 +16795,93 @@ fn condition_send_target(
     (send_text, Some(profile_name.to_string()), skills_injected)
 }
 
+/// `flywheel send --via-inbox` (ADR-0041, build-plan §5): the brief goes to
+/// each recipient's comms inbox as ONE `task@1` envelope through toron's
+/// `mail.append` effect; the pane receives only the constant wake line. No
+/// typing, no stall resend, no respawn: the envelope is the delivery.
+#[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
+fn cmd_send_via_inbox(
+    cfg: &Config,
+    project: &str,
+    msg: Option<&str>,
+    to: &str,
+    stage: Option<&str>,
+    params: &[String],
+    force: bool,
+    from: Option<&str>,
+    legacy_flags: (bool, bool, bool, bool, bool, bool, Option<u64>),
+) -> Result<()> {
+    if !comms_send::enabled(cfg) {
+        return Err(comms_send::SendError::Disabled.into());
+    }
+    // The legacy typing knobs mean nothing here; refuse rather than ignore.
+    let (wait, respawn, raw, ff, plane, unsafe_plane, timeout) = legacy_flags;
+    if wait || respawn || raw || ff || plane || unsafe_plane || timeout.is_some() {
+        bail!(
+            "--via-inbox delivers through the inbox: --wait/--timeout-ms/--respawn-on-stall/--raw/--fire-and-forget/--plane/--unsafe-plane do not apply (nothing sent)"
+        );
+    }
+    let text = match (stage, msg) {
+        (Some(s), m) => combine_stage_message(
+            stage_prompt_with_params_project(s, params, &project_dir(cfg, project))?,
+            m,
+        ),
+        (None, Some(m)) => m.to_string(),
+        (None, None) => bail!("provide --stage NAME or a message text"),
+    };
+    let param = |k: &str| {
+        params
+            .iter()
+            .find_map(|p| p.strip_prefix(&format!("{k}=")).map(str::to_string))
+            .filter(|v| !v.is_empty())
+    };
+    let task_id = param("task_id").unwrap_or_else(mint_task_id);
+    let bead = param("bead");
+    let scope: Vec<String> = param("scope")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !force {
+        let policy = config::Policy::load()?;
+        if let Some(p) = policy.violation(&text) {
+            bail!(
+                "refused by policy guard (pattern: {p:?}). Pass --force to override, or edit policy: flywheel policy remove"
+            );
+        }
+    }
+    let task = comms_send::task_from_text(&text, bead.as_deref(), scope);
+    let rows = comms_send::send(
+        cfg,
+        comms_send::Request {
+            project,
+            from,
+            to,
+            task_id: &task_id,
+            task,
+        },
+    )?;
+    log(
+        project,
+        EventKind::Send,
+        json!({ "to": to, "via": "inbox", "task_id": task_id, "results": rows }),
+    );
+    print_json(&comms_send::rows_json(&rows));
+    if rows
+        .iter()
+        .any(|r| r.state != "appended" && r.state != "already-appended")
+    {
+        bail!(
+            "comms send: not every envelope settled (see rows). Never resent blind: rerun with --param task_id={task_id} to reconcile the same msg ids"
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_send(
     cfg: &Config,
@@ -18514,10 +18650,7 @@ mod send_stall_recovery_tests {
             classify_stall_probe(Some(false), Some(false)),
             StallProbe::ProvenAbsent
         );
-        assert_eq!(
-            classify_stall_probe(None, None),
-            StallProbe::Unreadable
-        );
+        assert_eq!(classify_stall_probe(None, None), StallProbe::Unreadable);
         assert_eq!(
             classify_stall_probe(None, Some(false)),
             StallProbe::Unreadable
@@ -18569,8 +18702,7 @@ mod send_stall_recovery_tests {
         );
         // Negative control: a body that only slept would fail the probe assert.
         assert!(
-            send_body.contains("refusing blind resubmit")
-                || send_body.contains("proven absent"),
+            send_body.contains("refusing blind resubmit") || send_body.contains("proven absent"),
             "stall path must name the read-before-retry decision"
         );
     }
@@ -32119,6 +32251,18 @@ fn cmd_internal_send(
         iteration,
         profile,
     } = opts;
+    // build-plan §5: with the comms inbox on, `__send` is the mail.append
+    // effect (one task@1 envelope + the constant wake line). Nothing below
+    // (typing, confirm, last-sent resend) runs.
+    if comms_send::enabled(cfg) {
+        let task_id = match invocation.filter(|i| !i.is_empty()) {
+            Some(inv) => comms_send::loop_task_id(inv, iteration.unwrap_or(0), name, text),
+            None => mint_task_id(),
+        };
+        let out = comms_send::loop_send(cfg, project, name, text, &task_id)?;
+        println!("{out}");
+        return Ok(());
+    }
     // bd-gsvn.1: Spec C role conditioning lands in __send — the ONE dispatch
     // leaf shared by the pane runner and both loop paths. When a profile is
     // given, the behavior preamble is prepended (conditioned_prompt) and the

@@ -3722,6 +3722,32 @@ pub struct SendOutcome {
 /// an outcome with `landed: None`.
 #[function]
 async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
+    // build-plan §5: with the comms inbox on, the leaf IS the mail.append
+    // effect, in process (no `__send` subprocess, no typing, no resend).
+    // The task id is derived from (invocation, iteration, name, text), so a
+    // re-executed leaf re-sends the same msg id and the log appends it once.
+    if let Ok(cfg) = crate::config::Config::load()
+        && crate::comms_send::enabled(&cfg)
+    {
+        let a = args.clone();
+        let out = crate::backend::run_mail_off_runtime(move || {
+            let task_id = if a.invocation.is_empty() {
+                crate::comms_send::loop_task_id(
+                    &crate::mint_task_id(),
+                    a.iteration,
+                    &a.name,
+                    &a.text,
+                )
+            } else {
+                crate::comms_send::loop_task_id(&a.invocation, a.iteration, &a.name, &a.text)
+            };
+            crate::comms_send::loop_send(&cfg, &a.project, &a.name, &a.text, &task_id)
+        })
+        .await
+        .map_err(map_err)?;
+        return serde_json::from_value::<SendOutcome>(out)
+            .map_err(|e| map_err(anyhow::anyhow!("inbox send outcome: {e}")));
+    }
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
     cmd.args(send_prompt_argv(&args));
