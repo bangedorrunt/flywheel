@@ -387,8 +387,12 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
                 )
             })
             .unwrap_or_else(|| "last_wake=never".into());
+        // mcc9: the wake → brain counters, from the snapshot the host writes,
+        // so a dropping hop is visible here even with no daemon answering.
+        let wake_brain =
+            wake_brain_status_segment(doorbell_rt::wake_brain::read_snapshot(&state_dir, &ws));
         println!(
-            "{project}/{ws}: dispatcher {} {last}{}{}{}",
+            "{project}/{ws}: dispatcher {} {last}{}{}{}{wake_brain}",
             if alive { "up" } else { "DOWN" },
             {
                 let pins = crate::doorbell::read_unanswered(&crate::doorbell::unanswered_file(
@@ -427,6 +431,47 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// mcc9: ` wake_brain=dropped:N,full:M,backpressured:B,resumed:R` from the
+/// host's snapshot, or ` wake_brain=unmeasured` when no host wrote one (never
+/// a fabricated zero).
+fn wake_brain_status_segment(snap: Option<doorbell_rt::wake_brain::WakeBrainSnapshot>) -> String {
+    match snap {
+        Some(s) => format!(
+            " wake_brain=dropped:{},full:{},backpressured:{},resumed:{}",
+            s.dropped, s.wake_brain_full, s.backpressured, s.resumed
+        ),
+        None => " wake_brain=unmeasured".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod wake_brain_status_tests {
+    use super::wake_brain_status_segment;
+    use doorbell_rt::wake_brain::WakeBrainSnapshot;
+
+    /// mcc9: `doorbell status` names the exact counts; zero is printed as zero
+    /// (negative control) and a missing snapshot as `unmeasured`.
+    #[test]
+    fn doorbell_status_prints_wake_brain_counts() {
+        let flooded = WakeBrainSnapshot {
+            dropped: 499,
+            wake_brain_full: 1,
+            backpressured: 0,
+            resumed: 1,
+            ..WakeBrainSnapshot::default()
+        };
+        assert_eq!(
+            wake_brain_status_segment(Some(flooded)),
+            " wake_brain=dropped:499,full:1,backpressured:0,resumed:1"
+        );
+        assert_eq!(
+            wake_brain_status_segment(Some(WakeBrainSnapshot::default())),
+            " wake_brain=dropped:0,full:0,backpressured:0,resumed:0"
+        );
+        assert_eq!(wake_brain_status_segment(None), " wake_brain=unmeasured");
+    }
 }
 
 pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {

@@ -33,6 +33,12 @@ async fn host_workspace(
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
     fcfg.toron_bin = bins.toron.clone();
     fcfg.herdr_bin = bins.herdr.clone();
+    // mcc9: the backpressure window is host policy, read once here.
+    fcfg.wake_brain_wait = doorbell_rt::wake_brain::wait_from_env(
+        std::env::var(doorbell_rt::wake_brain::WAIT_ENV)
+            .ok()
+            .as_deref(),
+    );
     let mut host = FileHost::new(fcfg).with_tx(tx.clone());
     // Daemon-keyed generation: first run captures the doorbell binary
     // identity so a mid-run upgrade retires the loop instead of waking
@@ -2081,6 +2087,24 @@ fn health_body(app: &AppState) -> String {
     if no_prompt_hop {
         degraded.push("no_injectable_panes".to_string());
     }
+    // mcc9: the wake → brain hop's exact counters, per hosted workspace. A
+    // digest that says "N queued" while lines never reached the brain was the
+    // silent failure; a FRESH drop degrades loudly, a historical one is shown.
+    let wake_brain_rows: Vec<(String, Option<doorbell_rt::wake_brain::WakeBrainSnapshot>)> =
+        ws_names
+            .iter()
+            .map(|w| {
+                (
+                    w.clone(),
+                    doorbell_rt::wake_brain::hosted_snapshot(w)
+                        .or_else(|| doorbell_rt::wake_brain::read_snapshot(&app.fw_state, w)),
+                )
+            })
+            .collect();
+    let (wake_brain, wake_brain_dropping) = wake_brain_health(&wake_brain_rows, now);
+    if wake_brain_dropping {
+        degraded.push("wake_brain_dropping".to_string());
+    }
     let mailbox_root = doorbell_rt::toron_data_root(None);
     let presence_age =
         doorbell_rt::watchbeat::file_age_secs(&doorbell_rt::presence_path(&mailbox_root));
@@ -2131,6 +2155,10 @@ fn health_body(app: &AppState) -> String {
         // GS-062 ASK-USER E: wake_liveness Quiet/Live/Deaf (same shape as
         // flywheel serve /health). Keys come from AppState.hosted.
         "wake": wake,
+        // mcc9: `dropped` / `wake_brain_full` (+ backpressured, resumed) —
+        // exact, cumulative since the host armed. `doorbell status` prints
+        // this body, so the counts are where an operator already looks.
+        "wake_brain": wake_brain,
         "sweep": {"last_age_s": sweep_age},
         // Measured, not hardcoded: the literal `0` here read as "no wake
         // subscriptions" even on a fully hosted daemon mid-ring, and sent
@@ -2216,6 +2244,54 @@ fn health_body(app: &AppState) -> String {
         "owner": {"pid": std::process::id(), "gen": null, "host": hostname()},
     })
     .to_string()
+}
+
+/// mcc9: the `/health.wake_brain` body and whether a drop is FRESH (inside
+/// [`PROBE_FRESH_SECS`]). Pure over the per-workspace snapshots so the shape is
+/// testable without a daemon. A workspace with no snapshot reads `null`
+/// (unmeasured), never zeros.
+pub(super) fn wake_brain_health(
+    rows: &[(String, Option<doorbell_rt::wake_brain::WakeBrainSnapshot>)],
+    now: u64,
+) -> (serde_json::Value, bool) {
+    let mut total = doorbell_rt::wake_brain::WakeBrainSnapshot::default();
+    let mut fresh = false;
+    let mut per = serde_json::Map::new();
+    for (ws, snap) in rows {
+        match snap {
+            Some(s) => {
+                total = total.plus(*s);
+                if s.last_drop_unix
+                    .is_some_and(|t| now.saturating_sub(t) <= PROBE_FRESH_SECS)
+                {
+                    fresh = true;
+                }
+                per.insert(
+                    ws.clone(),
+                    serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            None => {
+                per.insert(ws.clone(), serde_json::Value::Null);
+            }
+        }
+    }
+    (
+        serde_json::json!({
+            "dropped": total.dropped,
+            "wake_brain_full": total.wake_brain_full,
+            "backpressured": total.backpressured,
+            "forwarded": total.forwarded,
+            "resumed": total.resumed,
+            "last_drop_age_s": total.last_drop_unix.map(|t| now.saturating_sub(t)),
+            "policy": format!(
+                "backpressure up to {}s on a full brain channel; then drop (counted exactly), one death, the replacement resumes from the last accepted cursor",
+                doorbell_rt::wake_brain::BACKPRESSURE_WAIT.as_secs()
+            ),
+            "workspaces": per,
+        }),
+        fresh,
+    )
 }
 
 fn hostname() -> String {
@@ -2827,6 +2903,54 @@ mod tests {
     /// The second half is the guard on the mirror rule: it must not relax
     /// `inbox_fetch_failing`, because one workspace's fetch error is still a
     /// local miss and not a dead fetch path.
+    /// mcc9: `/health.wake_brain` carries the exact counts, sums them across
+    /// hosted workspaces, reads an unmeasured workspace as `null`, and degrades
+    /// only on a FRESH drop. Negative control: zero drops (or an old one) never
+    /// degrades.
+    #[test]
+    fn health_wake_brain_reports_exact_counts_and_degrades_only_on_a_fresh_drop() {
+        use doorbell_rt::wake_brain::WakeBrainSnapshot;
+        let now = 10_000;
+        let clean = WakeBrainSnapshot {
+            forwarded: 40,
+            ..WakeBrainSnapshot::default()
+        };
+        let (body, fresh) =
+            super::wake_brain_health(&[("ws-a".into(), Some(clean)), ("ws-b".into(), None)], now);
+        assert!(!fresh, "zero drops must not degrade");
+        assert_eq!(body["dropped"], 0);
+        assert_eq!(body["wake_brain_full"], 0);
+        assert!(
+            body["workspaces"]["ws-b"].is_null(),
+            "unmeasured is null, not zeros"
+        );
+        let flooded = WakeBrainSnapshot {
+            forwarded: 1024,
+            wake_brain_full: 3,
+            backpressured: 2,
+            dropped: 499,
+            resumed: 1,
+            last_drop_unix: Some(now - 5),
+        };
+        let (body, fresh) = super::wake_brain_health(
+            &[("ws-a".into(), Some(clean)), ("ws-c".into(), Some(flooded))],
+            now,
+        );
+        assert!(fresh, "a drop inside the probe window degrades");
+        assert_eq!(body["dropped"], 499);
+        assert_eq!(body["wake_brain_full"], 3);
+        assert_eq!(body["forwarded"], 1064);
+        assert_eq!(body["last_drop_age_s"], 5);
+        assert_eq!(body["workspaces"]["ws-c"]["dropped"], 499);
+        let old = WakeBrainSnapshot {
+            last_drop_unix: Some(now - super::PROBE_FRESH_SECS - 1),
+            ..flooded
+        };
+        let (body, fresh) = super::wake_brain_health(&[("ws-c".into(), Some(old))], now);
+        assert!(!fresh, "a historical drop is shown, not degraded");
+        assert_eq!(body["dropped"], 499);
+    }
+
     #[test]
     fn health_degrades_on_any_fresh_store_skew_row() {
         use super::{AppState, CachedHealth, health_body};

@@ -11021,17 +11021,21 @@ fn spawn_wake_consumer<F>(
     project: &str,
     workspace: &str,
     state_dir: &std::path::Path,
+    resume_from: Option<String>,
     on_event: F,
 ) -> tokio::task::AbortHandle
 where
     F: Fn(doorbell_rt::wake_sock::WakeOutcome) + Send + 'static,
 {
     use doorbell_rt::wake_sock::{self, WakeOpts};
-    let opts = WakeOpts::new(
+    let mut opts = WakeOpts::new(
         wake_sock::wake_sock_path(),
         wake_sock::parse_kinds(DOORBELL_WATCH_KINDS),
         Some(project.to_string()),
     );
+    // mcc9: a replacement consumer resumes from the last line the brain
+    // accepted (`None` = first start, replay from origin).
+    opts.resume_from = resume_from;
     let state_dir = state_dir.to_path_buf();
     let workspace = workspace.to_string();
     wake_sock::spawn_wake_task(

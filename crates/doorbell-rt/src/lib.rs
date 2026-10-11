@@ -22,6 +22,7 @@ pub mod sinks;
 pub mod store;
 pub mod subscribe;
 pub mod tailprobe;
+pub mod wake_brain;
 pub mod wake_liveness;
 pub mod wake_sock;
 pub mod watchbeat;

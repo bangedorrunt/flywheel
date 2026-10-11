@@ -252,6 +252,13 @@ pub struct WakeOpts {
     /// restart was counted as a failure by the very mechanism performing it. The
     /// recovery was poisoning its own backoff and reading as an incident.
     pub retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// mcc9: the cursor this consumer subscribes from — the last line the
+    /// brain accepted from the consumer it replaces
+    /// ([`crate::wake_brain::WatchForwarder::resume_cursor`]). `None` keeps the
+    /// first-start behaviour (replay from origin). Before mcc9 every
+    /// replacement subscribed from origin, so a full-channel restart replayed
+    /// the whole history into the channel that had just overflowed.
+    pub resume_from: Option<String>,
 }
 
 impl WakeOpts {
@@ -264,6 +271,7 @@ impl WakeOpts {
             idle_timeout: IDLE_TIMEOUT,
             resync_floor: RESYNC_FLOOR,
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_from: None,
         }
     }
 
@@ -355,7 +363,7 @@ async fn run_wake_loop(
     let send = |out: WakeOutcome| {
         let _ = tx.send(out);
     };
-    let mut cursor: Option<String> = None;
+    let mut cursor: Option<String> = opts.resume_from.clone();
     // Resyncs this loop has performed. Counted across reconnects so the audit
     // rows read as a rate (1, 2, 3 ...) rather than N unrelated blips.
     let mut resyncs: u64 = 0;
@@ -612,6 +620,7 @@ mod tests {
                 idle_timeout: Duration::from_secs(30),
                 resync_floor: Duration::from_millis(50),
                 retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                resume_from: None,
             };
             let flag = opts.retire_flag();
 
@@ -813,6 +822,7 @@ mod tests {
             idle_timeout: Duration::from_secs(2),
             resync_floor: floor,
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_from: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
@@ -905,6 +915,7 @@ mod tests {
             idle_timeout: Duration::from_secs(2),
             resync_floor: Duration::from_millis(50),
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_from: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let audit = std::sync::Arc::new(|_: &str, _: serde_json::Value| {});
@@ -972,6 +983,7 @@ mod tests {
             idle_timeout: Duration::from_millis(400),
             resync_floor: Duration::from_millis(50),
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_from: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         rt.block_on(run_wake_loop(opts, &tx, &audit));
@@ -1024,6 +1036,7 @@ mod tests {
             idle_timeout: Duration::from_millis(100),
             resync_floor: Duration::from_millis(50),
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_from: None,
         };
         let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<WakeOutcome>(8);
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -1057,6 +1070,51 @@ mod tests {
         );
     }
 
+    /// mcc9: a replacement consumer subscribes FROM its resume cursor (the last
+    /// line the brain accepted), so the sidecar replays what the predecessor
+    /// dropped. Negative control in the same test: with no resume cursor the
+    /// first subscribe carries `since_cursor: null` (replay from origin, the
+    /// pre-mcc9 behaviour for every restart).
+    #[tokio::test]
+    async fn a_replacement_subscribes_from_its_resume_cursor() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        async fn first_subscribe(resume_from: Option<String>, tag: &str) -> serde_json::Value {
+            let path =
+                std::env::temp_dir().join(format!("wake-resume-{tag}-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+            let server = tokio::spawn(async move {
+                let (s, _) = listener.accept().await.expect("accept");
+                let (rd, mut wr) = s.into_split();
+                let mut lines = tokio::io::BufReader::new(rd).lines();
+                let sub = lines
+                    .next_line()
+                    .await
+                    .expect("read")
+                    .expect("subscribe line");
+                let _ = wr.write_all(b"").await; // then EOF ends the consumer
+                serde_json::from_str::<serde_json::Value>(&sub).expect("subscribe json")
+            });
+            let mut opts = WakeOpts::new(path.clone(), vec![9], Some("demo".into()));
+            opts.handshake_timeout = Duration::from_secs(2);
+            opts.idle_timeout = Duration::from_millis(300);
+            opts.resume_from = resume_from;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let audit = std::sync::Arc::new(|_: &str, _: serde_json::Value| {});
+            run_wake_loop(opts, &tx, &audit).await;
+            let _ = std::fs::remove_file(&path);
+            server.await.expect("server")
+        }
+        let cursor = format!("1001:{}", "ab".repeat(32));
+        let resumed = first_subscribe(Some(cursor.clone()), "some").await;
+        assert_eq!(
+            resumed["subscribe"]["since_cursor"],
+            serde_json::json!(cursor)
+        );
+        let fresh = first_subscribe(None, "none").await;
+        assert!(fresh["subscribe"]["since_cursor"].is_null());
+    }
+
     #[tokio::test]
     async fn absent_socket_is_one_loud_died() {
         let opts = WakeOpts {
@@ -1067,6 +1125,7 @@ mod tests {
             idle_timeout: Duration::from_millis(200),
             resync_floor: Duration::from_millis(50),
             retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_from: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let audits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
