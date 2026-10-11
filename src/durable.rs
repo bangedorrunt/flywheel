@@ -1220,6 +1220,19 @@ pub struct NotReadyMailArgs {
     pub reason: Option<String>,
 }
 
+/// Pure: the loop's status word for one `__mail-not-ready` leaf result. A
+/// leaf reporting `ok:false` — or JSON carrying no `ok` at all — is a
+/// FAILURE. The old line printed `planner mailed: {v}` unconditionally, a
+/// success word over a failed send, which is how beads were silently never
+/// dispatched with no reason delivered. Fail closed: an absent `ok` is
+/// never read as success.
+pub(crate) fn not_ready_mail_status(v: &serde_json::Value) -> &'static str {
+    match v.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => "planner mailed",
+        _ => "planner NOT mailed",
+    }
+}
+
 /// Checkpointed leaf — mail the planner that bead `bead_id` is NOT ready
 /// (missing/malformed `## VERIFY` fence, ADR-0019). The underlying
 /// `__mail-not-ready` command always exits 0 with `{ok, notified, error}` —
@@ -7632,9 +7645,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         reason: Some(reason.clone()),
                     };
                     match ctx.run(mail_not_ready, args).await {
+                        // bd-not-ready-alert-recipient-2yd1: the leaf's own
+                        // `ok` flag decides the status word. A send that
+                        // resolved to nobody is a FAILURE, so it must not be
+                        // printed as `planner mailed` — that word is how
+                        // beads were silently never dispatched with the
+                        // reason silently never delivered.
                         Ok(v) => eprintln!(
-                            "flywheel: bead {} NOT ready ({reason}) — planner mailed: {v}",
-                            bead.id
+                            "flywheel: bead {} NOT ready ({reason}) — {}: {v}",
+                            bead.id,
+                            not_ready_mail_status(&v)
                         ),
                         Err(e) => eprintln!(
                             "flywheel: mail-not-ready for {} failed (continuing): {e}",
