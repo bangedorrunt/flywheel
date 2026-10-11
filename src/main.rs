@@ -1786,6 +1786,12 @@ enum Commands {
         /// in the mail body (principles_block_reason / the fence error).
         #[arg(long)]
         reason: Option<String>,
+        /// Output shape. Internal leaves ALWAYS emit JSON on stdout (the
+        /// durable loop parses that), so this is accepted, not acted on:
+        /// machine callers may state it explicitly, and anything but
+        /// `json` fails loud rather than silently switching to non-JSON.
+        #[arg(long)]
+        format: Option<String>,
     },
     /// internal: programmatic done-mail (2026-08-18) — the loop mails the
     /// captain the close-reason REPORT on thread_id=<bead_id> when a
@@ -3470,7 +3476,18 @@ fn main() {
             bead_id,
             title,
             reason,
-        }) => cmd_internal_mail_not_ready(&cfg, project, bead_id, title, reason.as_deref()),
+            format,
+        }) => {
+            // The leaf emits JSON unconditionally; a non-json request is a
+            // caller mistake, not a behavior switch.
+            if format.as_deref().is_some_and(|f| f != "json") {
+                Err(anyhow::anyhow!(
+                    "__mail-not-ready only supports --format json"
+                ))
+            } else {
+                cmd_internal_mail_not_ready(&cfg, project, bead_id, title, reason.as_deref())
+            }
+        }
         Some(Commands::__MailDone { project, bead_id }) => {
             cmd_internal_mail_done(&cfg, project, bead_id)
         }
@@ -24874,7 +24891,10 @@ mod loop_tests {
                 crate::mail_shim::fixture_register(&project, &sender_profile)
                     .expect("register sender");
                 // the planner = the bead's creator (registered identity)
-                let planner = resolve_planner_for_bead(&dir_str, &bead_id, "FallbackIdentity");
+                let planner = planner_recipient_chain(&dir_str, &bead_id, "FallbackIdentity")
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
                 let planner_profile = spawn_agent_profile(&planner, "opencode", &project);
                 crate::mail_shim::fixture_register(&project, &planner_profile)
                     .expect("register planner");
@@ -24981,15 +25001,19 @@ mod loop_tests {
         let v: Value = serde_json::from_slice(&list.stdout).expect("br list json");
         let id = v["issues"][0]["id"].as_str().expect("bead id").to_string();
         let dir_str = dir.to_string_lossy().to_string();
-        let planner = resolve_planner_for_bead(&dir_str, &id, "FallbackIdentity");
+        let planner = planner_recipient_chain(&dir_str, &id, "FallbackIdentity")
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         assert!(
             !planner.is_empty() && planner != "FallbackIdentity",
             "creator resolved, got: {planner}"
         );
         // unresolvable bead -> fallback
         assert_eq!(
-            resolve_planner_for_bead(&dir_str, "bd-does-not-exist", "FallbackIdentity"),
-            "FallbackIdentity"
+            planner_recipient_chain(&dir_str, "bd-does-not-exist", "FallbackIdentity"),
+            vec!["FallbackIdentity".to_string()],
+            "unresolvable bead -> the configured operator is the only candidate"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -25360,6 +25384,81 @@ mod loop_tests {
         // a nameless pi agent's display name IS its pane id
         let targets = vec![("w1:p2".to_string(), "w1:p2".to_string())];
         assert_eq!(watch_name_for_pane(&targets, "w1:p2"), Some("w1:p2"));
+    }
+
+    // ---- bd-not-ready-alert-recipient-2yd1: the recipient chain ----
+
+    /// Pure: an OS username is skipped and the first REGISTERED candidate
+    /// wins. `br` writes `created_by` from `$USER`, so the first link is
+    /// almost always a name no mailbox knows.
+    #[test]
+    fn first_routable_skips_the_username_and_takes_the_registered_pin() {
+        let routable = |n: &str| n == "BoldKite" || n == "captain";
+        let chain = vec![
+            "bangedorrunt".to_string(),
+            "Flywheel".to_string(),
+            "captain".to_string(),
+        ];
+        assert_eq!(
+            first_routable(&chain, |c| routable(c)).as_deref(),
+            Some("captain"),
+            "the unroutable username and the unset operator fall through to the captain fold"
+        );
+        assert_eq!(
+            first_routable(&chain, |_| false),
+            None,
+            "nothing routable -> None, never a silent pick"
+        );
+    }
+
+    /// Pure: empty and whitespace-only candidates are never tried (an
+    /// unset `agent_mail` yields "", which would otherwise "resolve" as
+    /// the empty recipient).
+    #[test]
+    fn first_routable_ignores_blank_candidates() {
+        let mut tried = Vec::new();
+        let chain = vec!["   ".to_string(), String::new(), "BoldKite".to_string()];
+        let got = first_routable(&chain, |c| {
+            tried.push(c.to_string());
+            true
+        });
+        assert_eq!(got.as_deref(), Some("BoldKite"));
+        assert_eq!(tried, vec!["BoldKite"], "blanks are filtered before any whois");
+    }
+
+    /// Pure: order is preserved — the chain never prefers a later rung
+    /// over an earlier routable one (created_by beats the operator pin).
+    #[test]
+    fn first_routable_respects_chain_order() {
+        let chain = vec!["BoldKite".to_string(), "captain".to_string()];
+        assert_eq!(
+            first_routable(&chain, |_| true).as_deref(),
+            Some("BoldKite"),
+            "first routable wins; the captain fold is the last rung, not the first"
+        );
+    }
+
+    /// Pure: the loop's status word comes from the leaf's own `ok` flag.
+    /// `planner mailed` over `ok:false` is how beads were silently never
+    /// dispatched with no reason delivered.
+    #[test]
+    fn not_ready_mail_status_words_the_leaf_ok_flag() {
+        use serde_json::json;
+        assert_eq!(
+            crate::durable::not_ready_mail_status(&json!({"ok": true, "notified": "BoldKite"})),
+            "planner mailed"
+        );
+        assert_eq!(
+            crate::durable::not_ready_mail_status(&json!({"ok": false, "notified": "", "error": "unknown recipient"})),
+            "planner NOT mailed",
+            "a failed send is reported as a failure"
+        );
+        // A leaf that produced no parsable JSON has no ok flag at all —
+        // fail closed, never success-worded.
+        assert_eq!(
+            crate::durable::not_ready_mail_status(&json!({"raw": "garbage"})),
+            "planner NOT mailed"
+        );
     }
 }
 
@@ -35297,7 +35396,31 @@ fn cmd_internal_mail_not_ready(
         .as_ref()
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "Flywheel".to_string());
-    let planner = resolve_planner_for_bead(&key, bead_id, &fallback);
+    // bd-not-ready-alert-recipient-2yd1: the advisory must reach a REGISTERED
+    // identity or it never lands at all, and `br` writes `created_by` from
+    // `$USER` — an OS username, never a pin. So the chain is created_by,
+    // configured operator, then the arriving/captain fold, each RE-CHECKED
+    // against the mailbox instead of trusted.
+    let mut chain = planner_recipient_chain(&key, bead_id, &fallback);
+    chain.push("captain".to_string());
+    let planner = match first_routable(chain.iter().map(String::as_str), |c| {
+        mail_whois_ok(&*mail, &key, c)
+    }) {
+        Some(p) => p,
+        None => {
+            let tried = chain.join(", ");
+            eprintln!(
+                "flywheel: not-ready alert for {bead_id} has no routable recipient (tried {tried})"
+            );
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "notified": tried,
+                "error": format!("no routable planner identity for {key} (tried {tried})")
+            }));
+            return Ok(());
+        }
+    };
     let out = (|| -> Result<backend::SendReceipt> {
         backend::run_mail(mail.ensure_project(&key)).map_err(|e| anyhow!("{e}"))?;
         send_not_ready_mail(&*mail, &key, bead_id, title, &planner, reason)
@@ -35320,10 +35443,14 @@ fn cmd_internal_mail_not_ready(
     }
 }
 
-/// Resolve the planner to notify for a not-ready bead: the bead's creator
-/// (`br show --json` → `created_by`), falling back to the configured
-/// orchestrator identity when the creator cannot be resolved.
-fn resolve_planner_for_bead(project_dir: &str, bead_id: &str, fallback: &str) -> String {
+/// The recipient chain for a loop advisory mail about bead `bead_id`, in
+/// preference order: the bead's `created_by` when `br show` names one, then
+/// the configured operator pin (`cfg.agent_mail.name`, or the `Flywheel`
+/// default). Each entry is only a CANDIDATE — callers must re-check
+/// routability, because `br` derives `created_by` from `$USER` and an OS
+/// username is never a registered mail identity.
+fn planner_recipient_chain(project_dir: &str, bead_id: &str, fallback: &str) -> Vec<String> {
+    let mut chain = Vec::new();
     if let Ok(out) = std::process::Command::new("br")
         .args(["show", bead_id, "--json"])
         .current_dir(project_dir)
@@ -35342,9 +35469,30 @@ fn resolve_planner_for_bead(project_dir: &str, bead_id: &str, fallback: &str) ->
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
     {
-        return created_by.to_string();
+        chain.push(created_by.to_string());
     }
-    fallback.to_string()
+    if !fallback.trim().is_empty() {
+        chain.push(fallback.to_string());
+    }
+    chain
+}
+
+/// Pure: the first chain candidate `resolves` accepts, else `None`. Blank
+/// candidates are filtered before `resolves` ever sees them (an unset
+/// `agent_mail` yields `""`, which must not read as routable). Kept free of
+/// IO so the fallback order is testable without a mailbox — the one
+/// behaviour that silently swallowed the alert is exactly the order.
+///
+/// Takes `AsRef<str>` so callers can pass `&[String]`, `&Vec<String>`, or a
+/// literal `["a", "b"]` without an intermediate mapping.
+fn first_routable<S: AsRef<str>>(
+    chain: impl IntoIterator<Item = S>,
+    mut resolves: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    chain
+        .into_iter()
+        .map(|c| c.as_ref().trim().to_string())
+        .find(|c| !c.is_empty() && resolves(c))
 }
 
 /// Loop-originated mails: one enum over the four loop mails (bd-6tmi unify).
@@ -35658,19 +35806,24 @@ fn cmd_internal_mail_done(cfg: &Config, project: &str, bead_id: &str) -> Result<
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "Flywheel".to_string());
     let (title, report) = bead_title_and_close_report(&key, bead_id);
-    let created_by = resolve_planner_for_bead(&key, bead_id, &fallback);
-    // created_by is routable only when it is a registered identity in this
-    // project (the "bangedorrunt" class is a username, not a pin).
-    let captain = if mail_whois_ok(&*mail, &key, &created_by) {
-        created_by
-    } else if let Some(name) = registered_orchestrator(&*mail, &key) {
-        name
-    } else {
+    // bd-not-ready-alert-recipient-2yd1: ONE chain for both loop advisories.
+    // created_by (`br` writes it from `$USER`) is only a candidate — it is
+    // re-checked for routability, then the configured operator, then the
+    // arriving/captain fold, then the registered orchestrator as the last
+    // routable rung before soft-failing.
+    let mut chain = planner_recipient_chain(&key, bead_id, &fallback);
+    chain.push("captain".to_string());
+    let captain = first_routable(chain.iter().map(String::as_str), |c| {
+        mail_whois_ok(&*mail, &key, c)
+    })
+    .or_else(|| registered_orchestrator(&*mail, &key));
+    let Some(captain) = captain else {
+        let tried = chain.join(", ");
         print_json(&json!({
             "ok": false,
             "bead_id": bead_id,
-            "notified": created_by,
-            "error": format!("no routable captain identity for {key} (created_by {created_by} unregistered)")
+            "notified": tried,
+            "error": format!("no routable captain identity for {key} (tried {tried})")
         }));
         return Ok(());
     };
@@ -36042,7 +36195,12 @@ fn cmd_internal_reopen_bead(cfg: &Config, project: &str, bead_id: &str, sha: &st
         .as_ref()
         .and_then(|m| m.name.clone())
         .unwrap_or_else(|| "Flywheel".to_string());
-    let planner = resolve_planner_for_bead(&key, bead_id, &fallback);
+    // bd-not-ready-alert-recipient-2yd1: the same routable chain the
+    // not-ready/done advisories use. `resolve_planner_for_bead` used to
+    // return `created_by` — an OS username — unverified, so this alert
+    // bounced for every operator-created bead.
+    let mut chain = planner_recipient_chain(&key, bead_id, &fallback);
+    chain.push("captain".to_string());
     let mail = match backend::mail_backend(cfg) {
         Ok(m) => m,
         Err(e) => {
@@ -36052,6 +36210,25 @@ fn cmd_internal_reopen_bead(cfg: &Config, project: &str, bead_id: &str, sha: &st
                 "bead_id": bead_id,
                 "sha": sha,
                 "error": format!("mail backend: {e:#}"),
+            }));
+            return Ok(());
+        }
+    };
+    let planner = match first_routable(chain.iter().map(String::as_str), |c| {
+        mail_whois_ok(&*mail, &key, c)
+    }) {
+        Some(p) => p,
+        None => {
+            let tried = chain.join(", ");
+            eprintln!(
+                "flywheel: reopen alert for {bead_id} has no routable recipient (tried {tried})"
+            );
+            print_json(&json!({
+                "ok": false,
+                "bead_id": bead_id,
+                "sha": sha,
+                "notified": tried,
+                "error": format!("no routable planner identity for {key} (tried {tried})")
             }));
             return Ok(());
         }
