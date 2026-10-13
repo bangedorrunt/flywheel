@@ -23789,9 +23789,17 @@ fn cmd_loop(
 
         if once {
             println!("{}", dim("[loop] --once pass done"));
+            // `continue` means continue: a blocked crew is a reason to wait, not
+            // a reason the pass failed. Bailing here made `loop-mode supervise`
+            // count a provider-rate-limited agent as a consecutive failure and
+            // stop after three passes — the supervisor died precisely because a
+            // crew was idle on someone else's limit, while the crews that were
+            // still working went unsupervised. The pass is a success; the block
+            // is reported, and `stop`/`mail` remain the policies that act on it.
             if any_blocked && on_blocked == "continue" {
-                bail!(
-                    "loop: agents blocked (on_blocked=continue; pass --on-blocked stop|mail to control)"
+                println!(
+                    "{}",
+                    dim("loop: agents blocked (on_blocked=continue; pass --on-blocked stop|mail to control)")
                 );
             }
             return Ok(());
