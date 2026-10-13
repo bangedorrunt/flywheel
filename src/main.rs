@@ -3705,7 +3705,7 @@ fn print_concise_help() {
 // ---- robot snapshot ----
 
 fn robot_snapshot(cfg: &Config) -> Result<Value> {
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let c = Client::connect(Some(&cfg.socket_path()))?;
     let workspaces = c.workspace_list()?;
     let agents = c.agent_list()?;
     let fly: Vec<Value> = workspaces
@@ -3752,17 +3752,14 @@ fn robot_snapshot(cfg: &Config) -> Result<Value> {
 /// Independent of the `runs` CLI so the snapshot has no subcommand coupling.
 fn snapshot_runs() -> Vec<Value> {
     use state::EventKind;
-    let dir = config::state_dir();
     let mut entries = Vec::new();
-    let Ok(files) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    for file in files.flatten() {
-        let name = file.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".jsonl") {
-            continue;
-        }
-        let project = name.trim_end_matches(".jsonl").to_string();
+    // `project_logs()` is the ONE enumeration for log sweeps: it excludes
+    // the reserved bookkeeping logs. This used to sweep `*.jsonl` by hand
+    // and parse `miss-ledger` as a project, so every reserved row printed
+    // "skipping malformed log line" on `--robot-status` — the single
+    // command agents run most — and trained the reader to ignore flywheel's
+    // warnings.
+    for project in state::project_logs() {
         let Ok(rows) = state::read_log(&project) else {
             continue;
         };
@@ -14516,7 +14513,7 @@ fn cmd_add(
 // ---- list / status ----
 
 fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
+    let c = Client::connect(Some(&cfg.socket_path()))?;
     let workspaces = c.workspace_list()?;
     let agents = c.agent_list()?;
     let mut rows: Vec<Value> = Vec::new();
@@ -15991,7 +15988,7 @@ fn whois_pane_id(project: &str, pin: &str) -> Option<String> {
 /// bd-8pis: live herdr pane ids (status != dead). None when the daemon is
 /// unreachable — the caller trusts whois bindings instead of warn-storming.
 fn live_herdr_panes(cfg: &Config) -> Option<HashSet<String>> {
-    let mut c = Client::connect(Some(&cfg.socket_path())).ok()?;
+    let c = Client::connect(Some(&cfg.socket_path())).ok()?;
     let agents = c.agent_list().ok()?;
     Some(
         agents
@@ -25470,7 +25467,7 @@ fn cmd_safety(cfg: &Config) -> Result<()> {
     for p in &policy.deny {
         println!("  {}", dim(p));
     }
-    let mut c = if let Ok(c) = Client::connect(Some(&cfg.socket_path())) {
+    let c = if let Ok(c) = Client::connect(Some(&cfg.socket_path())) {
         c
     } else {
         println!("herdr: {}", error("unreachable"));
@@ -26376,7 +26373,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         }
     }
     match Client::connect(Some(&cfg.socket_path())) {
-        Ok(mut c) => match c.ping() {
+        Ok(c) => match c.ping() {
             Ok(_) => println!("herdr socket: {}", status_paint(AgentStatus::Idle)),
             Err(e) => {
                 ok = false;
@@ -37442,7 +37439,7 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
     }
 
     async fn snapshot(State(st): State<Arc<AppState>>) -> Result<String, StatusCode> {
-        let mut c = Client::connect(Some(&st.cfg.socket_path()))
+        let c = Client::connect(Some(&st.cfg.socket_path()))
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let agents = c
             .agent_list()
@@ -37560,7 +37557,7 @@ async fn serve_async(cfg: config::Config, port: u16) -> Result<()> {
             let mut tick = 0u32;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let mut c = match Client::connect(Some(&cfg.socket_path())) {
+                let c = match Client::connect(Some(&cfg.socket_path())) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
