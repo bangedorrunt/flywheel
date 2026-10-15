@@ -115,6 +115,28 @@ where
         .map_err(|e| anyhow::anyhow!("mail blocking task join failed: {e}"))?
 }
 
+/// The sync twin of [`run_mail_off_runtime`] for callers that BORROW (a
+/// `&mut self` host method, a `&Config`): run `f` on a scoped plain thread
+/// when the caller is inside a tokio runtime, inline otherwise. A plain
+/// thread has no runtime context, so the shared-runtime `block_on` inside
+/// `f` is the same thread->runtime bridge the async helper uses.
+///
+/// The embedded doorbell's `Host` methods are sync but the brain drives them
+/// from its runtime thread; every mail-touching one goes through this.
+pub fn run_mail_off_runtime_sync<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    if tokio::runtime::Handle::try_current().is_err() {
+        return f();
+    }
+    std::thread::scope(|s| match s.spawn(f).join() {
+        Ok(v) => v,
+        Err(p) => std::panic::resume_unwind(p),
+    })
+}
+
 /// Errors a backend may surface. `Unsupported` is the honest signal for a
 /// method a backend doesn't implement (real impl gap, or a stub backend like
 /// the unreleased `superlogical`/pre-R1 `toron`). `Other` wraps impl-specific
@@ -205,6 +227,23 @@ mod off_runtime_tests {
             })
             .expect("the bridge must not nest block_on on the caller's runtime");
         assert_eq!(v, 7);
+    }
+
+    /// The sync twin: same call shape from a borrowing caller inside a
+    /// runtime, and a plain pass-through outside one.
+    #[test]
+    fn run_mail_off_runtime_sync_bridges_inside_a_runtime_and_passes_through_outside() {
+        let outside =
+            super::run_mail_off_runtime_sync(|| crate::mail_shim::block_on(async { 3i32 }));
+        assert_eq!(outside, 3);
+        let rt = tokio::runtime::Runtime::new().expect("test runtime");
+        let borrowed = String::from("x");
+        let inside = rt.block_on(async {
+            super::run_mail_off_runtime_sync(|| {
+                (borrowed.len(), crate::mail_shim::block_on(async { 4i32 }))
+            })
+        });
+        assert_eq!(inside, (1, 4));
     }
 
     /// The hazard the bridge exists for, pinned as a canary: a direct
