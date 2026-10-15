@@ -217,6 +217,21 @@ impl FlywheelPorts {
     }
 }
 
+/// The two levels the fold reads for one recipient: the newest offset of its
+/// mail (the watermark) and the cursor `toron next` commits.
+///
+/// The cursor is keyed `(reader, stream)` with the stream being the reader's
+/// OWN npub (`toron next` defaults to it; naming anyone else's is refused).
+/// `INBOX_STREAM` is the log's name, not a cursor stream: reading the cursor
+/// there never sees an ack, so the host would ring an agent that had already
+/// read (found by the live fixture; pinned by
+/// `the_cursor_the_host_reads_is_the_one_toron_next_commits`).
+pub(crate) async fn head_and_cursor(store: &InboxStore, npub: &str) -> (u64, u64) {
+    let head = store.head(npub).await.unwrap_or(0);
+    let cursor = store.cursor(npub, npub).await.unwrap_or(0);
+    (head, cursor)
+}
+
 impl Ports for FlywheelPorts {
     fn observe(&mut self) -> Observation {
         let registry = crate::state::load_spawn_registry(&self.project);
@@ -240,14 +255,8 @@ impl Ports for FlywheelPorts {
             };
             let store = store.clone();
             let n2 = npub.clone();
-            let (head, cursor) = crate::mail_shim::block_on(async move {
-                let h = store.head(&n2).await.unwrap_or(0);
-                let c = store
-                    .cursor(&n2, toron_core::inbox::INBOX_STREAM)
-                    .await
-                    .unwrap_or(0);
-                (h, c)
-            });
+            let (head, cursor) =
+                crate::mail_shim::block_on(async move { head_and_cursor(&store, &n2).await });
             let pane = panes.iter().find(|p| p.pane_id == e.pane_id);
             let (state, bind) = match pane {
                 Some(p) => (
