@@ -2382,36 +2382,147 @@ fn local_engine_with_journal(
     }
 }
 
-/// bd-omwg: the pane-mode spawn drainer thread. Polls the engine's SpawnSink
-/// while `invoke` runs (an `await: true` run parks on its job promise until
-/// the drainer settles it), launches each job through [`launch_spawn_job`],
-/// and keeps draining until `stop` is set (the caller does this after invoke
-/// returns, then joins). Loads the profile catalog fresh — the thread is
-/// 'static and must not borrow the caller's.
+/// bd-omwg: the pane-mode approval drainer thread. Surfaces each parked
+/// approval promise, applies the ADR-0011 D7 SIGNOFF auto-pass, and resolves
+/// parked promises from captain decision mail, until `stop` is set (the caller
+/// does this after invoke returns, then joins).
+///
+/// erbo (bead `elm-effect-rs-approval-drainer-inbox-panic-erbo`): the drainer
+/// thread drives its own current-thread runtime, and BOTH of its synchronous
+/// reads `block_on` the shared mail runtime inside — the SIGNOFF snapshot
+/// (`snapshot::assemble` → `Mail::list_active`) and the decision scan
+/// (`Mail::inbox`). Called inline they panic "Cannot start a runtime from
+/// within a runtime" and kill the thread, so parked approvals silently stopped
+/// auto-resolving. Every such read now goes through
+/// [`crate::backend::run_mail_off_runtime`].
 pub fn start_approval_drainer(
     cfg: Config,
     project: String,
     engine: std::sync::Arc<toron_workflow::WorkflowEngine>,
     stop: std::sync::Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<Result<()>>> {
+    let reads_project = project.clone();
+    start_approval_drainer_with(engine, stop, project, move || {
+        production_drainer_reads(cfg, reads_project)
+    })
+}
+
+/// The drainer's two synchronous host reads. Each is a plain sync call that
+/// may `block_on` the shared mail runtime, so the drainer only ever runs them
+/// through [`crate::backend::run_mail_off_runtime`] — never inline on its own
+/// runtime.
+#[derive(Clone)]
+pub(crate) struct DrainerReads {
+    /// ADR-0011 D7: true iff the SIGNOFF auto-pass may fire for this project
+    /// right now (REVIEW residual empty AND OPEN DECISIONS empty).
+    pub signoff_clear: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// One page of the drainer identity's inbox, or `None` when mail is
+    /// unavailable (the drainer then degrades to sink-only behaviour).
+    pub inbox: Option<std::sync::Arc<dyn Fn() -> Result<Value> + Send + Sync>>,
+}
+
+/// Production reads. Built on the drainer thread BEFORE its runtime exists,
+/// so `Mail::from_config` never has to take the in-runtime guard path.
+fn production_drainer_reads(cfg: Config, project: String) -> DrainerReads {
+    let mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+        .ok()
+        .flatten();
+    let signoff_project = project.clone();
+    let signoff_clear = std::sync::Arc::new(move || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let swarm = crate::swarm_label(&signoff_project);
+        let ws = crate::doorbell::preferred_workspace(
+            &swarm,
+            crate::state::load_spawn_meta(&signoff_project).as_deref(),
+            |l| crate::doorbell::dispatcher_token(&crate::config::state_dir(), l),
+        );
+        let snap = crate::snapshot::assemble(&cfg, &signoff_project, &ws, now);
+        // REVIEW residual: any non-closed lane. Bead status is never the word
+        // "review", so that filter always auto-passed.
+        let review_residual = snap.lanes.iter().filter(|l| l.status != "closed").count();
+        let review_degraded = snap.degraded.iter().any(|d| d.contains("review"));
+        crate::signoff::observe(snap.decisions.len(), review_residual, review_degraded)
+    }) as std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+    let inbox = mail.map(|mail| {
+        std::sync::Arc::new(move || mail.inbox(&project, &mail.name, false, 25))
+            as std::sync::Arc<dyn Fn() -> Result<Value> + Send + Sync>
+    });
+    DrainerReads {
+        signoff_clear,
+        inbox,
+    }
+}
+
+/// Every Nth 150 ms drain pass scans the inbox (~2 s cadence).
+const APPROVAL_SCAN_EVERY_PASSES: u32 = 13;
+
+/// Pure: the captain decision for `promise_id` carried by one inbox page, if
+/// any. A row whose subject names `approve:<id>` approves, `reject:<id>`
+/// rejects; the first matching row wins (newest-first page order). Returns the
+/// sender alongside for the audit line.
+pub(crate) fn approval_decision_in_inbox(
+    rows: &[Value],
+    promise_id: &str,
+) -> Option<(toron_workflow::engine::Decision, String)> {
+    let token_a = format!("approve:{promise_id}");
+    let token_r = format!("reject:{promise_id}");
+    rows.iter().find_map(|row| {
+        let subject = row.get("subject").and_then(|s| s.as_str()).unwrap_or("");
+        let sender = row
+            .get("sender")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if subject.contains(&token_a) {
+            Some((
+                toron_workflow::engine::Decision::approved(format!(
+                    "via workflow approve (from {sender})"
+                )),
+                sender,
+            ))
+        } else if subject.contains(&token_r) {
+            Some((
+                toron_workflow::engine::Decision::rejected(format!(
+                    "via workflow approve (from {sender})"
+                )),
+                sender,
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+/// The drainer loop with its host reads injected (`make_reads` runs on the
+/// drainer thread before the runtime is built). Production wiring is
+/// [`start_approval_drainer`]; tests inject fixture reads.
+pub(crate) fn start_approval_drainer_with(
+    engine: std::sync::Arc<toron_workflow::WorkflowEngine>,
+    stop: std::sync::Arc<AtomicBool>,
+    project: String,
+    make_reads: impl FnOnce() -> DrainerReads + Send + 'static,
+) -> Result<std::thread::JoinHandle<Result<()>>> {
     let handle = std::thread::Builder::new()
         .name("approval-drainer".into())
         .spawn(move || {
+            // bd-1ub5: the drainer is the RESOLVE path. Parked promises are
+            // resolved by scanning the project inbox for a captain decision
+            // mail (`approve:<promise_id>` / `reject:<promise_id>` subject
+            // token) — `flywheel workflow approve` sends exactly that. Mail
+            // unavailable degrades to the sink-only behavior.
+            let reads = make_reads();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| anyhow!("approval drainer runtime: {e}"))?;
             rt.block_on(async {
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                // bd-1ub5: the drainer is the RESOLVE path. Parked promises are
-                // resolved by scanning the project inbox for a captain decision
-                // mail (`approve:<promise_id>` / `reject:<promise_id>` subject
-                // token) — `flywheel workflow approve` sends exactly that. Mail
-                // scan runs every ~2s inside the 150ms drain loop (every 13th
-                // pass); mail unavailable degrades to the sink-only behavior.
-                let mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
-                    .ok()
-                    .flatten();
+                // Loud, not spammy: a failing read prints when its error text
+                // changes, never silently `continue`s.
+                let mut last_scan_err: Option<String> = None;
                 let mut pass: u32 = 0;
                 loop {
                     pass = pass.wrapping_add(1);
@@ -2436,40 +2547,21 @@ pub fn start_approval_drainer(
                         );
                         // ADR-0011 D7: SIGNOFF auto-pass iff REVIEW residual
                         // empty AND OPEN DECISIONS empty. Irreversible
-                        // preference still parks.
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let swarm = crate::swarm_label(&project);
-                        let ws = crate::doorbell::preferred_workspace(
-                            &swarm,
-                            crate::state::load_spawn_meta(&project).as_deref(),
-                            |l| {
-                                crate::doorbell::dispatcher_token(
-                                    &crate::config::state_dir(),
-                                    l,
-                                )
-                            },
-                        );
-                        let snap = crate::snapshot::assemble(&cfg, &project, &ws, now);
-                        // REVIEW residual: any non-closed lane. Bead status
-                        // is never the word "review", so that filter always
-                        // auto-passed.
-                        let review_residual = snap
-                            .lanes
-                            .iter()
-                            .filter(|l| l.status != "closed")
-                            .count();
-                        let review_degraded = snap
-                            .degraded
-                            .iter()
-                            .any(|d| d.contains("review"));
-                        if crate::signoff::observe(
-                            snap.decisions.len(),
-                            review_residual,
-                            review_degraded,
-                        ) {
+                        // preference still parks. erbo: the snapshot read
+                        // shells mail, so it runs off this runtime.
+                        let observe = reads.signoff_clear.clone();
+                        let clear = match crate::backend::run_mail_off_runtime(move || Ok(observe()))
+                            .await
+                        {
+                            Ok(clear) => clear,
+                            Err(e) => {
+                                eprintln!(
+                                    "flywheel: SIGNOFF observe for {promise_id} failed ({e:#}); promise stays parked"
+                                );
+                                false
+                            }
+                        };
+                        if clear {
                             match engine
                                 .resolve_approval(
                                     &promise_id,
@@ -2492,57 +2584,51 @@ pub fn start_approval_drainer(
                         }
                     }
                     // Resolve pass: scan inbox for decision tokens on parked ids.
-                    if let Some(mail) = &mail {
+                    if let Some(inbox) = &reads.inbox {
                         let parked: Vec<String> = {
                             let sink = engine.approval_sink().lock().await;
                             sink.iter().cloned().collect()
                         };
-                        if !parked.is_empty() && pass.is_multiple_of(13) {
-                            for promise_id in &parked {
-                                let token_a = format!("approve:{promise_id}");
-                                let token_r = format!("reject:{promise_id}");
-                                let Ok(inbox) = mail.inbox(&project, &mail.name, false, 25) else {
-                                    continue;
-                                };
-                                let Some(rows) = inbox.as_array() else {
-                                    continue;
-                                };
-                                for row in rows {
-                                    let subject =
-                                        row.get("subject").and_then(|s| s.as_str()).unwrap_or("");
-                                    let sender =
-                                        row.get("sender").and_then(|s| s.as_str()).unwrap_or("");
-                                    let decision = if subject.contains(&token_a) {
-                                        Some(toron_workflow::engine::Decision::approved(format!(
-                                            "via workflow approve (from {sender})"
-                                        )))
-                                    } else if subject.contains(&token_r) {
-                                        Some(toron_workflow::engine::Decision::rejected(format!(
-                                            "via workflow approve (from {sender})"
-                                        )))
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(decision) = decision {
-                                        let outcome = decision.outcome.clone();
-                                        match engine
-                                            .resolve_approval(promise_id, &decision)
-                                            .await
-                                        {
-                                            Ok(()) => {
-                                                eprintln!(
-                                                    "flywheel: approval resolved: promise {} -> {} (from {sender})",
-                                                    promise_id, outcome
-                                                );
-                                                seen.remove(promise_id);
-                                            }
-                                            Err(e) => eprintln!(
-                                                "flywheel: resolve_approval {} failed: {e:#}",
-                                                promise_id
-                                            ),
-                                        }
-                                        break;
+                        if !parked.is_empty() && pass.is_multiple_of(APPROVAL_SCAN_EVERY_PASSES) {
+                            // One page per pass, shared by every parked id (it
+                            // used to be re-fetched once per promise).
+                            let read = inbox.clone();
+                            let page = crate::backend::run_mail_off_runtime(move || read()).await;
+                            let rows = match page {
+                                Ok(v) => {
+                                    last_scan_err = None;
+                                    v.as_array().cloned().unwrap_or_default()
+                                }
+                                Err(e) => {
+                                    let text = format!("{e:#}");
+                                    if last_scan_err.as_deref() != Some(text.as_str()) {
+                                        eprintln!(
+                                            "flywheel: approval drainer inbox scan failed ({text}); parked promises wait for the next scan"
+                                        );
+                                        last_scan_err = Some(text);
                                     }
+                                    Vec::new()
+                                }
+                            };
+                            for promise_id in &parked {
+                                let Some((decision, sender)) =
+                                    approval_decision_in_inbox(&rows, promise_id)
+                                else {
+                                    continue;
+                                };
+                                let outcome = decision.outcome.clone();
+                                match engine.resolve_approval(promise_id, &decision).await {
+                                    Ok(()) => {
+                                        eprintln!(
+                                            "flywheel: approval resolved: promise {} -> {} (from {sender})",
+                                            promise_id, outcome
+                                        );
+                                        seen.remove(promise_id);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "flywheel: resolve_approval {} failed: {e:#}",
+                                        promise_id
+                                    ),
                                 }
                             }
                         }
@@ -2559,6 +2645,12 @@ pub fn start_approval_drainer(
     Ok(handle)
 }
 
+/// bd-omwg: the pane-mode spawn drainer thread. Polls the engine's SpawnSink
+/// while `invoke` runs (an `await: true` run parks on its job promise until
+/// the drainer settles it), launches each job through [`launch_spawn_job`],
+/// and keeps draining until `stop` is set (the caller does this after invoke
+/// returns, then joins). Loads the profile catalog fresh — the thread is
+/// 'static and must not borrow the caller's.
 pub fn start_spawn_drainer(
     cfg: Config,
     project: String,
@@ -4786,5 +4878,236 @@ mod bd_fen3_fence_tests {
             DISPATCH_HOLD_BOUND_MS
         );
         let _ = DISPATCH_HOLD_BOUND_MS;
+    }
+}
+
+/// erbo (bead `elm-effect-rs-approval-drainer-inbox-panic-erbo`). The module
+/// name carries `off_runtime_tests` so the bead's verify filter
+/// (`test --bin flywheel off_runtime_tests`) runs these beside the
+/// `backend::off_runtime_tests` canaries.
+#[cfg(test)]
+mod approval_drainer_off_runtime_tests {
+    use super::{DrainerReads, approval_decision_in_inbox, start_approval_drainer_with};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use toron_workflow::engine::RunInput;
+
+    const PROJECT: &str = "comms-p0-erbo-fixture";
+    const APPROVER: &str = "ErboApprover";
+    const DRAINER: &str = "ErboDrainer";
+    // ADR-0037 W2: a pin holds ONE key across every project of the shared
+    // per-process test store, so the drainer-scan test (its own per-run
+    // project) registers its OWN pins instead of re-registering
+    // ErboApprover/ErboDrainer in a second project (W2 refuses that).
+    const SCAN_APPROVER: &str = "ErboScanApprover";
+    const SCAN_DRAINER: &str = "ErboScanDrainer";
+
+    fn approval_workflow() -> toron_workflow::schema::Workflow {
+        toron_workflow::schema::parse_workflow(
+            r#"name: erbo-approval
+trigger: { type: webhook }
+steps:
+  - name: ask
+    action: request_approval
+    message: "approve?"
+"#,
+        )
+        .expect("parse approval workflow")
+    }
+
+    /// The in-process facade (no `[mail.toron] url`) with both fixture pins
+    /// registered. Built OUTSIDE any runtime, as a CLI caller would.
+    fn in_process_mail(project: &str, pins: [&str; 2]) -> crate::mail_shim::Mail {
+        let mail = crate::mail_shim::Mail::from_config(None)
+            .expect("mail config")
+            .expect("in-process facade");
+        mail.ensure_project(project).expect("fixture project");
+        for pin in pins {
+            mail.register_agent(project, pin, "fixture", "fixture", "erbo fixture")
+                .expect("register fixture pin");
+        }
+        mail
+    }
+
+    /// Pure decision rule: approve / reject tokens, a different promise's
+    /// token, and an unrelated subject.
+    #[test]
+    fn approval_decision_in_inbox_reads_only_this_promises_token() {
+        let rows = vec![
+            json!({"subject": "status update", "sender": "A"}),
+            json!({"subject": "approve:other-promise", "sender": "B"}),
+            json!({"subject": "reject:p-1", "sender": "C"}),
+        ];
+        let (d, sender) = approval_decision_in_inbox(&rows, "p-1").expect("reject token");
+        assert_eq!(sender, "C");
+        assert!(format!("{:?}", d.outcome).to_lowercase().contains("reject"));
+        let (d, sender) = approval_decision_in_inbox(&rows, "other-promise").expect("approve");
+        assert_eq!(sender, "B");
+        assert!(format!("{:?}", d.outcome).to_lowercase().contains("approv"));
+        assert!(approval_decision_in_inbox(&rows, "p-2").is_none());
+        assert!(approval_decision_in_inbox(&[], "p-1").is_none());
+    }
+
+    /// Canary with the drainer's REAL read: an in-process `Mail::inbox` called
+    /// inline on a current-thread runtime (the drainer's shape) panics. This
+    /// is the pre-fix drainer; if tokio ever permits the nesting this goes red
+    /// and the bridge can be revisited.
+    #[test]
+    fn inline_in_process_inbox_panics_inside_the_drainer_runtime() {
+        let mail = in_process_mail(PROJECT, [APPROVER, DRAINER]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("drainer-shaped runtime");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async { mail.inbox(PROJECT, DRAINER, false, 25) })
+        }));
+        assert!(
+            res.is_err(),
+            "inline inbox inside the drainer runtime was expected to panic"
+        );
+    }
+
+    /// The drainer resolves a parked approval from a captain decision mail on
+    /// the in-process backend: the run parks, `approve:<promise_id>` lands in
+    /// the drainer identity's inbox, the drainer's scan (every 13th pass, run
+    /// through `run_mail_off_runtime`) resolves it, the run resumes, and the
+    /// drainer thread joins `Ok` — it survived the scan.
+    ///
+    /// Negative control (run by hand when this landed): calling `read()`
+    /// inline in the drainer instead of through `run_mail_off_runtime` makes
+    /// this test fail — the drainer thread panics with "Cannot start a runtime
+    /// from within a runtime", the run never resumes, and the join is `Err`.
+    #[test]
+    fn drainer_inbox_scan_resolves_parked_approval_inside_a_runtime() {
+        // A per-run project: the in-process store is a process singleton
+        // whose root other tests may point at a reused dir, so a fixed slug
+        // could hand the drainer an inbox full of earlier runs' decisions.
+        let project = format!(
+            "{PROJECT}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let mail = in_process_mail(&project, [SCAN_APPROVER, SCAN_DRAINER]);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async move {
+            let engine = Arc::new(toron_workflow::WorkflowEngine::local().expect("engine"));
+            let run_id = format!("erbo-approve-{}", uuid::Uuid::new_v4());
+            let handle = engine
+                .resonate()
+                .run(
+                    &run_id,
+                    toron_workflow::engine::run_workflow,
+                    RunInput {
+                        run_id: Some(run_id.clone()),
+                        workflow: approval_workflow(),
+                        trigger: json!({}),
+                    },
+                )
+                .spawn()
+                .await
+                .expect("spawn");
+            let promise_id = {
+                let mut tries = 0;
+                loop {
+                    let ids = engine.approval_sink().lock().await.clone();
+                    if let Some(id) = ids.first().cloned() {
+                        break id;
+                    }
+                    assert!(tries <= 50, "approval promise never appeared");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tries += 1;
+                }
+            };
+            assert!(!handle.done().await.expect("done check"), "run must park");
+
+            // The captain's decision mail (what `flywheel workflow approve`
+            // sends), delivered on the in-process plane.
+            let sender_mail = mail.clone().with_name(SCAN_APPROVER.to_string());
+            let subject = format!("approve:{promise_id}");
+            let send_project = project.clone();
+            crate::backend::run_mail_off_runtime(move || {
+                sender_mail.send(
+                    &send_project,
+                    &[SCAN_DRAINER.to_string()],
+                    &subject,
+                    "erbo fixture decision",
+                    "normal",
+                    false,
+                    None,
+                )
+            })
+            .await
+            .expect("decision mail sent");
+
+            let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let last_page = Arc::new(std::sync::Mutex::new(String::from("no scan yet")));
+            let reads = {
+                let scans = scans.clone();
+                let last_page = last_page.clone();
+                let mail = mail.clone();
+                let project = project.clone();
+                DrainerReads {
+                    // Keep the promise parked: only the inbox scan may resolve it.
+                    signoff_clear: Arc::new(|| false),
+                    inbox: Some(Arc::new(move || -> anyhow::Result<Value> {
+                        scans.fetch_add(1, Ordering::SeqCst);
+                        let page = mail.inbox(&project, SCAN_DRAINER, false, 25);
+                        *last_page.lock().unwrap() = match &page {
+                            Ok(v) => format!(
+                                "{} row(s), subjects {:?}",
+                                v.as_array().map_or(0, Vec::len),
+                                v.as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|r| r["subject"].as_str())
+                                    .collect::<Vec<_>>()
+                            ),
+                            Err(e) => format!("error: {e:#}"),
+                        };
+                        page
+                    })),
+                }
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let drainer = start_approval_drainer_with(
+                engine.clone(),
+                stop.clone(),
+                project.clone(),
+                move || reads,
+            )
+            .expect("drainer starts");
+
+            // Generous bound: the scan cadence is ~2s, but a loaded box
+            // (parallel full-suite builds) stretched one run past 30s.
+            let out = match tokio::time::timeout(std::time::Duration::from_secs(90), handle.result())
+                .await
+            {
+                Ok(r) => r.expect("run resumes after approval"),
+                Err(_) => panic!(
+                    "the drainer did not resolve the parked approval within 90s ({} inbox scans ran; last page: {})",
+                    scans.load(Ordering::SeqCst),
+                    last_page.lock().unwrap()
+                ),
+            };
+            stop.store(true, Ordering::SeqCst);
+            let joined = tokio::task::spawn_blocking(move || drainer.join())
+                .await
+                .expect("join task");
+            assert!(
+                matches!(joined, Ok(Ok(()))),
+                "the drainer thread must survive its inbox scan (no nested-runtime panic): {:?}",
+                joined.as_ref().map(|r| r.as_ref().map_err(|e| format!("{e:#}")))
+            );
+            assert!(scans.load(Ordering::SeqCst) >= 1, "the scan really ran");
+            assert!(
+                out.to_string().to_lowercase().contains("approv"),
+                "resumed with the mailed approve decision: {out}"
+            );
+        });
     }
 }

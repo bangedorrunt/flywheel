@@ -12771,7 +12771,19 @@ pub(crate) fn pinned_mail_identity(
                     eprintln!("flywheel: mail list_agents failed during pin draw for {name}: {e}");
                 }
             }
-            unique_adjnoun_pin(&taken, state::fnv1a64(name))
+            // ADR-0037 W2: a pin holds ONE key across ALL projects, so a
+            // fresh draw also skips pins bound in another project — else the
+            // register is refused (or would take over another agent's pin).
+            let seed = state::fnv1a64(name);
+            let mut pin = unique_adjnoun_pin(&taken, seed);
+            for _ in 0..256 {
+                if daemon_mode || !mail_shim::pin_bound_elsewhere(&key, &pin) {
+                    break;
+                }
+                taken.insert(pin.clone());
+                pin = unique_adjnoun_pin(&taken, seed);
+            }
+            pin
         });
     let profile = spawn_agent_profile(&mail_name, kind, project);
     if let Err(e) = backend::run_mail(mail.register_agent(&key, &profile)) {
@@ -24349,10 +24361,9 @@ mod loop_tests {
         // the surface sends AS its own identity — it needs a key in-project
         let sender = backend.agent_name().to_string();
         let sender_profile = spawn_agent_profile(&sender, "opencode", project);
-        backend::run_mail(backend.register_agent(project, &sender_profile))
-            .expect("register sender");
+        crate::mail_shim::fixture_register(project, &sender_profile).expect("register sender");
         let profile = spawn_agent_profile("PlannerOne", "opencode", project);
-        backend::run_mail(backend.register_agent(project, &profile)).expect("register");
+        crate::mail_shim::fixture_register(project, &profile).expect("register");
         let receipt = send_not_ready_mail(
             &backend,
             project,
@@ -24401,13 +24412,15 @@ mod loop_tests {
         let project = "done-mail-test";
         backend::run_mail(backend.ensure_project(project)).expect("ensure");
         let sender = backend.agent_name().to_string();
-        backend::run_mail(
-            backend.register_agent(project, &spawn_agent_profile(&sender, "opencode", project)),
+        crate::mail_shim::fixture_register(
+            project,
+            &spawn_agent_profile(&sender, "opencode", project),
         )
         .expect("register sender");
         let captain = "CaptainPine";
-        backend::run_mail(
-            backend.register_agent(project, &spawn_agent_profile(captain, "flywheel", project)),
+        crate::mail_shim::fixture_register(
+            project,
+            &spawn_agent_profile(captain, "flywheel", project),
         )
         .expect("register captain");
         // the orchestrator resolution prefers the program=="flywheel" agent
@@ -24469,10 +24482,9 @@ mod loop_tests {
         backend::run_mail(backend.ensure_project(project)).expect("ensure");
         let sender = backend.agent_name().to_string();
         let sender_profile = spawn_agent_profile(&sender, "opencode", project);
-        backend::run_mail(backend.register_agent(project, &sender_profile))
-            .expect("register sender");
+        crate::mail_shim::fixture_register(project, &sender_profile).expect("register sender");
         let profile = spawn_agent_profile("PlannerOne", "opencode", project);
-        backend::run_mail(backend.register_agent(project, &profile)).expect("register");
+        crate::mail_shim::fixture_register(project, &profile).expect("register");
         send_unverified_close_mail(&backend, project, "bd-sha-missing", "", "PlannerOne")
             .expect("unverified-close mail sends");
         let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
@@ -24629,12 +24641,12 @@ mod loop_tests {
                 backend::run_mail(backend.ensure_project(&project)).expect("ensure");
                 let sender = backend.agent_name().to_string();
                 let sender_profile = spawn_agent_profile(&sender, "opencode", &project);
-                backend::run_mail(backend.register_agent(&project, &sender_profile))
+                crate::mail_shim::fixture_register(&project, &sender_profile)
                     .expect("register sender");
                 // the planner = the bead's creator (registered identity)
                 let planner = resolve_planner_for_bead(&dir_str, &bead_id, "FallbackIdentity");
                 let planner_profile = spawn_agent_profile(&planner, "opencode", &project);
-                backend::run_mail(backend.register_agent(&project, &planner_profile))
+                crate::mail_shim::fixture_register(&project, &planner_profile)
                     .expect("register planner");
                 // tick 1: reopen + mail
                 let v = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
@@ -40834,7 +40846,7 @@ mod product_digest_tests {
 
     fn pd_register(mail: &mail_shim::Mail, project: &str, pin: &str) {
         mail.ensure_project(project).expect("ensure member");
-        mail.register_agent(project, pin, "flywheel", "m", "t")
+        mail.register_fixture(project, pin, "flywheel", "m", "t")
             .expect("register pin");
     }
 
