@@ -1627,9 +1627,13 @@ mod off_runtime_tests {
             ..Default::default()
         };
         let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()));
+        let (tx, _rx) = mpsc::channel(8);
+        let host = RtHost::new(cfg.clone(), &project, "offrt-remote", tx).expect("host");
         let rt = tokio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
             let _ = build_index(&cfg, &project);
+            // The inbox read builds its own mail handle and `block_on`s it.
+            let _ = host.fetch_inbox_process("PinA", "0");
         });
     }
 
