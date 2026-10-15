@@ -157,6 +157,18 @@ fn build_mailbox_once() -> Result<toron_core::mailbox::Mailbox, String> {
     rt.block_on(build_mailbox()).map_err(|e| format!("{e:#}"))
 }
 
+/// ADR-0037: pins are ONE namespace across projects. True when `pin` is
+/// bound in a project other than `project` in the in-process store (a
+/// remote mailbox has no such read; callers skip this check there).
+pub fn pin_bound_elsewhere(project: &str, pin: &str) -> bool {
+    if init_mailbox().is_err() {
+        return false;
+    }
+    block_on(mailbox().pin_bindings_elsewhere(project, pin))
+        .map(|b| !b.is_empty())
+        .unwrap_or(false)
+}
+
 /// The shared in-process mailbox. Only reachable after a successful
 /// `init_mailbox` (via `Mail::from_config`) — an unreachable panic here means
 /// a call path skipped construction, which is a programming error.
@@ -379,6 +391,64 @@ fn pin_test_mail_root_set() {
         let dir = std::env::temp_dir().join(format!("fw-mail-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         unsafe { std::env::set_var("TORON_MCP_DATA_DIR", &dir) };
+    }
+}
+
+/// ADR-0037 W2 test fixtures: one pin holds ONE key across every project of
+/// the shared per-process test store. A fixture registering a pin that
+/// another test already registered in another project reuses that key with
+/// proof of possession — the in-process equivalent of `toron agent
+/// bootstrap` — instead of minting a second key (which W2 refuses). Held
+/// under one lock so two tests never race the check-then-mint.
+#[cfg(test)]
+pub(crate) static FIXTURE_PIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) async fn fixture_register_async(
+    mb: &toron_core::mailbox::Mailbox,
+    project: &str,
+    profile: &AgentProfile,
+) -> Result<toron_core::mailbox::RegisteredAgent> {
+    let _g = FIXTURE_PIN_LOCK.lock().await;
+    match mb.pin_reuse_source(project, &profile.name, None).await? {
+        Some(from) => {
+            let proof = mb
+                .prove_pin_possession(&from, &profile.name, project)
+                .await?;
+            mb.register_agent_reusing(project, profile, &from, &proof)
+                .await
+        }
+        None => mb.register_agent(project, profile).await,
+    }
+}
+
+/// Blocking [`fixture_register_async`] on the shared in-process mailbox.
+#[cfg(test)]
+pub(crate) fn fixture_register(
+    project: &str,
+    profile: &AgentProfile,
+) -> Result<toron_core::mailbox::RegisteredAgent> {
+    pin_test_mail_root_once();
+    init_mailbox()?;
+    block_on(fixture_register_async(mailbox(), project, profile))
+}
+
+#[cfg(test)]
+impl Mail {
+    /// Test-fixture registration (see [`fixture_register`]).
+    pub(crate) fn register_fixture(
+        &self,
+        project_key: &str,
+        name: &str,
+        program: &str,
+        model: &str,
+        task_description: &str,
+    ) -> Result<Value> {
+        let mut profile = AgentProfile::new(name);
+        profile.program = Some(program.to_string());
+        profile.model = Some(model.to_string());
+        profile.task_description = Some(task_description.to_string());
+        Ok(fixture_register(project_key, &profile)?.to_json())
     }
 }
 
@@ -2829,7 +2899,7 @@ mod tests {
         let project = "yield-pairs-board";
         mail.ensure_project(project).expect("ensure");
         for name in ["BlueLake", "RoseDune"] {
-            mail.register_agent(project, name, "test", "test", "yield-read test")
+            mail.register_fixture(project, name, "test", "test", "yield-read test")
                 .expect("register");
         }
         mail.reserve(
@@ -2898,7 +2968,7 @@ mod tests {
         let project = "locks-list-board";
         mail.ensure_project(project).expect("ensure");
         for name in ["BlueLake", "RoseDune"] {
-            mail.register_agent(project, name, "test", "test", "bd-dsu1 test")
+            mail.register_fixture(project, name, "test", "test", "bd-dsu1 test")
                 .expect("register");
         }
         mail.reserve(
@@ -2991,7 +3061,7 @@ mod tests {
         let project = "upsert-stale-task";
         mail.ensure_project(project).expect("ensure");
         // Prior session: the agent self-registered with a stale bead task.
-        mail.register_agent(
+        mail.register_fixture(
             project,
             "flywheel-proj-oc",
             "opencode",
@@ -3021,7 +3091,7 @@ mod tests {
         let project = "broadcast-all";
         mail.ensure_project(project).expect("ensure");
         for name in ["flywheel", "BlueLake", "RoseDune"] {
-            mail.register_agent(project, name, "test", "test", "bd-pncn test")
+            mail.register_fixture(project, name, "test", "test", "bd-pncn test")
                 .expect("register");
         }
         let v = mail
@@ -3077,7 +3147,7 @@ mod tests {
         let project = "broadcast-dedupe";
         mail.ensure_project(project).expect("ensure");
         for name in ["flywheel", "BlueLake", "RoseDune"] {
-            mail.register_agent(project, name, "test", "test", "bd-pncn test")
+            mail.register_fixture(project, name, "test", "test", "bd-pncn test")
                 .expect("register");
         }
         let v = mail
@@ -3182,9 +3252,9 @@ mod tests {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("drift-urgent-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
-        mail.register_agent(&project, "DriftRecv", "opencode", "test", "seed")
+        mail.register_fixture(&project, "DriftRecv", "opencode", "test", "seed")
             .expect("recipient registered");
-        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+        mail.register_fixture(&project, &mail.name, "opencode", "test", "seed")
             .expect("facade identity registered");
         let recv = vec!["DriftRecv".to_string()];
         mail.send(&project, &recv, "u1", "body", "urgent", false, None)
@@ -3233,13 +3303,13 @@ mod tests {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("c3b3-filter-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
-        mail.register_agent(&project, "FilterSender", "opencode", "test", "seed")
+        mail.register_fixture(&project, "FilterSender", "opencode", "test", "seed")
             .expect("sender registered");
-        mail.register_agent(&project, "FilterRecv", "opencode", "test", "seed")
+        mail.register_fixture(&project, "FilterRecv", "opencode", "test", "seed")
             .expect("recipient registered");
         // The facade sends AS its own identity (`mail.name` = "flywheel") —
         // it must be registered too or send_message fails on the local key.
-        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+        mail.register_fixture(&project, &mail.name, "opencode", "test", "seed")
             .expect("facade identity registered");
         let recv = vec!["FilterRecv".to_string()];
 
@@ -3346,11 +3416,11 @@ mod tests {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("harvest-thread-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
-        mail.register_agent(&project, "ThreadSender", "opencode", "test", "seed")
+        mail.register_fixture(&project, "ThreadSender", "opencode", "test", "seed")
             .expect("sender registered");
-        mail.register_agent(&project, "ThreadRecv", "opencode", "test", "seed")
+        mail.register_fixture(&project, "ThreadRecv", "opencode", "test", "seed")
             .expect("recipient registered");
-        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+        mail.register_fixture(&project, &mail.name, "opencode", "test", "seed")
             .expect("facade identity registered");
         let recv = vec!["ThreadRecv".to_string()];
 
@@ -3467,11 +3537,11 @@ mod tests {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("thread-limit-{}-{stamp}", std::process::id());
         mail.ensure_project(&project).expect("project");
-        mail.register_agent(&project, "LimitSender", "opencode", "test", "seed")
+        mail.register_fixture(&project, "LimitSender", "opencode", "test", "seed")
             .expect("sender registered");
-        mail.register_agent(&project, "LimitRecv", "opencode", "test", "seed")
+        mail.register_fixture(&project, "LimitRecv", "opencode", "test", "seed")
             .expect("recipient registered");
-        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+        mail.register_fixture(&project, &mail.name, "opencode", "test", "seed")
             .expect("facade identity registered");
         let recv = vec!["LimitRecv".to_string()];
 
@@ -3559,11 +3629,11 @@ mod tests {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("c3b3-ackoverdue-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
-        mail.register_agent(&project, "OverdueSender", "opencode", "test", "seed")
+        mail.register_fixture(&project, "OverdueSender", "opencode", "test", "seed")
             .expect("sender registered");
-        mail.register_agent(&project, "OverdueRecv", "opencode", "test", "seed")
+        mail.register_fixture(&project, "OverdueRecv", "opencode", "test", "seed")
             .expect("recipient registered");
-        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+        mail.register_fixture(&project, &mail.name, "opencode", "test", "seed")
             .expect("facade identity registered");
         mail.send(
             &project,
@@ -3622,11 +3692,11 @@ mod tests {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("acksla-read-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
-        mail.register_agent(&project, "SlaSender", "opencode", "test", "seed")
+        mail.register_fixture(&project, "SlaSender", "opencode", "test", "seed")
             .expect("sender registered");
-        mail.register_agent(&project, "SlaRecv", "opencode", "test", "seed")
+        mail.register_fixture(&project, "SlaRecv", "opencode", "test", "seed")
             .expect("recipient registered");
-        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+        mail.register_fixture(&project, &mail.name, "opencode", "test", "seed")
             .expect("facade identity registered");
         let receipt = mail
             .send(
@@ -3760,11 +3830,11 @@ mod tests {
         let mail = Mail::from_config(None).expect("ok").expect("Some");
         let project = format!("since-bound-{}", std::process::id());
         mail.ensure_project(&project).expect("project");
-        mail.register_agent(&project, "BoundSender", "opencode", "test", "seed")
+        mail.register_fixture(&project, "BoundSender", "opencode", "test", "seed")
             .expect("sender registered");
-        mail.register_agent(&project, "BoundRecv", "opencode", "test", "seed")
+        mail.register_fixture(&project, "BoundRecv", "opencode", "test", "seed")
             .expect("recipient registered");
-        mail.register_agent(&project, &mail.name, "opencode", "test", "seed")
+        mail.register_fixture(&project, &mail.name, "opencode", "test", "seed")
             .expect("facade identity registered");
         mail.send(
             &project,

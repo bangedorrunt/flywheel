@@ -18,3 +18,6 @@ agents/
 
 # nightly rustc internal-compiler-error dumps (a compiler crash, not repo state)
 rustc-ice-*.txt
+
+# Operator secret key material: never commit (ADR-0037 W5 key custody).
+operator_nsec
