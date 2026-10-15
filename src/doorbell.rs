@@ -1707,6 +1707,17 @@ pub fn write_unanswered(path: &Path, pins: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// bd-doorbell-daemon-sink-wake-only-yfqz: under the comms flag the local
+    /// loop hosts the inbox wake, so it must not defer to a daemon host.
+    #[test]
+    fn the_comms_flag_disables_deference_to_a_daemon() {
+        let src = include_str!("doorbell.rs");
+        let a = src.find("let comms_on =").unwrap();
+        let tail = &src[a..a + 1800];
+        assert!(tail.contains("if !comms_on\n        && cfg_url.is_some()"));
+        assert!(tail.contains("if !comms_on\n        && matches!(\n            resolve_host("));
+    }
+
     use super::*;
 
     fn base() -> RingInput {
