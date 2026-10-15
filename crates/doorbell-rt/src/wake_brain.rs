@@ -83,6 +83,8 @@ pub struct WakeBrainCounters {
     backpressured: AtomicU64,
     dropped: AtomicU64,
     resumed: AtomicU64,
+    /// toron#17 `events_lost` frames seen (cap eviction upstream of us).
+    events_lost: AtomicU64,
     /// Unix seconds of the newest drop; 0 = never.
     last_drop_unix: AtomicU64,
     /// A full/drop happened that the on-disk snapshot does not show yet.
@@ -103,6 +105,11 @@ pub struct WakeBrainSnapshot {
     pub dropped: u64,
     /// Consumers re-armed from a recorded cursor.
     pub resumed: u64,
+    /// `events_lost` frames from the wake sidecar (toron#17): stored events
+    /// after our cursor were evicted before we read them. Each frame is one
+    /// counted gap; the range is in the audit row, verbatim.
+    #[serde(default)]
+    pub events_lost: u64,
     /// Unix seconds of the newest drop; `None` = never.
     pub last_drop_unix: Option<u64>,
 }
@@ -117,6 +124,7 @@ impl WakeBrainSnapshot {
             backpressured: self.backpressured + o.backpressured,
             dropped: self.dropped + o.dropped,
             resumed: self.resumed + o.resumed,
+            events_lost: self.events_lost + o.events_lost,
             last_drop_unix: self.last_drop_unix.max(o.last_drop_unix),
         }
     }
@@ -132,6 +140,7 @@ impl WakeBrainCounters {
             backpressured: self.backpressured.load(Ordering::SeqCst),
             dropped: self.dropped.load(Ordering::SeqCst),
             resumed: self.resumed.load(Ordering::SeqCst),
+            events_lost: self.events_lost.load(Ordering::SeqCst),
             last_drop_unix: (last > 0).then_some(last),
         }
     }
@@ -324,6 +333,19 @@ impl WatchForwarder {
         self.resume.lock().map(|g| g.clone()).unwrap_or(None)
     }
 
+    /// toron#17: the sidecar announced a gap. Count it exactly and persist
+    /// at once (a gap is rare, and a snapshot that lags it hides a loss).
+    /// The audit row naming the range is written by the wake consumer.
+    pub fn note_events_lost(&self) {
+        self.counters.events_lost.fetch_add(1, Ordering::SeqCst);
+        // A gap is a loss: it degrades `/health` the way a drop does.
+        self.counters
+            .last_drop_unix
+            .store((self.unix_now)(), Ordering::SeqCst);
+        self.counters.dirty.store(true, Ordering::SeqCst);
+        self.persist();
+    }
+
     /// Offer one watch line to the brain under the module policy.
     pub fn forward(&self, line: String) -> Forwarded {
         if self.condemned.load(Ordering::SeqCst) {
@@ -446,6 +468,41 @@ impl WatchForwarder {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// toron#17: every `events_lost` frame is counted exactly, persisted at
+    /// once, and degrades health; a quiet run counts zero (negative control).
+    #[test]
+    fn events_lost_frames_are_counted_exactly_and_persisted() {
+        let dir = std::env::temp_dir().join(format!("wb-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("ws.wake-brain.json");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let fw = WatchForwarder::new(tx, fresh_counters(), Arc::new(Mutex::new(None)))
+            .persist_to(path.clone());
+        assert_eq!(
+            fw.counters.snapshot().events_lost,
+            0,
+            "none seen, none counted"
+        );
+        for _ in 0..3 {
+            fw.note_events_lost();
+        }
+        let s = fw.counters.snapshot();
+        assert_eq!(s.events_lost, 3, "exact, one per frame");
+        assert!(s.last_drop_unix.is_some(), "a gap degrades health");
+        let on_disk = read_snapshot(&dir, "ws");
+        assert_eq!(on_disk.map(|d| d.events_lost), None, "path shape differs");
+        let raw: WakeBrainSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw.events_lost, 3, "persisted at once");
+        // An older snapshot (no field) still reads, as zero.
+        let old: WakeBrainSnapshot = serde_json::from_str(
+            r#"{"forwarded":1,"wake_brain_full":0,"backpressured":0,"dropped":0,"resumed":0,"last_drop_unix":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.events_lost, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn hex(n: u64) -> String {
         format!("{n:064x}")

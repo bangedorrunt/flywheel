@@ -1980,6 +1980,9 @@ impl Host for FileHost {
                         WakeOutcome::Heartbeat => {
                             crate::watchbeat::touch_heartbeat(&beat_state, &beat_workspace);
                         }
+                        // toron#17: a counted, audited gap (the consumer wrote
+                        // the row); the consumer is not dead.
+                        WakeOutcome::EventsLost { .. } => forwarder.note_events_lost(),
                         WakeOutcome::Died => {
                             // The relay is where a death storm was previously
                             // invisible, so it is where the rate gets named.
