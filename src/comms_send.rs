@@ -309,7 +309,48 @@ fn state_text(s: &SendState) -> (String, Option<u64>) {
 
 /// Rounds a send may take when a concurrent sender's epoch claim fences it
 /// (the refused append never landed, so minting again cannot duplicate).
-const MAX_ROUNDS: usize = 8;
+const MAX_ROUNDS: usize = 24;
+
+/// One async mutex per sender npub, process-wide. Claim-to-settle is the
+/// window in which a concurrent run of the SAME sender fences us (a claim
+/// fences every lower epoch at once), so runs of one sender in one process
+/// take turns instead of fencing each other. Across processes there is no
+/// lock (and no lock file): contenders recover through the jittered
+/// retry rounds.
+fn sender_gate(sender: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static GATES: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut g = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    g.entry(sender.to_string()).or_default().clone()
+}
+
+/// Pure: the backoff before retry round `round` (>= 1) given a random
+/// draw: `1 + draw % (25 * round + 1)` ms. Every contender draws its own, so
+/// they stop moving in step (a fixed `25 * round` kept them in lockstep and
+/// let the rounds run out).
+pub fn backoff_ms(round: usize, draw: u64) -> u64 {
+    1 + draw % (25 * round as u64 + 1)
+}
+
+/// A fresh random draw per call (std's per-process random hasher state, mixed
+/// with the clock and a counter; no extra dependency).
+fn random_draw() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(N.fetch_add(1, Ordering::Relaxed));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
+}
 
 fn run_id() -> String {
     let t = std::time::SystemTime::now()
@@ -346,6 +387,7 @@ pub async fn append_task(
     let dir = comms_dir(state_dir, sender);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let run = run_id();
+    let gate = sender_gate(sender);
     let body = serde_json::to_value(task)?;
 
     // 1. Reconcile whatever a crashed earlier run journaled (toron's
@@ -370,10 +412,17 @@ pub async fn append_task(
             break;
         }
         if round > 0 {
-            // Concurrent senders of one npub race on toron's per-sender
-            // journal epoch (see the PR notes); back off, then re-plan.
-            tokio::time::sleep(std::time::Duration::from_millis(25 * round as u64)).await;
+            // Fenced by a concurrent sender of this npub (another process,
+            // or the toron journal-epoch race): back off with jitter, then
+            // re-plan.
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms(
+                round,
+                random_draw(),
+            )))
+            .await;
         }
+        // Claim-to-settle is one critical section per sender in this process.
+        let _turn = gate.lock().await;
         // 2. Plan each pending recipient from its intent record and the log.
         let store_epoch = store.producer_epoch(sender).await?;
         let mut resend: Vec<(usize, Envelope)> = Vec::new();
@@ -715,6 +764,43 @@ pub fn loop_send(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backoff_is_jittered_bounded_and_never_zero() {
+        for round in 1..=MAX_ROUNDS {
+            let mut seen = std::collections::BTreeSet::new();
+            for d in 0..2000u64 {
+                let ms = backoff_ms(round, d);
+                assert!((1..=25 * round as u64 + 1).contains(&ms), "{ms} @ {round}");
+                seen.insert(ms);
+            }
+            // Contenders must be able to land on different delays.
+            assert!(seen.len() > 1);
+        }
+        assert_ne!(random_draw(), random_draw());
+    }
+
+    #[tokio::test]
+    async fn one_sender_one_gate_distinct_senders_distinct_gates() {
+        assert!(std::sync::Arc::ptr_eq(
+            &sender_gate("npub-a"),
+            &sender_gate("npub-a")
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &sender_gate("npub-a"),
+            &sender_gate("npub-b")
+        ));
+        let g = sender_gate("npub-a");
+        let _held = g.lock().await;
+        assert!(
+            sender_gate("npub-a").try_lock().is_err(),
+            "same sender takes turns"
+        );
+        assert!(
+            sender_gate("npub-b").try_lock().is_ok(),
+            "other senders do not wait"
+        );
+    }
+
     use super::*;
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -971,6 +1057,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(log.len(), 3, "one row per run");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_task_takes_its_senders_turn_before_claiming() {
+        let store = mem_store().await;
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let dir = tempfile::tempdir().unwrap();
+        let held = sender_gate(A).lock_owned().await;
+        let (st, d, r) = (store.clone(), dir.path().to_path_buf(), rcpt.clone());
+        let run =
+            tokio::spawn(async move { append_task(&st, &d, A, &r, "c", "t-gated", &task()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!run.is_finished(), "must wait for the sender's turn");
+        assert_eq!(
+            store
+                .read_stream(toron_core::inbox::INBOX_STREAM, None)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "nothing claimed or appended while another run holds the turn"
+        );
+        drop(held);
+        let rows = run.await.unwrap().unwrap();
+        assert_eq!(rows[0].state, "appended");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_concurrent_runs_of_one_sender_all_land_on_distinct_epochs() {
+        let store = mem_store().await;
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let dir = tempfile::tempdir().unwrap();
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let (st, d, r) = (
+                store.clone(),
+                dir.path().join(format!("r{i}")),
+                rcpt.clone(),
+            );
+            set.spawn(async move {
+                append_task(&st, &d, A, &r, "c", &format!("t-many-{i}"), &task()).await
+            });
+        }
+        let mut rows = Vec::new();
+        while let Some(r) = set.join_next().await {
+            rows.push(r.unwrap().unwrap());
+        }
+        let mut epochs: Vec<u64> = rows.iter().map(|r| epoch_of(&r[0].msg_id)).collect();
+        epochs.sort_unstable();
+        epochs.dedup();
+        assert_eq!(epochs.len(), 12, "twelve runs, twelve distinct epochs");
+        assert!(rows.iter().all(|r| r[0].state == "appended"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
