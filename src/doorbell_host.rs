@@ -1591,8 +1591,6 @@ mod events_lost_tests {
 
 #[cfg(test)]
 mod inbox_flag_tests {
-    use super::*;
-
     #[test]
     fn the_flag_arm_registers_no_text_sink_and_starts_the_inbox_host() {
         let src = include_str!("doorbell_host.rs");
