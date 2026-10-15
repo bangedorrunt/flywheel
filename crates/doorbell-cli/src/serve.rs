@@ -2283,6 +2283,9 @@ pub(super) fn wake_brain_health(
             "backpressured": total.backpressured,
             "forwarded": total.forwarded,
             "resumed": total.resumed,
+            // toron#17: gap frames from the wake sidecar (cap eviction
+            // upstream). Non-zero means events were lost, not delayed.
+            "events_lost": total.events_lost,
             "last_drop_age_s": total.last_drop_unix.map(|t| now.saturating_sub(t)),
             "policy": format!(
                 "backpressure up to {}s on a full brain channel; then drop (counted exactly), one death, the replacement resumes from the last accepted cursor",
@@ -2930,6 +2933,7 @@ mod tests {
             backpressured: 2,
             dropped: 499,
             resumed: 1,
+            events_lost: 2,
             last_drop_unix: Some(now - 5),
         };
         let (body, fresh) = super::wake_brain_health(
@@ -2939,6 +2943,7 @@ mod tests {
         assert!(fresh, "a drop inside the probe window degrades");
         assert_eq!(body["dropped"], 499);
         assert_eq!(body["wake_brain_full"], 3);
+        assert_eq!(body["events_lost"], 2, "toron#17 gaps are on /health");
         assert_eq!(body["forwarded"], 1064);
         assert_eq!(body["last_drop_age_s"], 5);
         assert_eq!(body["workspaces"]["ws-c"]["dropped"], 499);

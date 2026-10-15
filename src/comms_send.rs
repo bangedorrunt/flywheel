@@ -19,8 +19,15 @@
 //! Idempotency: the msg id for `(sender, task id, recipient)` is recorded in
 //! flywheel's intent file before toron's journal sees it, so a retry with
 //! the same task id re-sends the SAME msg id ([`plan_send`]), and the log
-//! appends it once. A sender process claims a fresh epoch per run from a
-//! local lease ([`next_epoch`]) so two runs never reuse a triple.
+//! appends it once. Each run mints under an epoch claimed from the log
+//! itself (`InboxStore::claim_epoch`, atomic, toron#19), so two runs, in one
+//! process or many, never share an epoch and flywheel keeps no lock or epoch
+//! file. A claim fences every lower epoch at once, so a run whose append is
+//! refused as fenced (and was therefore never delivered) mints again under a
+//! fresh claim.
+//!
+//! A different payload under an existing msg id is `PayloadConflict`
+//! (toron#18): a hard error, never a replay.
 //!
 //! Gated: `TORON_COMMS_INBOX=1` or `[comms] inbox_log = true`.
 
@@ -34,7 +41,7 @@ use toron_core::delivery::Reject;
 use toron_core::envelope::{
     Class, ContextId, ContractId, ENVELOPE_V, Envelope, MsgId, Recipient, TaskId, is_npub_hex,
 };
-use toron_core::inbox::InboxStore;
+use toron_core::inbox::{InboxError, InboxStore};
 use toron_core::outbox::{self, SendState};
 
 use crate::config::Config;
@@ -54,10 +61,23 @@ pub fn enabled(cfg: &Config) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendError {
     Disabled,
-    BadAddress { token: String },
-    UnknownAddress { token: String, why: String },
-    AmbiguousAddress { token: String, why: String },
+    BadAddress {
+        token: String,
+    },
+    UnknownAddress {
+        token: String,
+        why: String,
+    },
+    AmbiguousAddress {
+        token: String,
+        why: String,
+    },
     NoSender,
+    /// The log (or the intent record) holds different content under this
+    /// producer triple, or a task id was reused with a different brief.
+    PayloadConflict {
+        msg_key: String,
+    },
 }
 
 impl std::fmt::Display for SendError {
@@ -81,6 +101,10 @@ impl std::fmt::Display for SendError {
             Self::NoSender => write!(
                 f,
                 "no sender: pass --from <pin|npub> or set FLYWHEEL_MAIL_AS / AGENT_NAME (nothing sent)"
+            ),
+            Self::PayloadConflict { msg_key } => write!(
+                f,
+                "payload conflict on {msg_key}: the log (or this task id's recorded brief) holds different content under this id; not replayed, not re-sent. Use a new --param task_id"
             ),
         }
     }
@@ -198,13 +222,10 @@ pub fn task_envelope(
     Ok(env)
 }
 
-/// Pure: the next epoch a sender run claims. Above both the log's producer
-/// state and every epoch this host already leased, so a triple is never
-/// reused (a reused triple would replay as someone else's message).
-pub fn next_epoch(store_epoch: Option<u64>, leased: Option<u64>) -> u64 {
-    let a = store_epoch.map_or(0, |e| e + 1);
-    let b = leased.map_or(0, |e| e + 1);
-    a.max(b)
+/// Pure: a refusal text from the log that means "different content under
+/// this triple" (toron#18). Never retried, never read as a replay.
+pub fn is_payload_conflict(why: &str) -> bool {
+    why.contains("payload conflict")
 }
 
 /// What to do for one recipient.
@@ -286,9 +307,32 @@ fn state_text(s: &SendState) -> (String, Option<u64>) {
     }
 }
 
+/// Rounds a send may take when a concurrent sender's epoch claim fences it
+/// (the refused append never landed, so minting again cannot duplicate).
+const MAX_ROUNDS: usize = 8;
+
+fn run_id() -> String {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("flywheel:{}:{t}", std::process::id())
+}
+
+/// Boundary: re-append a recorded envelope that the log already holds. The
+/// log answers `replay` for identical content and `PayloadConflict` for
+/// different content; a fenced epoch cannot be re-appended, so it is
+/// accepted on the lookup alone.
+async fn verify_recorded(store: &InboxStore, env: &Envelope) -> Result<()> {
+    match store.append_envelope(env).await {
+        Err(InboxError::PayloadConflict { msg_key }) => {
+            Err(SendError::PayloadConflict { msg_key }.into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Boundary: append one task to every recipient, exactly once per
-/// `(sender, task id, recipient)`. Holds the sender's local lock for the
-/// whole run (one sender process at a time per npub on this host).
+/// `(sender, task id, recipient)`.
 #[allow(clippy::too_many_arguments)]
 pub async fn append_task(
     store: &InboxStore,
@@ -301,12 +345,8 @@ pub async fn append_task(
 ) -> Result<Vec<SentRow>> {
     let dir = comms_dir(state_dir, sender);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("sender.lock"))?;
-    lock.lock().context("lock the sender")?;
+    let run = run_id();
+    let body = serde_json::to_value(task)?;
 
     // 1. Reconcile whatever a crashed earlier run journaled (toron's
     //    mail.append recovery): present -> settled, absent -> appended with
@@ -315,115 +355,163 @@ pub async fn append_task(
         .await
         .map_err(|e| anyhow!("recover sender intents: {e}"))?;
 
-    // 2. Plan each recipient from its intent record and the log.
-    let store_epoch = store.producer_epoch(sender).await?;
-    let mut plans = Vec::new();
-    for (token, npub) in recipients {
-        let path = dir.join(format!("{}.json", intent_key(task_id, npub)));
-        let recorded: Option<Envelope> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-        let offset = match &recorded {
-            Some(env) => store.lookup(&env.msg).await?,
-            None => None,
-        };
-        plans.push((
-            token.clone(),
-            npub.clone(),
-            path,
-            plan_send(recorded, offset, store_epoch),
-        ));
-    }
+    // (msg key, state, offset) once a recipient is settled; `last_why` keeps
+    // the latest refusal for a recipient still pending.
+    type Done = (String, String, Option<u64>);
+    let mut done: Vec<Option<Done>> = vec![None; recipients.len()];
+    let mut last_why: Vec<Option<(String, String)>> = vec![None; recipients.len()];
+    let paths: Vec<PathBuf> = recipients
+        .iter()
+        .map(|(_, npub)| dir.join(format!("{}.json", intent_key(task_id, npub))))
+        .collect();
 
-    // 3. Mint under a freshly leased epoch; record each intent BEFORE the
-    //    send (the record is what makes a retry re-send the same msg id).
-    let mut sends = Vec::new();
-    let mut rows = Vec::new();
-    let mut minted = Vec::new();
-    if plans.iter().any(|p| matches!(p.3, SendPlan::Mint)) {
-        let lease = dir.join("epoch");
-        let leased = std::fs::read_to_string(&lease)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok());
-        let epoch = next_epoch(store_epoch, leased);
-        write_atomic(&lease, epoch.to_string().as_bytes())?;
-        let mut seq = 0u64;
-        for (_, npub, path, plan) in &plans {
-            if matches!(plan, SendPlan::Mint) {
-                let msg = MsgId {
-                    producer: sender.to_string(),
-                    epoch,
-                    seq,
-                };
-                seq += 1;
-                let env = task_envelope(sender, npub, msg, context, task_id, task)
-                    .map_err(|r| anyhow!("task@1 refused: {r}"))?;
-                write_atomic(path, serde_json::to_string(&env)?.as_bytes())?;
-                minted.push(env);
-            }
+    for round in 0..MAX_ROUNDS {
+        if done.iter().all(Option::is_some) {
+            break;
         }
-    }
-    let mut minted_iter = minted.into_iter();
-    let mut resend = Vec::new();
-    let mut fresh = Vec::new();
-    for (token, npub, _, plan) in plans {
-        let env = match plan {
-            SendPlan::AlreadyAppended { env, offset } => {
-                rows.push((
-                    token,
-                    npub,
-                    env.msg.key(),
-                    Some(("already-appended".to_string(), Some(offset))),
-                ));
+        if round > 0 {
+            // Concurrent senders of one npub race on toron's per-sender
+            // journal epoch (see the PR notes); back off, then re-plan.
+            tokio::time::sleep(std::time::Duration::from_millis(25 * round as u64)).await;
+        }
+        // 2. Plan each pending recipient from its intent record and the log.
+        let store_epoch = store.producer_epoch(sender).await?;
+        let mut resend: Vec<(usize, Envelope)> = Vec::new();
+        let mut mint: Vec<usize> = Vec::new();
+        for i in 0..recipients.len() {
+            if done[i].is_some() {
                 continue;
             }
-            SendPlan::Resend(env) => {
-                resend.push(env.clone());
-                env
+            let recorded: Option<Envelope> = std::fs::read_to_string(&paths[i])
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+            if let Some(env) = &recorded
+                && (env.body != body || env.context.0 != context)
+            {
+                // The same task id with a different brief is not a retry.
+                return Err(SendError::PayloadConflict {
+                    msg_key: env.msg.key(),
+                }
+                .into());
             }
-            SendPlan::Mint => {
-                let env = minted_iter
-                    .next()
-                    .expect("one minted envelope per Mint plan");
-                fresh.push(env.clone());
-                env
+            let offset = match &recorded {
+                Some(env) => store.lookup(&env.msg).await?,
+                None => None,
+            };
+            match plan_send(recorded, offset, store_epoch) {
+                SendPlan::AlreadyAppended { env, offset } => {
+                    verify_recorded(store, &env).await?;
+                    done[i] = Some((env.msg.key(), "already-appended".into(), Some(offset)));
+                }
+                SendPlan::Resend(env) => resend.push((i, env)),
+                SendPlan::Mint => mint.push(i),
             }
-        };
-        rows.push((token, npub, env.msg.key(), None));
-    }
-    // Older epochs first: the log fences an epoch below its current one.
-    sends.extend(resend);
-    sends.extend(fresh);
+        }
 
-    // 4. mail.append (journal first, then append; reconcile, never blind).
-    let report = if sends.is_empty() {
-        None
-    } else {
-        Some(
-            outbox::send_and_recover(store.clone(), sender.to_string(), sends)
+        // 3a. Resends first, under their recorded epochs, lower epoch first
+        //     (the log fences an epoch below its current one). Resending
+        //     BEFORE claiming keeps the claim from fencing them.
+        resend.sort_by_key(|(_, e)| (e.msg.epoch, e.msg.seq));
+        // 3b. Mint under an epoch claimed from the log; record each intent
+        //     BEFORE the send (the record is what makes a retry re-send the
+        //     same msg id). An unused epoch is simply skipped.
+        let mut fresh: Vec<(usize, Envelope)> = Vec::new();
+        if !mint.is_empty() {
+            // Resends settle before the claim fences their epochs.
+            settle_batch(store, sender, &resend, &paths, &mut done, &mut last_why).await?;
+            let claim = store
+                .claim_epoch(sender, &run)
                 .await
-                .map_err(|e| anyhow!("mail.append: {e}"))?,
-        )
-    };
-    Ok(rows
-        .into_iter()
-        .map(|(to, npub, key, done)| {
-            let (state, offset) = done.unwrap_or_else(|| {
-                report
-                    .as_ref()
-                    .and_then(|r| r.sent.get(&key))
-                    .map_or(("unknown".into(), None), state_text)
+                .context("claim an epoch")?;
+            for (seq, i) in mint.iter().enumerate() {
+                let msg = MsgId {
+                    producer: sender.to_string(),
+                    epoch: claim.epoch,
+                    seq: seq as u64,
+                };
+                let env = task_envelope(sender, &recipients[*i].1, msg, context, task_id, task)
+                    .map_err(|r| anyhow!("task@1 refused: {r}"))?;
+                write_atomic(&paths[*i], serde_json::to_string(&env)?.as_bytes())?;
+                fresh.push((*i, env));
+            }
+            settle_batch(store, sender, &fresh, &paths, &mut done, &mut last_why).await?;
+        } else {
+            settle_batch(store, sender, &resend, &paths, &mut done, &mut last_why).await?;
+        }
+    }
+
+    Ok(recipients
+        .iter()
+        .enumerate()
+        .map(|(i, (to, npub))| {
+            let (msg_id, state, offset) = done[i].clone().unwrap_or_else(|| {
+                let (key, why) = last_why[i].clone().unwrap_or_default();
+                (
+                    key,
+                    format!("refused: fenced out after {MAX_ROUNDS} rounds: {why}"),
+                    None,
+                )
             });
             SentRow {
-                to,
-                npub,
-                msg_id: key,
+                to: to.clone(),
+                npub: npub.clone(),
+                msg_id,
                 state,
                 offset,
                 wake: String::new(),
             }
         })
         .collect())
+}
+
+/// Boundary: send one batch through `mail.append` and fold the outcomes
+/// into `done`. A refusal that is not a payload conflict means the append
+/// never landed (fenced by a newer claim, or a seq gap): the intent is
+/// dropped so the next round mints fresh. A payload conflict is a hard
+/// error.
+async fn settle_batch(
+    store: &InboxStore,
+    sender: &str,
+    batch: &[(usize, Envelope)],
+    paths: &[PathBuf],
+    done: &mut [Option<(String, String, Option<u64>)>],
+    last_why: &mut [Option<(String, String)>],
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let report = outbox::send_and_recover(
+        store.clone(),
+        sender.to_string(),
+        batch.iter().map(|(_, e)| e.clone()).collect(),
+    )
+    .await
+    .map_err(|e| anyhow!("mail.append: {e}"))?;
+    for (i, env) in batch {
+        let key = env.msg.key();
+        match report.sent.get(&key) {
+            Some(SendState::Refused(why)) if is_payload_conflict(why) => {
+                return Err(SendError::PayloadConflict { msg_key: key }.into());
+            }
+            Some(SendState::Refused(why)) => {
+                let _ = std::fs::remove_file(&paths[*i]);
+                last_why[*i] = Some((key, why.clone()));
+            }
+            Some(SendState::Settled(o)) => {
+                done[*i] = Some((key, "appended".into(), Some(*o)));
+            }
+            // In flight / unknown / not reported: the append may not have
+            // run (the journal refused the intent under a racing sender).
+            // Ask the log, never guess: present -> settled; absent -> the
+            // intent record stays and the next round re-sends the SAME msg
+            // id (the log dedupes by triple) or mints if it was fenced.
+            Some(_) | None => match store.lookup(&env.msg).await? {
+                Some(o) => done[*i] = Some((key, "appended".into(), Some(o))),
+                None => last_why[*i] = Some((key, "append not confirmed".into())),
+            },
+        }
+    }
+    Ok(())
 }
 
 /// Boundary: ring one recipient with the constant wake line for its head.
@@ -694,15 +782,6 @@ mod tests {
     }
 
     #[test]
-    fn epochs_never_reuse_a_triple() {
-        assert_eq!(next_epoch(None, None), 0);
-        assert_eq!(next_epoch(Some(4), None), 5);
-        assert_eq!(next_epoch(Some(4), Some(9)), 10);
-        // A leased epoch whose send never landed still moves the next one up.
-        assert_eq!(next_epoch(None, Some(0)), 1);
-    }
-
-    #[test]
     fn a_retry_resends_the_recorded_msg_id_and_never_mints_twice() {
         let env = task_envelope(A, B, msg(2, 0), "c", "t", &task()).unwrap();
         assert_eq!(
@@ -816,6 +895,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Simulate a crash after flywheel recorded the intent, before any
         // append: the record exists, the log does not have it.
+        let claim = store.claim_epoch(A, "crashed-run").await.unwrap();
+        assert_eq!(claim.epoch, 0);
         let env = task_envelope(A, B, msg(0, 0), "c", "t-9", &task()).unwrap();
         let path = comms_dir(dir.path(), A).join(format!("{}.json", intent_key("t-9", B)));
         write_atomic(&path, serde_json::to_string(&env).unwrap().as_bytes()).unwrap();
@@ -856,5 +937,155 @@ mod tests {
             !lines[0].contains("Fix the doorbell"),
             "no payload in the pane"
         );
+    }
+
+    fn epoch_of(msg_id: &str) -> u64 {
+        msg_id.rsplitn(3, ':').nth(1).unwrap().parse().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_runs_never_share_an_epoch() {
+        let store = mem_store().await;
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let (d1, d2, d3) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let t = task();
+        let (r1, r2, r3) = tokio::join!(
+            append_task(&store, d1.path(), A, &rcpt, "c", "t-a", &t),
+            append_task(&store, d2.path(), A, &rcpt, "c", "t-b", &t),
+            append_task(&store, d3.path(), A, &rcpt, "c", "t-c", &t),
+        );
+        let rows = [r1.unwrap(), r2.unwrap(), r3.unwrap()];
+        let mut epochs: Vec<u64> = rows.iter().map(|r| epoch_of(&r[0].msg_id)).collect();
+        for r in &rows {
+            assert_eq!(r[0].state, "appended", "a fenced run mints again: {r:?}");
+        }
+        epochs.sort_unstable();
+        epochs.dedup();
+        assert_eq!(epochs.len(), 3, "three runs, three distinct epochs");
+        let log = store
+            .read_stream(toron_core::inbox::INBOX_STREAM, None)
+            .await
+            .unwrap();
+        assert_eq!(log.len(), 3, "one row per run");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_run_needs_no_lock_or_epoch_file() {
+        let store = mem_store().await;
+        let dir = tempfile::tempdir().unwrap();
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let rows = append_task(&store, dir.path(), A, &rcpt, "c", "t-1", &task())
+            .await
+            .unwrap();
+        assert_eq!(rows[0].state, "appended");
+        assert_eq!(epoch_of(&rows[0].msg_id), 0, "the first claim is epoch 0");
+        let names: Vec<String> = std::fs::read_dir(comms_dir(dir.path(), A))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| n.ends_with(".json")) && names.len() == 1,
+            "only the intent record, no lock/epoch file: {names:?}"
+        );
+        // The claim is what the log now says the epoch is.
+        assert_eq!(store.producer_epoch(A).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorded_intent_fenced_by_a_newer_claim_mints_again() {
+        let store = mem_store().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mine = store.claim_epoch(A, "this-run").await.unwrap();
+        assert_eq!(mine.epoch, 0);
+        let env = task_envelope(A, B, msg(0, 0), "c", "t-f", &task()).unwrap();
+        let path = comms_dir(dir.path(), A).join(format!("{}.json", intent_key("t-f", B)));
+        write_atomic(&path, serde_json::to_string(&env).unwrap().as_bytes()).unwrap();
+        // Another run claims a newer epoch: the recorded one can never land.
+        let other = store.claim_epoch(A, "other-run").await.unwrap();
+        assert_eq!(other.epoch, 1);
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let rows = append_task(&store, dir.path(), A, &rcpt, "c", "t-f", &task())
+            .await
+            .unwrap();
+        assert_eq!(rows[0].state, "appended");
+        assert_ne!(rows[0].msg_id, env.msg.key(), "a fresh msg id");
+        assert!(
+            epoch_of(&rows[0].msg_id) > other.epoch,
+            "under a fresh claim"
+        );
+        assert_eq!(
+            store.lookup(&env.msg).await.unwrap(),
+            None,
+            "never delivered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn different_content_under_a_recorded_triple_is_a_hard_error_never_a_replay() {
+        let store = mem_store().await;
+        let dir = tempfile::tempdir().unwrap();
+        // The log already holds DIFFERENT content under (A, 0, 0)...
+        let other_task = task_from_text("Another brief entirely", None, vec![]);
+        let held = task_envelope(A, B, msg(0, 0), "c", "t-held", &other_task).unwrap();
+        store.append_envelope(&held).await.unwrap();
+        // ...and flywheel's intent record for t-x points at that same triple.
+        let mine = task_envelope(A, B, msg(0, 0), "c", "t-x", &task()).unwrap();
+        let path = comms_dir(dir.path(), A).join(format!("{}.json", intent_key("t-x", B)));
+        write_atomic(&path, serde_json::to_string(&mine).unwrap().as_bytes()).unwrap();
+        let head = rows_for(&store, B).await;
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let err = append_task(&store, dir.path(), A, &rcpt, "c", "t-x", &task())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<SendError>(),
+                Some(SendError::PayloadConflict { .. })
+            ),
+            "{err:#}"
+        );
+        assert_eq!(rows_for(&store, B).await, head, "nothing appended");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reused_task_id_with_a_different_brief_is_a_conflict_not_a_silent_resend() {
+        let store = mem_store().await;
+        let dir = tempfile::tempdir().unwrap();
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        append_task(&store, dir.path(), A, &rcpt, "c", "t-1", &task())
+            .await
+            .unwrap();
+        let changed = task_from_text("A different brief", None, vec![]);
+        let err = append_task(&store, dir.path(), A, &rcpt, "c", "t-1", &changed)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SendError>(),
+            Some(SendError::PayloadConflict { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn toron_payload_conflict_text_is_what_we_classify() {
+        let store = mem_store().await;
+        let a = task_envelope(A, B, msg(0, 0), "c", "t-1", &task()).unwrap();
+        store.append_envelope(&a).await.unwrap();
+        let b = task_envelope(A, B, msg(0, 0), "c", "t-2", &task()).unwrap();
+        let typed = store.append_envelope(&b).await.unwrap_err();
+        assert!(matches!(typed, InboxError::PayloadConflict { .. }));
+        // The kernel-facing entry (what mail.append uses) carries it as text.
+        let kernel = store
+            .append_json(
+                toron_core::inbox::INBOX_STREAM,
+                &toron_core::inbox::l16_json(&b),
+            )
+            .await
+            .unwrap_err();
+        assert!(is_payload_conflict(&kernel.to_string()), "{kernel}");
+        assert!(!is_payload_conflict("stale epoch 0 < 3"));
     }
 }

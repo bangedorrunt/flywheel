@@ -154,6 +154,9 @@ fn wake_outcome_to_brain(
         WakeOutcome::Heartbeat => {
             doorbell_rt::watchbeat::touch_heartbeat(&config::state_dir(), workspace);
         }
+        // toron#17: a counted, audited gap (the consumer wrote the row); the
+        // consumer is not dead and nothing reconnects.
+        WakeOutcome::EventsLost { .. } => fw.note_events_lost(),
         WakeOutcome::Died => {
             doorbell_rt::msg::deliver_died_blocking(tx);
         }
@@ -1482,6 +1485,49 @@ mod parity_tests {
         assert!(
             fx.iter()
                 .any(|e| matches!(e, doorbell_rt::Effect::RestartWatch))
+        );
+    }
+}
+
+#[cfg(test)]
+mod events_lost_tests {
+    //! toron#17: an `events_lost` outcome reaches the host's exact counters
+    //! (no silent loss) and is never a death or a delivery.
+    use super::*;
+    use doorbell_rt::wake_sock::WakeOutcome;
+
+    #[test]
+    fn an_events_lost_outcome_is_counted_not_dropped_on_the_floor() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let counters = std::sync::Arc::new(doorbell_rt::wake_brain::WakeBrainCounters::default());
+        let fw = doorbell_rt::wake_brain::WatchForwarder::new(
+            tx.clone(),
+            counters.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
+        let retry = std::sync::Mutex::new(doorbell_rt::WatchRetry::default());
+        for _ in 0..2 {
+            wake_outcome_to_brain(
+                WakeOutcome::EventsLost {
+                    from: "seq:1".into(),
+                    through: "seq:9".into(),
+                },
+                &fw,
+                &tx,
+                "ws",
+                &retry,
+            );
+        }
+        let s = counters.snapshot();
+        assert_eq!(s.events_lost, 2, "exact");
+        assert_eq!(
+            (s.dropped, s.forwarded),
+            (0, 0),
+            "not a drop, not a delivery"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no death, nothing forwarded to the brain"
         );
     }
 }
