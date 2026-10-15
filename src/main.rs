@@ -6054,6 +6054,12 @@ mod workspace_origin_tests {
             0,
             "no spawn path calls the legacy prime directly"
         );
+        let a = src.find("\nfn prime_bootstrap_with(").unwrap();
+        let body = &src[a..a + src[a..].find("\n}\n").unwrap()];
+        assert!(
+            body.contains("PrimeChoice::Bootstrap(h) => {\n            pane_write::launch_bootstrap_into(c, pane_id, h);\n        }"),
+            "the flag arm goes through the PaneWrite sink: {body}"
+        );
         let arm = concat!("=> prime_via", "_send_text(c, pane_id)");
         assert_eq!(src.matches(arm).count(), 1);
     }
