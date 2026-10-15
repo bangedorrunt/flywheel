@@ -67,77 +67,31 @@ impl doorbell_rt::PromptSink for HerdrPromptSink {
     }
 }
 
-/// Phase 3 wake-line-only sink (flag on: `TORON_COMMS_INBOX=1` or
-/// `[comms] inbox_log = true`). Whatever text the brain composed is DROPPED:
-/// the pane gets the closed [`crate::pane_write::PaneWrite::WakeLine`]
-/// constant and nothing else, and it goes through the one sink that may type
-/// into panes, so the pane never carries a payload (the agent runs
-/// `toron next`). No `agent_not_ready` text fallback: a pane herdr will not
-/// prompt is a failed delivery the brain parks, not a place to type the
-/// brief.
-///
-/// The `wm` in the line is a per-pin ring counter for now. The real inbox
-/// watermark comes from toron's `InboxProgram` (Phase 3, deferred).
-pub struct WakeOnlyPromptSink {
-    project: String,
-    client: Option<Client>,
-    rings: std::collections::HashMap<String, u64>,
+/// Flag-on brain sink (`TORON_COMMS_INBOX=1` or `[comms] inbox_log = true`).
+/// Under the flag the pane is written by exactly one thing: the inbox host
+/// ([`crate::inbox_host`]), which types the constant wake line for the real
+/// log watermark through the closed `PaneWrite` sink. Whatever text the legacy
+/// brain composes is DROPPED here (counted, never typed, never queued to a
+/// RAM digest because the delivery reports success), so the brain can
+/// neither type a payload nor accumulate one.
+pub struct NoTextSink {
+    dropped: u64,
 }
 
-impl WakeOnlyPromptSink {
-    pub fn new(cfg: &Config, project: &str) -> Self {
-        Self {
-            project: project.to_string(),
-            client: Client::connect(Some(&cfg.socket_path())).ok(),
-            rings: Default::default(),
-        }
+impl NoTextSink {
+    pub fn new() -> Self {
+        Self { dropped: 0 }
     }
 }
 
-/// Resolve `pin` to its pane in `registry` and type the wake line for ring
-/// number `ring` through `typer`. The only text that can reach the pane is
-/// `PaneWrite::WakeLine`.
-pub(crate) fn deliver_wake_line(
-    typer: &dyn crate::pane_write::PaneTyper,
-    registry: &[state::SpawnEntry],
-    pin: &str,
-    ring: u64,
-) -> Result<(), doorbell_rt::RtError> {
-    use crate::pane_write::{PaneWrite, Urgency, Wm};
-    let Some(entry) = registry
-        .iter()
-        .find(|e| e.mail_identity.as_deref() == Some(pin))
-    else {
-        eprintln!(
-            "flywheel doorbell: [DoorbellMiss] pin {pin} not in registry — no pane to wake (loud)"
-        );
-        return Err(doorbell_rt::RtError::UndeliveredPin(pin.to_string()));
-    };
-    crate::pane_write::write(
-        typer,
-        &entry.name,
-        &PaneWrite::WakeLine {
-            wm: Wm(ring),
-            urgency: Urgency::Normal,
-        },
-    )
-    .map_err(|e| doorbell_rt::RtError::PromptFailed(e.to_string()))
-}
-
-impl doorbell_rt::PromptSink for WakeOnlyPromptSink {
-    fn send(&mut self, pin: &str, _line: &str) -> Result<(), doorbell_rt::RtError> {
-        let Some(client) = self.client.as_ref() else {
-            return Err(doorbell_rt::RtError::UndeliveredPin(pin.to_string()));
-        };
-        let registry = state::load_spawn_registry(&self.project);
-        let ring = self.rings.get(pin).copied().unwrap_or(0) + 1;
-        deliver_wake_line(&crate::pane_write::HerdrPanes(client), &registry, pin, ring)?;
-        self.rings.insert(pin.to_string(), ring);
+impl doorbell_rt::PromptSink for NoTextSink {
+    fn send(&mut self, _pin: &str, _line: &str) -> Result<(), doorbell_rt::RtError> {
+        self.dropped += 1;
         Ok(())
     }
 
     fn name(&self) -> &'static str {
-        "herdr-wake-only"
+        "inbox-no-text"
     }
 }
 
@@ -230,7 +184,11 @@ fn wake_outcome_to_brain(
         }
         // toron#17: a counted, audited gap (the consumer wrote the row); the
         // consumer is not dead and nothing reconnects.
-        WakeOutcome::EventsLost { .. } => fw.note_events_lost(),
+        WakeOutcome::EventsLost { .. } => {
+            fw.note_events_lost();
+            // Bindings are re-verified before any further ring.
+            crate::inbox_host::signal_invalidate(toron_core::inbox_program::Invalidate::EventsLost);
+        }
         WakeOutcome::Died => {
             doorbell_rt::msg::deliver_died_blocking(tx);
         }
@@ -449,6 +407,9 @@ impl RtHost {
                         // then exit so the next sweep re-subscribes.
                         eprintln!(
                             "flywheel doorbell: events_lost — clearing coverage and reconciling via session.snapshot"
+                        );
+                        crate::inbox_host::signal_invalidate(
+                            toron_core::inbox_program::Invalidate::EventsLost,
                         );
                         clear_covered(&covered_shared, &clear_ids);
                         reconcile_status_after_events_lost(
@@ -1001,14 +962,18 @@ async fn run_embedded_async(
         generation.clone(),
     );
     let cfg_for_factory = cfg.clone();
+    // Dropped (stop + join) when this function returns.
+    let mut _inbox_guard: Option<crate::inbox_host::InboxHost> = None;
     if crate::comms_send::enabled(&cfg) {
-        // Phase 3: wake line only; the pane never carries a payload.
-        let (cfg_w, proj_w) = (cfg.clone(), project.to_string());
-        sinks.add_sink_with_factory(
-            "herdr",
-            Box::new(WakeOnlyPromptSink::new(&cfg, project)),
-            move || Box::new(WakeOnlyPromptSink::new(&cfg_w, &proj_w)),
-        );
+        // Phase 3: the inbox host owns every pane write (wake line only, the
+        // real log watermark); the brain's text is dropped.
+        sinks.add_sink_with_factory("herdr", Box::new(NoTextSink::new()), || {
+            Box::new(NoTextSink::new())
+        });
+        _inbox_guard = Some(crate::inbox_host::InboxHost::spawn(
+            crate::inbox_ports::FlywheelPorts::new(&cfg, project, workspace),
+            crate::inbox_host::HostCfg::from_env(),
+        ));
     } else {
         sinks.add_sink_with_factory(
             "herdr",
@@ -1653,104 +1618,28 @@ mod events_lost_tests {
 }
 
 #[cfg(test)]
-mod wake_only_tests {
+mod inbox_flag_tests {
     use super::*;
-    use crate::pane_write::PaneTyper;
-    use std::cell::RefCell;
+    use doorbell_rt::PromptSink;
 
-    #[derive(Default)]
-    struct Rec(RefCell<Vec<String>>);
-    impl PaneTyper for Rec {
-        fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
-            self.0.borrow_mut().push(format!("prompt {target} {line}"));
-            Ok(())
-        }
-        fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
-            self.0.borrow_mut().push(format!("keys {target} {keys:?}"));
-            Ok(())
-        }
-        fn close(&self, p: &str) -> anyhow::Result<()> {
-            self.0.borrow_mut().push(format!("close {p}"));
-            Ok(())
-        }
-    }
-    struct Down;
-    impl PaneTyper for Down {
-        fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            Err(anyhow::anyhow!("agent_not_ready"))
-        }
-        fn keys(&self, _: &str, _: &[&str]) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn close(&self, _: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn registry() -> Vec<state::SpawnEntry> {
-        let mut e = state::SpawnEntry::legacy("w1:p1", "flywheel-x-pi");
-        e.mail_identity = Some("TealBirch".into());
-        vec![e]
+    #[test]
+    fn the_no_text_sink_drops_what_the_brain_composes() {
+        let mut s = NoTextSink::new();
+        s.send("TealBirch", "BRAIN PAYLOAD: do the thing").unwrap();
+        s.send("TealBirch", "again").unwrap();
+        assert_eq!(s.dropped, 2);
+        assert_eq!(s.name(), "inbox-no-text");
     }
 
     #[test]
-    fn a_ring_types_the_wake_line_and_never_the_brain_text() {
-        let r = Rec::default();
-        deliver_wake_line(&r, &registry(), "TealBirch", 5).unwrap();
-        let got = r.0.borrow().clone();
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(
-            got[0],
-            format!(
-                "prompt flywheel-x-pi {}",
-                crate::pane_write::wake_line(
-                    crate::pane_write::Wm(5),
-                    crate::pane_write::Urgency::Normal
-                )
-            )
-        );
-        assert!(got[0].contains("run: toron next"));
-    }
-
-    #[test]
-    fn an_unknown_pin_is_an_undelivered_pin_and_types_nothing() {
-        let r = Rec::default();
-        let e = deliver_wake_line(&r, &registry(), "Nobody", 1).unwrap_err();
-        assert!(matches!(e, doorbell_rt::RtError::UndeliveredPin(p) if p == "Nobody"));
-        assert!(r.0.borrow().is_empty());
-    }
-
-    #[test]
-    fn an_unpromptable_pane_fails_the_delivery_with_no_text_fallback() {
-        let e = deliver_wake_line(&Down, &registry(), "TealBirch", 1).unwrap_err();
-        assert!(
-            matches!(e, doorbell_rt::RtError::PromptFailed(m) if m.contains("agent_not_ready"))
-        );
-    }
-
-    #[test]
-    fn the_wake_only_sink_ignores_the_line_it_is_handed() {
-        // Source check: the sink's send never uses `_line`.
-        let src = include_str!("doorbell_host.rs");
-        let a = src
-            .find("impl doorbell_rt::PromptSink for WakeOnlyPromptSink")
-            .unwrap();
-        let body = &src[a..src[a..].find("\n}\n").map(|n| a + n).unwrap()];
-        assert_eq!(body.matches("_line: &str").count(), 1);
-        assert_eq!(
-            body.matches("_line").count(),
-            body.matches("wake_line").count() + 1,
-            "the ignored parameter is never used"
-        );
-    }
-
-    #[test]
-    fn the_flag_selects_the_wake_only_sink_at_registration() {
+    fn the_flag_arm_registers_no_text_sink_and_starts_the_inbox_host() {
         let src = include_str!("doorbell_host.rs");
         let a = src.find("if crate::comms_send::enabled(&cfg) {").unwrap();
-        let tail = &src[a..a + 900];
-        assert!(tail.contains("WakeOnlyPromptSink::new(&cfg, project)"));
-        assert!(tail.contains("} else {"));
+        let tail = &src[a..a + 1100];
+        let flag_arm = &tail[..tail.find("} else {").unwrap()];
+        assert!(flag_arm.contains("NoTextSink::new()"));
+        assert!(flag_arm.contains("InboxHost::spawn("));
+        assert!(!flag_arm.contains("HerdrPromptSink"), "no legacy sink under the flag");
         assert!(tail.find("} else {").unwrap() < tail.find("HerdrPromptSink::new(").unwrap());
     }
 }

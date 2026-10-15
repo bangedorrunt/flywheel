@@ -83,7 +83,8 @@ pub enum PaneOp {
 /// The constant wake line for a watermark (redesign §4.1, §6A.4).
 pub fn wake_line(wm: Wm, urgency: Urgency) -> String {
     match urgency {
-        Urgency::Normal => format!("{WAKE_MARK} new work (wm {:x}) — run: toron next", wm.0),
+        // toron_core owns the line: one constant per watermark (ADR-0041).
+        Urgency::Normal => toron_core::wake::wake_line(wm.0),
         Urgency::Urgent => format!("{WAKE_MARK} URGENT steer (wm {:x}) — run: toron next", wm.0),
     }
 }
