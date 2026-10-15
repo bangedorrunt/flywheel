@@ -51,11 +51,24 @@ async fn host_workspace(
     // process restart. Targets table is shared, so the factory sees the
     // refreshed routing after registry changes.
     let targets = host.target_table();
-    sinks.add_sink_with_factory(
-        "herdr",
-        Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
-        move || Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
-    );
+    if doorbell_rt::comms_inbox_env() {
+        // Comms flag: the flywheel inbox host is the only pane writer (wake
+        // line, real watermark). This host must not type the brain line.
+        eprintln!(
+            "doorbell serve: {project}/{workspace} — comms flag on: pane writes belong to the flywheel inbox host; this host types nothing"
+        );
+        sinks.add_sink_with_factory(
+            "herdr",
+            Box::new(doorbell_rt::NoTextSink::new()),
+            || Box::new(doorbell_rt::NoTextSink::new()),
+        );
+    } else {
+        sinks.add_sink_with_factory(
+            "herdr",
+            Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
+            move || Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
+        );
+    }
     // bd-8ulu: a durable human wake with zero swarm needs somewhere to land.
     // The pane registry is not an option for a human pin, so register the
     // webhook adapters this workspace's rows justify — one per distinct
@@ -2410,6 +2423,20 @@ fn stats_body(app: &AppState) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// bd-doorbell-daemon-sink-wake-only-yfqz: under the comms flag the daemon
+    /// host must not register the sink that types the brain line.
+    #[test]
+    fn the_daemon_host_types_nothing_under_the_comms_flag() {
+        let src = include_str!("serve.rs");
+        let a = src.find("if doorbell_rt::comms_inbox_env() {").unwrap();
+        let tail = &src[a..a + 1600];
+        let flag_arm = &tail[..tail.find("} else {").unwrap()];
+        assert!(flag_arm.contains("doorbell_rt::NoTextSink::new()"));
+        assert!(!flag_arm.contains("CliPromptSink"));
+        let else_arm = &tail[tail.find("} else {").unwrap()..];
+        assert!(else_arm.contains("CliPromptSink::new("), "flag-off path unchanged");
+    }
+
     use super::known_journal_workspaces;
     use super::{PortHolder, classify_port_holder};
 

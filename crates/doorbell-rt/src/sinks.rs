@@ -443,6 +443,57 @@ impl PromptSink for MockSink {
         "mock"
     }
 }
+/// The comms flag as the daemon can see it: env `TORON_COMMS_INBOX` is
+/// `1`/`true`/`on` (the same words as `toron_core::inbox::resolve_enabled`;
+/// the daemon has no flywheel config, so the config-file flag must be
+/// exported to its unit).
+pub fn comms_inbox_env() -> bool {
+    comms_flag_word(std::env::var("TORON_COMMS_INBOX").ok().as_deref())
+}
+
+/// Pure: the flag words.
+pub fn comms_flag_word(v: Option<&str>) -> bool {
+    matches!(v, Some("1" | "true" | "on"))
+}
+
+/// Sink for hosts that run under the comms flag (bd-doorbell-daemon-sink-
+/// wake-only-yfqz). Under the flag the only thing that may write a pane is
+/// the flywheel inbox host (the constant wake line for the real log
+/// watermark, through the closed `PaneWrite` sink), so a host without that
+/// sink must type NOTHING. Delivery reports success so the brain does not
+/// shed the line into a RAM digest; the line is counted and dropped.
+pub struct NoTextSink {
+    dropped: u64,
+}
+
+impl NoTextSink {
+    pub fn new() -> Self {
+        Self { dropped: 0 }
+    }
+
+    /// Lines dropped so far.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+impl Default for NoTextSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PromptSink for NoTextSink {
+    fn send(&mut self, _pin: &str, _line: &str) -> Result<(), RtError> {
+        self.dropped += 1;
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "comms-inbox-no-text"
+    }
+}
+
 /// herdr CLI prompt sink (bd-ene2 Phase 3): delivers via
 /// `herdr agent prompt <name> <line>`, resolving the pin through the
 /// shared routing table the `FileHost` index refresh owns. Unknown pin
@@ -779,6 +830,27 @@ impl DmTransport for MockDmTransport {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_text_sink_types_nothing_and_never_fails() {
+        let mut s = NoTextSink::new();
+        for l in ["BRAIN PAYLOAD", "another", ""] {
+            s.send("TealBirch", l).expect("always Ok: nothing to digest");
+        }
+        assert_eq!(s.dropped(), 3);
+        assert_eq!(s.name(), "comms-inbox-no-text");
+    }
+
+    #[test]
+    fn the_comms_flag_words_match_toron() {
+        for on in ["1", "true", "on"] {
+            assert!(comms_flag_word(Some(on)), "{on}");
+        }
+        for off in ["", "0", "false", "yes", "off"] {
+            assert!(!comms_flag_word(Some(off)), "{off}");
+        }
+        assert!(!comms_flag_word(None));
+    }
+
     use super::*;
 
     fn sent_len(sent: &Arc<std::sync::Mutex<Vec<(String, String)>>>) -> usize {
