@@ -41,6 +41,9 @@ jobs:
         with:
           repository: bangedorrunt/toron
           path: toron
+          # bd-9bs4: pinned to a reviewed toron main head (migration 22,
+          # [comms] inbox_log). Bump deliberately; do not float on main.
+          ref: 2952cb28dd54834b052bab483fcd275ea9e15bdf
           # Both repos are private: the default GITHUB_TOKEN is scoped to
           # THIS repo only. The operator must set CI_TORON_TOKEN (fine-
           # grained PAT, Contents:read on bangedorrunt/toron). Until then
@@ -110,6 +113,9 @@ jobs:
         with:
           repository: bangedorrunt/toron
           path: toron
+          # bd-9bs4: pinned to a reviewed toron main head (migration 22,
+          # [comms] inbox_log). Bump deliberately; do not float on main.
+          ref: 2952cb28dd54834b052bab483fcd275ea9e15bdf
           token: ${{ secrets.CI_TORON_TOKEN }}
       - name: Checkout beads (public — br CLI)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
