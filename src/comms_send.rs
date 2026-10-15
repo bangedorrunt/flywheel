@@ -216,7 +216,7 @@ pub fn task_envelope(
         causation: None,
         deadline_ts_us: None,
         lease_ms: None,
-        body: serde_json::to_value(task).map_err(|e| Reject::BadEnvelope(e.to_string()))?,
+        body: serde_json::to_value(task).map_err(|e| Reject::bad_envelope(e.to_string()))?,
     };
     env.validate()?;
     Ok(env)

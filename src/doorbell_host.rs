@@ -278,9 +278,14 @@ impl RtHost {
             model.session_topology = Some(topo);
         }
         // Same seeds as the old loop head (fail-loud on I/O, never skip).
-        crate::durable::seed_workspace_from_active_loop(&mut model, project)?;
-        crate::seed_roles_from_binds(&mut model, project)?;
-        crate::rebuild_assignment_from_receipts(&mut model);
+        // Host construction runs inside the embedded runtime; the receipt
+        // store lists via `block_on` on the shared mail runtime, so seed off it.
+        crate::backend::run_mail_off_runtime_sync(|| -> anyhow::Result<()> {
+            crate::durable::seed_workspace_from_active_loop(&mut model, project)?;
+            crate::seed_roles_from_binds(&mut model, project)?;
+            crate::rebuild_assignment_from_receipts(&mut model);
+            Ok(())
+        })?;
         model.last_now = unix_now();
         // bd-b2b3: opt-in. Recording a boundary per tick changes the
         // dispatcher's storage and latency profile, so it is an explicit
@@ -539,7 +544,9 @@ fn build_index(cfg: &Config, project: &str) -> doorbell::SelfIndex {
         .iter()
         .filter_map(|e| e.mail_identity.clone())
         .collect();
-    crate::doorbell_self_index(cfg, project, &pins)
+    // Mail whois runs `block_on` on the shared mail runtime; this is reached
+    // from the brain's runtime thread (host construction, maintenance sweep).
+    crate::backend::run_mail_off_runtime_sync(|| crate::doorbell_self_index(cfg, project, &pins))
 }
 
 fn unix_now() -> u64 {
@@ -620,7 +627,9 @@ impl Host for RtHost {
         // GS-048: expand Reclassify → DecisionReady cmds so Prompt announces
         // reach Effect::Prompt (nested handle would drop them). Live Snapshot
         // from briefing world facts — never Snapshot::default() invent-green.
-        let snap = crate::live_decide_snapshot(&self.cfg, &self.project);
+        let snap = crate::backend::run_mail_off_runtime_sync(|| {
+            crate::live_decide_snapshot(&self.cfg, &self.project)
+        });
         let cmds = workspace::expand_reclassify_cmds(
             &mut self.model,
             cmds,
@@ -714,7 +723,9 @@ impl Host for RtHost {
         let Some(mb) = crate::mail_shim::try_mailbox() else {
             return Vec::new();
         };
-        match crate::mail_shim::block_on(mb.check_ack_sla_expired(&self.project, None)) {
+        match crate::backend::run_mail_off_runtime_sync(|| {
+            crate::mail_shim::block_on(mb.check_ack_sla_expired(&self.project, None))
+        }) {
             Ok(emitted) if emitted.is_empty() => Vec::new(),
             Ok(emitted) => {
                 doorbell::audit_append(
@@ -869,17 +880,21 @@ impl Host for RtHost {
 
 impl RtHost {
     fn fetch_inbox_process(&self, pin: &str, since: &str) -> Option<Vec<serde_json::Value>> {
-        let mail = crate::mail_shim::Mail::from_config(Some(&self.cfg.toron_mail_config()))
-            .ok()
-            .flatten()?;
-        let filter = crate::mail_shim::MailInboxFilter {
-            since_ts: Some(since.to_string()),
-            limit: 50,
-            include_bodies: true,
-            ..Default::default()
-        };
-        let v = mail.inbox_filtered(&self.project, pin, &filter).ok()?;
-        v.as_array().cloned()
+        // In-process mail `block_on`s the shared mail runtime inside
+        // `inbox_filtered`; this is called from the brain's runtime thread.
+        crate::backend::run_mail_off_runtime_sync(|| {
+            let mail = crate::mail_shim::Mail::from_config(Some(&self.cfg.toron_mail_config()))
+                .ok()
+                .flatten()?;
+            let filter = crate::mail_shim::MailInboxFilter {
+                since_ts: Some(since.to_string()),
+                limit: 50,
+                include_bodies: true,
+                ..Default::default()
+            };
+            let v = mail.inbox_filtered(&self.project, pin, &filter).ok()?;
+            v.as_array().cloned()
+        })
     }
 
     fn fetch_inbox_cli(&self, pin: &str, since: &str) -> Vec<serde_json::Value> {
@@ -1024,7 +1039,27 @@ async fn run_embedded_async(
         host.wake_counters.clone(),
         host.wake_resume.clone(),
     );
-    if !spawn_bus_watch(&cfg, project, workspace, tx.clone(), bus_fw) {
+    // `spawn_bus_watch` drives the shared mail runtime with `block_on`; run it
+    // off this runtime (backend::run_mail_off_runtime).
+    let bus_armed = {
+        let (cfg_b, project_b, workspace_b, tx_b) = (
+            cfg.clone(),
+            project.to_string(),
+            workspace.to_string(),
+            tx.clone(),
+        );
+        crate::backend::run_mail_off_runtime(move || {
+            Ok(spawn_bus_watch(
+                &cfg_b,
+                &project_b,
+                &workspace_b,
+                tx_b,
+                bus_fw,
+            ))
+        })
+        .await?
+    };
+    if !bus_armed {
         let tx_w = tx.clone();
         let project = project.to_string();
         let beat_workspace = workspace.to_string();
@@ -1145,10 +1180,11 @@ fn spawn_bus_watch(
         let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
             .ok()
             .flatten()?;
+        // Remote-daemon mail has no in-process mailbox (`mailbox()` panics
+        // there): no bus to watch, so the caller falls back to the wake socket.
+        let mb = crate::mail_shim::try_mailbox()?;
         let bus = crate::mail_shim::block_on(async {
-            Ok::<std::sync::Arc<dyn toron_core::bus::Bus>, anyhow::Error>(
-                crate::mail_shim::mailbox().bus().clone(),
-            )
+            Ok::<std::sync::Arc<dyn toron_core::bus::Bus>, anyhow::Error>(mb.bus().clone())
         })
         .ok()?;
         let filter = {
@@ -1716,5 +1752,99 @@ mod wake_only_tests {
         assert!(tail.contains("WakeOnlyPromptSink::new(&cfg, project)"));
         assert!(tail.contains("} else {"));
         assert!(tail.find("} else {").unwrap() < tail.find("HerdrPromptSink::new(").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod off_runtime_tests {
+    use super::*;
+    use doorbell_rt::Host;
+
+    /// Every mail-touching sync host method, called the way the brain calls
+    /// them: from inside a running runtime, with IN-PROCESS mail. Inline,
+    /// each of these panics "Cannot start a runtime from within a runtime".
+    #[test]
+    fn host_mail_methods_do_not_nest_block_on_inside_a_runtime() {
+        let _home = crate::config::test_state_home();
+        // In-process mail (no [mail.toron] url); built OUTSIDE any runtime.
+        let _mail = crate::mail_shim::Mail::from_config(None)
+            .expect("in-process mail")
+            .expect("some");
+        let (tx, _rx) = mpsc::channel(8);
+        let mut host = RtHost::new(Config::default(), "offrt-methods", "offrt", tx).expect("host");
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            // maintenance sweep -> build_index (whois)
+            let _ = host.sweep_maintenance();
+            // ack-sla scan
+            let _ = host.scan_ack_sla();
+            // inbox read (`last` skips the timestamp parse, so the in-process
+            // `inbox_filtered` `block_on` is actually reached)
+            let _ = host.fetch_inbox_process("SomePin", "last");
+            // tick -> live_decide_snapshot
+            let _ = host.tick(&BrainMsg::Watch(String::new()));
+        });
+    }
+
+    /// Remote-daemon mail: the index build asks `whois` per registered pin
+    /// through `backend::run_mail` (a `block_on`). Inline inside a runtime
+    /// that panics, so it must go off the runtime. (The daemon is
+    /// unreachable here; the failure is swallowed, only the nesting matters.)
+    #[test]
+    fn build_index_with_remote_mail_does_not_nest_block_on_inside_a_runtime() {
+        let _home = crate::config::test_state_home();
+        let proj_dir = std::env::temp_dir().join(format!("offrt-idx-{}", std::process::id()));
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let project = proj_dir.to_string_lossy().into_owned();
+        let key = crate::state::spawn_registry_key(&project);
+        let agents = config::state_dir().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join(format!("{key}.json")),
+            serde_json::json!([{"pane_id": "p1", "name": "h1", "mail_identity": "PinA"}])
+                .to_string(),
+        )
+        .unwrap();
+        let cfg = Config {
+            mail: Some(crate::config::MailSections {
+                toron: Some(crate::config::MailServerConfig {
+                    url: Some("http://127.0.0.1:9/mcp".into()),
+                    token: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()));
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let _ = build_index(&cfg, &project);
+        });
+    }
+
+    /// The whole embedded loop starts with in-process mail and stays up:
+    /// host construction (index), bus watch arming and the brain run all
+    /// happen inside its runtime. A crash at start ends the thread.
+    #[test]
+    fn the_embedded_doorbell_starts_and_stays_up_with_in_process_mail() {
+        let _home = crate::config::test_state_home();
+        let _mail = crate::mail_shim::Mail::from_config(None)
+            .expect("in-process mail")
+            .expect("some");
+        let ws = "offrt-embedded";
+        let cfg = Config::default();
+        let h = std::thread::spawn(move || run_embedded(&cfg, "offrt-embedded", ws));
+        std::thread::sleep(Duration::from_secs(4));
+        let died_early = h.is_finished();
+        // Stop the loop: it exits when its pid file goes away.
+        let _ = std::fs::remove_file(doorbell::pid_file(&config::state_dir(), ws));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !h.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !died_early,
+            "the embedded doorbell exited within 4s of starting: {:?}",
+            h.join().map(|r| r.map_err(|e| e.to_string()))
+        );
     }
 }
