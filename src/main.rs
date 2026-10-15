@@ -43,6 +43,8 @@ mod daemon;
 mod decide;
 mod doorbell;
 mod doorbell_host;
+mod inbox_host;
+mod inbox_ports;
 mod doorbell_tick;
 mod durable;
 mod durable_policy;

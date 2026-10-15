@@ -1,0 +1,366 @@
+// governed-by: ADR-0041
+//! The flywheel side of the Phase 3 inbox host: [`FlywheelPorts`] implements
+//! [`crate::inbox_host::Ports`] over the live machinery. This is the only
+//! place the wake path touches the store, herdr and the filesystem.
+//!
+//! - observe: the spawn registry names the recipients; the in-process comms
+//!   store answers `head` and `cursor`; herdr's `pane.list` gives the pane
+//!   state and the `report_metadata` tokens the binding is verified against.
+//! - ring: the closed [`crate::pane_write::PaneWrite::WakeLine`], by pane id.
+//!   Nothing else can reach a pane from here.
+//! - facts: `bind` and `deaf` facts append to
+//!   `<state>/facts/<project-key>-inbox.jsonl`, keyed and idempotent.
+//! - notify: a `notify@1` envelope appended to the supervisor's / captain's
+//!   inbox under a synthetic, stable system producer (the doorbell has no
+//!   key of its own); the normal wake then rings that pane like any other.
+
+use crate::config::{self, Config};
+use crate::herdr_shim::{AgentStatus, Client};
+use crate::inbox_host::{Bind, Observation, Ports, Seen};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use toron_core::backend::herdr::{TOKEN_NPUB, TOKEN_PIN};
+use toron_core::inbox::InboxStore;
+use toron_core::inbox_program::DeafCause;
+use toron_core::wake::{PaneState, Urgency};
+
+/// How a verified binding is named in the `bind` fact.
+pub const VERIFIED_BY: &str = "report_metadata";
+
+pub struct FlywheelPorts {
+    cfg: Config,
+    project: String,
+    workspace: String,
+    store: Option<InboxStore>,
+    npubs: BTreeMap<String, String>,
+    herdr_was_down: bool,
+    facts_seen: BTreeSet<String>,
+    warned_store: bool,
+}
+
+/// Pure: herdr's word to the wake rule's pane state.
+pub fn pane_state(s: AgentStatus) -> PaneState {
+    match s {
+        AgentStatus::Idle => PaneState::Idle,
+        AgentStatus::Done => PaneState::Done,
+        AgentStatus::Working => PaneState::Working,
+        AgentStatus::Blocked => PaneState::Blocked,
+        AgentStatus::Unknown => PaneState::Unknown,
+    }
+}
+
+/// Pure: the binding for `pin`/`npub` from a pane's stamped tokens. Verified
+/// only when BOTH the pin and the npub the spawn stamped match; a missing or
+/// different stamp is an unverified binding (escalated, never rung).
+pub fn verify_tokens(
+    tokens: &serde_json::Map<String, Value>,
+    pin: &str,
+    npub: &str,
+    pane_id: &str,
+    session: &str,
+) -> Bind {
+    let get = |k: &str| tokens.get(k).and_then(Value::as_str).unwrap_or("");
+    Bind {
+        pane_id: pane_id.to_string(),
+        herdr_session: session.to_string(),
+        verified: get(TOKEN_PIN) == pin && get(TOKEN_NPUB) == npub && !npub.is_empty(),
+        verified_by: VERIFIED_BY.to_string(),
+    }
+}
+
+/// Pure: the system producer the doorbell's notifications are sent as (a
+/// stable 64-hex id per project; no key, `from` only has to equal it).
+pub fn system_producer(project: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(format!("flywheel-doorbell:{project}").as_bytes()))
+}
+
+/// Pure: the notice text for a deaf recipient.
+pub fn deaf_text(pin: &str, wm: u64, cause: DeafCause) -> String {
+    let why = match cause {
+        DeafCause::NoAnswer => "was rung the whole budget and never ran `toron next`",
+        DeafCause::Unbound => "has mail but no verified pane binding",
+    };
+    format!(
+        "⟦toron⟧ DEAF: {pin} {why} (wm {wm:x}). Check its pane; mail stays in its inbox."
+    )
+}
+
+impl FlywheelPorts {
+    pub fn new(cfg: &Config, project: &str, workspace: &str) -> Self {
+        let mut p = Self {
+            cfg: cfg.clone(),
+            project: project.to_string(),
+            workspace: workspace.to_string(),
+            store: None,
+            npubs: BTreeMap::new(),
+            herdr_was_down: false,
+            facts_seen: BTreeSet::new(),
+            warned_store: false,
+        };
+        p.load_facts();
+        p
+    }
+
+    fn facts_path(&self) -> std::path::PathBuf {
+        config::state_dir()
+            .join("facts")
+            .join(format!("{}-inbox.jsonl", crate::state::state_key(&self.project)))
+    }
+
+    fn load_facts(&mut self) {
+        if let Ok(s) = std::fs::read_to_string(self.facts_path()) {
+            for l in s.lines() {
+                if let Ok(v) = serde_json::from_str::<Value>(l)
+                    && let Some(k) = v.get("key").and_then(Value::as_str)
+                {
+                    self.facts_seen.insert(k.to_string());
+                }
+            }
+        }
+    }
+
+    fn store(&mut self) -> Option<&InboxStore> {
+        if self.store.is_none() {
+            match crate::comms_send::store() {
+                Ok(s) => self.store = Some(s),
+                Err(e) => {
+                    if !self.warned_store {
+                        self.warned_store = true;
+                        eprintln!("flywheel inbox: no in-process comms store ({e:#}); not ringing");
+                    }
+                }
+            }
+        }
+        self.store.as_ref()
+    }
+
+    fn npub_of(&mut self, pin: &str) -> Option<String> {
+        if let Some(n) = self.npubs.get(pin) {
+            return Some(n.clone());
+        }
+        let key = crate::project_dir_str(&self.cfg, &self.project).ok()?;
+        let mail = crate::backend::mail_backend(&self.cfg).ok()?;
+        let w = crate::backend::run_mail(mail.whois(&key, pin)).ok()?;
+        if w.npub.is_empty() {
+            return None;
+        }
+        self.npubs.insert(pin.to_string(), w.npub.clone());
+        Some(w.npub)
+    }
+
+    fn client(&self) -> Option<Client> {
+        Client::connect(Some(&self.cfg.socket_path())).ok()
+    }
+
+    fn pin_of_npub(&self, npub: &str) -> String {
+        self.npubs
+            .iter()
+            .find(|(_, n)| n.as_str() == npub)
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| npub.chars().take(8).collect())
+    }
+
+    /// The pin to notify for a role: a bound role, else the captain alias.
+    fn role_pin(&self, roles: &[&str]) -> Option<String> {
+        let binds = crate::state::load_role_binds(&self.project).unwrap_or_default();
+        for r in roles {
+            if let Some(p) = binds.get(*r) {
+                return Some(p.clone());
+            }
+        }
+        crate::state::load_captain_alias(&self.project)
+    }
+
+    fn notify_pin(&mut self, pin: &str, text: String, key: &str) -> Result<(), String> {
+        let to = self
+            .npub_of(pin)
+            .ok_or_else(|| format!("no npub for {pin}"))?;
+        let producer = system_producer(&self.project);
+        let store = self.store().ok_or("no comms store")?.clone();
+        let (project, key) = (self.project.clone(), key.to_string());
+        crate::mail_shim::block_on(async move {
+            use toron_core::contracts::notify_v1::NotifyV1;
+            use toron_core::envelope::{
+                Class, ContextId, ContractId, ENVELOPE_V, Envelope, MsgId, Recipient,
+            };
+            let claim = store
+                .claim_epoch(&producer, &format!("doorbell:{}", std::process::id()))
+                .await
+                .map_err(|e| e.to_string())?;
+            let env = Envelope {
+                v: ENVELOPE_V,
+                msg: MsgId {
+                    producer: producer.clone(),
+                    epoch: claim.epoch,
+                    seq: 0,
+                },
+                from: producer,
+                to: Recipient::Npub(to),
+                class: Class::Notify,
+                contract: ContractId::new("notify", 1),
+                context: ContextId(format!("{project}:{key}")),
+                task: None,
+                generation: 0,
+                causation: None,
+                deadline_ts_us: None,
+                lease_ms: None,
+                body: serde_json::to_value(NotifyV1 { text }).map_err(|e| e.to_string())?,
+            };
+            env.validate().map_err(|e| format!("{e:?}"))?;
+            store
+                .append_envelope(&env)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+impl Ports for FlywheelPorts {
+    fn observe(&mut self) -> Observation {
+        let registry = crate::state::load_spawn_registry(&self.project);
+        let client = self.client();
+        let herdr_restarted = client.is_some() && self.herdr_was_down;
+        self.herdr_was_down = client.is_none();
+        let panes = client
+            .as_ref()
+            .and_then(|c| c.pane_list(None).ok())
+            .unwrap_or_default();
+        let mut seen = Vec::new();
+        for e in &registry {
+            let Some(pin) = e.mail_identity.clone() else {
+                continue;
+            };
+            let Some(npub) = self.npub_of(&pin) else {
+                continue;
+            };
+            let Some(store) = self.store() else {
+                return Observation::default();
+            };
+            let store = store.clone();
+            let n2 = npub.clone();
+            let (head, cursor) = crate::mail_shim::block_on(async move {
+                let h = store.head(&n2).await.unwrap_or(0);
+                let c = store
+                    .cursor(&n2, toron_core::inbox::INBOX_STREAM)
+                    .await
+                    .unwrap_or(0);
+                (h, c)
+            });
+            let pane = panes.iter().find(|p| p.pane_id == e.pane_id);
+            let (state, bind) = match pane {
+                Some(p) => (
+                    pane_state(p.agent_status),
+                    Some(verify_tokens(
+                        &p.tokens,
+                        &pin,
+                        &npub,
+                        &p.pane_id,
+                        &p.workspace_id,
+                    )),
+                ),
+                None if client.is_some() => (PaneState::Gone, None),
+                None => (PaneState::Unknown, None),
+            };
+            seen.push(Seen {
+                npub,
+                pin,
+                head,
+                cursor,
+                urgency: Urgency::Normal,
+                pane: state,
+                bind,
+            });
+        }
+        Observation {
+            seen,
+            herdr_restarted,
+        }
+    }
+
+    fn reverify(&mut self, npub: &str) -> Option<Bind> {
+        let pin = self.pin_of_npub(npub);
+        let registry = crate::state::load_spawn_registry(&self.project);
+        let e = registry
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))?;
+        let client = self.client()?;
+        let p = client
+            .pane_list(None)
+            .ok()?
+            .into_iter()
+            .find(|p| p.pane_id == e.pane_id)?;
+        Some(verify_tokens(&p.tokens, &pin, npub, &p.pane_id, &p.workspace_id))
+    }
+
+    fn ring(&mut self, _npub: &str, pane_id: &str, wm: u64, line: &str) -> Result<(), String> {
+        use crate::pane_write::{PaneWrite, Urgency as U, Wm};
+        let w = PaneWrite::WakeLine {
+            wm: Wm(wm),
+            urgency: U::Normal,
+        };
+        // The fold names the line; the sink renders it. They must agree, or
+        // something other than the wake line is about to reach a pane.
+        if crate::pane_write::wake_line(Wm(wm), U::Normal) != line {
+            return Err("fold line differs from the pane sink's wake line".into());
+        }
+        let client = self.client().ok_or("herdr unreachable")?;
+        crate::pane_write::write(&crate::pane_write::HerdrPanes(&client), pane_id, &w)
+            .map_err(|e| e.to_string())
+    }
+
+    fn fact(&mut self, key: &str, mut fact: Value) -> Result<(), String> {
+        if self.facts_seen.contains(key) {
+            return Ok(());
+        }
+        if let Some(o) = fact.as_object_mut() {
+            o.insert("key".into(), json!(key));
+            o.insert("workspace".into(), json!(self.workspace));
+            o.insert("ts".into(), json!(chrono::Utc::now().to_rfc3339()));
+        }
+        let path = self.facts_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        writeln!(f, "{fact}").map_err(|e| e.to_string())?;
+        self.facts_seen.insert(key.to_string());
+        Ok(())
+    }
+
+    fn notify_supervisor(&mut self, npub: &str, wm: u64, cause: DeafCause) -> Result<(), String> {
+        let key = format!("deaf-supervisor:{npub}:{wm}");
+        if self.facts_seen.contains(&key) {
+            return Ok(());
+        }
+        let who = self.pin_of_npub(npub);
+        let Some(sup) = self.role_pin(&["supervisor", "lead"]) else {
+            return Err("no supervisor, lead or captain pin bound".into());
+        };
+        self.notify_pin(&sup, deaf_text(&who, wm, cause), &key)?;
+        self.fact(&key, json!({"kind": "notified", "to": sup, "role": "supervisor"}))
+    }
+
+    fn notify_captain(&mut self, npub: &str, wm: u64, cause: DeafCause) -> Result<(), String> {
+        let key = format!("deaf-captain:{npub}:{wm}");
+        if self.facts_seen.contains(&key) {
+            return Ok(());
+        }
+        let who = self.pin_of_npub(npub);
+        let text = deaf_text(&who, wm, cause);
+        // The loud, unconditional leg: the captain surface herdr offers us
+        // is a pane, and that is the inbox wake; this line is for the log.
+        eprintln!("flywheel inbox: CAPTAIN: {text}");
+        let Some(cap) = crate::state::load_captain_alias(&self.project) else {
+            return self.fact(&key, json!({"kind": "notified", "to": null, "role": "captain"}));
+        };
+        self.notify_pin(&cap, text, &key)?;
+        self.fact(&key, json!({"kind": "notified", "to": cap, "role": "captain"}))
+    }
+}
