@@ -741,24 +741,36 @@ pub fn ensure_running(
     // registration via API lands in bd-asr2.8; until then this is a loud
     // attach with no local writer. Stop local dispatchers before enabling
     // the daemon host (`flywheel kill`), else both ring (Phase 3 ends this).
-    let cfg_url = crate::config::Config::load()
-        .ok()
-        .and_then(|c| c.doorbell_url());
+    let loaded = crate::config::Config::load().ok();
+    // Comms flag: the pane writer is the inbox host inside THIS loop (wake
+    // line, real watermark). A daemon host does not run it, so deferring to
+    // one would leave the workspace with no writer: run the local loop.
+    let comms_on = loaded.as_ref().is_some_and(crate::comms_send::enabled)
+        || toron_core::inbox::enabled();
+    if comms_on {
+        eprintln!(
+            "flywheel doorbell: comms flag on — the local loop hosts the inbox wake (no deference to a daemon)"
+        );
+    }
+    let cfg_url = loaded.and_then(|c| c.doorbell_url());
     // bd-0gmw: a configured daemon that is down gets one pidfile-mode
     // bring-up attempt (never launchctl bootstrap — persistence stays
     // opt-in via `doorbell install`) before host resolution degrades us.
     // Attached/Started → resolve_host below sees /health and defers;
     // Degraded → fall through, embedded as today.
-    if cfg_url.is_some()
+    if !comms_on
+        && cfg_url.is_some()
         && let crate::daemon::DoorbellEnsure::Degraded { hint } =
             crate::daemon::ensure_doorbell_spawn()
     {
         eprintln!("flywheel doorbell: {hint}");
     }
-    if matches!(
-        resolve_host(state_dir, cfg_url, Some((project, workspace))),
-        DoorbellHost::Proxy { .. }
-    ) {
+    if !comms_on
+        && matches!(
+            resolve_host(state_dir, cfg_url, Some((project, workspace))),
+            DoorbellHost::Proxy { .. }
+        )
+    {
         eprintln!(
             "flywheel doorbell: daemon host alive — attached, local loop suppressed (deference)"
         );

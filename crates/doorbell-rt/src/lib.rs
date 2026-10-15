@@ -40,7 +40,10 @@ pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_
 pub use msg::{AskKind, AskReply, BrainMsg, deliver_died_blocking};
 pub use policy::{RestartPolicy, WatchRetry};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
-pub use sinks::{CliPromptSink, MockSink, PromptSink, SendOutcome, SinkManager, Undelivered};
+pub use sinks::{
+    CliPromptSink, MockSink, NoTextSink, PromptSink, SendOutcome, SinkManager, Undelivered,
+    comms_inbox_env,
+};
 pub use store::{FileStore, Fold, TornTail};
 pub use subscribe::{
     Actor, Budget, Filter, Identity, Refusal, Scope, SinkKind, Subscription, SubscriptionStore,

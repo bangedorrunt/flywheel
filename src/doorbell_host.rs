@@ -67,34 +67,6 @@ impl doorbell_rt::PromptSink for HerdrPromptSink {
     }
 }
 
-/// Flag-on brain sink (`TORON_COMMS_INBOX=1` or `[comms] inbox_log = true`).
-/// Under the flag the pane is written by exactly one thing: the inbox host
-/// ([`crate::inbox_host`]), which types the constant wake line for the real
-/// log watermark through the closed `PaneWrite` sink. Whatever text the legacy
-/// brain composes is DROPPED here (counted, never typed, never queued to a
-/// RAM digest because the delivery reports success), so the brain can
-/// neither type a payload nor accumulate one.
-pub struct NoTextSink {
-    dropped: u64,
-}
-
-impl NoTextSink {
-    pub fn new() -> Self {
-        Self { dropped: 0 }
-    }
-}
-
-impl doorbell_rt::PromptSink for NoTextSink {
-    fn send(&mut self, _pin: &str, _line: &str) -> Result<(), doorbell_rt::RtError> {
-        self.dropped += 1;
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "inbox-no-text"
-    }
-}
-
 /// The embedded host: owns the reducer model and every flywheel-shaped
 /// capability the brain orchestrates.
 pub struct RtHost {
@@ -967,8 +939,8 @@ async fn run_embedded_async(
     if crate::comms_send::enabled(&cfg) {
         // Phase 3: the inbox host owns every pane write (wake line only, the
         // real log watermark); the brain's text is dropped.
-        sinks.add_sink_with_factory("herdr", Box::new(NoTextSink::new()), || {
-            Box::new(NoTextSink::new())
+        sinks.add_sink_with_factory("herdr", Box::new(doorbell_rt::NoTextSink::new()), || {
+            Box::new(doorbell_rt::NoTextSink::new())
         });
         _inbox_guard = Some(crate::inbox_host::InboxHost::spawn(
             crate::inbox_ports::FlywheelPorts::new(&cfg, project, workspace),
@@ -1620,16 +1592,6 @@ mod events_lost_tests {
 #[cfg(test)]
 mod inbox_flag_tests {
     use super::*;
-    use doorbell_rt::PromptSink;
-
-    #[test]
-    fn the_no_text_sink_drops_what_the_brain_composes() {
-        let mut s = NoTextSink::new();
-        s.send("TealBirch", "BRAIN PAYLOAD: do the thing").unwrap();
-        s.send("TealBirch", "again").unwrap();
-        assert_eq!(s.dropped, 2);
-        assert_eq!(s.name(), "inbox-no-text");
-    }
 
     #[test]
     fn the_flag_arm_registers_no_text_sink_and_starts_the_inbox_host() {
@@ -1637,7 +1599,7 @@ mod inbox_flag_tests {
         let a = src.find("if crate::comms_send::enabled(&cfg) {").unwrap();
         let tail = &src[a..a + 1100];
         let flag_arm = &tail[..tail.find("} else {").unwrap()];
-        assert!(flag_arm.contains("NoTextSink::new()"));
+        assert!(flag_arm.contains("doorbell_rt::NoTextSink::new()"));
         assert!(flag_arm.contains("InboxHost::spawn("));
         assert!(!flag_arm.contains("HerdrPromptSink"), "no legacy sink under the flag");
         assert!(tail.find("} else {").unwrap() < tail.find("HerdrPromptSink::new(").unwrap());
