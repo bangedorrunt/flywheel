@@ -46,7 +46,6 @@ pub enum Harness {
     Other,
 }
 
-#[allow(dead_code)]
 impl Harness {
     /// Map a herdr agent kind (`pi`, `opencode`, `claude`, ...) to a harness.
     pub fn from_kind(kind: &str) -> Self {
@@ -146,6 +145,71 @@ impl PaneTyper for HerdrPanes<'_> {
     }
 }
 
+/// herdr as the pane boundary for a SPAWN-time write: the agent has just
+/// started, so `agent.prompt` may still be gated. Falls back to
+/// `pane.send_text` + settle + Enter (retried; Enter alone is retried once the
+/// text has landed, the text is never re-typed). Same boot semantics as the
+/// legacy prime, but reachable only with a closed [`PaneWrite`].
+pub struct BootPanes<'a>(pub &'a crate::herdr_shim::Client);
+
+impl PaneTyper for BootPanes<'_> {
+    fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
+        if self.0.agent_prompt(target, line, None).is_ok() {
+            return Ok(());
+        }
+        let policy = crate::retry::RetryPolicy {
+            max_attempts: 3,
+            base: std::time::Duration::from_secs(2),
+            cap: std::time::Duration::from_secs(5),
+        };
+        policy
+            .retry_with_backoff(
+                || self.0.pane_send_text(target, line),
+                |_| true,
+                |attempt, e| eprintln!("flywheel: warn: bootstrap send_text attempt {attempt} failed for {target}: {e:#} — retrying"),
+                std::thread::sleep,
+            )
+            .map_err(|e| anyhow::anyhow!("herdr pane.send_text {target}: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        policy
+            .retry_with_backoff(
+                || self.0.pane_send_input(target, &["Enter"]),
+                |_| true,
+                |attempt, e| eprintln!("flywheel: warn: bootstrap Enter attempt {attempt} failed for {target}: {e:#} — retrying Enter only"),
+                std::thread::sleep,
+            )
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("herdr pane.send_input {target}: {e}"))
+    }
+    fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
+        HerdrPanes(self.0).keys(target, keys)
+    }
+    fn close(&self, pane_id: &str) -> anyhow::Result<()> {
+        HerdrPanes(self.0).close(pane_id)
+    }
+}
+
+/// Spawn-time bootstrap: type the per-harness [`PaneWrite::LaunchBootstrap`]
+/// constant into a fresh pane. Best-effort like the legacy prime (a failed
+/// bootstrap warns, never fails the spawn); returns whether it landed.
+pub fn launch_bootstrap_into(
+    c: &crate::herdr_shim::Client,
+    pane_id: &str,
+    harness: Harness,
+) -> bool {
+    match write(
+        &BootPanes(c),
+        pane_id,
+        &PaneWrite::LaunchBootstrap { harness },
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("flywheel: warn: launch bootstrap into {pane_id} failed: {e:#}");
+            false
+        }
+    }
+}
+
 /// The sink: perform one write. The only way flywheel's comms path touches
 /// a pane.
 pub fn write(t: &dyn PaneTyper, target: &str, w: &PaneWrite) -> anyhow::Result<()> {
@@ -162,6 +226,13 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
     ".agent_prompt_coded(",
     ".pane_send_text(",
     "\"agent\", \"prompt\"",
+    // Phase 3 extension: the Enter/keys half of a typed line and the raw
+    // wire method names, so a payload cannot be typed around the sink by
+    // calling the lower primitive. Legacy counts below include these.
+    ".pane_send_input(",
+    "\"pane.send_text\"",
+    "\"pane.send_input\"",
+    "\"agent.prompt\"",
 ];
 
 /// Legacy call sites that still type text, frozen at their Phase 2 count.
@@ -172,7 +243,7 @@ pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
     ("crates/doorbell-rt/src/sinks.rs", 1),
     ("src/cmd/doorbell.rs", 1),
     ("src/herdr_shim.rs", 1),
-    ("src/main.rs", 8),
+    ("src/main.rs", 10),
 ];
 
 /// The file allowed to type into panes.
@@ -330,6 +401,30 @@ mod tests {
                 "{path}: lower the frozen count"
             );
         }
+    }
+
+    /// Phase 3 extension negative control: the lower primitives (Enter /
+    /// raw wire names) are fenced too, in the doorbell host and anywhere new.
+    #[test]
+    fn the_extended_fence_catches_the_lower_primitives() {
+        for bad in [
+            "c.pane_send_input(p, &[\"Enter\"]);",
+            "call(\"pane.send_text\", json!({}));",
+            "call(\"pane.send_input\", json!({}));",
+            "call(\"agent.prompt\", json!({}));",
+        ] {
+            let files = vec![(
+                "src/doorbell_host.rs".to_string(),
+                format!("fn f() {{ {bad} }}"),
+            )];
+            assert_eq!(fence_violations(&files).len(), 1, "{bad}");
+        }
+        // and a comment mentioning them is fine
+        let ok = vec![(
+            "src/doorbell_host.rs".to_string(),
+            "// pane.send_text\n".to_string(),
+        )];
+        assert!(fence_violations(&ok).is_empty());
     }
 
     /// Negative control: a fixture tree with a payload typed outside the
