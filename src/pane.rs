@@ -4896,6 +4896,12 @@ mod approval_drainer_off_runtime_tests {
     const PROJECT: &str = "comms-p0-erbo-fixture";
     const APPROVER: &str = "ErboApprover";
     const DRAINER: &str = "ErboDrainer";
+    // ADR-0037 W2: a pin holds ONE key across every project of the shared
+    // per-process test store, so the drainer-scan test (its own per-run
+    // project) registers its OWN pins instead of re-registering
+    // ErboApprover/ErboDrainer in a second project (W2 refuses that).
+    const SCAN_APPROVER: &str = "ErboScanApprover";
+    const SCAN_DRAINER: &str = "ErboScanDrainer";
 
     fn approval_workflow() -> toron_workflow::schema::Workflow {
         toron_workflow::schema::parse_workflow(
@@ -4912,12 +4918,12 @@ steps:
 
     /// The in-process facade (no `[mail.toron] url`) with both fixture pins
     /// registered. Built OUTSIDE any runtime, as a CLI caller would.
-    fn in_process_mail(project: &str) -> crate::mail_shim::Mail {
+    fn in_process_mail(project: &str, pins: [&str; 2]) -> crate::mail_shim::Mail {
         let mail = crate::mail_shim::Mail::from_config(None)
             .expect("mail config")
             .expect("in-process facade");
         mail.ensure_project(project).expect("fixture project");
-        for pin in [APPROVER, DRAINER] {
+        for pin in pins {
             mail.register_agent(project, pin, "fixture", "fixture", "erbo fixture")
                 .expect("register fixture pin");
         }
@@ -4949,7 +4955,7 @@ steps:
     /// and the bridge can be revisited.
     #[test]
     fn inline_in_process_inbox_panics_inside_the_drainer_runtime() {
-        let mail = in_process_mail(PROJECT);
+        let mail = in_process_mail(PROJECT, [APPROVER, DRAINER]);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4982,7 +4988,7 @@ steps:
             "{PROJECT}-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
-        let mail = in_process_mail(&project);
+        let mail = in_process_mail(&project, [SCAN_APPROVER, SCAN_DRAINER]);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -5021,13 +5027,13 @@ steps:
 
             // The captain's decision mail (what `flywheel workflow approve`
             // sends), delivered on the in-process plane.
-            let sender_mail = mail.clone().with_name(APPROVER.to_string());
+            let sender_mail = mail.clone().with_name(SCAN_APPROVER.to_string());
             let subject = format!("approve:{promise_id}");
             let send_project = project.clone();
             crate::backend::run_mail_off_runtime(move || {
                 sender_mail.send(
                     &send_project,
-                    &[DRAINER.to_string()],
+                    &[SCAN_DRAINER.to_string()],
                     &subject,
                     "erbo fixture decision",
                     "normal",
@@ -5050,7 +5056,7 @@ steps:
                     signoff_clear: Arc::new(|| false),
                     inbox: Some(Arc::new(move || -> anyhow::Result<Value> {
                         scans.fetch_add(1, Ordering::SeqCst);
-                        let page = mail.inbox(&project, DRAINER, false, 25);
+                        let page = mail.inbox(&project, SCAN_DRAINER, false, 25);
                         *last_page.lock().unwrap() = match &page {
                             Ok(v) => format!(
                                 "{} row(s), subjects {:?}",
