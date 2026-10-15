@@ -1286,7 +1286,15 @@ mod tests {
                 persona: None,
                 task_description: None,
             };
-            async move { mailbox.register_agent("demo", &profile).await }
+            async move {
+                mailbox.register_agent("demo", &profile).await?;
+                // ADR-0037 W2: the workflow actor pin (`flywheel`) already
+                // holds a key in other projects of this shared test store;
+                // register it here by reusing that key (proof of possession)
+                // so the runner finds it on the roster instead of minting.
+                let actor = toron_core::nostr::identity::AgentProfile::new("flywheel");
+                crate::mail_shim::fixture_register_async(&mailbox, "demo", &actor).await
+            }
         })
         .expect("register the recipient");
         drop(mailbox);
