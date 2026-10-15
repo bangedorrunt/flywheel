@@ -433,14 +433,14 @@ pub(crate) fn cmd_doorbell_status(cfg: &Config, project: &str) -> Result<()> {
     Ok(())
 }
 
-/// mcc9: ` wake_brain=dropped:N,full:M,backpressured:B,resumed:R` from the
+/// mcc9: ` wake_brain=dropped:N,full:M,backpressured:B,resumed:R,lost:L` from the
 /// host's snapshot, or ` wake_brain=unmeasured` when no host wrote one (never
 /// a fabricated zero).
 fn wake_brain_status_segment(snap: Option<doorbell_rt::wake_brain::WakeBrainSnapshot>) -> String {
     match snap {
         Some(s) => format!(
-            " wake_brain=dropped:{},full:{},backpressured:{},resumed:{}",
-            s.dropped, s.wake_brain_full, s.backpressured, s.resumed
+            " wake_brain=dropped:{},full:{},backpressured:{},resumed:{},lost:{}",
+            s.dropped, s.wake_brain_full, s.backpressured, s.resumed, s.events_lost
         ),
         None => " wake_brain=unmeasured".to_string(),
     }
@@ -460,15 +460,16 @@ mod wake_brain_status_tests {
             wake_brain_full: 1,
             backpressured: 0,
             resumed: 1,
+            events_lost: 7,
             ..WakeBrainSnapshot::default()
         };
         assert_eq!(
             wake_brain_status_segment(Some(flooded)),
-            " wake_brain=dropped:499,full:1,backpressured:0,resumed:1"
+            " wake_brain=dropped:499,full:1,backpressured:0,resumed:1,lost:7"
         );
         assert_eq!(
             wake_brain_status_segment(Some(WakeBrainSnapshot::default())),
-            " wake_brain=dropped:0,full:0,backpressured:0,resumed:0"
+            " wake_brain=dropped:0,full:0,backpressured:0,resumed:0,lost:0"
         );
         assert_eq!(wake_brain_status_segment(None), " wake_brain=unmeasured");
     }

@@ -31,6 +31,14 @@ pub enum WakeOutcome {
     Watch(String),
     /// Quiet-bus heartbeat: touch watchbeat, emit nothing.
     Heartbeat,
+    /// toron#17 `events_lost`: stored events after our cursor were evicted
+    /// before we read them. `from`/`through` are the server's OPAQUE cursor
+    /// strings, passed through verbatim (never parsed). The consumer keeps
+    /// going; the host counts the gap and surfaces it.
+    EventsLost {
+        from: String,
+        through: String,
+    },
     Died,
 }
 
@@ -47,6 +55,10 @@ pub const AUDIT_SOCK_HANDSHAKE: &str = "wake_sock_handshake";
 /// ending, so it is the only one whose rate the brain's restart backoff never
 /// bounds — and until now the only one that wrote no row at all.
 pub const AUDIT_SOCK_SHED: &str = "wake_sock_shed";
+/// toron#17: the sidecar said events were lost (cap eviction) between our
+/// cursor and what it still stores. One row per frame, never sampled: a gap
+/// is rare and every one is a loss an operator must be able to find.
+pub const AUDIT_SOCK_EVENTS_LOST: &str = "wake_sock_events_lost";
 
 /// Floor between resync reconnects. A shed is lossless and non-fatal by design,
 /// so it does not end the consumer and does not reach the backoff that every
@@ -197,6 +209,11 @@ pub enum FrameAction {
     Heartbeat,
     Eose,
     Shed(String),
+    /// toron#17 gap frame; opaque cursors, verbatim.
+    EventsLost {
+        from: String,
+        through: String,
+    },
 }
 
 pub fn frame_action(line: &str) -> Result<FrameAction, String> {
@@ -225,6 +242,20 @@ pub fn frame_action(line: &str) -> Result<FrameAction, String> {
             .and_then(|c| c.as_str())
             .ok_or_else(|| "shed without resync_from".to_string())?;
         return Ok(FrameAction::Shed(from.to_string()));
+    }
+    if let Some(b) = v.get("events_lost") {
+        // A gap frame is a loss signal even when malformed: count it with
+        // `unknown` rather than dropping it into the unknown-frame audit.
+        let field = |name: &str| {
+            b.get(name)
+                .and_then(|c| c.as_str())
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        return Ok(FrameAction::EventsLost {
+            from: field("from"),
+            through: field("through"),
+        });
     }
     Err("unknown wake frame".to_string())
 }
@@ -367,6 +398,7 @@ async fn run_wake_loop(
     // Resyncs this loop has performed. Counted across reconnects so the audit
     // rows read as a rate (1, 2, 3 ...) rather than N unrelated blips.
     let mut resyncs: u64 = 0;
+    let mut lost_frames: u64 = 0;
     loop {
         if resyncs > 0 {
             tokio::time::sleep(opts.resync_floor).await;
@@ -450,6 +482,21 @@ async fn run_wake_loop(
                     Ok(FrameAction::Watch(w)) => send(WakeOutcome::Watch(w)),
                     Ok(FrameAction::Heartbeat) => send(WakeOutcome::Heartbeat),
                     Ok(FrameAction::Eose) => {}
+                    Ok(FrameAction::EventsLost { from, through }) => {
+                        // Not a reconnect: the sidecar keeps serving what it
+                        // still stores. Surface the gap, count it, go on.
+                        lost_frames += 1;
+                        audit(
+                            AUDIT_SOCK_EVENTS_LOST,
+                            serde_json::json!({
+                                "from": from,
+                                "through": through,
+                                "lost_index": lost_frames,
+                                "reason": "sidecar evicted stored events after our cursor before we read them",
+                            }),
+                        );
+                        send(WakeOutcome::EventsLost { from, through });
+                    }
                     Ok(FrameAction::Shed(from)) => {
                         // Lossless, not silent: the cursor makes the resync
                         // correct, this row makes it visible, and the floor at
@@ -880,6 +927,101 @@ mod tests {
             vec![Some(1), Some(2), Some(3)],
             "the rows must count the resyncs, so a loop reads as a rate instead of N \
              unrelated blips: {sheds:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn events_lost_is_a_loss_frame_with_opaque_cursors_never_an_unknown_frame() {
+        match frame_action(r#"{"events_lost":{"from":"seq:12","through":"seq:97"}}"#) {
+            Ok(FrameAction::EventsLost { from, through }) => {
+                assert_eq!((from.as_str(), through.as_str()), ("seq:12", "seq:97"));
+            }
+            other => panic!("expected EventsLost, got {other:?}"),
+        }
+        // `unknown` (the sidecar no longer knows our cursor) passes through.
+        assert!(matches!(
+            frame_action(r#"{"events_lost":{"from":"1:ab","through":"unknown"}}"#),
+            Ok(FrameAction::EventsLost { through, .. }) if through == "unknown"
+        ));
+        // A malformed gap frame is still a loss, counted as `unknown`.
+        assert!(matches!(
+            frame_action(r#"{"events_lost":{}}"#),
+            Ok(FrameAction::EventsLost { from, through }) if from == "unknown" && through == "unknown"
+        ));
+        // A genuinely unknown frame is still the loud error.
+        assert!(frame_action(r#"{"mystery":{}}"#).is_err());
+    }
+
+    /// toron#17 end to end on the consumer: the gap frame is audited with
+    /// the server's cursors verbatim, surfaces as an outcome IN ORDER (before
+    /// the events the sidecar still had), and is not a death or a resync.
+    #[tokio::test]
+    async fn an_events_lost_frame_is_audited_surfaced_in_order_and_not_a_death() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let path = std::env::temp_dir().join(format!("wake-lost-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        tokio::spawn(async move {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 1024];
+            let _ = s.read(&mut buf).await;
+            let frames = concat!(
+                "{\"events_lost\":{\"from\":\"seq:12\",\"through\":\"seq:97\"}}\n",
+                "{\"event\":{\"kind\":9,\"id\":\"e1\",\"pubkey\":\"p\",\"content\":\"c\",\"tags\":[],\"created_at\":3}}\n",
+                "{\"eose\":{\"cursor\":\"seq:98\"}}\n",
+            );
+            let _ = s.write_all(frames.as_bytes()).await;
+        });
+        let opts = WakeOpts {
+            sock_path: path.clone(),
+            kinds: vec![9],
+            project: None,
+            handshake_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(2),
+            resync_floor: Duration::from_millis(10),
+            retired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_from: Some("seq:12".to_string()),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let audit = std::sync::Arc::new(move |k: &str, d: serde_json::Value| {
+            sink.lock().expect("audit lock").push((k.to_string(), d));
+        });
+        run_wake_loop(opts, &tx, &audit).await;
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(o) = rx.recv().await {
+            got.push(o);
+        }
+        assert!(
+            matches!(&got[0], WakeOutcome::EventsLost { from, through }
+                if from == "seq:12" && through == "seq:97"),
+            "the gap comes first, verbatim: {got:?}"
+        );
+        assert!(
+            matches!(&got[1], WakeOutcome::Watch(_)),
+            "then the event: {got:?}"
+        );
+        let rows = seen.lock().expect("audit lock");
+        let lost: Vec<_> = rows
+            .iter()
+            .filter(|(k, _)| k == AUDIT_SOCK_EVENTS_LOST)
+            .collect();
+        assert_eq!(lost.len(), 1, "one row per gap frame");
+        assert_eq!(lost[0].1["from"], "seq:12");
+        assert_eq!(lost[0].1["through"], "seq:97");
+        assert!(
+            !rows.iter().any(|(k, _)| k == AUDIT_SOCK_FRAME),
+            "not an unknown frame"
+        );
+        assert!(
+            !rows.iter().any(|(k, _)| k == AUDIT_SOCK_SHED),
+            "not a resync"
         );
         let _ = std::fs::remove_file(&path);
     }

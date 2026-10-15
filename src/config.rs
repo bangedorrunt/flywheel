@@ -242,6 +242,16 @@ pub struct Config {
     /// ADR-0011 D2: operator-owned pane cap. Repo `.flywheel/` must not raise it.
     #[serde(default)]
     pub crew: Option<CrewBudgetConfig>,
+    /// `[comms]` (ADR-0041, build-plan §5): `inbox_log = true` turns on the
+    /// comms inbox send path, the config twin of `TORON_COMMS_INBOX=1`.
+    #[serde(default)]
+    pub comms: Option<CommsSection>,
+}
+
+/// `[comms] inbox_log = true` (Phase 2 opt-in flag).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommsSection {
+    pub inbox_log: Option<bool>,
 }
 
 /// `[crew] max = 5` in operator config (ADR-0011 D2).
