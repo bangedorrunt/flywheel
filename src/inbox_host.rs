@@ -781,6 +781,26 @@ mod tests {
     }
 
     #[test]
+    fn a_ring_for_a_generation_the_fold_has_invalidated_is_dropped_at_the_boundary() {
+        let f = Fake::default();
+        let mut core = Core::default();
+        core.model.generation = 1;
+        let mut p = f.clone();
+        let mut rep = RoundReport::default();
+        let stale = InboxCmd::Ring {
+            recipient: R.into(),
+            pane_id: "w1:p1".into(),
+            herdr_session: "w1".into(),
+            binding_gen: 0,
+            wm: 2,
+            line: wake_line(2),
+        };
+        execute(&mut core, &mut p, vec![stale], &mut rep);
+        assert!(f.0.lock().unwrap().rings.is_empty(), "nothing typed for a stale gen");
+        assert_eq!((rep.rings, rep.failed), (0, 1));
+    }
+
+    #[test]
     fn the_host_thread_is_dedicated_and_outside_any_runtime() {
         #[derive(Clone)]
         struct Probe(Fake, Arc<Mutex<Vec<(String, bool)>>>);
