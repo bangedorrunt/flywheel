@@ -637,6 +637,9 @@ mod tests {
 
     #[test]
     fn an_unanswered_message_rings_exactly_max_rings_then_goes_deaf_once() {
+        // The budget is toron's (`toron_core::wake`); the live fixture and the
+        // docs assume 5. A change there must be a decision here, not a drift.
+        assert_eq!(MAX_RINGS, 5, "toron changed the ring budget");
         let f = Fake::default();
         set(&f, seen(4, 0, true));
         let mut core = Core::default();
@@ -842,6 +845,8 @@ mod tests {
         assert!(!body.contains("wake_line("), "the host never builds the line");
         let ports = include_str!("inbox_ports.rs");
         assert_eq!(ports.matches("pane_write::write(").count(), 1);
+        // the sink's rendering must equal the fold's line, or nothing is typed
+        assert!(ports.contains("!= line"), "ring compares the fold's line");
         assert!(!ports.contains("new work"));
         // (spelled in pieces: the pane-text fence scans this file too)
         let (a, b) = (concat!(".agent_", "prompt("), concat!(".pane_send_", "text("));
