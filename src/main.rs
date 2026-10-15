@@ -6044,7 +6044,11 @@ mod workspace_origin_tests {
         let src = include_str!("main.rs");
         let call_lines =
             |p: &str| src.lines().filter(|l| l.trim_start().starts_with(p)).count();
-        assert_eq!(call_lines("prime_bootstrap("), 3, "spawn + add + re-launch");
+        assert_eq!(
+            call_lines("prime_bootstrap("),
+            4,
+            "spawn (peer arm + plain arm) + add + re-launch"
+        );
         assert_eq!(
             call_lines("prime_via_send_text("),
             0,
@@ -9566,6 +9570,11 @@ projects available: {}",
             if has_peer_prime {
                 // The peer template is its own prime — typed, never stacked.
                 prime_line_via_send_text(&mut c, &pane_id, &peer_args[0]);
+                // Phase 3 (flag on): the pane still needs the pull contract,
+                // so the per-harness LaunchBootstrap follows the template.
+                if comms_inbox_on() {
+                    prime_bootstrap(&mut c, &pane_id, &kind);
+                }
             } else {
                 // Identity first (mail identity + guard note), then the boot
                 // ready check (code-pointer gate keeps the boot-prime call).
