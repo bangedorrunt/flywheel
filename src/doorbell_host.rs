@@ -1598,6 +1598,41 @@ mod off_runtime_tests {
         });
     }
 
+    /// Remote-daemon mail: the index build asks `whois` per registered pin
+    /// through `backend::run_mail` (a `block_on`). Inline inside a runtime
+    /// that panics, so it must go off the runtime. (The daemon is
+    /// unreachable here; the failure is swallowed, only the nesting matters.)
+    #[test]
+    fn build_index_with_remote_mail_does_not_nest_block_on_inside_a_runtime() {
+        let _home = crate::config::test_state_home();
+        let proj_dir = std::env::temp_dir().join(format!("offrt-idx-{}", std::process::id()));
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let project = proj_dir.to_string_lossy().into_owned();
+        let key = crate::state::spawn_registry_key(&project);
+        let agents = config::state_dir().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join(format!("{key}.json")),
+            serde_json::json!([{"pane_id": "p1", "name": "h1", "mail_identity": "PinA"}])
+                .to_string(),
+        )
+        .unwrap();
+        let cfg = Config {
+            mail: Some(crate::config::MailSections {
+                toron: Some(crate::config::MailServerConfig {
+                    url: Some("http://127.0.0.1:9/mcp".into()),
+                    token: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()));
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let _ = build_index(&cfg, &project);
+        });
+    }
+
     /// The whole embedded loop starts with in-process mail and stays up:
     /// host construction (index), bus watch arming and the brain run all
     /// happen inside its runtime. A crash at start ends the thread.
