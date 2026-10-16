@@ -45,6 +45,8 @@ mod doorbell;
 mod doorbell_host;
 mod inbox_host;
 mod inbox_ports;
+mod supervisor_program;
+mod supervisor_host;
 mod doorbell_tick;
 mod durable;
 mod durable_policy;
@@ -1143,6 +1145,13 @@ enum Commands {
     Captain {
         #[command(subcommand)]
         cmd: CaptainCmd,
+    },
+    /// Supervisor facts and steers (Phase 4a; `TORON_COMMS_INBOX` on):
+    /// crews report `progress|done|exit`, the operator steers
+    /// `redirect|pause|resume|cancel`, `view` prints the CrewView.
+    Supervisor {
+        #[command(subcommand)]
+        cmd: supervisor_host::SupervisorCmd,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -3008,6 +3017,7 @@ fn main() {
         }) => cmd_interrupt(&cfg, project, to, keys, *force),
         Some(Commands::Crew { cmd }) => cmd_crew(&cfg, cmd),
         Some(Commands::Captain { cmd }) => cmd_captain(&cfg, cmd),
+        Some(Commands::Supervisor { cmd }) => supervisor_host::run_cli(cmd),
         Some(Commands::View {
             project,
             to,
@@ -22540,6 +22550,12 @@ fn cmd_loop_supervise(
 ) -> Result<()> {
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
+    }
+    // Phase 4a: under the comms flag the same cadence runs on
+    // SupervisorProgram (MaxR/MaxT instead of "3 failed passes"). Flag off:
+    // the legacy loop below, unchanged.
+    if comms_send::enabled(cfg) {
+        return supervisor_host::run_supervise(cfg, project, work, interval_secs, to, stall_minutes);
     }
     let exe = std::env::current_exe().context("resolve the flywheel executable")?;
     let project_dir = crate::project_dir(cfg, project);
