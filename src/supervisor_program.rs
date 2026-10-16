@@ -157,8 +157,11 @@ pub enum ChildState {
     NeedsRestart,
     /// Ended normally (`Done`). Final.
     Done,
-    /// Cancelled by a steer or a subtree cancel. Final.
+    /// Cancelled by a steer. Final.
     Cancelled,
+    /// Stopped by a subtree cancel (restart intensity exceeded). Final for
+    /// this incarnation; the next incarnation re-adopts it from the registry.
+    Halted,
     /// Poison ceiling reached. Final until an operator acts.
     Parked,
     /// Ended and not restarted (temporary). Final.
@@ -673,7 +676,7 @@ fn fail_subtree(next: &mut SupModel, cmds: &mut Vec<SupCmd>, reason: &str, who: 
         let Some(c) = next.children.get_mut(&id) else {
             continue;
         };
-        c.state = ChildState::Cancelled;
+        c.state = ChildState::Halted;
         if id != PASS {
             cmds.push(SupCmd::Exit {
                 child: id.clone(),
@@ -828,6 +831,16 @@ impl Program for SupervisorProgram {
                         next.status = Status::Superseded;
                     } else if next.status == Status::Superseded {
                         next.status = Status::Running;
+                    } else if next.status == Status::Failed {
+                        // D6: a new host incarnation (its own accepted
+                        // claim) starts the intensity window over. The
+                        // escalation fact stays (`escalations`, the
+                        // `Escalate` command already issued). Crews the
+                        // failure halted are dropped so the registry
+                        // re-adopts them; an operator's steer cancel stays.
+                        next.status = Status::Running;
+                        next.restarts.clear();
+                        next.children.retain(|_, c| c.state != ChildState::Halted);
                     }
                 }
             }
@@ -1329,6 +1342,57 @@ mod tests {
         assert_eq!(escalations(&c), 1);
         assert_eq!(m.status, Status::Failed);
         assert!(m.children.values().all(|c| !c.state.live()), "subtree cancelled");
+    }
+
+    fn failed() -> SupModel {
+        let mut m = base();
+        for (i, id) in ["a", "b", "a"].into_iter().enumerate() {
+            m = crash_and_relaunch(m, id, 1_000 + i as u64 * 1_000).0;
+        }
+        let (m, c) = step(&m, &exit("b", 5_000));
+        assert_eq!(escalations(&c), 1);
+        assert_eq!(m.status, Status::Failed);
+        m
+    }
+
+    fn claim(holder: &str, e: u64) -> SupMsg {
+        SupMsg::Claim { holder: holder.into(), sup_epoch: e }
+    }
+
+    #[test]
+    fn an_own_claim_after_failure_is_a_fresh_incarnation_keeping_the_escalation() {
+        let m = failed();
+        let (r, c) = step(&m, &claim(ME, 3));
+        assert_eq!(r.status, Status::Running);
+        assert!(c.is_empty(), "the reset itself asks for nothing");
+        assert!(r.restarts.is_empty());
+        assert_eq!(r.escalations, 1, "the escalation fact is kept");
+        assert!(r.children.is_empty(), "halted children are re-adopted from the registry");
+        // Re-adopted, it supervises again from a clean budget.
+        let mut r = step(&r, &SupMsg::Spawn { spec: spec("a"), now_ms: 9_000 }).0;
+        let (r, c) = step(&r, &exit("a", 9_100));
+        assert_eq!(relaunches(&c).len(), 1);
+        assert_eq!(r.status, Status::Running);
+    }
+
+    #[test]
+    fn only_the_hosts_own_accepted_claim_resets_a_failure() {
+        let m = failed();
+        let (s, _) = step(&m, &claim(ME, 2));
+        assert_eq!(s.status, Status::Failed, "a rejected (stale) own claim resets nothing");
+        let (s, _) = step(&m, &claim("other", 3));
+        assert_eq!(s.status, Status::Superseded, "a foreign claim supersedes, it does not reset");
+    }
+
+    #[test]
+    fn an_operator_cancel_survives_a_new_incarnation() {
+        let mut m = failed();
+        let mut gone = m.children["a"].clone();
+        gone.state = ChildState::Cancelled;
+        m.children.insert("c".into(), gone);
+        let (r, _) = step(&m, &claim(ME, 3));
+        assert_eq!(r.children["c"].state, ChildState::Cancelled, "a steer cancel is final");
+        assert!(!r.children.contains_key("a"), "a subtree-halted crew is re-adoptable");
     }
 
     #[test]
