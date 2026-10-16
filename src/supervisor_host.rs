@@ -874,10 +874,13 @@ pub struct HostCfg {
     pub passes: bool,
     /// What a failure restarts; `None` = the tier default (`one_for_one`).
     pub strategy: Option<crate::supervisor_program::Strategy>,
+    /// Wake a round on a change to the files its reads come from (4b.7).
+    /// Off = the plain tick, nothing else differs.
+    pub hints: bool,
 }
 
 impl HostCfg {
-    /// Read `FLYWHEEL_SUPERVISOR_{TICK_MS,ACK_MS,LEASE_MS,PASSES,STRATEGY}`.
+    /// Read `FLYWHEEL_SUPERVISOR_{TICK_MS,ACK_MS,LEASE_MS,PASSES,STRATEGY,HINTS}`.
     pub fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
         Self {
@@ -888,6 +891,7 @@ impl HostCfg {
             strategy: std::env::var("FLYWHEEL_SUPERVISOR_STRATEGY")
                 .ok()
                 .and_then(|v| crate::supervisor_program::Strategy::parse(&v)),
+            hints: std::env::var("FLYWHEEL_SUPERVISOR_HINTS").map_or(true, |v| v != "off"),
         }
     }
 
@@ -985,6 +989,21 @@ fn host_loop(
             now_ms: now_ms(),
         });
     }
+    // 4b.7: the tick stays the truth; a change to the files a round reads wakes
+    // the next round early. Dropping the channel (hints off) is the plain tick.
+    let (hint_tx, hint_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let _watcher = if hc.hints {
+        let (_, index_db) = crate::mail_shim::mailbox_roots();
+        Some(crate::supervisor_hints::Watcher::spawn(
+            crate::supervisor_hints::watched_paths(&index_db, &paths.inbox),
+            hint_tx,
+            std::time::Duration::from_millis(crate::supervisor_hints::POLL_MS),
+            std::time::Duration::from_millis(crate::supervisor_hints::MIN_GAP_MS),
+        ))
+    } else {
+        drop(hint_tx);
+        None
+    };
     let mut pass: Option<std::process::Child> = None;
     let mut last_pass_end = std::time::Instant::now() - std::time::Duration::from_secs(interval_secs);
     loop {
@@ -1048,7 +1067,7 @@ fn host_loop(
             }
             crate::supervisor_program::Status::Running => {}
         }
-        std::thread::sleep(std::time::Duration::from_millis(hc.tick_ms));
+        crate::supervisor_hints::wait(&hint_rx, std::time::Duration::from_millis(hc.tick_ms));
     }
 }
 
@@ -1406,6 +1425,111 @@ mod tests {
         assert_eq!(cfg.policy().unwrap().strategy, Strategy::OneForAll);
         let none = HostCfg { strategy: None, ack_ms: None, lease_ms: None, ..HostCfg::from_env() };
         assert!(none.policy().is_none(), "no override: the tier default stands");
+    }
+
+    /// What a hinted loop publishes after each round.
+    fn spawn_loop(
+        mut c: Core,
+        mut j: MemJournal,
+        f: Fake,
+        rx: std::sync::mpsc::Receiver<()>,
+        tick: std::time::Duration,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        acked: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<Core> {
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = 10_000 + t0.elapsed().as_millis() as u64;
+                round(&mut c, &mut j, &mut f.clone(), vec![], now).unwrap();
+                if c.model.steers.get(&1).is_some_and(|s| s.state == SteerState::Acked) {
+                    acked.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                crate::supervisor_hints::wait(&rx, tick);
+            }
+            c
+        })
+    }
+
+    fn steered_core(d: &Path) -> (Core, MemJournal, Fake) {
+        let (mut c, mut j, f) = (open(d), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
+        let epoch = c.model.accepted_epoch;
+        let ctl = SupMsg::Control { op: SteerOp::Redirect, child: "a".into(), sup_epoch: epoch, now_ms: 2_000 };
+        go(&mut c, &mut j, &f, vec![ctl], 2_000);
+        assert_eq!(c.model.steers[&1].state, SteerState::Pending);
+        (c, j, f)
+    }
+
+    #[test]
+    fn with_a_hint_a_steer_ack_is_folded_within_200ms_of_a_5s_tick() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let d = tempfile::tempdir().unwrap();
+        let (c, j, f) = steered_core(d.path());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (stop, acked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let h = spawn_loop(c, j, f.clone(), rx, std::time::Duration::from_secs(5), stop.clone(), acked.clone());
+        std::thread::sleep(std::time::Duration::from_millis(150)); // the loop is now waiting out its tick
+        f.0.lock().unwrap().obs.push(SupMsg::Cursor { child: "a".into(), cursor: 10 }); // toron next
+        let t = std::time::Instant::now();
+        tx.send(()).unwrap();
+        while !acked.load(Ordering::Relaxed) && t.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let took = t.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        let _ = tx.send(());
+        let core = h.join().unwrap();
+        assert!(acked.load(Ordering::Relaxed) && took < std::time::Duration::from_millis(200), "ack took {took:?}");
+        assert_eq!(core.model.steers[&1].state, SteerState::Acked);
+    }
+
+    #[test]
+    fn without_the_hint_the_same_ack_waits_for_the_tick_and_folds_the_same_model() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        // Hinted run.
+        let (c, j, f) = steered_core(d1.path());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (stop, acked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let h = spawn_loop(c, j, f.clone(), rx, std::time::Duration::from_millis(400), stop.clone(), acked.clone());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        f.0.lock().unwrap().obs.push(SupMsg::Cursor { child: "a".into(), cursor: 10 });
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stop.store(true, Ordering::Relaxed);
+        let _ = tx.send(());
+        let hinted = h.join().unwrap();
+        // The channel dropped: only the tick drives it.
+        let (c, j, f) = steered_core(d2.path());
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        drop(tx);
+        let (stop, acked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let h = spawn_loop(c, j, f.clone(), rx, std::time::Duration::from_millis(400), stop.clone(), acked.clone());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        f.0.lock().unwrap().obs.push(SupMsg::Cursor { child: "a".into(), cursor: 10 });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!acked.load(Ordering::Relaxed), "no hint: not yet (the tick is 400 ms)");
+        let t = std::time::Instant::now();
+        while !acked.load(Ordering::Relaxed) && t.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let plain = h.join().unwrap();
+        assert!(acked.load(Ordering::Relaxed), "the tick still folds it: a lost hint costs one tick");
+        assert_eq!(plain.model.steers[&1].state, hinted.model.steers[&1].state);
+        assert_eq!(crate::supervisor_program::crew_view(&plain.model), crate::supervisor_program::crew_view(&hinted.model));
+    }
+
+    #[test]
+    fn the_hints_word_defaults_on_and_off_turns_them_off() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_HINTS") };
+        assert!(HostCfg::from_env().hints);
+        unsafe { std::env::set_var("FLYWHEEL_SUPERVISOR_HINTS", "off") };
+        assert!(!HostCfg::from_env().hints);
+        unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_HINTS") };
     }
 
     #[test]

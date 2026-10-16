@@ -48,6 +48,7 @@ mod inbox_ports;
 mod ring_ledger;
 mod supervisor_program;
 mod supervisor_host;
+mod supervisor_hints;
 mod doorbell_tick;
 mod durable;
 mod durable_policy;
