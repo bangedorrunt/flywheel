@@ -267,6 +267,8 @@ pub struct RoundReport {
     pub skipped: u64,
     /// Commands that failed.
     pub failed: u64,
+    /// Effects `FLYWHEEL_ALLOW_EXEC=0` refused. One line each.
+    pub suppressed: Vec<String>,
 }
 
 impl Core {
@@ -506,6 +508,68 @@ fn key_of(c: &SupCmd) -> String {
     }
 }
 
+// Test threads set this so a long fixture does not flip the process-wide
+// env under a sibling test that is also folding.
+#[cfg(test)]
+thread_local! {
+    static EXEC_FORCE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `FLYWHEEL_ALLOW_EXEC=0` is the log-only switch. Unset, or any other
+/// value, keeps today's effects. Read on each command, not stored.
+pub fn exec_allowed() -> bool {
+    #[cfg(test)]
+    if EXEC_FORCE_OFF.with(|c| c.get()) {
+        return false;
+    }
+    std::env::var("FLYWHEEL_ALLOW_EXEC").ok().as_deref() != Some("0")
+}
+
+/// Relaunch spawns a process. Exit closes a pane. Both stay off the
+/// journal when the switch is on: a settled row would confirm work nobody
+/// did, and recover would feed `Relaunched`.
+fn suppression_line(cmd: &SupCmd) -> Option<String> {
+    if exec_allowed() {
+        return None;
+    }
+    match cmd {
+        SupCmd::Relaunch {
+            child, generation, ..
+        } => Some(format!(
+            "suppressed Relaunch {child} gen {generation}: FLYWHEEL_ALLOW_EXEC=0"
+        )),
+        SupCmd::Exit { child, generation } => Some(format!(
+            "suppressed Exit {child} gen {generation}: FLYWHEEL_ALLOW_EXEC=0"
+        )),
+        _ => None,
+    }
+}
+
+fn note_suppressed(p: &CtxPaths, line: &str) -> Result<()> {
+    let path = p.log.with_extension("suppressed");
+    if let Some(d) = path.parent() {
+        crate::private_fs::create_private_dir_all(d)?;
+    }
+    let mut f = crate::private_fs::open_private_append(&path)?;
+    writeln!(f, "{line}")?;
+    Ok(())
+}
+
+fn dispatch(
+    core: &Core,
+    j: &mut dyn EffectJournal,
+    ports: &mut dyn Ports,
+    cmd: &SupCmd,
+    rep: &mut RoundReport,
+) -> Result<Vec<SupMsg>> {
+    let n = rep.suppressed.len();
+    let back = execute(j, ports, cmd, rep);
+    for line in &rep.suppressed[n..] {
+        note_suppressed(&core.paths, line)?;
+    }
+    Ok(back)
+}
+
 /// Run one command under the journal. Returns the messages its outcome
 /// feeds back into the fold.
 pub fn execute(
@@ -514,6 +578,11 @@ pub fn execute(
     cmd: &SupCmd,
     rep: &mut RoundReport,
 ) -> Vec<SupMsg> {
+    if let Some(line) = suppression_line(cmd) {
+        eprintln!("flywheel supervisor: {line}");
+        rep.suppressed.push(line);
+        return Vec::new();
+    }
     let key = key_of(cmd);
     let generation = match j.begin(&key) {
         Begin::Skip => {
@@ -606,7 +675,7 @@ pub fn feed(
         let cmds = core.append_fold(m)?;
         rep.logged += core.seq - before;
         for c in &cmds {
-            q.extend(execute(j, ports, c, rep));
+            q.extend(dispatch(core, j, ports, c, rep)?);
         }
     }
     Ok(())
@@ -681,15 +750,17 @@ pub fn recover(
             }
             continue;
         }
-        let fed = execute(j, ports, c, &mut rep);
+        let fed = dispatch(core, j, ports, c, &mut rep)?;
         // `execute` returns nothing for a Relaunch only when the journal skipped
         // it (a run feeds back `Relaunched` or `CmdFailed`). A settled relaunch is skipped, but if the host
         // died before `Relaunched` was logged the child would sit `Restarting`
         // until its lease ran out (and then be restarted again, spending the
         // budget). The settled row IS the confirmation: feed it, and only while
         // the model is still waiting for it (defence in depth: the fold ignores
-        // a confirmation that is not current anyway).
+        // a confirmation that is not current anyway). The log-only switch also
+        // returns nothing, and that is not a confirmation: nobody spawned.
         if fed.is_empty()
+            && exec_allowed()
             && let SupCmd::Relaunch {
                 child, generation, ..
             } = c
@@ -2010,6 +2081,167 @@ mod tests {
         // A tick later changes nothing and relaunches nothing.
         go(&mut c, &mut j, &f, vec![], 3_000);
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 1);
+    }
+
+    /// Drops `FLYWHEEL_ALLOW_EXEC` and the relaunch-bin override.
+    struct ClearExec;
+
+    impl Drop for ClearExec {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("FLYWHEEL_ALLOW_EXEC") }
+            unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_RELAUNCH_BIN") }
+            unsafe { std::env::remove_var("RELAUNCH_MARKER") }
+        }
+    }
+
+    fn relaunch_script(dir: &Path) -> PathBuf {
+        let bin = dir.join("relaunch.sh");
+        std::fs::write(&bin, "#!/bin/sh\necho $$ > \"$RELAUNCH_MARKER\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        bin
+    }
+
+    /// Forces the switch off on this thread. Drop clears it.
+    struct ForceOff;
+
+    impl ForceOff {
+        fn new() -> Self {
+            EXEC_FORCE_OFF.with(|c| c.set(true));
+            Self
+        }
+    }
+
+    impl Drop for ForceOff {
+        fn drop(&mut self) {
+            EXEC_FORCE_OFF.with(|c| c.set(false));
+        }
+    }
+
+    #[test]
+    fn allow_exec_zero_records_the_crash_and_does_not_spawn() {
+        let _home = crate::config::lock_env();
+        let _clear = ClearExec;
+        // The env itself is the switch. Hold it only for this assert so a
+        // sibling fold in this process does not go log-only.
+        unsafe { std::env::set_var("FLYWHEEL_ALLOW_EXEC", "0") };
+        assert!(!exec_allowed());
+        unsafe { std::env::set_var("FLYWHEEL_ALLOW_EXEC", "1") };
+        assert!(exec_allowed());
+        unsafe { std::env::remove_var("FLYWHEEL_ALLOW_EXEC") };
+        assert!(exec_allowed());
+        let _off = ForceOff::new();
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("spawned");
+        unsafe {
+            std::env::set_var(
+                "FLYWHEEL_SUPERVISOR_RELAUNCH_BIN",
+                relaunch_script(d.path()),
+            )
+        };
+        unsafe { std::env::set_var("RELAUNCH_MARKER", &marker) };
+        let cfg = crate::config::Config::default();
+        let mut live = LivePorts::new(&cfg, "exec", "exec");
+        let mut c = open(d.path());
+        let mut j = MemJournal::default();
+        let rep = round(
+            &mut c,
+            &mut j,
+            &mut live,
+            vec![
+                spawn("a"),
+                SupMsg::Exit {
+                    child: "a".into(),
+                    now_ms: 2_000,
+                },
+            ],
+            2_000,
+        )
+        .unwrap();
+        assert!(!marker.exists(), "relaunch spawned under the switch");
+        assert_eq!(c.model.children["a"].state, ChildState::Restarting);
+        assert!(
+            rep.suppressed
+                .iter()
+                .any(|l| l.contains("suppressed Relaunch"))
+        );
+        let note = std::fs::read_to_string(
+            CtxPaths::new(d.path(), "proj")
+                .log
+                .with_extension("suppressed"),
+        )
+        .unwrap();
+        assert!(note.contains("suppressed Relaunch"), "{note}");
+        let log = std::fs::read_to_string(CtxPaths::new(d.path(), "proj").log).unwrap();
+        assert!(
+            log.contains("\"kind\":\"exit\""),
+            "the crash is in the log: {log}"
+        );
+        // Recover must not invent a relaunch the switch refused.
+        recover(&mut c, &mut j, &mut live).unwrap();
+        assert!(!marker.exists(), "recover spawned under the switch");
+        assert_eq!(c.model.children["a"].state, ChildState::Restarting);
+
+        drop(_off);
+        let d2 = tempfile::tempdir().unwrap();
+        let marker2 = d2.path().join("spawned");
+        unsafe {
+            std::env::set_var(
+                "FLYWHEEL_SUPERVISOR_RELAUNCH_BIN",
+                relaunch_script(d2.path()),
+            )
+        };
+        unsafe { std::env::set_var("RELAUNCH_MARKER", &marker2) };
+        let mut live2 = LivePorts::new(&cfg, "exec", "exec");
+        let mut c2 = open(d2.path());
+        let mut j2 = MemJournal::default();
+        round(
+            &mut c2,
+            &mut j2,
+            &mut live2,
+            vec![
+                spawn("a"),
+                SupMsg::Exit {
+                    child: "a".into(),
+                    now_ms: 2_000,
+                },
+            ],
+            2_000,
+        )
+        .unwrap();
+        assert!(marker2.exists(), "unset switch did not relaunch");
+        assert_eq!(c2.model.children["a"].state, ChildState::Running);
+        unsafe { std::env::remove_var("RELAUNCH_MARKER") };
+    }
+
+    #[test]
+    fn readme_names_the_verbs_that_run_later() {
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+        let later = readme
+            .split("### Runs later")
+            .nth(1)
+            .expect("README is missing the runs-later list");
+        let later = later.split("## Command map").next().unwrap();
+        for needle in [
+            "Relaunch",
+            "hook install",
+            "--delta-file",
+            "loop-mode supervise",
+            "supervisor fact",
+            "supervisor steer",
+            "supervisor view",
+            "next",
+            "ack",
+            "done",
+            "inbox",
+            "FLYWHEEL_ALLOW_EXEC=0",
+        ] {
+            assert!(later.contains(needle), "runs-later list missing {needle}");
+        }
     }
 
     fn open_with(dir: &Path, strategy: crate::supervisor_program::Strategy) -> Core {
