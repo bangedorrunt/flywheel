@@ -299,6 +299,34 @@ impl Core {
 
 // ---- executing commands ---------------------------------------------------
 
+/// Ring an urgent steer: an `Interrupt`, then the `URGENT steer (wm N)` wake
+/// line, but only if this is the first wake for `(npub, wm)` across both
+/// hosts. Returns whether it rang. At-most-once: a re-run of the durable
+/// command after a crash does not ring again (the steer's ack window is the
+/// backstop for an unanswered steer).
+pub(crate) fn ring_urgent_steer(
+    ledger: &crate::ring_ledger::RingLedger,
+    typer: &dyn crate::pane_write::PaneTyper,
+    npub: &str,
+    pane: &str,
+    offset: u64,
+) -> anyhow::Result<bool> {
+    use crate::pane_write::{PaneWrite, Urgency, Wm, write};
+    if !ledger.steer_may_ring(npub, offset) {
+        return Ok(false);
+    }
+    write(typer, pane, &PaneWrite::Interrupt)?;
+    write(
+        typer,
+        pane,
+        &PaneWrite::WakeLine {
+            wm: Wm(offset),
+            urgency: Urgency::Urgent,
+        },
+    )?;
+    Ok(true)
+}
+
 fn key_of(c: &SupCmd) -> String {
     match c.durability() {
         Durability::Durable { key } => key,
@@ -750,18 +778,15 @@ impl Ports for LivePorts {
             self.inbox
                 .append_notify(&s.child, text, &format!("steer:{}", s.seq), s.generation)?;
         if s.urgent
-            && let (Some(pane), Some(c)) = (self.pane_of(&s.child), self.client())
+            && let (Some(pane), Some(c), Some(npub)) =
+                (self.pane_of(&s.child), self.client(), self.inbox.npub_of(&s.child))
         {
-            use crate::pane_write::{HerdrPanes, PaneWrite, Urgency, Wm, write};
-            let panes = HerdrPanes(&c);
-            write(&panes, &pane, &PaneWrite::Interrupt).map_err(|e| format!("{e:#}"))?;
-            write(
-                &panes,
+            ring_urgent_steer(
+                &self.inbox.ring_ledger(),
+                &crate::pane_write::HerdrPanes(&c),
+                &npub,
                 &pane,
-                &PaneWrite::WakeLine {
-                    wm: Wm(offset),
-                    urgency: Urgency::Urgent,
-                },
+                offset,
             )
             .map_err(|e| format!("{e:#}"))?;
         }
@@ -1470,6 +1495,77 @@ mod tests {
         drop(w);
         assert_eq!(c.model.status, Status::Failed);
         assert_eq!(f.0.lock().unwrap().exited.len(), 2, "the subtree was cancelled");
+    }
+
+    /// A pane that records every write, shared by both hosts in a test.
+    #[derive(Default)]
+    struct RecPane(std::sync::Mutex<Vec<String>>);
+
+    impl crate::pane_write::PaneTyper for RecPane {
+        fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("{target} line {line}"));
+            Ok(())
+        }
+        fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("{target} keys {}", keys.join("+")));
+            Ok(())
+        }
+        fn close(&self, target: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("{target} close"));
+            Ok(())
+        }
+    }
+
+    fn urgent_lines(p: &RecPane) -> usize {
+        p.0.lock().unwrap().iter().filter(|l| l.contains("URGENT steer")).count()
+    }
+
+    fn normal_lines(p: &RecPane) -> usize {
+        p.0.lock().unwrap().iter().filter(|l| l.contains("line") && !l.contains("URGENT")).count()
+    }
+
+    fn inbox_ring(l: &crate::ring_ledger::RingLedger, p: &RecPane, wm: u64) {
+        let line = crate::pane_write::wake_line(crate::pane_write::Wm(wm), crate::pane_write::Urgency::Normal);
+        crate::inbox_ports::ring_wake(l, p, "npub1a", "w1:a", wm, &line).unwrap();
+    }
+
+    #[test]
+    fn one_urgent_steer_is_one_ring_counting_both_hosts_supervisor_first() {
+        let d = tempfile::tempdir().unwrap();
+        let l = crate::ring_ledger::RingLedger::new(d.path().join("rings"));
+        let p = RecPane::default();
+        assert!(ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap());
+        // The inbox host sees the same mail at wm 7 and wants to ring it.
+        inbox_ring(&l, &p, 7);
+        assert_eq!(urgent_lines(&p), 1);
+        assert_eq!(normal_lines(&p), 0, "no second ring for the same mail");
+        assert_eq!(p.0.lock().unwrap().iter().filter(|w| w.contains("keys")).count(), 1, "one interrupt");
+        // Still unread: the inbox host's budgeted re-ring is a real ring.
+        inbox_ring(&l, &p, 7);
+        assert_eq!(normal_lines(&p), 1, "re-rings stay the doorbell's");
+    }
+
+    #[test]
+    fn one_urgent_steer_is_one_ring_counting_both_hosts_inbox_first() {
+        let d = tempfile::tempdir().unwrap();
+        let l = crate::ring_ledger::RingLedger::new(d.path().join("rings"));
+        let p = RecPane::default();
+        inbox_ring(&l, &p, 7);
+        assert!(!ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap(), "already woken");
+        assert_eq!(urgent_lines(&p), 0);
+        assert_eq!(normal_lines(&p), 1);
+        assert!(p.0.lock().unwrap().iter().all(|w| !w.contains("keys")), "no interrupt either");
+    }
+
+    #[test]
+    fn a_rerun_steer_command_does_not_ring_twice_and_a_later_mail_rings() {
+        let d = tempfile::tempdir().unwrap();
+        let l = crate::ring_ledger::RingLedger::new(d.path().join("rings"));
+        let p = RecPane::default();
+        assert!(ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap());
+        assert!(!ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap());
+        assert!(ring_urgent_steer(&l, &p, "npub1a", "w1:a", 8).unwrap(), "a second steer is its own wake");
+        assert_eq!(urgent_lines(&p), 2);
     }
 
     #[test]
