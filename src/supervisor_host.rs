@@ -1454,6 +1454,24 @@ mod tests {
         assert_eq!(f.0.lock().unwrap().exited.len(), 2, "the subtree was cancelled");
     }
 
+    #[test]
+    fn a_stale_claims_settle_does_not_close_the_key() {
+        let mut j = MemJournal::default();
+        let g1 = match j.begin("relaunch:a:2") {
+            Begin::Run(g) => g,
+            other => panic!("{other:?}"),
+        };
+        let g2 = match j.begin("relaunch:a:2") {
+            Begin::Run(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert!(g2 > g1);
+        j.finish("relaunch:a:2", g1, true);
+        assert!(matches!(j.begin("relaunch:a:2"), Begin::Run(_)), "the older claim settled nothing");
+        j.finish("relaunch:a:2", g2 + 1, true);
+        assert_eq!(j.begin("relaunch:a:2"), Begin::Skip, "the current claim settles it");
+    }
+
     // ---- the real journal -------------------------------------------------
 
     fn toron_journal() -> (ToronEffectJournal, tokio::runtime::Runtime) {
