@@ -108,6 +108,16 @@ impl FlywheelPorts {
             .join(format!("{}-inbox.jsonl", crate::state::state_key(&self.project)))
     }
 
+    /// The ledger the supervisor host shares with this host (one wake per
+    /// mail, counting both; see `ring_ledger`).
+    pub(crate) fn ring_ledger(&self) -> crate::ring_ledger::RingLedger {
+        crate::ring_ledger::RingLedger::new(config::state_dir().join("inbox").join(format!(
+            "{}-{}-rings",
+            crate::state::state_key(&self.project),
+            crate::state::state_key(&self.workspace)
+        )))
+    }
+
     fn budget_path(&self) -> std::path::PathBuf {
         config::state_dir().join("inbox").join(format!(
             "{}-{}-ring-budget.json",
@@ -253,6 +263,33 @@ pub(crate) async fn head_and_cursor(store: &InboxStore, npub: &str) -> (u64, u64
     (head, cursor)
 }
 
+/// Type the wake line for `wm` into `pane_id`, unless the supervisor host's
+/// urgent steer ring already woke this recipient at this watermark (that ring
+/// is this watermark's first: skipped here, but the caller's budget counts it).
+pub(crate) fn ring_wake(
+    ledger: &crate::ring_ledger::RingLedger,
+    typer: &dyn crate::pane_write::PaneTyper,
+    npub: &str,
+    pane_id: &str,
+    wm: u64,
+    line: &str,
+) -> Result<(), String> {
+    use crate::pane_write::{PaneWrite, Urgency as U, Wm};
+    let w = PaneWrite::WakeLine {
+        wm: Wm(wm),
+        urgency: U::Normal,
+    };
+    // The fold names the line; the sink renders it. They must agree, or
+    // something other than the wake line is about to reach a pane.
+    if crate::pane_write::wake_line(Wm(wm), U::Normal) != line {
+        return Err("fold line differs from the pane sink's wake line".into());
+    }
+    if !ledger.inbox_may_ring(npub, wm) {
+        return Ok(());
+    }
+    crate::pane_write::write(typer, pane_id, &w).map_err(|e| e.to_string())
+}
+
 impl Ports for FlywheelPorts {
     fn observe(&mut self) -> Observation {
         let registry = crate::state::load_spawn_registry(&self.project);
@@ -324,20 +361,16 @@ impl Ports for FlywheelPorts {
         Some(verify_tokens(&p.tokens, &pin, npub, &p.pane_id, &p.workspace_id))
     }
 
-    fn ring(&mut self, _npub: &str, pane_id: &str, wm: u64, line: &str) -> Result<(), String> {
-        use crate::pane_write::{PaneWrite, Urgency as U, Wm};
-        let w = PaneWrite::WakeLine {
-            wm: Wm(wm),
-            urgency: U::Normal,
-        };
-        // The fold names the line; the sink renders it. They must agree, or
-        // something other than the wake line is about to reach a pane.
-        if crate::pane_write::wake_line(Wm(wm), U::Normal) != line {
-            return Err("fold line differs from the pane sink's wake line".into());
-        }
+    fn ring(&mut self, npub: &str, pane_id: &str, wm: u64, line: &str) -> Result<(), String> {
         let client = self.client().ok_or("herdr unreachable")?;
-        crate::pane_write::write(&crate::pane_write::HerdrPanes(&client), pane_id, &w)
-            .map_err(|e| e.to_string())
+        ring_wake(
+            &self.ring_ledger(),
+            &crate::pane_write::HerdrPanes(&client),
+            npub,
+            pane_id,
+            wm,
+            line,
+        )
     }
 
     fn load_budget(&mut self) -> BTreeMap<String, crate::inbox_host::Budget> {
