@@ -90,7 +90,10 @@ pub fn deaf_text(pin: &str, wm: u64, cause: DeafCause) -> String {
         DeafCause::NoAnswer => "was rung the whole budget and never ran `toron next`",
         DeafCause::Unbound => "has mail but no verified pane binding",
     };
-    format!("⟦toron⟧ DEAF: {pin} {why} (wm {wm:x}). Check its pane; mail stays in its inbox.")
+    format!(
+        "⟦toron⟧ DEAF: {} {why} (wm {wm:x}). Check its pane; mail stays in its inbox.",
+        crate::redact::present(pin)
+    )
 }
 
 impl FlywheelPorts {
@@ -580,6 +583,17 @@ mod tests {
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn a_deaf_notice_quotes_the_pin_and_hides_a_token() {
+        let token = "ghp_ABCDEFGHIJKLMNOPQRST";
+        let pin = format!("TealBirch\n{token}");
+        let text = deaf_text(&pin, 0xab, DeafCause::NoAnswer);
+        assert!(!text.contains('\n'), "{text}");
+        assert!(!text.contains(token), "{text}");
+        assert!(text.contains("`TealBirch"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+    }
 
     fn env(name: &str, major: u32, class: Class, body: Value, task: bool) -> Envelope {
         Envelope {
