@@ -777,6 +777,31 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_binding_rings_only_after_it_is_reverified() {
+        let f = Fake::default();
+        set(&f, seen(4, 0, true));
+        let mut core = Core::default();
+        let now = run(&mut core, &f, 2, 1_000);
+        drop(core);
+        // herdr cannot vouch for the pane yet: the restored binding stays
+        // unverified and nothing is typed into it.
+        f.0.lock().unwrap().reverify = None;
+        let mut core2 = restarted(&f);
+        run(&mut core2, &f, 3, now);
+        assert_eq!(
+            f.0.lock().unwrap().rings.len(),
+            2,
+            "no ring on a restored, unverified binding"
+        );
+        assert!(f.0.lock().unwrap().reverified >= 1, "it asks herdr");
+        // Once herdr vouches, the remaining budget is spent and no more.
+        f.0.lock().unwrap().reverify = Some(bind(true));
+        core2.reverify_next_ms.clear();
+        run(&mut core2, &f, 10, now + 10_000_000);
+        assert_eq!(f.0.lock().unwrap().rings.len() as u32, MAX_RINGS);
+    }
+
+    #[test]
     fn a_restart_after_deaf_stays_quiet_and_never_re_escalates() {
         let f = Fake::default();
         set(&f, seen(4, 0, true));
