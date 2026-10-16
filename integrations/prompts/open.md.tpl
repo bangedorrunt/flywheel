@@ -37,7 +37,7 @@ unless the operator requests a change.
 
 Session start is `flywheel arrive <project> --as <pin>` then
 `flywheel briefing "<objective>" --project <p> --json`. Open-mode
-stays current-pane when briefing topology is `open` or `join`.
+stays current-pane when briefing topology is `open`, or `swarm` with `join` set (joining the live fleet spawns nothing).
 Join-loud prints JOINING, not spawning. Do not fork a dispatcher
 when one is already up; attach `toron watch --live`.
 

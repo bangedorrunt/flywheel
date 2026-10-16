@@ -42,7 +42,16 @@ pub struct World {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
+    /// swarm | loop | open (| none). Never `join`: joining the live fleet is
+    /// a swarm option, see `join`.
     pub topology: String,
+    /// Phase 4 topologies: `join` is an option of `Swarm`, not a fourth
+    /// topology. True = arrive on the live fleet instead of spawning a second
+    /// swarm (`workflow` is `join`, argv is `flywheel arrive`). Omitted from
+    /// the JSON when false, so every non-join briefing is byte-identical to
+    /// what it was.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub join: bool,
     pub workflow: String,
     pub token: Option<String>,
     pub stages: Vec<String>,
@@ -55,6 +64,24 @@ pub struct Proposal {
     /// bd-2o1v P0-5 (a): profile affinity of the proposed row, READ from
     /// the workflow's steps by the caller (never re-declared here).
     pub role: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The crew-confirm gate's predicate (bd-2o1v): does committing this proposal
+/// spawn panes? `open`/`none` spawn nothing, and neither does `join` (a swarm
+/// option that arrives on the live fleet), so those stay outside the gate.
+pub fn spawns_crew(p: &Proposal) -> bool {
+    !p.join && !matches!(p.topology.as_str(), "open" | "none" | "")
+}
+
+/// A topology word as the operator may type it, as (topology, join). `join`
+/// is accepted as an alias for `swarm` with the join option, so existing
+/// `--topology join`, `/join` and stored `session_topology=join` keep working.
+pub fn split_topology(t: &str) -> (&str, bool) {
+    if t == "join" { ("swarm", true) } else { (t, false) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,11 +161,13 @@ pub fn is_compose_token(primitive: &str) -> bool {
 /// Topology comes from decide's one routing table (ADR-0032 Spec 9): the
 /// only briefing-local rule is the joinable-world override. The old private
 /// primitive→topology map is deleted (it diverged on babysit-bead).
-fn topology_for(decision: &Decision, world: &World) -> String {
+/// Returns (topology, join): `join` is a Swarm option, never a topology.
+fn topology_for(decision: &Decision, world: &World) -> (String, bool) {
     if world.joinable {
-        return "join".into();
+        return ("swarm".into(), true);
     }
-    decision.topology.to_string()
+    let (t, join) = split_topology(decision.topology);
+    (t.to_string(), join)
 }
 
 fn default_n(unique: u32, cap: u32) -> u32 {
@@ -315,8 +344,8 @@ pub fn assemble(
         contention: !world.held_paths.is_empty(),
     };
     let decision = decide::decide(objective, &snap);
-    let topology = topology_for(&decision, world);
-    let unique_owned: Vec<String> = if unique_roles.is_empty() && topology == "swarm" {
+    let (topology, join) = topology_for(&decision, world);
+    let unique_owned: Vec<String> = if unique_roles.is_empty() && topology == "swarm" && !join {
         WAVE_SWARM_ROLES.iter().map(|s| (*s).to_string()).collect()
     } else {
         unique_roles.to_vec()
@@ -347,7 +376,7 @@ pub fn assemble(
         .collect();
 
     let mut argv = decision.argv.clone();
-    if topology == "join" {
+    if join {
         argv = vec!["flywheel".into(), "arrive".into(), world.project.clone()];
         if let Some(id) = &world.coalition_id {
             argv.extend(["--coalition".into(), id.clone()]);
@@ -377,7 +406,7 @@ pub fn assemble(
             world.agent_pin.as_deref(),
         ));
     }
-    let why = if topology == "join" {
+    let why = if join {
         format!(
             "live fleet on {} (pins={}, dispatcher={}) — join by default (ADR-0011 D5)",
             world.project, world.pin_count, world.dispatcher
@@ -417,9 +446,9 @@ pub fn assemble(
             when: "multi-lane and no live fleet to join".into(),
         },
     ];
-    if world.joinable && !alternatives.iter().any(|a| a.topology == "join") {
+    if world.joinable && !alternatives.iter().any(|a| a.workflow.as_deref() == Some("join")) {
         alternatives.push(Alternative {
-            topology: "join".into(),
+            topology: "swarm".into(),
             workflow: Some("join".into()),
             when: "live fleet — join instead of spawning".into(),
         });
@@ -451,6 +480,7 @@ pub fn assemble(
         world: world.clone(),
         proposal: Proposal {
             topology: topology.clone(),
+            join,
             workflow: decision.primitive.to_string(),
             token,
             stages: Vec::new(),
@@ -472,7 +502,7 @@ pub fn assemble(
         questions: vec![
             Question {
                 id: "topology".into(),
-                options: vec!["swarm".into(), "loop".into(), "open".into(), "join".into()],
+                options: vec!["swarm".into(), "loop".into(), "open".into()],
                 default: topology,
             },
             Question {
@@ -521,7 +551,9 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
     if session.is_empty() {
         return;
     }
-    if b.proposal.topology == session {
+    // `join` is a swarm option: compare and set (topology, join) pairs.
+    let (session_topology, session_join) = split_topology(session);
+    if b.proposal.topology == session_topology && b.proposal.join == session_join {
         if sticky_held {
             // Airtight print: never leave invent swarm primitive in why under open/loop hold.
             if b.proposal.why.contains("wave-swarm")
@@ -536,10 +568,15 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
         }
         return;
     }
-    let classified = b.proposal.topology.clone();
-    b.proposal.topology = session.to_string();
+    let classified = if b.proposal.join {
+        "join".to_string()
+    } else {
+        b.proposal.topology.clone()
+    };
+    b.proposal.topology = session_topology.to_string();
+    b.proposal.join = session_join;
     if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
-        q.default = session.to_string();
+        q.default = session_topology.to_string();
     }
     let prior_why = if sticky_held {
         // Do not echo invent swarm/join/loop primitive names into the print surface.
@@ -633,14 +670,15 @@ pub fn apply_answers(
         let t = t.trim();
         if !matches!(t, "swarm" | "loop" | "open" | "join") {
             return Err(format!(
-                "briefing topology {t:?} is not swarm|loop|open|join"
+                "briefing topology {t:?} is not swarm|loop|open (join = swarm joining the live fleet)"
             ));
         }
-        if t != b.proposal.topology {
+        let (topo, join) = split_topology(t);
+        if topo != b.proposal.topology || join != b.proposal.join {
             rebuild_argv_for_topology(b, t);
         }
         if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
-            q.default = t.to_string();
+            q.default = topo.to_string();
         }
     }
     if let Some(c) = crew {
@@ -648,7 +686,7 @@ pub fn apply_answers(
         if c.is_empty() {
             return Err("briefing crew must be N or role:n,role:n".into());
         }
-        if !b.proposal.argv.is_empty() && b.proposal.topology != "join" {
+        if !b.proposal.argv.is_empty() && !b.proposal.join {
             splice_flag(&mut b.proposal.argv, "--crew", c);
         }
         if let Some(q) = b.questions.iter_mut().find(|q| q.id == "crew") {
@@ -665,7 +703,7 @@ pub fn apply_answers(
                 "briefing model {m:?} is not default|@cheap|@standard|@premium"
             ));
         }
-        if m != "default" && !b.proposal.argv.is_empty() && b.proposal.topology == "swarm" {
+        if m != "default" && !b.proposal.argv.is_empty() && b.proposal.topology == "swarm" && !b.proposal.join {
             let roles: Vec<String> = if b.proposal.crew.is_empty() {
                 WAVE_SWARM_ROLES.iter().map(|s| (*s).to_string()).collect()
             } else {
@@ -695,7 +733,9 @@ fn splice_project(argv: &mut Vec<String>, project: &str) {
 }
 
 fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
-    b.proposal.topology = topology.to_string();
+    let (topo, join) = split_topology(topology);
+    b.proposal.topology = topo.to_string();
+    b.proposal.join = join;
     match topology {
         "open" => {
             b.proposal.workflow = "none".into();
@@ -834,6 +874,151 @@ mod tests {
         }
     }
 
+    fn joinable() -> World {
+        World {
+            project: "toron".into(),
+            dispatcher: "up".into(),
+            joinable: true,
+            pin_count: 3,
+            coalition_id: Some("coal-1".into()),
+            ..World::default()
+        }
+    }
+
+    fn solo() -> World {
+        World {
+            project: "toron".into(),
+            dispatcher: "absent".into(),
+            ..World::default()
+        }
+    }
+
+    #[test]
+    fn join_is_a_swarm_option_and_no_briefing_names_a_join_topology() {
+        for (world, objective) in [
+            (joinable(), "wave-swarm 3 crews"),
+            (joinable(), "join the fleet"),
+            (joinable(), "fix the login bug"),
+            (solo(), "join the fleet"),
+            (solo(), "wave-swarm 3 crews"),
+            (solo(), "fix the login bug"),
+        ] {
+            let b = assemble(objective, &world, &["coder".into()], 5, None);
+            let v = serde_json::to_value(&b).unwrap();
+            assert_ne!(b.proposal.topology, "join", "{objective}");
+            assert!(b.alternatives.iter().all(|a| a.topology != "join"), "{objective}");
+            let q = b.questions.iter().find(|q| q.id == "topology").unwrap();
+            assert!(!q.options.iter().any(|o| o == "join"), "{objective}: {:?}", q.options);
+            assert_ne!(q.default, "join", "{objective}");
+            if !world.joinable && !b.proposal.join {
+                assert!(
+                    b.alternatives.iter().all(|a| a.workflow.as_deref() != Some("join")),
+                    "{objective}: no join alternative without a live fleet"
+                );
+            }
+            // The join option is visible only when it is on.
+            assert_eq!(v["proposal"].get("join").is_some(), b.proposal.join, "{objective}");
+            if b.proposal.join {
+                assert_eq!(b.proposal.topology, "swarm");
+                if let Some(a) = b.proposal.argv.get(1) {
+                    assert_eq!(a, "arrive", "{objective}");
+                }
+            }
+        }
+        // A joinable world offers the join workflow as a swarm alternative.
+        let b = assemble("fix the login bug", &joinable(), &[], 5, None);
+        assert!(b.alternatives.iter().any(|a| a.topology == "swarm" && a.workflow.as_deref() == Some("join")));
+    }
+
+    #[test]
+    fn join_does_not_default_the_wave_swarm_roles_into_the_crew() {
+        // A swarm with no named roles defaults to the wave-swarm roles; a join
+        // arrives on an existing fleet and must not pick them up.
+        let j = assemble("wave-swarm 3 crews", &joinable(), &[], 5, None);
+        let s = assemble("wave-swarm 3 crews", &solo(), &[], 5, None);
+        assert!(j.proposal.join && !s.proposal.join);
+        assert!(!s.proposal.crew.is_empty(), "precondition: a swarm gets default roles");
+        assert_ne!(j.proposal.crew, s.proposal.crew, "join: {:?}", j.proposal.crew);
+    }
+
+    #[test]
+    fn a_non_join_briefing_serialises_without_a_join_key() {
+        let b = assemble("wave-swarm 3 crews", &solo(), &["coder".into()], 5, None);
+        assert!(!b.proposal.join);
+        let v = serde_json::to_value(&b).unwrap();
+        assert!(v["proposal"].get("join").is_none(), "byte-identical for non-join: {v}");
+        // And an old briefing JSON without the key still reads back (join=false).
+        let back: Briefing = serde_json::from_value(v).unwrap();
+        assert!(!back.proposal.join);
+    }
+
+    #[test]
+    fn the_crew_confirm_gate_ignores_join_exactly_as_the_old_join_topology_did() {
+        let p = |t: &str, join: bool| {
+            let mut b = assemble("wave-swarm 3 crews", &solo(), &["coder".into()], 5, None);
+            b.proposal.topology = t.into();
+            b.proposal.join = join;
+            b.proposal
+        };
+        assert!(spawns_crew(&p("swarm", false)));
+        assert!(spawns_crew(&p("loop", false)));
+        assert!(!spawns_crew(&p("swarm", true)), "join spawns no pane");
+        assert!(!spawns_crew(&p("open", false)));
+        assert!(!spawns_crew(&p("none", false)));
+        assert!(!spawns_crew(&p("", false)));
+        let joined = assemble("wave-swarm 3 crews", &joinable(), &["coder".into()], 5, None);
+        assert!(!spawns_crew(&joined.proposal), "a live fleet is joined without the gate");
+    }
+
+    #[test]
+    fn the_join_alias_still_remixes_and_swarm_clears_it() {
+        let mut b = assemble("wave-swarm 3 crews", &solo(), &["coder".into()], 5, None);
+        apply_answers(&mut b, Some("join"), None, None).unwrap();
+        assert_eq!((b.proposal.topology.as_str(), b.proposal.join), ("swarm", true));
+        assert_eq!(b.proposal.workflow, "join");
+        assert_eq!(b.proposal.argv[1], "arrive");
+        let q = b.questions.iter().find(|q| q.id == "topology").unwrap();
+        assert_eq!(q.default, "swarm");
+        // crew is not spliced into an arrive argv; a model slot is not either.
+        apply_answers(&mut b, None, Some("3"), Some("@cheap")).unwrap();
+        assert!(!b.proposal.argv.iter().any(|a| a == "--crew" || a.contains("=@cheap")));
+        // Choosing swarm explicitly leaves the join option.
+        apply_answers(&mut b, Some("swarm"), None, None).unwrap();
+        assert_eq!((b.proposal.topology.as_str(), b.proposal.join), ("swarm", false));
+        assert_eq!(b.proposal.workflow, "wave-swarm");
+        assert_ne!(b.proposal.argv.get(1).map(String::as_str), Some("arrive"));
+        // open and loop clear it too.
+        apply_answers(&mut b, Some("join"), None, None).unwrap();
+        apply_answers(&mut b, Some("open"), None, None).unwrap();
+        assert!(!b.proposal.join && b.proposal.topology == "open");
+        apply_answers(&mut b, Some("join"), None, None).unwrap();
+        apply_answers(&mut b, Some("loop"), None, None).unwrap();
+        assert!(!b.proposal.join && b.proposal.topology == "loop");
+        // Re-asking for what is already there changes nothing.
+        let mut j = assemble("wave-swarm 3 crews", &joinable(), &["coder".into()], 5, None);
+        let before = j.proposal.clone();
+        apply_answers(&mut j, Some("join"), None, None).unwrap();
+        assert_eq!(j.proposal, before);
+        assert!(apply_answers(&mut j, Some("joined"), None, None).is_err());
+    }
+
+    #[test]
+    fn a_stored_session_topology_of_join_aligns_as_swarm_with_the_option() {
+        let mut b = assemble("wave-swarm 3 crews", &solo(), &["coder".into()], 5, None);
+        align_with_session_topology(&mut b, "join", false);
+        assert_eq!((b.proposal.topology.as_str(), b.proposal.join), ("swarm", true));
+        let q = b.questions.iter().find(|q| q.id == "topology").unwrap();
+        assert_eq!(q.default, "swarm");
+        // Already aligned: nothing to do.
+        let before = b.proposal.clone();
+        align_with_session_topology(&mut b, "join", false);
+        assert_eq!(b.proposal, before);
+        // A swarm session over a join proposal drops the option (the old label flip).
+        let mut j = assemble("wave-swarm 3 crews", &joinable(), &["coder".into()], 5, None);
+        align_with_session_topology(&mut j, "swarm", false);
+        assert_eq!((j.proposal.topology.as_str(), j.proposal.join), ("swarm", false));
+    }
+
     #[test]
     fn joinable_world_proposes_join_not_compose() {
         let world = World {
@@ -846,7 +1031,8 @@ mod tests {
         };
         let b = assemble("wave-swarm 3 crews", &world, &["coder".into()], 5, None);
         assert_eq!(b.schema, SCHEMA);
-        assert_eq!(b.proposal.topology, "join");
+        assert_eq!(b.proposal.topology, "swarm", "join is a swarm option, not a topology");
+        assert!(b.proposal.join);
         assert_eq!(b.proposal.argv[1], "arrive");
         assert!(b.proposal.why.contains("JOINING") || b.proposal.why.contains("join"));
         let banner = join_banner(&world);
@@ -1115,10 +1301,11 @@ mod tests {
             5,
             None,
         );
-        assert_eq!(b.proposal.topology, "join", "precondition: join");
+        assert!(b.proposal.join, "precondition: join");
         assert_eq!(b.proposal.argv[1], "arrive");
         align_with_session_topology(&mut b, "open", true);
         assert_eq!(b.proposal.topology, "open");
+        assert!(!b.proposal.join, "an open session clears the join option");
         assert!(
             b.proposal.argv.is_empty(),
             "sticky_held open×join: empty argv, got {:?}",
@@ -1169,13 +1356,14 @@ mod tests {
                 5,
                 None,
             );
-            assert!(
-                matches!(b.proposal.topology.as_str(), "swarm" | "join"),
+            assert_eq!(
+                b.proposal.topology, "swarm",
                 "{label}: precondition topology={}",
                 b.proposal.topology
             );
             align_with_session_topology(&mut b, "open", true);
             assert_eq!(b.proposal.topology, "open", "{label}");
+            assert!(!b.proposal.join, "{label}");
             assert!(
                 b.proposal.argv.is_empty(),
                 "{label}: argv must be empty for --commit fail-closed, got {:?}",
@@ -1456,10 +1644,13 @@ mod tests {
             ..World::default()
         };
         let b = assemble("refactor the auth module", &world, &[], 5, None);
-        assert_eq!(b.proposal.topology, "join");
+        assert_eq!(b.proposal.topology, "swarm");
+        assert!(b.proposal.join);
         assert!(has_crew_and_model_questions(&b));
         assert!(
-            b.alternatives.iter().any(|a| a.topology == "join"),
+            b.alternatives
+                .iter()
+                .any(|a| a.workflow.as_deref() == Some("join")),
             "alternatives must surface join: {:?}",
             b.alternatives
         );

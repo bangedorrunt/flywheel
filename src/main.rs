@@ -959,7 +959,7 @@ enum Commands {
         commit: bool,
         #[arg(long)]
         yes: bool,
-        /// remix topology: swarm|loop|open|join (binds the topology question)
+        /// remix topology: swarm|loop|open (binds the topology question; `join` = swarm joining the live fleet)
         #[arg(long)]
         topology: Option<String>,
         /// pane budget N or role:n,role:n (binds the crew question)
@@ -6656,7 +6656,7 @@ mod bd2o1v_reset_tests {
             .expect("argv exec must exist after the gate");
         assert!(bind < gate && gate < exec && refusal < exec && tty_ask < exec);
         assert!(
-            body.contains(r#""open" | "join" | "none""#),
+            body.contains("briefing::spawns_crew(&b.proposal)"),
             "zero-pane topologies bypass the gate"
         );
     }
@@ -15332,7 +15332,7 @@ fn cmd_briefing(
         // without the operator's word — TTY asks inline; non-TTY callers
         // (agents) present the proposal in chat and rerun with --yes / a
         // remixed --crew. Cron/loop never route through briefing.
-        let spawns_crew = !matches!(b.proposal.topology.as_str(), "open" | "join" | "none" | "");
+        let spawns_crew = briefing::spawns_crew(&b.proposal);
         if commit && !yes && spawns_crew {
             let plan = format!(
                 "crew plan (proposal): topology={} workflow={} crew-default={} argv=`{}`",
