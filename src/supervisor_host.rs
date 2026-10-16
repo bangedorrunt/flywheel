@@ -609,7 +609,13 @@ pub fn execute(
                 generation: *generation,
             }]
         }),
-        SupCmd::Exit { child, generation } => ports.exit(child, *generation).map(|_| vec![]),
+        SupCmd::Exit { child, generation } => {
+            let done = ports.exit(child, *generation).map(|_| vec![]);
+            if done.is_ok() {
+                crate::harness_caps::uninstall_if_configured();
+            }
+            done
+        }
         SupCmd::AppendSteer {
             seq,
             child,
@@ -1583,6 +1589,12 @@ pub enum SupervisorCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Whether the marked supervisor hook block is in `file`.
+    Hooks {
+        /// Operator file to read. Omit to use `FLYWHEEL_SUPERVISOR_HOOK_FILE`.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
 }
 
 /// Parse a steer op word.
@@ -1694,6 +1706,14 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
             } else {
                 print_view(&m, &rows);
             }
+            Ok(())
+        }
+        SupervisorCmd::Hooks { file } => {
+            let from_env = std::env::var("FLYWHEEL_SUPERVISOR_HOOK_FILE").ok();
+            let path = file
+                .as_deref()
+                .or_else(|| from_env.as_deref().map(std::path::Path::new));
+            println!("{}", crate::harness_caps::doctor_line(path));
             Ok(())
         }
     }
