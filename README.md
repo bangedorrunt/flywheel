@@ -219,7 +219,7 @@ These verbs cause something to run later on the operator's behalf. Allow-list
 them only when that is intended:
 
 - `Relaunch` of a lead (the host spawns `flywheel loop-mode supervise`)
-- hook install (edits an operator-owned file; no harness is verified, so the host does not install one today)
+- hook install (edits an operator-owned file when a harness row is capable and verified; opencode, pi, grok, and omp are unverified, so a launch of those does not write a hook; the `fake` row is the fixture)
 - `--delta-file` (queues a goal the crew will act on)
 - `loop-mode supervise` (the host itself)
 
