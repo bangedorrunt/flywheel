@@ -1495,10 +1495,12 @@ mod tests {
         assert_eq!(c2.model.status, Status::Running, "a re-run is a fresh incarnation");
         assert!(c2.model.restarts.is_empty(), "the intensity window starts over");
         assert_eq!(c2.model.escalations, 1, "the escalation fact is kept");
-        let mut j2 = MemJournal::default();
+        // The same effect journal: a re-run keeps the old keys settled, so the
+        // new incarnation's commands must not collide with them.
+        let j2 = &mut j;
         let before = f.0.lock().unwrap().relaunched.len();
-        go(&mut c2, &mut j2, &f, vec![spawn("a")], 10_000);
-        go(&mut c2, &mut j2, &f, vec![ex("a", 10_100)], 10_100);
+        go(&mut c2, j2, &f, vec![spawn("a")], 10_000);
+        go(&mut c2, j2, &f, vec![ex("a", 10_100)], 10_100);
         assert_eq!(c2.model.status, Status::Running);
         assert_eq!(f.0.lock().unwrap().relaunched.len(), before + 1, "the new host supervises the crew again");
         let (msgs, _, _) = read_log(&paths).unwrap();
