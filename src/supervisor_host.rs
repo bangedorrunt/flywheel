@@ -467,7 +467,27 @@ pub fn recover(
     let mut rep = RoundReport::default();
     let mut follow = Vec::new();
     for c in &cmds {
-        follow.extend(execute(j, ports, c, &mut rep));
+        let fed = execute(j, ports, c, &mut rep);
+        // `execute` returns nothing for a Relaunch only when the journal skipped
+        // it (a run feeds back `Relaunched` or `CmdFailed`). A settled relaunch is skipped, but if the host
+        // died before `Relaunched` was logged the child would sit `Restarting`
+        // until its lease ran out (and then be restarted again, spending the
+        // budget). The settled row IS the confirmation: feed it, only while
+        // the model is still waiting for it (so a clean log grows by nothing).
+        if fed.is_empty()
+            && let SupCmd::Relaunch { child, generation } = c
+            && core
+                .model
+                .children
+                .get(child)
+                .is_some_and(|ch| ch.state == crate::supervisor_program::ChildState::Restarting && ch.generation == *generation)
+        {
+            follow.push(SupMsg::Relaunched {
+                child: child.clone(),
+                generation: *generation,
+            });
+        }
+        follow.extend(fed);
     }
     feed(core, j, ports, follow, &mut rep)?;
     Ok(rep)
@@ -1343,6 +1363,38 @@ mod tests {
         let w2 = f2.0.lock().unwrap();
         assert_eq!(w2.relaunched, vec![("c".to_string(), 2)], "exactly the unsettled relaunch, once");
         assert!(w2.exited.is_empty(), "the settled Exit does not run again");
+    }
+
+    #[test]
+    fn a_kill_between_a_settled_relaunch_and_its_feedback_does_not_strand_the_child_restarting() {
+        use crate::supervisor_program::Strategy;
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open_with(d.path(), Strategy::RestForOne), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
+        // The crash window: the exit is logged, the relaunch ran and settled,
+        // the host died before `Relaunched` was fed back.
+        let cmds = c.append_fold(SupMsg::Exit { child: "a".into(), now_ms: 2_000 }).unwrap();
+        let mut rep = RoundReport::default();
+        let mut p = f.clone();
+        for cmd in &cmds {
+            execute(&mut j, &mut p, cmd, &mut rep);
+        }
+        let want: Vec<(String, u64)> = vec![("a".into(), 2), ("b".into(), 2)];
+        assert_eq!(f.0.lock().unwrap().relaunched, want);
+        drop(c);
+        let f2 = Fake::default();
+        let mut c2 = open_with(d.path(), Strategy::RestForOne);
+        let mut p2 = f2.clone();
+        recover(&mut c2, &mut j, &mut p2).unwrap();
+        assert!(f2.0.lock().unwrap().relaunched.is_empty(), "nothing runs twice");
+        assert_eq!(c2.model.children["a"].state, ChildState::Running, "confirmed from the settled journal row");
+        assert_eq!(c2.model.children["b"].state, ChildState::Running);
+        // A second recovery over the now-complete log feeds nothing more.
+        let n = read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len();
+        drop(c2);
+        let mut c3 = open_with(d.path(), Strategy::RestForOne);
+        recover(&mut c3, &mut j, &mut f2.clone()).unwrap();
+        assert_eq!(read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len(), n, "a clean log grows by nothing");
     }
 
     #[test]
