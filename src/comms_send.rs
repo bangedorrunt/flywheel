@@ -216,7 +216,7 @@ pub fn task_envelope(
         causation: None,
         deadline_ts_us: None,
         lease_ms: None,
-        body: serde_json::to_value(task).map_err(|e| Reject::BadEnvelope(e.to_string()))?,
+        body: serde_json::to_value(task).map_err(|e| Reject::bad_envelope(e.to_string()))?,
     };
     env.validate()?;
     Ok(env)
@@ -666,17 +666,48 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
             (Err(e), _) => format!("skipped: herdr unavailable ({e})"),
             (Ok(c), Some(pin)) => match wake_target(c, &project, pin) {
                 Err(e) => format!("no-pane ({e:#})"),
+                // The doorbell's inbox host rings level-triggered with the ring
+                // budget and the deaf escalation. A sender ring on top of it
+                // would be a second, unbudgeted writer for the same mail.
                 Ok(target) => {
-                    let panes = crate::pane_write::HerdrPanes(c);
-                    match crate::mail_shim::block_on(ring(&store, &panes, &target, &row.npub)) {
-                        Ok(wm) => format!("rung wm {:x}", wm.0),
-                        Err(e) => format!("failed: {e:#}"),
+                    let ws = crate::find_workspace(c, &project).ok();
+                    if doorbell_owner(&project, ws.as_deref()).is_some() {
+                        "left to the doorbell host (budgeted, level-triggered)".to_string()
+                    } else {
+                        let panes = crate::pane_write::HerdrPanes(c);
+                        match crate::mail_shim::block_on(ring(&store, &panes, &target, &row.npub))
+                        {
+                            Ok(wm) => format!("rung wm {:x}", wm.0),
+                            Err(e) => format!("failed: {e:#}"),
+                        }
                     }
                 }
             },
         };
     }
     Ok(rows)
+}
+
+/// A live doorbell owner for this project's workspace (embedded or daemon
+/// host), by its lease: the writer that rings with a budget. `None` = nobody
+/// is hosting, so the sender's own ring is the only wake there is.
+pub fn doorbell_owner(project: &str, workspace: Option<&str>) -> Option<u32> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    doorbell_owner_in(&crate::config::state_dir(), project, workspace, now)
+}
+
+fn doorbell_owner_in(
+    state_dir: &std::path::Path,
+    project: &str,
+    workspace: Option<&str>,
+    now: u64,
+) -> Option<u32> {
+    doorbell_rt::lease::live_leases(state_dir, now)
+        .into_iter()
+        .find(|(ws, _)| ws == project || Some(ws.as_str()) == workspace)
+        .map(|(_, l)| l.pid)
 }
 
 fn wake_target(c: &mut crate::herdr_shim::Client, project: &str, pin: &str) -> Result<String> {
@@ -973,6 +1004,42 @@ mod tests {
             .unwrap();
         assert_eq!(other[0].state, "appended");
         assert_ne!(other[0].msg_id, first[0].msg_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cursor_the_host_reads_is_the_one_toron_next_commits() {
+        let store = mem_store().await;
+        let dir = tempfile::tempdir().unwrap();
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        append_task(&store, dir.path(), A, &rcpt, "c", "t-1", &task())
+            .await
+            .unwrap();
+        let (head, cursor) = crate::inbox_ports::head_and_cursor(&store, B).await;
+        assert!(head > 0 && cursor == 0, "unread mail: head {head} > cursor 0");
+        // The agent runs `toron next`: the cursor commits to the head.
+        let got = store.next(B, None, false).await.unwrap();
+        assert_eq!(got.items.len(), 1);
+        let (head2, cursor2) = crate::inbox_ports::head_and_cursor(&store, B).await;
+        assert_eq!((head2, cursor2), (head, head), "the ack is seen: cursor == head");
+        // The wrong key (the log's name) never sees it: the bug this pins.
+        assert_eq!(store.cursor(B, toron_core::inbox::INBOX_STREAM).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn a_live_doorbell_lease_means_the_sender_does_not_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000_000;
+        assert_eq!(doorbell_owner_in(dir.path(), "proj", None, now), None);
+        let me = std::process::id();
+        let lease = doorbell_rt::lease::acquire_lease(dir.path(), "proj", now).unwrap();
+        assert_eq!(lease.pid, me);
+        assert_eq!(doorbell_owner_in(dir.path(), "proj", None, now), Some(me));
+        // Another project's owner is not this project's writer.
+        assert_eq!(doorbell_owner_in(dir.path(), "other", None, now), None);
+        // The workspace name (a label that differs from the project) counts.
+        assert_eq!(doorbell_owner_in(dir.path(), "x", Some("proj"), now), Some(me));
+        // A wedged heartbeat is no owner: the sender falls back to ringing.
+        assert_eq!(doorbell_owner_in(dir.path(), "proj", None, now + 1000), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

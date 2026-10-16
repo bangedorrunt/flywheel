@@ -43,6 +43,8 @@ mod daemon;
 mod decide;
 mod doorbell;
 mod doorbell_host;
+mod inbox_host;
+mod inbox_ports;
 mod doorbell_tick;
 mod durable;
 mod durable_policy;
@@ -6024,6 +6026,47 @@ mod workspace_origin_tests {
     // `prime_via_send_text` for non-in-arg kinds, (c) the prime helper
     // itself must warn with the manual socket one-liner on final failure.
     #[test]
+    fn spawn_prime_is_launch_bootstrap_under_the_flag_and_ready_check_without() {
+        use pane_write::Harness;
+        assert_eq!(prime_choice(false, "pi"), PrimeChoice::LegacyReady);
+        assert_eq!(prime_choice(false, "claude"), PrimeChoice::LegacyReady);
+        assert_eq!(prime_choice(true, "pi"), PrimeChoice::Bootstrap(Harness::Pi));
+        assert_eq!(
+            prime_choice(true, "claude"),
+            PrimeChoice::Bootstrap(Harness::Claude)
+        );
+        assert_eq!(
+            prime_choice(true, "who-knows"),
+            PrimeChoice::Bootstrap(Harness::Other)
+        );
+        // The bootstrap is the closed per-harness constant, never the READY check.
+        let text = pane_write::launch_bootstrap(Harness::Pi);
+        assert!(text.contains("toron next") && !text.contains("READY"));
+        // Every spawn-path prime (spawn, add, re-launch) goes through the choice.
+        let src = include_str!("main.rs");
+        let call_lines =
+            |p: &str| src.lines().filter(|l| l.trim_start().starts_with(p)).count();
+        assert_eq!(
+            call_lines("prime_bootstrap("),
+            4,
+            "spawn (peer arm + plain arm) + add + re-launch"
+        );
+        assert_eq!(
+            call_lines("prime_via_send_text("),
+            0,
+            "no spawn path calls the legacy prime directly"
+        );
+        let a = src.find("\nfn prime_bootstrap_with(").unwrap();
+        let body = &src[a..a + src[a..].find("\n}\n").unwrap()];
+        assert!(
+            body.contains("PrimeChoice::Bootstrap(h) => {\n            pane_write::launch_bootstrap_into(c, pane_id, h);\n        }"),
+            "the flag arm goes through the PaneWrite sink: {body}"
+        );
+        let arm = concat!("=> prime_via", "_send_text(c, pane_id)");
+        assert_eq!(src.matches(arm).count(), 1);
+    }
+
+    #[test]
     fn add_prime_wired_into_add_path() {
         let src = include_str!("main.rs");
         let add = src.find("fn cmd_add(").expect("cmd_add present in main.rs");
@@ -6039,13 +6082,13 @@ mod workspace_origin_tests {
                     .find("if settle_secs > 0")
                     .expect("settle sleep in cmd_add")
                     < add_body
-                        .find("prime_via_send_text(&mut c, &prev)")
+                        .find("prime_bootstrap(&mut c, &prev, &kind)")
                         .expect("prime call in cmd_add"),
             "cmd_add must sleep the settle BEFORE priming (bd-umb3)"
         );
         // (b) the add path primes via the shared helper (not skipped)
         assert!(
-            add_body.contains("prime_via_send_text(&mut c, &prev);"),
+            add_body.contains("prime_bootstrap(&mut c, &prev, &kind);"),
             "cmd_add must invoke the retried boot prime for each new pane (bd-umb3)"
         );
         // (c) helper warns with the manual socket one-liner on final failure
@@ -6760,7 +6803,7 @@ mod spawn_boot_reliability_tests {
                 .find("verify_or_respawn_pane(")
                 .expect("verify call in cmd_spawn")
                 > spawn_body
-                    .find("prime_via_send_text(&mut c, &pane_id)")
+                    .find("prime_bootstrap(&mut c, &pane_id, &kind)")
                     .expect("prime call in cmd_spawn"),
             "cmd_spawn must verify the live process AFTER priming (bd-spawn-omp-boot-reliability-3h06)"
         );
@@ -7755,6 +7798,49 @@ fn needs_in_arg_prime(_kind: &str) -> bool {
 /// discovering `agent_not_ready` on the first send.
 fn prime_via_send_text(c: &mut Client, pane_id: &str) {
     prime_line_via_send_text(c, pane_id, boot_prime_line());
+}
+
+/// Phase 3: is the inbox comms path on (`TORON_COMMS_INBOX=1` or
+/// `[comms] inbox_log = true`)? Spawn-time and doorbell wiring branch on it.
+fn comms_inbox_on() -> bool {
+    toron_core::inbox::enabled()
+        || Config::load()
+            .map(|c| comms_send::enabled(&c))
+            .unwrap_or(false)
+}
+
+/// The spawn-time prime for pane `pane_id` running herdr kind `kind`. Flag on:
+/// the per-harness `PaneWrite::LaunchBootstrap` constant through the sink
+/// (pull contract: run `toron next`; no payload). Flag off: the legacy
+/// READY check, byte for byte as before.
+fn prime_bootstrap(c: &mut Client, pane_id: &str, kind: &str) {
+    prime_bootstrap_with(c, pane_id, kind, comms_inbox_on());
+}
+
+/// What the spawn-time prime does; pure so both arms are testable.
+#[derive(Debug, PartialEq, Eq)]
+enum PrimeChoice {
+    /// Flag on: `PaneWrite::LaunchBootstrap { harness }` through the sink.
+    Bootstrap(pane_write::Harness),
+    /// Flag off: the legacy READY check.
+    LegacyReady,
+}
+
+fn prime_choice(inbox: bool, kind: &str) -> PrimeChoice {
+    if inbox {
+        PrimeChoice::Bootstrap(pane_write::Harness::from_kind(kind))
+    } else {
+        PrimeChoice::LegacyReady
+    }
+}
+
+fn prime_bootstrap_with(c: &mut Client, pane_id: &str, kind: &str, inbox: bool) {
+    match prime_choice(inbox, kind) {
+        PrimeChoice::Bootstrap(h) => {
+            pane_write::launch_bootstrap_into(c, pane_id, h);
+        }
+        PrimeChoice::LegacyReady => prime_via_send_text(c, pane_id),
+    }
 }
 
 /// One typed prime line with retries. bd-peeraware-enametoolong-iswg:
@@ -8811,7 +8897,7 @@ fn verify_or_respawn_pane(
         // H2 / bd-umb3: re-prime (peer templates are their own prime; never
         // stack).
         if prime {
-            prime_via_send_text(c, pane_id);
+            prime_bootstrap(c, pane_id, kind);
         }
     }
 }
@@ -9492,6 +9578,11 @@ projects available: {}",
             if has_peer_prime {
                 // The peer template is its own prime — typed, never stacked.
                 prime_line_via_send_text(&mut c, &pane_id, &peer_args[0]);
+                // Phase 3 (flag on): the pane still needs the pull contract,
+                // so the per-harness LaunchBootstrap follows the template.
+                if comms_inbox_on() {
+                    prime_bootstrap(&mut c, &pane_id, &kind);
+                }
             } else {
                 // Identity first (mail identity + guard note), then the boot
                 // ready check (code-pointer gate keeps the boot-prime call).
@@ -9500,7 +9591,7 @@ projects available: {}",
                     &pane_id,
                     &doorbell::identity_prime(&name, identity),
                 );
-                prime_via_send_text(&mut c, &pane_id);
+                prime_bootstrap(&mut c, &pane_id, &kind);
             }
             // bd-spawn-omp-boot-reliability-3h06: post-boot dead-shell gate —
             // verify the pane holds a LIVE agent process (pane_agent_alive,
@@ -14247,7 +14338,7 @@ fn cmd_add(
                 // bd-umb3: retried prime — a transiently-busy pane must not
                 // silently stay unpromptable; on final failure the helper
                 // warns with the manual socket one-liner.
-                prime_via_send_text(&mut c, &prev);
+                prime_bootstrap(&mut c, &prev, &kind);
             }
             // bd-627z.4 / bd-add-missing-mail-identity-16le: the pin was
             // drawn + registered BEFORE the split; bind the pane identity

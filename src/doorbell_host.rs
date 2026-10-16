@@ -156,7 +156,11 @@ fn wake_outcome_to_brain(
         }
         // toron#17: a counted, audited gap (the consumer wrote the row); the
         // consumer is not dead and nothing reconnects.
-        WakeOutcome::EventsLost { .. } => fw.note_events_lost(),
+        WakeOutcome::EventsLost { .. } => {
+            fw.note_events_lost();
+            // Bindings are re-verified before any further ring.
+            crate::inbox_host::signal_invalidate(toron_core::inbox_program::Invalidate::EventsLost);
+        }
         WakeOutcome::Died => {
             doorbell_rt::msg::deliver_died_blocking(tx);
         }
@@ -375,6 +379,9 @@ impl RtHost {
                         // then exit so the next sweep re-subscribes.
                         eprintln!(
                             "flywheel doorbell: events_lost — clearing coverage and reconciling via session.snapshot"
+                        );
+                        crate::inbox_host::signal_invalidate(
+                            toron_core::inbox_program::Invalidate::EventsLost,
                         );
                         clear_covered(&covered_shared, &clear_ids);
                         reconcile_status_after_events_lost(
@@ -927,23 +934,37 @@ async fn run_embedded_async(
         generation.clone(),
     );
     let cfg_for_factory = cfg.clone();
-    sinks.add_sink_with_factory(
-        "herdr",
-        Box::new(HerdrPromptSink::new(
-            &cfg,
-            project,
-            workspace,
-            generation.clone(),
-        )),
-        move || {
+    // Dropped (stop + join) when this function returns.
+    let mut _inbox_guard: Option<crate::inbox_host::InboxHost> = None;
+    if crate::comms_send::enabled(&cfg) {
+        // Phase 3: the inbox host owns every pane write (wake line only, the
+        // real log watermark); the brain's text is dropped.
+        sinks.add_sink_with_factory("herdr", Box::new(doorbell_rt::NoTextSink::new()), || {
+            Box::new(doorbell_rt::NoTextSink::new())
+        });
+        _inbox_guard = Some(crate::inbox_host::InboxHost::spawn(
+            crate::inbox_ports::FlywheelPorts::new(&cfg, project, workspace),
+            crate::inbox_host::HostCfg::from_env(),
+        ));
+    } else {
+        sinks.add_sink_with_factory(
+            "herdr",
             Box::new(HerdrPromptSink::new(
-                &cfg_for_factory,
-                &fp,
-                &fw,
-                fgen.clone(),
-            ))
-        },
-    );
+                &cfg,
+                project,
+                workspace,
+                generation.clone(),
+            )),
+            move || {
+                Box::new(HerdrPromptSink::new(
+                    &cfg_for_factory,
+                    &fp,
+                    &fw,
+                    fgen.clone(),
+                ))
+            },
+        );
+    }
     let store = FileStore::new(config::state_dir());
     // Watch source: in-process bus watch first (zero fork), wake-sock fallback.
     // Both stamp the watchbeat (event/hb split, GS-062); the socket task goes
@@ -1565,6 +1586,21 @@ mod events_lost_tests {
             rx.try_recv().is_err(),
             "no death, nothing forwarded to the brain"
         );
+    }
+}
+
+#[cfg(test)]
+mod inbox_flag_tests {
+    #[test]
+    fn the_flag_arm_registers_no_text_sink_and_starts_the_inbox_host() {
+        let src = include_str!("doorbell_host.rs");
+        let a = src.find("if crate::comms_send::enabled(&cfg) {").unwrap();
+        let tail = &src[a..a + 1100];
+        let flag_arm = &tail[..tail.find("} else {").unwrap()];
+        assert!(flag_arm.contains("doorbell_rt::NoTextSink::new()"));
+        assert!(flag_arm.contains("InboxHost::spawn("));
+        assert!(!flag_arm.contains("HerdrPromptSink"), "no legacy sink under the flag");
+        assert!(tail.find("} else {").unwrap() < tail.find("HerdrPromptSink::new(").unwrap());
     }
 }
 
