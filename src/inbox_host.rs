@@ -806,6 +806,24 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_remembers_a_partially_read_cursor_so_it_is_not_mistaken_for_an_ack() {
+        let f = Fake::default();
+        set(&f, seen(9, 4, true)); // read up to 4 of 9
+        let mut core = Core::default();
+        let now = run(&mut core, &f, 2, 1_000);
+        assert_eq!(f.0.lock().unwrap().rings.len(), 2);
+        drop(core);
+        f.0.lock().unwrap().reverify = Some(bind(true));
+        let mut core2 = restarted(&f);
+        run(&mut core2, &f, 10, now);
+        assert_eq!(
+            f.0.lock().unwrap().rings.len() as u32,
+            MAX_RINGS,
+            "the same cursor is not an advance: the budget carries over"
+        );
+    }
+
+    #[test]
     fn a_restart_after_deaf_stays_quiet_and_never_re_escalates() {
         let f = Fake::default();
         set(&f, seen(4, 0, true));
