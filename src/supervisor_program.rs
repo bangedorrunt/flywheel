@@ -71,6 +71,40 @@ pub fn orphan_window_ms(lease_ms: u64) -> u64 {
     lease_ms.saturating_mul(2).max(ORPHAN_FLOOR_MS)
 }
 
+/// The window the host writes onto [`Policy::t_orphan_ms`]. `scale` is
+/// `FLYWHEEL_SUPERVISOR_CLOCK_SCALE` (1 outside a fixture). The fold does
+/// not read the environment. A scale of 1 is the real window. A fixture
+/// scale shrinks it so a test can pass `now_ms` without sleeping minutes.
+pub fn scaled_orphan_ms(lease_ms: u64, scale: u64) -> u64 {
+    let raw = orphan_window_ms(lease_ms);
+    (raw / scale.max(1)).max(1)
+}
+
+/// One `Adopt` for a dead lead, or nothing. Nothing before `t_orphan_ms`,
+/// nothing while the host's pid is alive, nothing for a crew, nothing twice.
+pub fn adopt_msg(model: &SupModel, child: &str, now_ms: u64, host_dead: bool) -> Option<SupMsg> {
+    if !host_dead || model.adopted.contains(child) {
+        return None;
+    }
+    let c = model.children.get(child)?;
+    if c.spec.kind != ChildKind::Lead || c.state != ChildState::Running {
+        return None;
+    }
+    if now_ms.saturating_sub(c.last_progress_ms) < model.policy.t_orphan_ms {
+        return None;
+    }
+    let sup_epoch = model.accepted_epoch.saturating_add(1);
+    if sup_epoch <= model.accepted_epoch {
+        return None;
+    }
+    Some(SupMsg::Adopt {
+        child: child.to_string(),
+        new_parent: model.me.clone(),
+        sup_epoch,
+        now_ms,
+    })
+}
+
 fn default_t_orphan_ms() -> u64 {
     orphan_window_ms(DEFAULT_LEASE_MS)
 }
@@ -453,6 +487,13 @@ pub struct SupModel {
     /// Task ids that have ended abnormally `poison` times. Not reassigned.
     #[serde(default)]
     pub parked_tasks: BTreeSet<String>,
+    /// Lead children already adopted. Stops a later round from bumping
+    /// `sup_epoch` again for the same death.
+    #[serde(default)]
+    pub adopted: BTreeSet<String>,
+    /// Escalate fact keys already spent as one `ChildEscalated`.
+    #[serde(default)]
+    pub escalated_facts: BTreeSet<String>,
 }
 
 impl SupModel {
@@ -483,6 +524,8 @@ impl SupModel {
             assignments: BTreeMap::new(),
             task_abnormal: BTreeMap::new(),
             parked_tasks: BTreeSet::new(),
+            adopted: BTreeSet::new(),
+            escalated_facts: BTreeSet::new(),
         }
     }
 
@@ -575,6 +618,10 @@ pub enum SupMsg {
         reason: String,
         /// Time.
         now_ms: u64,
+        /// Fact key, when this came from a lead's escalate file. The same
+        /// key is one restart. Direct messages omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fact_key: Option<String>,
     },
     /// A new parent takes an orphaned lead. Accepted only when the child is
     /// a lead, its last progress is at least `t_orphan_ms` old, and
@@ -1275,16 +1322,24 @@ impl Program for SupervisorProgram {
                 child,
                 reason: _,
                 now_ms,
+                fact_key,
             } => {
                 // Same slot as any abnormal end. A full window, including a
                 // captain's, escalates through `fail_subtree` instead of
-                // relaunching for free.
+                // relaunching for free. A fact key spends that slot once.
                 next.now_ms = next.now_ms.max(*now_ms);
-                if next
-                    .children
-                    .get(child)
-                    .is_some_and(|c| c.state == ChildState::Running)
+                let seen = fact_key
+                    .as_ref()
+                    .is_some_and(|k| next.escalated_facts.contains(k));
+                if !seen
+                    && next
+                        .children
+                        .get(child)
+                        .is_some_and(|c| c.state == ChildState::Running)
                 {
+                    if let Some(k) = fact_key.clone() {
+                        next.escalated_facts.insert(k);
+                    }
                     abnormal_end(&mut next, &mut cmds, child, *now_ms, true);
                 }
             }
@@ -1303,6 +1358,7 @@ impl Program for SupervisorProgram {
                     next.now_ms = next.now_ms.max(*now_ms);
                     next.accepted_epoch = *sup_epoch;
                     next.leader = new_parent.clone();
+                    next.adopted.insert(child.clone());
                 }
             }
             SupMsg::Cursor { child, cursor } => {
@@ -3404,6 +3460,7 @@ mod tests {
                 child: "plane".into(),
                 reason: "intensity".into(),
                 now_ms: 5_000,
+                fact_key: None,
             },
         );
         assert_eq!(m.restarts, vec![5_000]);
@@ -3451,6 +3508,7 @@ mod tests {
                     child: child.into(),
                     reason: "down".into(),
                     now_ms: t,
+                    fact_key: None,
                 },
             );
             assert_eq!(
@@ -3474,6 +3532,7 @@ mod tests {
                 child: "plane".into(),
                 reason: "down".into(),
                 now_ms: 90_000,
+                fact_key: None,
             },
         );
         assert_eq!(escalations(&c), 1);
