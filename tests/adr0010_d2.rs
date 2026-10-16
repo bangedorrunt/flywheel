@@ -8,12 +8,14 @@
 
 const WORKSPACE: &str = include_str!("../src/workspace.rs");
 
-/// D2 mint: the crew handler acks with a generation-bound watermark.
+/// D2 mint (retired): `Msg::WakeAck` had no sender outside tests; the only ack
+/// is the cursor `toron next` commits (bd-doorbell-daemon-sink-wake-only-yfqz).
+/// The variant must not come back as a second ack path.
 #[test]
-fn adr0010_d2_wake_ack_variant_present() {
+fn adr0010_d2_wake_ack_variant_is_retired() {
     assert!(
-        WORKSPACE.contains("WakeAck { pin") && WORKSPACE.contains("through_seq"),
-        "D2 (bd-8jlv): workspace.rs must define Msg::WakeAck {{ pin, through_seq }}"
+        !WORKSPACE.contains("WakeAck {"),
+        "Msg::WakeAck is deleted: the cursor is the one ack"
     );
 }
 
