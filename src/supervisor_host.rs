@@ -1954,6 +1954,10 @@ mod tests {
         assert!(body.contains("supervisor_hints::wait(&hint_rx"), "the loop waits on the hints");
         assert!(body.contains("supervisor_hints::Watcher::spawn("), "and something feeds them");
         assert!(body.contains("if hc.hints {"), "the off switch gates the watcher");
+        assert!(
+            body.contains("watched_paths(&index_db, &paths.inbox)"),
+            "the watcher covers toron's index and this context's own input file"
+        );
         assert!(!body.contains("thread::sleep(std::time::Duration::from_millis(hc.tick_ms))"), "no plain sleep left in the loop");
     }
 }
