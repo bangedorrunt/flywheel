@@ -592,15 +592,6 @@ pub enum Msg {
     SlaFired {
         posts: Vec<String>,
     },
-    /// ADR-0010 D2 (bd-8jlv): crew handler mints this after handling a
-    /// wake, citing the generation it handled. Presented wakes with
-    /// seq <= through_seq leave the shown set (handling fact);
-    /// anything newer re-presents at the next prompt. Idempotent:
-    /// duplicate or stale acks fold into the watermark via max.
-    WakeAck {
-        pin: String,
-        through_seq: u64,
-    },
     /// Transport death. Slice restarts the watch; model queues survive.
     WatchDied,
     /// Delegates to the swarm slice; guarantees a Cmd::Reclaim when the
@@ -1994,24 +1985,6 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             );
             next.doorbell = dm;
             cmds.extend(c);
-        }
-        Msg::WakeAck { pin, through_seq } => {
-            // ADR-0010 D2 (bd-8jlv): fold the generation-bound ack
-            // into the watermark (idempotent max — duplicate or stale
-            // acks change nothing) and drop handled presentations.
-            // Emits nothing: the ack is the handling fact, recorded
-            // in the Msg journal by the caller.
-            let mark = next.wake_acked.get(pin).copied().unwrap_or(0);
-            if *through_seq > mark {
-                next.wake_acked.insert(pin.clone(), *through_seq);
-            }
-            let watermark = next.wake_acked.get(pin).copied().unwrap_or(0);
-            if let Some(entries) = next.wake.shown.get_mut(pin) {
-                entries.retain(|e| e.seq > watermark);
-                if entries.is_empty() {
-                    next.wake.shown.remove(pin);
-                }
-            }
         }
         Msg::Reclaim {
             bead_id,
@@ -5380,122 +5353,6 @@ mod adr0010_d2_tests {
                 _ => None,
             })
             .collect()
-    }
-
-    #[test]
-    fn adr0010_d2_kill_between_present_and_ack_represents_once_more() {
-        let s = prompt_setup();
-        // Presentation: first wake prompts exactly once.
-        let (a, cmds1) = tick(&s, &fact("w1"));
-        let l1 = "[doorbell] plane-P urgent w1".to_string();
-        assert_eq!(prompts(&cmds1), vec![l1.clone()]);
-        assert_eq!(
-            a.wake.shown.get("P"),
-            Some(&vec![PresentedWake {
-                seq: 1,
-                line: l1.clone(),
-            }]),
-            "presentation binds the line to its generation"
-        );
-        // Kill + refold from the Msg log: identical state, identical cmds.
-        let (a2, cmds1b) = tick(&s, &fact("w1"));
-        assert_eq!(a, a2, "refold from Default reproduces the live model");
-        assert_eq!(cmds1, cmds1b, "refold reproduces the live Cmd sequence");
-        // Next prompt re-presents the unacked wake exactly once more.
-        let (b, cmds2) = tick(&a, &fact("w2"));
-        let l2 = "[doorbell] plane-P urgent w2".to_string();
-        let got = prompts(&cmds2);
-        assert_eq!(
-            got.iter().filter(|l| *l == &l1).count(),
-            1,
-            "unacked wake re-presents exactly once more: {got:?}"
-        );
-        assert!(got.contains(&l2), "new wake still prompts: {got:?}");
-        // Refolded path agrees on the re-presentation too.
-        let (b2, cmds2b) = tick(&a2, &fact("w2"));
-        assert_eq!(b, b2);
-        assert_eq!(cmds2, cmds2b);
-        // Ack through the latest generation clears the ledger.
-        let (c, ack_cmds) = tick(
-            &b,
-            &Msg::WakeAck {
-                pin: "P".into(),
-                through_seq: b.seq,
-            },
-        );
-        assert!(ack_cmds.is_empty(), "an ack emits nothing");
-        assert_eq!(c.wake_acked.get("P"), Some(&b.seq));
-        assert!(
-            !c.wake.shown.contains_key("P"),
-            "acked generations leave the shown set"
-        );
-        // After ack, the next prompt carries only the new wake.
-        let (_, cmds3) = tick(&c, &fact("w3"));
-        assert_eq!(
-            prompts(&cmds3),
-            vec!["[doorbell] plane-P urgent w3".to_string()]
-        );
-    }
-
-    #[test]
-    fn adr0010_d2_duplicate_and_stale_acks_are_noops() {
-        let setup = prompt_setup();
-        let (w1, _) = tick(&setup, &fact("w1"));
-        let (w1ack, _) = tick(
-            &w1,
-            &Msg::WakeAck {
-                pin: "P".into(),
-                through_seq: w1.seq,
-            },
-        );
-        assert!(!w1ack.wake.shown.contains_key("P"));
-        // Duplicate ack: same watermark, same empty ledger.
-        let (dup, cmds) = tick(
-            &w1ack,
-            &Msg::WakeAck {
-                pin: "P".into(),
-                through_seq: w1.seq,
-            },
-        );
-        assert_eq!(cmds, [] as [Cmd; 0]);
-        assert_eq!(
-            dup.wake.shown, w1ack.wake.shown,
-            "duplicate ack changes nothing"
-        );
-        assert_eq!(
-            dup.wake_acked, w1ack.wake_acked,
-            "duplicate ack changes nothing"
-        );
-        // Stale ack: through_seq below the watermark is ignored.
-        let (w2, _) = tick(&w1, &fact("w2"));
-        let (stale, _) = tick(
-            &w2,
-            &Msg::WakeAck {
-                pin: "P".into(),
-                through_seq: 1,
-            },
-        );
-        assert_eq!(
-            stale.wake.shown.get("P").map(Vec::len),
-            Some(2),
-            "stale ack must not clear newer presentations"
-        );
-        assert_eq!(stale.wake_acked.get("P"), Some(&1));
-    }
-
-    #[test]
-    fn adr0010_d2_unknown_pin_ack_is_harmless() {
-        let m = WorkspaceModel::default();
-        let (next, cmds) = tick(
-            &m,
-            &Msg::WakeAck {
-                pin: "Ghost".into(),
-                through_seq: 7,
-            },
-        );
-        assert_eq!(cmds, [] as [Cmd; 0]);
-        assert_eq!(next.wake_acked.get("Ghost"), Some(&7));
-        assert!(!next.wake.shown.contains_key("Ghost"));
     }
 
     #[test]
