@@ -45,6 +45,7 @@ mod doorbell;
 mod doorbell_host;
 mod inbox_host;
 mod inbox_ports;
+mod ring_ledger;
 mod supervisor_program;
 mod supervisor_host;
 mod doorbell_tick;
