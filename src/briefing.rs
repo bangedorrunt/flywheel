@@ -88,8 +88,8 @@ pub fn split_topology(t: &str) -> (&str, bool) {
 /// Toron's topology enum from the wire spelling. `swarm|loop|open|supervisor`
 /// parse; `join` and `none` do not (join is [`Proposal::join`], none is a
 /// decide word). Proposal fields stay `String` because `none` is stored and
-/// is not a [`toron_core::topology::Topology`] variant.
-#[cfg_attr(not(test), allow(dead_code))]
+/// is not a [`toron_core::topology::Topology`] variant. Spawn facts call this
+/// once; briefing JSON stays the wire strings.
 pub fn topology_enum(s: &str) -> Option<toron_core::topology::Topology> {
     toron_core::topology::Topology::parse(s)
 }
