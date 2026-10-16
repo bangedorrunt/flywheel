@@ -85,6 +85,15 @@ pub fn split_topology(t: &str) -> (&str, bool) {
     if t == "join" { ("swarm", true) } else { (t, false) }
 }
 
+/// Toron's topology enum from the wire spelling. `swarm|loop|open|supervisor`
+/// parse; `join` and `none` do not (join is [`Proposal::join`], none is a
+/// decide word). Proposal fields stay `String` because `none` is stored and
+/// is not a [`toron_core::topology::Topology`] variant. Spawn facts call this
+/// once; briefing JSON stays the wire strings.
+pub fn topology_enum(s: &str) -> Option<toron_core::topology::Topology> {
+    toron_core::topology::Topology::parse(s)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Alternative {
     pub topology: String,
@@ -861,6 +870,17 @@ fn splice_role_models(argv: &mut Vec<String>, specs: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topology_enum_parses_swarm_loop_open_and_supervisor_but_not_join() {
+        use toron_core::topology::Topology;
+        assert_eq!(topology_enum("swarm"), Some(Topology::Swarm));
+        assert_eq!(topology_enum("loop"), Some(Topology::Loop));
+        assert_eq!(topology_enum("open"), Some(Topology::Open));
+        assert_eq!(topology_enum("supervisor"), Some(Topology::Supervisor));
+        assert_eq!(topology_enum("join"), None);
+        assert_eq!(topology_enum("none"), None);
+    }
 
     /// bd-compose-plumbing-zdzi: an empty FLEET, not an anonymous caller —
     /// the fixture carries the arriving pin the way the CLI resolves it, so a

@@ -12980,6 +12980,11 @@ pub(crate) fn bind_pane_mail_identity(
                         "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
                     );
                 }
+                // Flag on only, after the toron_pin / toron_npub stamp. Records
+                // the two facts; nothing is appended and nothing is shelled.
+                if comms_inbox_on() && !npub.is_empty() {
+                    record_spawn_comms_facts(project, pin, &npub);
+                }
             }
             Err(e) => {
                 eprintln!("flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}")
@@ -13000,6 +13005,85 @@ pub(crate) fn bind_pane_mail_identity(
     }
     if let Err(e) = state::save_spawn_registry(project, &entries) {
         eprintln!("flywheel: cannot save spawn registry for {name}: {e:#}");
+    }
+}
+
+/// Bodies toron accepts for the two spawn facts: `context@1` is
+/// `{topology, gen}`, `role@1` is `{npub, role, gen}`. `context` is the
+/// envelope's context, not a body field. A topology word that is not the
+/// enum (`join`, `none`) becomes JSON null so it is not stored as one.
+pub(crate) fn spawn_facts(
+    context: &str,
+    topology: &str,
+    pin_npub: &str,
+    role: &str,
+    generation: u32,
+) -> [Value; 2] {
+    let topology = match briefing::topology_enum(topology) {
+        Some(t) => Value::String(t.as_str().to_string()),
+        None => Value::Null,
+    };
+    [
+        json!({
+            "contract": "context@1",
+            "context": context,
+            "body": { "topology": topology, "gen": generation }
+        }),
+        json!({
+            "contract": "role@1",
+            "context": context,
+            "body": { "npub": pin_npub, "role": role, "gen": generation }
+        }),
+    ]
+}
+
+/// After the pane stamp, under the comms flag only: say that `context@1`
+/// and `role@1` should be appended. Does not append and does not shell out.
+fn record_spawn_comms_facts(project: &str, pin: &str, npub: &str) {
+    let stored = state::load_session_topology(project).unwrap_or_default();
+    let (word, _) = briefing::split_topology(&stored);
+    // ponytail: the stamp has no decide row. Empty / `none` falls through to
+    // swarm because this only runs for a pane that was just spawned; a stored
+    // swarm|loop|open|supervisor (and join, via split_topology) is kept.
+    let topology = match briefing::topology_enum(word) {
+        Some(t) => t.as_str(),
+        None => "swarm",
+    };
+    let role = if state::load_captain_alias(project).as_deref() == Some(pin) {
+        "captain"
+    } else {
+        "crew"
+    };
+    let facts = spawn_facts(project, topology, npub, role, 1);
+    eprintln!(
+        "flywheel: comms context@1 and role@1 pending append for {pin} (not sent): {}",
+        serde_json::to_string(&facts).unwrap_or_default()
+    );
+}
+
+#[cfg(test)]
+mod spawn_facts_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_facts_are_context_and_role_bodies() {
+        let npub = "ab".repeat(32);
+        let [context, role] = spawn_facts("proj", "swarm", &npub, "crew", 3);
+        assert_eq!(context["contract"], "context@1");
+        assert_eq!(context["context"], "proj");
+        assert_eq!(context["body"]["topology"], "swarm");
+        assert_eq!(context["body"]["gen"], 3);
+        assert!(context["body"].get("npub").is_none());
+        assert_eq!(role["contract"], "role@1");
+        assert_eq!(role["context"], "proj");
+        assert_eq!(role["body"]["npub"], npub);
+        assert_eq!(role["body"]["role"], "crew");
+        assert_eq!(role["body"]["gen"], 3);
+        assert!(role["body"].get("topology").is_none());
+        let [join_ctx, _] = spawn_facts("proj", "join", &npub, "crew", 1);
+        assert!(join_ctx["body"]["topology"].is_null());
+        let [sup, _] = spawn_facts("proj", "supervisor", &npub, "crew", 1);
+        assert_eq!(sup["body"]["topology"], "supervisor");
     }
 }
 
