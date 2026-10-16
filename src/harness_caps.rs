@@ -34,10 +34,26 @@ impl HarnessCaps {
 
 /// Harnesses this repo already names. None are verified capable.
 pub const TABLE: &[HarnessCaps] = &[
-    HarnessCaps { harness: "opencode", hook: None, verified_by: None },
-    HarnessCaps { harness: "pi", hook: None, verified_by: None },
-    HarnessCaps { harness: "grok", hook: None, verified_by: None },
-    HarnessCaps { harness: "omp", hook: None, verified_by: None },
+    HarnessCaps {
+        harness: "opencode",
+        hook: None,
+        verified_by: None,
+    },
+    HarnessCaps {
+        harness: "pi",
+        hook: None,
+        verified_by: None,
+    },
+    HarnessCaps {
+        harness: "grok",
+        hook: None,
+        verified_by: None,
+    },
+    HarnessCaps {
+        harness: "omp",
+        hook: None,
+        verified_by: None,
+    },
 ];
 
 /// Static hook body. Contains [`HOOK_REASON`] and `toron next --urgent --peek`.
@@ -48,6 +64,9 @@ pub fn hook_script() -> &'static str {
 
 /// Append the marked hook block to `existing`. Does not touch other lines.
 pub fn install_block(existing: &str) -> String {
+    if existing.contains(HOOK_START) && existing.contains(HOOK_END) {
+        return existing.to_string();
+    }
     let mut out = String::new();
     out.push_str(existing);
     if !existing.is_empty() && !existing.ends_with('\n') {
@@ -128,6 +147,10 @@ mod tests {
         let fixture = "operator hook before\noperator hook after\n";
         assert_eq!(uninstall_block(&install_block(fixture)), fixture);
         assert_eq!(uninstall_block(fixture), fixture);
+        assert_eq!(
+            install_block(&install_block(fixture)),
+            install_block(fixture)
+        );
     }
 
     #[test]
