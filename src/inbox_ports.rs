@@ -352,14 +352,17 @@ pub(crate) async fn urgency_of_head(store: &InboxStore, npub: &str, head: u64) -
 ///
 /// The fold always names the normal wake line; this checks that and then
 /// types from `urgency`, which the caller took from the head envelope. An
-/// urgent head is an interrupt and the urgent line, not the normal line. A
-/// normal head is the normal line only. One call is one wake.
+/// urgent head is the urgent line. `interrupt` adds Escape before that
+/// line. A hook-capable pane passes `interrupt = false`: the ring stays,
+/// the next tool call is the hook's job. A normal head is the normal line
+/// only. One call is one wake.
 pub(crate) fn ring_wake(
     typer: &dyn crate::pane_write::PaneTyper,
     pane_id: &str,
     wm: u64,
     line: &str,
     urgency: Urgency,
+    interrupt: bool,
 ) -> Result<(), String> {
     use crate::pane_write::{PaneWrite, Urgency as U, Wm};
     let normal = crate::pane_write::wake_line(Wm(wm), U::Normal);
@@ -370,8 +373,10 @@ pub(crate) fn ring_wake(
     }
     match urgency {
         Urgency::Urgent => {
-            crate::pane_write::write(typer, pane_id, &PaneWrite::Interrupt)
-                .map_err(|e| e.to_string())?;
+            if interrupt {
+                crate::pane_write::write(typer, pane_id, &PaneWrite::Interrupt)
+                    .map_err(|e| e.to_string())?;
+            }
             crate::pane_write::write(
                 typer,
                 pane_id,
@@ -480,12 +485,20 @@ impl Ports for FlywheelPorts {
     fn ring(&mut self, npub: &str, pane_id: &str, wm: u64, line: &str) -> Result<(), String> {
         let client = self.client().ok_or("herdr unreachable")?;
         let urgency = self.urgencies.get(npub).copied().unwrap_or(Urgency::Normal);
+        let kind = crate::state::load_spawn_registry(&self.project)
+            .into_iter()
+            .find(|e| e.pane_id == pane_id)
+            .and_then(|e| e.harness)
+            .unwrap_or_default();
+        let interrupt =
+            crate::harness_caps::interrupt_for(&kind, crate::harness_caps::installed_from_env());
         ring_wake(
             &crate::pane_write::HerdrPanes(&client),
             pane_id,
             wm,
             line,
             urgency,
+            interrupt,
         )
     }
 
@@ -676,6 +689,7 @@ mod tests {
             7,
             &fold_line(7),
             urgency_of_envelope(&urgent),
+            true,
         )
         .unwrap();
         ring_wake(
@@ -684,6 +698,7 @@ mod tests {
             8,
             &fold_line(8),
             urgency_of_envelope(&notify),
+            true,
         )
         .unwrap();
         let writes = pane.0.lock().unwrap().clone();
