@@ -25,12 +25,12 @@
 //! A steer is a `steer@1` envelope (`op`, `priority`, optional `delta`,
 //! `sup_epoch`). `priority` is `urgent` unless the op is `resume` (the same
 //! rule the fold uses). The doorbell reads that field and rings; this host
-//! only appends. `sup_epoch` is the lead epoch the fold passes. Callers with
-//! no epoch pass `0`: toron accepts any steer while the context has no
-//! `lead@1` row, and fences to that row once one exists. An escalation is
-//! `escalate@1` (`context`, `reason`, `evidence`). `Assign` stays log-only
-//! and does not append `task@1`. A steer that was already sent as `notify@1`
-//! is not re-sent; a restart resolves it.
+//! only appends. When `inbox_lead` can be read, `sup_epoch` is the epoch
+//! toron stored on `lead@1`. `FLYWHEEL_SUPERVISOR_EPOCH=fold` keeps the
+//! fold's counter and writes no lead fact. An escalation is `escalate@1`
+//! (`context`, `reason`, `evidence`). `Assign` stays log-only and does not
+//! append `task@1`. A steer the log already appended is not sent again; a
+//! restart resolves one that is still pending.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read as _, Write as _};
@@ -269,17 +269,31 @@ impl Core {
         Ok(core)
     }
 
-    /// Claim the next epoch for `holder`.
+    /// Claim the next epoch from the fold (`accepted_epoch + 1`).
+    ///
+    /// This runs only while the fold is the authority (`FLYWHEEL_SUPERVISOR_EPOCH=fold`,
+    /// or `inbox_lead` cannot be read). Startup uses [`claim_for_host`] when
+    /// the store is the authority, so the two counters never both assign.
     pub fn claim(&mut self, holder: &str) -> Result<u64> {
+        let e = self.model.accepted_epoch + 1;
+        self.claim_stored(holder, e)
+    }
+
+    /// Record a `sup_epoch` toron already stored. The fold does not add one.
+    /// A number at or below the accepted epoch is logged and refused.
+    pub fn claim_stored(&mut self, holder: &str, sup_epoch: u64) -> Result<u64> {
         if self.model.me != holder {
             self.append_fold(SupMsg::Rebind { me: holder.into() })?;
         }
-        let e = self.model.accepted_epoch + 1;
         self.append_fold(SupMsg::Claim {
             holder: holder.into(),
-            sup_epoch: e,
+            sup_epoch,
         })?;
-        Ok(e)
+        if self.model.accepted_epoch == sup_epoch && self.model.leader == holder {
+            Ok(sup_epoch)
+        } else {
+            bail!("fold refused lead epoch {sup_epoch}")
+        }
     }
 
     fn append_fold(&mut self, m: SupMsg) -> Result<Vec<SupCmd>> {
@@ -312,9 +326,9 @@ impl Core {
 /// `priority` is `urgent` when the fold would treat the steer as urgent
 /// (`op != resume`), otherwise `normal`. `delta` is the 4b.4 object on
 /// `redirect` and is omitted for every other op. `ack_by` is omitted: this
-/// host does not put a deadline on the envelope. `sup_epoch` is the caller's
-/// lead epoch; pass `0` when there is none (no `lead@1` row accepts any
-/// steer; a row fences later appends to that epoch).
+/// host does not put a deadline on the envelope. `sup_epoch` is the epoch
+/// the caller holds. `0` is valid only while the context has no `lead@1`
+/// row; once a row exists toron refuses any other.
 pub(crate) fn steer_v1(
     s: &SteerSend,
     delta: Option<&crate::steer_delta::Delta>,
@@ -613,6 +627,33 @@ pub fn recover(
     let mut rep = RoundReport::default();
     let mut follow = Vec::new();
     for c in &cmds {
+        // The log already recorded this append (a `steer@1`, or a notify from
+        // before that contract). Do not send another envelope. A still-pending
+        // steer is closed when its child restarts (`AppliedByRestart`).
+        if let SupCmd::AppendSteer { seq, .. } = c
+            && core
+                .model
+                .steers
+                .get(seq)
+                .is_some_and(|s| s.offset.is_some())
+        {
+            let key = key_of(c);
+            match j.begin(&key) {
+                Begin::Skip => rep.skipped += 1,
+                Begin::Run(g) => {
+                    j.finish(&key, g, true);
+                    rep.skipped += 1;
+                }
+                Begin::Unavailable(why) => {
+                    rep.failed += 1;
+                    follow.push(SupMsg::CmdFailed {
+                        key,
+                        why: format!("journal unavailable: {why}"),
+                    });
+                }
+            }
+            continue;
+        }
         let fed = execute(j, ports, c, &mut rep);
         // `execute` returns nothing for a Relaunch only when the journal skipped
         // it (a run feeds back `Relaunched` or `CmdFailed`). A settled relaunch is skipped, but if the host
@@ -1094,6 +1135,59 @@ fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
+/// Startup claim. The store is the authority when `inbox_lead` can be read,
+/// unless `FLYWHEEL_SUPERVISOR_EPOCH=fold`. The fold's counter runs only on
+/// the other side of that gate.
+fn claim_for_host(core: &mut Core, project: &str, me: &str) -> Result<u64> {
+    let forced = std::env::var("FLYWHEEL_SUPERVISOR_EPOCH").ok();
+    let opened = crate::comms_send::store()
+        .ok()
+        .map(|store| store.with_operator(crate::inbox_ports::system_producer(project)));
+    let readable = match &opened {
+        Some(store) => crate::mail_shim::block_on(store.lead_of(project)).is_ok(),
+        None => false,
+    };
+    if forced.as_deref() == Some("toron") && (opened.is_none() || !readable) {
+        bail!("FLYWHEEL_SUPERVISOR_EPOCH=toron but inbox_lead cannot be read");
+    }
+    match crate::lead_claim::epoch_authority(forced.as_deref(), readable) {
+        crate::lead_claim::EpochAuthority::Fold => core.claim(me),
+        crate::lead_claim::EpochAuthority::Toron => {
+            let store = opened.context("comms store required for a lead claim")?;
+            let step = crate::mail_shim::block_on(crate::lead_claim::sync_lead(
+                &store,
+                project,
+                me,
+                core.model.accepted_epoch,
+            ));
+            apply_lead(core, me, step)
+        }
+    }
+}
+
+/// Fold the epoch [`crate::lead_claim::sync_lead`] returned. A stale or
+/// pending refusal is logged as the fold's own reject and does not move
+/// `accepted_epoch`.
+pub(crate) fn apply_lead(
+    core: &mut Core,
+    holder: &str,
+    step: Result<crate::lead_claim::LeadStep, crate::lead_claim::LeadError>,
+) -> Result<u64> {
+    use crate::lead_claim::LeadError;
+    match step {
+        Ok(
+            crate::lead_claim::LeadStep::CatchUp(epoch)
+            | crate::lead_claim::LeadStep::Appended(epoch),
+        ) => core.claim_stored(holder, epoch),
+        Err(LeadError::Stale | LeadError::Pending) => {
+            let current = core.model.accepted_epoch;
+            let _ = core.claim_stored(holder, current);
+            bail!("toron refused the lead claim")
+        }
+        Err(LeadError::Store(e)) => bail!("{e}"),
+    }
+}
+
 /// `loop-mode supervise` under the comms flag: the same cadence, rehosted
 /// on [`SupervisorProgram`]. Returns when the supervisor failed (intensity
 /// exceeded: escalated, subtree cancelled) or was superseded.
@@ -1154,7 +1248,7 @@ fn host_loop(
     lease: &mut doorbell_rt::lease::OwnerLease,
 ) -> Result<()> {
     let mut core = Core::open(paths.clone(), me, Tier::Lead, hc.policy())?;
-    let epoch = core.claim(me)?;
+    let epoch = claim_for_host(&mut core, project, me)?;
     let mut journal = ToronEffectJournal::open(
         &format!("supervise:{}", crate::state::state_key(project)),
         me,
@@ -1598,6 +1692,120 @@ mod tests {
         let mut c = Core::open(paths, "lead-1", Tier::Lead, None).unwrap();
         c.claim("lead-1").unwrap();
         c
+    }
+
+    #[test]
+    fn lead_epoch_a_refused_store_claim_does_not_move_the_fold() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = open(d.path());
+        let before = c.model.accepted_epoch;
+        let err = apply_lead(&mut c, "lead-1", Err(crate::lead_claim::LeadError::Stale));
+        assert!(err.is_err());
+        assert_eq!(c.model.accepted_epoch, before);
+        assert!(c.model.rejects >= 1);
+        let (msgs, _, _) = read_log(&CtxPaths::new(d.path(), "proj")).unwrap();
+        let (replayed, cmds) = crate::supervisor_program::replay(&msgs);
+        assert_eq!(replayed.accepted_epoch, before);
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            SupCmd::Reject {
+                cause: crate::supervisor_program::RejectCause::StaleEpoch,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lead_epoch_the_fold_records_the_epoch_toron_stored() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = dir.join("index.sqlite");
+        let pool = toron_core::index::schema::connect(&db.to_string_lossy())
+            .await
+            .unwrap();
+        toron_core::index::schema::migrate(&pool).await.unwrap();
+        let store = toron_core::inbox::InboxStore::new(pool)
+            .with_operator(crate::inbox_ports::system_producer("proj"));
+        crate::lead_claim::append_lead_at(&store, "proj", "other", 7)
+            .await
+            .unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let mut c =
+            Core::open(CtxPaths::new(d.path(), "proj"), "lead-1", Tier::Lead, None).unwrap();
+        assert_eq!(c.model.accepted_epoch, 0);
+        let step = crate::lead_claim::sync_lead(&store, "proj", "lead-1", 0)
+            .await
+            .unwrap();
+        let epoch = apply_lead(&mut c, "lead-1", Ok(step)).unwrap();
+        assert_eq!(epoch, 8);
+        assert_eq!(c.model.accepted_epoch, 8);
+        assert_eq!(store.lead_of("proj").await.unwrap().unwrap().sup_epoch, 8);
+    }
+
+    #[test]
+    fn lead_epoch_recover_does_not_resend_a_steer_the_log_already_appended() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
+        let epoch = c.model.accepted_epoch;
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Control {
+                op: SteerOp::Redirect,
+                child: "a".into(),
+                sup_epoch: epoch,
+                delta_sha: Some(D.into()),
+                now_ms: 2_000,
+            }],
+            2_000,
+        );
+        assert_eq!(f.0.lock().unwrap().steers.len(), 1);
+        assert!(c.model.steers.values().any(|s| s.offset.is_some()));
+        let mut fresh = MemJournal::default();
+        recover(&mut c, &mut fresh, &mut f.clone()).unwrap();
+        assert_eq!(
+            f.0.lock().unwrap().steers.len(),
+            1,
+            "a steer the log already appended is not sent again"
+        );
+    }
+
+    #[test]
+    fn lead_epoch_store_stale_and_the_fold_reject_are_one_cause() {
+        let err =
+            toron_core::inbox::InboxError::Reject(toron_core::delivery::Reject::StaleSupEpoch {
+                sent: 0,
+                current: 1,
+            });
+        assert_eq!(
+            crate::lead_claim::store_reject_cause(&err),
+            Some(crate::supervisor_program::RejectCause::StaleEpoch)
+        );
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Control {
+                op: SteerOp::Cancel,
+                child: "a".into(),
+                sup_epoch: 0,
+                delta_sha: None,
+                now_ms: 2_000,
+            }],
+            2_000,
+        );
+        let tags: Vec<_> =
+            f.0.lock()
+                .unwrap()
+                .rejects
+                .iter()
+                .map(|(_, tag)| tag.clone())
+                .collect();
+        assert_eq!(tags, vec!["stale_epoch".to_string()]);
     }
 
     fn spawn(id: &str) -> SupMsg {
