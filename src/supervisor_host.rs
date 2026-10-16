@@ -97,6 +97,8 @@ pub struct SteerSend {
     pub sup_epoch: u64,
     /// Interrupt and ring as well.
     pub urgent: bool,
+    /// sha256 of the redirect's delta; its bytes are in the side store.
+    pub delta_sha: Option<String>,
 }
 
 // ---- the context log ------------------------------------------------------
@@ -299,6 +301,22 @@ impl Core {
 
 // ---- executing commands ---------------------------------------------------
 
+/// The mail body of a steer: the line that names the op (and, for a redirect,
+/// the generation to re-claim at), then the delta when there is one.
+pub(crate) fn steer_body(s: &SteerSend, delta: Option<&crate::steer_delta::Delta>) -> String {
+    crate::steer_delta::body(
+        &format!(
+            "steer {} on {} (seq {}, generation {}, sup_epoch {}) — run: toron next",
+            s.op.tag(),
+            s.child,
+            s.seq,
+            s.generation,
+            s.sup_epoch
+        ),
+        delta,
+    )
+}
+
 /// Ring an urgent steer: an `Interrupt`, then the `URGENT steer (wm N)` wake
 /// line, but only if this is the first wake for `(npub, wm)` across both
 /// hosts. Returns whether it rang. At-most-once: a re-run of the durable
@@ -372,6 +390,7 @@ pub fn execute(
             generation,
             sup_epoch,
             urgent,
+            delta_sha,
         } => ports
             .append_steer(&SteerSend {
                 seq: *seq,
@@ -380,6 +399,7 @@ pub fn execute(
                 generation: *generation,
                 sup_epoch: *sup_epoch,
                 urgent: *urgent,
+                delta_sha: delta_sha.clone(),
             })
             .map(|offset| vec![SupMsg::SteerAppended { seq: *seq, offset }]),
         SupCmd::Escalate {
@@ -787,14 +807,16 @@ impl Ports for LivePorts {
     }
 
     fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {
-        let text = format!(
-            "steer {} on {} (seq {}, generation {}, sup_epoch {}) — run: toron next",
-            s.op.tag(),
-            s.child,
-            s.seq,
-            s.generation,
-            s.sup_epoch
-        );
+        // The delta comes from the side store by sha and is refused unless its
+        // bytes hash to that sha; it goes in the mail BODY, never a pane.
+        let delta = match &s.delta_sha {
+            Some(sha) => Some(
+                crate::steer_delta::load(&CtxPaths::default_dir(), &self.project, sha)
+                    .map_err(|e| format!("{e:#}"))?,
+            ),
+            None => None,
+        };
+        let text = steer_body(s, delta.as_ref());
         let offset =
             self.inbox
                 .append_notify(&s.child, text, &format!("steer:{}", s.seq), s.generation)?;
@@ -1152,6 +1174,10 @@ pub enum SupervisorCmd {
         /// The sup_epoch the sender holds (default: the log's accepted one).
         #[arg(long)]
         sup_epoch: Option<u64>,
+        /// redirect only: a JSON file with the typed delta (goal, acceptance,
+        /// scope.paths, priority, budget), at most 8 KiB.
+        #[arg(long)]
+        delta_file: Option<PathBuf>,
     },
     /// Print the CrewView from the log (read-only; replays it).
     View {
@@ -1198,9 +1224,24 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
             child,
             op,
             sup_epoch,
+            delta_file,
         } => {
             let p = CtxPaths::new(&CtxPaths::default_dir(), project);
             let op = parse_op(op)?;
+            // Validate and stash the delta BEFORE queueing the steer: a bad
+            // file queues nothing.
+            let delta_sha = match (op, delta_file) {
+                (SteerOp::Redirect, Some(f)) => {
+                    let raw = std::fs::read(f).with_context(|| format!("read {}", f.display()))?;
+                    let d = crate::steer_delta::parse(&raw)?;
+                    Some(crate::steer_delta::store(&CtxPaths::default_dir(), project, &d)?)
+                }
+                (SteerOp::Redirect, None) => {
+                    bail!("a redirect needs --delta-file (the new goal, as JSON); nothing queued")
+                }
+                (_, Some(_)) => bail!("--delta-file is for redirect only; nothing queued"),
+                (_, None) => None,
+            };
             let epoch = match sup_epoch {
                 Some(e) => *e,
                 None => {
@@ -1214,6 +1255,7 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
                     op,
                     child: child.clone(),
                     sup_epoch: epoch,
+                    delta_sha,
                     now_ms: now_ms(),
                 },
             )?;
@@ -1255,6 +1297,9 @@ fn print_view(m: &SupModel, rows: &[CrewRow]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A well-formed delta sha for tests that only need one.
+    const D: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::supervisor_program::{ChildState, SteerState, Status};
     use std::sync::{Arc, Mutex};
 
@@ -1455,7 +1500,13 @@ mod tests {
         let (mut c, mut j, f) = (open(d), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
         let epoch = c.model.accepted_epoch;
-        let ctl = SupMsg::Control { op: SteerOp::Redirect, child: "a".into(), sup_epoch: epoch, now_ms: 2_000 };
+        let ctl = SupMsg::Control {
+            op: SteerOp::Redirect,
+            child: "a".into(),
+            sup_epoch: epoch,
+            delta_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            now_ms: 2_000,
+        };
         go(&mut c, &mut j, &f, vec![ctl], 2_000);
         assert_eq!(c.model.steers[&1].state, SteerState::Pending);
         (c, j, f)
@@ -1532,6 +1583,99 @@ mod tests {
         unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_HINTS") };
     }
 
+    // ---- 4b.4: the delta rides the mail body, never the pane
+
+    fn send(op: SteerOp, sha: Option<&str>) -> SteerSend {
+        SteerSend { seq: 1, child: "a".into(), op, generation: 2, sup_epoch: 2, urgent: true, delta_sha: sha.map(Into::into) }
+    }
+
+    #[test]
+    fn a_redirect_delta_lands_in_the_mail_body_with_a_matching_hash_and_the_pane_sees_only_the_wake() {
+        let delta = crate::steer_delta::parse(br#"{"goal":"port the parser to the new AST","acceptance":"cargo test"}"#).unwrap();
+        let s = send(SteerOp::Redirect, Some(&delta.sha));
+        let body = steer_body(&s, Some(&delta));
+        assert!(body.contains("steer redirect on a (seq 1, generation 2, sup_epoch 2)"));
+        let (sha, json) = crate::steer_delta::delta_in_body(&body).expect("the delta is in the body");
+        assert_eq!(sha, delta.sha);
+        assert_eq!(crate::steer_delta::sha_hex(json.as_bytes()), delta.sha, "body hash == logged sha");
+        // Ring it: the pane gets an interrupt and the wake line, nothing else.
+        let d = tempfile::tempdir().unwrap();
+        let l = crate::ring_ledger::RingLedger::new(d.path().join("rings"));
+        let p = RecPane::default();
+        assert!(ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap());
+        let writes = p.0.lock().unwrap().clone();
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        assert!(writes[0].contains("keys"), "{writes:?}");
+        assert!(writes[1].contains("URGENT steer (wm 7)"), "{writes:?}");
+        for w in &writes {
+            assert!(!w.contains("port the parser") && !w.contains("cargo test") && !w.contains(&delta.sha), "no payload in a pane: {w}");
+        }
+    }
+
+    #[test]
+    fn a_steer_without_a_delta_has_the_plain_one_line_body() {
+        let b = steer_body(&send(SteerOp::Pause, None), None);
+        assert_eq!(b.lines().count(), 1);
+        assert!(crate::steer_delta::delta_in_body(&b).is_none());
+    }
+
+    fn steer_cmd(op: &str, delta_file: Option<PathBuf>) -> SupervisorCmd {
+        SupervisorCmd::Steer { project: "proj".into(), child: "a".into(), op: op.into(), sup_epoch: Some(2), delta_file }
+    }
+
+    fn queued() -> String {
+        std::fs::read_to_string(CtxPaths::new(&CtxPaths::default_dir(), "proj").inbox).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_cli_validates_the_delta_first_and_a_bad_one_queues_nothing() {
+        let _g = crate::config::lock_env();
+        let d = tempfile::tempdir().unwrap();
+        let w = |name: &str, body: &[u8]| {
+            let p = d.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        // No file: refused.
+        assert!(run_cli(&steer_cmd("redirect", None)).is_err());
+        // Unknown key, wrong shape, not JSON, too big: refused.
+        for (n, b) in [
+            ("k.json", br#"{"goal":"x","rm":"-rf"}"#.to_vec()),
+            ("s.json", br#"{"goal":5}"#.to_vec()),
+            ("j.json", b"nope".to_vec()),
+            ("big.json", format!(r#"{{"goal":"{}"}}"#, "a".repeat(9000)).into_bytes()),
+        ] {
+            assert!(run_cli(&steer_cmd("redirect", Some(w(n, &b)))).is_err(), "{n}");
+        }
+        // A file on another op: refused.
+        assert!(run_cli(&steer_cmd("pause", Some(w("ok.json", br#"{"goal":"x"}"#)))).is_err());
+        assert_eq!(queued(), "", "nothing was queued by any refused call");
+        assert!(!CtxPaths::default_dir().join(format!("{}.deltas", crate::state::state_key("proj"))).exists(), "and nothing stashed");
+    }
+
+    #[test]
+    fn a_good_delta_is_stashed_owner_only_and_the_input_names_only_its_sha() {
+        let _g = crate::config::lock_env();
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("d.json");
+        std::fs::write(&f, br#"{"scope":{"paths":["src/x.rs"]},"goal":"secret-ish goal text"}"#).unwrap();
+        run_cli(&steer_cmd("redirect", Some(f))).unwrap();
+        let line = queued();
+        let m: SupMsg = serde_json::from_str(line.trim()).unwrap();
+        let SupMsg::Control { op: SteerOp::Redirect, delta_sha: Some(sha), .. } = m else { panic!("{line}") };
+        assert!(!line.contains("secret-ish"), "the input file carries the sha, not the delta");
+        let got = crate::steer_delta::load(&CtxPaths::default_dir(), "proj", &sha).unwrap();
+        assert_eq!(got.sha, sha);
+        #[cfg(unix)]
+        {
+            let dir = CtxPaths::default_dir().join(format!("{}.deltas", crate::state::state_key("proj")));
+            assert_eq!(crate::private_fs::mode_of(&dir), 0o700);
+            assert_eq!(crate::private_fs::mode_of(&dir.join(format!("{sha}.json"))), 0o600);
+        }
+        // Other ops still queue without a file.
+        run_cli(&steer_cmd("cancel", None)).unwrap();
+    }
+
     #[test]
     fn a_kill_at_any_point_replays_to_the_same_model_and_view() {
         let d = tempfile::tempdir().unwrap();
@@ -1546,7 +1690,7 @@ mod tests {
                 op: SteerOp::Redirect,
                 child: "a".into(),
                 sup_epoch: epoch,
-                now_ms: 2_000,
+                delta_sha: Some(D.into()), now_ms: 2_000,
             }],
             2_000,
         );
@@ -1638,7 +1782,7 @@ mod tests {
             &mut c,
             &mut j,
             &f,
-            vec![SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: e, now_ms: 2_000 }],
+            vec![SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: e, delta_sha: None, now_ms: 2_000 }],
             2_000,
         );
         let s = f.0.lock().unwrap().steers.clone();
@@ -1662,7 +1806,7 @@ mod tests {
         c.claim("lead-1").unwrap(); // epoch 2
         append_input(
             c.paths(),
-            &SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: 1, now_ms: 2_000 },
+            &SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: 1, delta_sha: None, now_ms: 2_000 },
         )
         .unwrap();
         go(&mut c, &mut j, &f, vec![], 2_000);
