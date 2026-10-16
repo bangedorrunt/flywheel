@@ -472,8 +472,9 @@ pub fn recover(
         // it (a run feeds back `Relaunched` or `CmdFailed`). A settled relaunch is skipped, but if the host
         // died before `Relaunched` was logged the child would sit `Restarting`
         // until its lease ran out (and then be restarted again, spending the
-        // budget). The settled row IS the confirmation: feed it, only while
-        // the model is still waiting for it (so a clean log grows by nothing).
+        // budget). The settled row IS the confirmation: feed it, and only while
+        // the model is still waiting for it (defence in depth: the fold ignores
+        // a confirmation that is not current anyway).
         if fed.is_empty()
             && let SupCmd::Relaunch { child, generation } = c
             && core
@@ -1389,12 +1390,13 @@ mod tests {
         assert!(f2.0.lock().unwrap().relaunched.is_empty(), "nothing runs twice");
         assert_eq!(c2.model.children["a"].state, ChildState::Running, "confirmed from the settled journal row");
         assert_eq!(c2.model.children["b"].state, ChildState::Running);
-        // A second recovery over the now-complete log feeds nothing more.
-        let n = read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len();
+        // A second recovery over the now-complete log changes nothing (a no-op
+        // message is never logged, so the log does not grow either).
         drop(c2);
-        let mut c3 = open_with(d.path(), Strategy::RestForOne);
+        let mut c3 = open_with(d.path(), Strategy::RestForOne); // opening logs its own rebind/claim
+        let n = read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len();
         recover(&mut c3, &mut j, &mut f2.clone()).unwrap();
-        assert_eq!(read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len(), n, "a clean log grows by nothing");
+        assert_eq!(read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len(), n, "recovery over a complete log appends nothing");
     }
 
     #[test]
