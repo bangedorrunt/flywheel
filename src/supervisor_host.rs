@@ -1945,4 +1945,15 @@ mod tests {
             assert!(!host.contains(call), "pane text call {call} outside the sink");
         }
     }
+
+    #[test]
+    fn the_host_loop_waits_on_the_hint_channel_and_arms_the_watcher_unless_hints_are_off() {
+        let me = include_str!("supervisor_host.rs");
+        let host = &me[..me.find("#[cfg(test)]").unwrap()];
+        let body = &host[host.find("fn host_loop(").unwrap()..];
+        assert!(body.contains("supervisor_hints::wait(&hint_rx"), "the loop waits on the hints");
+        assert!(body.contains("supervisor_hints::Watcher::spawn("), "and something feeds them");
+        assert!(body.contains("if hc.hints {"), "the off switch gates the watcher");
+        assert!(!body.contains("thread::sleep(std::time::Duration::from_millis(hc.tick_ms))"), "no plain sleep left in the loop");
+    }
 }
