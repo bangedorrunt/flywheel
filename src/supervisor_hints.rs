@@ -190,6 +190,13 @@ mod tests {
         rx.recv_timeout(d).is_ok()
     }
 
+    /// `fs::write` is create-then-write: one change can show as two (and so
+    /// two hints). Let a step finish and drop the extras before the next one.
+    fn settle(rx: &Receiver<()>) {
+        std::thread::sleep(ms(120));
+        while rx.try_recv().is_ok() {}
+    }
+
     #[test]
     fn a_change_to_any_watched_file_sends_a_hint_and_quiet_sends_none() {
         let d = tempfile::tempdir().unwrap();
@@ -200,10 +207,13 @@ mod tests {
         assert!(!recv_within(&rx, ms(150)), "nothing changed: no hint");
         std::fs::write(&wal, b"first").unwrap(); // the file did not exist: appearing is a change
         assert!(recv_within(&rx, ms(500)), "the WAL appeared");
+        settle(&rx);
         std::fs::write(&inbox, b"{}\n").unwrap();
         assert!(recv_within(&rx, ms(500)), "the input file appeared");
+        settle(&rx);
         std::fs::write(&db, b"longer content").unwrap();
         assert!(recv_within(&rx, ms(500)), "the index changed");
+        settle(&rx);
         assert!(!recv_within(&rx, ms(150)), "and then it is quiet again");
     }
 
@@ -214,6 +224,7 @@ mod tests {
         std::fs::write(&f, b"0").unwrap();
         let (tx, rx) = sync_channel::<()>(64);
         let _w = Watcher::spawn(vec![f.clone()], tx, ms(5), ms(100));
+        std::thread::sleep(ms(60));
         let t = Instant::now();
         let mut n = 0u64;
         while t.elapsed() < ms(450) {
@@ -234,8 +245,11 @@ mod tests {
         std::fs::write(&f, b"0").unwrap();
         let (tx, rx) = sync_channel::<()>(8);
         let _w = Watcher::spawn(vec![f.clone()], tx, ms(5), ms(150));
+        std::thread::sleep(ms(60)); // let the watcher take its first look before the change
         std::fs::write(&f, b"11").unwrap();
         assert!(recv_within(&rx, ms(400)));
+        std::thread::sleep(ms(20)); // still inside the 150 ms gap of that hint
+        while rx.try_recv().is_ok() {}
         std::fs::write(&f, b"222").unwrap(); // inside the gap of the first
         assert!(recv_within(&rx, ms(600)), "the held change arrives once the gap ends");
     }
@@ -247,6 +261,7 @@ mod tests {
         std::fs::write(&f, b"0").unwrap();
         let (tx, rx) = sync_channel::<()>(8);
         let w = Watcher::spawn(vec![f.clone()], tx, ms(5), ms(10));
+        std::thread::sleep(ms(60));
         drop(w);
         std::fs::write(&f, b"changed after the drop").unwrap();
         assert!(!recv_within(&rx, ms(150)), "no hint after drop (and the channel is closed)");
