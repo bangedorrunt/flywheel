@@ -48,8 +48,9 @@ pub struct Proposal {
     /// Phase 4 topologies: `join` is an option of `Swarm`, not a fourth
     /// topology. True = arrive on the live fleet instead of spawning a second
     /// swarm (`workflow` is `join`, argv is `flywheel arrive`). Omitted from
-    /// the JSON when false, so every non-join briefing is byte-identical to
-    /// what it was.
+    /// the JSON when false, so the proposal of a non-join briefing is unchanged
+    /// (the briefing as a whole differs in one place: the `topology` question's
+    /// options no longer list `join`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub join: bool,
     pub workflow: String,
@@ -946,7 +947,7 @@ mod tests {
         let b = assemble("wave-swarm 3 crews", &solo(), &["coder".into()], 5, None);
         assert!(!b.proposal.join);
         let v = serde_json::to_value(&b).unwrap();
-        assert!(v["proposal"].get("join").is_none(), "byte-identical for non-join: {v}");
+        assert!(v["proposal"].get("join").is_none(), "no join key on a non-join proposal: {v}");
         // And an old briefing JSON without the key still reads back (join=false).
         let back: Briefing = serde_json::from_value(v).unwrap();
         assert!(!back.proposal.join);

@@ -84,13 +84,30 @@ pub enum Restart {
     Temporary,
 }
 
-/// What a failure restarts. Data, so 4b adds `RestForOne`/`OneForAll`
-/// without touching the intensity code.
+/// What a failure restarts (OTP's strategies, §6A.2). Data: the intensity
+/// code does not look at it, only [`restart_set`] does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
     /// Only the failed child.
     OneForOne,
+    /// The failed child and every live child started after it (a planner ->
+    /// coder -> reviewer chain: a restarted planner invalidates what follows).
+    RestForOne,
+    /// Every live child.
+    OneForAll,
+}
+
+impl Strategy {
+    /// The word fixtures and `FLYWHEEL_SUPERVISOR_STRATEGY` use.
+    pub fn parse(w: &str) -> Option<Self> {
+        match w {
+            "one_for_one" => Some(Self::OneForOne),
+            "rest_for_one" => Some(Self::RestForOne),
+            "one_for_all" => Some(Self::OneForAll),
+            _ => None,
+        }
+    }
 }
 
 /// The supervisor's budgets and windows.
@@ -194,7 +211,7 @@ pub struct Child {
     pub lease_deadline_ms: u64,
     /// Last accepted progress.
     pub last_progress_ms: u64,
-    /// Start order (for `rest_for_one` in 4b).
+    /// Start order (`rest_for_one` restarts the children after the failed one).
     pub order: u64,
     /// Lease expiry suspended (`pause`).
     pub paused: bool,
@@ -755,25 +772,83 @@ fn abnormal_end(
         fail_subtree(next, cmds, "restart_intensity", id);
         return;
     }
+    // One failure event is ONE slot in the window, however many children the
+    // strategy restarts with it (OTP).
     next.restarts.push(now);
-    let lease = next.policy.lease_ms;
-    let Some(c) = next.children.get_mut(id) else {
-        return;
-    };
-    c.generation += 1;
-    c.state = ChildState::Restarting;
-    c.paused = false;
-    c.lease_deadline_ms = now.saturating_add(lease);
-    let generation = c.generation;
-    for s in next.steers.values_mut() {
-        if s.child == id && s.state == SteerState::Pending {
-            s.state = SteerState::AppliedByRestart;
+    let set = restart_set(next, id);
+    // Siblings still running are stopped first (the failed child already
+    // ended, so it gets no Exit); a temporary sibling is stopped for good.
+    for m in &set {
+        if m == id {
+            continue;
+        }
+        let Some(c) = next.children.get_mut(m) else {
+            continue;
+        };
+        cmds.push(SupCmd::Exit {
+            child: m.clone(),
+            generation: c.generation,
+        });
+        if c.spec.restart == Restart::Temporary {
+            c.state = ChildState::Gone;
         }
     }
-    cmds.push(SupCmd::Relaunch {
-        child: id.into(),
-        generation,
-    });
+    let lease = next.policy.lease_ms;
+    for m in set {
+        let Some(c) = next.children.get_mut(&m) else {
+            continue;
+        };
+        if c.state == ChildState::Gone {
+            continue;
+        }
+        c.generation += 1;
+        c.state = ChildState::Restarting;
+        c.paused = false;
+        c.lease_deadline_ms = now.saturating_add(lease);
+        let generation = c.generation;
+        for s in next.steers.values_mut() {
+            if s.child == m && s.state == SteerState::Pending {
+                s.state = SteerState::AppliedByRestart;
+            }
+        }
+        cmds.push(SupCmd::Relaunch {
+            child: m,
+            generation,
+        });
+    }
+}
+
+/// The children one failure of `failed` restarts, in start order, `failed`
+/// included. A pure function of the model, so replay recomputes it exactly.
+/// A sibling is in the set only while `Running`: one already `Restarting` (or
+/// waiting on herdr) is covered by the restart it has, never restarted twice.
+/// The loop pass is cadence, not a crew: it never joins another child's set
+/// and its own failure never cascades.
+fn restart_set(m: &SupModel, failed: &str) -> Vec<String> {
+    let Some(f) = m.children.get(failed) else {
+        return Vec::new();
+    };
+    let strategy = if failed == PASS {
+        Strategy::OneForOne
+    } else {
+        m.policy.strategy
+    };
+    let mut set: Vec<(u64, String)> = vec![(f.order, failed.to_string())];
+    for (id, c) in &m.children {
+        if id == failed || id == PASS || c.state != ChildState::Running {
+            continue;
+        }
+        let in_set = match strategy {
+            Strategy::OneForOne => false,
+            Strategy::RestForOne => c.order > f.order,
+            Strategy::OneForAll => true,
+        };
+        if in_set {
+            set.push((c.order, id.clone()));
+        }
+    }
+    set.sort();
+    set.into_iter().map(|(_, id)| id).collect()
 }
 
 /// A child's report is accepted only at its current generation and with no steer
@@ -1135,7 +1210,15 @@ impl Program for SupervisorProgram {
                         .map(|(id, _)| id.clone())
                         .collect();
                     for id in expired {
-                        abnormal_end(&mut next, &mut cmds, &id, now, true);
+                        // An earlier failure in this very tick may have restarted
+                        // this child as a sibling (fresh lease): not expired now.
+                        if next
+                            .children
+                            .get(&id)
+                            .is_some_and(|c| now > c.lease_deadline_ms)
+                        {
+                            abnormal_end(&mut next, &mut cmds, &id, now, true);
+                        }
                     }
                 }
             }
@@ -1322,6 +1405,298 @@ mod tests {
             },
         );
         (m, c)
+    }
+
+
+    // ---- 4b.1: strategies (`rest_for_one`, `one_for_all`)
+
+    /// A lead with crews `ids` (start order = list order) under `strategy`.
+    fn strat(strategy: Strategy, ids: &[&str]) -> SupModel {
+        let mut policy = Policy::for_tier(Tier::Lead);
+        policy.strategy = strategy;
+        let mut m = SupModel::default();
+        let mut msgs = vec![
+            SupMsg::Hello {
+                me: ME.into(),
+                tier: Tier::Lead,
+                policy: Some(policy),
+            },
+            SupMsg::Claim {
+                holder: ME.into(),
+                sup_epoch: 2,
+            },
+        ];
+        for id in ids {
+            msgs.push(SupMsg::Spawn {
+                spec: spec(id),
+                now_ms: 0,
+            });
+        }
+        for msg in &msgs {
+            m = step(&m, msg).0;
+        }
+        m
+    }
+
+    /// Confirm every `Restarting` child's relaunch landed.
+    fn settle(m: SupModel) -> SupModel {
+        let mut m = m;
+        let ids: Vec<(String, u64)> = m
+            .children
+            .iter()
+            .filter(|(_, c)| c.state == ChildState::Restarting)
+            .map(|(id, c)| (id.clone(), c.generation))
+            .collect();
+        for (child, generation) in ids {
+            m = step(&m, &SupMsg::Relaunched { child, generation }).0;
+        }
+        m
+    }
+
+    fn exits(c: &[SupCmd]) -> Vec<(String, u64)> {
+        c.iter()
+            .filter_map(|c| match c {
+                SupCmd::Exit { child, generation } => Some((child.clone(), *generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rl(v: &[(&str, u64)]) -> Vec<(String, u64)> {
+        v.iter().map(|(a, g)| (a.to_string(), *g)).collect()
+    }
+
+    #[test]
+    fn one_for_one_restarts_only_the_failed_child() {
+        let (m, c) = step(&strat(Strategy::OneForOne, &["a", "b", "c"]), &exit("b", 10));
+        assert_eq!(relaunches(&c), rl(&[("b", 2)]));
+        assert!(exits(&c).is_empty());
+        assert_eq!(m.children["c"].generation, 1);
+    }
+
+    #[test]
+    fn rest_for_one_restarts_the_failed_child_and_those_started_after_it_never_before() {
+        let (m, c) = step(&strat(Strategy::RestForOne, &["a", "b", "c"]), &exit("b", 10));
+        assert_eq!(relaunches(&c), rl(&[("b", 2), ("c", 2)]));
+        assert_eq!(exits(&c), rl(&[("c", 1)]), "the running sibling is stopped first; the failed child already ended");
+        assert_eq!(m.children["a"].generation, 1, "an earlier child is never touched");
+        assert_eq!(m.children["a"].state, ChildState::Running);
+        assert_eq!(m.children["c"].state, ChildState::Restarting);
+    }
+
+    #[test]
+    fn rest_for_one_on_the_last_child_is_one_for_one() {
+        let (_, c) = step(&strat(Strategy::RestForOne, &["a", "b", "c"]), &exit("c", 10));
+        assert_eq!(relaunches(&c), rl(&[("c", 2)]));
+        assert!(exits(&c).is_empty());
+    }
+
+    #[test]
+    fn one_for_all_restarts_every_live_child() {
+        let (_, c) = step(&strat(Strategy::OneForAll, &["a", "b", "c"]), &exit("b", 10));
+        assert_eq!(relaunches(&c), rl(&[("a", 2), ("b", 2), ("c", 2)]));
+        assert_eq!(exits(&c), rl(&[("a", 1), ("c", 1)]));
+    }
+
+    #[test]
+    fn exits_precede_relaunches_in_the_command_list() {
+        let (_, c) = step(&strat(Strategy::OneForAll, &["a", "b", "c"]), &exit("b", 10));
+        let last_exit = c.iter().rposition(|x| matches!(x, SupCmd::Exit { .. })).unwrap();
+        let first_rl = c.iter().position(|x| matches!(x, SupCmd::Relaunch { .. })).unwrap();
+        assert!(last_exit < first_rl);
+    }
+
+    #[test]
+    fn a_cascade_costs_one_intensity_slot_and_the_fourth_event_escalates() {
+        let mut m = strat(Strategy::OneForAll, &["a", "b", "c"]);
+        for (i, t) in [10u64, 20, 30].into_iter().enumerate() {
+            // A different child fails each time, so none reaches the poison ceiling.
+            let (n, c) = step(&m, &exit(["a", "b", "c"][i], t));
+            assert_eq!(relaunches(&c).len(), 3, "event {i} restarts all three");
+            assert_eq!(n.restarts.len(), i + 1, "one slot per failure event, not per child");
+            assert_eq!(escalations(&c), 0);
+            m = settle(n);
+        }
+        let (m, c) = step(&m, &exit("a", 40));
+        assert_eq!(escalations(&c), 1, "MaxR+1 failure events escalate");
+        assert_eq!(m.status, Status::Failed);
+        assert!(relaunches(&c).is_empty());
+    }
+
+    #[test]
+    fn a_restarted_child_keeps_its_place() {
+        let m = strat(Strategy::RestForOne, &["a", "b", "c"]);
+        let before: Vec<u64> = ["a", "b", "c"].iter().map(|i| m.children[*i].order).collect();
+        let (m, _) = step(&m, &exit("a", 10));
+        let m = settle(m);
+        let after: Vec<u64> = ["a", "b", "c"].iter().map(|i| m.children[*i].order).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_failure_while_a_sibling_is_restarting_does_not_restart_it_twice() {
+        let (m, c) = step(&strat(Strategy::RestForOne, &["a", "b", "c"]), &exit("c", 10));
+        assert_eq!(relaunches(&c), rl(&[("c", 2)]));
+        // c's relaunch is unconfirmed; b fails: c is covered by that restart.
+        let (m, c) = step(&m, &exit("b", 20));
+        assert_eq!(relaunches(&c), rl(&[("b", 2)]), "c is Restarting already: not restarted again");
+        assert!(exits(&c).is_empty());
+        assert_eq!(m.children["c"].generation, 2);
+    }
+
+    #[test]
+    fn two_leases_expiring_in_one_tick_are_one_cascade_not_two() {
+        let m = strat(Strategy::OneForAll, &["a", "b"]);
+        let (m, c) = step(&m, &SupMsg::Tick { now_ms: DEFAULT_LEASE_MS + 1 });
+        assert_eq!(relaunches(&c), rl(&[("a", 2), ("b", 2)]), "b was restarted with a: its lease is fresh");
+        assert_eq!(m.restarts.len(), 1);
+    }
+
+    #[test]
+    fn a_pending_steer_on_a_restarted_sibling_is_applied_by_restart() {
+        let m = strat(Strategy::OneForAll, &["a", "b"]);
+        let (m, _) = step(
+            &m,
+            &SupMsg::Control {
+                op: SteerOp::Redirect,
+                child: "a".into(),
+                sup_epoch: 2,
+                now_ms: 1_000,
+            },
+        );
+        let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 });
+        assert_eq!(m.steers[&1].state, SteerState::Pending);
+        let (m, _) = step(&m, &exit("b", 2_000));
+        assert_eq!(m.steers[&1].state, SteerState::AppliedByRestart, "never left gating a dead incarnation");
+        assert_eq!(m.children["a"].generation, 2);
+    }
+
+    #[test]
+    fn a_temporary_sibling_is_stopped_not_restarted() {
+        let mut m = strat(Strategy::OneForAll, &["a", "b"]);
+        m.children.get_mut("a").unwrap().spec.restart = Restart::Temporary;
+        let (m, c) = step(&m, &exit("b", 10));
+        assert_eq!(relaunches(&c), rl(&[("b", 2)]));
+        assert_eq!(exits(&c), rl(&[("a", 1)]));
+        assert_eq!(m.children["a"].state, ChildState::Gone);
+    }
+
+    #[test]
+    fn finished_and_parked_siblings_are_not_in_the_set() {
+        let mut m = strat(Strategy::OneForAll, &["a", "b", "c"]);
+        m.children.get_mut("a").unwrap().state = ChildState::Done;
+        m.children.get_mut("c").unwrap().state = ChildState::Parked;
+        let (_, c) = step(&m, &exit("b", 10));
+        assert_eq!(relaunches(&c), rl(&[("b", 2)]));
+    }
+
+    #[test]
+    fn the_loop_pass_child_is_never_a_sibling_and_never_cascades() {
+        let m = strat(Strategy::OneForAll, &["a", PASS]);
+        let (_, c) = step(&m, &exit("a", 10));
+        assert_eq!(relaunches(&c), rl(&[("a", 2)]), "the pass is cadence, not a crew");
+        let (_, c) = step(&m, &exit(PASS, 10));
+        assert_eq!(relaunches(&c), rl(&[(PASS, 2)]), "a pass failure does not restart crews");
+    }
+
+    #[test]
+    fn a_parked_failing_child_does_not_cascade() {
+        let mut m = strat(Strategy::OneForAll, &["a", "b"]);
+        m.children.get_mut("b").unwrap().abnormal = 2;
+        let (m, c) = step(&m, &exit("b", 10));
+        assert!(relaunches(&c).is_empty());
+        assert_eq!(m.children["b"].state, ChildState::Parked);
+        assert_eq!(m.children["a"].state, ChildState::Running);
+    }
+
+    #[test]
+    fn a_cascade_deferred_by_herdr_down_runs_once_when_it_is_back() {
+        let m = strat(Strategy::OneForAll, &["a", "b"]);
+        let (m, _) = step(&m, &SupMsg::HerdrDown { now_ms: 5 });
+        let (m, c) = step(&m, &exit("a", 10));
+        assert!(relaunches(&c).is_empty());
+        let (m, _) = step(&m, &SupMsg::HerdrUp { now_ms: 20 });
+        let (m, c) = step(&m, &SupMsg::Tick { now_ms: 21 });
+        assert_eq!(relaunches(&c), rl(&[("a", 2), ("b", 2)]));
+        assert_eq!(m.restarts.len(), 1);
+        let (_, c) = step(&m, &SupMsg::Tick { now_ms: 22 });
+        assert!(relaunches(&c).is_empty(), "exactly once");
+    }
+
+    #[test]
+    fn strategy_round_trips_and_parses_the_fixture_words() {
+        for (w, s) in [
+            ("one_for_one", Strategy::OneForOne),
+            ("rest_for_one", Strategy::RestForOne),
+            ("one_for_all", Strategy::OneForAll),
+        ] {
+            assert_eq!(Strategy::parse(w), Some(s));
+            assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{w}\""));
+        }
+        assert_eq!(Strategy::parse("nope"), None);
+    }
+
+    /// Seeded generator: no proptest in this crate, so a plain LCG walks many
+    /// message sequences and checks the invariants after each step.
+    #[test]
+    fn invariants_hold_over_generated_sequences_for_every_strategy() {
+        for strategy in [Strategy::OneForOne, Strategy::RestForOne, Strategy::OneForAll] {
+            for seed in 0..200u64 {
+                let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let mut next = move || {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (x >> 33) as usize
+                };
+                let ids = ["a", "b", "c", "d"];
+                let mut m = strat(strategy, &ids);
+                let mut msgs: Vec<SupMsg> = Vec::new();
+                let mut keys = std::collections::BTreeSet::new();
+                let mut t = 0u64;
+                for _ in 0..40 {
+                    t += 1 + (next() % 4) as u64 * 60_000;
+                    let id = ids[next() % ids.len()];
+                    let msg = match next() % 4 {
+                        0 | 1 => exit(id, t),
+                        2 => SupMsg::Tick { now_ms: t },
+                        _ => SupMsg::Relaunched {
+                            child: id.into(),
+                            generation: m.children[id].generation,
+                        },
+                    };
+                    let (n, c) = step(&m, &msg);
+                    // (child, generation) of a relaunch is never reused.
+                    for (ch, g) in relaunches(&c) {
+                        assert!(keys.insert((ch.clone(), g)), "{strategy:?} seed {seed}: relaunch:{ch}:{g} reused");
+                        assert_eq!(g, n.children[&ch].generation);
+                    }
+                    for (id, ch) in &n.children {
+                        assert!(ch.generation >= m.children[id].generation, "generation never goes back");
+                        assert_eq!(ch.order, m.children[id].order, "order is stable");
+                    }
+                    assert!(n.restarts.len() as u32 <= n.policy.max_r, "the window never exceeds MaxR");
+                    msgs.push(msg);
+                    m = n;
+                }
+                // P8: replay gives the same model.
+                let mut all = vec![
+                    SupMsg::Hello {
+                        me: ME.into(),
+                        tier: Tier::Lead,
+                        policy: Some({
+                            let mut p = Policy::for_tier(Tier::Lead);
+                            p.strategy = strategy;
+                            p
+                        }),
+                    },
+                    SupMsg::Claim { holder: ME.into(), sup_epoch: 2 },
+                ];
+                for id in ids {
+                    all.push(SupMsg::Spawn { spec: spec(id), now_ms: 0 });
+                }
+                all.extend(msgs);
+                assert_eq!(replay(&all).0, m, "{strategy:?} seed {seed}: replay differs");
+            }
+        }
     }
 
     // ---- defaults (build-plan: leads 3/30 min, captain 2/60 min, poison 3, cap 5)
