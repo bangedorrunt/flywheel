@@ -206,6 +206,13 @@ If a host stops with "restart intensity exceeded", fix the cause and re-run
 over, crews the failure halted are re-adopted from the registry; the
 escalation stays on record, and an operator's `steer cancel` stays final).
 
+A `redirect` needs the new goal: `flywheel supervisor steer <project> --child X
+--op redirect --delta-file F`, where F is a JSON object limited to `goal`,
+`acceptance`, `scope.paths`, `priority`, `budget` (at most 8 KiB; anything else
+is refused before anything is queued). The host puts the delta in the steer
+mail's body, never in a pane; the supervisor log keeps only its sha256. The crew
+sees it with `toron next`, and re-claims at the next generation once it acks.
+
 ## Command map
 
 | Group | Commands |
