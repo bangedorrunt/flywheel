@@ -715,7 +715,8 @@ pub enum SupCmd {
         /// Gen.
         generation: u64,
     },
-    /// Append the steer envelope; urgent ones also interrupt and ring.
+    /// Append the steer envelope. The doorbell rings from its `priority`;
+    /// this command does not type a pane.
     AppendSteer {
         /// Steer seq.
         seq: u64,
@@ -727,7 +728,8 @@ pub enum SupCmd {
         generation: u64,
         /// Epoch.
         sup_epoch: u64,
-        /// Interrupt + urgent wake line as well.
+        /// `op != resume`. The envelope's `priority` is derived from the op,
+        /// not from this flag. The host does not ring from it.
         urgent: bool,
         /// sha256 of the redirect's delta (the body of the mail).
         #[serde(default, skip_serializing_if = "Option::is_none")]

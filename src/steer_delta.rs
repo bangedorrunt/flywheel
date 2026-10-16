@@ -1,11 +1,11 @@
-//! Phase 4b.4 (interim form): the typed `delta` of a `redirect` steer.
+//! Phase 4b.4: the typed `delta` of a `redirect` steer.
 //!
 //! §6A.4 makes a redirect's new contract a typed `delta{goal?, acceptance?,
-//! scope.paths?, priority?, budget?}`. Until toron carries `steer@1.delta`, the
-//! CLI validates a JSON file against that set, the host appends the delta as
-//! the **envelope body** of the steer mail (never a pane write: panes carry no
-//! payload), and the supervisor's log keeps only its sha256 so the fold stays
-//! small and a decision never depends on the mail store's retention.
+//! scope.paths?, priority?, budget?}`. The CLI validates a JSON file against
+//! that set. The host puts the object on the `steer@1` body (never a pane
+//! write: panes carry no payload). The supervisor log keeps `{seq, op,
+//! delta_sha, offset}`, not the delta bytes, so the fold stays small and a
+//! decision never depends on the mail store's retention.
 //!
 //! The delta's bytes travel from the CLI to the host through a content-addressed
 //! side store next to the context log (`<key>.deltas/<sha>.json`, owner-only):
@@ -126,8 +126,8 @@ pub fn load(base: &Path, project: &str, sha: &str) -> Result<Delta> {
     })
 }
 
-/// The mail body of a steer: the line that names the op, then (for a redirect)
-/// the delta under its sha. The pane never sees any of it.
+/// Text form of a steer (header, then the delta under its sha). The live
+/// mail body is `steer@1`, not this string. The pane never sees either.
 pub fn body(header: &str, delta: Option<&Delta>) -> String {
     match delta {
         Some(d) => format!("{header}\ndelta sha256:{}\n{}", d.sha, d.json),
@@ -151,7 +151,9 @@ mod tests {
 
     #[test]
     fn the_typed_keys_validate_and_canonicalise() {
-        let d = ok(r#"{"priority": 2, "goal": "ship it", "scope": {"paths": ["src/a.rs"]}, "acceptance": "tests pass", "budget": {"usd": 3}}"#);
+        let d = ok(
+            r#"{"priority": 2, "goal": "ship it", "scope": {"paths": ["src/a.rs"]}, "acceptance": "tests pass", "budget": {"usd": 3}}"#,
+        );
         assert_eq!(
             d.json,
             r#"{"acceptance":"tests pass","budget":{"usd":3},"goal":"ship it","priority":2,"scope":{"paths":["src/a.rs"]}}"#
@@ -159,12 +161,17 @@ mod tests {
         assert_eq!(d.sha, sha_hex(d.json.as_bytes()));
         assert!(is_sha(&d.sha));
         // The same delta in another key order and spacing is the same delta.
-        assert_eq!(ok(r#"{"goal":"ship it"}"#).sha, ok("{ \"goal\" :\n \"ship it\" }").sha);
+        assert_eq!(
+            ok(r#"{"goal":"ship it"}"#).sha,
+            ok("{ \"goal\" :\n \"ship it\" }").sha
+        );
     }
 
     #[test]
     fn an_unknown_key_is_rejected() {
-        let e = parse(br#"{"goal":"x","shell":"rm -rf /"}"#).unwrap_err().to_string();
+        let e = parse(br#"{"goal":"x","shell":"rm -rf /"}"#)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("unknown delta key"), "{e}");
     }
 
@@ -190,7 +197,12 @@ mod tests {
 
     #[test]
     fn non_utf8_is_rejected() {
-        assert!(parse(&[b'{', 0xff, 0xfe, b'}']).unwrap_err().to_string().contains("UTF-8"));
+        assert!(
+            parse(&[b'{', 0xff, 0xfe, b'}'])
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
     }
 
     #[test]
@@ -199,7 +211,12 @@ mod tests {
         assert_eq!(at.len(), MAX_DELTA_BYTES);
         assert!(parse(at.as_bytes()).is_ok(), "exactly the cap is allowed");
         let over = format!(r#"{{"goal":"{}"}}"#, "a".repeat(MAX_DELTA_BYTES - 10));
-        assert!(parse(over.as_bytes()).unwrap_err().to_string().contains("max"));
+        assert!(
+            parse(over.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("max")
+        );
         // Whitespace padding does not count against the delta.
         let padded = format!("{}{}", r#"{"goal":"x"}"#, " ".repeat(MAX_DELTA_BYTES + 100));
         assert!(parse(padded.as_bytes()).is_ok());
@@ -214,8 +231,16 @@ mod tests {
         // Tamper: same name, other bytes.
         let p = dir_for(d.path(), "proj").join(format!("{sha}.json"));
         std::fs::write(&p, br#"{"goal":"evil"}"#).unwrap();
-        assert!(load(d.path(), "proj", &sha).unwrap_err().to_string().contains("does not hash"));
-        assert!(load(d.path(), "proj", "../../etc/passwd").is_err(), "a sha is hex, never a path");
+        assert!(
+            load(d.path(), "proj", &sha)
+                .unwrap_err()
+                .to_string()
+                .contains("does not hash")
+        );
+        assert!(
+            load(d.path(), "proj", "../../etc/passwd").is_err(),
+            "a sha is hex, never a path"
+        );
         assert!(load(d.path(), "proj", &"0".repeat(64)).is_err(), "absent");
     }
 
@@ -226,7 +251,11 @@ mod tests {
         assert!(b.starts_with("steer redirect on x\n"));
         let (sha, json) = delta_in_body(&b).unwrap();
         assert_eq!(sha, d.sha);
-        assert_eq!(sha_hex(json.as_bytes()), sha, "the body hash equals the logged sha");
+        assert_eq!(
+            sha_hex(json.as_bytes()),
+            sha,
+            "the body hash equals the logged sha"
+        );
         assert_eq!(body("h", None), "h");
         assert!(delta_in_body("h").is_none());
     }
