@@ -467,7 +467,28 @@ pub fn recover(
     let mut rep = RoundReport::default();
     let mut follow = Vec::new();
     for c in &cmds {
-        follow.extend(execute(j, ports, c, &mut rep));
+        let fed = execute(j, ports, c, &mut rep);
+        // `execute` returns nothing for a Relaunch only when the journal skipped
+        // it (a run feeds back `Relaunched` or `CmdFailed`). A settled relaunch is skipped, but if the host
+        // died before `Relaunched` was logged the child would sit `Restarting`
+        // until its lease ran out (and then be restarted again, spending the
+        // budget). The settled row IS the confirmation: feed it, and only while
+        // the model is still waiting for it (defence in depth: the fold ignores
+        // a confirmation that is not current anyway).
+        if fed.is_empty()
+            && let SupCmd::Relaunch { child, generation } = c
+            && core
+                .model
+                .children
+                .get(child)
+                .is_some_and(|ch| ch.state == crate::supervisor_program::ChildState::Restarting && ch.generation == *generation)
+        {
+            follow.push(SupMsg::Relaunched {
+                child: child.clone(),
+                generation: *generation,
+            });
+        }
+        follow.extend(fed);
     }
     feed(core, j, ports, follow, &mut rep)?;
     Ok(rep)
@@ -851,10 +872,12 @@ pub struct HostCfg {
     pub lease_ms: Option<u64>,
     /// Do not run loop passes (crews only).
     pub passes: bool,
+    /// What a failure restarts; `None` = the tier default (`one_for_one`).
+    pub strategy: Option<crate::supervisor_program::Strategy>,
 }
 
 impl HostCfg {
-    /// Read `FLYWHEEL_SUPERVISOR_{TICK_MS,ACK_MS,LEASE_MS,PASSES}`.
+    /// Read `FLYWHEEL_SUPERVISOR_{TICK_MS,ACK_MS,LEASE_MS,PASSES,STRATEGY}`.
     pub fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
         Self {
@@ -862,14 +885,20 @@ impl HostCfg {
             ack_ms: num("FLYWHEEL_SUPERVISOR_ACK_MS"),
             lease_ms: num("FLYWHEEL_SUPERVISOR_LEASE_MS"),
             passes: std::env::var("FLYWHEEL_SUPERVISOR_PASSES").map_or(true, |v| v != "off"),
+            strategy: std::env::var("FLYWHEEL_SUPERVISOR_STRATEGY")
+                .ok()
+                .and_then(|v| crate::supervisor_program::Strategy::parse(&v)),
         }
     }
 
     fn policy(&self) -> Option<Policy> {
-        if self.ack_ms.is_none() && self.lease_ms.is_none() {
+        if self.ack_ms.is_none() && self.lease_ms.is_none() && self.strategy.is_none() {
             return None;
         }
         let mut p = Policy::for_tier(Tier::Lead);
+        if let Some(s) = self.strategy {
+            p.strategy = s;
+        }
         if let Some(a) = self.ack_ms {
             p.ack_ms = a;
         }
@@ -1302,6 +1331,81 @@ mod tests {
         // A tick later changes nothing and relaunches nothing.
         go(&mut c, &mut j, &f, vec![], 3_000);
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 1);
+    }
+
+    fn open_with(dir: &Path, strategy: crate::supervisor_program::Strategy) -> Core {
+        let mut policy = Policy::for_tier(Tier::Lead);
+        policy.strategy = strategy;
+        let mut c = Core::open(CtxPaths::new(dir, "proj"), "lead-1", Tier::Lead, Some(policy)).unwrap();
+        c.claim("lead-1").unwrap();
+        c
+    }
+
+    #[test]
+    fn a_rest_for_one_cascade_stops_then_relaunches_and_a_kill_mid_cascade_finishes_it_exactly_once() {
+        use crate::supervisor_program::Strategy;
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open_with(d.path(), Strategy::RestForOne), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b"), spawn("c")], 1_000);
+        go(&mut c, &mut j, &f, vec![SupMsg::Exit { child: "b".into(), now_ms: 2_000 }], 2_000);
+        {
+            let w = f.0.lock().unwrap();
+            assert_eq!(w.exited, vec![("c".to_string(), 1)]);
+            assert_eq!(w.relaunched, vec![("b".to_string(), 2), ("c".to_string(), 2)], "never a");
+        }
+        // Crash model: c's relaunch ran but its journal row never settled.
+        // Only unsettled commands may re-run.
+        j.rows.get_mut("relaunch:c:2").unwrap().0 = false;
+        drop(c);
+        let f2 = Fake::default();
+        let mut c2 = open_with(d.path(), Strategy::RestForOne);
+        let mut p2 = f2.clone();
+        recover(&mut c2, &mut j, &mut p2).unwrap();
+        let w2 = f2.0.lock().unwrap();
+        assert_eq!(w2.relaunched, vec![("c".to_string(), 2)], "exactly the unsettled relaunch, once");
+        assert!(w2.exited.is_empty(), "the settled Exit does not run again");
+    }
+
+    #[test]
+    fn a_kill_between_a_settled_relaunch_and_its_feedback_does_not_strand_the_child_restarting() {
+        use crate::supervisor_program::Strategy;
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open_with(d.path(), Strategy::RestForOne), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
+        // The crash window: the exit is logged, the relaunch ran and settled,
+        // the host died before `Relaunched` was fed back.
+        let cmds = c.append_fold(SupMsg::Exit { child: "a".into(), now_ms: 2_000 }).unwrap();
+        let mut rep = RoundReport::default();
+        let mut p = f.clone();
+        for cmd in &cmds {
+            execute(&mut j, &mut p, cmd, &mut rep);
+        }
+        let want: Vec<(String, u64)> = vec![("a".into(), 2), ("b".into(), 2)];
+        assert_eq!(f.0.lock().unwrap().relaunched, want);
+        drop(c);
+        let f2 = Fake::default();
+        let mut c2 = open_with(d.path(), Strategy::RestForOne);
+        let mut p2 = f2.clone();
+        recover(&mut c2, &mut j, &mut p2).unwrap();
+        assert!(f2.0.lock().unwrap().relaunched.is_empty(), "nothing runs twice");
+        assert_eq!(c2.model.children["a"].state, ChildState::Running, "confirmed from the settled journal row");
+        assert_eq!(c2.model.children["b"].state, ChildState::Running);
+        // A second recovery over the now-complete log changes nothing (a no-op
+        // message is never logged, so the log does not grow either).
+        drop(c2);
+        let mut c3 = open_with(d.path(), Strategy::RestForOne); // opening logs its own rebind/claim
+        let n = read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len();
+        recover(&mut c3, &mut j, &mut f2.clone()).unwrap();
+        assert_eq!(read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len(), n, "recovery over a complete log appends nothing");
+    }
+
+    #[test]
+    fn the_strategy_word_reaches_the_policy() {
+        use crate::supervisor_program::Strategy;
+        let cfg = HostCfg { strategy: Some(Strategy::OneForAll), ..HostCfg::from_env() };
+        assert_eq!(cfg.policy().unwrap().strategy, Strategy::OneForAll);
+        let none = HostCfg { strategy: None, ack_ms: None, lease_ms: None, ..HostCfg::from_env() };
+        assert!(none.policy().is_none(), "no override: the tier default stands");
     }
 
     #[test]
