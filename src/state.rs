@@ -595,6 +595,34 @@ pub struct ExpectedReply {
     pub created_ts: String,
 }
 
+/// Key of one outstanding ask under the comms flag: `(from, request msg id)`.
+/// The agent-keyed [`ExpectedReply`] list is unchanged. Not wired at the
+/// collab insert: that site has no flag check, so it still overwrites.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn ask_key(from: &str, msg_id: &str) -> String {
+    format!("{from}\u{1f}{msg_id}")
+}
+
+/// Outstanding asks beside the agent-keyed list. Flag off: one slot per
+/// `from` (a later ask overwrites). Flag on: one slot per [`ask_key`].
+/// The value is the thread id. Pure; the collab insert does not call this.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn record_outstanding_asks<'a>(
+    flag: bool,
+    asks: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for (from, msg_id, thread) in asks {
+        let key = if flag {
+            ask_key(from, msg_id)
+        } else {
+            from.to_string()
+        };
+        map.insert(key, thread.to_string());
+    }
+    map
+}
+
 /// Per-project expected-reply file: `expected-replies/<project>.json`.
 pub fn expected_replies_dir() -> PathBuf {
     state_dir().join("expected-replies")
@@ -2847,6 +2875,27 @@ mod loops_sidecar_tests {
         // cleanup
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    /// Flag on, two asks from one agent both stay. Flag off, the second
+    /// overwrites (today's collab retain).
+    #[test]
+    fn ask_key_keeps_two_asks_from_one_agent_when_the_flag_is_on() {
+        let asks = [("CalmGate", "m1", "t1"), ("CalmGate", "m2", "t2")];
+        let off = record_outstanding_asks(false, asks);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off.get("CalmGate").map(String::as_str), Some("t2"));
+        let on = record_outstanding_asks(true, asks);
+        assert_eq!(on.len(), 2);
+        assert_eq!(
+            on.get(&ask_key("CalmGate", "m1")).map(String::as_str),
+            Some("t1")
+        );
+        assert_eq!(
+            on.get(&ask_key("CalmGate", "m2")).map(String::as_str),
+            Some("t2")
+        );
+        assert_ne!(ask_key("CalmGate", "m1"), "CalmGate");
     }
 
     /// bd-fw-name-binding-loss-7rc: the spawn registry (pane_id → name)
