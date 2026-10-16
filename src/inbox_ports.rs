@@ -502,13 +502,14 @@ impl Ports for FlywheelPorts {
     ) -> Result<(), String> {
         let path = self.budget_path();
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            crate::private_fs::create_private_dir_all(dir).map_err(|e| e.to_string())?;
         }
         // Write-then-rename: a crash leaves the old file or the new, never half.
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(budget).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+        crate::private_fs::write_private_atomic(
+            &path,
+            &serde_json::to_vec(budget).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn fact(&mut self, key: &str, mut fact: Value) -> Result<(), String> {
@@ -522,14 +523,10 @@ impl Ports for FlywheelPorts {
         }
         let path = self.facts_path();
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            crate::private_fs::create_private_dir_all(dir).map_err(|e| e.to_string())?;
         }
         use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
+        let mut f = crate::private_fs::open_private_append(&path).map_err(|e| e.to_string())?;
         writeln!(f, "{fact}").map_err(|e| e.to_string())?;
         self.facts_seen.insert(key.to_string());
         Ok(())
