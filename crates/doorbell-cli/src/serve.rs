@@ -2529,7 +2529,8 @@ mod tests {
         assert!(doorbell_rt::daemon_claims_writer_lease(false));
         assert!(!doorbell_rt::daemon_claims_writer_lease(true));
         let src = include_str!("serve.rs");
-        let a = src.find("fn reconcile_hosted").or_else(|| src.find("unhosted_subscribed(&subs")).unwrap();
+        // The first occurrence is the real auto-host pass (this test is later).
+        let a = src.find("let unhosted = unhosted_subscribed(").unwrap();
         let body = &src[a..a + 2400];
         let g = body.find("if claims {").expect("auto-host claim gate");
         assert!(body[g..].find("acquire_lease").unwrap() < body[g..].find("spawn_host_loop(").unwrap());
