@@ -659,6 +659,8 @@ mod tests {
         ring_fails: bool,
         budget: BTreeMap<String, Budget>,
         saves: u64,
+        /// The saved budget's `rings_since_advance` at the moment of each ring.
+        saved_at_ring: Vec<u32>,
     }
 
     #[derive(Clone, Default)]
@@ -685,8 +687,10 @@ mod tests {
             w.reverified += 1;
             w.reverify.clone()
         }
-        fn ring(&mut self, _n: &str, pane: &str, wm: u64, line: &str) -> Result<(), String> {
+        fn ring(&mut self, n: &str, pane: &str, wm: u64, line: &str) -> Result<(), String> {
             let mut w = self.0.lock().unwrap();
+            let at = w.budget.get(n).map_or(0, |b| b.rings_since_advance);
+            w.saved_at_ring.push(at);
             if w.ring_fails {
                 return Err("down".into());
             }
@@ -865,6 +869,11 @@ mod tests {
             w.saves
         );
         assert_eq!(w.budget[R].rings_since_advance, MAX_RINGS);
+        assert_eq!(
+            w.saved_at_ring,
+            (1..=MAX_RINGS).collect::<Vec<_>>(),
+            "each ring is already inside the saved budget when it goes out"
+        );
         assert_eq!(w.budget[R].deaf, Some(4));
         // The ring that follows a save is already inside the saved count.
         let g = Fake::default();
