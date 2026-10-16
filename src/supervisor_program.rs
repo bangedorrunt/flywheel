@@ -353,6 +353,10 @@ pub struct SupModel {
     pub deaf_seen: BTreeSet<String>,
     /// Latest time seen.
     pub now_ms: u64,
+    /// Generation floor for crews a failure halted: a re-adopted crew starts
+    /// above it, so effect keys (`relaunch:<id>:<gen>`) and the generation
+    /// fence never see an old incarnation's values again.
+    pub retired_gen: BTreeMap<String, u64>,
 }
 
 impl SupModel {
@@ -379,6 +383,7 @@ impl SupModel {
             failed_cmds: 0,
             deaf_seen: BTreeSet::new(),
             now_ms: 0,
+            retired_gen: BTreeMap::new(),
         }
     }
 
@@ -840,7 +845,16 @@ impl Program for SupervisorProgram {
                         // re-adopts them; an operator's steer cancel stays.
                         next.status = Status::Running;
                         next.restarts.clear();
-                        next.children.retain(|_, c| c.state != ChildState::Halted);
+                        let halted: Vec<(String, u64)> = next
+                            .children
+                            .iter()
+                            .filter(|(_, c)| c.state == ChildState::Halted)
+                            .map(|(id, c)| (id.clone(), c.generation))
+                            .collect();
+                        for (id, g) in halted {
+                            next.children.remove(&id);
+                            next.retired_gen.insert(id, g);
+                        }
                     }
                 }
             }
@@ -859,7 +873,7 @@ impl Program for SupervisorProgram {
                         Child {
                             spec: spec.clone(),
                             state: ChildState::Running,
-                            generation: 1,
+                            generation: next.retired_gen.remove(&spec.id).map_or(1, |g| g + 1),
                             abnormal: 0,
                             lease_deadline_ms: lease,
                             last_progress_ms: *now_ms,
@@ -1368,10 +1382,23 @@ mod tests {
         assert!(r.restarts.is_empty());
         assert_eq!(r.escalations, 1, "the escalation fact is kept");
         assert!(r.children.is_empty(), "halted children are re-adopted from the registry");
-        // Re-adopted, it supervises again from a clean budget.
-        let mut r = step(&r, &SupMsg::Spawn { spec: spec("a"), now_ms: 9_000 }).0;
+        // Re-adopted, it supervises again from a clean budget, in a NEW
+        // generation: the old incarnation's effect keys (`relaunch:a:3`) are
+        // settled in the journal and must not swallow the new one's, and a
+        // late report from the old generation stays fenced.
+        let old = (m.children["a"].generation, m.children["b"].generation);
+        let r = step(&r, &SupMsg::Spawn { spec: spec("a"), now_ms: 9_000 }).0;
+        let r = step(&r, &SupMsg::Spawn { spec: spec("b"), now_ms: 9_000 }).0;
+        assert_eq!(r.children["a"].generation, old.0 + 1);
+        assert_eq!(r.children["b"].generation, old.1 + 1);
+        assert_eq!(r.children["a"].abnormal, 0);
+        let (late, c) = step(&r, &SupMsg::Done { child: "a".into(), generation: old.0, now_ms: 9_050 });
+        assert_eq!(rejects(&c), vec![RejectCause::StaleGen]);
+        assert_eq!(late.children["a"].state, ChildState::Running);
         let (r, c) = step(&r, &exit("a", 9_100));
-        assert_eq!(relaunches(&c).len(), 1);
+        let rl = relaunches(&c);
+        assert_eq!(rl.len(), 1);
+        assert!(rl[0].1 > old.0 + 1, "a relaunch key never reuses a settled one: {rl:?} vs {old:?}");
         assert_eq!(r.status, Status::Running);
     }
 
