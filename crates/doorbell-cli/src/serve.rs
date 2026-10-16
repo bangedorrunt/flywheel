@@ -690,13 +690,15 @@ fn straggler_note(report: &DrainReport) -> Option<String> {
     Some(note)
 }
 
-pub async fn run(cfg: &Config) -> Result<()> {
+/// D9 layer 1 at startup: a live lease on a workspace this host would write
+/// means another writer runs there — refuse before touching its socket.
+/// `claims` false (comms flag on: this host types nothing) never refuses: a
+/// foreign lease is the inbox host, and it is exactly who should hold it.
+fn refuse_live_leases(cfg: &Config, now: u64, claims: bool) -> Result<()> {
     use doorbell_rt::lease;
-    let now = lease::unix_now();
-    // D9 layer 1 first, per workspace: a live lease means another writer
-    // runs there — refuse before touching its socket (never clobber a
-    // stranger's bind). Leases live in the FLYWHEEL state dir, shared
-    // with embedded loops, so either side excludes the other per ws.
+    if !claims {
+        return Ok(());
+    }
     for (project, workspace) in &cfg.hosts {
         if let Some(cur) = lease::read_lease(&cfg.flywheel_state, workspace)
             && !lease::lease_stale(&cur, now)
@@ -709,6 +711,44 @@ pub async fn run(cfg: &Config) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Claim one writer lease per hosted workspace. `claims` false (comms flag
+/// on) claims none: the flywheel inbox host is the only pane writer, and a
+/// daemon lease would make the sender defer to a host that types nothing.
+fn claim_writer_leases(
+    cfg: &Config,
+    claims: bool,
+) -> Result<Vec<(String, doorbell_rt::lease::OwnerLease)>> {
+    use doorbell_rt::lease;
+    let mut owned = Vec::new();
+    if !claims {
+        return Ok(owned);
+    }
+    for (_, workspace) in &cfg.hosts {
+        match lease::acquire_lease(&cfg.flywheel_state, workspace, lease::unix_now()) {
+            Ok(l) => owned.push((workspace.clone(), l)),
+            Err(e) => {
+                for (ws, l) in &owned {
+                    lease::release_lease(&cfg.flywheel_state, ws, l);
+                }
+                anyhow::bail!("doorbell serve: lease claim failed after bind: {e:?}");
+            }
+        }
+    }
+    Ok(owned)
+}
+
+pub async fn run(cfg: &Config) -> Result<()> {
+    use doorbell_rt::lease;
+    let now = lease::unix_now();
+    // D9 layer 1 first, per workspace: a live lease means another writer
+    // runs there — refuse before touching its socket (never clobber a
+    // stranger's bind). Leases live in the FLYWHEEL state dir, shared
+    // with embedded loops, so either side excludes the other per ws.
+    let claims = doorbell_rt::daemon_claims_writer_lease(doorbell_rt::comms_inbox_env());
+    refuse_live_leases(cfg, now, claims)?;
     let tcp = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", cfg.port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -741,17 +781,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
     // Claim one writer lease per hosted workspace before serving.
     let owned: Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>> =
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    for (_, workspace) in &cfg.hosts {
-        match lease::acquire_lease(&cfg.flywheel_state, workspace, lease::unix_now()) {
-            Ok(l) => owned.lock().push((workspace.clone(), l)),
-            Err(e) => {
-                for (ws, l) in owned.lock().iter() {
-                    lease::release_lease(&cfg.flywheel_state, ws, l);
-                }
-                anyhow::bail!("doorbell serve: lease claim failed after bind: {e:?}");
-            }
-        }
-    }
+    let claimed = claim_writer_leases(cfg, claims)?;
+    owned.lock().extend(claimed);
     let sock_path = cfg.socket_path();
     if let Some(parent) = sock_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -1245,23 +1276,27 @@ fn reconcile_once(
     // reconcile task forever (and every /health handler behind it).
     let unhosted = unhosted_subscribed(&subs, &hosted_keys(&hosted.lock()));
     for (project, workspace) in unhosted {
-        if let Some(cur) = lease::read_lease(&cfg.flywheel_state, &workspace)
-            && !lease::lease_stale(&cur, now)
-        {
-            continue; // a live writer (embedded loop) owns it — never steal
-        }
-        match lease::acquire_lease(&cfg.flywheel_state, &workspace, now) {
-            Ok(l) => {
-                owned.lock().push((workspace.clone(), l));
-                eprintln!("doorbell serve: auto-hosting {project}/{workspace} (subscribed)");
-                // The worker shares the served cache, so an immediate
-                // startup failure invalidates the same snapshot /health uses.
-                spawn_host_loop(cfg, hosted, loops, owned, health, &project, &workspace);
+        let claims = doorbell_rt::daemon_claims_writer_lease(doorbell_rt::comms_inbox_env());
+        if claims {
+            if let Some(cur) = lease::read_lease(&cfg.flywheel_state, &workspace)
+                && !lease::lease_stale(&cur, now)
+            {
+                continue; // a live writer (embedded loop) owns it — never steal
             }
-            Err(e) => {
-                eprintln!("doorbell serve: auto-host {project}/{workspace} lease failed: {e:?}")
+            match lease::acquire_lease(&cfg.flywheel_state, &workspace, now) {
+                Ok(l) => owned.lock().push((workspace.clone(), l)),
+                Err(e) => {
+                    eprintln!(
+                        "doorbell serve: auto-host {project}/{workspace} lease failed: {e:?}"
+                    );
+                    continue;
+                }
             }
         }
+        eprintln!("doorbell serve: auto-hosting {project}/{workspace} (subscribed)");
+        // The worker shares the served cache, so an immediate
+        // startup failure invalidates the same snapshot /health uses.
+        spawn_host_loop(cfg, hosted, loops, owned, health, &project, &workspace);
     }
     // bd-mk60: retire what this tick did not justify. Runs AFTER the auto-host
     // pass so a pair that is still subscribed is already hosted — and that
@@ -2435,6 +2470,70 @@ mod tests {
         assert!(!flag_arm.contains("CliPromptSink"));
         let else_arm = &tail[tail.find("} else {").unwrap()..];
         assert!(else_arm.contains("CliPromptSink::new("), "flag-off path unchanged");
+    }
+
+    fn lease_cfg(dir: &std::path::Path) -> crate::lifecycle::Config {
+        crate::lifecycle::Config {
+            state_dir: dir.join("doorbell"),
+            port: 0,
+            flywheel_state: dir.join("fw"),
+            hosts: vec![("p".to_string(), "w".to_string())],
+        }
+    }
+
+    /// Follow-up (a): with the comms flag on, a daemon host that types nothing
+    /// must neither claim the per-workspace writer lease nor refuse to start
+    /// beside one — otherwise the sender defers to it (0 rings, no deaf
+    /// escalation) and `flywheel __doorbell` refuses to run.
+    #[test]
+    fn flag_on_the_daemon_claims_no_writer_lease_and_defers_to_none() {
+        let d = std::env::temp_dir().join(format!("db-lease-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&d);
+        let cfg = lease_cfg(&d);
+        std::fs::create_dir_all(&cfg.flywheel_state).unwrap();
+        let now = doorbell_rt::lease::unix_now();
+        // Another live writer (the inbox host: a live pid) holds the workspace.
+        let theirs = doorbell_rt::lease::acquire_lease(&cfg.flywheel_state, "w", now).unwrap();
+        assert!(super::refuse_live_leases(&cfg, now, false).is_ok(), "flag on: no refusal");
+        assert!(super::claim_writer_leases(&cfg, false).unwrap().is_empty());
+        let cur = doorbell_rt::lease::read_lease(&cfg.flywheel_state, "w").unwrap();
+        assert_eq!(cur.pid, theirs.pid, "the foreign lease is untouched");
+        // Nobody else: the daemon leaves no lease for the sender to defer to.
+        doorbell_rt::lease::release_lease(&cfg.flywheel_state, "w", &theirs);
+        assert!(super::claim_writer_leases(&cfg, false).unwrap().is_empty());
+        assert!(
+            doorbell_rt::lease::live_leases(&cfg.flywheel_state, now).is_empty(),
+            "no lease: the sender rings itself and the embedded host may start"
+        );
+    }
+
+    #[test]
+    fn flag_off_the_daemon_still_claims_and_still_refuses_a_live_lease() {
+        let d = std::env::temp_dir().join(format!("db-lease-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&d);
+        let cfg = lease_cfg(&d);
+        std::fs::create_dir_all(&cfg.flywheel_state).unwrap();
+        let now = doorbell_rt::lease::unix_now();
+        let claimed = super::claim_writer_leases(&cfg, true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(doorbell_rt::lease::live_leases(&cfg.flywheel_state, now).len(), 1);
+        assert!(super::refuse_live_leases(&cfg, now, true).is_err(), "legacy D9 refusal intact");
+        for (ws, l) in &claimed {
+            doorbell_rt::lease::release_lease(&cfg.flywheel_state, ws, l);
+        }
+        assert!(super::refuse_live_leases(&cfg, now, true).is_ok());
+    }
+
+    #[test]
+    fn the_claim_decision_is_the_flag_inverted_and_auto_host_obeys_it() {
+        assert!(doorbell_rt::daemon_claims_writer_lease(false));
+        assert!(!doorbell_rt::daemon_claims_writer_lease(true));
+        let src = include_str!("serve.rs");
+        let a = src.find("fn reconcile_hosted").or_else(|| src.find("unhosted_subscribed(&subs")).unwrap();
+        let body = &src[a..a + 2400];
+        let g = body.find("if claims {").expect("auto-host claim gate");
+        assert!(body[g..].find("acquire_lease").unwrap() < body[g..].find("spawn_host_loop(").unwrap());
+        assert!(body.contains("daemon_claims_writer_lease(doorbell_rt::comms_inbox_env())"));
     }
 
     use super::known_journal_workspaces;

@@ -451,6 +451,17 @@ pub fn comms_inbox_env() -> bool {
     comms_flag_word(std::env::var("TORON_COMMS_INBOX").ok().as_deref())
 }
 
+/// Pure: does a daemon host claim the per-workspace writer lease? The lease
+/// is the PANE-WRITER lease: it says "the holder types into these panes", and
+/// the sender defers its own ring to it and `flywheel __doorbell` refuses to
+/// run beside it. With the comms flag on the daemon host types nothing (its
+/// sink is `NoTextSink`), so holding the lease would silence the sender and
+/// lock out the real writer (the flywheel inbox host) with nobody ringing.
+/// Flag on: do not claim, do not defer to a foreign lease.
+pub fn daemon_claims_writer_lease(comms_flag_on: bool) -> bool {
+    !comms_flag_on
+}
+
 /// Pure: the flag words.
 pub fn comms_flag_word(v: Option<&str>) -> bool {
     matches!(v, Some("1" | "true" | "on"))
