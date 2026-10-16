@@ -60,6 +60,7 @@ mod effect_journal;
 mod failure;
 mod fs_util;
 mod harness_registry;
+mod harness_caps;
 mod headless;
 mod herdr_shim;
 mod ingress;
