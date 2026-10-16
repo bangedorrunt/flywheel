@@ -59,8 +59,21 @@ pub const CREW_CAP: usize = 5;
 pub const DEFAULT_ACK_MS: u64 = 120_000;
 /// Default child lease.
 pub const DEFAULT_LEASE_MS: u64 = 600_000;
+/// Floor for the orphan window. A lead is adoptable only after
+/// `max(2 * lease_ms, ORPHAN_FLOOR_MS)` with no progress.
+pub const ORPHAN_FLOOR_MS: u64 = 600_000;
 /// The loop pass child's id.
 pub const PASS: &str = "pass";
+
+/// Orphan window for a lease. Not read from the environment: the host puts
+/// the result on [`Policy`] before the fold sees it.
+pub fn orphan_window_ms(lease_ms: u64) -> u64 {
+    lease_ms.saturating_mul(2).max(ORPHAN_FLOOR_MS)
+}
+
+fn default_t_orphan_ms() -> u64 {
+    orphan_window_ms(DEFAULT_LEASE_MS)
+}
 
 /// Which tier this supervisor is (picks the intensity budget).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +83,18 @@ pub enum Tier {
     Lead,
     /// The captain (root): 2 per 60 min.
     Captain,
+}
+
+/// Crew pane, or one nested lead process. A lead is one child of this
+/// supervisor: its own crews stay in its own model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildKind {
+    /// A pane. Old logs omit `kind` and parse as this.
+    #[default]
+    Crew,
+    /// A nested `loop-mode supervise` context. Counts toward `crew_cap`.
+    Lead,
 }
 
 /// Restart rule of a child (§6A.2).
@@ -129,6 +154,10 @@ pub struct Policy {
     pub ack_ms: u64,
     /// Child lease.
     pub lease_ms: u64,
+    /// How long a lead may go without progress before another parent may
+    /// adopt it. `max(2 * lease_ms, ORPHAN_FLOOR_MS)`, set by [`Policy::for_tier`].
+    #[serde(default = "default_t_orphan_ms")]
+    pub t_orphan_ms: u64,
 }
 
 impl Policy {
@@ -147,6 +176,7 @@ impl Policy {
             crew_cap: CREW_CAP,
             ack_ms: DEFAULT_ACK_MS,
             lease_ms: DEFAULT_LEASE_MS,
+            t_orphan_ms: orphan_window_ms(DEFAULT_LEASE_MS),
         }
     }
 }
@@ -160,6 +190,12 @@ pub struct ChildSpec {
     pub npub: Option<String>,
     /// Restart rule.
     pub restart: Restart,
+    /// Crew or lead. Missing on old logs: [`ChildKind::Crew`].
+    #[serde(default)]
+    pub kind: ChildKind,
+    /// Beads whose `role` matches this are eligible. Missing means the child id.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// Where a child is.
@@ -194,6 +230,32 @@ impl ChildState {
     pub fn live_for_host(self) -> bool {
         self.live()
     }
+}
+
+/// One bead the supervisor may hand to a crew.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyBead {
+    /// Task id.
+    pub id: String,
+    /// Paths the task reserves. Overlap with an in-flight assignment waits.
+    pub scope_paths: Vec<String>,
+    /// Dependencies proved. `false` is not assigned.
+    pub deps_proved: bool,
+    /// Must equal the child's id, or its `role` when set.
+    pub role: String,
+}
+
+/// An in-flight assignment. The fold records it; the host does not write a pane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assignment {
+    /// Task id.
+    pub task: String,
+    /// Crew it was given to.
+    pub child: String,
+    /// That child's generation at assignment.
+    pub generation: u64,
+    /// Scope held while this assignment is in flight.
+    pub scope_paths: Vec<String>,
 }
 
 /// One child.
@@ -382,6 +444,15 @@ pub struct SupModel {
     /// above it, so effect keys (`relaunch:<id>:<gen>`) and the generation
     /// fence never see an old incarnation's values again.
     pub retired_gen: BTreeMap<String, u64>,
+    /// In-flight bead assignments, keyed by task id.
+    #[serde(default)]
+    pub assignments: BTreeMap<String, Assignment>,
+    /// Times a task was assigned and then ended abnormally.
+    #[serde(default)]
+    pub task_abnormal: BTreeMap<String, u32>,
+    /// Task ids that have ended abnormally `poison` times. Not reassigned.
+    #[serde(default)]
+    pub parked_tasks: BTreeSet<String>,
 }
 
 impl SupModel {
@@ -409,6 +480,9 @@ impl SupModel {
             deaf_seen: BTreeSet::new(),
             now_ms: 0,
             retired_gen: BTreeMap::new(),
+            assignments: BTreeMap::new(),
+            task_abnormal: BTreeMap::new(),
+            parked_tasks: BTreeSet::new(),
         }
     }
 
@@ -491,6 +565,30 @@ pub enum SupMsg {
         /// Time.
         now_ms: u64,
     },
+    /// A child (a lead, in 4b.2) ended abnormally. One restart slot, the
+    /// parent's strategy, relaunch at `generation + 1`. Not a free restart:
+    /// a full window escalates instead.
+    ChildEscalated {
+        /// Child.
+        child: String,
+        /// Why the child escalated. The fold spends a slot either way.
+        reason: String,
+        /// Time.
+        now_ms: u64,
+    },
+    /// A new parent takes an orphaned lead. Accepted only when the child is
+    /// a lead, its last progress is at least `t_orphan_ms` old, and
+    /// `sup_epoch` is newer than the one this host already accepted.
+    Adopt {
+        /// The lead child.
+        child: String,
+        /// The parent that is taking it.
+        new_parent: String,
+        /// Epoch the new parent holds.
+        sup_epoch: u64,
+        /// Time.
+        now_ms: u64,
+    },
     /// The inbox host's `deaf` fact for the child (its durable key, so
     /// re-reading the facts file never ends a second incarnation).
     Deaf {
@@ -567,6 +665,19 @@ pub enum SupMsg {
     },
     /// A commit landed: wedge and dead-stop probes re-arm.
     WorkMoved,
+    /// Beads ready to hand out. Overlaps stay pending; nothing is assigned
+    /// when this supervisor is not running.
+    ReadyBeads {
+        /// Candidates, in order.
+        beads: Vec<ReadyBead>,
+        /// Time.
+        now_ms: u64,
+    },
+    /// The ready-bead read failed. Assign nothing.
+    ReadyBeadsFailed {
+        /// Time.
+        now_ms: u64,
+    },
     /// Clock.
     Tick {
         /// Time.
@@ -592,6 +703,10 @@ pub enum SupCmd {
         child: String,
         /// Gen.
         generation: u64,
+        /// Crew relaunch is a pane control; a lead is a nested supervise process.
+        /// Old command lines omit this and read as [`ChildKind::Crew`].
+        #[serde(default)]
+        kind: ChildKind,
     },
     /// Stop the child's pane (cancel, subtree cancel).
     Exit {
@@ -627,6 +742,15 @@ pub enum SupCmd {
         /// Evidence text.
         evidence: String,
     },
+    /// Hand a bead to a crew. Logged only; the host does not write a pane.
+    Assign {
+        /// Task id.
+        task: String,
+        /// Crew.
+        child: String,
+        /// The crew's generation.
+        generation: u64,
+    },
     /// Park a poisoned child as a ceiling.
     Park {
         /// Child.
@@ -659,8 +783,15 @@ pub enum SupCmd {
 impl KCmd for SupCmd {
     fn durability(&self) -> Durability {
         let key = match self {
-            Self::Relaunch { child, generation } => format!("relaunch:{child}:{generation}"),
+            Self::Relaunch {
+                child, generation, ..
+            } => format!("relaunch:{child}:{generation}"),
             Self::Exit { child, generation } => format!("exit:{child}:{generation}"),
+            Self::Assign {
+                task,
+                child,
+                generation,
+            } => format!("assign:{task}:{child}:{generation}"),
             Self::AppendSteer { seq, .. } => format!("steer:{seq}"),
             Self::Escalate { n, reason, .. } => format!("escalate:{n}:{reason}"),
             Self::Park { child, .. } => format!("park:{child}"),
@@ -757,6 +888,84 @@ fn fail_subtree(next: &mut SupModel, cmds: &mut Vec<SupCmd>, reason: &str, who: 
     escalate(next, cmds, reason, ev);
 }
 
+fn drop_assignments(next: &mut SupModel, id: &str) {
+    let gone: Vec<String> = next
+        .assignments
+        .iter()
+        .filter(|(_, a)| a.child == id)
+        .map(|(t, _)| t.clone())
+        .collect();
+    for t in gone {
+        next.assignments.remove(&t);
+    }
+}
+
+/// The child abnormal-end path already parks at 3. This only refuses to
+/// hand the same task out again once it has ended that many times.
+fn note_task_end(next: &mut SupModel, id: &str) {
+    let gone: Vec<String> = next
+        .assignments
+        .iter()
+        .filter(|(_, a)| a.child == id)
+        .map(|(t, _)| t.clone())
+        .collect();
+    for t in gone {
+        next.assignments.remove(&t);
+        let n = next.task_abnormal.entry(t.clone()).or_insert(0);
+        *n += 1;
+        if *n >= next.policy.poison {
+            next.parked_tasks.insert(t);
+        }
+    }
+}
+
+fn child_role(c: &Child) -> &str {
+    c.spec.role.as_deref().unwrap_or(&c.spec.id)
+}
+
+fn scopes_overlap(a: &[String], b: &[String]) -> bool {
+    a.iter().any(|x| {
+        b.iter()
+            .any(|y| toron_core::mailbox::reservations::overlaps(x, y))
+    })
+}
+
+fn pick_assignee(m: &SupModel, bead: &ReadyBead) -> Option<(String, u64)> {
+    if m.status != Status::Running || !bead.deps_proved {
+        return None;
+    }
+    if m.parked_tasks.contains(&bead.id)
+        || m.task_abnormal.get(&bead.id).copied().unwrap_or(0) >= m.policy.poison
+    {
+        return None;
+    }
+    if m.assignments.contains_key(&bead.id) {
+        return None;
+    }
+    // One task in flight per crew, and never more tasks than `crew_cap`.
+    // Live panes are the spawn cap; they are not themselves a full book.
+    if m.assignments.len() >= m.policy.crew_cap {
+        return None;
+    }
+    if m.assignments
+        .values()
+        .any(|a| scopes_overlap(&bead.scope_paths, &a.scope_paths))
+    {
+        return None;
+    }
+    let busy: BTreeSet<&str> = m.assignments.values().map(|a| a.child.as_str()).collect();
+    m.children
+        .values()
+        .find(|c| {
+            c.spec.kind == ChildKind::Crew
+                && c.spec.id != PASS
+                && c.state == ChildState::Running
+                && !busy.contains(c.spec.id.as_str())
+                && bead.role == child_role(c)
+        })
+        .map(|c| (c.spec.id.clone(), c.generation))
+}
+
 /// A child ended abnormally: restart it, park it, or fail the supervisor.
 /// `count_incarnation` is false for a deferred restart (herdr was down).
 fn abnormal_end(
@@ -769,17 +978,28 @@ fn abnormal_end(
     if next.status != Status::Running {
         return;
     }
+    let temporary = {
+        let Some(c) = next.children.get(id) else {
+            return;
+        };
+        if !c.state.live() {
+            return;
+        }
+        // Already ended and waiting on herdr: one end is one incarnation.
+        if c.state == ChildState::NeedsRestart && count_incarnation {
+            return;
+        }
+        c.spec.restart == Restart::Temporary
+    };
+    if count_incarnation {
+        note_task_end(next, id);
+    } else {
+        drop_assignments(next, id);
+    }
     let Some(c) = next.children.get_mut(id) else {
         return;
     };
-    if !c.state.live() {
-        return;
-    }
-    // Already ended and waiting on herdr: one end is one incarnation.
-    if c.state == ChildState::NeedsRestart && count_incarnation {
-        return;
-    }
-    if c.spec.restart == Restart::Temporary {
+    if temporary {
         c.state = ChildState::Gone;
         return;
     }
@@ -812,6 +1032,11 @@ fn abnormal_end(
     // strategy restarts with it (OTP).
     next.restarts.push(now);
     let set = restart_set(next, id);
+    for m in &set {
+        if m != id {
+            drop_assignments(next, m);
+        }
+    }
     // Siblings still running are stopped first (the failed child already
     // ended, so it gets no Exit); a temporary sibling is stopped for good.
     for m in &set {
@@ -842,6 +1067,7 @@ fn abnormal_end(
         c.paused = false;
         c.lease_deadline_ms = now.saturating_add(lease);
         let generation = c.generation;
+        let kind = c.spec.kind;
         for s in next.steers.values_mut() {
             if s.child == m && s.state == SteerState::Pending {
                 s.state = SteerState::AppliedByRestart;
@@ -850,6 +1076,7 @@ fn abnormal_end(
         cmds.push(SupCmd::Relaunch {
             child: m,
             generation,
+            kind,
         });
     }
 }
@@ -1008,7 +1235,11 @@ impl Program for SupervisorProgram {
                     }
                 }
             }
-            SupMsg::Done { child, generation, now_ms } => {
+            SupMsg::Done {
+                child,
+                generation,
+                now_ms,
+            } => {
                 next.now_ms = next.now_ms.max(*now_ms);
                 if accept_report(&mut next, &mut cmds, child, *generation)
                     && let Some(c) = next.children.get_mut(child)
@@ -1038,6 +1269,40 @@ impl Program for SupervisorProgram {
                     abnormal_end(&mut next, &mut cmds, child, *now_ms, true);
                 }
             }
+            SupMsg::ChildEscalated {
+                child,
+                reason: _,
+                now_ms,
+            } => {
+                // Same slot as any abnormal end. A full window, including a
+                // captain's, escalates through `fail_subtree` instead of
+                // relaunching for free.
+                next.now_ms = next.now_ms.max(*now_ms);
+                if next
+                    .children
+                    .get(child)
+                    .is_some_and(|c| c.state == ChildState::Running)
+                {
+                    abnormal_end(&mut next, &mut cmds, child, *now_ms, true);
+                }
+            }
+            SupMsg::Adopt {
+                child,
+                new_parent,
+                sup_epoch,
+                now_ms,
+            } => {
+                let orphan = next.children.get(child).is_some_and(|c| {
+                    c.spec.kind == ChildKind::Lead
+                        && c.state == ChildState::Running
+                        && now_ms.saturating_sub(c.last_progress_ms) >= next.policy.t_orphan_ms
+                });
+                if orphan && *sup_epoch > next.accepted_epoch {
+                    next.now_ms = next.now_ms.max(*now_ms);
+                    next.accepted_epoch = *sup_epoch;
+                    next.leader = new_parent.clone();
+                }
+            }
             SupMsg::Cursor { child, cursor } => {
                 let mut bump = false;
                 for s in next.steers.values_mut() {
@@ -1051,7 +1316,10 @@ impl Program for SupervisorProgram {
                         // one is stale. Only if the child still is at the
                         // generation the steer was issued at.
                         bump |= s.op == SteerOp::Redirect
-                            && next.children.get(child).is_some_and(|c| c.generation == s.generation);
+                            && next
+                                .children
+                                .get(child)
+                                .is_some_and(|c| c.generation == s.generation);
                     }
                 }
                 if bump && let Some(c) = next.children.get_mut(child) {
@@ -1118,7 +1386,11 @@ impl Program for SupervisorProgram {
                         op: *op,
                         // A redirect names the generation the crew re-claims at
                         // once it acks: its reports at the old one go stale then.
-                        generation: if *op == SteerOp::Redirect { generation + 1 } else { generation },
+                        generation: if *op == SteerOp::Redirect {
+                            generation + 1
+                        } else {
+                            generation
+                        },
                         sup_epoch: *sup_epoch,
                         urgent: *op != SteerOp::Resume,
                         delta_sha: delta_sha.clone(),
@@ -1195,6 +1467,35 @@ impl Program for SupervisorProgram {
                 next.paged.clear();
                 next.stalled = false;
             }
+            SupMsg::ReadyBeads { beads, now_ms } => {
+                if next.status == Status::Running {
+                    let mut any = false;
+                    for bead in beads {
+                        let Some((child, generation)) = pick_assignee(&next, bead) else {
+                            continue;
+                        };
+                        next.assignments.insert(
+                            bead.id.clone(),
+                            Assignment {
+                                task: bead.id.clone(),
+                                child: child.clone(),
+                                generation,
+                                scope_paths: bead.scope_paths.clone(),
+                            },
+                        );
+                        cmds.push(SupCmd::Assign {
+                            task: bead.id.clone(),
+                            child,
+                            generation,
+                        });
+                        any = true;
+                    }
+                    if any {
+                        next.now_ms = next.now_ms.max(*now_ms);
+                    }
+                }
+            }
+            SupMsg::ReadyBeadsFailed { .. } => {}
             SupMsg::Tick { now_ms } => {
                 // The clock reading is used, not stored: a tick that decides
                 // nothing leaves the model equal, so the host logs nothing.
@@ -1287,10 +1588,9 @@ impl Program for SupervisorProgram {
                 if let Some(rest) = key.strip_prefix("relaunch:")
                     && let Some((id, generation)) = rest.rsplit_once(':')
                     && let Ok(generation) = generation.parse::<u64>()
-                    && next
-                        .children
-                        .get(id)
-                        .is_some_and(|c| c.state == ChildState::Restarting && c.generation == generation)
+                    && next.children.get(id).is_some_and(|c| {
+                        c.state == ChildState::Restarting && c.generation == generation
+                    })
                 {
                     let now = next.now_ms;
                     abnormal_end(&mut next, &mut cmds, id, now, true);
@@ -1376,6 +1676,8 @@ mod tests {
             id: id.into(),
             npub: Some(format!("npub-{id}")),
             restart: Restart::Transient,
+            kind: ChildKind::Crew,
+            role: None,
         }
     }
 
@@ -1432,7 +1734,9 @@ mod tests {
     fn relaunches(c: &[SupCmd]) -> Vec<(String, u64)> {
         c.iter()
             .filter_map(|c| match c {
-                SupCmd::Relaunch { child, generation } => Some((child.clone(), *generation)),
+                SupCmd::Relaunch {
+                    child, generation, ..
+                } => Some((child.clone(), *generation)),
                 _ => None,
             })
             .collect()
@@ -1466,7 +1770,6 @@ mod tests {
         );
         (m, c)
     }
-
 
     // ---- 4b.1: strategies (`rest_for_one`, `one_for_all`)
 
@@ -1528,7 +1831,10 @@ mod tests {
 
     #[test]
     fn one_for_one_restarts_only_the_failed_child() {
-        let (m, c) = step(&strat(Strategy::OneForOne, &["a", "b", "c"]), &exit("b", 10));
+        let (m, c) = step(
+            &strat(Strategy::OneForOne, &["a", "b", "c"]),
+            &exit("b", 10),
+        );
         assert_eq!(relaunches(&c), rl(&[("b", 2)]));
         assert!(exits(&c).is_empty());
         assert_eq!(m.children["c"].generation, 1);
@@ -1536,33 +1842,58 @@ mod tests {
 
     #[test]
     fn rest_for_one_restarts_the_failed_child_and_those_started_after_it_never_before() {
-        let (m, c) = step(&strat(Strategy::RestForOne, &["a", "b", "c"]), &exit("b", 10));
+        let (m, c) = step(
+            &strat(Strategy::RestForOne, &["a", "b", "c"]),
+            &exit("b", 10),
+        );
         assert_eq!(relaunches(&c), rl(&[("b", 2), ("c", 2)]));
-        assert_eq!(exits(&c), rl(&[("c", 1)]), "the running sibling is stopped first; the failed child already ended");
-        assert_eq!(m.children["a"].generation, 1, "an earlier child is never touched");
+        assert_eq!(
+            exits(&c),
+            rl(&[("c", 1)]),
+            "the running sibling is stopped first; the failed child already ended"
+        );
+        assert_eq!(
+            m.children["a"].generation, 1,
+            "an earlier child is never touched"
+        );
         assert_eq!(m.children["a"].state, ChildState::Running);
         assert_eq!(m.children["c"].state, ChildState::Restarting);
     }
 
     #[test]
     fn rest_for_one_on_the_last_child_is_one_for_one() {
-        let (_, c) = step(&strat(Strategy::RestForOne, &["a", "b", "c"]), &exit("c", 10));
+        let (_, c) = step(
+            &strat(Strategy::RestForOne, &["a", "b", "c"]),
+            &exit("c", 10),
+        );
         assert_eq!(relaunches(&c), rl(&[("c", 2)]));
         assert!(exits(&c).is_empty());
     }
 
     #[test]
     fn one_for_all_restarts_every_live_child() {
-        let (_, c) = step(&strat(Strategy::OneForAll, &["a", "b", "c"]), &exit("b", 10));
+        let (_, c) = step(
+            &strat(Strategy::OneForAll, &["a", "b", "c"]),
+            &exit("b", 10),
+        );
         assert_eq!(relaunches(&c), rl(&[("a", 2), ("b", 2), ("c", 2)]));
         assert_eq!(exits(&c), rl(&[("a", 1), ("c", 1)]));
     }
 
     #[test]
     fn exits_precede_relaunches_in_the_command_list() {
-        let (_, c) = step(&strat(Strategy::OneForAll, &["a", "b", "c"]), &exit("b", 10));
-        let last_exit = c.iter().rposition(|x| matches!(x, SupCmd::Exit { .. })).unwrap();
-        let first_rl = c.iter().position(|x| matches!(x, SupCmd::Relaunch { .. })).unwrap();
+        let (_, c) = step(
+            &strat(Strategy::OneForAll, &["a", "b", "c"]),
+            &exit("b", 10),
+        );
+        let last_exit = c
+            .iter()
+            .rposition(|x| matches!(x, SupCmd::Exit { .. }))
+            .unwrap();
+        let first_rl = c
+            .iter()
+            .position(|x| matches!(x, SupCmd::Relaunch { .. }))
+            .unwrap();
         assert!(last_exit < first_rl);
     }
 
@@ -1573,7 +1904,11 @@ mod tests {
             // A different child fails each time, so none reaches the poison ceiling.
             let (n, c) = step(&m, &exit(["a", "b", "c"][i], t));
             assert_eq!(relaunches(&c).len(), 3, "event {i} restarts all three");
-            assert_eq!(n.restarts.len(), i + 1, "one slot per failure event, not per child");
+            assert_eq!(
+                n.restarts.len(),
+                i + 1,
+                "one slot per failure event, not per child"
+            );
             assert_eq!(escalations(&c), 0);
             m = settle(n);
         }
@@ -1586,20 +1921,33 @@ mod tests {
     #[test]
     fn a_restarted_child_keeps_its_place() {
         let m = strat(Strategy::RestForOne, &["a", "b", "c"]);
-        let before: Vec<u64> = ["a", "b", "c"].iter().map(|i| m.children[*i].order).collect();
+        let before: Vec<u64> = ["a", "b", "c"]
+            .iter()
+            .map(|i| m.children[*i].order)
+            .collect();
         let (m, _) = step(&m, &exit("a", 10));
         let m = settle(m);
-        let after: Vec<u64> = ["a", "b", "c"].iter().map(|i| m.children[*i].order).collect();
+        let after: Vec<u64> = ["a", "b", "c"]
+            .iter()
+            .map(|i| m.children[*i].order)
+            .collect();
         assert_eq!(before, after);
     }
 
     #[test]
     fn a_failure_while_a_sibling_is_restarting_does_not_restart_it_twice() {
-        let (m, c) = step(&strat(Strategy::RestForOne, &["a", "b", "c"]), &exit("c", 10));
+        let (m, c) = step(
+            &strat(Strategy::RestForOne, &["a", "b", "c"]),
+            &exit("c", 10),
+        );
         assert_eq!(relaunches(&c), rl(&[("c", 2)]));
         // c's relaunch is unconfirmed; b fails: c is covered by that restart.
         let (m, c) = step(&m, &exit("b", 20));
-        assert_eq!(relaunches(&c), rl(&[("b", 2)]), "c is Restarting already: not restarted again");
+        assert_eq!(
+            relaunches(&c),
+            rl(&[("b", 2)]),
+            "c is Restarting already: not restarted again"
+        );
         assert!(exits(&c).is_empty());
         assert_eq!(m.children["c"].generation, 2);
     }
@@ -1607,8 +1955,17 @@ mod tests {
     #[test]
     fn two_leases_expiring_in_one_tick_are_one_cascade_not_two() {
         let m = strat(Strategy::OneForAll, &["a", "b"]);
-        let (m, c) = step(&m, &SupMsg::Tick { now_ms: DEFAULT_LEASE_MS + 1 });
-        assert_eq!(relaunches(&c), rl(&[("a", 2), ("b", 2)]), "b was restarted with a: its lease is fresh");
+        let (m, c) = step(
+            &m,
+            &SupMsg::Tick {
+                now_ms: DEFAULT_LEASE_MS + 1,
+            },
+        );
+        assert_eq!(
+            relaunches(&c),
+            rl(&[("a", 2), ("b", 2)]),
+            "b was restarted with a: its lease is fresh"
+        );
         assert_eq!(m.restarts.len(), 1);
     }
 
@@ -1628,7 +1985,11 @@ mod tests {
         let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 });
         assert_eq!(m.steers[&1].state, SteerState::Pending);
         let (m, _) = step(&m, &exit("b", 2_000));
-        assert_eq!(m.steers[&1].state, SteerState::AppliedByRestart, "never left gating a dead incarnation");
+        assert_eq!(
+            m.steers[&1].state,
+            SteerState::AppliedByRestart,
+            "never left gating a dead incarnation"
+        );
         assert_eq!(m.children["a"].generation, 2);
     }
 
@@ -1655,9 +2016,17 @@ mod tests {
     fn the_loop_pass_child_is_never_a_sibling_and_never_cascades() {
         let m = strat(Strategy::OneForAll, &["a", PASS]);
         let (_, c) = step(&m, &exit("a", 10));
-        assert_eq!(relaunches(&c), rl(&[("a", 2)]), "the pass is cadence, not a crew");
+        assert_eq!(
+            relaunches(&c),
+            rl(&[("a", 2)]),
+            "the pass is cadence, not a crew"
+        );
         let (_, c) = step(&m, &exit(PASS, 10));
-        assert_eq!(relaunches(&c), rl(&[(PASS, 2)]), "a pass failure does not restart crews");
+        assert_eq!(
+            relaunches(&c),
+            rl(&[(PASS, 2)]),
+            "a pass failure does not restart crews"
+        );
     }
 
     #[test]
@@ -1701,11 +2070,19 @@ mod tests {
     /// message sequences and checks the invariants after each step.
     #[test]
     fn invariants_hold_over_generated_sequences_for_every_strategy() {
-        for strategy in [Strategy::OneForOne, Strategy::RestForOne, Strategy::OneForAll] {
+        for strategy in [
+            Strategy::OneForOne,
+            Strategy::RestForOne,
+            Strategy::OneForAll,
+        ] {
             for seed in 0..200u64 {
-                let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let mut x = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let mut next = move || {
-                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     (x >> 33) as usize
                 };
                 let ids = ["a", "b", "c", "d"];
@@ -1727,14 +2104,23 @@ mod tests {
                     let (n, c) = step(&m, &msg);
                     // (child, generation) of a relaunch is never reused.
                     for (ch, g) in relaunches(&c) {
-                        assert!(keys.insert((ch.clone(), g)), "{strategy:?} seed {seed}: relaunch:{ch}:{g} reused");
+                        assert!(
+                            keys.insert((ch.clone(), g)),
+                            "{strategy:?} seed {seed}: relaunch:{ch}:{g} reused"
+                        );
                         assert_eq!(g, n.children[&ch].generation);
                     }
                     for (id, ch) in &n.children {
-                        assert!(ch.generation >= m.children[id].generation, "generation never goes back");
+                        assert!(
+                            ch.generation >= m.children[id].generation,
+                            "generation never goes back"
+                        );
                         assert_eq!(ch.order, m.children[id].order, "order is stable");
                     }
-                    assert!(n.restarts.len() as u32 <= n.policy.max_r, "the window never exceeds MaxR");
+                    assert!(
+                        n.restarts.len() as u32 <= n.policy.max_r,
+                        "the window never exceeds MaxR"
+                    );
                     msgs.push(msg);
                     m = n;
                 }
@@ -1749,13 +2135,23 @@ mod tests {
                             p
                         }),
                     },
-                    SupMsg::Claim { holder: ME.into(), sup_epoch: 2 },
+                    SupMsg::Claim {
+                        holder: ME.into(),
+                        sup_epoch: 2,
+                    },
                 ];
                 for id in ids {
-                    all.push(SupMsg::Spawn { spec: spec(id), now_ms: 0 });
+                    all.push(SupMsg::Spawn {
+                        spec: spec(id),
+                        now_ms: 0,
+                    });
                 }
                 all.extend(msgs);
-                assert_eq!(replay(&all).0, m, "{strategy:?} seed {seed}: replay differs");
+                assert_eq!(
+                    replay(&all).0,
+                    m,
+                    "{strategy:?} seed {seed}: replay differs"
+                );
             }
         }
     }
@@ -1784,16 +2180,33 @@ mod tests {
 
     #[test]
     fn a_delta_that_is_not_a_sha_or_that_rides_another_op_is_rejected() {
-        for bad in ["", "not-a-sha", &"A".repeat(64), &"a".repeat(63), &"g".repeat(64), "../../x"] {
+        for bad in [
+            "",
+            "not-a-sha",
+            &"A".repeat(64),
+            &"a".repeat(63),
+            &"g".repeat(64),
+            "../../x",
+        ] {
             let (_, c) = step(&base(), &redirect("a", Some(bad)));
             assert_eq!(rejects(&c), vec![RejectCause::BadSteer], "{bad:?}");
         }
         for op in [SteerOp::Pause, SteerOp::Resume, SteerOp::Cancel] {
             let (_, c) = step(
                 &base(),
-                &SupMsg::Control { op, child: "a".into(), sup_epoch: 2, delta_sha: Some(D.into()), now_ms: 1 },
+                &SupMsg::Control {
+                    op,
+                    child: "a".into(),
+                    sup_epoch: 2,
+                    delta_sha: Some(D.into()),
+                    now_ms: 1,
+                },
             );
-            assert_eq!(rejects(&c), vec![RejectCause::BadSteer], "{op:?} takes no delta");
+            assert_eq!(
+                rejects(&c),
+                vec![RejectCause::BadSteer],
+                "{op:?} takes no delta"
+            );
         }
     }
 
@@ -1801,9 +2214,18 @@ mod tests {
     fn a_redirect_with_a_delta_records_the_sha_and_names_the_generation_to_reclaim_at() {
         let (m, c) = step(&base(), &redirect("a", Some(D)));
         assert_eq!(m.steers[&1].delta_sha.as_deref(), Some(D));
-        assert_eq!(m.children["a"].generation, 1, "the crew has not acked: still g");
+        assert_eq!(
+            m.children["a"].generation, 1,
+            "the crew has not acked: still g"
+        );
         match c.as_slice() {
-            [SupCmd::AppendSteer { generation, delta_sha, .. }] => {
+            [
+                SupCmd::AppendSteer {
+                    generation,
+                    delta_sha,
+                    ..
+                },
+            ] => {
                 assert_eq!(*generation, 2, "the mail names g+1");
                 assert_eq!(delta_sha.as_deref(), Some(D));
             }
@@ -1814,7 +2236,14 @@ mod tests {
     fn acked_redirect() -> SupModel {
         let (m, _) = step(&base(), &redirect("a", Some(D)));
         let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 });
-        step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 7 }).0
+        step(
+            &m,
+            &SupMsg::Cursor {
+                child: "a".into(),
+                cursor: 7,
+            },
+        )
+        .0
     }
 
     #[test]
@@ -1823,9 +2252,27 @@ mod tests {
         assert_eq!(m.steers[&1].state, SteerState::Acked);
         assert_eq!(m.children["a"].generation, 2);
         assert_eq!(m.current_delta("a"), Some(D));
-        let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 1, now_ms: 2_000 });
-        assert_eq!(rejects(&c), vec![RejectCause::StaleGen], "a late done(g) is stale");
-        let (m2, c) = step(&m, &SupMsg::Progress { child: "a".into(), generation: 2, now_ms: 2_000 });
+        let (_, c) = step(
+            &m,
+            &SupMsg::Done {
+                child: "a".into(),
+                generation: 1,
+                now_ms: 2_000,
+            },
+        );
+        assert_eq!(
+            rejects(&c),
+            vec![RejectCause::StaleGen],
+            "a late done(g) is stale"
+        );
+        let (m2, c) = step(
+            &m,
+            &SupMsg::Progress {
+                child: "a".into(),
+                generation: 2,
+                now_ms: 2_000,
+            },
+        );
         assert!(rejects(&c).is_empty(), "the crew re-claimed at g+1");
         assert_eq!(m2.children["a"].last_progress_ms, 2_000);
     }
@@ -1833,7 +2280,13 @@ mod tests {
     #[test]
     fn re_reading_the_cursor_does_not_bump_twice() {
         let m = acked_redirect();
-        let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 99 });
+        let (m, _) = step(
+            &m,
+            &SupMsg::Cursor {
+                child: "a".into(),
+                cursor: 99,
+            },
+        );
         assert_eq!(m.children["a"].generation, 2);
     }
 
@@ -1841,10 +2294,22 @@ mod tests {
     fn an_acked_pause_does_not_bump_the_generation() {
         let (m, _) = step(
             &base(),
-            &SupMsg::Control { op: SteerOp::Pause, child: "a".into(), sup_epoch: 2, delta_sha: None, now_ms: 1 },
+            &SupMsg::Control {
+                op: SteerOp::Pause,
+                child: "a".into(),
+                sup_epoch: 2,
+                delta_sha: None,
+                now_ms: 1,
+            },
         );
         let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 });
-        let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 7 });
+        let (m, _) = step(
+            &m,
+            &SupMsg::Cursor {
+                child: "a".into(),
+                cursor: 7,
+            },
+        );
         assert_eq!(m.children["a"].generation, 1);
     }
 
@@ -1852,22 +2317,55 @@ mod tests {
     fn a_redirect_the_crew_never_acks_is_applied_by_a_restart_at_g_plus_one_carrying_the_delta() {
         let (m, _) = step(&base(), &redirect("a", Some(D)));
         let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 });
-        let (m, c) = step(&m, &SupMsg::Tick { now_ms: 1_000 + DEFAULT_ACK_MS + 1 });
+        let (m, c) = step(
+            &m,
+            &SupMsg::Tick {
+                now_ms: 1_000 + DEFAULT_ACK_MS + 1,
+            },
+        );
         assert_eq!(relaunches(&c), vec![("a".to_string(), 2)], "g+1, not g+2");
         assert_eq!(m.steers[&1].state, SteerState::AppliedByRestart);
-        assert_eq!(m.current_delta("a"), Some(D), "the new incarnation reads that mail first");
-        let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 1, now_ms: 9 });
+        assert_eq!(
+            m.current_delta("a"),
+            Some(D),
+            "the new incarnation reads that mail first"
+        );
+        let (_, c) = step(
+            &m,
+            &SupMsg::Done {
+                child: "a".into(),
+                generation: 1,
+                now_ms: 9,
+            },
+        );
         assert_eq!(rejects(&c), vec![RejectCause::StaleGen]);
     }
 
     #[test]
     fn the_newest_acked_or_restart_applied_delta_is_the_current_one() {
         let m = acked_redirect();
-        let (m, _) = step(&m, &SupMsg::Progress { child: "a".into(), generation: 2, now_ms: 1_500 });
+        let (m, _) = step(
+            &m,
+            &SupMsg::Progress {
+                child: "a".into(),
+                generation: 2,
+                now_ms: 1_500,
+            },
+        );
         let (m, _) = step(&m, &redirect("a", Some(D2)));
-        assert_eq!(m.current_delta("a"), Some(D), "a pending one is not current yet");
+        assert_eq!(
+            m.current_delta("a"),
+            Some(D),
+            "a pending one is not current yet"
+        );
         let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 2, offset: 9 });
-        let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 9 });
+        let (m, _) = step(
+            &m,
+            &SupMsg::Cursor {
+                child: "a".into(),
+                cursor: 9,
+            },
+        );
         assert_eq!(m.current_delta("a"), Some(D2));
         assert_eq!(m.children["a"].generation, 3);
         assert_eq!(m.current_delta("b"), None);
@@ -1886,14 +2384,23 @@ mod tests {
         let (m, c) = step(&base(), &redirect("a", Some(D)));
         let json = serde_json::to_string(&(m, c)).unwrap();
         assert!(json.contains(D));
-        assert!(!json.contains("goal"), "no delta content in the model or the commands");
+        assert!(
+            !json.contains("goal"),
+            "no delta content in the model or the commands"
+        );
     }
 
     #[test]
     fn an_old_log_line_without_the_field_still_parses() {
         let line = r#"{"kind":"control","op":"cancel","child":"a","sup_epoch":2,"now_ms":5}"#;
         let m: SupMsg = serde_json::from_str(line).unwrap();
-        assert!(matches!(m, SupMsg::Control { delta_sha: None, .. }));
+        assert!(matches!(
+            m,
+            SupMsg::Control {
+                delta_sha: None,
+                ..
+            }
+        ));
     }
 
     // ---- defaults (build-plan: leads 3/30 min, captain 2/60 min, poison 3, cap 5)
@@ -1927,7 +2434,10 @@ mod tests {
         assert!(relaunches(&c).is_empty(), "the 4th restart is not made");
         assert_eq!(escalations(&c), 1);
         assert_eq!(m.status, Status::Failed);
-        assert!(m.children.values().all(|c| !c.state.live()), "subtree cancelled");
+        assert!(
+            m.children.values().all(|c| !c.state.live()),
+            "subtree cancelled"
+        );
     }
 
     fn failed() -> SupModel {
@@ -1942,7 +2452,10 @@ mod tests {
     }
 
     fn claim(holder: &str, e: u64) -> SupMsg {
-        SupMsg::Claim { holder: holder.into(), sup_epoch: e }
+        SupMsg::Claim {
+            holder: holder.into(),
+            sup_epoch: e,
+        }
     }
 
     #[test]
@@ -1953,24 +2466,51 @@ mod tests {
         assert!(c.is_empty(), "the reset itself asks for nothing");
         assert!(r.restarts.is_empty());
         assert_eq!(r.escalations, 1, "the escalation fact is kept");
-        assert!(r.children.is_empty(), "halted children are re-adopted from the registry");
+        assert!(
+            r.children.is_empty(),
+            "halted children are re-adopted from the registry"
+        );
         // Re-adopted, it supervises again from a clean budget, in a NEW
         // generation: the old incarnation's effect keys (`relaunch:a:3`) are
         // settled in the journal and must not swallow the new one's, and a
         // late report from the old generation stays fenced.
         let old = (m.children["a"].generation, m.children["b"].generation);
-        let r = step(&r, &SupMsg::Spawn { spec: spec("a"), now_ms: 9_000 }).0;
-        let r = step(&r, &SupMsg::Spawn { spec: spec("b"), now_ms: 9_000 }).0;
+        let r = step(
+            &r,
+            &SupMsg::Spawn {
+                spec: spec("a"),
+                now_ms: 9_000,
+            },
+        )
+        .0;
+        let r = step(
+            &r,
+            &SupMsg::Spawn {
+                spec: spec("b"),
+                now_ms: 9_000,
+            },
+        )
+        .0;
         assert_eq!(r.children["a"].generation, old.0 + 1);
         assert_eq!(r.children["b"].generation, old.1 + 1);
         assert_eq!(r.children["a"].abnormal, 0);
-        let (late, c) = step(&r, &SupMsg::Done { child: "a".into(), generation: old.0, now_ms: 9_050 });
+        let (late, c) = step(
+            &r,
+            &SupMsg::Done {
+                child: "a".into(),
+                generation: old.0,
+                now_ms: 9_050,
+            },
+        );
         assert_eq!(rejects(&c), vec![RejectCause::StaleGen]);
         assert_eq!(late.children["a"].state, ChildState::Running);
         let (r, c) = step(&r, &exit("a", 9_100));
         let rl = relaunches(&c);
         assert_eq!(rl.len(), 1);
-        assert!(rl[0].1 > old.0 + 1, "a relaunch key never reuses a settled one: {rl:?} vs {old:?}");
+        assert!(
+            rl[0].1 > old.0 + 1,
+            "a relaunch key never reuses a settled one: {rl:?} vs {old:?}"
+        );
         assert_eq!(r.status, Status::Running);
     }
 
@@ -1978,9 +2518,17 @@ mod tests {
     fn only_the_hosts_own_accepted_claim_resets_a_failure() {
         let m = failed();
         let (s, _) = step(&m, &claim(ME, 2));
-        assert_eq!(s.status, Status::Failed, "a rejected (stale) own claim resets nothing");
+        assert_eq!(
+            s.status,
+            Status::Failed,
+            "a rejected (stale) own claim resets nothing"
+        );
         let (s, _) = step(&m, &claim("other", 3));
-        assert_eq!(s.status, Status::Superseded, "a foreign claim supersedes, it does not reset");
+        assert_eq!(
+            s.status,
+            Status::Superseded,
+            "a foreign claim supersedes, it does not reset"
+        );
     }
 
     #[test]
@@ -1990,8 +2538,15 @@ mod tests {
         gone.state = ChildState::Cancelled;
         m.children.insert("c".into(), gone);
         let (r, _) = step(&m, &claim(ME, 3));
-        assert_eq!(r.children["c"].state, ChildState::Cancelled, "a steer cancel is final");
-        assert!(!r.children.contains_key("a"), "a subtree-halted crew is re-adoptable");
+        assert_eq!(
+            r.children["c"].state,
+            ChildState::Cancelled,
+            "a steer cancel is final"
+        );
+        assert!(
+            !r.children.contains_key("a"),
+            "a subtree-halted crew is re-adoptable"
+        );
     }
 
     #[test]
@@ -2006,9 +2561,23 @@ mod tests {
             },
         )
         .0;
-        m = step(&m, &SupMsg::Claim { holder: ME.into(), sup_epoch: 1 }).0;
+        m = step(
+            &m,
+            &SupMsg::Claim {
+                holder: ME.into(),
+                sup_epoch: 1,
+            },
+        )
+        .0;
         for id in ["a", "b", "c"] {
-            m = step(&m, &SupMsg::Spawn { spec: spec(id), now_ms: 0 }).0;
+            m = step(
+                &m,
+                &SupMsg::Spawn {
+                    spec: spec(id),
+                    now_ms: 0,
+                },
+            )
+            .0;
         }
         let (m, c1) = step(&m, &exit("a", 1_000));
         let (m, c2) = step(&m, &exit("b", 2_000));
@@ -2042,10 +2611,29 @@ mod tests {
     #[test]
     fn nothing_restarts_after_the_supervisor_failed() {
         let mut m = base();
-        m = step(&m, &SupMsg::Spawn { spec: ChildSpec { id: PASS.into(), npub: None, restart: Restart::Permanent }, now_ms: 0 }).0;
+        m = step(
+            &m,
+            &SupMsg::Spawn {
+                spec: ChildSpec {
+                    id: PASS.into(),
+                    npub: None,
+                    restart: Restart::Permanent,
+                    kind: ChildKind::Crew,
+                    role: None,
+                },
+                now_ms: 0,
+            },
+        )
+        .0;
         let mut esc = 0;
         for t in 1..=6u64 {
-            let (n, c) = step(&m, &SupMsg::PassExit { ok: false, now_ms: t * 1_000 });
+            let (n, c) = step(
+                &m,
+                &SupMsg::PassExit {
+                    ok: false,
+                    now_ms: t * 1_000,
+                },
+            );
             m = n;
             esc += escalations(&c);
         }
@@ -2126,8 +2714,17 @@ mod tests {
                 now_ms: 500_000,
             },
         );
-        let (_, c) = step(&m, &SupMsg::Tick { now_ms: DEFAULT_LEASE_MS + 10 });
-        assert_eq!(relaunches(&c), vec![("b".to_string(), 2)], "a was renewed, b was not");
+        let (_, c) = step(
+            &m,
+            &SupMsg::Tick {
+                now_ms: DEFAULT_LEASE_MS + 10,
+            },
+        );
+        assert_eq!(
+            relaunches(&c),
+            vec![("b".to_string(), 2)],
+            "a was renewed, b was not"
+        );
     }
 
     // ---- P9: sup_epoch fence
@@ -2139,7 +2736,8 @@ mod tests {
             op: SteerOp::Cancel,
             child: "a".into(),
             sup_epoch: e,
-            delta_sha: None, now_ms: 10,
+            delta_sha: None,
+            now_ms: 10,
         };
         let (m1, c) = step(&m, &ctl(1));
         assert_eq!(rejects(&c), vec![RejectCause::StaleEpoch]);
@@ -2162,8 +2760,19 @@ mod tests {
         );
         assert!(c.is_empty());
         assert_eq!(m.status, Status::Superseded);
-        let (m, c) = run(m, &[exit("a", 1), SupMsg::Tick { now_ms: DEFAULT_LEASE_MS * 2 }]);
-        assert!(relaunches(&c).is_empty(), "a superseded supervisor restarts nothing");
+        let (m, c) = run(
+            m,
+            &[
+                exit("a", 1),
+                SupMsg::Tick {
+                    now_ms: DEFAULT_LEASE_MS * 2,
+                },
+            ],
+        );
+        assert!(
+            relaunches(&c).is_empty(),
+            "a superseded supervisor restarts nothing"
+        );
         assert_eq!(m.children["a"].state, ChildState::Running);
         // And its own old epoch is now stale.
         let (_, c) = step(
@@ -2172,7 +2781,8 @@ mod tests {
                 op: SteerOp::Cancel,
                 child: "a".into(),
                 sup_epoch: 2,
-                delta_sha: None, now_ms: 5,
+                delta_sha: None,
+                now_ms: 5,
             },
         );
         assert_eq!(rejects(&c), vec![RejectCause::StaleEpoch]);
@@ -2181,15 +2791,52 @@ mod tests {
     #[test]
     fn a_restarted_host_rebinds_and_its_own_claim_is_not_a_supersession() {
         let mut m = SupModel::new("host-1", Tier::Lead);
-        m = SupervisorProgram::update(&m, &SupMsg::Claim { holder: "host-1".into(), sup_epoch: 1 }).model;
+        m = SupervisorProgram::update(
+            &m,
+            &SupMsg::Claim {
+                holder: "host-1".into(),
+                sup_epoch: 1,
+            },
+        )
+        .model;
         // host-2 starts over the same log: without Rebind its claim reads as foreign.
-        let foreign = SupervisorProgram::update(&m, &SupMsg::Claim { holder: "host-2".into(), sup_epoch: 2 }).model;
+        let foreign = SupervisorProgram::update(
+            &m,
+            &SupMsg::Claim {
+                holder: "host-2".into(),
+                sup_epoch: 2,
+            },
+        )
+        .model;
         assert_eq!(foreign.status, Status::Superseded);
-        let m = SupervisorProgram::update(&m, &SupMsg::Rebind { me: "host-2".into() }).model;
-        let m = SupervisorProgram::update(&m, &SupMsg::Claim { holder: "host-2".into(), sup_epoch: 2 }).model;
-        assert_eq!((m.status, m.leader.as_str(), m.accepted_epoch), (Status::Running, "host-2", 2));
+        let m = SupervisorProgram::update(
+            &m,
+            &SupMsg::Rebind {
+                me: "host-2".into(),
+            },
+        )
+        .model;
+        let m = SupervisorProgram::update(
+            &m,
+            &SupMsg::Claim {
+                holder: "host-2".into(),
+                sup_epoch: 2,
+            },
+        )
+        .model;
+        assert_eq!(
+            (m.status, m.leader.as_str(), m.accepted_epoch),
+            (Status::Running, "host-2", 2)
+        );
         // and the old host, replaying the same log, is the one superseded
-        let old = SupervisorProgram::update(&SupModel::new("host-1", Tier::Lead), &SupMsg::Claim { holder: "host-2".into(), sup_epoch: 2 }).model;
+        let old = SupervisorProgram::update(
+            &SupModel::new("host-1", Tier::Lead),
+            &SupMsg::Claim {
+                holder: "host-2".into(),
+                sup_epoch: 2,
+            },
+        )
+        .model;
         assert_eq!(old.status, Status::Superseded);
     }
 
@@ -2214,12 +2861,18 @@ mod tests {
                 op: SteerOp::Redirect,
                 child: "a".into(),
                 sup_epoch: 2,
-                delta_sha: Some(D.into()), now_ms: 1_000,
+                delta_sha: Some(D.into()),
+                now_ms: 1_000,
             },
         );
         assert!(matches!(
             c.as_slice(),
-            [SupCmd::AppendSteer { seq: 1, urgent: true, generation: 2, .. }]
+            [SupCmd::AppendSteer {
+                seq: 1,
+                urgent: true,
+                generation: 2,
+                ..
+            }]
         ));
         step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 }).0
     }
@@ -2228,36 +2881,83 @@ mod tests {
     fn while_a_steer_is_unacked_no_progress_or_done_is_accepted() {
         let m = steered();
         for msg in [
-            SupMsg::Progress { child: "a".into(), generation: 1, now_ms: 2_000 },
-            SupMsg::Done { child: "a".into(), generation: 1, now_ms: 2_000 },
+            SupMsg::Progress {
+                child: "a".into(),
+                generation: 1,
+                now_ms: 2_000,
+            },
+            SupMsg::Done {
+                child: "a".into(),
+                generation: 1,
+                now_ms: 2_000,
+            },
         ] {
             let (m2, c) = step(&m, &msg);
             assert_eq!(rejects(&c), vec![RejectCause::SteerPending]);
             assert_eq!(m2.children["a"].state, ChildState::Running);
         }
         // The other child is not gated.
-        let (_, c) = step(&m, &SupMsg::Progress { child: "b".into(), generation: 1, now_ms: 2_000 });
+        let (_, c) = step(
+            &m,
+            &SupMsg::Progress {
+                child: "b".into(),
+                generation: 1,
+                now_ms: 2_000,
+            },
+        );
         assert!(rejects(&c).is_empty());
     }
 
     #[test]
     fn the_cursor_reaching_the_steer_offset_acks_it_and_opens_the_gate() {
         let m = steered();
-        let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 6 });
+        let (m, _) = step(
+            &m,
+            &SupMsg::Cursor {
+                child: "a".into(),
+                cursor: 6,
+            },
+        );
         assert_eq!(m.steers[&1].state, SteerState::Pending, "6 < 7");
-        let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 7 });
+        let (m, _) = step(
+            &m,
+            &SupMsg::Cursor {
+                child: "a".into(),
+                cursor: 7,
+            },
+        );
         assert_eq!(m.steers[&1].state, SteerState::Acked);
         // The steer here is a redirect: the crew re-claims at g+1.
-        let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 1, now_ms: 3_000 });
+        let (_, c) = step(
+            &m,
+            &SupMsg::Done {
+                child: "a".into(),
+                generation: 1,
+                now_ms: 3_000,
+            },
+        );
         assert_eq!(rejects(&c), vec![RejectCause::StaleGen]);
-        let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 2, now_ms: 3_000 });
+        let (_, c) = step(
+            &m,
+            &SupMsg::Done {
+                child: "a".into(),
+                generation: 2,
+                now_ms: 3_000,
+            },
+        );
         assert!(rejects(&c).is_empty());
     }
 
     #[test]
     fn a_cursor_of_another_child_does_not_ack() {
         let m = steered();
-        let (m, _) = step(&m, &SupMsg::Cursor { child: "b".into(), cursor: 99 });
+        let (m, _) = step(
+            &m,
+            &SupMsg::Cursor {
+                child: "b".into(),
+                cursor: 99,
+            },
+        );
         assert_eq!(m.steers[&1].state, SteerState::Pending);
     }
 
@@ -2266,11 +2966,21 @@ mod tests {
         let m = steered();
         let ack_by = m.steers[&1].ack_by_ms;
         let (m, c) = step(&m, &SupMsg::Tick { now_ms: ack_by });
-        assert!(relaunches(&c).is_empty(), "at ack_by the crew still has time");
+        assert!(
+            relaunches(&c).is_empty(),
+            "at ack_by the crew still has time"
+        );
         let (m, c) = step(&m, &SupMsg::Tick { now_ms: ack_by + 1 });
         assert_eq!(relaunches(&c), vec![("a".to_string(), 2)]);
         assert_eq!(m.steers[&1].state, SteerState::AppliedByRestart);
-        let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 1, now_ms: ack_by + 2 });
+        let (_, c) = step(
+            &m,
+            &SupMsg::Done {
+                child: "a".into(),
+                generation: 1,
+                now_ms: ack_by + 2,
+            },
+        );
         assert_eq!(rejects(&c), vec![RejectCause::StaleGen]);
     }
 
@@ -2278,11 +2988,25 @@ mod tests {
     fn an_ignored_cancel_ends_the_child_instead_of_restarting_it() {
         let (m, _) = step(
             &base(),
-            &SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: 2, delta_sha: None, now_ms: 0 },
+            &SupMsg::Control {
+                op: SteerOp::Cancel,
+                child: "a".into(),
+                sup_epoch: 2,
+                delta_sha: None,
+                now_ms: 0,
+            },
         );
-        let (m, c) = step(&m, &SupMsg::Tick { now_ms: DEFAULT_ACK_MS + 1 });
+        let (m, c) = step(
+            &m,
+            &SupMsg::Tick {
+                now_ms: DEFAULT_ACK_MS + 1,
+            },
+        );
         assert!(relaunches(&c).iter().all(|(id, _)| id != "a"));
-        assert!(c.contains(&SupCmd::Exit { child: "a".into(), generation: 1 }));
+        assert!(c.contains(&SupCmd::Exit {
+            child: "a".into(),
+            generation: 1
+        }));
         assert_eq!(m.children["a"].state, ChildState::Cancelled);
         assert_eq!(m.steers[&1].state, SteerState::AppliedByRestart);
     }
@@ -2292,7 +3016,13 @@ mod tests {
         let m = steered();
         let (m, _) = step(
             &m,
-            &SupMsg::Control { op: SteerOp::Pause, child: "a".into(), sup_epoch: 2, delta_sha: None, now_ms: 2_000 },
+            &SupMsg::Control {
+                op: SteerOp::Pause,
+                child: "a".into(),
+                sup_epoch: 2,
+                delta_sha: None,
+                now_ms: 2_000,
+            },
         );
         assert_eq!(m.steers[&1].state, SteerState::Superseded);
         assert_eq!(m.steers[&2].state, SteerState::Pending);
@@ -2305,7 +3035,12 @@ mod tests {
         for t in [0u64, 1, 2] {
             m.restarts.push(t);
         }
-        let (m, c) = step(&m, &SupMsg::Tick { now_ms: m.steers[&1].ack_by_ms + 1 });
+        let (m, c) = step(
+            &m,
+            &SupMsg::Tick {
+                now_ms: m.steers[&1].ack_by_ms + 1,
+            },
+        );
         assert_eq!(escalations(&c), 1);
         assert_eq!(m.steers[&1].state, SteerState::Escalated);
     }
@@ -2319,7 +3054,10 @@ mod tests {
         for t in 0..3u64 {
             let (n, c) = crash_and_relaunch(m, "a", 1_000 * (t + 1));
             m = n;
-            parks += c.iter().filter(|c| matches!(c, SupCmd::Park { .. })).count();
+            parks += c
+                .iter()
+                .filter(|c| matches!(c, SupCmd::Park { .. }))
+                .count();
         }
         assert_eq!(parks, 1);
         assert_eq!(m.children["a"].state, ChildState::Parked);
@@ -2327,7 +3065,14 @@ mod tests {
 
     #[test]
     fn a_normal_end_is_final_and_a_temporary_child_is_never_restarted() {
-        let (m, _) = step(&base(), &SupMsg::Done { child: "a".into(), generation: 1, now_ms: 5 });
+        let (m, _) = step(
+            &base(),
+            &SupMsg::Done {
+                child: "a".into(),
+                generation: 1,
+                now_ms: 5,
+            },
+        );
         let (m, c) = step(&m, &exit("a", 6));
         assert!(relaunches(&c).is_empty(), "Done is final");
         assert_eq!(m.children["a"].state, ChildState::Done);
@@ -2335,7 +3080,13 @@ mod tests {
         m = step(
             &m,
             &SupMsg::Spawn {
-                spec: ChildSpec { id: "t".into(), npub: None, restart: Restart::Temporary },
+                spec: ChildSpec {
+                    id: "t".into(),
+                    npub: None,
+                    restart: Restart::Temporary,
+                    kind: ChildKind::Crew,
+                    role: None,
+                },
                 now_ms: 0,
             },
         )
@@ -2349,14 +3100,33 @@ mod tests {
     fn the_crew_cap_is_five_panes() {
         let mut m = base();
         for id in ["c", "d", "e"] {
-            m = step(&m, &SupMsg::Spawn { spec: spec(id), now_ms: 0 }).0;
+            m = step(
+                &m,
+                &SupMsg::Spawn {
+                    spec: spec(id),
+                    now_ms: 0,
+                },
+            )
+            .0;
         }
         assert_eq!(m.live_crews(), 5);
-        let (m, c) = step(&m, &SupMsg::Spawn { spec: spec("f"), now_ms: 0 });
+        let (m, c) = step(
+            &m,
+            &SupMsg::Spawn {
+                spec: spec("f"),
+                now_ms: 0,
+            },
+        );
         assert_eq!(rejects(&c), vec![RejectCause::CapExceeded]);
         assert!(!m.children.contains_key("f"));
         // Spawn is idempotent: re-reading the registry adds nothing.
-        let (m2, c) = step(&m, &SupMsg::Spawn { spec: spec("a"), now_ms: 9 });
+        let (m2, c) = step(
+            &m,
+            &SupMsg::Spawn {
+                spec: spec("a"),
+                now_ms: 9,
+            },
+        );
         assert!(c.is_empty() && m2.children == m.children);
     }
 
@@ -2375,7 +3145,11 @@ mod tests {
         let (m, c) = step(&m, &SupMsg::Tick { now_ms: 41 });
         assert_eq!(relaunches(&c), vec![("a".to_string(), 2)]);
         assert_eq!(m.children["a"].abnormal, 1, "one end is one incarnation");
-        assert_eq!(m.restarts.len(), 1, "and it went through the intensity check");
+        assert_eq!(
+            m.restarts.len(),
+            1,
+            "and it went through the intensity check"
+        );
     }
 
     #[test]
@@ -2384,7 +3158,13 @@ mod tests {
         let mut esc = 0;
         for i in 0..6u64 {
             let key = format!("relaunch:a:{}", m.children["a"].generation);
-            let (n, c) = step(&m, &SupMsg::CmdFailed { key, why: "x".into() });
+            let (n, c) = step(
+                &m,
+                &SupMsg::CmdFailed {
+                    key,
+                    why: "x".into(),
+                },
+            );
             m = n;
             esc += escalations(&c);
             if !matches!(m.children["a"].state, ChildState::Restarting) {
@@ -2400,23 +3180,47 @@ mod tests {
 
     #[test]
     fn a_deaf_fact_ends_the_incarnation_once_however_often_it_is_read() {
-        let d = |t| SupMsg::Deaf { child: "a".into(), key: "deaf:npub-a:4:no_answer".into(), now_ms: t };
+        let d = |t| SupMsg::Deaf {
+            child: "a".into(),
+            key: "deaf:npub-a:4:no_answer".into(),
+            now_ms: t,
+        };
         let (m, c) = step(&base(), &d(1_000));
         assert_eq!(relaunches(&c), vec![("a".to_string(), 2)]);
-        let (m, _) = step(&m, &SupMsg::Relaunched { child: "a".into(), generation: 2 });
+        let (m, _) = step(
+            &m,
+            &SupMsg::Relaunched {
+                child: "a".into(),
+                generation: 2,
+            },
+        );
         let (m, c) = step(&m, &d(2_000));
-        assert!(relaunches(&c).is_empty(), "the same fact is not a second death");
+        assert!(
+            relaunches(&c).is_empty(),
+            "the same fact is not a second death"
+        );
         assert_eq!(m.children["a"].generation, 2);
-        let fresh = SupMsg::Deaf { child: "a".into(), key: "deaf:npub-a:9:no_answer".into(), now_ms: 3_000 };
+        let fresh = SupMsg::Deaf {
+            child: "a".into(),
+            key: "deaf:npub-a:9:no_answer".into(),
+            now_ms: 3_000,
+        };
         let (_, c) = step(&m, &fresh);
-        assert_eq!(relaunches(&c), vec![("a".to_string(), 3)], "a new fact for the new incarnation is");
+        assert_eq!(
+            relaunches(&c),
+            vec![("a".to_string(), 3)],
+            "a new fact for the new incarnation is"
+        );
     }
 
     // ---- the pass child, wedge pages, dead stop (the locals cmd_loop_supervise kept)
 
     #[test]
     fn a_wedge_pages_once_until_work_moves() {
-        let w = |p: &str| SupMsg::Wedged { pin: p.into(), line: "wedged".into() };
+        let w = |p: &str| SupMsg::Wedged {
+            pin: p.into(),
+            line: "wedged".into(),
+        };
         let m = base();
         let (m, c1) = step(&m, &w("a"));
         let (m, c2) = step(&m, &w("a"));
@@ -2429,7 +3233,9 @@ mod tests {
 
     #[test]
     fn a_dead_stop_pages_once_per_stall() {
-        let s = SupMsg::Stalled { line: "dead stop".into() };
+        let s = SupMsg::Stalled {
+            line: "dead stop".into(),
+        };
         let (m, c1) = step(&base(), &s);
         let (m, c2) = step(&m, &s);
         assert_eq!((c1.len(), c2.len()), (1, 0));
@@ -2441,10 +3247,37 @@ mod tests {
     #[test]
     fn a_successful_pass_resets_the_pass_childs_incarnations() {
         let mut m = base();
-        m = step(&m, &SupMsg::Spawn { spec: ChildSpec { id: PASS.into(), npub: None, restart: Restart::Permanent }, now_ms: 0 }).0;
-        m = step(&m, &SupMsg::PassExit { ok: false, now_ms: 1_000 }).0;
+        m = step(
+            &m,
+            &SupMsg::Spawn {
+                spec: ChildSpec {
+                    id: PASS.into(),
+                    npub: None,
+                    restart: Restart::Permanent,
+                    kind: ChildKind::Crew,
+                    role: None,
+                },
+                now_ms: 0,
+            },
+        )
+        .0;
+        m = step(
+            &m,
+            &SupMsg::PassExit {
+                ok: false,
+                now_ms: 1_000,
+            },
+        )
+        .0;
         assert_eq!(m.restarts.len(), 1);
-        m = step(&m, &SupMsg::PassExit { ok: true, now_ms: 2_000 }).0;
+        m = step(
+            &m,
+            &SupMsg::PassExit {
+                ok: true,
+                now_ms: 2_000,
+            },
+        )
+        .0;
         assert_eq!(m.children[PASS].abnormal, 0);
     }
 
@@ -2452,16 +3285,48 @@ mod tests {
 
     fn script() -> Vec<SupMsg> {
         vec![
-            SupMsg::Hello { me: ME.into(), tier: Tier::Lead, policy: None },
-            SupMsg::Claim { holder: ME.into(), sup_epoch: 2 },
-            SupMsg::Spawn { spec: spec("a"), now_ms: 0 },
-            SupMsg::Spawn { spec: spec("b"), now_ms: 0 },
-            SupMsg::Control { op: SteerOp::Redirect, child: "a".into(), sup_epoch: 2, delta_sha: Some(D.into()), now_ms: 1_000 },
+            SupMsg::Hello {
+                me: ME.into(),
+                tier: Tier::Lead,
+                policy: None,
+            },
+            SupMsg::Claim {
+                holder: ME.into(),
+                sup_epoch: 2,
+            },
+            SupMsg::Spawn {
+                spec: spec("a"),
+                now_ms: 0,
+            },
+            SupMsg::Spawn {
+                spec: spec("b"),
+                now_ms: 0,
+            },
+            SupMsg::Control {
+                op: SteerOp::Redirect,
+                child: "a".into(),
+                sup_epoch: 2,
+                delta_sha: Some(D.into()),
+                now_ms: 1_000,
+            },
             SupMsg::SteerAppended { seq: 1, offset: 4 },
             exit("b", 2_000),
-            SupMsg::Relaunched { child: "b".into(), generation: 2 },
-            SupMsg::Progress { child: "b".into(), generation: 2, now_ms: 3_000 },
-            SupMsg::Control { op: SteerOp::Cancel, child: "b".into(), sup_epoch: 1, delta_sha: None, now_ms: 3_500 },
+            SupMsg::Relaunched {
+                child: "b".into(),
+                generation: 2,
+            },
+            SupMsg::Progress {
+                child: "b".into(),
+                generation: 2,
+                now_ms: 3_000,
+            },
+            SupMsg::Control {
+                op: SteerOp::Cancel,
+                child: "b".into(),
+                sup_epoch: 1,
+                delta_sha: None,
+                now_ms: 3_500,
+            },
             SupMsg::Tick { now_ms: 4_000 },
         ]
     }
@@ -2486,10 +3351,251 @@ mod tests {
         // Same log, same view, twice.
         assert_eq!(crew_view(&replay(&log).0), crew_view(&full));
         assert_eq!(
-            crew_view(&full).iter().map(|r| r.child.as_str()).collect::<Vec<_>>(),
+            crew_view(&full)
+                .iter()
+                .map(|r| r.child.as_str())
+                .collect::<Vec<_>>(),
             ["a", "b"],
             "ordered by start order"
         );
+    }
+
+    fn lead_spec(id: &str) -> ChildSpec {
+        let mut s = spec(id);
+        s.kind = ChildKind::Lead;
+        s
+    }
+
+    fn adopt(child: &str, epoch: u64, now_ms: u64) -> SupMsg {
+        SupMsg::Adopt {
+            child: child.into(),
+            new_parent: "host-2".into(),
+            sup_epoch: epoch,
+            now_ms,
+        }
+    }
+
+    /// A lead failure is one restart, not a free one, and the lead comes back at g+1.
+    #[test]
+    fn a_lead_failure_spends_one_restart_and_relaunches_at_the_next_generation() {
+        let mut m = SupModel::default();
+        for msg in [
+            SupMsg::Hello {
+                me: ME.into(),
+                tier: Tier::Lead,
+                policy: None,
+            },
+            SupMsg::Claim {
+                holder: ME.into(),
+                sup_epoch: 1,
+            },
+            SupMsg::Spawn {
+                spec: lead_spec("plane"),
+                now_ms: 0,
+            },
+        ] {
+            m = step(&m, &msg).0;
+        }
+        let (m, c) = step(
+            &m,
+            &SupMsg::ChildEscalated {
+                child: "plane".into(),
+                reason: "intensity".into(),
+                now_ms: 5_000,
+            },
+        );
+        assert_eq!(m.restarts, vec![5_000]);
+        assert_eq!(relaunches(&c), vec![("plane".into(), 2)]);
+        assert_eq!(m.children["plane"].generation, 2);
+        assert_eq!(m.children["plane"].state, ChildState::Restarting);
+        assert!(
+            c.iter().all(|x| !matches!(x, SupCmd::Exit { .. })),
+            "a lead is not a pane exit"
+        );
+    }
+
+    /// Captain intensity is the same fence: the restart that would exceed MaxR escalates.
+    #[test]
+    fn a_captain_with_a_full_window_escalates_a_lead_instead_of_restarting_free() {
+        let mut m = SupModel::default();
+        for msg in [
+            SupMsg::Hello {
+                me: "captain".into(),
+                tier: Tier::Captain,
+                policy: None,
+            },
+            SupMsg::Claim {
+                holder: "captain".into(),
+                sup_epoch: 1,
+            },
+            SupMsg::Spawn {
+                spec: lead_spec("plane"),
+                now_ms: 0,
+            },
+            SupMsg::Spawn {
+                spec: lead_spec("other"),
+                now_ms: 0,
+            },
+        ] {
+            m = step(&m, &msg).0;
+        }
+        assert_eq!(m.policy.max_r, CAPTAIN_MAX_R);
+        // Two leads, so the third failure is still under the poison ceiling
+        // and the captain window (2) is what stops it.
+        for (child, t) in [("plane", 1_000u64), ("other", 2_000)] {
+            let (n, c) = step(
+                &m,
+                &SupMsg::ChildEscalated {
+                    child: child.into(),
+                    reason: "down".into(),
+                    now_ms: t,
+                },
+            );
+            assert_eq!(
+                relaunches(&c).len(),
+                1,
+                "inside the window the lead restarts"
+            );
+            let generation = n.children[child].generation;
+            m = step(
+                &n,
+                &SupMsg::Relaunched {
+                    child: child.into(),
+                    generation,
+                },
+            )
+            .0;
+        }
+        let (m, c) = step(
+            &m,
+            &SupMsg::ChildEscalated {
+                child: "plane".into(),
+                reason: "down".into(),
+                now_ms: 90_000,
+            },
+        );
+        assert_eq!(escalations(&c), 1);
+        assert!(
+            relaunches(&c).is_empty(),
+            "the over-budget restart is not made"
+        );
+        assert_eq!(m.status, Status::Failed);
+        assert_eq!(m.restarts.len() as u32, CAPTAIN_MAX_R);
+    }
+
+    #[test]
+    fn adopt_before_t_orphan_changes_nothing_and_after_it_the_old_epoch_is_stale() {
+        let mut m = SupModel::default();
+        let mut log = vec![
+            SupMsg::Hello {
+                me: ME.into(),
+                tier: Tier::Lead,
+                policy: None,
+            },
+            SupMsg::Claim {
+                holder: ME.into(),
+                sup_epoch: 2,
+            },
+            SupMsg::Spawn {
+                spec: lead_spec("plane"),
+                now_ms: 0,
+            },
+        ];
+        for msg in &log {
+            m = step(&m, msg).0;
+        }
+        assert_eq!(m.policy.t_orphan_ms, orphan_window_ms(DEFAULT_LEASE_MS));
+        let t = m.policy.t_orphan_ms;
+        let early = adopt("plane", 3, t - 1);
+        let (m_early, c_early) = step(&m, &early);
+        assert_eq!(m_early, m, "before T_orphan the model is untouched");
+        assert!(c_early.is_empty());
+        log.push(early);
+        // A crew is not adoptable even after the window.
+        let crew_try = adopt("nope", 3, t);
+        let (m_crew, c_crew) = step(&m, &crew_try);
+        assert_eq!(m_crew, m);
+        assert!(c_crew.is_empty());
+        let late = adopt("plane", 3, t);
+        let (m, c) = step(&m, &late);
+        assert!(c.is_empty(), "adoption is a model move, not a command");
+        assert_eq!(m.accepted_epoch, 3);
+        assert_eq!(m.leader, "host-2");
+        assert_eq!(
+            m.children["plane"].state,
+            ChildState::Running,
+            "crews were never stopped"
+        );
+        assert_eq!(m.children["plane"].generation, 1);
+        log.push(late);
+        let cancel = SupMsg::Control {
+            op: SteerOp::Cancel,
+            child: "plane".into(),
+            sup_epoch: 2,
+            delta_sha: None,
+            now_ms: t + 1,
+        };
+        let (m, c) = step(&m, &cancel);
+        assert_eq!(rejects(&c), vec![RejectCause::StaleEpoch]);
+        assert_eq!(m.accepted_epoch, 3);
+        log.push(cancel);
+        assert_eq!(replay(&log).0, m, "the same log is the same model");
+    }
+
+    #[test]
+    fn a_child_spec_without_kind_parses_as_crew() {
+        let raw = r#"{"id":"a","npub":null,"restart":"transient"}"#;
+        let s: ChildSpec = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.kind, ChildKind::Crew);
+        let msg =
+            r#"{"kind":"spawn","spec":{"id":"a","npub":null,"restart":"permanent"},"now_ms":0}"#;
+        let parsed: SupMsg = serde_json::from_str(msg).unwrap();
+        match parsed {
+            SupMsg::Spawn { spec, .. } => assert_eq!(spec.kind, ChildKind::Crew),
+            other => panic!("{other:?}"),
+        }
+        let policy = r#"{"tier":"lead","strategy":"one_for_one","max_r":3,"max_t_ms":1,"poison":3,"crew_cap":5,"ack_ms":1,"lease_ms":1}"#;
+        let p: Policy = serde_json::from_str(policy).unwrap();
+        assert_eq!(p.t_orphan_ms, default_t_orphan_ms());
+    }
+
+    #[test]
+    fn a_lead_counts_toward_the_crew_cap_and_its_crews_are_not_in_this_model() {
+        let mut m = base();
+        m = step(
+            &m,
+            &SupMsg::Spawn {
+                spec: lead_spec("plane"),
+                now_ms: 0,
+            },
+        )
+        .0;
+        m = step(
+            &m,
+            &SupMsg::Spawn {
+                spec: spec("c"),
+                now_ms: 0,
+            },
+        )
+        .0;
+        m = step(
+            &m,
+            &SupMsg::Spawn {
+                spec: spec("d"),
+                now_ms: 0,
+            },
+        )
+        .0;
+        let (m, c) = step(
+            &m,
+            &SupMsg::Spawn {
+                spec: spec("e"),
+                now_ms: 0,
+            },
+        );
+        assert_eq!(rejects(&c), vec![RejectCause::CapExceeded]);
+        assert!(!m.children.contains_key("e"));
+        assert_eq!(m.live_crews(), CREW_CAP);
     }
 
     #[test]
@@ -2513,7 +3619,14 @@ mod tests {
             Durability::Durable { key } => key,
             Durability::Ephemeral => String::new(),
         };
-        assert_eq!(k(&SupCmd::Relaunch { child: "a".into(), generation: 3 }), "relaunch:a:3");
+        assert_eq!(
+            k(&SupCmd::Relaunch {
+                child: "a".into(),
+                generation: 3,
+                kind: ChildKind::Crew
+            }),
+            "relaunch:a:3"
+        );
         assert_eq!(
             k(&SupCmd::AppendSteer {
                 seq: 4,
@@ -2526,5 +3639,265 @@ mod tests {
             }),
             "steer:4"
         );
+        assert_eq!(
+            k(&SupCmd::Assign {
+                task: "t1".into(),
+                child: "a".into(),
+                generation: 1
+            }),
+            "assign:t1:a:1"
+        );
+    }
+
+    fn bead(id: &str, path: &str, role: &str, proved: bool) -> ReadyBead {
+        ReadyBead {
+            id: id.into(),
+            scope_paths: vec![path.into()],
+            deps_proved: proved,
+            role: role.into(),
+        }
+    }
+
+    fn assigns(c: &[SupCmd]) -> Vec<(String, String)> {
+        c.iter()
+            .filter_map(|c| match c {
+                SupCmd::Assign { task, child, .. } => Some((task.clone(), child.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overlapping_beads_assign_the_first_and_a_disjoint_third() {
+        // The overlap function the guard calls. Same path, conflict; different paths, not.
+        assert!(toron_core::mailbox::reservations::overlaps(
+            "src/a.rs", "src/a.rs"
+        ));
+        assert!(!toron_core::mailbox::reservations::overlaps(
+            "src/a.rs", "src/b.rs"
+        ));
+        let msg = SupMsg::ReadyBeads {
+            beads: vec![
+                bead("t1", "src/a.rs", "a", true),
+                bead("t2", "src/a.rs", "b", true),
+                bead("t3", "src/b.rs", "b", true),
+                bead("t4", "src/c.rs", "a", false),
+            ],
+            now_ms: 50,
+        };
+        let (m, c) = step(&base(), &msg);
+        assert_eq!(
+            assigns(&c),
+            vec![("t1".into(), "a".into()), ("t3".into(), "b".into())]
+        );
+        assert!(!m.assignments.contains_key("t2"), "overlap stays pending");
+        assert!(!m.assignments.contains_key("t4"), "deps not proved");
+        let mut m2 = base();
+        m2 = step(
+            &m2,
+            &SupMsg::Spawn {
+                spec: lead_spec("plane"),
+                now_ms: 0,
+            },
+        )
+        .0;
+        let (m2, c2) = step(
+            &m2,
+            &SupMsg::ReadyBeads {
+                beads: vec![bead("lead-task", "src/z.rs", "plane", true)],
+                now_ms: 1,
+            },
+        );
+        assert!(assigns(&c2).is_empty(), "a lead is not a crew assignee");
+        assert!(m2.assignments.is_empty());
+    }
+
+    #[test]
+    fn ready_beads_failed_and_a_role_mismatch_assign_nothing() {
+        let m = base();
+        let (m2, c) = step(&m, &SupMsg::ReadyBeadsFailed { now_ms: 5 });
+        assert_eq!(m2, m);
+        assert!(c.is_empty());
+        let (m3, c) = step(
+            &m2,
+            &SupMsg::ReadyBeads {
+                beads: vec![bead("t9", "src/z.rs", "nope", true)],
+                now_ms: 6,
+            },
+        );
+        assert_eq!(m3, m2);
+        assert!(assigns(&c).is_empty());
+    }
+
+    #[test]
+    fn an_in_flight_assignment_consumes_a_crew_slot() {
+        // Two live crews and cap 2: each takes one disjoint bead. A third
+        // waits, because `a` is already busy and the book is full. Live
+        // panes alone do not fill the book: a full spawn still receives work.
+        let mut policy = Policy::for_tier(Tier::Lead);
+        policy.crew_cap = 2;
+        let mut m = SupModel::default();
+        for msg in [
+            SupMsg::Hello {
+                me: ME.into(),
+                tier: Tier::Lead,
+                policy: Some(policy),
+            },
+            SupMsg::Claim {
+                holder: ME.into(),
+                sup_epoch: 1,
+            },
+            SupMsg::Spawn {
+                spec: spec("a"),
+                now_ms: 0,
+            },
+            SupMsg::Spawn {
+                spec: spec("b"),
+                now_ms: 0,
+            },
+        ] {
+            m = step(&m, &msg).0;
+        }
+        let (m, c) = step(
+            &m,
+            &SupMsg::ReadyBeads {
+                beads: vec![
+                    bead("t1", "src/a.rs", "a", true),
+                    bead("t3", "src/b.rs", "b", true),
+                    bead("t5", "src/c.rs", "a", true),
+                ],
+                now_ms: 10,
+            },
+        );
+        assert_eq!(
+            assigns(&c),
+            vec![("t1".into(), "a".into()), ("t3".into(), "b".into())]
+        );
+        assert!(!m.assignments.contains_key("t5"));
+        let full = base();
+        assert_eq!(full.live_crews(), 2);
+        let (_, c) = step(
+            &full,
+            &SupMsg::ReadyBeads {
+                beads: vec![bead("t1", "src/a.rs", "a", true)],
+                now_ms: 1,
+            },
+        );
+        assert_eq!(assigns(&c), vec![("t1".into(), "a".into())]);
+    }
+
+    #[test]
+    fn ready_beads_replay_equals_the_model() {
+        let log = vec![
+            SupMsg::Hello {
+                me: ME.into(),
+                tier: Tier::Lead,
+                policy: None,
+            },
+            SupMsg::Claim {
+                holder: ME.into(),
+                sup_epoch: 2,
+            },
+            SupMsg::Spawn {
+                spec: spec("a"),
+                now_ms: 0,
+            },
+            SupMsg::Spawn {
+                spec: spec("b"),
+                now_ms: 0,
+            },
+            SupMsg::ReadyBeads {
+                beads: vec![
+                    bead("t1", "src/a.rs", "a", true),
+                    bead("t2", "src/a.rs", "b", true),
+                    bead("t3", "src/b.rs", "b", true),
+                ],
+                now_ms: 50,
+            },
+        ];
+        let mut m = SupModel::default();
+        for msg in &log {
+            m = step(&m, msg).0;
+        }
+        assert_eq!(replay(&log).0, m);
+        assert_eq!(m.assignments.len(), 2);
+    }
+
+    #[test]
+    fn a_task_that_ends_abnormally_three_times_is_not_reassigned() {
+        let mut wa = spec("a");
+        wa.role = Some("worker".into());
+        let mut wb = spec("b");
+        wb.role = Some("worker".into());
+        let mut log = vec![
+            SupMsg::Hello {
+                me: ME.into(),
+                tier: Tier::Lead,
+                policy: None,
+            },
+            SupMsg::Claim {
+                holder: ME.into(),
+                sup_epoch: 1,
+            },
+            SupMsg::Spawn {
+                spec: wa,
+                now_ms: 0,
+            },
+            SupMsg::Spawn {
+                spec: wb,
+                now_ms: 0,
+            },
+        ];
+        let mut m = SupModel::default();
+        for msg in &log {
+            m = step(&m, msg).0;
+        }
+        for n in 1..=3u64 {
+            let beads = SupMsg::ReadyBeads {
+                beads: vec![bead("t1", "src/t.rs", "worker", true)],
+                now_ms: n * 1_000,
+            };
+            let (next, c) = step(&m, &beads);
+            assert_eq!(assigns(&c), vec![("t1".into(), "a".into())], "attempt {n}");
+            log.push(beads);
+            m = next;
+            let ex = exit("a", n * 1_000 + 10);
+            let (next, c) = step(&m, &ex);
+            log.push(ex);
+            m = next;
+            if n < 3 {
+                let generation = m.children["a"].generation;
+                assert!(
+                    relaunches(&c)
+                        .iter()
+                        .any(|(id, g)| id == "a" && *g == generation)
+                );
+                let rel = SupMsg::Relaunched {
+                    child: "a".into(),
+                    generation,
+                };
+                log.push(rel.clone());
+                m = step(&m, &rel).0;
+            } else {
+                assert!(matches!(c.last(), Some(SupCmd::Park { child, .. }) if child == "a"));
+                assert!(relaunches(&c).is_empty());
+            }
+        }
+        assert_eq!(m.task_abnormal.get("t1").copied(), Some(3));
+        assert!(m.parked_tasks.contains("t1"));
+        assert_eq!(m.children["b"].state, ChildState::Running);
+        let again = SupMsg::ReadyBeads {
+            beads: vec![bead("t1", "src/t.rs", "worker", true)],
+            now_ms: 9_000,
+        };
+        let before = m.clone();
+        let (m2, c) = step(&m, &again);
+        assert!(
+            c.is_empty(),
+            "the other worker does not inherit a poisoned task"
+        );
+        assert_eq!(m2, before);
+        log.push(again);
+        assert_eq!(replay(&log).0, m2);
     }
 }

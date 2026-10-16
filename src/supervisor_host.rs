@@ -38,8 +38,8 @@ use serde_json::{Value, json};
 use toron_core::kernel::{Cmd as _, Durability, Program};
 
 use crate::supervisor_program::{
-    CrewRow, PASS, Policy, Restart, SteerOp, SupCmd, SupModel, SupMsg, SupervisorProgram, Tier,
-    ChildSpec, crew_view,
+    ChildKind, ChildSpec, CrewRow, PASS, Policy, Restart, SteerOp, SupCmd, SupModel, SupMsg,
+    SupervisorProgram, Tier, crew_view,
 };
 
 /// Journal answer for one command.
@@ -65,8 +65,9 @@ pub trait EffectJournal {
 pub trait Ports {
     /// Facts this round: registry spawns, cursors, deaf facts, herdr edges.
     fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg>;
-    /// Start incarnation `generation` of `child`.
-    fn relaunch(&mut self, child: &str, generation: u64) -> Result<(), String>;
+    /// Start incarnation `generation` of `child`. A lead is a nested supervise
+    /// process, never a pane write.
+    fn relaunch(&mut self, child: &str, generation: u64, kind: ChildKind) -> Result<(), String>;
     /// Stop `child`'s pane.
     fn exit(&mut self, child: &str, generation: u64) -> Result<(), String>;
     /// Append the steer envelope; urgent ones interrupt and ring. Returns
@@ -345,6 +346,27 @@ pub(crate) fn ring_urgent_steer(
     Ok(true)
 }
 
+/// Argv (no binary) for a lead relaunch: nested supervise, no pane payload.
+pub fn lead_supervise_argv(project: &str, context: &str) -> Vec<String> {
+    vec![
+        "loop-mode".into(),
+        "supervise".into(),
+        project.into(),
+        "--context".into(),
+        context.into(),
+    ]
+}
+
+/// Crew relaunch stays `crew control … relaunch`. A lead uses [`lead_supervise_argv`].
+fn relaunch_argv(project: &str, child: &str, kind: ChildKind) -> Vec<String> {
+    match kind {
+        ChildKind::Lead => lead_supervise_argv(project, child),
+        ChildKind::Crew => {
+            vec!["crew".into(), "control".into(), project.into(), child.into(), "relaunch".into()]
+        }
+    }
+}
+
 fn key_of(c: &SupCmd) -> String {
     match c.durability() {
         Durability::Durable { key } => key,
@@ -376,12 +398,14 @@ pub fn execute(
         Begin::Run(g) => g,
     };
     let res: Result<Vec<SupMsg>, String> = match cmd {
-        SupCmd::Relaunch { child, generation } => ports.relaunch(child, *generation).map(|_| {
-            vec![SupMsg::Relaunched {
-                child: child.clone(),
-                generation: *generation,
-            }]
-        }),
+        SupCmd::Relaunch { child, generation, kind } => {
+            ports.relaunch(child, *generation, *kind).map(|_| {
+                vec![SupMsg::Relaunched {
+                    child: child.clone(),
+                    generation: *generation,
+                }]
+            })
+        }
         SupCmd::Exit { child, generation } => ports.exit(child, *generation).map(|_| vec![]),
         SupCmd::AppendSteer {
             seq,
@@ -407,6 +431,10 @@ pub fn execute(
             reason,
             evidence,
         } => ports.escalate(*n, reason, evidence).map(|_| vec![]),
+        SupCmd::Assign { .. } => {
+            // ponytail: log-only until 4b.8; task@1 append waits on the producer helper
+            Ok(vec![])
+        }
         SupCmd::Park { child, incarnations } => ports.park(child, *incarnations).map(|_| vec![]),
         SupCmd::Page { kind, pin, line, .. } => ports.page(kind, pin, line).map(|_| vec![]),
         SupCmd::Reject { n, cause, child } => ports.reject(*n, cause.tag(), child).map(|_| vec![]),
@@ -496,7 +524,7 @@ pub fn recover(
         // the model is still waiting for it (defence in depth: the fold ignores
         // a confirmation that is not current anyway).
         if fed.is_empty()
-            && let SupCmd::Relaunch { child, generation } = c
+            && let SupCmd::Relaunch { child, generation, .. } = c
             && core
                 .model
                 .children
@@ -718,6 +746,8 @@ impl Ports for LivePorts {
                     id: pin,
                     npub,
                     restart: Restart::Transient,
+                    kind: ChildKind::Crew,
+                    role: None,
                 },
                 now_ms,
             });
@@ -779,13 +809,15 @@ impl Ports for LivePorts {
         out
     }
 
-    fn relaunch(&mut self, child: &str, generation: u64) -> Result<(), String> {
+    fn relaunch(&mut self, child: &str, generation: u64, kind: ChildKind) -> Result<(), String> {
         if child == PASS {
             // The next interval is the relaunch of the pass child.
             return Ok(());
         }
+        // Lead argv is a nested supervise. This host only runs under the
+        // comms flag (`run_supervise`); a second host is refused by the lease.
         let st = std::process::Command::new(&self.relaunch_bin)
-            .args(["crew", "control", &self.project, child, "relaunch"])
+            .args(relaunch_argv(&self.project, child, kind))
             .env("FLYWHEEL_SUPERVISOR_GENERATION", generation.to_string())
             .status()
             .map_err(|e| format!("spawn relaunch: {e}"))?;
@@ -930,6 +962,7 @@ impl HostCfg {
         }
         if let Some(l) = self.lease_ms {
             p.lease_ms = l;
+            p.t_orphan_ms = crate::supervisor_program::orphan_window_ms(l);
         }
         Some(p)
     }
@@ -1007,6 +1040,8 @@ fn host_loop(
                 id: PASS.into(),
                 npub: None,
                 restart: Restart::Permanent,
+                kind: ChildKind::Crew,
+                role: None,
             },
             now_ms: now_ms(),
         });
@@ -1324,7 +1359,7 @@ mod tests {
         fn observe(&mut self, _m: &SupModel, _now: u64) -> Vec<SupMsg> {
             std::mem::take(&mut self.0.lock().unwrap().obs)
         }
-        fn relaunch(&mut self, c: &str, g: u64) -> Result<(), String> {
+        fn relaunch(&mut self, c: &str, g: u64, _kind: ChildKind) -> Result<(), String> {
             let mut w = self.0.lock().unwrap();
             if w.fail_relaunch {
                 return Err("herdr said no".into());
@@ -1368,11 +1403,17 @@ mod tests {
     }
 
     fn spawn(id: &str) -> SupMsg {
+        spawn_as(id, ChildKind::Crew)
+    }
+
+    fn spawn_as(id: &str, kind: ChildKind) -> SupMsg {
         SupMsg::Spawn {
             spec: ChildSpec {
                 id: id.into(),
                 npub: Some(format!("npub-{id}")),
                 restart: Restart::Transient,
+                kind,
+                role: None,
             },
             now_ms: 0,
         }
@@ -2055,7 +2096,12 @@ mod tests {
         assert_eq!(f.0.lock().unwrap().relaunched, vec![("a".to_string(), 2)]);
         // Same command again (a replay): the journal says settled.
         let mut rep = RoundReport::default();
-        let again = execute(&mut j, &mut p, &SupCmd::Relaunch { child: "a".into(), generation: 2 }, &mut rep);
+        let again = execute(
+            &mut j,
+            &mut p,
+            &SupCmd::Relaunch { child: "a".into(), generation: 2, kind: ChildKind::Crew },
+            &mut rep,
+        );
         assert!(again.is_empty() && rep.skipped == 1);
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 1);
     }
@@ -2072,6 +2118,72 @@ mod tests {
         assert!(gate < legacy, "the gate precedes the unchanged legacy loop");
         assert!(body[gate..legacy].contains("supervisor_host::run_supervise("));
         assert!(src.contains("SUPERVISE_MAX_CONSECUTIVE_FAILURES"), "legacy rule still defined for flag-off");
+    }
+
+    #[test]
+    fn an_assign_does_not_write_a_pane() {
+        use crate::supervisor_program::ReadyBead;
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::ReadyBeads {
+                beads: vec![ReadyBead {
+                    id: "t1".into(),
+                    scope_paths: vec!["src/a.rs".into()],
+                    deps_proved: true,
+                    role: "a".into(),
+                }],
+                now_ms: 1_500,
+            }],
+            1_500,
+        );
+        let w = f.0.lock().unwrap();
+        assert!(w.exited.is_empty(), "assign must not Exit a pane");
+        assert!(w.steers.is_empty(), "assign must not write pane text");
+        assert!(w.relaunched.is_empty());
+        drop(w);
+        assert!(
+            j.rows.keys().any(|k| k == "assign:t1:a:1"),
+            "assign is journaled, not written to a pane: {:?}",
+            j.rows.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_lead_relaunch_is_recorded_and_does_not_touch_a_pane() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn_as("plane", ChildKind::Lead)], 1_000);
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::ChildEscalated {
+                child: "plane".into(),
+                reason: "down".into(),
+                now_ms: 2_000,
+            }],
+            2_000,
+        );
+        let w = f.0.lock().unwrap();
+        assert_eq!(w.relaunched, vec![("plane".to_string(), 2)]);
+        assert!(w.exited.is_empty(), "lead relaunch must not Exit a pane");
+        assert!(w.steers.is_empty(), "lead relaunch must not write pane text");
+        assert_eq!(
+            relaunch_argv("proj", "plane", ChildKind::Lead),
+            lead_supervise_argv("proj", "plane")
+        );
+        assert_eq!(
+            lead_supervise_argv("proj", "plane"),
+            ["loop-mode", "supervise", "proj", "--context", "plane"]
+        );
+        let crew = relaunch_argv("proj", "plane", ChildKind::Crew);
+        assert_eq!(crew, ["crew", "control", "proj", "plane", "relaunch"]);
+        assert!(!crew.iter().any(|a| a == "--context"));
     }
 
     #[test]
