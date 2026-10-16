@@ -1,8 +1,8 @@
 // governed-by: redesign-proposal §6A (supervisor topology), build-plan §8 (Phase 4a)
 //! `SupervisorProgram`: the pure fold behind `loop-mode supervise` (Phase 4a).
 //!
-//! `(Model, Msg) -> (Model, Vec<Cmd>)`, no clock, no store, no `HashMap`, no
-//! shell-out. Time arrives as `now_ms` on a message. The host
+//! `(Model, Msg) -> (Model, Vec<Cmd>)`, no clock, no store, no unordered
+//! maps, no shell-out. Time arrives as `now_ms` on a message. The host
 //! ([`crate::supervisor_host`]) interprets the commands; the fold only
 //! decides.
 //!
@@ -168,6 +168,11 @@ pub enum ChildState {
 impl ChildState {
     fn live(self) -> bool {
         matches!(self, Self::Running | Self::Restarting | Self::NeedsRestart)
+    }
+
+    /// Whether the host should keep driving this child (pass cadence).
+    pub fn live_for_host(self) -> bool {
+        self.live()
     }
 }
 
@@ -341,6 +346,8 @@ pub struct SupModel {
     pub stalled: bool,
     /// Commands that failed.
     pub failed_cmds: u64,
+    /// Deaf facts already acted on.
+    pub deaf_seen: BTreeSet<String>,
     /// Latest time seen.
     pub now_ms: u64,
 }
@@ -367,6 +374,7 @@ impl SupModel {
             paged: BTreeSet::new(),
             stalled: false,
             failed_cmds: 0,
+            deaf_seen: BTreeSet::new(),
             now_ms: 0,
         }
     }
@@ -444,10 +452,13 @@ pub enum SupMsg {
         /// Time.
         now_ms: u64,
     },
-    /// The inbox host's `deaf` fact for the child.
+    /// The inbox host's `deaf` fact for the child (its durable key, so
+    /// re-reading the facts file never ends a second incarnation).
     Deaf {
         /// Child.
         child: String,
+        /// The fact's key.
+        key: String,
         /// Time.
         now_ms: u64,
     },
@@ -859,7 +870,18 @@ impl Program for SupervisorProgram {
                     c.abnormal = 0;
                 }
             }
-            SupMsg::Exit { child, now_ms } | SupMsg::Deaf { child, now_ms } => {
+            SupMsg::Deaf { child, key, now_ms } => {
+                next.now_ms = next.now_ms.max(*now_ms);
+                if next.deaf_seen.insert(key.clone())
+                    && next
+                        .children
+                        .get(child)
+                        .is_some_and(|c| c.state == ChildState::Running)
+                {
+                    abnormal_end(&mut next, &mut cmds, child, *now_ms, true);
+                }
+            }
+            SupMsg::Exit { child, now_ms } => {
                 next.now_ms = next.now_ms.max(*now_ms);
                 if next
                     .children
@@ -1005,8 +1027,9 @@ impl Program for SupervisorProgram {
                 next.stalled = false;
             }
             SupMsg::Tick { now_ms } => {
-                next.now_ms = next.now_ms.max(*now_ms);
-                let now = next.now_ms;
+                // The clock reading is used, not stored: a tick that decides
+                // nothing leaves the model equal, so the host logs nothing.
+                let now = next.now_ms.max(*now_ms);
                 if next.status == Status::Running {
                     // A restart herdr's absence deferred (level-triggered).
                     if next.herdr_up {
@@ -1683,6 +1706,20 @@ mod tests {
             m.children["a"].state == ChildState::Parked || esc == 1,
             "bounded: parked by poison or escalated by intensity"
         );
+    }
+
+    #[test]
+    fn a_deaf_fact_ends_the_incarnation_once_however_often_it_is_read() {
+        let d = |t| SupMsg::Deaf { child: "a".into(), key: "deaf:npub-a:4:no_answer".into(), now_ms: t };
+        let (m, c) = step(&base(), &d(1_000));
+        assert_eq!(relaunches(&c), vec![("a".to_string(), 2)]);
+        let (m, _) = step(&m, &SupMsg::Relaunched { child: "a".into(), generation: 2 });
+        let (m, c) = step(&m, &d(2_000));
+        assert!(relaunches(&c).is_empty(), "the same fact is not a second death");
+        assert_eq!(m.children["a"].generation, 2);
+        let fresh = SupMsg::Deaf { child: "a".into(), key: "deaf:npub-a:9:no_answer".into(), now_ms: 3_000 };
+        let (_, c) = step(&m, &fresh);
+        assert_eq!(relaunches(&c), vec![("a".to_string(), 3)], "a new fact for the new incarnation is");
     }
 
     // ---- the pass child, wedge pages, dead stop (the locals cmd_loop_supervise kept)
