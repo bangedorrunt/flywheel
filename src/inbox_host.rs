@@ -74,13 +74,7 @@ pub trait Ports: Send + 'static {
     fn reverify(&mut self, npub: &str) -> Option<Bind>;
     /// Type the constant wake line into `pane_id`. The host has already
     /// checked `binding_gen` against the fold's generation.
-    fn ring(
-        &mut self,
-        npub: &str,
-        pane_id: &str,
-        wm: u64,
-        line: &str,
-    ) -> Result<(), String>;
+    fn ring(&mut self, npub: &str, pane_id: &str, wm: u64, line: &str) -> Result<(), String>;
     /// Record one durable, keyed fact (`bind`, `deaf`). Idempotent by key.
     fn fact(&mut self, key: &str, fact: Value) -> Result<(), String>;
     /// A notify envelope for the supervisor's inbox.
@@ -225,12 +219,7 @@ fn write_binds(core: &Core, before: &InboxModel, ports: &mut dyn Ports, rep: &mu
 /// The effect boundary: interpret commands through `ports`. A failed command
 /// is fed back as `CmdFailed` (it changes nothing; the next tick decides
 /// again from durable state).
-pub fn execute(
-    core: &mut Core,
-    ports: &mut dyn Ports,
-    cmds: Vec<InboxCmd>,
-    rep: &mut RoundReport,
-) {
+pub fn execute(core: &mut Core, ports: &mut dyn Ports, cmds: Vec<InboxCmd>, rep: &mut RoundReport) {
     for cmd in cmds {
         let key = match cmd.durability() {
             Durability::Durable { key } => Some(key),
@@ -662,7 +651,11 @@ mod tests {
         run(&mut core, &f, 5, now);
         let w = f.0.lock().unwrap();
         assert_eq!(w.rings.len() as u32, MAX_RINGS, "no ring past the budget");
-        let deaf: Vec<_> = w.facts.iter().filter(|(_, v)| v["kind"] == "deaf").collect();
+        let deaf: Vec<_> = w
+            .facts
+            .iter()
+            .filter(|(_, v)| v["kind"] == "deaf")
+            .collect();
         assert_eq!(deaf.len(), 1, "one deaf fact per watermark");
         assert_eq!(deaf[0].1["wm"], 4);
         assert_eq!(deaf[0].1["cause"], "no_answer");
@@ -697,7 +690,11 @@ mod tests {
         let mut core = Core::default();
         run(&mut core, &f, 3, 1_000);
         let w = f.0.lock().unwrap();
-        let binds: Vec<_> = w.facts.iter().filter(|(_, v)| v["kind"] == "bind").collect();
+        let binds: Vec<_> = w
+            .facts
+            .iter()
+            .filter(|(_, v)| v["kind"] == "bind")
+            .collect();
         assert_eq!(binds.len(), 1, "{binds:?}");
         let v = &binds[0].1;
         assert_eq!(v["npub"], R);
@@ -715,8 +712,16 @@ mod tests {
         let mut core = Core::default();
         run(&mut core, &f, u64::from(MAX_RINGS) + 2, 1_000);
         let w = f.0.lock().unwrap();
-        assert!(w.rings.is_empty(), "negative control: no ring {:?}", w.rings);
-        let deaf: Vec<_> = w.facts.iter().filter(|(_, v)| v["kind"] == "deaf").collect();
+        assert!(
+            w.rings.is_empty(),
+            "negative control: no ring {:?}",
+            w.rings
+        );
+        let deaf: Vec<_> = w
+            .facts
+            .iter()
+            .filter(|(_, v)| v["kind"] == "deaf")
+            .collect();
         assert_eq!(deaf.len(), 1);
         assert_eq!(deaf[0].1["cause"], "unbound");
         assert_eq!(w.sup.len(), 1);
@@ -734,7 +739,12 @@ mod tests {
         // events_lost: the generation moves; unread mail remains
         f.0.lock().unwrap().reverify = Some(bind(true));
         let now = 2_000_000;
-        round(&mut core, &mut p, vec![Input::Invalidate(Invalidate::EventsLost)], now);
+        round(
+            &mut core,
+            &mut p,
+            vec![Input::Invalidate(Invalidate::EventsLost)],
+            now,
+        );
         {
             let w = f.0.lock().unwrap();
             assert_eq!(w.reverified, 1, "re-verified");
@@ -796,7 +806,10 @@ mod tests {
             line: wake_line(2),
         };
         execute(&mut core, &mut p, vec![stale], &mut rep);
-        assert!(f.0.lock().unwrap().rings.is_empty(), "nothing typed for a stale gen");
+        assert!(
+            f.0.lock().unwrap().rings.is_empty(),
+            "nothing typed for a stale gen"
+        );
         assert_eq!((rep.rings, rep.failed), (0, 1));
     }
 
@@ -850,8 +863,16 @@ mod tests {
         drop(host);
         let t = threads.lock().unwrap();
         assert!(!t.is_empty());
-        assert!(t.iter().all(|(n, no_rt)| n == "flywheel-inbox-host" && *no_rt), "{t:?}");
-        assert_eq!(f.0.lock().unwrap().rings.len(), 1, "rang over the channel loop");
+        assert!(
+            t.iter()
+                .all(|(n, no_rt)| n == "flywheel-inbox-host" && *no_rt),
+            "{t:?}"
+        );
+        assert_eq!(
+            f.0.lock().unwrap().rings.len(),
+            1,
+            "rang over the channel loop"
+        );
     }
 
     #[test]
@@ -862,14 +883,20 @@ mod tests {
         let host = include_str!("inbox_host.rs");
         let body = &host[..host.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(!body.contains("new work"), "no hand-written wake text");
-        assert!(!body.contains("wake_line("), "the host never builds the line");
+        assert!(
+            !body.contains("wake_line("),
+            "the host never builds the line"
+        );
         let ports = include_str!("inbox_ports.rs");
         assert_eq!(ports.matches("pane_write::write(").count(), 1);
         // the sink's rendering must equal the fold's line, or nothing is typed
         assert!(ports.contains("!= line"), "ring compares the fold's line");
         assert!(!ports.contains("new work"));
         // (spelled in pieces: the pane-text fence scans this file too)
-        let (a, b) = (concat!(".agent_", "prompt("), concat!(".pane_send_", "text("));
+        let (a, b) = (
+            concat!(".agent_", "prompt("),
+            concat!(".pane_send_", "text("),
+        );
         assert!(!ports.contains(a) && !ports.contains(b));
         let pw = include_str!("pane_write.rs");
         assert!(pw.contains("toron_core::wake::wake_line(wm.0)"));
