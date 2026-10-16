@@ -166,12 +166,10 @@ pub fn read_log(p: &CtxPaths) -> Result<(Vec<SupMsg>, u64, u64)> {
 
 fn append_log(p: &CtxPaths, e: &Entry) -> Result<()> {
     if let Some(d) = p.log.parent() {
-        std::fs::create_dir_all(d)?;
+        // 0700/0600, not the ambient umask. A log line can carry a steer sha.
+        crate::private_fs::create_private_dir_all(d)?;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&p.log)?;
+    let mut f = crate::private_fs::open_private_append(&p.log)?;
     writeln!(f, "{}", serde_json::to_string(e)?)?;
     f.sync_data()?;
     Ok(())
@@ -236,12 +234,9 @@ pub fn read_inputs(p: &CtxPaths, from: u64) -> (Vec<SupMsg>, u64) {
 /// CLI side: add one input fact.
 pub fn append_input(p: &CtxPaths, msg: &SupMsg) -> Result<()> {
     if let Some(d) = p.inbox.parent() {
-        std::fs::create_dir_all(d)?;
+        crate::private_fs::create_private_dir_all(d)?;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&p.inbox)?;
+    let mut f = crate::private_fs::open_private_append(&p.inbox)?;
     // One write per line: O_APPEND keeps concurrent writers' lines whole.
     f.write_all(format!("{}\n", serde_json::to_string(msg)?).as_bytes())?;
     Ok(())
@@ -867,13 +862,9 @@ impl LivePorts {
         }
         let path = self.facts_path();
         if let Some(d) = path.parent() {
-            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+            crate::private_fs::create_private_dir_all(d).map_err(|e| e.to_string())?;
         }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| e.to_string())?;
+        let mut f = crate::private_fs::open_private_append(&path).map_err(|e| e.to_string())?;
         writeln!(f, "{v}").map_err(|e| e.to_string())
     }
 
@@ -1729,6 +1720,97 @@ mod tests {
         let mut c = Core::open(paths, "lead-1", Tier::Lead, None).unwrap();
         c.claim("lead-1").unwrap();
         c
+    }
+
+    /// Process-wide. Restored on drop. The window is the test body.
+    /// `mode_t` is 16 bits on macOS and 32 on other Unix.
+    #[cfg(unix)]
+    struct UmaskGuard {
+        prev: u32,
+    }
+
+    #[cfg(unix)]
+    impl UmaskGuard {
+        fn set(mask: u32) -> Self {
+            Self {
+                prev: unsafe { set_umask(mask) },
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                set_umask(self.prev);
+            }
+        }
+    }
+
+    #[cfg(all(unix, target_os = "macos"))]
+    unsafe fn set_umask(mask: u32) -> u32 {
+        unsafe extern "C" {
+            fn umask(mask: u16) -> u16;
+        }
+        // SAFETY: the guard restores the previous mask on drop. The test
+        // body is the only window, and it runs under the env lock.
+        unsafe { umask(mask as u16) as u32 }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    unsafe fn set_umask(mask: u32) -> u32 {
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        // SAFETY: the guard restores the previous mask on drop.
+        unsafe { umask(mask) }
+    }
+
+    /// Every new comms file under umask 022. A creator that forgets the
+    /// explicit mode lands at 0644, which this walk rejects.
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_log_and_inbox_are_owner_only_under_umask_022() {
+        let _home = crate::config::lock_env();
+        let _umask = UmaskGuard::set(0o022);
+        let d = tempfile::tempdir().unwrap();
+        let paths = CtxPaths::new(d.path(), "modes");
+        append_log(
+            &paths,
+            &Entry {
+                seq: 1,
+                in_off: None,
+                msg: crate::supervisor_program::SupMsg::WorkMoved,
+            },
+        )
+        .unwrap();
+        append_input(&paths, &crate::supervisor_program::SupMsg::WorkMoved).unwrap();
+
+        let cfg = crate::config::Config::default();
+        let mut inbox = crate::inbox_ports::FlywheelPorts::new(&cfg, "modes", "ws");
+        crate::inbox_host::Ports::fact(&mut inbox, "modes-fact", json!({"kind": "bind"})).unwrap();
+        crate::inbox_host::Ports::save_budget(&mut inbox, &BTreeMap::new()).unwrap();
+        let mut live = LivePorts::new(&cfg, "modes", "ws");
+        live.fact("sup-fact", json!({"kind": "x"})).unwrap();
+
+        assert_owner_only(paths.log.parent().unwrap());
+        assert_owner_only(&crate::config::state_dir());
+    }
+
+    #[cfg(unix)]
+    fn assert_owner_only(root: &Path) {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            let mode = crate::private_fs::mode_of(&p);
+            if p.is_dir() {
+                assert_eq!(mode, 0o700, "{p:?} is {mode:o}");
+                for e in std::fs::read_dir(&p).unwrap() {
+                    stack.push(e.unwrap().path());
+                }
+            } else {
+                assert_eq!(mode, 0o600, "{p:?} is {mode:o}");
+            }
+        }
     }
 
     #[test]
