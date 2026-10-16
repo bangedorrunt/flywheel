@@ -117,6 +117,10 @@ pub(crate) enum LoopCmd {
         /// line) — one page per wedge, cleared when a commit lands.
         #[arg(long, default_value_t = crate::durable::DEAD_STOP_DEFAULT_MINUTES)]
         stall_minutes: u64,
+        /// Nested lead. Its own log and lease, beside the root host.
+        /// A lead relaunch passes the child id here.
+        #[arg(long)]
+        context: Option<String>,
     },
     /// Query the state of a durable loop invocation on the Resonate server
     Status { project: String },
