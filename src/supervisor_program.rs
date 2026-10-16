@@ -413,6 +413,12 @@ pub enum SupMsg {
         /// Policy overrides (tests and fixtures); `None` = settled defaults.
         policy: Option<Policy>,
     },
+    /// A new host process takes over an existing context: it is `me` from now
+    /// on (the log's `Hello` names the FIRST host). Logged, so replay agrees.
+    Rebind {
+        /// The new host's holder id.
+        me: String,
+    },
     /// `lead{holder, sup_epoch}`: a supervisor takes the lease.
     Claim {
         /// Holder.
@@ -808,6 +814,9 @@ impl Program for SupervisorProgram {
                     m.policy = p.clone();
                 }
                 next = m;
+            }
+            SupMsg::Rebind { me } => {
+                next.me = me.clone();
             }
             SupMsg::Claim { holder, sup_epoch } => {
                 if *sup_epoch <= next.accepted_epoch {
@@ -1504,6 +1513,21 @@ mod tests {
             },
         );
         assert_eq!(rejects(&c), vec![RejectCause::StaleEpoch]);
+    }
+
+    #[test]
+    fn a_restarted_host_rebinds_and_its_own_claim_is_not_a_supersession() {
+        let mut m = SupModel::new("host-1", Tier::Lead);
+        m = SupervisorProgram::update(&m, &SupMsg::Claim { holder: "host-1".into(), sup_epoch: 1 }).model;
+        // host-2 starts over the same log: without Rebind its claim reads as foreign.
+        let foreign = SupervisorProgram::update(&m, &SupMsg::Claim { holder: "host-2".into(), sup_epoch: 2 }).model;
+        assert_eq!(foreign.status, Status::Superseded);
+        let m = SupervisorProgram::update(&m, &SupMsg::Rebind { me: "host-2".into() }).model;
+        let m = SupervisorProgram::update(&m, &SupMsg::Claim { holder: "host-2".into(), sup_epoch: 2 }).model;
+        assert_eq!((m.status, m.leader.as_str(), m.accepted_epoch), (Status::Running, "host-2", 2));
+        // and the old host, replaying the same log, is the one superseded
+        let old = SupervisorProgram::update(&SupModel::new("host-1", Tier::Lead), &SupMsg::Claim { holder: "host-2".into(), sup_epoch: 2 }).model;
+        assert_eq!(old.status, Status::Superseded);
     }
 
     #[test]

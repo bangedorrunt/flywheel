@@ -263,6 +263,9 @@ impl Core {
 
     /// Claim the next epoch for `holder`.
     pub fn claim(&mut self, holder: &str) -> Result<u64> {
+        if self.model.me != holder {
+            self.append_fold(SupMsg::Rebind { me: holder.into() })?;
+        }
         let e = self.model.accepted_epoch + 1;
         self.append_fold(SupMsg::Claim {
             holder: holder.into(),
@@ -1318,6 +1321,21 @@ mod tests {
         assert_eq!(c2.model.accepted_epoch, 2);
         assert!(c2.model.children.contains_key("a"));
         assert_eq!(c2.model.status, Status::Running);
+    }
+
+    #[test]
+    fn a_different_host_process_over_the_same_log_runs_it_and_replay_agrees() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
+        drop(c);
+        let mut c2 = Core::open(CtxPaths::new(d.path(), "proj"), "lead-2", Tier::Lead, None).unwrap();
+        c2.claim("lead-2").unwrap();
+        assert_eq!(c2.model.status, Status::Running, "a restart is not its own supersession");
+        assert_eq!(c2.model.leader, "lead-2");
+        let (msgs, _, _) = read_log(&CtxPaths::new(d.path(), "proj")).unwrap();
+        let (replayed, _) = crate::supervisor_program::replay(&msgs);
+        assert_eq!(replayed, c2.model);
     }
 
     #[test]
