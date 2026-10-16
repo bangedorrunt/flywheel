@@ -22,11 +22,15 @@
 //! only writer of `<ctx>.log.jsonl` and records how far it has read the
 //! input file, so a restart neither loses nor repeats an input.
 //!
-//! Gap (named, not hidden): steer@1/escalate@1 contracts and the
-//! `sup_epoch` fence at append are specified for toron-core (§6A.12) and do
-//! not exist there at 80356f5. Until they do, the fence is the fold's
-//! (`Control` below the accepted epoch is rejected before anything is sent)
-//! and a steer travels as a `notify@1` envelope whose text names the op.
+//! A steer is a `steer@1` envelope (`op`, `priority`, optional `delta`,
+//! `sup_epoch`). `priority` is `urgent` unless the op is `resume` (the same
+//! rule the fold uses). The doorbell reads that field and rings; this host
+//! only appends. `sup_epoch` is the lead epoch the fold passes. Callers with
+//! no epoch pass `0`: toron accepts any steer while the context has no
+//! `lead@1` row, and fences to that row once one exists. An escalation is
+//! `escalate@1` (`context`, `reason`, `evidence`). `Assign` stays log-only
+//! and does not append `task@1`. A steer that was already sent as `notify@1`
+//! is not re-sent; a restart resolves it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read as _, Write as _};
@@ -70,8 +74,8 @@ pub trait Ports {
     fn relaunch(&mut self, child: &str, generation: u64, kind: ChildKind) -> Result<(), String>;
     /// Stop `child`'s pane.
     fn exit(&mut self, child: &str, generation: u64) -> Result<(), String>;
-    /// Append the steer envelope; urgent ones interrupt and ring. Returns
-    /// the log offset.
+    /// Append the `steer@1` envelope. Returns the log offset. Does not type
+    /// a pane: the doorbell rings from the envelope's `priority`.
     fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String>;
     /// Tell the captain and record the fact.
     fn escalate(&mut self, n: u64, reason: &str, evidence: &str) -> Result<(), String>;
@@ -96,7 +100,8 @@ pub struct SteerSend {
     pub generation: u64,
     /// Epoch.
     pub sup_epoch: u64,
-    /// Interrupt and ring as well.
+    /// `op != resume`. Not read when building the envelope: `priority`
+    /// follows the op, so a stale flag cannot disagree with the fold.
     pub urgent: bool,
     /// sha256 of the redirect's delta; its bytes are in the side store.
     pub delta_sha: Option<String>,
@@ -148,8 +153,8 @@ pub fn read_log(p: &CtxPaths) -> Result<(Vec<SupMsg>, u64, u64)> {
         if l.trim().is_empty() {
             continue;
         }
-        let e: Entry =
-            serde_json::from_str(l).with_context(|| format!("{}:{}: bad log line", p.log.display(), i + 1))?;
+        let e: Entry = serde_json::from_str(l)
+            .with_context(|| format!("{}:{}: bad log line", p.log.display(), i + 1))?;
         seq = e.seq + 1;
         if let Some(o) = e.in_off {
             in_off = o;
@@ -302,48 +307,128 @@ impl Core {
 
 // ---- executing commands ---------------------------------------------------
 
-/// The mail body of a steer: the line that names the op (and, for a redirect,
-/// the generation to re-claim at), then the delta when there is one.
-pub(crate) fn steer_body(s: &SteerSend, delta: Option<&crate::steer_delta::Delta>) -> String {
-    crate::steer_delta::body(
-        &format!(
-            "steer {} on {} (seq {}, generation {}, sup_epoch {}) — run: toron next",
-            s.op.tag(),
-            s.child,
-            s.seq,
-            s.generation,
-            s.sup_epoch
-        ),
+/// `steer@1` body.
+///
+/// `priority` is `urgent` when the fold would treat the steer as urgent
+/// (`op != resume`), otherwise `normal`. `delta` is the 4b.4 object on
+/// `redirect` and is omitted for every other op. `ack_by` is omitted: this
+/// host does not put a deadline on the envelope. `sup_epoch` is the caller's
+/// lead epoch; pass `0` when there is none (no `lead@1` row accepts any
+/// steer; a row fences later appends to that epoch).
+pub(crate) fn steer_v1(
+    s: &SteerSend,
+    delta: Option<&crate::steer_delta::Delta>,
+) -> toron_core::contracts::steer_v1::SteerV1 {
+    let delta = if s.op == SteerOp::Redirect {
+        delta.and_then(|d| serde_json::from_str(&d.json).ok())
+    } else {
+        None
+    };
+    toron_core::contracts::steer_v1::SteerV1 {
+        op: s.op.tag().to_string(),
+        priority: if s.op == SteerOp::Resume {
+            "normal"
+        } else {
+            "urgent"
+        }
+        .to_string(),
         delta,
-    )
+        ack_by: None,
+        sup_epoch: s.sup_epoch,
+    }
 }
 
-/// Ring an urgent steer: an `Interrupt`, then the `URGENT steer (wm N)` wake
-/// line, but only if this is the first wake for `(npub, wm)` across both
-/// hosts. Returns whether it rang. At-most-once: a re-run of the durable
-/// command after a crash does not ring again (the steer's ack window is the
-/// backstop for an unanswered steer).
-pub(crate) fn ring_urgent_steer(
-    ledger: &crate::ring_ledger::RingLedger,
-    typer: &dyn crate::pane_write::PaneTyper,
-    npub: &str,
-    pane: &str,
-    offset: u64,
-) -> anyhow::Result<bool> {
-    use crate::pane_write::{PaneWrite, Urgency, Wm, write};
-    if !ledger.steer_may_ring(npub, offset) {
-        return Ok(false);
-    }
-    write(typer, pane, &PaneWrite::Interrupt)?;
-    write(
-        typer,
-        pane,
-        &PaneWrite::WakeLine {
-            wm: Wm(offset),
-            urgency: Urgency::Urgent,
+/// The envelope `append_steer` appends. `task` is the child: the fold has no
+/// task id distinct from the child pin. `generation` is the incarnation the
+/// command named (a redirect's is already `g+1`).
+pub(crate) fn steer_envelope(
+    project: &str,
+    producer: &str,
+    epoch: u64,
+    to_npub: &str,
+    s: &SteerSend,
+    delta: Option<&crate::steer_delta::Delta>,
+) -> Result<toron_core::envelope::Envelope, String> {
+    use toron_core::envelope::{
+        Class, ContextId, ContractId, ENVELOPE_V, Envelope, MsgId, Recipient, TaskId,
+    };
+    let body = serde_json::to_value(steer_v1(s, delta)).map_err(|e| e.to_string())?;
+    let env = Envelope {
+        v: ENVELOPE_V,
+        msg: MsgId {
+            producer: producer.to_string(),
+            epoch,
+            seq: 0,
         },
-    )?;
-    Ok(true)
+        from: producer.to_string(),
+        to: Recipient::Npub(to_npub.to_string()),
+        class: Class::Control,
+        contract: ContractId::new("steer", 1),
+        context: ContextId(project.to_string()),
+        task: Some(TaskId(s.child.clone())),
+        generation: u32::try_from(s.generation).unwrap_or(u32::MAX),
+        causation: None,
+        deadline_ts_us: None,
+        lease_ms: None,
+        body,
+    };
+    env.validate().map_err(|e| format!("{e:?}"))?;
+    Ok(env)
+}
+
+/// `escalate@1` body. `reason` must be non-empty. `evidence` is whatever the
+/// caller has; an empty slice is an empty list, not a missing field.
+/// `context` is prose for the reader (the project), not an envelope id.
+pub(crate) fn escalate_v1(
+    context: &str,
+    reason: &str,
+    evidence: &[String],
+) -> Result<toron_core::contracts::escalate_v1::EscalateV1, String> {
+    if reason.trim().is_empty() {
+        return Err("escalate@1 reason must be non-empty".into());
+    }
+    Ok(toron_core::contracts::escalate_v1::EscalateV1 {
+        context: context.to_string(),
+        reason: reason.to_string(),
+        evidence: evidence.to_vec(),
+    })
+}
+
+/// The envelope `escalate` appends, addressed to the captain's npub.
+pub(crate) fn escalate_envelope(
+    project: &str,
+    producer: &str,
+    epoch: u64,
+    to_npub: &str,
+    reason: &str,
+    evidence: &[String],
+) -> Result<toron_core::envelope::Envelope, String> {
+    use toron_core::envelope::{
+        Class, ContextId, ContractId, ENVELOPE_V, Envelope, MsgId, Recipient,
+    };
+    let body =
+        serde_json::to_value(escalate_v1(project, reason, evidence)?).map_err(|e| e.to_string())?;
+    let env = Envelope {
+        v: ENVELOPE_V,
+        msg: MsgId {
+            producer: producer.to_string(),
+            epoch,
+            seq: 0,
+        },
+        from: producer.to_string(),
+        to: Recipient::Npub(to_npub.to_string()),
+        class: Class::Control,
+        contract: ContractId::new("escalate", 1),
+        context: ContextId(project.to_string()),
+        task: None,
+        generation: 0,
+        causation: None,
+        deadline_ts_us: None,
+        lease_ms: None,
+        body,
+    };
+    env.validate().map_err(|e| format!("{e:?}"))?;
+    Ok(env)
 }
 
 /// Argv (no binary) for a lead relaunch: nested supervise, no pane payload.
@@ -362,7 +447,13 @@ fn relaunch_argv(project: &str, child: &str, kind: ChildKind) -> Vec<String> {
     match kind {
         ChildKind::Lead => lead_supervise_argv(project, child),
         ChildKind::Crew => {
-            vec!["crew".into(), "control".into(), project.into(), child.into(), "relaunch".into()]
+            vec![
+                "crew".into(),
+                "control".into(),
+                project.into(),
+                child.into(),
+                "relaunch".into(),
+            ]
         }
     }
 }
@@ -398,14 +489,16 @@ pub fn execute(
         Begin::Run(g) => g,
     };
     let res: Result<Vec<SupMsg>, String> = match cmd {
-        SupCmd::Relaunch { child, generation, kind } => {
-            ports.relaunch(child, *generation, *kind).map(|_| {
-                vec![SupMsg::Relaunched {
-                    child: child.clone(),
-                    generation: *generation,
-                }]
-            })
-        }
+        SupCmd::Relaunch {
+            child,
+            generation,
+            kind,
+        } => ports.relaunch(child, *generation, *kind).map(|_| {
+            vec![SupMsg::Relaunched {
+                child: child.clone(),
+                generation: *generation,
+            }]
+        }),
         SupCmd::Exit { child, generation } => ports.exit(child, *generation).map(|_| vec![]),
         SupCmd::AppendSteer {
             seq,
@@ -432,11 +525,16 @@ pub fn execute(
             evidence,
         } => ports.escalate(*n, reason, evidence).map(|_| vec![]),
         SupCmd::Assign { .. } => {
-            // ponytail: log-only until 4b.8; task@1 append waits on the producer helper
+            // Log-only. Assign does not append task@1.
             Ok(vec![])
         }
-        SupCmd::Park { child, incarnations } => ports.park(child, *incarnations).map(|_| vec![]),
-        SupCmd::Page { kind, pin, line, .. } => ports.page(kind, pin, line).map(|_| vec![]),
+        SupCmd::Park {
+            child,
+            incarnations,
+        } => ports.park(child, *incarnations).map(|_| vec![]),
+        SupCmd::Page {
+            kind, pin, line, ..
+        } => ports.page(kind, pin, line).map(|_| vec![]),
         SupCmd::Reject { n, cause, child } => ports.reject(*n, cause.tag(), child).map(|_| vec![]),
     };
     j.finish(&key, generation, res.is_ok());
@@ -524,12 +622,13 @@ pub fn recover(
         // the model is still waiting for it (defence in depth: the fold ignores
         // a confirmation that is not current anyway).
         if fed.is_empty()
-            && let SupCmd::Relaunch { child, generation, .. } = c
-            && core
-                .model
-                .children
-                .get(child)
-                .is_some_and(|ch| ch.state == crate::supervisor_program::ChildState::Restarting && ch.generation == *generation)
+            && let SupCmd::Relaunch {
+                child, generation, ..
+            } = c
+            && core.model.children.get(child).is_some_and(|ch| {
+                ch.state == crate::supervisor_program::ChildState::Restarting
+                    && ch.generation == *generation
+            })
         {
             follow.push(SupMsg::Relaunched {
                 child: child.clone(),
@@ -594,7 +693,9 @@ impl EffectJournal for ToronEffectJournal {
             Err(e) => return Begin::Unavailable(e.to_string()),
         };
         if claimed.state == EffectState::Prepared {
-            let _ = self.j.settle(key, claimed.generation, EffectState::InFlight);
+            let _ = self
+                .j
+                .settle(key, claimed.generation, EffectState::InFlight);
         }
         Begin::Run(claimed.generation)
     }
@@ -669,15 +770,17 @@ impl LivePorts {
     }
 
     fn facts_path(&self) -> PathBuf {
-        crate::config::state_dir()
-            .join("facts")
-            .join(format!("{}-supervisor.jsonl", crate::state::state_key(&self.project)))
+        crate::config::state_dir().join("facts").join(format!(
+            "{}-supervisor.jsonl",
+            crate::state::state_key(&self.project)
+        ))
     }
 
     fn inbox_facts_path(&self) -> PathBuf {
-        crate::config::state_dir()
-            .join("facts")
-            .join(format!("{}-inbox.jsonl", crate::state::state_key(&self.project)))
+        crate::config::state_dir().join("facts").join(format!(
+            "{}-inbox.jsonl",
+            crate::state::state_key(&self.project)
+        ))
     }
 
     fn fact(&mut self, key: &str, mut v: Value) -> Result<(), String> {
@@ -757,7 +860,11 @@ impl Ports for LivePorts {
             if s.state != crate::supervisor_program::SteerState::Pending || s.offset.is_none() {
                 continue;
             }
-            let Some(npub) = model.children.get(&s.child).and_then(|c| c.spec.npub.clone()) else {
+            let Some(npub) = model
+                .children
+                .get(&s.child)
+                .and_then(|c| c.spec.npub.clone())
+            else {
                 continue;
             };
             if let Some(store) = self.inbox.store().cloned() {
@@ -832,15 +939,22 @@ impl Ports for LivePorts {
         if child == PASS {
             return Ok(());
         }
-        let pane = self.pane_of(child).ok_or_else(|| format!("no pane for {child}"))?;
+        let pane = self
+            .pane_of(child)
+            .ok_or_else(|| format!("no pane for {child}"))?;
         let c = self.client().ok_or("herdr unavailable")?;
-        crate::pane_write::write(&crate::pane_write::HerdrPanes(&c), &pane, &crate::pane_write::PaneWrite::Exit)
-            .map_err(|e| format!("{e:#}"))
+        crate::pane_write::write(
+            &crate::pane_write::HerdrPanes(&c),
+            &pane,
+            &crate::pane_write::PaneWrite::Exit,
+        )
+        .map_err(|e| format!("{e:#}"))
     }
 
     fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {
         // The delta comes from the side store by sha and is refused unless its
-        // bytes hash to that sha; it goes in the mail BODY, never a pane.
+        // bytes hash to that sha. It rides the steer@1 body, never a pane.
+        // The supervisor log keeps the sha (the fold's message), not these bytes.
         let delta = match &s.delta_sha {
             Some(sha) => Some(
                 crate::steer_delta::load(&CtxPaths::default_dir(), &self.project, sha)
@@ -848,28 +962,36 @@ impl Ports for LivePorts {
             ),
             None => None,
         };
-        let text = steer_body(s, delta.as_ref());
-        let offset =
-            self.inbox
-                .append_notify(&s.child, text, &format!("steer:{}", s.seq), s.generation)?;
-        if s.urgent
-            && let (Some(pane), Some(c), Some(npub)) =
-                (self.pane_of(&s.child), self.client(), self.inbox.npub_of(&s.child))
-        {
-            ring_urgent_steer(
-                &self.inbox.ring_ledger(),
-                &crate::pane_write::HerdrPanes(&c),
-                &npub,
-                &pane,
-                offset,
-            )
-            .map_err(|e| format!("{e:#}"))?;
-        }
-        Ok(offset)
+        let to = self
+            .inbox
+            .npub_of(&s.child)
+            .ok_or_else(|| format!("no npub for {}", s.child))?;
+        let (producer, epoch) = self.inbox.claim_producer_epoch()?;
+        let env = steer_envelope(&self.project, &producer, epoch, &to, s, delta.as_ref())?;
+        self.inbox.append_env(env)
     }
 
     fn escalate(&mut self, n: u64, reason: &str, evidence: &str) -> Result<(), String> {
-        let line = format!("loop-mode supervise: ESCALATE {reason} in {} — {evidence}", self.project);
+        let evidence_v: Vec<String> = if evidence.is_empty() {
+            Vec::new()
+        } else {
+            vec![evidence.to_string()]
+        };
+        // No captain pin: there is no npub to address. The page below is the
+        // same sink as before. A bound captain gets escalate@1 as well.
+        if let Some(cap) = crate::state::load_captain_alias(&self.project) {
+            let to = self
+                .inbox
+                .npub_of(&cap)
+                .ok_or_else(|| format!("no npub for {cap}"))?;
+            let (producer, epoch) = self.inbox.claim_producer_epoch()?;
+            let env = escalate_envelope(&self.project, &producer, epoch, &to, reason, &evidence_v)?;
+            self.inbox.append_env(env)?;
+        }
+        let line = format!(
+            "loop-mode supervise: ESCALATE {reason} in {} — {evidence}",
+            self.project
+        );
         eprintln!("{line}");
         self.fact(
             &format!("escalate:{n}:{reason}"),
@@ -993,11 +1115,26 @@ pub fn run_supervise(
     let mut lease = match doorbell_rt::lease::acquire_lease(&sd, &lease_ws, now_s()) {
         Ok(l) => l,
         Err(doorbell_rt::lease::LeaseDenied::Held(o)) => {
-            bail!("another supervisor host (pid {}) holds {project}; not starting a second", o.pid)
+            bail!(
+                "another supervisor host (pid {}) holds {project}; not starting a second",
+                o.pid
+            )
         }
         Err(_) => bail!("cannot write the supervisor lease"),
     };
-    let result = host_loop(cfg, project, work, interval_secs, to, stall_minutes, &hc, &paths, &me, &lease_ws, &mut lease);
+    let result = host_loop(
+        cfg,
+        project,
+        work,
+        interval_secs,
+        to,
+        stall_minutes,
+        &hc,
+        &paths,
+        &me,
+        &lease_ws,
+        &mut lease,
+    );
     doorbell_rt::lease::release_lease(&sd, &lease_ws, &lease);
     result
 }
@@ -1018,7 +1155,10 @@ fn host_loop(
 ) -> Result<()> {
     let mut core = Core::open(paths.clone(), me, Tier::Lead, hc.policy())?;
     let epoch = core.claim(me)?;
-    let mut journal = ToronEffectJournal::open(&format!("supervise:{}", crate::state::state_key(project)), me)?;
+    let mut journal = ToronEffectJournal::open(
+        &format!("supervise:{}", crate::state::state_key(project)),
+        me,
+    )?;
     let mut ports = LivePorts::new(cfg, project, project);
     eprintln!(
         "flywheel supervisor: {project} hosted on SupervisorProgram (sup_epoch {epoch}, {} children replayed, MaxR {}/{}s) — comms flag on",
@@ -1028,7 +1168,10 @@ fn host_loop(
     );
     let rec = recover(&mut core, &mut journal, &mut ports)?;
     if rec.ran + rec.skipped > 0 {
-        eprintln!("flywheel supervisor: recovery ran {} command(s), {} already settled", rec.ran, rec.skipped);
+        eprintln!(
+            "flywheel supervisor: recovery ran {} command(s), {} already settled",
+            rec.ran, rec.skipped
+        );
     }
     let exe = std::env::current_exe().context("resolve the flywheel executable")?;
     let project_dir = crate::project_dir(cfg, project);
@@ -1062,7 +1205,8 @@ fn host_loop(
         None
     };
     let mut pass: Option<std::process::Child> = None;
-    let mut last_pass_end = std::time::Instant::now() - std::time::Duration::from_secs(interval_secs);
+    let mut last_pass_end =
+        std::time::Instant::now() - std::time::Duration::from_secs(interval_secs);
     loop {
         let now = now_ms();
         if let Some(c) = pass.as_mut()
@@ -1075,7 +1219,14 @@ fn host_loop(
                 now_ms: now,
             });
             // The dead-stop and wedge probes ride the end of a pass, as before.
-            extra.extend(probe_msgs(cfg, project, &project_dir, stall_secs, &core.model, now));
+            extra.extend(probe_msgs(
+                cfg,
+                project,
+                &project_dir,
+                stall_secs,
+                &core.model,
+                now,
+            ));
         }
         let pass_live = core
             .model
@@ -1095,11 +1246,25 @@ fn host_loop(
                     .with_context(|| format!("spawn `{}`", argv.join(" ")))?,
             );
         }
-        let rep = round(&mut core, &mut journal, &mut ports, std::mem::take(&mut extra), now)?;
+        let rep = round(
+            &mut core,
+            &mut journal,
+            &mut ports,
+            std::mem::take(&mut extra),
+            now,
+        )?;
         if rep.failed > 0 {
-            eprintln!("flywheel supervisor: {} command(s) failed this round", rep.failed);
+            eprintln!(
+                "flywheel supervisor: {} command(s) failed this round",
+                rep.failed
+            );
         }
-        doorbell_rt::lease::refresh_lease(&crate::config::state_dir(), lease_ws, lease, chrono::Utc::now().timestamp().max(0) as u64);
+        doorbell_rt::lease::refresh_lease(
+            &crate::config::state_dir(),
+            lease_ws,
+            lease,
+            chrono::Utc::now().timestamp().max(0) as u64,
+        );
         match core.model.status {
             crate::supervisor_program::Status::Failed => {
                 if let Some(mut c) = pass.take() {
@@ -1168,7 +1333,12 @@ fn probe_msgs(
     }
     let paged: std::collections::HashSet<String> = model.paged.iter().cloned().collect();
     for a in crate::probe_pane_wedges(cfg, project, project_dir, now, stall_secs, &paged) {
-        if let crate::durable::PaneWedgeAction::Page { pin, pane_id, error } = a {
+        if let crate::durable::PaneWedgeAction::Page {
+            pin,
+            pane_id,
+            error,
+        } = a
+        {
             out.push(SupMsg::Wedged {
                 line: format!(
                     "loop-mode supervise: PANE WEDGE in {project} — {pin} ({pane_id}) is alive but parked on: {error} (nothing committed for {}s)",
@@ -1245,9 +1415,20 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
             let p = CtxPaths::new(&CtxPaths::default_dir(), project);
             let now_ms = now_ms();
             let msg = match kind.as_str() {
-                "progress" => SupMsg::Progress { child: child.clone(), generation: *generation, now_ms },
-                "done" => SupMsg::Done { child: child.clone(), generation: *generation, now_ms },
-                "exit" => SupMsg::Exit { child: child.clone(), now_ms },
+                "progress" => SupMsg::Progress {
+                    child: child.clone(),
+                    generation: *generation,
+                    now_ms,
+                },
+                "done" => SupMsg::Done {
+                    child: child.clone(),
+                    generation: *generation,
+                    now_ms,
+                },
+                "exit" => SupMsg::Exit {
+                    child: child.clone(),
+                    now_ms,
+                },
                 other => bail!("unknown fact kind {other:?} (progress|done|exit)"),
             };
             append_input(&p, &msg)?;
@@ -1269,7 +1450,11 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
                 (SteerOp::Redirect, Some(f)) => {
                     let raw = std::fs::read(f).with_context(|| format!("read {}", f.display()))?;
                     let d = crate::steer_delta::parse(&raw)?;
-                    Some(crate::steer_delta::store(&CtxPaths::default_dir(), project, &d)?)
+                    Some(crate::steer_delta::store(
+                        &CtxPaths::default_dir(),
+                        project,
+                        &d,
+                    )?)
                 }
                 (SteerOp::Redirect, None) => {
                     bail!("a redirect needs --delta-file (the new goal, as JSON); nothing queued")
@@ -1294,7 +1479,10 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
                     now_ms: now_ms(),
                 },
             )?;
-            println!("queued steer {} for {child} under sup_epoch {epoch}", op.tag());
+            println!(
+                "queued steer {} for {child} under sup_epoch {epoch}",
+                op.tag()
+            );
             Ok(())
         }
         SupervisorCmd::View { project, json } => {
@@ -1303,10 +1491,13 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
             let (m, _) = crate::supervisor_program::replay(&msgs);
             let rows = crew_view(&m);
             if *json {
-                println!("{}", serde_json::to_string_pretty(&json!({
-                    "status": m.status, "sup_epoch": m.accepted_epoch, "leader": m.leader,
-                    "restarts_in_window": m.restarts.len(), "rows": rows,
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "status": m.status, "sup_epoch": m.accepted_epoch, "leader": m.leader,
+                        "restarts_in_window": m.restarts.len(), "rows": rows,
+                    }))?
+                );
             } else {
                 print_view(&m, &rows);
             }
@@ -1318,14 +1509,21 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
 fn print_view(m: &SupModel, rows: &[CrewRow]) {
     println!(
         "supervisor {:?} sup_epoch {} leader {} restarts {}/{}",
-        m.status, m.accepted_epoch, m.leader, m.restarts.len(), m.policy.max_r
+        m.status,
+        m.accepted_epoch,
+        m.leader,
+        m.restarts.len(),
+        m.policy.max_r
     );
     for r in rows {
         let steer = r
             .pending_steer
             .map(|(s, o)| format!(" steer#{s}:{}", o.tag()))
             .unwrap_or_default();
-        println!("  {:<20} {:?} gen {} abnormal {}{steer}", r.child, r.state, r.generation, r.abnormal);
+        println!(
+            "  {:<20} {:?} gen {} abnormal {}{steer}",
+            r.child, r.state, r.generation, r.abnormal
+        );
     }
 }
 
@@ -1335,7 +1533,7 @@ mod tests {
 
     /// A well-formed delta sha for tests that only need one.
     const D: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    use crate::supervisor_program::{ChildState, SteerState, Status};
+    use crate::supervisor_program::{ChildState, Status, SteerState};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -1429,10 +1627,23 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
-        let rep = go(&mut c, &mut j, &f, vec![SupMsg::Exit { child: "a".into(), now_ms: 2_000 }], 2_000);
+        let rep = go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Exit {
+                child: "a".into(),
+                now_ms: 2_000,
+            }],
+            2_000,
+        );
         assert_eq!(f.0.lock().unwrap().relaunched, vec![("a".to_string(), 2)]);
         assert_eq!(rep.ran, 1);
-        assert_eq!(c.model.children["a"].state, ChildState::Running, "Relaunched fed back");
+        assert_eq!(
+            c.model.children["a"].state,
+            ChildState::Running,
+            "Relaunched fed back"
+        );
         // A tick later changes nothing and relaunches nothing.
         go(&mut c, &mut j, &f, vec![], 3_000);
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 1);
@@ -1441,22 +1652,52 @@ mod tests {
     fn open_with(dir: &Path, strategy: crate::supervisor_program::Strategy) -> Core {
         let mut policy = Policy::for_tier(Tier::Lead);
         policy.strategy = strategy;
-        let mut c = Core::open(CtxPaths::new(dir, "proj"), "lead-1", Tier::Lead, Some(policy)).unwrap();
+        let mut c = Core::open(
+            CtxPaths::new(dir, "proj"),
+            "lead-1",
+            Tier::Lead,
+            Some(policy),
+        )
+        .unwrap();
         c.claim("lead-1").unwrap();
         c
     }
 
     #[test]
-    fn a_rest_for_one_cascade_stops_then_relaunches_and_a_kill_mid_cascade_finishes_it_exactly_once() {
+    fn a_rest_for_one_cascade_stops_then_relaunches_and_a_kill_mid_cascade_finishes_it_exactly_once()
+     {
         use crate::supervisor_program::Strategy;
         let d = tempfile::tempdir().unwrap();
-        let (mut c, mut j, f) = (open_with(d.path(), Strategy::RestForOne), MemJournal::default(), Fake::default());
-        go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b"), spawn("c")], 1_000);
-        go(&mut c, &mut j, &f, vec![SupMsg::Exit { child: "b".into(), now_ms: 2_000 }], 2_000);
+        let (mut c, mut j, f) = (
+            open_with(d.path(), Strategy::RestForOne),
+            MemJournal::default(),
+            Fake::default(),
+        );
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![spawn("a"), spawn("b"), spawn("c")],
+            1_000,
+        );
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Exit {
+                child: "b".into(),
+                now_ms: 2_000,
+            }],
+            2_000,
+        );
         {
             let w = f.0.lock().unwrap();
             assert_eq!(w.exited, vec![("c".to_string(), 1)]);
-            assert_eq!(w.relaunched, vec![("b".to_string(), 2), ("c".to_string(), 2)], "never a");
+            assert_eq!(
+                w.relaunched,
+                vec![("b".to_string(), 2), ("c".to_string(), 2)],
+                "never a"
+            );
         }
         // Crash model: c's relaunch ran but its journal row never settled.
         // Only unsettled commands may re-run.
@@ -1467,7 +1708,11 @@ mod tests {
         let mut p2 = f2.clone();
         recover(&mut c2, &mut j, &mut p2).unwrap();
         let w2 = f2.0.lock().unwrap();
-        assert_eq!(w2.relaunched, vec![("c".to_string(), 2)], "exactly the unsettled relaunch, once");
+        assert_eq!(
+            w2.relaunched,
+            vec![("c".to_string(), 2)],
+            "exactly the unsettled relaunch, once"
+        );
         assert!(w2.exited.is_empty(), "the settled Exit does not run again");
     }
 
@@ -1475,11 +1720,20 @@ mod tests {
     fn a_kill_between_a_settled_relaunch_and_its_feedback_does_not_strand_the_child_restarting() {
         use crate::supervisor_program::Strategy;
         let d = tempfile::tempdir().unwrap();
-        let (mut c, mut j, f) = (open_with(d.path(), Strategy::RestForOne), MemJournal::default(), Fake::default());
+        let (mut c, mut j, f) = (
+            open_with(d.path(), Strategy::RestForOne),
+            MemJournal::default(),
+            Fake::default(),
+        );
         go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
         // The crash window: the exit is logged, the relaunch ran and settled,
         // the host died before `Relaunched` was fed back.
-        let cmds = c.append_fold(SupMsg::Exit { child: "a".into(), now_ms: 2_000 }).unwrap();
+        let cmds = c
+            .append_fold(SupMsg::Exit {
+                child: "a".into(),
+                now_ms: 2_000,
+            })
+            .unwrap();
         let mut rep = RoundReport::default();
         let mut p = f.clone();
         for cmd in &cmds {
@@ -1492,8 +1746,15 @@ mod tests {
         let mut c2 = open_with(d.path(), Strategy::RestForOne);
         let mut p2 = f2.clone();
         recover(&mut c2, &mut j, &mut p2).unwrap();
-        assert!(f2.0.lock().unwrap().relaunched.is_empty(), "nothing runs twice");
-        assert_eq!(c2.model.children["a"].state, ChildState::Running, "confirmed from the settled journal row");
+        assert!(
+            f2.0.lock().unwrap().relaunched.is_empty(),
+            "nothing runs twice"
+        );
+        assert_eq!(
+            c2.model.children["a"].state,
+            ChildState::Running,
+            "confirmed from the settled journal row"
+        );
         assert_eq!(c2.model.children["b"].state, ChildState::Running);
         // A second recovery over the now-complete log changes nothing (a no-op
         // message is never logged, so the log does not grow either).
@@ -1501,16 +1762,31 @@ mod tests {
         let mut c3 = open_with(d.path(), Strategy::RestForOne); // opening logs its own rebind/claim
         let n = read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len();
         recover(&mut c3, &mut j, &mut f2.clone()).unwrap();
-        assert_eq!(read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len(), n, "recovery over a complete log appends nothing");
+        assert_eq!(
+            read_log(&CtxPaths::new(d.path(), "proj")).unwrap().0.len(),
+            n,
+            "recovery over a complete log appends nothing"
+        );
     }
 
     #[test]
     fn the_strategy_word_reaches_the_policy() {
         use crate::supervisor_program::Strategy;
-        let cfg = HostCfg { strategy: Some(Strategy::OneForAll), ..HostCfg::from_env() };
+        let cfg = HostCfg {
+            strategy: Some(Strategy::OneForAll),
+            ..HostCfg::from_env()
+        };
         assert_eq!(cfg.policy().unwrap().strategy, Strategy::OneForAll);
-        let none = HostCfg { strategy: None, ack_ms: None, lease_ms: None, ..HostCfg::from_env() };
-        assert!(none.policy().is_none(), "no override: the tier default stands");
+        let none = HostCfg {
+            strategy: None,
+            ack_ms: None,
+            lease_ms: None,
+            ..HostCfg::from_env()
+        };
+        assert!(
+            none.policy().is_none(),
+            "no override: the tier default stands"
+        );
     }
 
     /// What a hinted loop publishes after each round.
@@ -1528,7 +1804,11 @@ mod tests {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let now = 10_000 + t0.elapsed().as_millis() as u64;
                 round(&mut c, &mut j, &mut f.clone(), vec![], now).unwrap();
-                if c.model.steers.get(&1).is_some_and(|s| s.state == SteerState::Acked) {
+                if c.model
+                    .steers
+                    .get(&1)
+                    .is_some_and(|s| s.state == SteerState::Acked)
+                {
                     acked.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 crate::supervisor_hints::wait(&rx, tick);
@@ -1545,7 +1825,9 @@ mod tests {
             op: SteerOp::Redirect,
             child: "a".into(),
             sup_epoch: epoch,
-            delta_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            delta_sha: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ),
             now_ms: 2_000,
         };
         go(&mut c, &mut j, &f, vec![ctl], 2_000);
@@ -1559,10 +1841,24 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (c, j, f) = steered_core(d.path());
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let (stop, acked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        let h = spawn_loop(c, j, f.clone(), rx, std::time::Duration::from_secs(5), stop.clone(), acked.clone());
+        let (stop, acked) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let h = spawn_loop(
+            c,
+            j,
+            f.clone(),
+            rx,
+            std::time::Duration::from_secs(5),
+            stop.clone(),
+            acked.clone(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(150)); // the loop is now waiting out its tick
-        f.0.lock().unwrap().obs.push(SupMsg::Cursor { child: "a".into(), cursor: 10 }); // toron next
+        f.0.lock().unwrap().obs.push(SupMsg::Cursor {
+            child: "a".into(),
+            cursor: 10,
+        }); // toron next
         let t = std::time::Instant::now();
         tx.send(()).unwrap();
         while !acked.load(Ordering::Relaxed) && t.elapsed() < std::time::Duration::from_secs(2) {
@@ -1572,7 +1868,10 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let _ = tx.send(());
         let core = h.join().unwrap();
-        assert!(acked.load(Ordering::Relaxed) && took < std::time::Duration::from_millis(200), "ack took {took:?}");
+        assert!(
+            acked.load(Ordering::Relaxed) && took < std::time::Duration::from_millis(200),
+            "ack took {took:?}"
+        );
         assert_eq!(core.model.steers[&1].state, SteerState::Acked);
     }
 
@@ -1584,10 +1883,24 @@ mod tests {
         // Hinted run.
         let (c, j, f) = steered_core(d1.path());
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let (stop, acked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        let h = spawn_loop(c, j, f.clone(), rx, std::time::Duration::from_millis(400), stop.clone(), acked.clone());
+        let (stop, acked) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let h = spawn_loop(
+            c,
+            j,
+            f.clone(),
+            rx,
+            std::time::Duration::from_millis(400),
+            stop.clone(),
+            acked.clone(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(100));
-        f.0.lock().unwrap().obs.push(SupMsg::Cursor { child: "a".into(), cursor: 10 });
+        f.0.lock().unwrap().obs.push(SupMsg::Cursor {
+            child: "a".into(),
+            cursor: 10,
+        });
         tx.send(()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
         stop.store(true, Ordering::Relaxed);
@@ -1597,21 +1910,44 @@ mod tests {
         let (c, j, f) = steered_core(d2.path());
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         drop(tx);
-        let (stop, acked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        let h = spawn_loop(c, j, f.clone(), rx, std::time::Duration::from_millis(400), stop.clone(), acked.clone());
+        let (stop, acked) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let h = spawn_loop(
+            c,
+            j,
+            f.clone(),
+            rx,
+            std::time::Duration::from_millis(400),
+            stop.clone(),
+            acked.clone(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(100));
-        f.0.lock().unwrap().obs.push(SupMsg::Cursor { child: "a".into(), cursor: 10 });
+        f.0.lock().unwrap().obs.push(SupMsg::Cursor {
+            child: "a".into(),
+            cursor: 10,
+        });
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!acked.load(Ordering::Relaxed), "no hint: not yet (the tick is 400 ms)");
+        assert!(
+            !acked.load(Ordering::Relaxed),
+            "no hint: not yet (the tick is 400 ms)"
+        );
         let t = std::time::Instant::now();
         while !acked.load(Ordering::Relaxed) && t.elapsed() < std::time::Duration::from_secs(2) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         stop.store(true, Ordering::Relaxed);
         let plain = h.join().unwrap();
-        assert!(acked.load(Ordering::Relaxed), "the tick still folds it: a lost hint costs one tick");
+        assert!(
+            acked.load(Ordering::Relaxed),
+            "the tick still folds it: a lost hint costs one tick"
+        );
         assert_eq!(plain.model.steers[&1].state, hinted.model.steers[&1].state);
-        assert_eq!(crate::supervisor_program::crew_view(&plain.model), crate::supervisor_program::crew_view(&hinted.model));
+        assert_eq!(
+            crate::supervisor_program::crew_view(&plain.model),
+            crate::supervisor_program::crew_view(&hinted.model)
+        );
     }
 
     #[test]
@@ -1624,48 +1960,103 @@ mod tests {
         unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_HINTS") };
     }
 
-    // ---- 4b.4: the delta rides the mail body, never the pane
+    // ---- 4b.8: steer@1 body. The doorbell rings; the pane never sees the delta.
 
     fn send(op: SteerOp, sha: Option<&str>) -> SteerSend {
-        SteerSend { seq: 1, child: "a".into(), op, generation: 2, sup_epoch: 2, urgent: true, delta_sha: sha.map(Into::into) }
-    }
-
-    #[test]
-    fn a_redirect_delta_lands_in_the_mail_body_with_a_matching_hash_and_the_pane_sees_only_the_wake() {
-        let delta = crate::steer_delta::parse(br#"{"goal":"port the parser to the new AST","acceptance":"cargo test"}"#).unwrap();
-        let s = send(SteerOp::Redirect, Some(&delta.sha));
-        let body = steer_body(&s, Some(&delta));
-        assert!(body.contains("steer redirect on a (seq 1, generation 2, sup_epoch 2)"));
-        let (sha, json) = crate::steer_delta::delta_in_body(&body).expect("the delta is in the body");
-        assert_eq!(sha, delta.sha);
-        assert_eq!(crate::steer_delta::sha_hex(json.as_bytes()), delta.sha, "body hash == logged sha");
-        // Ring it: the pane gets an interrupt and the wake line, nothing else.
-        let d = tempfile::tempdir().unwrap();
-        let l = crate::ring_ledger::RingLedger::new(d.path().join("rings"));
-        let p = RecPane::default();
-        assert!(ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap());
-        let writes = p.0.lock().unwrap().clone();
-        assert_eq!(writes.len(), 2, "{writes:?}");
-        assert!(writes[0].contains("keys"), "{writes:?}");
-        assert!(writes[1].contains("URGENT steer (wm 7)"), "{writes:?}");
-        for w in &writes {
-            assert!(!w.contains("port the parser") && !w.contains("cargo test") && !w.contains(&delta.sha), "no payload in a pane: {w}");
+        SteerSend {
+            seq: 1,
+            child: "a".into(),
+            op,
+            generation: 2,
+            sup_epoch: 2,
+            urgent: false,
+            delta_sha: sha.map(Into::into),
         }
     }
 
+    const NPUB: &str = "abababababababababababababababababababababababababababababababab";
+
+    fn built(
+        s: &SteerSend,
+        delta: Option<&crate::steer_delta::Delta>,
+    ) -> toron_core::envelope::Envelope {
+        steer_envelope("proj", NPUB, 0, NPUB, s, delta).unwrap()
+    }
+
     #[test]
-    fn a_steer_without_a_delta_has_the_plain_one_line_body() {
-        let b = steer_body(&send(SteerOp::Pause, None), None);
-        assert_eq!(b.lines().count(), 1);
-        assert!(crate::steer_delta::delta_in_body(&b).is_none());
+    fn append_steer_redirect_is_steer_v1_urgent_with_delta_and_resume_is_normal() {
+        let delta = crate::steer_delta::parse(
+            br#"{"goal":"port the parser to the new AST","acceptance":"cargo test"}"#,
+        )
+        .unwrap();
+        // urgent: false on purpose. Priority follows the op, not the flag.
+        let redirect = built(&send(SteerOp::Redirect, Some(&delta.sha)), Some(&delta));
+        assert_eq!(redirect.contract.name, "steer");
+        assert_eq!(redirect.contract.major, 1);
+        assert_eq!(redirect.body["priority"], "urgent");
+        assert_eq!(redirect.body["op"], "redirect");
+        assert_eq!(redirect.body["sup_epoch"], 2);
+        assert!(redirect.body.get("ack_by").is_none());
+        let obj = redirect.body["delta"].as_object().expect("delta object");
+        assert_eq!(obj["goal"], "port the parser to the new AST");
+        let canonical = serde_json::to_string(&redirect.body["delta"]).unwrap();
+        assert_eq!(
+            crate::steer_delta::sha_hex(canonical.as_bytes()),
+            delta.sha,
+            "body delta hashes to the sha the log stores"
+        );
+        // No epoch: the caller passes 0. The body records that, it does not invent one.
+        let mut none = send(SteerOp::Redirect, Some(&delta.sha));
+        none.sup_epoch = 0;
+        assert_eq!(built(&none, Some(&delta)).body["sup_epoch"], 0);
+
+        let resume = built(&send(SteerOp::Resume, None), None);
+        assert_eq!(resume.contract.name, "steer");
+        assert_eq!(resume.contract.major, 1);
+        assert_eq!(resume.body["priority"], "normal");
+        assert_eq!(resume.body["op"], "resume");
+        assert!(resume.body.get("delta").is_none(), "resume omits delta");
+
+        // A pause is urgent and still has no delta. The delta bytes are not a pane line.
+        let pause = steer_v1(&send(SteerOp::Pause, None), Some(&delta));
+        assert_eq!(pause.priority, "urgent");
+        assert!(pause.delta.is_none());
+        let rendered = serde_json::to_string(&redirect.body).unwrap();
+        assert!(rendered.contains("port the parser"));
+        let wake = crate::pane_write::wake_line(
+            crate::pane_write::Wm(7),
+            crate::pane_write::Urgency::Urgent,
+        );
+        assert!(!wake.contains("port the parser") && !wake.contains(&delta.sha));
+    }
+
+    #[test]
+    fn escalate_v1_requires_a_reason_and_an_empty_evidence_list_stays_empty() {
+        let ok = escalate_v1("proj", "restart_intensity", &[]).unwrap();
+        assert_eq!(ok.context, "proj");
+        assert_eq!(ok.reason, "restart_intensity");
+        assert!(ok.evidence.is_empty());
+        let one = escalate_v1("proj", "restart_intensity", &["log:1".into()]).unwrap();
+        assert_eq!(one.evidence, vec!["log:1".to_string()]);
+        assert!(escalate_v1("proj", "  ", &[]).is_err());
+        let env = escalate_envelope("proj", NPUB, 0, NPUB, "restart_intensity", &[]).unwrap();
+        assert_eq!(env.contract.name, "escalate");
+        assert_eq!(env.contract.major, 1);
     }
 
     fn steer_cmd(op: &str, delta_file: Option<PathBuf>) -> SupervisorCmd {
-        SupervisorCmd::Steer { project: "proj".into(), child: "a".into(), op: op.into(), sup_epoch: Some(2), delta_file }
+        SupervisorCmd::Steer {
+            project: "proj".into(),
+            child: "a".into(),
+            op: op.into(),
+            sup_epoch: Some(2),
+            delta_file,
+        }
     }
 
     fn queued() -> String {
-        std::fs::read_to_string(CtxPaths::new(&CtxPaths::default_dir(), "proj").inbox).unwrap_or_default()
+        std::fs::read_to_string(CtxPaths::new(&CtxPaths::default_dir(), "proj").inbox)
+            .unwrap_or_default()
     }
 
     #[test]
@@ -1684,14 +2075,25 @@ mod tests {
             ("k.json", br#"{"goal":"x","rm":"-rf"}"#.to_vec()),
             ("s.json", br#"{"goal":5}"#.to_vec()),
             ("j.json", b"nope".to_vec()),
-            ("big.json", format!(r#"{{"goal":"{}"}}"#, "a".repeat(9000)).into_bytes()),
+            (
+                "big.json",
+                format!(r#"{{"goal":"{}"}}"#, "a".repeat(9000)).into_bytes(),
+            ),
         ] {
-            assert!(run_cli(&steer_cmd("redirect", Some(w(n, &b)))).is_err(), "{n}");
+            assert!(
+                run_cli(&steer_cmd("redirect", Some(w(n, &b)))).is_err(),
+                "{n}"
+            );
         }
         // A file on another op: refused.
         assert!(run_cli(&steer_cmd("pause", Some(w("ok.json", br#"{"goal":"x"}"#)))).is_err());
         assert_eq!(queued(), "", "nothing was queued by any refused call");
-        assert!(!CtxPaths::default_dir().join(format!("{}.deltas", crate::state::state_key("proj"))).exists(), "and nothing stashed");
+        assert!(
+            !CtxPaths::default_dir()
+                .join(format!("{}.deltas", crate::state::state_key("proj")))
+                .exists(),
+            "and nothing stashed"
+        );
     }
 
     #[test]
@@ -1699,19 +2101,37 @@ mod tests {
         let _g = crate::config::lock_env();
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("d.json");
-        std::fs::write(&f, br#"{"scope":{"paths":["src/x.rs"]},"goal":"secret-ish goal text"}"#).unwrap();
+        std::fs::write(
+            &f,
+            br#"{"scope":{"paths":["src/x.rs"]},"goal":"secret-ish goal text"}"#,
+        )
+        .unwrap();
         run_cli(&steer_cmd("redirect", Some(f))).unwrap();
         let line = queued();
         let m: SupMsg = serde_json::from_str(line.trim()).unwrap();
-        let SupMsg::Control { op: SteerOp::Redirect, delta_sha: Some(sha), .. } = m else { panic!("{line}") };
-        assert!(!line.contains("secret-ish"), "the input file carries the sha, not the delta");
+        let SupMsg::Control {
+            op: SteerOp::Redirect,
+            delta_sha: Some(sha),
+            ..
+        } = m
+        else {
+            panic!("{line}")
+        };
+        assert!(
+            !line.contains("secret-ish"),
+            "the input file carries the sha, not the delta"
+        );
         let got = crate::steer_delta::load(&CtxPaths::default_dir(), "proj", &sha).unwrap();
         assert_eq!(got.sha, sha);
         #[cfg(unix)]
         {
-            let dir = CtxPaths::default_dir().join(format!("{}.deltas", crate::state::state_key("proj")));
+            let dir =
+                CtxPaths::default_dir().join(format!("{}.deltas", crate::state::state_key("proj")));
             assert_eq!(crate::private_fs::mode_of(&dir), 0o700);
-            assert_eq!(crate::private_fs::mode_of(&dir.join(format!("{sha}.json"))), 0o600);
+            assert_eq!(
+                crate::private_fs::mode_of(&dir.join(format!("{sha}.json"))),
+                0o600
+            );
         }
         // Other ops still queue without a file.
         run_cli(&steer_cmd("cancel", None)).unwrap();
@@ -1731,11 +2151,21 @@ mod tests {
                 op: SteerOp::Redirect,
                 child: "a".into(),
                 sup_epoch: epoch,
-                delta_sha: Some(D.into()), now_ms: 2_000,
+                delta_sha: Some(D.into()),
+                now_ms: 2_000,
             }],
             2_000,
         );
-        go(&mut c, &mut j, &f, vec![SupMsg::Exit { child: "b".into(), now_ms: 3_000 }], 3_000);
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Exit {
+                child: "b".into(),
+                now_ms: 3_000,
+            }],
+            3_000,
+        );
         let want = c.model.clone();
         drop(c);
         // "kill -9": reopen from the log alone.
@@ -1744,7 +2174,12 @@ mod tests {
         let (replayed, _) = crate::supervisor_program::replay(&msgs);
         assert_eq!(replayed, want);
         assert_eq!(crew_view(&replayed), crew_view(&want));
-        assert!(replayed.steers.values().any(|s| s.state == SteerState::Pending));
+        assert!(
+            replayed
+                .steers
+                .values()
+                .any(|s| s.state == SteerState::Pending)
+        );
         assert_eq!(replayed.children.len(), 2, "same child set");
     }
 
@@ -1767,9 +2202,14 @@ mod tests {
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
         drop(c);
-        let mut c2 = Core::open(CtxPaths::new(d.path(), "proj"), "lead-2", Tier::Lead, None).unwrap();
+        let mut c2 =
+            Core::open(CtxPaths::new(d.path(), "proj"), "lead-2", Tier::Lead, None).unwrap();
         c2.claim("lead-2").unwrap();
-        assert_eq!(c2.model.status, Status::Running, "a restart is not its own supersession");
+        assert_eq!(
+            c2.model.status,
+            Status::Running,
+            "a restart is not its own supersession"
+        );
         assert_eq!(c2.model.leader, "lead-2");
         let (msgs, _, _) = read_log(&CtxPaths::new(d.path(), "proj")).unwrap();
         let (replayed, _) = crate::supervisor_program::replay(&msgs);
@@ -1781,8 +2221,26 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
-        go(&mut c, &mut j, &f, vec![SupMsg::Exit { child: "a".into(), now_ms: 2_000 }], 2_000);
-        go(&mut c, &mut j, &f, vec![SupMsg::Exit { child: "b".into(), now_ms: 2_100 }], 2_100);
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Exit {
+                child: "a".into(),
+                now_ms: 2_000,
+            }],
+            2_000,
+        );
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Exit {
+                child: "b".into(),
+                now_ms: 2_100,
+            }],
+            2_100,
+        );
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 2);
         // Crash model: the second relaunch's journal row never settled.
         j.rows.get_mut("relaunch:b:2").unwrap().0 = false;
@@ -1791,7 +2249,11 @@ mod tests {
         let mut c2 = open(d.path());
         let mut p2 = f2.clone();
         let rep = recover(&mut c2, &mut j, &mut p2).unwrap();
-        assert_eq!(f2.0.lock().unwrap().relaunched, vec![("b".to_string(), 2)], "only the unsettled one");
+        assert_eq!(
+            f2.0.lock().unwrap().relaunched,
+            vec![("b".to_string(), 2)],
+            "only the unsettled one"
+        );
         assert!(rep.skipped >= 1);
     }
 
@@ -1801,7 +2263,16 @@ mod tests {
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         f.0.lock().unwrap().fail_relaunch = true;
         go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
-        let rep = go(&mut c, &mut j, &f, vec![SupMsg::Exit { child: "a".into(), now_ms: 2_000 }], 2_000);
+        let rep = go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Exit {
+                child: "a".into(),
+                now_ms: 2_000,
+            }],
+            2_000,
+        );
         assert!(rep.failed >= 1);
         assert!(c.model.failed_cmds >= 1);
         assert!(
@@ -1823,18 +2294,44 @@ mod tests {
             &mut c,
             &mut j,
             &f,
-            vec![SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: e, delta_sha: None, now_ms: 2_000 }],
+            vec![SupMsg::Control {
+                op: SteerOp::Cancel,
+                child: "a".into(),
+                sup_epoch: e,
+                delta_sha: None,
+                now_ms: 2_000,
+            }],
             2_000,
         );
         let s = f.0.lock().unwrap().steers.clone();
         assert_eq!(s.len(), 1);
         assert!(s[0].urgent && s[0].op == SteerOp::Cancel && s[0].generation == 1);
-        assert_eq!(c.model.steers[&1].offset, Some(10), "the offset came back as a fact");
+        assert_eq!(
+            c.model.steers[&1].offset,
+            Some(10),
+            "the offset came back as a fact"
+        );
         // While pending, the child's done is refused (P13).
-        go(&mut c, &mut j, &f, vec![SupMsg::Done { child: "a".into(), generation: 1, now_ms: 2_500 }], 2_500);
-        assert_eq!(f.0.lock().unwrap().rejects.last().unwrap().1, "steer_pending");
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Done {
+                child: "a".into(),
+                generation: 1,
+                now_ms: 2_500,
+            }],
+            2_500,
+        );
+        assert_eq!(
+            f.0.lock().unwrap().rejects.last().unwrap().1,
+            "steer_pending"
+        );
         // The cursor reaches the steer: acked.
-        f.0.lock().unwrap().obs.push(SupMsg::Cursor { child: "a".into(), cursor: 10 });
+        f.0.lock().unwrap().obs.push(SupMsg::Cursor {
+            child: "a".into(),
+            cursor: 10,
+        });
         go(&mut c, &mut j, &f, vec![], 3_000);
         assert_eq!(c.model.steers[&1].state, SteerState::Acked);
     }
@@ -1847,7 +2344,13 @@ mod tests {
         c.claim("lead-1").unwrap(); // epoch 2
         append_input(
             c.paths(),
-            &SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: 1, delta_sha: None, now_ms: 2_000 },
+            &SupMsg::Control {
+                op: SteerOp::Cancel,
+                child: "a".into(),
+                sup_epoch: 1,
+                delta_sha: None,
+                now_ms: 2_000,
+            },
         )
         .unwrap();
         go(&mut c, &mut j, &f, vec![], 2_000);
@@ -1863,7 +2366,14 @@ mod tests {
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
         let p = c.paths().clone();
-        append_input(&p, &SupMsg::Exit { child: "a".into(), now_ms: 2_000 }).unwrap();
+        append_input(
+            &p,
+            &SupMsg::Exit {
+                child: "a".into(),
+                now_ms: 2_000,
+            },
+        )
+        .unwrap();
         // A torn write: no newline yet.
         std::fs::OpenOptions::new()
             .append(true)
@@ -1884,11 +2394,17 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
-        let before = std::fs::read_to_string(&c.paths().log).unwrap().lines().count();
+        let before = std::fs::read_to_string(&c.paths().log)
+            .unwrap()
+            .lines()
+            .count();
         for t in 2..20u64 {
             go(&mut c, &mut j, &f, vec![], t * 100);
         }
-        let after = std::fs::read_to_string(&c.paths().log).unwrap().lines().count();
+        let after = std::fs::read_to_string(&c.paths().log)
+            .unwrap()
+            .lines()
+            .count();
         assert_eq!(before, after);
     }
 
@@ -1897,9 +2413,18 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
-        let ex = |id: &str, t| SupMsg::Exit { child: id.into(), now_ms: t };
+        let ex = |id: &str, t| SupMsg::Exit {
+            child: id.into(),
+            now_ms: t,
+        };
         for (i, id) in ["a", "b", "a", "b"].iter().enumerate() {
-            go(&mut c, &mut j, &f, vec![ex(id, 2_000 + i as u64)], 2_000 + i as u64);
+            go(
+                &mut c,
+                &mut j,
+                &f,
+                vec![ex(id, 2_000 + i as u64)],
+                2_000 + i as u64,
+            );
         }
         let w = f.0.lock().unwrap();
         assert_eq!(w.relaunched.len(), 3);
@@ -1907,78 +2432,11 @@ mod tests {
         assert_eq!(w.escalated[0].1, "restart_intensity");
         drop(w);
         assert_eq!(c.model.status, Status::Failed);
-        assert_eq!(f.0.lock().unwrap().exited.len(), 2, "the subtree was cancelled");
-    }
-
-    /// A pane that records every write, shared by both hosts in a test.
-    #[derive(Default)]
-    struct RecPane(std::sync::Mutex<Vec<String>>);
-
-    impl crate::pane_write::PaneTyper for RecPane {
-        fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(format!("{target} line {line}"));
-            Ok(())
-        }
-        fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(format!("{target} keys {}", keys.join("+")));
-            Ok(())
-        }
-        fn close(&self, target: &str) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(format!("{target} close"));
-            Ok(())
-        }
-    }
-
-    fn urgent_lines(p: &RecPane) -> usize {
-        p.0.lock().unwrap().iter().filter(|l| l.contains("URGENT steer")).count()
-    }
-
-    fn normal_lines(p: &RecPane) -> usize {
-        p.0.lock().unwrap().iter().filter(|l| l.contains("line") && !l.contains("URGENT")).count()
-    }
-
-    fn inbox_ring(l: &crate::ring_ledger::RingLedger, p: &RecPane, wm: u64) {
-        let line = crate::pane_write::wake_line(crate::pane_write::Wm(wm), crate::pane_write::Urgency::Normal);
-        crate::inbox_ports::ring_wake(l, p, "npub1a", "w1:a", wm, &line).unwrap();
-    }
-
-    #[test]
-    fn one_urgent_steer_is_one_ring_counting_both_hosts_supervisor_first() {
-        let d = tempfile::tempdir().unwrap();
-        let l = crate::ring_ledger::RingLedger::new(d.path().join("rings"));
-        let p = RecPane::default();
-        assert!(ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap());
-        // The inbox host sees the same mail at wm 7 and wants to ring it.
-        inbox_ring(&l, &p, 7);
-        assert_eq!(urgent_lines(&p), 1);
-        assert_eq!(normal_lines(&p), 0, "no second ring for the same mail");
-        assert_eq!(p.0.lock().unwrap().iter().filter(|w| w.contains("keys")).count(), 1, "one interrupt");
-        // Still unread: the inbox host's budgeted re-ring is a real ring.
-        inbox_ring(&l, &p, 7);
-        assert_eq!(normal_lines(&p), 1, "re-rings stay the doorbell's");
-    }
-
-    #[test]
-    fn one_urgent_steer_is_one_ring_counting_both_hosts_inbox_first() {
-        let d = tempfile::tempdir().unwrap();
-        let l = crate::ring_ledger::RingLedger::new(d.path().join("rings"));
-        let p = RecPane::default();
-        inbox_ring(&l, &p, 7);
-        assert!(!ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap(), "already woken");
-        assert_eq!(urgent_lines(&p), 0);
-        assert_eq!(normal_lines(&p), 1);
-        assert!(p.0.lock().unwrap().iter().all(|w| !w.contains("keys")), "no interrupt either");
-    }
-
-    #[test]
-    fn a_rerun_steer_command_does_not_ring_twice_and_a_later_mail_rings() {
-        let d = tempfile::tempdir().unwrap();
-        let l = crate::ring_ledger::RingLedger::new(d.path().join("rings"));
-        let p = RecPane::default();
-        assert!(ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap());
-        assert!(!ring_urgent_steer(&l, &p, "npub1a", "w1:a", 7).unwrap());
-        assert!(ring_urgent_steer(&l, &p, "npub1a", "w1:a", 8).unwrap(), "a second steer is its own wake");
-        assert_eq!(urgent_lines(&p), 2);
+        assert_eq!(
+            f.0.lock().unwrap().exited.len(),
+            2,
+            "the subtree was cancelled"
+        );
     }
 
     #[test]
@@ -1988,21 +2446,40 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
         go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
-        let ex = |id: &str, t| SupMsg::Exit { child: id.into(), now_ms: t };
+        let ex = |id: &str, t| SupMsg::Exit {
+            child: id.into(),
+            now_ms: t,
+        };
         for (i, id) in ["a", "b", "a", "b"].iter().enumerate() {
-            go(&mut c, &mut j, &f, vec![ex(id, 2_000 + i as u64)], 2_000 + i as u64);
+            go(
+                &mut c,
+                &mut j,
+                &f,
+                vec![ex(id, 2_000 + i as u64)],
+                2_000 + i as u64,
+            );
         }
         assert_eq!(c.model.status, Status::Failed);
         drop(c);
         let paths = CtxPaths::new(d.path(), "proj");
         // The log alone still says Failed: replay is faithful (P8).
         let (msgs, _, _) = read_log(&paths).unwrap();
-        assert_eq!(crate::supervisor_program::replay(&msgs).0.status, Status::Failed);
+        assert_eq!(
+            crate::supervisor_program::replay(&msgs).0.status,
+            Status::Failed
+        );
         // A new host process claims the next epoch and runs.
         let mut c2 = Core::open(paths.clone(), "lead-2", Tier::Lead, None).unwrap();
         c2.claim("lead-2").unwrap();
-        assert_eq!(c2.model.status, Status::Running, "a re-run is a fresh incarnation");
-        assert!(c2.model.restarts.is_empty(), "the intensity window starts over");
+        assert_eq!(
+            c2.model.status,
+            Status::Running,
+            "a re-run is a fresh incarnation"
+        );
+        assert!(
+            c2.model.restarts.is_empty(),
+            "the intensity window starts over"
+        );
         assert_eq!(c2.model.escalations, 1, "the escalation fact is kept");
         // The same effect journal: a re-run keeps the old keys settled, so the
         // new incarnation's commands must not collide with them.
@@ -2011,7 +2488,11 @@ mod tests {
         go(&mut c2, j2, &f, vec![spawn("a")], 10_000);
         go(&mut c2, j2, &f, vec![ex("a", 10_100)], 10_100);
         assert_eq!(c2.model.status, Status::Running);
-        assert_eq!(f.0.lock().unwrap().relaunched.len(), before + 1, "the new host supervises the crew again");
+        assert_eq!(
+            f.0.lock().unwrap().relaunched.len(),
+            before + 1,
+            "the new host supervises the crew again"
+        );
         let (msgs, _, _) = read_log(&paths).unwrap();
         let replayed = crate::supervisor_program::replay(&msgs).0;
         assert_eq!(replayed.status, Status::Running);
@@ -2031,9 +2512,16 @@ mod tests {
         };
         assert!(g2 > g1);
         j.finish("relaunch:a:2", g1, true);
-        assert!(matches!(j.begin("relaunch:a:2"), Begin::Run(_)), "the older claim settled nothing");
+        assert!(
+            matches!(j.begin("relaunch:a:2"), Begin::Run(_)),
+            "the older claim settled nothing"
+        );
         j.finish("relaunch:a:2", g2 + 1, true);
-        assert_eq!(j.begin("relaunch:a:2"), Begin::Skip, "the current claim settles it");
+        assert_eq!(
+            j.begin("relaunch:a:2"),
+            Begin::Skip,
+            "the current claim settles it"
+        );
     }
 
     // ---- the real journal -------------------------------------------------
@@ -2043,13 +2531,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap().keep();
         let db = dir.join("index.sqlite");
         let pool = rt.block_on(async {
-            let pool = toron_core::index::schema::connect(&db.to_string_lossy()).await.unwrap();
+            let pool = toron_core::index::schema::connect(&db.to_string_lossy())
+                .await
+                .unwrap();
             toron_core::index::schema::migrate(&pool).await.unwrap();
             pool
         });
         let jd = toron_core::journal::JournalDb::new(pool, "supervise:test", 64);
         (
-            ToronEffectJournal::new(toron_core::journal::ToronJournal::spawn(jd, rt.handle()), "me"),
+            ToronEffectJournal::new(
+                toron_core::journal::ToronJournal::spawn(jd, rt.handle()),
+                "me",
+            ),
             rt,
         )
     }
@@ -2092,14 +2585,28 @@ mod tests {
         let mut c = open(d.path());
         let mut p = f.clone();
         round(&mut c, &mut j, &mut p, vec![spawn("a")], 1_000).unwrap();
-        round(&mut c, &mut j, &mut p, vec![SupMsg::Exit { child: "a".into(), now_ms: 2_000 }], 2_000).unwrap();
+        round(
+            &mut c,
+            &mut j,
+            &mut p,
+            vec![SupMsg::Exit {
+                child: "a".into(),
+                now_ms: 2_000,
+            }],
+            2_000,
+        )
+        .unwrap();
         assert_eq!(f.0.lock().unwrap().relaunched, vec![("a".to_string(), 2)]);
         // Same command again (a replay): the journal says settled.
         let mut rep = RoundReport::default();
         let again = execute(
             &mut j,
             &mut p,
-            &SupCmd::Relaunch { child: "a".into(), generation: 2, kind: ChildKind::Crew },
+            &SupCmd::Relaunch {
+                child: "a".into(),
+                generation: 2,
+                kind: ChildKind::Crew,
+            },
             &mut rep,
         );
         assert!(again.is_empty() && rep.skipped == 1);
@@ -2113,11 +2620,18 @@ mod tests {
         let src = include_str!("main.rs");
         let a = src.find("fn cmd_loop_supervise(").unwrap();
         let body = &src[a..a + 2_600];
-        let gate = body.find("if comms_send::enabled(cfg) {").expect("flag gate");
-        let legacy = body.find("supervise_failure_count(").expect("legacy path kept");
+        let gate = body
+            .find("if comms_send::enabled(cfg) {")
+            .expect("flag gate");
+        let legacy = body
+            .find("supervise_failure_count(")
+            .expect("legacy path kept");
         assert!(gate < legacy, "the gate precedes the unchanged legacy loop");
         assert!(body[gate..legacy].contains("supervisor_host::run_supervise("));
-        assert!(src.contains("SUPERVISE_MAX_CONSECUTIVE_FAILURES"), "legacy rule still defined for flag-off");
+        assert!(
+            src.contains("SUPERVISE_MAX_CONSECUTIVE_FAILURES"),
+            "legacy rule still defined for flag-off"
+        );
     }
 
     #[test]
@@ -2157,7 +2671,13 @@ mod tests {
     fn a_lead_relaunch_is_recorded_and_does_not_touch_a_pane() {
         let d = tempfile::tempdir().unwrap();
         let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
-        go(&mut c, &mut j, &f, vec![spawn_as("plane", ChildKind::Lead)], 1_000);
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![spawn_as("plane", ChildKind::Lead)],
+            1_000,
+        );
         go(
             &mut c,
             &mut j,
@@ -2172,7 +2692,10 @@ mod tests {
         let w = f.0.lock().unwrap();
         assert_eq!(w.relaunched, vec![("plane".to_string(), 2)]);
         assert!(w.exited.is_empty(), "lead relaunch must not Exit a pane");
-        assert!(w.steers.is_empty(), "lead relaunch must not write pane text");
+        assert!(
+            w.steers.is_empty(),
+            "lead relaunch must not write pane text"
+        );
         assert_eq!(
             relaunch_argv("proj", "plane", ChildKind::Lead),
             lead_supervise_argv("proj", "plane")
@@ -2192,13 +2715,28 @@ mod tests {
         let prog = include_str!("supervisor_program.rs");
         // The fold is pure: no process, fs, clock, or runtime in it.
         let pure = &prog[..prog.find("#[cfg(test)]").unwrap()];
-        for banned in ["std::process", "std::fs", "std::time", "SystemTime", "Instant", "tokio", "block_on", "HashMap"] {
-            assert!(!pure.contains(banned), "supervisor_program must stay pure: {banned}");
+        for banned in [
+            "std::process",
+            "std::fs",
+            "std::time",
+            "SystemTime",
+            "Instant",
+            "tokio",
+            "block_on",
+            "HashMap",
+        ] {
+            assert!(
+                !pure.contains(banned),
+                "supervisor_program must stay pure: {banned}"
+            );
         }
         // The host never types into a pane except through the PaneWrite sink.
         let host = &me[..me.find("#[cfg(test)]").unwrap()];
         for call in crate::pane_write::PANE_TEXT_CALLS {
-            assert!(!host.contains(call), "pane text call {call} outside the sink");
+            assert!(
+                !host.contains(call),
+                "pane text call {call} outside the sink"
+            );
         }
     }
 
@@ -2207,13 +2745,25 @@ mod tests {
         let me = include_str!("supervisor_host.rs");
         let host = &me[..me.find("#[cfg(test)]").unwrap()];
         let body = &host[host.find("fn host_loop(").unwrap()..];
-        assert!(body.contains("supervisor_hints::wait(&hint_rx"), "the loop waits on the hints");
-        assert!(body.contains("supervisor_hints::Watcher::spawn("), "and something feeds them");
-        assert!(body.contains("if hc.hints {"), "the off switch gates the watcher");
+        assert!(
+            body.contains("supervisor_hints::wait(&hint_rx"),
+            "the loop waits on the hints"
+        );
+        assert!(
+            body.contains("supervisor_hints::Watcher::spawn("),
+            "and something feeds them"
+        );
+        assert!(
+            body.contains("if hc.hints {"),
+            "the off switch gates the watcher"
+        );
         assert!(
             body.contains("watched_paths(&index_db, &paths.inbox)"),
             "the watcher covers toron's index and this context's own input file"
         );
-        assert!(!body.contains("thread::sleep(std::time::Duration::from_millis(hc.tick_ms))"), "no plain sleep left in the loop");
+        assert!(
+            !body.contains("thread::sleep(std::time::Duration::from_millis(hc.tick_ms))"),
+            "no plain sleep left in the loop"
+        );
     }
 }

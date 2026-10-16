@@ -43,14 +43,6 @@ mod daemon;
 mod decide;
 mod doorbell;
 mod doorbell_host;
-mod inbox_host;
-mod inbox_ports;
-mod ring_ledger;
-mod private_fs;
-mod steer_delta;
-mod supervisor_program;
-mod supervisor_host;
-mod supervisor_hints;
 mod doorbell_tick;
 mod durable;
 mod durable_policy;
@@ -59,15 +51,22 @@ mod durable_transition;
 mod effect_journal;
 mod failure;
 mod fs_util;
-mod harness_registry;
 mod harness_caps;
+mod harness_registry;
 mod headless;
 mod herdr_shim;
+mod inbox_host;
+mod inbox_ports;
 mod ingress;
 mod init_scaffold;
 mod intent;
+mod private_fs;
 mod stale_check;
+mod steer_delta;
 mod stuck_vs_busy;
+mod supervisor_hints;
+mod supervisor_host;
+mod supervisor_program;
 mod unanswered_triage;
 // Jev RANKS the derived crew menu; it never defines one. The ranker and its
 // rubric are built and tested here, and nothing calls them yet: bd-drlm wires
@@ -6045,7 +6044,10 @@ mod workspace_origin_tests {
         use pane_write::Harness;
         assert_eq!(prime_choice(false, "pi"), PrimeChoice::LegacyReady);
         assert_eq!(prime_choice(false, "claude"), PrimeChoice::LegacyReady);
-        assert_eq!(prime_choice(true, "pi"), PrimeChoice::Bootstrap(Harness::Pi));
+        assert_eq!(
+            prime_choice(true, "pi"),
+            PrimeChoice::Bootstrap(Harness::Pi)
+        );
         assert_eq!(
             prime_choice(true, "claude"),
             PrimeChoice::Bootstrap(Harness::Claude)
@@ -6059,8 +6061,11 @@ mod workspace_origin_tests {
         assert!(text.contains("toron next") && !text.contains("READY"));
         // Every spawn-path prime (spawn, add, re-launch) goes through the choice.
         let src = include_str!("main.rs");
-        let call_lines =
-            |p: &str| src.lines().filter(|l| l.trim_start().starts_with(p)).count();
+        let call_lines = |p: &str| {
+            src.lines()
+                .filter(|l| l.trim_start().starts_with(p))
+                .count()
+        };
         assert_eq!(
             call_lines("prime_bootstrap("),
             4,
@@ -22644,7 +22649,14 @@ fn cmd_loop_supervise(
     // SupervisorProgram (MaxR/MaxT instead of "3 failed passes"). Flag off:
     // the legacy loop below, unchanged.
     if comms_send::enabled(cfg) {
-        return supervisor_host::run_supervise(cfg, project, work, interval_secs, to, stall_minutes);
+        return supervisor_host::run_supervise(
+            cfg,
+            project,
+            work,
+            interval_secs,
+            to,
+            stall_minutes,
+        );
     }
     let exe = std::env::current_exe().context("resolve the flywheel executable")?;
     let project_dir = crate::project_dir(cfg, project);
