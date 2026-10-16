@@ -1879,11 +1879,43 @@ pub fn send_prompt_argv(args: &SendArgs) -> Vec<String> {
 /// leaf each iteration, so replay reproduces the same decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpectedReplyRun {
+    /// Mail identity the file stored. The map key is [`crate::state::ask_key`],
+    /// not this field: `reply_settled` must be handed this, or it deletes the
+    /// wrong row.
+    pub agent: String,
     pub thread: String,
     /// message id of the question (the reply must differ from it)
     pub head: Option<String>,
     /// 0 = not reminded yet, 1 = reminded once (next silence escalates)
     pub reminder_count: u32,
+}
+
+/// Rebuild the in-run reply map from the file. The key is
+/// [`crate::state::ask_key`]`(agent, head or thread)`, so two asks from one
+/// agent both stay. A matching key keeps its reminder count when the thread
+/// is the same question; a new thread starts the budget over.
+pub fn reconcile_expected_replies(
+    prev: &std::collections::HashMap<String, ExpectedReplyRun>,
+    entries: &[crate::state::ExpectedReply],
+) -> std::collections::HashMap<String, ExpectedReplyRun> {
+    let mut next = std::collections::HashMap::new();
+    for e in entries {
+        let key = crate::state::ask_key(&e.agent, e.head.as_deref().unwrap_or(&e.thread));
+        let reminder_count = match prev.get(&key) {
+            Some(old) if old.thread == e.thread => old.reminder_count,
+            _ => 0,
+        };
+        next.insert(
+            key,
+            ExpectedReplyRun {
+                agent: e.agent.clone(),
+                thread: e.thread.clone(),
+                head: e.head.clone(),
+                reminder_count,
+            },
+        );
+    }
+    next
 }
 
 /// bd-a7j: pure decision — did the asked thread move after dispatch?
@@ -6823,7 +6855,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
     }
     // pane_exited names observed this iteration (event path feeds heal step)
     let mut exited_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // bd-a7j: outstanding expected replies (agent → thread/head/reminder).
+    // bd-a7j: outstanding expected replies, keyed by ask_key(agent, head).
     // Rebuilt each iteration from the checkpointed load_expected_replies
     // leaf; only ever mutated in-run (never written to files by the body).
     let mut expected_replies: std::collections::HashMap<String, ExpectedReplyRun> =
@@ -8411,39 +8443,20 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // reconcile workflow-local state with the (possibly updated) file:
         // keep reminder counts for unchanged expectations, reset for new
         // questions (a fresh collab ask starts a fresh reminder budget).
-        let mut next_expected: std::collections::HashMap<String, ExpectedReplyRun> =
-            std::collections::HashMap::new();
-        for e in expected_entries {
-            let run = expected_replies
-                .get(&e.agent)
-                .cloned()
-                .unwrap_or(ExpectedReplyRun {
-                    thread: e.thread.clone(),
-                    head: e.head.clone(),
-                    reminder_count: 0,
-                });
-            let run = if run.thread == e.thread {
-                run
-            } else {
-                ExpectedReplyRun {
-                    thread: e.thread.clone(),
-                    head: e.head.clone(),
-                    reminder_count: 0,
-                }
-            };
-            next_expected.insert(e.agent.clone(), run);
-        }
-        expected_replies = next_expected;
+        let prev = std::mem::take(&mut expected_replies);
+        expected_replies = reconcile_expected_replies(&prev, &expected_entries);
 
         let mut satisfied_names: Vec<String> = Vec::new();
         let mut escalate_names: Vec<String> = Vec::new();
-        for (agent, exp) in &mut expected_replies {
+        for (key, exp) in &mut expected_replies {
             // The file stores the MAIL identity (collab resolved it); the
             // swarm states use herdr names — map one to the other so the
             // settle check, the thread check, and the reminder target agree.
             // bd-aseq: match through the pinned identity (state field or
             // spawn registry), never the bare hash mapping alone.
-            let Some(matched) = match_expected_agent(&params.project, &states, agent) else {
+            // `key` is ask_key; `exp.agent` is the identity reply_settled deletes.
+            let agent = exp.agent.clone();
+            let Some(matched) = match_expected_agent(&params.project, &states, &agent) else {
                 continue; // agent not in this swarm (or expectation stale)
             };
             let herdr_name = matched.name.clone();
@@ -8500,12 +8513,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             reply_settled,
                             ReplySettledArgs {
                                 project: params.project.clone(),
-                                name: agent.clone(),
+                                name: exp.agent.clone(),
                                 thread: exp.thread.clone(),
                             },
                         )
                         .await; // leaf errors logged inside; local retain below
-                    satisfied_names.push(agent.clone());
+                    satisfied_names.push(key.clone());
                 }
                 ReplyVerdict::Reminded => {
                     let _ = ctx
@@ -9931,6 +9944,58 @@ pub fn route_event(
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod reconcile_expected_replies_tests {
+    use super::*;
+
+    fn entry(head: &str, thread: &str) -> crate::state::ExpectedReply {
+        crate::state::ExpectedReply {
+            agent: "CalmGate".into(),
+            thread: thread.into(),
+            head: Some(head.into()),
+            created_ts: "t".into(),
+        }
+    }
+
+    #[test]
+    fn two_asks_from_one_agent_stay_two_keys_and_the_mail_identity_is_not_the_key() {
+        let entries = vec![entry("m1", "t1"), entry("m2", "t2")];
+        let k1 = crate::state::ask_key("CalmGate", "m1");
+        let mut prev = std::collections::HashMap::new();
+        prev.insert(
+            k1.clone(),
+            ExpectedReplyRun {
+                agent: "CalmGate".into(),
+                thread: "t1".into(),
+                head: Some("m1".into()),
+                reminder_count: 1,
+            },
+        );
+        let next = reconcile_expected_replies(&prev, &entries);
+        assert_eq!(next.len(), 2);
+        let kept = next.get(&k1).unwrap();
+        assert_eq!(kept.agent, "CalmGate");
+        assert_ne!(k1, kept.agent);
+        assert_eq!(kept.reminder_count, 1);
+        let k2 = crate::state::ask_key("CalmGate", "m2");
+        assert_eq!(next.get(&k2).unwrap().reminder_count, 0);
+        assert_eq!(next.get(&k2).unwrap().agent, "CalmGate");
+
+        let mut stale = std::collections::HashMap::new();
+        stale.insert(
+            k1.clone(),
+            ExpectedReplyRun {
+                agent: "CalmGate".into(),
+                thread: "other".into(),
+                head: Some("m1".into()),
+                reminder_count: 1,
+            },
+        );
+        let reset = reconcile_expected_replies(&stale, &entries[..1]);
+        assert_eq!(reset.get(&k1).unwrap().reminder_count, 0);
     }
 }
 
