@@ -42,8 +42,8 @@ use serde_json::{Value, json};
 use toron_core::kernel::{Cmd as _, Durability, Program};
 
 use crate::supervisor_program::{
-    ChildKind, ChildSpec, CrewRow, PASS, Policy, Restart, SteerOp, SupCmd, SupModel, SupMsg,
-    SupervisorProgram, Tier, crew_view,
+    ChildKind, ChildSpec, ChildState, CrewRow, PASS, Policy, Restart, SteerOp, SupCmd, SupModel,
+    SupMsg, SupervisorProgram, Tier, crew_view,
 };
 
 /// Journal answer for one command.
@@ -136,6 +136,15 @@ impl CtxPaths {
         }
     }
 
+    /// A lead's own log. The root log stays [`Self::new`].
+    pub fn with_context(dir: &Path, project: &str, context: &str) -> Self {
+        let key = format!("{}--{context}", crate::state::state_key(project));
+        Self {
+            log: dir.join(format!("{key}.log.jsonl")),
+            inbox: dir.join(format!("{key}.in.jsonl")),
+        }
+    }
+
     /// The default state directory.
     pub fn default_dir() -> PathBuf {
         crate::config::state_dir().join("supervisor")
@@ -191,10 +200,12 @@ fn scrub_msg(m: SupMsg) -> SupMsg {
             child,
             reason,
             now_ms,
+            fact_key,
         } => SupMsg::ChildEscalated {
             child,
             reason: flatten(&reason),
             now_ms,
+            fact_key,
         },
         SupMsg::CmdFailed { key, why } => SupMsg::CmdFailed {
             key,
@@ -474,6 +485,22 @@ pub(crate) fn escalate_envelope(
     Ok(env)
 }
 
+/// Lease workspace for a supervise host. The root keeps `supervise-<key>`.
+/// A lead adds `--<context>` so it can run beside the root.
+pub fn supervise_lease_workspace(project: &str, context: Option<&str>) -> String {
+    let key = crate::state::state_key(project);
+    match context {
+        Some(c) if context_token(c) => format!("supervise-{key}--{c}"),
+        _ => format!("supervise-{key}"),
+    }
+}
+
+fn context_token(c: &str) -> bool {
+    !c.is_empty()
+        && c.chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
 /// Argv (no binary) for a lead relaunch: nested supervise, no pane payload.
 pub fn lead_supervise_argv(project: &str, context: &str) -> Vec<String> {
     vec![
@@ -486,6 +513,62 @@ pub fn lead_supervise_argv(project: &str, context: &str) -> Vec<String> {
 }
 
 /// Crew relaunch stays `crew control … relaunch`. A lead uses [`lead_supervise_argv`].
+fn lead_facts_file(project: &str, context: Option<&str>) -> PathBuf {
+    let name = match context {
+        Some(c) if context_token(c) => {
+            format!("{}--{c}-supervisor.jsonl", crate::state::state_key(project))
+        }
+        _ => format!("{}-supervisor.jsonl", crate::state::state_key(project)),
+    };
+    crate::config::state_dir().join("facts").join(name)
+}
+
+/// What a parent may learn from one lead's facts file. Pass, progress, and
+/// done lines stay in the lead. An escalate line is one `ChildEscalated`.
+/// A dead lease past `t_orphan_ms` is one `Adopt`.
+fn child_upward(
+    model: &SupModel,
+    child: &str,
+    now_ms: u64,
+    text: &str,
+    host_dead: bool,
+) -> Vec<SupMsg> {
+    let Some(c) = model.children.get(child) else {
+        return Vec::new();
+    };
+    if c.spec.kind != ChildKind::Lead {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["kind"] != "escalate" {
+            continue;
+        }
+        let Some(key) = v["key"].as_str().filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        if model.escalated_facts.contains(key) {
+            continue;
+        }
+        if c.state != ChildState::Running {
+            continue;
+        }
+        out.push(SupMsg::ChildEscalated {
+            child: child.to_string(),
+            reason: v["reason"].as_str().unwrap_or("escalate").to_string(),
+            now_ms,
+            fact_key: Some(key.to_string()),
+        });
+    }
+    if let Some(msg) = crate::supervisor_program::adopt_msg(model, child, now_ms, host_dead) {
+        out.push(msg);
+    }
+    out
+}
+
 fn relaunch_argv(project: &str, child: &str, kind: ChildKind) -> Vec<String> {
     match kind {
         ChildKind::Lead => lead_supervise_argv(project, child),
@@ -894,6 +977,8 @@ pub struct LivePorts {
     facts_seen: BTreeSet<String>,
     deaf_off: u64,
     relaunch_bin: PathBuf,
+    /// Set on a nested lead host so its facts file is not the root's.
+    context: Option<String>,
 }
 
 impl LivePorts {
@@ -911,14 +996,30 @@ impl LivePorts {
             facts_seen: BTreeSet::new(),
             deaf_off: 0,
             relaunch_bin,
+            context: None,
         }
     }
 
+    /// This host is the lead for `context` (its own facts file and lease).
+    pub fn in_context(mut self, context: &str) -> Self {
+        if context_token(context) {
+            self.context = Some(context.to_string());
+        }
+        self
+    }
+
     fn facts_path(&self) -> PathBuf {
-        crate::config::state_dir().join("facts").join(format!(
-            "{}-supervisor.jsonl",
-            crate::state::state_key(&self.project)
-        ))
+        lead_facts_file(&self.project, self.context.as_deref())
+    }
+
+    /// The lead host's pid is dead. No lease file means the lead was never
+    /// started here, which is not a death.
+    fn lead_host_dead(&self, context: &str) -> bool {
+        let ws = supervise_lease_workspace(&self.project, Some(context));
+        match doorbell_rt::lease::read_lease(&crate::config::state_dir(), &ws) {
+            Some(lease) => !doorbell_rt::lease::pid_alive(lease.pid),
+            None => false,
+        }
     }
 
     fn inbox_facts_path(&self) -> PathBuf {
@@ -964,6 +1065,25 @@ impl LivePorts {
 impl Ports for LivePorts {
     fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg> {
         let mut out = Vec::new();
+        // Lead facts and a dead lease, before the herdr edge, so a lead
+        // failure still restarts while herdr reads up.
+        let leads: Vec<String> = model
+            .children
+            .iter()
+            .filter(|(_, c)| c.spec.kind == ChildKind::Lead)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in leads {
+            let text = std::fs::read_to_string(lead_facts_file(&self.project, Some(&id)))
+                .unwrap_or_default();
+            out.extend(child_upward(
+                model,
+                &id,
+                now_ms,
+                &text,
+                self.lead_host_dead(&id),
+            ));
+        }
         // herdr edges.
         let up = self.client().is_some();
         if self.herdr_up != Some(up) {
@@ -1196,10 +1316,14 @@ pub struct HostCfg {
     /// Wake a round on a change to the files its reads come from (4b.7).
     /// Off = the plain tick, nothing else differs.
     pub hints: bool,
+    /// `FLYWHEEL_SUPERVISOR_CLOCK_SCALE`. 1 in production. Captured at
+    /// `from_env` so a later test cannot change a policy already built.
+    pub clock_scale: u64,
 }
 
 impl HostCfg {
-    /// Read `FLYWHEEL_SUPERVISOR_{TICK_MS,ACK_MS,LEASE_MS,PASSES,STRATEGY,HINTS}`.
+    /// Read `FLYWHEEL_SUPERVISOR_{TICK_MS,ACK_MS,LEASE_MS,PASSES,STRATEGY,HINTS}`
+    /// and `FLYWHEEL_SUPERVISOR_CLOCK_SCALE` (fixtures only; 1 is production).
     pub fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
         Self {
@@ -1211,11 +1335,14 @@ impl HostCfg {
                 .ok()
                 .and_then(|v| crate::supervisor_program::Strategy::parse(&v)),
             hints: std::env::var("FLYWHEEL_SUPERVISOR_HINTS").map_or(true, |v| v != "off"),
+            clock_scale: clock_scale(),
         }
     }
 
     fn policy(&self) -> Option<Policy> {
-        if self.ack_ms.is_none() && self.lease_ms.is_none() && self.strategy.is_none() {
+        let scale = self.clock_scale.max(1);
+        if self.ack_ms.is_none() && self.lease_ms.is_none() && self.strategy.is_none() && scale == 1
+        {
             return None;
         }
         let mut p = Policy::for_tier(Tier::Lead);
@@ -1225,12 +1352,21 @@ impl HostCfg {
         if let Some(a) = self.ack_ms {
             p.ack_ms = a;
         }
-        if let Some(l) = self.lease_ms {
-            p.lease_ms = l;
-            p.t_orphan_ms = crate::supervisor_program::orphan_window_ms(l);
+        let lease = self.lease_ms.unwrap_or(p.lease_ms);
+        if self.lease_ms.is_some() {
+            p.lease_ms = lease;
         }
+        p.t_orphan_ms = crate::supervisor_program::scaled_orphan_ms(lease, scale);
         Some(p)
     }
+}
+
+fn clock_scale() -> u64 {
+    std::env::var("FLYWHEEL_SUPERVISOR_CLOCK_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
 }
 
 fn now_ms() -> u64 {
@@ -1300,12 +1436,26 @@ pub fn run_supervise(
     interval_secs: u64,
     to: &str,
     stall_minutes: u64,
+    context: Option<&str>,
 ) -> Result<()> {
+    if let Some(c) = context
+        && !context_token(c)
+    {
+        bail!("--context must be letters, digits, '-' or '_'");
+    }
     let hc = HostCfg::from_env();
-    let paths = CtxPaths::new(&CtxPaths::default_dir(), project);
-    let me = format!("supervise-{project}-{}", std::process::id());
-    // One live host per context (the log has one writer).
-    let lease_ws = format!("supervise-{}", crate::state::state_key(project));
+    let dir = CtxPaths::default_dir();
+    let paths = match context {
+        Some(c) => CtxPaths::with_context(&dir, project, c),
+        None => CtxPaths::new(&dir, project),
+    };
+    let me = match context {
+        Some(c) => format!("supervise-{project}-{c}-{}", std::process::id()),
+        None => format!("supervise-{project}-{}", std::process::id()),
+    };
+    // One live host per context (the log has one writer). A lead does not
+    // take the root's lease, so the two processes can run together.
+    let lease_ws = supervise_lease_workspace(project, context);
     let sd = crate::config::state_dir();
     let now_s = || chrono::Utc::now().timestamp().max(0) as u64;
     let mut lease = match doorbell_rt::lease::acquire_lease(&sd, &lease_ws, now_s()) {
@@ -1330,6 +1480,7 @@ pub fn run_supervise(
         &me,
         &lease_ws,
         &mut lease,
+        context,
     );
     doorbell_rt::lease::release_lease(&sd, &lease_ws, &lease);
     result
@@ -1348,6 +1499,7 @@ fn host_loop(
     me: &str,
     lease_ws: &str,
     lease: &mut doorbell_rt::lease::OwnerLease,
+    context: Option<&str>,
 ) -> Result<()> {
     let mut core = Core::open(paths.clone(), me, Tier::Lead, hc.policy())?;
     let epoch = claim_for_host(&mut core, project, me)?;
@@ -1356,6 +1508,9 @@ fn host_loop(
         me,
     )?;
     let mut ports = LivePorts::new(cfg, project, project);
+    if let Some(c) = context {
+        ports = ports.in_context(c);
+    }
     eprintln!(
         "flywheel supervisor: {project} hosted on SupervisorProgram (sup_epoch {epoch}, {} children replayed, MaxR {}/{}s) — comms flag on",
         core.model.children.len(),
@@ -2386,6 +2541,8 @@ mod tests {
 
     #[test]
     fn the_strategy_word_reaches_the_policy() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_CLOCK_SCALE") };
         use crate::supervisor_program::Strategy;
         let cfg = HostCfg {
             strategy: Some(Strategy::OneForAll),
@@ -3301,6 +3458,7 @@ mod tests {
                 child: "plane".into(),
                 reason: "down".into(),
                 now_ms: 2_000,
+                fact_key: None,
             }],
             2_000,
         );
@@ -3368,6 +3526,7 @@ mod tests {
                     child: "plane".into(),
                     reason: "down".into(),
                     now_ms: 2_000,
+                    fact_key: None,
                 },
             ],
             2_000,
@@ -3441,6 +3600,261 @@ mod tests {
         assert!(
             !body.contains("thread::sleep(std::time::Duration::from_millis(hc.tick_ms))"),
             "no plain sleep left in the loop"
+        );
+    }
+
+    struct ScaleGuard;
+
+    impl ScaleGuard {
+        fn set(v: &str) -> Self {
+            unsafe { std::env::set_var("FLYWHEEL_SUPERVISOR_CLOCK_SCALE", v) };
+            Self
+        }
+    }
+
+    impl Drop for ScaleGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_CLOCK_SCALE") };
+        }
+    }
+
+    #[test]
+    fn a_dead_lead_is_adopted_once_after_the_scaled_window() {
+        let _home = crate::config::lock_env();
+        let _scale = ScaleGuard::set("1200000");
+        let policy = HostCfg::from_env()
+            .policy()
+            .expect("the clock scale is a policy override");
+        assert_eq!(
+            policy.t_orphan_ms, 1,
+            "1_200_000 ms window / scale 1_200_000 is 1 ms, not a real wait"
+        );
+        let d = tempfile::tempdir().unwrap();
+        let mut c = Core::open(
+            CtxPaths::new(d.path(), "proj"),
+            "root",
+            Tier::Lead,
+            Some(policy),
+        )
+        .unwrap();
+        c.claim("root").unwrap();
+        let (mut j, f) = (MemJournal::default(), Fake::default());
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![spawn_as("plane", ChildKind::Lead), spawn("plain")],
+            0,
+        );
+        let nested = CtxPaths::with_context(d.path(), "proj", "plane");
+        let mut lead = Core::open(nested.clone(), "plane-host", Tier::Lead, None).unwrap();
+        lead.claim("plane-host").unwrap();
+        let (mut jl, fl) = (MemJournal::default(), Fake::default());
+        go(&mut lead, &mut jl, &fl, vec![spawn("a"), spawn("b")], 0);
+        let nested_before = read_log(&nested).unwrap().0.len();
+        let view_before: Vec<_> = crew_view(&c.model)
+            .iter()
+            .map(|r| r.child.clone())
+            .collect();
+
+        let mut sleeper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let ws = supervise_lease_workspace("proj", Some("plane"));
+        let path = doorbell_rt::lease::owner_file(&crate::config::state_dir(), &ws);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lease = doorbell_rt::lease::OwnerLease {
+            pid: sleeper.id(),
+            boot_id: "test".into(),
+            host: "test".into(),
+            started_unix: 1,
+            heartbeat_unix: 1,
+            kind: None,
+        };
+        std::fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
+        let cfg = crate::config::Config::default();
+        let mut live = LivePorts::new(&cfg, "proj", "proj");
+        let alive = live.observe(&c.model, 1);
+        assert!(
+            alive.iter().all(|m| !matches!(m, SupMsg::Adopt { .. })),
+            "a live lead host is not adopted: {alive:?}"
+        );
+        sleeper.kill().unwrap();
+        let _ = sleeper.wait();
+        let too_soon = live.observe(&c.model, 0);
+        assert!(
+            too_soon.iter().all(|m| !matches!(m, SupMsg::Adopt { .. })),
+            "dead, but still inside the window: {too_soon:?}"
+        );
+        let due = live.observe(&c.model, 1);
+        let adopt: Vec<_> = due
+            .iter()
+            .filter(|m| matches!(m, SupMsg::Adopt { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(adopt.len(), 1, "one adopt after the window: {due:?}");
+        go(&mut c, &mut j, &f, adopt, 1);
+        assert_eq!(c.model.accepted_epoch, 2);
+        assert!(c.model.adopted.contains("plane"));
+        assert_eq!(c.model.leader, "root");
+        assert_eq!(c.model.children["plane"].state, ChildState::Running);
+        assert_eq!(c.model.children["plain"].state, ChildState::Running);
+        let view_after: Vec<_> = crew_view(&c.model)
+            .iter()
+            .map(|r| r.child.clone())
+            .collect();
+        assert_eq!(view_before, view_after, "view keeps the same child set");
+        let again = live.observe(&c.model, 5);
+        assert!(
+            again.iter().all(|m| !matches!(m, SupMsg::Adopt { .. })),
+            "the same death is one adopt: {again:?}"
+        );
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Control {
+                op: SteerOp::Cancel,
+                child: "plane".into(),
+                sup_epoch: 1,
+                delta_sha: None,
+                now_ms: 5,
+            }],
+            5,
+        );
+        let tags: Vec<_> =
+            f.0.lock()
+                .unwrap()
+                .rejects
+                .iter()
+                .map(|(_, t)| t.clone())
+                .collect();
+        assert_eq!(tags, vec!["stale_epoch".to_string()]);
+        assert_eq!(
+            read_log(&nested).unwrap().0.len(),
+            nested_before,
+            "adoption does not rewrite the lead's log"
+        );
+        assert_eq!(lead.model.children["a"].state, ChildState::Running);
+        assert_eq!(lead.model.children["b"].state, ChildState::Running);
+        let (msgs, _, _) = read_log(&CtxPaths::new(d.path(), "proj")).unwrap();
+        let (replayed, _) = crate::supervisor_program::replay(&msgs);
+        assert_eq!(replayed.accepted_epoch, c.model.accepted_epoch);
+        assert_eq!(replayed.adopted, c.model.adopted);
+    }
+
+    #[test]
+    fn a_lead_escalation_is_one_notice_and_loop_passes_stay_inside() {
+        let _home = crate::config::lock_env();
+        let d = tempfile::tempdir().unwrap();
+        let mut c = open(d.path());
+        let (mut j, f) = (MemJournal::default(), Fake::default());
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![spawn_as("plane", ChildKind::Lead), spawn("plain")],
+            0,
+        );
+        let mut lead = Core::open(
+            CtxPaths::with_context(d.path(), "proj", "plane"),
+            "plane-host",
+            Tier::Lead,
+            None,
+        )
+        .unwrap();
+        lead.claim("plane-host").unwrap();
+        let (mut jl, fl) = (MemJournal::default(), Fake::default());
+        go(&mut lead, &mut jl, &fl, vec![spawn("a"), spawn("b")], 0);
+        let mut bump = |child: &str, now: u64| {
+            go(
+                &mut lead,
+                &mut jl,
+                &fl,
+                vec![SupMsg::ChildEscalated {
+                    child: child.into(),
+                    reason: "down".into(),
+                    now_ms: now,
+                    fact_key: None,
+                }],
+                now,
+            );
+            if lead.model.status == crate::supervisor_program::Status::Running
+                && lead.model.children[child].state == ChildState::Restarting
+            {
+                let generation = lead.model.children[child].generation;
+                go(
+                    &mut lead,
+                    &mut jl,
+                    &fl,
+                    vec![SupMsg::Relaunched {
+                        child: child.into(),
+                        generation,
+                    }],
+                    now,
+                );
+            }
+        };
+        // Two crews, so poison does not park either one before the window fills.
+        bump("a", 1_000);
+        bump("b", 2_000);
+        bump("a", 3_000);
+        bump("b", 4_000);
+        assert_eq!(
+            lead.model.status,
+            crate::supervisor_program::Status::Failed,
+            "the fourth crew failure escalates the lead"
+        );
+        let (n, reason) = fl.0.lock().unwrap().escalated[0].clone();
+        let cfg = crate::config::Config::default();
+        LivePorts::new(&cfg, "proj", "proj")
+            .in_context("plane")
+            .escalate(n, &reason, "crew-a")
+            .unwrap();
+        let path = lead_facts_file("proj", Some("plane"));
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "{\"kind\":\"pass\",\"n\":1}\n{\"kind\":\"progress\"}\n{\"kind\":\"done\"}\n",
+        );
+        std::fs::write(&path, text).unwrap();
+        let mut root = LivePorts::new(&cfg, "proj", "proj");
+        let msgs = root.observe(&c.model, 4_000);
+        let ups: Vec<_> = msgs
+            .iter()
+            .filter(|m| matches!(m, SupMsg::ChildEscalated { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(ups.len(), 1, "one notice, not one per pass: {msgs:?}");
+        assert!(
+            msgs.iter().all(|m| !matches!(
+                m,
+                SupMsg::Progress { .. } | SupMsg::Done { .. } | SupMsg::PassExit { .. }
+            )),
+            "pass, progress, and done stay in the lead: {msgs:?}"
+        );
+        go(&mut c, &mut j, &f, ups, 4_000);
+        assert_eq!(
+            f.0.lock().unwrap().relaunched,
+            vec![("plane".to_string(), 2)]
+        );
+        let generation = c.model.children["plane"].generation;
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::Relaunched {
+                child: "plane".into(),
+                generation,
+            }],
+            4_000,
+        );
+        let again = root.observe(&c.model, 5_000);
+        assert!(
+            again
+                .iter()
+                .all(|m| !matches!(m, SupMsg::ChildEscalated { .. })),
+            "the same escalate fact does not restart the lead again: {again:?}"
         );
     }
 }

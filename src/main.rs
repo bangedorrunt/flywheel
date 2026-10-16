@@ -3189,7 +3189,16 @@ fn main() {
                 interval,
                 to,
                 stall_minutes,
-            } => cmd_loop_supervise(&cfg, project, *work, *interval, to, *stall_minutes),
+                context,
+            } => cmd_loop_supervise(
+                &cfg,
+                project,
+                *work,
+                *interval,
+                to,
+                *stall_minutes,
+                context.as_deref(),
+            ),
             LoopCmd::Status { project } => cmd_loop_status(&cfg, project),
             LoopCmd::List => cmd_loop_list(),
             LoopCmd::Prune => cmd_loop_prune(),
@@ -22623,6 +22632,7 @@ fn cmd_loop_supervise(
     interval_secs: u64,
     to: &str,
     stall_minutes: u64,
+    context: Option<&str>,
 ) -> Result<()> {
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
@@ -22638,6 +22648,7 @@ fn cmd_loop_supervise(
             interval_secs,
             to,
             stall_minutes,
+            context,
         );
     }
     let exe = std::env::current_exe().context("resolve the flywheel executable")?;
