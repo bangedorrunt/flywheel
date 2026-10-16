@@ -276,6 +276,10 @@ pub struct Steer {
     pub ack_by_ms: u64,
     /// Log offset of the appended envelope, once known.
     pub offset: Option<u64>,
+    /// sha256 of the redirect's delta (4b.4). The content lives in the steer
+    /// mail's body, never in this log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_sha: Option<String>,
     /// State.
     pub state: SteerState,
 }
@@ -298,6 +302,9 @@ pub enum RejectCause {
     CapExceeded,
     /// This supervisor is not running.
     NotRunning,
+    /// A redirect without a delta, or a delta on another op, or one that is
+    /// not a sha256 (4b.4).
+    BadSteer,
 }
 
 impl RejectCause {
@@ -311,6 +318,7 @@ impl RejectCause {
             Self::UnknownChild => "unknown_child",
             Self::CapExceeded => "cap_exceeded",
             Self::NotRunning => "not_running",
+            Self::BadSteer => "bad_steer",
         }
     }
 }
@@ -508,6 +516,9 @@ pub enum SupMsg {
         child: String,
         /// Epoch the sender holds.
         sup_epoch: u64,
+        /// sha256 of the delta (required for `redirect`, refused for the rest).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta_sha: Option<String>,
         /// Time.
         now_ms: u64,
     },
@@ -603,6 +614,9 @@ pub enum SupCmd {
         sup_epoch: u64,
         /// Interrupt + urgent wake line as well.
         urgent: bool,
+        /// sha256 of the redirect's delta (the body of the mail).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta_sha: Option<String>,
     },
     /// Tell the parent (the captain) and record the fact.
     Escalate {
@@ -676,6 +690,28 @@ fn escalate(next: &mut SupModel, cmds: &mut Vec<SupCmd>, reason: &str, evidence:
         reason: reason.into(),
         evidence,
     });
+}
+
+/// A delta sha: 64 lowercase hex digits.
+fn is_sha(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The delta a child currently works under: the newest redirect of it that was
+/// acked or applied by a restart (the new incarnation reads that mail first).
+impl SupModel {
+    /// See above.
+    pub fn current_delta(&self, child: &str) -> Option<&str> {
+        self.steers
+            .values()
+            .rev()
+            .find(|s| {
+                s.child == child
+                    && s.delta_sha.is_some()
+                    && matches!(s.state, SteerState::Acked | SteerState::AppliedByRestart)
+            })
+            .and_then(|s| s.delta_sha.as_deref())
+    }
 }
 
 /// P11: the restart budget. Window entries older than `max_t` leave; the
@@ -1003,22 +1039,38 @@ impl Program for SupervisorProgram {
                 }
             }
             SupMsg::Cursor { child, cursor } => {
+                let mut bump = false;
                 for s in next.steers.values_mut() {
                     if s.child == *child
                         && s.state == SteerState::Pending
                         && s.offset.is_some_and(|o| *cursor >= o)
                     {
                         s.state = SteerState::Acked;
+                        // An acked redirect moves the crew to a new generation
+                        // (4b.4): the contract changed, so a report for the old
+                        // one is stale. Only if the child still is at the
+                        // generation the steer was issued at.
+                        bump |= s.op == SteerOp::Redirect
+                            && next.children.get(child).is_some_and(|c| c.generation == s.generation);
                     }
+                }
+                if bump && let Some(c) = next.children.get_mut(child) {
+                    c.generation += 1;
                 }
             }
             SupMsg::Control {
                 op,
                 child,
                 sup_epoch,
+                delta_sha,
                 now_ms,
             } => {
                 next.now_ms = next.now_ms.max(*now_ms);
+                let delta_ok = match (op, delta_sha) {
+                    (SteerOp::Redirect, Some(d)) => is_sha(d),
+                    (SteerOp::Redirect, None) => false,
+                    (_, d) => d.is_none(),
+                };
                 if *sup_epoch < next.accepted_epoch {
                     reject(&mut next, &mut cmds, RejectCause::StaleEpoch, child);
                 } else if *sup_epoch > next.accepted_epoch {
@@ -1027,6 +1079,8 @@ impl Program for SupervisorProgram {
                     reject(&mut next, &mut cmds, RejectCause::NotRunning, child);
                 } else if !next.children.get(child).is_some_and(|c| c.state.live()) {
                     reject(&mut next, &mut cmds, RejectCause::UnknownChild, child);
+                } else if !delta_ok {
+                    reject(&mut next, &mut cmds, RejectCause::BadSteer, child);
                 } else {
                     next.steer_seq += 1;
                     let seq = next.steer_seq;
@@ -1047,6 +1101,7 @@ impl Program for SupervisorProgram {
                             sup_epoch: *sup_epoch,
                             ack_by_ms: ack_by,
                             offset: None,
+                            delta_sha: delta_sha.clone(),
                             state: SteerState::Pending,
                         },
                     );
@@ -1061,9 +1116,12 @@ impl Program for SupervisorProgram {
                         seq,
                         child: child.clone(),
                         op: *op,
-                        generation,
+                        // A redirect names the generation the crew re-claims at
+                        // once it acks: its reports at the old one go stale then.
+                        generation: if *op == SteerOp::Redirect { generation + 1 } else { generation },
                         sup_epoch: *sup_epoch,
                         urgent: *op != SteerOp::Resume,
+                        delta_sha: delta_sha.clone(),
                     });
                 }
             }
@@ -1308,6 +1366,8 @@ pub fn replay(msgs: &[SupMsg]) -> (SupModel, Vec<SupCmd>) {
 mod tests {
     use super::*;
 
+    /// A well-formed delta sha for tests that only need one.
+    const D: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ME: &str = "lead-1";
     const MIN: u64 = 60_000;
 
@@ -1561,6 +1621,7 @@ mod tests {
                 op: SteerOp::Redirect,
                 child: "a".into(),
                 sup_epoch: 2,
+                delta_sha: Some(D.into()),
                 now_ms: 1_000,
             },
         );
@@ -1697,6 +1758,142 @@ mod tests {
                 assert_eq!(replay(&all).0, m, "{strategy:?} seed {seed}: replay differs");
             }
         }
+    }
+
+    // ---- 4b.4: the redirect delta (interim form)
+
+    fn redirect(child: &str, sha: Option<&str>) -> SupMsg {
+        SupMsg::Control {
+            op: SteerOp::Redirect,
+            child: child.into(),
+            sup_epoch: 2,
+            delta_sha: sha.map(Into::into),
+            now_ms: 1_000,
+        }
+    }
+
+    const D2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn a_redirect_without_a_delta_is_rejected_bad_steer_and_nothing_is_sent() {
+        let (m, c) = step(&base(), &redirect("a", None));
+        assert_eq!(rejects(&c), vec![RejectCause::BadSteer]);
+        assert!(m.steers.is_empty());
+        assert!(!c.iter().any(|x| matches!(x, SupCmd::AppendSteer { .. })));
+    }
+
+    #[test]
+    fn a_delta_that_is_not_a_sha_or_that_rides_another_op_is_rejected() {
+        for bad in ["", "not-a-sha", &"A".repeat(64), &"a".repeat(63), &"g".repeat(64), "../../x"] {
+            let (_, c) = step(&base(), &redirect("a", Some(bad)));
+            assert_eq!(rejects(&c), vec![RejectCause::BadSteer], "{bad:?}");
+        }
+        for op in [SteerOp::Pause, SteerOp::Resume, SteerOp::Cancel] {
+            let (_, c) = step(
+                &base(),
+                &SupMsg::Control { op, child: "a".into(), sup_epoch: 2, delta_sha: Some(D.into()), now_ms: 1 },
+            );
+            assert_eq!(rejects(&c), vec![RejectCause::BadSteer], "{op:?} takes no delta");
+        }
+    }
+
+    #[test]
+    fn a_redirect_with_a_delta_records_the_sha_and_names_the_generation_to_reclaim_at() {
+        let (m, c) = step(&base(), &redirect("a", Some(D)));
+        assert_eq!(m.steers[&1].delta_sha.as_deref(), Some(D));
+        assert_eq!(m.children["a"].generation, 1, "the crew has not acked: still g");
+        match c.as_slice() {
+            [SupCmd::AppendSteer { generation, delta_sha, .. }] => {
+                assert_eq!(*generation, 2, "the mail names g+1");
+                assert_eq!(delta_sha.as_deref(), Some(D));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn acked_redirect() -> SupModel {
+        let (m, _) = step(&base(), &redirect("a", Some(D)));
+        let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 });
+        step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 7 }).0
+    }
+
+    #[test]
+    fn an_acked_redirect_bumps_the_generation_and_the_old_one_goes_stale() {
+        let m = acked_redirect();
+        assert_eq!(m.steers[&1].state, SteerState::Acked);
+        assert_eq!(m.children["a"].generation, 2);
+        assert_eq!(m.current_delta("a"), Some(D));
+        let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 1, now_ms: 2_000 });
+        assert_eq!(rejects(&c), vec![RejectCause::StaleGen], "a late done(g) is stale");
+        let (m2, c) = step(&m, &SupMsg::Progress { child: "a".into(), generation: 2, now_ms: 2_000 });
+        assert!(rejects(&c).is_empty(), "the crew re-claimed at g+1");
+        assert_eq!(m2.children["a"].last_progress_ms, 2_000);
+    }
+
+    #[test]
+    fn re_reading_the_cursor_does_not_bump_twice() {
+        let m = acked_redirect();
+        let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 99 });
+        assert_eq!(m.children["a"].generation, 2);
+    }
+
+    #[test]
+    fn an_acked_pause_does_not_bump_the_generation() {
+        let (m, _) = step(
+            &base(),
+            &SupMsg::Control { op: SteerOp::Pause, child: "a".into(), sup_epoch: 2, delta_sha: None, now_ms: 1 },
+        );
+        let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 });
+        let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 7 });
+        assert_eq!(m.children["a"].generation, 1);
+    }
+
+    #[test]
+    fn a_redirect_the_crew_never_acks_is_applied_by_a_restart_at_g_plus_one_carrying_the_delta() {
+        let (m, _) = step(&base(), &redirect("a", Some(D)));
+        let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 });
+        let (m, c) = step(&m, &SupMsg::Tick { now_ms: 1_000 + DEFAULT_ACK_MS + 1 });
+        assert_eq!(relaunches(&c), vec![("a".to_string(), 2)], "g+1, not g+2");
+        assert_eq!(m.steers[&1].state, SteerState::AppliedByRestart);
+        assert_eq!(m.current_delta("a"), Some(D), "the new incarnation reads that mail first");
+        let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 1, now_ms: 9 });
+        assert_eq!(rejects(&c), vec![RejectCause::StaleGen]);
+    }
+
+    #[test]
+    fn the_newest_acked_or_restart_applied_delta_is_the_current_one() {
+        let m = acked_redirect();
+        let (m, _) = step(&m, &SupMsg::Progress { child: "a".into(), generation: 2, now_ms: 1_500 });
+        let (m, _) = step(&m, &redirect("a", Some(D2)));
+        assert_eq!(m.current_delta("a"), Some(D), "a pending one is not current yet");
+        let (m, _) = step(&m, &SupMsg::SteerAppended { seq: 2, offset: 9 });
+        let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 9 });
+        assert_eq!(m.current_delta("a"), Some(D2));
+        assert_eq!(m.children["a"].generation, 3);
+        assert_eq!(m.current_delta("b"), None);
+    }
+
+    #[test]
+    fn a_superseded_redirect_is_not_the_current_delta() {
+        let (m, _) = step(&base(), &redirect("a", Some(D)));
+        let (m, _) = step(&m, &redirect("a", Some(D2)));
+        assert_eq!(m.steers[&1].state, SteerState::Superseded);
+        assert_eq!(m.current_delta("a"), None);
+    }
+
+    #[test]
+    fn the_log_holds_the_sha_and_never_the_delta_text() {
+        let (m, c) = step(&base(), &redirect("a", Some(D)));
+        let json = serde_json::to_string(&(m, c)).unwrap();
+        assert!(json.contains(D));
+        assert!(!json.contains("goal"), "no delta content in the model or the commands");
+    }
+
+    #[test]
+    fn an_old_log_line_without_the_field_still_parses() {
+        let line = r#"{"kind":"control","op":"cancel","child":"a","sup_epoch":2,"now_ms":5}"#;
+        let m: SupMsg = serde_json::from_str(line).unwrap();
+        assert!(matches!(m, SupMsg::Control { delta_sha: None, .. }));
     }
 
     // ---- defaults (build-plan: leads 3/30 min, captain 2/60 min, poison 3, cap 5)
@@ -1942,7 +2139,7 @@ mod tests {
             op: SteerOp::Cancel,
             child: "a".into(),
             sup_epoch: e,
-            now_ms: 10,
+            delta_sha: None, now_ms: 10,
         };
         let (m1, c) = step(&m, &ctl(1));
         assert_eq!(rejects(&c), vec![RejectCause::StaleEpoch]);
@@ -1975,7 +2172,7 @@ mod tests {
                 op: SteerOp::Cancel,
                 child: "a".into(),
                 sup_epoch: 2,
-                now_ms: 5,
+                delta_sha: None, now_ms: 5,
             },
         );
         assert_eq!(rejects(&c), vec![RejectCause::StaleEpoch]);
@@ -2017,12 +2214,12 @@ mod tests {
                 op: SteerOp::Redirect,
                 child: "a".into(),
                 sup_epoch: 2,
-                now_ms: 1_000,
+                delta_sha: Some(D.into()), now_ms: 1_000,
             },
         );
         assert!(matches!(
             c.as_slice(),
-            [SupCmd::AppendSteer { seq: 1, urgent: true, generation: 1, .. }]
+            [SupCmd::AppendSteer { seq: 1, urgent: true, generation: 2, .. }]
         ));
         step(&m, &SupMsg::SteerAppended { seq: 1, offset: 7 }).0
     }
@@ -2050,7 +2247,10 @@ mod tests {
         assert_eq!(m.steers[&1].state, SteerState::Pending, "6 < 7");
         let (m, _) = step(&m, &SupMsg::Cursor { child: "a".into(), cursor: 7 });
         assert_eq!(m.steers[&1].state, SteerState::Acked);
+        // The steer here is a redirect: the crew re-claims at g+1.
         let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 1, now_ms: 3_000 });
+        assert_eq!(rejects(&c), vec![RejectCause::StaleGen]);
+        let (_, c) = step(&m, &SupMsg::Done { child: "a".into(), generation: 2, now_ms: 3_000 });
         assert!(rejects(&c).is_empty());
     }
 
@@ -2078,7 +2278,7 @@ mod tests {
     fn an_ignored_cancel_ends_the_child_instead_of_restarting_it() {
         let (m, _) = step(
             &base(),
-            &SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: 2, now_ms: 0 },
+            &SupMsg::Control { op: SteerOp::Cancel, child: "a".into(), sup_epoch: 2, delta_sha: None, now_ms: 0 },
         );
         let (m, c) = step(&m, &SupMsg::Tick { now_ms: DEFAULT_ACK_MS + 1 });
         assert!(relaunches(&c).iter().all(|(id, _)| id != "a"));
@@ -2092,7 +2292,7 @@ mod tests {
         let m = steered();
         let (m, _) = step(
             &m,
-            &SupMsg::Control { op: SteerOp::Pause, child: "a".into(), sup_epoch: 2, now_ms: 2_000 },
+            &SupMsg::Control { op: SteerOp::Pause, child: "a".into(), sup_epoch: 2, delta_sha: None, now_ms: 2_000 },
         );
         assert_eq!(m.steers[&1].state, SteerState::Superseded);
         assert_eq!(m.steers[&2].state, SteerState::Pending);
@@ -2256,12 +2456,12 @@ mod tests {
             SupMsg::Claim { holder: ME.into(), sup_epoch: 2 },
             SupMsg::Spawn { spec: spec("a"), now_ms: 0 },
             SupMsg::Spawn { spec: spec("b"), now_ms: 0 },
-            SupMsg::Control { op: SteerOp::Redirect, child: "a".into(), sup_epoch: 2, now_ms: 1_000 },
+            SupMsg::Control { op: SteerOp::Redirect, child: "a".into(), sup_epoch: 2, delta_sha: Some(D.into()), now_ms: 1_000 },
             SupMsg::SteerAppended { seq: 1, offset: 4 },
             exit("b", 2_000),
             SupMsg::Relaunched { child: "b".into(), generation: 2 },
             SupMsg::Progress { child: "b".into(), generation: 2, now_ms: 3_000 },
-            SupMsg::Control { op: SteerOp::Cancel, child: "b".into(), sup_epoch: 1, now_ms: 3_500 },
+            SupMsg::Control { op: SteerOp::Cancel, child: "b".into(), sup_epoch: 1, delta_sha: None, now_ms: 3_500 },
             SupMsg::Tick { now_ms: 4_000 },
         ]
     }
@@ -2321,7 +2521,8 @@ mod tests {
                 op: SteerOp::Cancel,
                 generation: 1,
                 sup_epoch: 2,
-                urgent: true
+                urgent: true,
+                delta_sha: None,
             }),
             "steer:4"
         );
