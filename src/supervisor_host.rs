@@ -431,6 +431,10 @@ pub fn execute(
             reason,
             evidence,
         } => ports.escalate(*n, reason, evidence).map(|_| vec![]),
+        SupCmd::Assign { .. } => {
+            // ponytail: log-only until 4b.8; task@1 append waits on the producer helper
+            Ok(vec![])
+        }
         SupCmd::Park { child, incarnations } => ports.park(child, *incarnations).map(|_| vec![]),
         SupCmd::Page { kind, pin, line, .. } => ports.page(kind, pin, line).map(|_| vec![]),
         SupCmd::Reject { n, cause, child } => ports.reject(*n, cause.tag(), child).map(|_| vec![]),
@@ -743,6 +747,7 @@ impl Ports for LivePorts {
                     npub,
                     restart: Restart::Transient,
                     kind: ChildKind::Crew,
+                    role: None,
                 },
                 now_ms,
             });
@@ -1036,6 +1041,7 @@ fn host_loop(
                 npub: None,
                 restart: Restart::Permanent,
                 kind: ChildKind::Crew,
+                role: None,
             },
             now_ms: now_ms(),
         });
@@ -1407,6 +1413,7 @@ mod tests {
                 npub: Some(format!("npub-{id}")),
                 restart: Restart::Transient,
                 kind,
+                role: None,
             },
             now_ms: 0,
         }
@@ -2111,6 +2118,39 @@ mod tests {
         assert!(gate < legacy, "the gate precedes the unchanged legacy loop");
         assert!(body[gate..legacy].contains("supervisor_host::run_supervise("));
         assert!(src.contains("SUPERVISE_MAX_CONSECUTIVE_FAILURES"), "legacy rule still defined for flag-off");
+    }
+
+    #[test]
+    fn an_assign_does_not_write_a_pane() {
+        use crate::supervisor_program::ReadyBead;
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a")], 1_000);
+        go(
+            &mut c,
+            &mut j,
+            &f,
+            vec![SupMsg::ReadyBeads {
+                beads: vec![ReadyBead {
+                    id: "t1".into(),
+                    scope_paths: vec!["src/a.rs".into()],
+                    deps_proved: true,
+                    role: "a".into(),
+                }],
+                now_ms: 1_500,
+            }],
+            1_500,
+        );
+        let w = f.0.lock().unwrap();
+        assert!(w.exited.is_empty(), "assign must not Exit a pane");
+        assert!(w.steers.is_empty(), "assign must not write pane text");
+        assert!(w.relaunched.is_empty());
+        drop(w);
+        assert!(
+            j.rows.keys().any(|k| k == "assign:t1:a:1"),
+            "assign is journaled, not written to a pane: {:?}",
+            j.rows.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

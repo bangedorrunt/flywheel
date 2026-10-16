@@ -193,6 +193,9 @@ pub struct ChildSpec {
     /// Crew or lead. Missing on old logs: [`ChildKind::Crew`].
     #[serde(default)]
     pub kind: ChildKind,
+    /// Beads whose `role` matches this are eligible. Missing means the child id.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// Where a child is.
@@ -227,6 +230,32 @@ impl ChildState {
     pub fn live_for_host(self) -> bool {
         self.live()
     }
+}
+
+/// One bead the supervisor may hand to a crew.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyBead {
+    /// Task id.
+    pub id: String,
+    /// Paths the task reserves. Overlap with an in-flight assignment waits.
+    pub scope_paths: Vec<String>,
+    /// Dependencies proved. `false` is not assigned.
+    pub deps_proved: bool,
+    /// Must equal the child's id, or its `role` when set.
+    pub role: String,
+}
+
+/// An in-flight assignment. The fold records it; the host does not write a pane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assignment {
+    /// Task id.
+    pub task: String,
+    /// Crew it was given to.
+    pub child: String,
+    /// That child's generation at assignment.
+    pub generation: u64,
+    /// Scope held while this assignment is in flight.
+    pub scope_paths: Vec<String>,
 }
 
 /// One child.
@@ -415,6 +444,15 @@ pub struct SupModel {
     /// above it, so effect keys (`relaunch:<id>:<gen>`) and the generation
     /// fence never see an old incarnation's values again.
     pub retired_gen: BTreeMap<String, u64>,
+    /// In-flight bead assignments, keyed by task id.
+    #[serde(default)]
+    pub assignments: BTreeMap<String, Assignment>,
+    /// Times a task was assigned and then ended abnormally.
+    #[serde(default)]
+    pub task_abnormal: BTreeMap<String, u32>,
+    /// Task ids that have ended abnormally `poison` times. Not reassigned.
+    #[serde(default)]
+    pub parked_tasks: BTreeSet<String>,
 }
 
 impl SupModel {
@@ -442,6 +480,9 @@ impl SupModel {
             deaf_seen: BTreeSet::new(),
             now_ms: 0,
             retired_gen: BTreeMap::new(),
+            assignments: BTreeMap::new(),
+            task_abnormal: BTreeMap::new(),
+            parked_tasks: BTreeSet::new(),
         }
     }
 
@@ -624,6 +665,19 @@ pub enum SupMsg {
     },
     /// A commit landed: wedge and dead-stop probes re-arm.
     WorkMoved,
+    /// Beads ready to hand out. Overlaps stay pending; nothing is assigned
+    /// when this supervisor is not running.
+    ReadyBeads {
+        /// Candidates, in order.
+        beads: Vec<ReadyBead>,
+        /// Time.
+        now_ms: u64,
+    },
+    /// The ready-bead read failed. Assign nothing.
+    ReadyBeadsFailed {
+        /// Time.
+        now_ms: u64,
+    },
     /// Clock.
     Tick {
         /// Time.
@@ -688,6 +742,15 @@ pub enum SupCmd {
         /// Evidence text.
         evidence: String,
     },
+    /// Hand a bead to a crew. Logged only; the host does not write a pane.
+    Assign {
+        /// Task id.
+        task: String,
+        /// Crew.
+        child: String,
+        /// The crew's generation.
+        generation: u64,
+    },
     /// Park a poisoned child as a ceiling.
     Park {
         /// Child.
@@ -722,6 +785,7 @@ impl KCmd for SupCmd {
         let key = match self {
             Self::Relaunch { child, generation, .. } => format!("relaunch:{child}:{generation}"),
             Self::Exit { child, generation } => format!("exit:{child}:{generation}"),
+            Self::Assign { task, child, generation } => format!("assign:{task}:{child}:{generation}"),
             Self::AppendSteer { seq, .. } => format!("steer:{seq}"),
             Self::Escalate { n, reason, .. } => format!("escalate:{n}:{reason}"),
             Self::Park { child, .. } => format!("park:{child}"),
@@ -818,6 +882,72 @@ fn fail_subtree(next: &mut SupModel, cmds: &mut Vec<SupCmd>, reason: &str, who: 
     escalate(next, cmds, reason, ev);
 }
 
+fn drop_assignments(next: &mut SupModel, id: &str) {
+    let gone: Vec<String> = next
+        .assignments
+        .iter()
+        .filter(|(_, a)| a.child == id)
+        .map(|(t, _)| t.clone())
+        .collect();
+    for t in gone {
+        next.assignments.remove(&t);
+    }
+}
+
+/// The child abnormal-end path already parks at 3. This only refuses to
+/// hand the same task out again once it has ended that many times.
+fn note_task_end(next: &mut SupModel, id: &str) {
+    let gone: Vec<String> = next
+        .assignments
+        .iter()
+        .filter(|(_, a)| a.child == id)
+        .map(|(t, _)| t.clone())
+        .collect();
+    for t in gone {
+        next.assignments.remove(&t);
+        let n = next.task_abnormal.entry(t.clone()).or_insert(0);
+        *n += 1;
+        if *n >= next.policy.poison {
+            next.parked_tasks.insert(t);
+        }
+    }
+}
+
+fn child_role(c: &Child) -> &str {
+    c.spec.role.as_deref().unwrap_or(&c.spec.id)
+}
+
+fn scopes_overlap(a: &[String], b: &[String]) -> bool {
+    a.iter().any(|x| b.iter().any(|y| toron_core::mailbox::reservations::overlaps(x, y)))
+}
+
+fn pick_assignee(m: &SupModel, bead: &ReadyBead) -> Option<(String, u64)> {
+    if m.status != Status::Running || !bead.deps_proved {
+        return None;
+    }
+    if m.parked_tasks.contains(&bead.id)
+        || m.task_abnormal.get(&bead.id).copied().unwrap_or(0) >= m.policy.poison
+    {
+        return None;
+    }
+    if m.assignments.contains_key(&bead.id) {
+        return None;
+    }
+    // In-flight assignments consume crew slots along with live crews.
+    if m.live_crews() + m.assignments.len() >= m.policy.crew_cap {
+        return None;
+    }
+    if m.assignments.values().any(|a| scopes_overlap(&bead.scope_paths, &a.scope_paths)) {
+        return None;
+    }
+    m.children.values().find(|c| {
+        c.spec.kind == ChildKind::Crew
+            && c.spec.id != PASS
+            && c.state == ChildState::Running
+            && bead.role == child_role(c)
+    }).map(|c| (c.spec.id.clone(), c.generation))
+}
+
 /// A child ended abnormally: restart it, park it, or fail the supervisor.
 /// `count_incarnation` is false for a deferred restart (herdr was down).
 fn abnormal_end(
@@ -830,17 +960,28 @@ fn abnormal_end(
     if next.status != Status::Running {
         return;
     }
+    let temporary = {
+        let Some(c) = next.children.get(id) else {
+            return;
+        };
+        if !c.state.live() {
+            return;
+        }
+        // Already ended and waiting on herdr: one end is one incarnation.
+        if c.state == ChildState::NeedsRestart && count_incarnation {
+            return;
+        }
+        c.spec.restart == Restart::Temporary
+    };
+    if count_incarnation {
+        note_task_end(next, id);
+    } else {
+        drop_assignments(next, id);
+    }
     let Some(c) = next.children.get_mut(id) else {
         return;
     };
-    if !c.state.live() {
-        return;
-    }
-    // Already ended and waiting on herdr: one end is one incarnation.
-    if c.state == ChildState::NeedsRestart && count_incarnation {
-        return;
-    }
-    if c.spec.restart == Restart::Temporary {
+    if temporary {
         c.state = ChildState::Gone;
         return;
     }
@@ -873,6 +1014,11 @@ fn abnormal_end(
     // strategy restarts with it (OTP).
     next.restarts.push(now);
     let set = restart_set(next, id);
+    for m in &set {
+        if m != id {
+            drop_assignments(next, m);
+        }
+    }
     // Siblings still running are stopped first (the failed child already
     // ended, so it gets no Exit); a temporary sibling is stopped for good.
     for m in &set {
@@ -1292,6 +1438,35 @@ impl Program for SupervisorProgram {
                 next.paged.clear();
                 next.stalled = false;
             }
+            SupMsg::ReadyBeads { beads, now_ms } => {
+                if next.status == Status::Running {
+                    let mut any = false;
+                    for bead in beads {
+                        let Some((child, generation)) = pick_assignee(&next, bead) else {
+                            continue;
+                        };
+                        next.assignments.insert(
+                            bead.id.clone(),
+                            Assignment {
+                                task: bead.id.clone(),
+                                child: child.clone(),
+                                generation,
+                                scope_paths: bead.scope_paths.clone(),
+                            },
+                        );
+                        cmds.push(SupCmd::Assign {
+                            task: bead.id.clone(),
+                            child,
+                            generation,
+                        });
+                        any = true;
+                    }
+                    if any {
+                        next.now_ms = next.now_ms.max(*now_ms);
+                    }
+                }
+            }
+            SupMsg::ReadyBeadsFailed { .. } => {}
             SupMsg::Tick { now_ms } => {
                 // The clock reading is used, not stored: a tick that decides
                 // nothing leaves the model equal, so the host logs nothing.
@@ -1474,6 +1649,7 @@ mod tests {
             npub: Some(format!("npub-{id}")),
             restart: Restart::Transient,
             kind: ChildKind::Crew,
+            role: None,
         }
     }
 
@@ -2140,7 +2316,7 @@ mod tests {
     #[test]
     fn nothing_restarts_after_the_supervisor_failed() {
         let mut m = base();
-        m = step(&m, &SupMsg::Spawn { spec: ChildSpec { id: PASS.into(), npub: None, restart: Restart::Permanent, kind: ChildKind::Crew }, now_ms: 0 }).0;
+        m = step(&m, &SupMsg::Spawn { spec: ChildSpec { id: PASS.into(), npub: None, restart: Restart::Permanent, kind: ChildKind::Crew, role: None }, now_ms: 0 }).0;
         let mut esc = 0;
         for t in 1..=6u64 {
             let (n, c) = step(&m, &SupMsg::PassExit { ok: false, now_ms: t * 1_000 });
@@ -2433,7 +2609,7 @@ mod tests {
         m = step(
             &m,
             &SupMsg::Spawn {
-                spec: ChildSpec { id: "t".into(), npub: None, restart: Restart::Temporary, kind: ChildKind::Crew },
+                spec: ChildSpec { id: "t".into(), npub: None, restart: Restart::Temporary, kind: ChildKind::Crew, role: None },
                 now_ms: 0,
             },
         )
@@ -2539,7 +2715,7 @@ mod tests {
     #[test]
     fn a_successful_pass_resets_the_pass_childs_incarnations() {
         let mut m = base();
-        m = step(&m, &SupMsg::Spawn { spec: ChildSpec { id: PASS.into(), npub: None, restart: Restart::Permanent, kind: ChildKind::Crew }, now_ms: 0 }).0;
+        m = step(&m, &SupMsg::Spawn { spec: ChildSpec { id: PASS.into(), npub: None, restart: Restart::Permanent, kind: ChildKind::Crew, role: None }, now_ms: 0 }).0;
         m = step(&m, &SupMsg::PassExit { ok: false, now_ms: 1_000 }).0;
         assert_eq!(m.restarts.len(), 1);
         m = step(&m, &SupMsg::PassExit { ok: true, now_ms: 2_000 }).0;
@@ -2779,5 +2955,171 @@ mod tests {
             }),
             "steer:4"
         );
+        assert_eq!(
+            k(&SupCmd::Assign { task: "t1".into(), child: "a".into(), generation: 1 }),
+            "assign:t1:a:1"
+        );
+    }
+
+    fn bead(id: &str, path: &str, role: &str, proved: bool) -> ReadyBead {
+        ReadyBead {
+            id: id.into(),
+            scope_paths: vec![path.into()],
+            deps_proved: proved,
+            role: role.into(),
+        }
+    }
+
+    fn assigns(c: &[SupCmd]) -> Vec<(String, String)> {
+        c.iter()
+            .filter_map(|c| match c {
+                SupCmd::Assign { task, child, .. } => Some((task.clone(), child.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overlapping_beads_assign_the_first_and_a_disjoint_third() {
+        // The overlap function the guard calls. Same path, conflict; different paths, not.
+        assert!(toron_core::mailbox::reservations::overlaps("src/a.rs", "src/a.rs"));
+        assert!(!toron_core::mailbox::reservations::overlaps("src/a.rs", "src/b.rs"));
+        let msg = SupMsg::ReadyBeads {
+            beads: vec![
+                bead("t1", "src/a.rs", "a", true),
+                bead("t2", "src/a.rs", "b", true),
+                bead("t3", "src/b.rs", "b", true),
+                bead("t4", "src/c.rs", "a", false),
+            ],
+            now_ms: 50,
+        };
+        let (m, c) = step(&base(), &msg);
+        assert_eq!(
+            assigns(&c),
+            vec![("t1".into(), "a".into()), ("t3".into(), "b".into())]
+        );
+        assert!(!m.assignments.contains_key("t2"), "overlap stays pending");
+        assert!(!m.assignments.contains_key("t4"), "deps not proved");
+        let mut m2 = base();
+        m2 = step(&m2, &SupMsg::Spawn { spec: lead_spec("plane"), now_ms: 0 }).0;
+        let (m2, c2) = step(
+            &m2,
+            &SupMsg::ReadyBeads { beads: vec![bead("lead-task", "src/z.rs", "plane", true)], now_ms: 1 },
+        );
+        assert!(assigns(&c2).is_empty(), "a lead is not a crew assignee");
+        assert!(m2.assignments.is_empty());
+    }
+
+    #[test]
+    fn ready_beads_failed_and_a_role_mismatch_assign_nothing() {
+        let m = base();
+        let (m2, c) = step(&m, &SupMsg::ReadyBeadsFailed { now_ms: 5 });
+        assert_eq!(m2, m);
+        assert!(c.is_empty());
+        let (m3, c) = step(
+            &m2,
+            &SupMsg::ReadyBeads { beads: vec![bead("t9", "src/z.rs", "nope", true)], now_ms: 6 },
+        );
+        assert_eq!(m3, m2);
+        assert!(assigns(&c).is_empty());
+    }
+
+    #[test]
+    fn an_in_flight_assignment_consumes_a_crew_slot() {
+        let mut policy = Policy::for_tier(Tier::Lead);
+        policy.crew_cap = 3;
+        let mut m = SupModel::default();
+        for msg in [
+            SupMsg::Hello { me: ME.into(), tier: Tier::Lead, policy: Some(policy) },
+            SupMsg::Claim { holder: ME.into(), sup_epoch: 1 },
+            SupMsg::Spawn { spec: spec("a"), now_ms: 0 },
+            SupMsg::Spawn { spec: spec("b"), now_ms: 0 },
+        ] {
+            m = step(&m, &msg).0;
+        }
+        let (m, c) = step(
+            &m,
+            &SupMsg::ReadyBeads {
+                beads: vec![bead("t1", "src/a.rs", "a", true), bead("t3", "src/b.rs", "b", true)],
+                now_ms: 10,
+            },
+        );
+        assert_eq!(assigns(&c), vec![("t1".into(), "a".into())], "2 live + 1 in flight fills cap 3");
+        assert!(!m.assignments.contains_key("t3"));
+    }
+
+    #[test]
+    fn ready_beads_replay_equals_the_model() {
+        let log = vec![
+            SupMsg::Hello { me: ME.into(), tier: Tier::Lead, policy: None },
+            SupMsg::Claim { holder: ME.into(), sup_epoch: 2 },
+            SupMsg::Spawn { spec: spec("a"), now_ms: 0 },
+            SupMsg::Spawn { spec: spec("b"), now_ms: 0 },
+            SupMsg::ReadyBeads {
+                beads: vec![bead("t1", "src/a.rs", "a", true), bead("t2", "src/a.rs", "b", true), bead("t3", "src/b.rs", "b", true)],
+                now_ms: 50,
+            },
+        ];
+        let mut m = SupModel::default();
+        for msg in &log {
+            m = step(&m, msg).0;
+        }
+        assert_eq!(replay(&log).0, m);
+        assert_eq!(m.assignments.len(), 2);
+    }
+
+    #[test]
+    fn a_task_that_ends_abnormally_three_times_is_not_reassigned() {
+        let mut wa = spec("a");
+        wa.role = Some("worker".into());
+        let mut wb = spec("b");
+        wb.role = Some("worker".into());
+        let mut log = vec![
+            SupMsg::Hello { me: ME.into(), tier: Tier::Lead, policy: None },
+            SupMsg::Claim { holder: ME.into(), sup_epoch: 1 },
+            SupMsg::Spawn { spec: wa, now_ms: 0 },
+            SupMsg::Spawn { spec: wb, now_ms: 0 },
+        ];
+        let mut m = SupModel::default();
+        for msg in &log {
+            m = step(&m, msg).0;
+        }
+        for n in 1..=3u64 {
+            let beads = SupMsg::ReadyBeads {
+                beads: vec![bead("t1", "src/t.rs", "worker", true)],
+                now_ms: n * 1_000,
+            };
+            let (next, c) = step(&m, &beads);
+            assert_eq!(assigns(&c), vec![("t1".into(), "a".into())], "attempt {n}");
+            log.push(beads);
+            m = next;
+            let ex = exit("a", n * 1_000 + 10);
+            let (next, c) = step(&m, &ex);
+            log.push(ex);
+            m = next;
+            if n < 3 {
+                let generation = m.children["a"].generation;
+                assert!(relaunches(&c).iter().any(|(id, g)| id == "a" && *g == generation));
+                let rel = SupMsg::Relaunched { child: "a".into(), generation };
+                log.push(rel.clone());
+                m = step(&m, &rel).0;
+            } else {
+                assert!(matches!(c.last(), Some(SupCmd::Park { child, .. }) if child == "a"));
+                assert!(relaunches(&c).is_empty());
+            }
+        }
+        assert_eq!(m.task_abnormal.get("t1").copied(), Some(3));
+        assert!(m.parked_tasks.contains("t1"));
+        assert_eq!(m.children["b"].state, ChildState::Running);
+        let again = SupMsg::ReadyBeads {
+            beads: vec![bead("t1", "src/t.rs", "worker", true)],
+            now_ms: 9_000,
+        };
+        let before = m.clone();
+        let (m2, c) = step(&m, &again);
+        assert!(c.is_empty(), "the other worker does not inherit a poisoned task");
+        assert_eq!(m2, before);
+        log.push(again);
+        assert_eq!(replay(&log).0, m2);
     }
 }
