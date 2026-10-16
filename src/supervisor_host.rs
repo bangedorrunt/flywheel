@@ -3324,6 +3324,68 @@ mod tests {
         assert!(!crew.iter().any(|a| a == "--context"));
     }
 
+    /// Records each relaunch's argv. The fake port drops `kind`, so only a
+    /// real `LivePorts` spawn proves a lead is nested supervise.
+    fn relaunch_args_script(dir: &Path) -> PathBuf {
+        let bin = dir.join("relaunch-args.sh");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$RELAUNCH_MARKER\"\necho --- >> \"$RELAUNCH_MARKER\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        bin
+    }
+
+    #[test]
+    fn a_live_lead_relaunch_spawns_nested_supervise() {
+        let _home = crate::config::lock_env();
+        let _clear = ClearExec;
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("argv");
+        unsafe {
+            std::env::set_var(
+                "FLYWHEEL_SUPERVISOR_RELAUNCH_BIN",
+                relaunch_args_script(d.path()),
+            )
+        };
+        unsafe { std::env::set_var("RELAUNCH_MARKER", &marker) };
+        let cfg = crate::config::Config::default();
+        let mut live = LivePorts::new(&cfg, "proj", "proj");
+        let mut c = open(d.path());
+        let mut j = MemJournal::default();
+        round(
+            &mut c,
+            &mut j,
+            &mut live,
+            vec![
+                spawn_as("plane", ChildKind::Lead),
+                SupMsg::ChildEscalated {
+                    child: "plane".into(),
+                    reason: "down".into(),
+                    now_ms: 2_000,
+                },
+            ],
+            2_000,
+        )
+        .unwrap();
+        let got = std::fs::read_to_string(&marker).expect("relaunch script did not run");
+        assert!(
+            got.contains("loop-mode\nsupervise\nproj\n--context\nplane\n"),
+            "lead relaunch argv: {got}"
+        );
+        assert!(
+            !got.lines().any(|l| l == "crew"),
+            "a lead relaunch must not be a pane crew control: {got}"
+        );
+        assert_eq!(c.model.children["plane"].state, ChildState::Running);
+        assert_eq!(c.model.children["plane"].spec.kind, ChildKind::Lead);
+    }
+
     #[test]
     fn the_host_loop_runs_on_a_plain_thread_and_the_fold_never_shells_out() {
         let me = include_str!("supervisor_host.rs");
