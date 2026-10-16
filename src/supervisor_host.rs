@@ -1473,6 +1473,43 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_log_replays_failed_but_a_new_host_is_a_new_incarnation_that_runs() {
+        // D6: after "restart intensity exceeded" the message says re-run
+        // supervise; a re-run used to exit at once until the log was deleted.
+        let d = tempfile::tempdir().unwrap();
+        let (mut c, mut j, f) = (open(d.path()), MemJournal::default(), Fake::default());
+        go(&mut c, &mut j, &f, vec![spawn("a"), spawn("b")], 1_000);
+        let ex = |id: &str, t| SupMsg::Exit { child: id.into(), now_ms: t };
+        for (i, id) in ["a", "b", "a", "b"].iter().enumerate() {
+            go(&mut c, &mut j, &f, vec![ex(id, 2_000 + i as u64)], 2_000 + i as u64);
+        }
+        assert_eq!(c.model.status, Status::Failed);
+        drop(c);
+        let paths = CtxPaths::new(d.path(), "proj");
+        // The log alone still says Failed: replay is faithful (P8).
+        let (msgs, _, _) = read_log(&paths).unwrap();
+        assert_eq!(crate::supervisor_program::replay(&msgs).0.status, Status::Failed);
+        // A new host process claims the next epoch and runs.
+        let mut c2 = Core::open(paths.clone(), "lead-2", Tier::Lead, None).unwrap();
+        c2.claim("lead-2").unwrap();
+        assert_eq!(c2.model.status, Status::Running, "a re-run is a fresh incarnation");
+        assert!(c2.model.restarts.is_empty(), "the intensity window starts over");
+        assert_eq!(c2.model.escalations, 1, "the escalation fact is kept");
+        // The same effect journal: a re-run keeps the old keys settled, so the
+        // new incarnation's commands must not collide with them.
+        let j2 = &mut j;
+        let before = f.0.lock().unwrap().relaunched.len();
+        go(&mut c2, j2, &f, vec![spawn("a")], 10_000);
+        go(&mut c2, j2, &f, vec![ex("a", 10_100)], 10_100);
+        assert_eq!(c2.model.status, Status::Running);
+        assert_eq!(f.0.lock().unwrap().relaunched.len(), before + 1, "the new host supervises the crew again");
+        let (msgs, _, _) = read_log(&paths).unwrap();
+        let replayed = crate::supervisor_program::replay(&msgs).0;
+        assert_eq!(replayed.status, Status::Running);
+        assert_eq!(replayed, c2.model, "replay of the extended log agrees");
+    }
+
+    #[test]
     fn a_stale_claims_settle_does_not_close_the_key() {
         let mut j = MemJournal::default();
         let g1 = match j.begin("relaunch:a:2") {
