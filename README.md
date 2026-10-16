@@ -188,6 +188,24 @@ content). Budget 5/30/3 with per-channel queues, rolling windows, and a
 microsecond high-water; the filter is deliberately tight (reactions are not
 wake-worthy).
 
+## Supervisor host (Phase 4a)
+
+With `TORON_COMMS_INBOX=1` (or `[comms] inbox_log=true`), `loop-mode supervise`
+runs a `SupervisorProgram` host: restart intensity (leads 3 per 30 min,
+captain 2 per 60 min), generation fencing, a steer gate, and a lease fence,
+all folded from an append-only log under the state dir. Flag off, the legacy
+supervise path runs unchanged.
+
+`flywheel supervisor fact|steer|view` are **not** flag-gated: they only append
+to, or read, that log. Without a running host they are inert — a fact or steer
+is recorded and acted on when a host next starts; nothing is rung or
+relaunched by the verb itself. `view` is read-only.
+
+If a host stops with "restart intensity exceeded", fix the cause and re-run
+`supervise`: a new host is a new incarnation (the intensity window starts
+over, crews the failure halted are re-adopted from the registry; the
+escalation stays on record, and an operator's `steer cancel` stays final).
+
 ## Command map
 
 | Group | Commands |
