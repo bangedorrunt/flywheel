@@ -60,6 +60,7 @@ mod inbox_ports;
 mod ingress;
 mod init_scaffold;
 mod intent;
+mod lead_claim;
 mod private_fs;
 mod spawn_facts;
 mod stale_check;
