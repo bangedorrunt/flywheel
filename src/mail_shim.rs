@@ -61,7 +61,7 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// default, `TORON_DATA_DIR` / `TORON_MCP_DATA_DIR` override.
 static MAILBOX: OnceLock<toron_core::mailbox::Mailbox> = OnceLock::new();
 
-fn runtime() -> Result<&'static Runtime> {
+pub(crate) fn runtime() -> Result<&'static Runtime> {
     init_once(&RUNTIME, &INIT_GATE, || {
         Runtime::new().map_err(|e| format!("failed to initialize tokio runtime: {e}"))
     })

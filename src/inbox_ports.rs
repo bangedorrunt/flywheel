@@ -120,7 +120,7 @@ impl FlywheelPorts {
         }
     }
 
-    fn store(&mut self) -> Option<&InboxStore> {
+    pub(crate) fn store(&mut self) -> Option<&InboxStore> {
         if self.store.is_none() {
             match crate::comms_send::store() {
                 Ok(s) => self.store = Some(s),
@@ -135,7 +135,7 @@ impl FlywheelPorts {
         self.store.as_ref()
     }
 
-    fn npub_of(&mut self, pin: &str) -> Option<String> {
+    pub(crate) fn npub_of(&mut self, pin: &str) -> Option<String> {
         if let Some(n) = self.npubs.get(pin) {
             return Some(n.clone());
         }
@@ -173,6 +173,19 @@ impl FlywheelPorts {
     }
 
     fn notify_pin(&mut self, pin: &str, text: String, key: &str) -> Result<(), String> {
+        self.append_notify(pin, text, key, 0).map(|_| ())
+    }
+
+    /// Append one `notify@1` to `pin`'s inbox as the system producer; returns
+    /// the log offset. `generation` is the envelope's (a steer carries the
+    /// child's incarnation).
+    pub(crate) fn append_notify(
+        &mut self,
+        pin: &str,
+        text: String,
+        key: &str,
+        generation: u64,
+    ) -> Result<u64, String> {
         let to = self
             .npub_of(pin)
             .ok_or_else(|| format!("no npub for {pin}"))?;
@@ -201,7 +214,7 @@ impl FlywheelPorts {
                 contract: ContractId::new("notify", 1),
                 context: ContextId(format!("{project}:{key}")),
                 task: None,
-                generation: 0,
+                generation: u32::try_from(generation).unwrap_or(u32::MAX),
                 causation: None,
                 deadline_ts_us: None,
                 lease_ms: None,
@@ -211,7 +224,7 @@ impl FlywheelPorts {
             store
                 .append_envelope(&env)
                 .await
-                .map(|_| ())
+                .map(|a| a.offset)
                 .map_err(|e| e.to_string())
         })
     }
