@@ -111,11 +111,14 @@ impl FlywheelPorts {
     /// The ledger the supervisor host shares with this host (one wake per
     /// mail, counting both; see `ring_ledger`).
     pub(crate) fn ring_ledger(&self) -> crate::ring_ledger::RingLedger {
-        crate::ring_ledger::RingLedger::new(config::state_dir().join("inbox").join(format!(
-            "{}-{}-rings",
-            crate::state::state_key(&self.project),
-            crate::state::state_key(&self.workspace)
-        )))
+        // Keyed by project alone: the supervisor host's workspace is the
+        // project name, the doorbell's may be a herdr workspace id, and both
+        // must reach the same ledger.
+        crate::ring_ledger::RingLedger::new(
+            config::state_dir()
+                .join("inbox")
+                .join(format!("{}-rings", crate::state::state_key(&self.project))),
+        )
     }
 
     fn budget_path(&self) -> std::path::PathBuf {
