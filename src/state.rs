@@ -595,12 +595,20 @@ pub struct ExpectedReply {
     pub created_ts: String,
 }
 
-/// Key of one outstanding ask under the comms flag: `(from, request msg id)`.
-/// The agent-keyed [`ExpectedReply`] list is unchanged. Not wired at the
-/// collab insert: that site has no flag check, so it still overwrites.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Key of one outstanding ask: `(from, request msg id)`.
 pub fn ask_key(from: &str, msg_id: &str) -> String {
     format!("{from}\u{1f}{msg_id}")
+}
+
+/// Insert `new`. Flag off replaces every ask from that agent. Flag on
+/// replaces only the same `(agent, head)`, so two asks from one agent stay.
+pub fn upsert_expected_reply(flag: bool, entries: &mut Vec<ExpectedReply>, new: ExpectedReply) {
+    if flag {
+        entries.retain(|e| !(e.agent == new.agent && e.head == new.head));
+    } else {
+        entries.retain(|e| e.agent != new.agent);
+    }
+    entries.push(new);
 }
 
 /// Outstanding asks beside the agent-keyed list. Flag off: one slot per
@@ -2896,6 +2904,35 @@ mod loops_sidecar_tests {
             Some("t2")
         );
         assert_ne!(ask_key("CalmGate", "m1"), "CalmGate");
+    }
+
+    #[test]
+    fn upsert_keeps_two_asks_from_one_agent_only_when_the_flag_is_on() {
+        let mk = |head: &str, thread: &str| ExpectedReply {
+            agent: "CalmGate".into(),
+            thread: thread.into(),
+            head: Some(head.into()),
+            created_ts: "t".into(),
+        };
+        let mut off = Vec::new();
+        upsert_expected_reply(false, &mut off, mk("m1", "t1"));
+        upsert_expected_reply(false, &mut off, mk("m2", "t2"));
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].head.as_deref(), Some("m2"));
+        let mut on = Vec::new();
+        upsert_expected_reply(true, &mut on, mk("m1", "t1"));
+        upsert_expected_reply(true, &mut on, mk("m2", "t2"));
+        assert_eq!(on.len(), 2);
+        upsert_expected_reply(true, &mut on, mk("m1", "t-new"));
+        assert_eq!(on.len(), 2);
+        assert!(
+            on.iter()
+                .any(|e| e.head.as_deref() == Some("m1") && e.thread == "t-new")
+        );
+        assert!(
+            on.iter()
+                .any(|e| e.head.as_deref() == Some("m2") && e.thread == "t2")
+        );
     }
 
     /// bd-fw-name-binding-loss-7rc: the spawn registry (pane_id → name)

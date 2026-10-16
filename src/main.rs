@@ -61,6 +61,7 @@ mod ingress;
 mod init_scaffold;
 mod intent;
 mod private_fs;
+mod spawn_facts;
 mod stale_check;
 mod steer_delta;
 mod stuck_vs_busy;
@@ -13013,82 +13014,33 @@ pub(crate) fn bind_pane_mail_identity(
     }
 }
 
-/// Bodies toron accepts for the two spawn facts: `context@1` is
-/// `{topology, gen}`, `role@1` is `{npub, role, gen}`. `context` is the
-/// envelope's context, not a body field. A topology word that is not the
-/// enum (`join`, `none`) becomes JSON null so it is not stored as one.
-pub(crate) fn spawn_facts(
-    context: &str,
-    topology: &str,
-    pin_npub: &str,
-    role: &str,
-    generation: u32,
-) -> [Value; 2] {
-    let topology = match briefing::topology_enum(topology) {
-        Some(t) => Value::String(t.as_str().to_string()),
-        None => Value::Null,
-    };
-    [
-        json!({
-            "contract": "context@1",
-            "context": context,
-            "body": { "topology": topology, "gen": generation }
-        }),
-        json!({
-            "contract": "role@1",
-            "context": context,
-            "body": { "npub": pin_npub, "role": role, "gen": generation }
-        }),
-    ]
-}
-
-/// After the pane stamp, under the comms flag only: say that `context@1`
-/// and `role@1` should be appended. Does not append and does not shell out.
+/// After the pane stamp, under the comms flag only: append `context@1` and
+/// `role@1`. A store miss or a refusal is logged. The spawn still returns.
 fn record_spawn_comms_facts(project: &str, pin: &str, npub: &str) {
     let stored = state::load_session_topology(project).unwrap_or_default();
     let (word, _) = briefing::split_topology(&stored);
     // ponytail: the stamp has no decide row. Empty / `none` falls through to
     // swarm because this only runs for a pane that was just spawned; a stored
     // swarm|loop|open|supervisor (and join, via split_topology) is kept.
-    let topology = match briefing::topology_enum(word) {
-        Some(t) => t.as_str(),
-        None => "swarm",
-    };
+    let topology = briefing::topology_enum(word).unwrap_or(toron_core::topology::Topology::Swarm);
     let role = if state::load_captain_alias(project).as_deref() == Some(pin) {
-        "captain"
+        toron_core::authority::Role::Captain
     } else {
-        "crew"
+        toron_core::authority::Role::Crew
     };
-    let facts = spawn_facts(project, topology, npub, role, 1);
-    eprintln!(
-        "flywheel: comms context@1 and role@1 pending append for {pin} (not sent): {}",
-        serde_json::to_string(&facts).unwrap_or_default()
-    );
-}
-
-#[cfg(test)]
-mod spawn_facts_tests {
-    use super::*;
-
-    #[test]
-    fn spawn_facts_are_context_and_role_bodies() {
-        let npub = "ab".repeat(32);
-        let [context, role] = spawn_facts("proj", "swarm", &npub, "crew", 3);
-        assert_eq!(context["contract"], "context@1");
-        assert_eq!(context["context"], "proj");
-        assert_eq!(context["body"]["topology"], "swarm");
-        assert_eq!(context["body"]["gen"], 3);
-        assert!(context["body"].get("npub").is_none());
-        assert_eq!(role["contract"], "role@1");
-        assert_eq!(role["context"], "proj");
-        assert_eq!(role["body"]["npub"], npub);
-        assert_eq!(role["body"]["role"], "crew");
-        assert_eq!(role["body"]["gen"], 3);
-        assert!(role["body"].get("topology").is_none());
-        let [join_ctx, _] = spawn_facts("proj", "join", &npub, "crew", 1);
-        assert!(join_ctx["body"]["topology"].is_null());
-        let [sup, _] = spawn_facts("proj", "supervisor", &npub, "crew", 1);
-        assert_eq!(sup["body"]["topology"], "supervisor");
+    let store = match comms_send::store() {
+        Ok(store) => store.with_operator(inbox_ports::system_producer(project)),
+        Err(e) => {
+            eprintln!("flywheel: comms spawn facts skipped for {pin}: {e:#}");
+            return;
+        }
+    };
+    match mail_shim::block_on(spawn_facts::append_spawn_facts(
+        &store, project, topology, npub, role,
+    )) {
+        Ok(Some(what)) => eprintln!("flywheel: comms recorded {what} for {pin}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("flywheel: comms spawn facts not appended for {pin}: {e}"),
     }
 }
 
@@ -21920,15 +21872,19 @@ fn cmd_collab(
     {
         let mut entries = state::load_expected_replies(project);
         let ts = crate::state::now_iso();
+        // Flag off keeps one ask per agent. Flag on keeps one per (agent, msg).
+        let flag = comms_inbox_on();
         for t in &targets {
-            let agent = t.clone();
-            entries.retain(|e| e.agent != agent); // one outstanding ask per agent
-            entries.push(state::ExpectedReply {
-                agent,
-                thread: thread_id.clone(),
-                head: Some(msg_id.clone()),
-                created_ts: ts.clone(),
-            });
+            state::upsert_expected_reply(
+                flag,
+                &mut entries,
+                state::ExpectedReply {
+                    agent: t.clone(),
+                    thread: thread_id.clone(),
+                    head: Some(msg_id.clone()),
+                    created_ts: ts.clone(),
+                },
+            );
         }
         if let Err(e) = state::save_expected_replies(project, &entries) {
             eprintln!("flywheel: cannot save expected-reply registry: {e:#}");
