@@ -108,6 +108,14 @@ impl FlywheelPorts {
             .join(format!("{}-inbox.jsonl", crate::state::state_key(&self.project)))
     }
 
+    fn budget_path(&self) -> std::path::PathBuf {
+        config::state_dir().join("inbox").join(format!(
+            "{}-{}-ring-budget.json",
+            crate::state::state_key(&self.project),
+            crate::state::state_key(&self.workspace)
+        ))
+    }
+
     fn load_facts(&mut self) {
         if let Ok(s) = std::fs::read_to_string(self.facts_path()) {
             for l in s.lines() {
@@ -317,6 +325,31 @@ impl Ports for FlywheelPorts {
         let client = self.client().ok_or("herdr unreachable")?;
         crate::pane_write::write(&crate::pane_write::HerdrPanes(&client), pane_id, &w)
             .map_err(|e| e.to_string())
+    }
+
+    fn load_budget(&mut self) -> BTreeMap<String, crate::inbox_host::Budget> {
+        std::fs::read_to_string(self.budget_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_budget(
+        &mut self,
+        budget: &BTreeMap<String, crate::inbox_host::Budget>,
+    ) -> Result<(), String> {
+        let path = self.budget_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        // Write-then-rename: a crash leaves the old file or the new, never half.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec(budget).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
     }
 
     fn fact(&mut self, key: &str, mut fact: Value) -> Result<(), String> {
