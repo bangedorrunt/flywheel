@@ -61,6 +61,7 @@ mod ingress;
 mod init_scaffold;
 mod intent;
 mod lead_claim;
+mod redact;
 mod private_fs;
 mod spawn_facts;
 mod stale_check;
@@ -22692,10 +22693,12 @@ fn cmd_loop_supervise(
                 error,
             } = action
             {
-                let line = format!(
-                    "loop-mode supervise: PANE WEDGE in {project} — {pin} ({pane_id}) is alive but \
-                     parked on: {error} (nothing committed for {}s)",
-                    probe.last_commit_age_secs.unwrap_or(0)
+                let line = redact::wedge_notice(
+                    project,
+                    &pin,
+                    &pane_id,
+                    &error,
+                    probe.last_commit_age_secs.unwrap_or(0),
                 );
                 eprintln!(
                     "{line} — paging the captain once (clear it with a fresh session: \
