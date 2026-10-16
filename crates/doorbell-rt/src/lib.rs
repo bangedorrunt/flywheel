@@ -42,7 +42,7 @@ pub use policy::{RestartPolicy, WatchRetry};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
 pub use sinks::{
     CliPromptSink, MockSink, NoTextSink, PromptSink, SendOutcome, SinkManager, Undelivered,
-    comms_inbox_env, daemon_claims_writer_lease,
+    comms_inbox_env,
 };
 pub use store::{FileStore, Fold, TornTail};
 pub use subscribe::{
