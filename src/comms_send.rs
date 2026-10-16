@@ -675,8 +675,7 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
                         "left to the doorbell host (budgeted, level-triggered)".to_string()
                     } else {
                         let panes = crate::pane_write::HerdrPanes(c);
-                        match crate::mail_shim::block_on(ring(&store, &panes, &target, &row.npub))
-                        {
+                        match crate::mail_shim::block_on(ring(&store, &panes, &target, &row.npub)) {
                             Ok(wm) => format!("rung wm {:x}", wm.0),
                             Err(e) => format!("failed: {e:#}"),
                         }
@@ -704,9 +703,17 @@ fn doorbell_owner_in(
     workspace: Option<&str>,
     now: u64,
 ) -> Option<u32> {
+    // A lease counts only if its holder RINGS: a daemon host under the comms
+    // flag holds the workspace lease but types nothing (kind `no-text`), so
+    // deferring to it left the workspace silent. The inbox host's own lease
+    // (`inbox-<ws>`) is the ringer there (follow-up a).
+    let inbox = workspace.map(doorbell_rt::lease::inbox_lease_key);
     doorbell_rt::lease::live_leases(state_dir, now)
         .into_iter()
-        .find(|(ws, _)| ws == project || Some(ws.as_str()) == workspace)
+        .find(|(ws, l)| {
+            (ws == project || Some(ws.as_str()) == workspace) && doorbell_rt::lease::is_ringer(l)
+                || Some(ws) == inbox.as_ref()
+        })
         .map(|(_, l)| l.pid)
 }
 
@@ -1015,14 +1022,27 @@ mod tests {
             .await
             .unwrap();
         let (head, cursor) = crate::inbox_ports::head_and_cursor(&store, B).await;
-        assert!(head > 0 && cursor == 0, "unread mail: head {head} > cursor 0");
+        assert!(
+            head > 0 && cursor == 0,
+            "unread mail: head {head} > cursor 0"
+        );
         // The agent runs `toron next`: the cursor commits to the head.
         let got = store.next(B, None, false).await.unwrap();
         assert_eq!(got.items.len(), 1);
         let (head2, cursor2) = crate::inbox_ports::head_and_cursor(&store, B).await;
-        assert_eq!((head2, cursor2), (head, head), "the ack is seen: cursor == head");
+        assert_eq!(
+            (head2, cursor2),
+            (head, head),
+            "the ack is seen: cursor == head"
+        );
         // The wrong key (the log's name) never sees it: the bug this pins.
-        assert_eq!(store.cursor(B, toron_core::inbox::INBOX_STREAM).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .cursor(B, toron_core::inbox::INBOX_STREAM)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1037,9 +1057,44 @@ mod tests {
         // Another project's owner is not this project's writer.
         assert_eq!(doorbell_owner_in(dir.path(), "other", None, now), None);
         // The workspace name (a label that differs from the project) counts.
-        assert_eq!(doorbell_owner_in(dir.path(), "x", Some("proj"), now), Some(me));
+        assert_eq!(
+            doorbell_owner_in(dir.path(), "x", Some("proj"), now),
+            Some(me)
+        );
         // A wedged heartbeat is no owner: the sender falls back to ringing.
-        assert_eq!(doorbell_owner_in(dir.path(), "proj", None, now + 1000), None);
+        assert_eq!(
+            doorbell_owner_in(dir.path(), "proj", None, now + 1000),
+            None
+        );
+    }
+
+    /// Follow-up (a), the regression: a LIVE lease held by a daemon host that
+    /// types nothing (comms flag) must not silence the sender; the inbox
+    /// host's own lease is the ringer there.
+    #[test]
+    fn a_live_lease_held_by_a_no_text_daemon_does_not_silence_the_sender() {
+        use doorbell_rt::lease::{KIND_NO_TEXT, acquire_lease_kind, inbox_lease_key};
+        let dir = tempfile::tempdir().unwrap();
+        let now = doorbell_rt::lease::unix_now();
+        // The daemon (a live process: this one) holds the workspace, typing nothing.
+        let held = acquire_lease_kind(dir.path(), "proj", now, Some(KIND_NO_TEXT)).unwrap();
+        assert_eq!(held.pid, std::process::id(), "the holder is alive");
+        assert_eq!(
+            doorbell_owner_in(dir.path(), "proj", Some("proj"), now),
+            None,
+            "sender rings itself"
+        );
+        // The inbox host comes up beside it: now there IS a ringer to defer to.
+        acquire_lease_kind(dir.path(), &inbox_lease_key("proj"), now, None).unwrap();
+        assert_eq!(
+            doorbell_owner_in(dir.path(), "proj", Some("proj"), now),
+            Some(std::process::id())
+        );
+        // A different workspace's inbox lease is not this one's.
+        assert_eq!(
+            doorbell_owner_in(dir.path(), "other", Some("other"), now),
+            None
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

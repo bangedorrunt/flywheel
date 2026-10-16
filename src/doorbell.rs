@@ -3749,6 +3749,7 @@ mod tests {
             host: "audit".into(),
             started_unix: now,
             heartbeat_unix: now,
+            kind: None,
         };
         std::fs::write(
             owner_file(&dir, "ws"),
