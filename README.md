@@ -213,6 +213,20 @@ is refused before anything is queued). The host puts the delta in the steer
 mail's body, never in a pane; the supervisor log keeps only its sha256. The crew
 sees it with `toron next`, and re-claims at the next generation once it acks.
 
+### Runs later
+
+These verbs cause something to run later on the operator's behalf. Allow-list
+them only when that is intended:
+
+- `Relaunch` of a lead (the host spawns `flywheel loop-mode supervise`)
+- hook install (edits an operator-owned file; no harness is verified, so the host does not install one today)
+- `--delta-file` (queues a goal the crew will act on)
+- `loop-mode supervise` (the host itself)
+
+Safe set, read or append only: `supervisor fact`, `supervisor steer`, `supervisor view`, `next`, `ack`, `done`, `inbox`. They do not spawn and they do not edit operator files.
+
+`FLYWHEEL_ALLOW_EXEC=0` makes that host log-only for the process: it still folds and records facts, and it does not `Relaunch`, does not install a hook, and does not write a pane except the constant wake line. Each suppressed effect is one stderr line and one line in `<context>.log.suppressed`. Unset, or any value other than `0`, is today's behaviour. The switch is not stored.
+
 ## Command map
 
 | Group | Commands |
