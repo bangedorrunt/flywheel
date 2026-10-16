@@ -2734,7 +2734,8 @@ fn main() {
             "judgment pack drift|seed|remove|list — compare and sync judgment packs across the user tier (source of truth) and the project tier; a user pack at a higher version is never downgraded",
             "stage remove <name> — delete a user-tier stage file (backed up as <name>.toml.bak) so the compiled-in stage resolves again",
                 "checkpoint timeline audit history changes resume analytics",
-                "backend safety guards policy deps integration config upgrade tutorial serve preflight"
+                "backend safety guards policy deps integration config upgrade tutorial serve preflight",
+            "supervisor fact|steer|view|hooks (hooks reports the marked hook block; production harnesses stay unverified)"
             ],
             "tracker": "br/bv (CLI, no MCP)",
             "coordination": "toron mail",
@@ -6082,7 +6083,8 @@ mod workspace_origin_tests {
         let a = src.find("\nfn prime_bootstrap_with(").unwrap();
         let body = &src[a..a + src[a..].find("\n}\n").unwrap()];
         assert!(
-            body.contains("PrimeChoice::Bootstrap(h) => {\n            pane_write::launch_bootstrap_into(c, pane_id, h);\n        }"),
+            body.contains("pane_write::launch_bootstrap_into(c, pane_id, h);")
+                && body.contains("note_launch_hook(kind);"),
             "the flag arm goes through the PaneWrite sink: {body}"
         );
         let arm = concat!("=> prime_via", "_send_text(c, pane_id)");
@@ -7861,8 +7863,30 @@ fn prime_bootstrap_with(c: &mut Client, pane_id: &str, kind: &str, inbox: bool) 
     match prime_choice(inbox, kind) {
         PrimeChoice::Bootstrap(h) => {
             pane_write::launch_bootstrap_into(c, pane_id, h);
+            note_launch_hook(kind);
         }
         PrimeChoice::LegacyReady => prime_via_send_text(c, pane_id),
+    }
+}
+
+/// Capable harness, comms flag already on (this only runs from the
+/// bootstrap arm). A missing file name or an unverified harness does
+/// nothing. Exec off leaves the operator file untouched and says so.
+/// A failed write keeps Interrupt; it does not go quiet.
+fn note_launch_hook(kind: &str) {
+    let path = std::env::var("FLYWHEEL_SUPERVISOR_HOOK_FILE").ok();
+    match harness_caps::plan_launch_hook(
+        kind,
+        path.as_deref().map(std::path::Path::new),
+        supervisor_host::exec_allowed(),
+    ) {
+        harness_caps::LaunchHook::Suppressed => {
+            eprintln!("flywheel supervisor: suppressed hook install: FLYWHEEL_ALLOW_EXEC=0");
+        }
+        harness_caps::LaunchHook::Failed(e) => {
+            eprintln!("flywheel supervisor: hook install failed ({e}); interrupt stays");
+        }
+        harness_caps::LaunchHook::Skip | harness_caps::LaunchHook::Installed => {}
     }
 }
 
