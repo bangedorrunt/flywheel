@@ -22,6 +22,29 @@ pub struct OwnerLease {
     pub host: String,
     pub started_unix: u64,
     pub heartbeat_unix: u64,
+    /// What the holder does with the workspace. `None` = a ringing writer
+    /// (the legacy lease and the embedded host). [`KIND_NO_TEXT`] = a daemon
+    /// host under the comms flag: it holds the workspace's journal and
+    /// brain but types nothing, so it is not "the ringer" (follow-up a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// The lease kind of a daemon host that types nothing (comms flag on).
+pub const KIND_NO_TEXT: &str = "no-text";
+
+/// Does the holder of `lease` ring panes? A no-text daemon host does not, so
+/// a sender must not defer to it and `flywheel __doorbell` may run its inbox
+/// host beside it.
+pub fn is_ringer(lease: &OwnerLease) -> bool {
+    lease.kind.as_deref() != Some(KIND_NO_TEXT)
+}
+
+/// The lease key of the INBOX host (the pane writer under the comms flag) for
+/// `workspace`: a second lease, so two inbox hosts cannot ring one workspace
+/// even while a no-text daemon holds the workspace lease itself.
+pub fn inbox_lease_key(workspace: &str) -> String {
+    format!("inbox-{workspace}")
 }
 pub fn owner_file(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir
@@ -115,6 +138,16 @@ pub fn acquire_lease(
     workspace: &str,
     now_unix: u64,
 ) -> Result<OwnerLease, LeaseDenied> {
+    acquire_lease_kind(state_dir, workspace, now_unix, None)
+}
+
+/// [`acquire_lease`] recording what the holder does ([`KIND_NO_TEXT`]).
+pub fn acquire_lease_kind(
+    state_dir: &Path,
+    workspace: &str,
+    now_unix: u64,
+    kind: Option<&str>,
+) -> Result<OwnerLease, LeaseDenied> {
     if let Some(cur) = read_lease(state_dir, workspace)
         && !lease_stale(&cur, now_unix)
     {
@@ -126,6 +159,7 @@ pub fn acquire_lease(
         host: host_name(),
         started_unix: now_unix,
         heartbeat_unix: now_unix,
+        kind: kind.map(str::to_string),
     };
     write_lease(state_dir, workspace, &lease)?;
     Ok(lease)
@@ -198,6 +232,34 @@ pub fn deference_decision(
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_lease_kind_round_trips_and_a_legacy_file_is_a_ringer() {
+        let d = std::env::temp_dir().join(format!("dbrt-lease-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let now = unix_now();
+        let held = acquire_lease_kind(&d, "w", now, Some(KIND_NO_TEXT)).unwrap();
+        let read = read_lease(&d, "w").unwrap();
+        assert_eq!(read.kind.as_deref(), Some(KIND_NO_TEXT));
+        assert!(!is_ringer(&read));
+        release_lease(&d, "w", &held);
+        // A lease written before `kind` existed has no such field: a ringer.
+        std::fs::create_dir_all(d.join("doorbell")).unwrap();
+        std::fs::write(
+            owner_file(&d, "w"),
+            r#"{"pid":1,"boot_id":"b","host":"h","started_unix":1,"heartbeat_unix":1}"#,
+        )
+        .unwrap();
+        let legacy = read_lease(&d, "w").unwrap();
+        assert!(legacy.kind.is_none() && is_ringer(&legacy));
+        // The plain acquire writes no kind at all.
+        release_lease(&d, "w", &legacy);
+        let _ = std::fs::remove_file(owner_file(&d, "w"));
+        let plain = acquire_lease(&d, "w", now).unwrap();
+        assert!(!std::fs::read_to_string(owner_file(&d, "w")).unwrap().contains("kind"));
+        assert_eq!(inbox_lease_key("w"), "inbox-w");
+        release_lease(&d, "w", &plain);
+    }
+
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("dbrt-lease-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -249,6 +311,7 @@ mod tests {
             host: host_name(),
             started_unix: now,
             heartbeat_unix: now,
+            kind: None,
         };
         assert_eq!(
             deference_decision(Some(&live), true, now),

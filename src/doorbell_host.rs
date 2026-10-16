@@ -291,10 +291,7 @@ impl RtHost {
     /// toron-core surfaces it as a typed signal (see hook below).
     fn cover_new_panes(&mut self) {
         let registry = state::load_spawn_registry(&self.project);
-        let covered = self
-            .covered_panes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let covered = self.covered_panes.lock().unwrap_or_else(|e| e.into_inner());
         let pane_ids: Vec<(String, String)> = registry
             .iter()
             .filter(|e| !e.pane_id.is_empty())
@@ -343,10 +340,7 @@ impl RtHost {
         };
 
         {
-            let mut covered = self
-                .covered_panes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut covered = self.covered_panes.lock().unwrap_or_else(|e| e.into_inner());
             covered.extend(attempt_ids.iter().cloned());
         }
 
@@ -358,8 +352,9 @@ impl RtHost {
                 match stream.read_outcome() {
                     Ok(StreamOutcome::Event(ev)) => {
                         if let crate::herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
-                        | crate::herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) =
-                            ev.data
+                        | crate::herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(
+                            change,
+                        ) = ev.data
                         {
                             let pin = pin_by_pane
                                 .get(&change.pane_id)
@@ -423,9 +418,8 @@ fn reconcile_status_after_events_lost(
         return;
     };
     let agents = match c.call("session.snapshot", serde_json::json!({})) {
-        Ok(snap) => agents_from_session_snapshot(&snap).unwrap_or_else(|| {
-            c.agent_list().unwrap_or_default()
-        }),
+        Ok(snap) => agents_from_session_snapshot(&snap)
+            .unwrap_or_else(|| c.agent_list().unwrap_or_default()),
         Err(e) => {
             eprintln!(
                 "flywheel doorbell: session.snapshot failed ({e:#}) — falling back to agent.list"
@@ -454,19 +448,11 @@ fn agents_from_session_snapshot(
     // Common shapes: { agents: [...] } or { panes: [...] } with agent fields,
     // or nested under tabs. Prefer an agents array; else try panes.
     if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {
-        let parsed: Result<Vec<_>, _> = arr
-            .iter()
-            .cloned()
-            .map(serde_json::from_value)
-            .collect();
+        let parsed: Result<Vec<_>, _> = arr.iter().cloned().map(serde_json::from_value).collect();
         return parsed.ok();
     }
     if let Some(arr) = snap.get("panes").and_then(|v| v.as_array()) {
-        let parsed: Result<Vec<_>, _> = arr
-            .iter()
-            .cloned()
-            .map(serde_json::from_value)
-            .collect();
+        let parsed: Result<Vec<_>, _> = arr.iter().cloned().map(serde_json::from_value).collect();
         return parsed.ok();
     }
     None
@@ -878,6 +864,43 @@ impl RtHost {
     }
 }
 
+/// The inbox host alone, beside a no-text daemon host (comms flag). It holds
+/// the `inbox-<ws>` lease (one pane writer per workspace), the pid file the
+/// spawn path uses, and nothing of the journal or the brain.
+fn run_inbox_only(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
+    let sd = config::state_dir();
+    let key = doorbell_rt::lease::inbox_lease_key(workspace);
+    let mut lease = doorbell_rt::lease::acquire_lease(&sd, &key, doorbell_rt::lease::unix_now())
+        .map_err(|e| {
+            anyhow::anyhow!("flywheel doorbell: inbox host refuse double-run (live lease): {e:?}")
+        })?;
+    let path = doorbell::pid_file(&sd, workspace);
+    doorbell::write_pid(&path, std::process::id())?;
+    eprintln!(
+        "flywheel doorbell: comms flag on; a daemon host holds {project}/{workspace} but types nothing — running the inbox host only (pane writer)"
+    );
+    let mut host = crate::inbox_host::InboxHost::spawn(
+        crate::inbox_ports::FlywheelPorts::new(cfg, project, workspace),
+        crate::inbox_host::HostCfg::from_env(),
+    );
+    let mut beats = 0u32;
+    while path.exists() {
+        std::thread::sleep(Duration::from_secs(1));
+        beats += 1;
+        if beats % 30 == 0 {
+            doorbell_rt::lease::refresh_lease(
+                &sd,
+                &key,
+                &mut lease,
+                doorbell_rt::lease::unix_now(),
+            );
+        }
+    }
+    host.stop();
+    doorbell_rt::lease::release_lease(&sd, &key, &lease);
+    Ok(())
+}
+
 pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
     use anyhow::Context;
     // F3/bd-ene2 D9 layer 1 — claim the single-writer lease for THIS
@@ -885,10 +908,22 @@ pub fn run_embedded(cfg: &Config, project: &str, workspace: &str) -> anyhow::Res
     // is independent). Live lease held elsewhere for the same workspace
     // means another loop runs: refuse, never double-run.
     let now = doorbell_rt::lease::unix_now();
-    let lease =
-        doorbell_rt::lease::acquire_lease(&config::state_dir(), workspace, now).map_err(|e| {
-            anyhow::anyhow!("flywheel doorbell: embedded refuse double-run (live lease): {e:?}")
-        })?;
+    let lease = match doorbell_rt::lease::acquire_lease(&config::state_dir(), workspace, now) {
+        Ok(l) => l,
+        // Comms flag, workspace held by a daemon host that types nothing: it
+        // owns the journal and the brain; this process is the pane writer, so
+        // run the inbox host alone (follow-up a). Anything else: refuse.
+        Err(doorbell_rt::lease::LeaseDenied::Held(h))
+            if crate::comms_send::enabled(cfg) && !doorbell_rt::lease::is_ringer(&h) =>
+        {
+            return run_inbox_only(cfg, project, workspace);
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "flywheel doorbell: embedded refuse double-run (live lease): {e:?}"
+            ));
+        }
+    };
     let path = doorbell::pid_file(&config::state_dir(), workspace);
     doorbell::write_pid(&path, std::process::id())?;
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
@@ -1591,6 +1626,37 @@ mod events_lost_tests {
 
 #[cfg(test)]
 mod inbox_flag_tests {
+    /// Follow-up (a): beside a no-text daemon host the embedded loop runs the
+    /// inbox host ALONE (no brain, no journal: the daemon owns them), under its
+    /// own lease; anything else still refuses a live lease.
+    #[test]
+    fn beside_a_no_text_daemon_the_inbox_host_runs_alone_under_its_own_lease() {
+        let src = include_str!("doorbell_host.rs");
+        let a = src.find("pub fn run_embedded(").unwrap();
+        let head = &src[a..a + 1500];
+        assert!(
+            head.contains("is_ringer(&h)")
+                && head.contains("run_inbox_only(cfg, project, workspace)")
+        );
+        assert!(
+            head.contains("embedded refuse double-run"),
+            "other live leases still refuse"
+        );
+        let b = src.find("fn run_inbox_only(").unwrap();
+        let body = &src[b..src.find("pub fn run_embedded(").unwrap()];
+        assert!(body.contains("inbox_lease_key(workspace)"));
+        assert!(body.contains("InboxHost::spawn("));
+        for banned in [
+            "Brain::",
+            "FileStore",
+            "RtHost",
+            "SinkManager",
+            "spawn_bus_watch",
+        ] {
+            assert!(!body.contains(banned), "inbox-only must not touch {banned}");
+        }
+    }
+
     #[test]
     fn the_flag_arm_registers_no_text_sink_and_starts_the_inbox_host() {
         let src = include_str!("doorbell_host.rs");
@@ -1599,7 +1665,10 @@ mod inbox_flag_tests {
         let flag_arm = &tail[..tail.find("} else {").unwrap()];
         assert!(flag_arm.contains("doorbell_rt::NoTextSink::new()"));
         assert!(flag_arm.contains("InboxHost::spawn("));
-        assert!(!flag_arm.contains("HerdrPromptSink"), "no legacy sink under the flag");
+        assert!(
+            !flag_arm.contains("HerdrPromptSink"),
+            "no legacy sink under the flag"
+        );
         assert!(tail.find("} else {").unwrap() < tail.find("HerdrPromptSink::new(").unwrap());
     }
 }

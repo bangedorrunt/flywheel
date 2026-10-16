@@ -690,6 +690,17 @@ fn straggler_note(report: &DrainReport) -> Option<String> {
     Some(note)
 }
 
+/// The kind a daemon host stamps on its workspace lease: under the comms flag
+/// it types nothing ([`doorbell_rt::lease::KIND_NO_TEXT`]), so senders and
+/// `flywheel __doorbell` must not treat it as the ringer (follow-up a).
+fn daemon_lease_kind() -> Option<&'static str> {
+    daemon_lease_kind_for(doorbell_rt::comms_inbox_env())
+}
+
+fn daemon_lease_kind_for(comms_flag_on: bool) -> Option<&'static str> {
+    comms_flag_on.then_some(doorbell_rt::lease::KIND_NO_TEXT)
+}
+
 pub async fn run(cfg: &Config) -> Result<()> {
     use doorbell_rt::lease;
     let now = lease::unix_now();
@@ -742,7 +753,12 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let owned: Shared<Vec<(String, doorbell_rt::lease::OwnerLease)>> =
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     for (_, workspace) in &cfg.hosts {
-        match lease::acquire_lease(&cfg.flywheel_state, workspace, lease::unix_now()) {
+        match lease::acquire_lease_kind(
+            &cfg.flywheel_state,
+            workspace,
+            lease::unix_now(),
+            daemon_lease_kind(),
+        ) {
             Ok(l) => owned.lock().push((workspace.clone(), l)),
             Err(e) => {
                 for (ws, l) in owned.lock().iter() {
@@ -1250,7 +1266,7 @@ fn reconcile_once(
         {
             continue; // a live writer (embedded loop) owns it — never steal
         }
-        match lease::acquire_lease(&cfg.flywheel_state, &workspace, now) {
+        match lease::acquire_lease_kind(&cfg.flywheel_state, &workspace, now, daemon_lease_kind()) {
             Ok(l) => {
                 owned.lock().push((workspace.clone(), l));
                 eprintln!("doorbell serve: auto-hosting {project}/{workspace} (subscribed)");
@@ -2435,6 +2451,25 @@ mod tests {
         assert!(!flag_arm.contains("CliPromptSink"));
         let else_arm = &tail[tail.find("} else {").unwrap()..];
         assert!(else_arm.contains("CliPromptSink::new("), "flag-off path unchanged");
+    }
+
+    /// Follow-up (a): under the comms flag the daemon's workspace lease says it
+    /// types nothing; flag off it is the plain ringing-writer lease.
+    #[test]
+    fn the_daemon_lease_kind_follows_the_comms_flag() {
+        assert_eq!(super::daemon_lease_kind_for(true), Some("no-text"));
+        assert_eq!(super::daemon_lease_kind_for(false), None);
+        let src = include_str!("serve.rs");
+        let prod = &src[..src.find("\nmod tests {").unwrap()];
+        assert_eq!(prod.matches("lease::acquire_lease_kind(").count(), 2, "boot + auto-host claim");
+        assert!(!prod.contains("lease::acquire_lease(&cfg"), "no unstamped daemon claim");
+        let d = std::env::temp_dir().join(format!("db-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let held = doorbell_rt::lease::acquire_lease_kind(&d, "w", doorbell_rt::lease::unix_now(), super::daemon_lease_kind_for(true)).unwrap();
+        let read = doorbell_rt::lease::read_lease(&d, "w").unwrap();
+        assert_eq!(read.kind.as_deref(), Some("no-text"));
+        assert!(!doorbell_rt::lease::is_ringer(&read));
+        doorbell_rt::lease::release_lease(&d, "w", &held);
     }
 
     use super::known_journal_workspaces;

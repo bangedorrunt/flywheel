@@ -875,11 +875,16 @@ pub(crate) fn cmd_internal_doorbell(
     // bd-asr2.5: host selection — one implementation, two hosts. Daemon
     // mode never runs a local loop (subscription registration via API
     // lands in bd-asr2.8); embedded mode drives doorbell-rt's Brain.
-    match crate::doorbell::resolve_host(
-        &crate::config::state_dir(),
-        cfg.doorbell_url(),
-        Some((project, workspace)),
-    ) {
+    // Comms flag: the inbox host in THIS loop is the pane writer; a daemon
+    // host types nothing, so it never takes the loop (follow-up a).
+    let comms_on = crate::comms_send::enabled(cfg) || toron_core::inbox::enabled();
+    match crate::doorbell::host_for(comms_on, || {
+        crate::doorbell::resolve_host(
+            &crate::config::state_dir(),
+            cfg.doorbell_url(),
+            Some((project, workspace)),
+        )
+    }) {
         crate::doorbell::DoorbellHost::Proxy { url } => {
             eprintln!("flywheel doorbell: daemon host {url} — no local loop (attach only)");
             Ok(())
