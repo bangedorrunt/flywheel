@@ -25,7 +25,9 @@
 //! notification and a captain notification, once per watermark, and stops
 //! ringing.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
@@ -74,19 +76,55 @@ pub trait Ports: Send + 'static {
     fn reverify(&mut self, npub: &str) -> Option<Bind>;
     /// Type the constant wake line into `pane_id`. The host has already
     /// checked `binding_gen` against the fold's generation.
-    fn ring(
-        &mut self,
-        npub: &str,
-        pane_id: &str,
-        wm: u64,
-        line: &str,
-    ) -> Result<(), String>;
+    fn ring(&mut self, npub: &str, pane_id: &str, wm: u64, line: &str) -> Result<(), String>;
     /// Record one durable, keyed fact (`bind`, `deaf`). Idempotent by key.
     fn fact(&mut self, key: &str, fact: Value) -> Result<(), String>;
     /// A notify envelope for the supervisor's inbox.
     fn notify_supervisor(&mut self, npub: &str, wm: u64, cause: DeafCause) -> Result<(), String>;
     /// A notification for the captain.
     fn notify_captain(&mut self, npub: &str, wm: u64, cause: DeafCause) -> Result<(), String>;
+    /// The ring budgets a previous doorbell process left behind (empty when
+    /// none). Read once, at host start.
+    fn load_budget(&mut self) -> BTreeMap<String, Budget> {
+        BTreeMap::new()
+    }
+    /// Persist the ring budgets before the rings they paid for go out.
+    fn save_budget(&mut self, _budget: &BTreeMap<String, Budget>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The ring-budget state of one recipient that must survive a doorbell
+/// restart (follow-up b). The fold's model is RAM-only; without this a
+/// restart gave every deaf recipient a fresh budget (an unbounded ring
+/// total over repeated restarts) and re-emitted `deaf`. Time is not kept:
+/// `now_ms` is relative to the process start, so a restored recipient has no
+/// last-ring time and the first tick decides from the budget alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Budget {
+    pub head: u64,
+    pub cursor: u64,
+    pub last_ring_wm: Option<u64>,
+    pub rings_since_advance: u32,
+    pub deaf: Option<u64>,
+    /// The pane the budget was spent on. A restored binding is UNVERIFIED and
+    /// is re-verified before any ring; a different pane is a new incarnation
+    /// and gets a fresh budget (the fold's own rule).
+    pub pane_id: Option<String>,
+    pub herdr_session: Option<String>,
+}
+
+/// First wait after a failed re-verify, doubling to [`REVERIFY_BACKOFF_CAP_MS`]
+/// (follow-up c). Fold-clock milliseconds.
+pub const REVERIFY_BACKOFF_BASE_MS: u64 = 2_000;
+/// The longest wait between re-verifies of one unbound recipient.
+pub const REVERIFY_BACKOFF_CAP_MS: u64 = 60_000;
+
+/// Pure: the wait after the `fails`-th consecutive failed re-verify.
+pub fn reverify_backoff_ms(fails: u32) -> u64 {
+    REVERIFY_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << fails.saturating_sub(1).min(5))
+        .min(REVERIFY_BACKOFF_CAP_MS)
 }
 
 /// An input to the host thread besides the periodic tick.
@@ -104,6 +142,14 @@ pub enum Input {
 #[derive(Clone, Debug, Default)]
 pub struct Core {
     pub model: InboxModel,
+    /// This round's clock (the fold's `now_ms`), for the re-verify backoff.
+    pub now_ms: u64,
+    /// Consecutive failed re-verifies per recipient.
+    reverify_fails: BTreeMap<String, u32>,
+    /// Earliest `now_ms` of the next re-verify per recipient.
+    reverify_next_ms: BTreeMap<String, u64>,
+    /// What was last persisted, so an unchanged budget writes nothing.
+    saved: BTreeMap<String, Budget>,
 }
 
 fn tag(cause: DeafCause) -> &'static str {
@@ -114,6 +160,53 @@ fn tag(cause: DeafCause) -> &'static str {
 }
 
 impl Core {
+    /// Pure: the budgets worth persisting (recipients that have spent rings
+    /// or been declared deaf).
+    pub fn snapshot(&self) -> BTreeMap<String, Budget> {
+        self.model
+            .recipients
+            .iter()
+            .filter(|(_, r)| r.rings_since_advance > 0 || r.deaf.is_some())
+            .map(|(npub, r)| {
+                (
+                    npub.clone(),
+                    Budget {
+                        head: r.head,
+                        cursor: r.cursor,
+                        last_ring_wm: r.last_ring_wm,
+                        rings_since_advance: r.rings_since_advance,
+                        deaf: r.deaf,
+                        pane_id: r.binding.as_ref().map(|b| b.pane_id.clone()),
+                        herdr_session: r.binding.as_ref().map(|b| b.herdr_session.clone()),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Seed the model from persisted budgets (host start, before any round).
+    pub fn restore(&mut self, budgets: BTreeMap<String, Budget>) {
+        for (npub, b) in &budgets {
+            let r = self.model.recipients.entry(npub.clone()).or_default();
+            r.head = b.head;
+            r.cursor = b.cursor;
+            r.last_ring_wm = b.last_ring_wm;
+            r.rings_since_advance = b.rings_since_advance;
+            r.deaf = b.deaf;
+            r.binding = b
+                .pane_id
+                .as_ref()
+                .map(|pane_id| toron_core::inbox_program::Binding {
+                    pane_id: pane_id.clone(),
+                    herdr_session: b.herdr_session.clone().unwrap_or_default(),
+                    generation: self.model.generation,
+                    verified: false,
+                    verified_by: "restored".into(),
+                });
+        }
+        self.saved = budgets;
+    }
+
     /// Fold messages in order; return the commands they asked for.
     pub fn fold(&mut self, msgs: &[InboxMsg]) -> Vec<InboxCmd> {
         let mut out = Vec::new();
@@ -211,6 +304,8 @@ pub struct RoundReport {
     pub binds: u64,
     pub failed: u64,
     pub reverified: u64,
+    /// Re-verifies skipped because the recipient is inside its backoff.
+    pub backed_off: u64,
 }
 
 fn write_binds(core: &Core, before: &InboxModel, ports: &mut dyn Ports, rep: &mut RoundReport) {
@@ -225,12 +320,7 @@ fn write_binds(core: &Core, before: &InboxModel, ports: &mut dyn Ports, rep: &mu
 /// The effect boundary: interpret commands through `ports`. A failed command
 /// is fed back as `CmdFailed` (it changes nothing; the next tick decides
 /// again from durable state).
-pub fn execute(
-    core: &mut Core,
-    ports: &mut dyn Ports,
-    cmds: Vec<InboxCmd>,
-    rep: &mut RoundReport,
-) {
+pub fn execute(core: &mut Core, ports: &mut dyn Ports, cmds: Vec<InboxCmd>, rep: &mut RoundReport) {
     for cmd in cmds {
         let key = match cmd.durability() {
             Durability::Durable { key } => Some(key),
@@ -261,12 +351,35 @@ pub fn execute(
                 }
             }
             InboxCmd::Reverify { recipient } => {
-                rep.reverified += 1;
-                if let Some(b) = ports.reverify(&recipient) {
-                    let before = core.model.clone();
-                    let g = core.model.generation;
-                    core.fold(&[bound_msg(&recipient, &b, g)]);
-                    write_binds(core, &before, ports, rep);
+                // Follow-up c: an unbound recipient is re-verified at a
+                // backed-off pace, not a `pane.list` per tick. Escalation
+                // counts ticks, so it is not delayed by this.
+                let due = core
+                    .reverify_next_ms
+                    .get(&recipient)
+                    .is_none_or(|t| core.now_ms >= *t);
+                if !due {
+                    rep.backed_off += 1;
+                } else {
+                    rep.reverified += 1;
+                    let mut verified = false;
+                    if let Some(b) = ports.reverify(&recipient) {
+                        verified = b.verified;
+                        let before = core.model.clone();
+                        let g = core.model.generation;
+                        core.fold(&[bound_msg(&recipient, &b, g)]);
+                        write_binds(core, &before, ports, rep);
+                    }
+                    if verified {
+                        core.reverify_fails.remove(&recipient);
+                        core.reverify_next_ms.remove(&recipient);
+                    } else {
+                        let f = core.reverify_fails.entry(recipient.clone()).or_default();
+                        *f = f.saturating_add(1);
+                        let wait = reverify_backoff_ms(*f);
+                        core.reverify_next_ms
+                            .insert(recipient.clone(), core.now_ms.saturating_add(wait));
+                    }
                 }
                 Ok(())
             }
@@ -314,6 +427,7 @@ pub fn round(
     now_ms: u64,
 ) -> RoundReport {
     let mut rep = RoundReport::default();
+    core.now_ms = now_ms;
     let obs = ports.observe();
     let before = core.model.clone();
     let mut msgs: Vec<InboxMsg> = Vec::new();
@@ -323,6 +437,11 @@ pub fn round(
             Input::Invalidate(w) => msgs.push(InboxMsg::Invalidate(w)),
             Input::Hint(n) => hints.push(n),
         }
+    }
+    // A generation move (or a herdr restart) is a reason to look again now.
+    if obs.herdr_restarted || msgs.iter().any(|m| matches!(m, InboxMsg::Invalidate(_))) {
+        core.reverify_fails.clear();
+        core.reverify_next_ms.clear();
     }
     msgs.extend(core.msgs_for(&obs));
     for n in hints {
@@ -336,6 +455,18 @@ pub fn round(
     msgs.push(InboxMsg::Tick { now_ms });
     let cmds = core.fold(&msgs);
     write_binds(core, &before, ports, &mut rep);
+    // Follow-up b: the budget a ring spends is persisted BEFORE the ring goes
+    // out, so a crash between the two can only under-ring, never exceed it.
+    let snap = core.snapshot();
+    if snap != core.saved {
+        match ports.save_budget(&snap) {
+            Ok(()) => core.saved = snap,
+            Err(e) => {
+                rep.failed += 1;
+                eprintln!("flywheel inbox: persisting the ring budget failed: {e}");
+            }
+        }
+    }
     execute(core, ports, cmds, &mut rep);
     rep
 }
@@ -437,6 +568,7 @@ impl InboxHost {
             .name("flywheel-inbox-host".into())
             .spawn(move || {
                 let mut core = Core::default();
+                core.restore(ports.load_budget());
                 let t0 = Instant::now();
                 let scale = cfg.clock_scale.max(1);
                 loop {
@@ -525,12 +657,25 @@ mod tests {
         cap: Vec<(String, u64)>,
         reverified: u64,
         ring_fails: bool,
+        budget: BTreeMap<String, Budget>,
+        saves: u64,
+        /// The saved budget's `rings_since_advance` at the moment of each ring.
+        saved_at_ring: Vec<u32>,
     }
 
     #[derive(Clone, Default)]
     struct Fake(Arc<Mutex<World>>);
 
     impl Ports for Fake {
+        fn load_budget(&mut self) -> BTreeMap<String, Budget> {
+            self.0.lock().unwrap().budget.clone()
+        }
+        fn save_budget(&mut self, b: &BTreeMap<String, Budget>) -> Result<(), String> {
+            let mut w = self.0.lock().unwrap();
+            w.budget = b.clone();
+            w.saves += 1;
+            Ok(())
+        }
         fn observe(&mut self) -> Observation {
             let mut w = self.0.lock().unwrap();
             let o = w.obs.clone();
@@ -542,8 +687,10 @@ mod tests {
             w.reverified += 1;
             w.reverify.clone()
         }
-        fn ring(&mut self, _n: &str, pane: &str, wm: u64, line: &str) -> Result<(), String> {
+        fn ring(&mut self, n: &str, pane: &str, wm: u64, line: &str) -> Result<(), String> {
             let mut w = self.0.lock().unwrap();
+            let at = w.budget.get(n).map_or(0, |b| b.rings_since_advance);
+            w.saved_at_ring.push(at);
             if w.ring_fails {
                 return Err("down".into());
             }
@@ -604,6 +751,263 @@ mod tests {
         now
     }
 
+    /// "Restart the doorbell": a fresh core seeded from what the previous
+    /// process persisted.
+    fn restarted(f: &Fake) -> Core {
+        let mut c = Core::default();
+        c.restore(f.0.lock().unwrap().budget.clone());
+        c
+    }
+
+    #[test]
+    fn a_restart_does_not_refresh_the_ring_budget() {
+        let f = Fake::default();
+        set(&f, seen(4, 0, true));
+        let mut core = Core::default();
+        let now = run(&mut core, &f, 3, 1_000);
+        assert_eq!(f.0.lock().unwrap().rings.len(), 3);
+        drop(core); // the doorbell dies; the budget was persisted before each ring
+        // herdr answers the re-verify of the restored (unverified) binding.
+        f.0.lock().unwrap().reverify = Some(bind(true));
+        let mut core2 = restarted(&f);
+        run(&mut core2, &f, 10, now);
+        let w = f.0.lock().unwrap();
+        assert_eq!(
+            w.rings.len() as u32,
+            MAX_RINGS,
+            "3 before + 2 after the restart = the budget, not 3 + 5"
+        );
+        assert_eq!(w.sup.len(), 1, "deaf escalates once");
+    }
+
+    #[test]
+    fn a_restored_binding_rings_only_after_it_is_reverified() {
+        let f = Fake::default();
+        set(&f, seen(4, 0, true));
+        let mut core = Core::default();
+        let now = run(&mut core, &f, 2, 1_000);
+        drop(core);
+        // herdr cannot vouch for the pane yet: the restored binding stays
+        // unverified and nothing is typed into it.
+        f.0.lock().unwrap().reverify = None;
+        let mut core2 = restarted(&f);
+        run(&mut core2, &f, 3, now);
+        assert_eq!(
+            f.0.lock().unwrap().rings.len(),
+            2,
+            "no ring on a restored, unverified binding"
+        );
+        assert!(f.0.lock().unwrap().reverified >= 1, "it asks herdr");
+        // Once herdr vouches, the remaining budget is spent and no more.
+        f.0.lock().unwrap().reverify = Some(bind(true));
+        core2.reverify_next_ms.clear();
+        run(&mut core2, &f, 10, now + 10_000_000);
+        assert_eq!(f.0.lock().unwrap().rings.len() as u32, MAX_RINGS);
+    }
+
+    #[test]
+    fn a_restart_remembers_a_partially_read_cursor_so_it_is_not_mistaken_for_an_ack() {
+        let f = Fake::default();
+        set(&f, seen(9, 4, true)); // read up to 4 of 9
+        let mut core = Core::default();
+        let now = run(&mut core, &f, 2, 1_000);
+        assert_eq!(f.0.lock().unwrap().rings.len(), 2);
+        drop(core);
+        f.0.lock().unwrap().reverify = Some(bind(true));
+        let mut core2 = restarted(&f);
+        run(&mut core2, &f, 10, now);
+        assert_eq!(
+            f.0.lock().unwrap().rings.len() as u32,
+            MAX_RINGS,
+            "the same cursor is not an advance: the budget carries over"
+        );
+    }
+
+    #[test]
+    fn a_restart_after_deaf_stays_quiet_and_never_re_escalates() {
+        let f = Fake::default();
+        set(&f, seen(4, 0, true));
+        let mut core = Core::default();
+        let now = run(&mut core, &f, 12, 1_000);
+        let (rings, sup, cap) = {
+            let w = f.0.lock().unwrap();
+            (w.rings.len(), w.sup.len(), w.cap.len())
+        };
+        assert_eq!((sup, cap), (1, 1));
+        let mut core2 = restarted(&f);
+        run(&mut core2, &f, 12, now);
+        let w = f.0.lock().unwrap();
+        assert_eq!(
+            w.rings.len(),
+            rings,
+            "no ring after a restart of a deaf recipient"
+        );
+        assert_eq!((w.sup.len(), w.cap.len()), (1, 1), "no second escalation");
+    }
+
+    #[test]
+    fn a_restart_keeps_the_budget_only_for_the_same_pane_and_an_unadvanced_cursor() {
+        // A new pane is a new incarnation: fresh budget (the fold's rule).
+        let f = Fake::default();
+        set(&f, seen(4, 0, true));
+        let mut core = Core::default();
+        let now = run(&mut core, &f, 3, 1_000);
+        let mut s2 = seen(4, 0, true);
+        s2.bind.as_mut().unwrap().pane_id = "w2:p9".into();
+        set(&f, s2);
+        let mut core2 = restarted(&f);
+        run(&mut core2, &f, 10, now);
+        assert_eq!(f.0.lock().unwrap().rings.len() as u32, 3 + MAX_RINGS);
+        // The agent ran `toron next` while the doorbell was down: cursor moved.
+        let g = Fake::default();
+        set(&g, seen(4, 0, true));
+        let mut c = Core::default();
+        let now = run(&mut c, &g, 3, 1_000);
+        set(&g, seen(4, 4, true));
+        let mut c2 = restarted(&g);
+        run(&mut c2, &g, 5, now);
+        assert_eq!(
+            g.0.lock().unwrap().rings.len(),
+            3,
+            "read: nothing more to ring"
+        );
+        assert_eq!(c2.model.recipients[R].rings_since_advance, 0);
+    }
+
+    #[test]
+    fn the_budget_is_persisted_on_change_only_and_before_the_ring() {
+        let f = Fake::default();
+        set(&f, seen(4, 0, true));
+        let mut core = Core::default();
+        run(&mut core, &f, 30, 1_000);
+        let w = f.0.lock().unwrap();
+        assert!(
+            w.saves <= u64::from(MAX_RINGS) + 1,
+            "one write per budget change, not per tick: {}",
+            w.saves
+        );
+        assert_eq!(w.budget[R].rings_since_advance, MAX_RINGS);
+        assert_eq!(
+            w.saved_at_ring,
+            (1..=MAX_RINGS).collect::<Vec<_>>(),
+            "each ring is already inside the saved budget when it goes out"
+        );
+        assert_eq!(w.budget[R].deaf, Some(4));
+        // The ring that follows a save is already inside the saved count.
+        let g = Fake::default();
+        set(&g, seen(9, 0, true));
+        let mut c = Core::default();
+        run(&mut c, &g, 1, 1_000);
+        assert_eq!(g.0.lock().unwrap().budget[R].rings_since_advance, 1);
+        // Budget survives a JSON round trip (the file format).
+        let j = serde_json::to_string(&g.0.lock().unwrap().budget).unwrap();
+        let back: BTreeMap<String, Budget> = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, g.0.lock().unwrap().budget);
+    }
+
+    #[test]
+    fn an_idle_recipient_leaves_no_budget_row() {
+        let f = Fake::default();
+        set(&f, seen(4, 4, true));
+        let mut core = Core::default();
+        run(&mut core, &f, 5, 1_000);
+        assert!(f.0.lock().unwrap().budget.is_empty());
+        assert_eq!(f.0.lock().unwrap().saves, 0);
+    }
+
+    /// 1 s ticks (the live period), not the budget-isolating spacing of `run`.
+    fn ticks(core: &mut Core, f: &Fake, n: u64, t0: u64, inputs_at: Option<(u64, Input)>) -> u64 {
+        let mut now = t0;
+        for i in 0..n {
+            let mut p = f.clone();
+            let inp = match &inputs_at {
+                Some((at, inp)) if *at == i => vec![inp.clone()],
+                _ => vec![],
+            };
+            round(core, &mut p, inp, now);
+            now += 1_000;
+        }
+        now
+    }
+
+    #[test]
+    fn an_unbound_recipient_is_reverified_at_a_backed_off_pace_and_still_escalates_on_ticks() {
+        let f = Fake::default();
+        set(&f, seen(5, 0, false));
+        let mut core = Core::default();
+        ticks(&mut core, &f, 20, 1_000, None);
+        let w = f.0.lock().unwrap();
+        assert!(
+            w.reverified <= 4,
+            "20 s of unbound ticks made {} pane.list calls (was one per tick)",
+            w.reverified
+        );
+        assert!(w.reverified >= 2, "it does keep looking");
+        let deaf: Vec<_> = w
+            .facts
+            .iter()
+            .filter(|(_, v)| v["kind"] == "deaf")
+            .collect();
+        assert_eq!(deaf.len(), 1, "escalation counts ticks, not reverifies");
+        assert_eq!(deaf[0].1["cause"], "unbound");
+        assert!(w.rings.is_empty());
+    }
+
+    #[test]
+    fn a_generation_move_reverifies_at_once_through_the_backoff() {
+        let f = Fake::default();
+        set(&f, seen(5, 0, false));
+        let mut core = Core::default();
+        let now = ticks(&mut core, &f, 3, 1_000, None);
+        let before = f.0.lock().unwrap().reverified;
+        // inside the backoff nothing is called...
+        let now = ticks(&mut core, &f, 1, now, None);
+        assert_eq!(f.0.lock().unwrap().reverified, before);
+        // ...until events_lost moves the generation.
+        ticks(
+            &mut core,
+            &f,
+            1,
+            now,
+            Some((0, Input::Invalidate(Invalidate::EventsLost))),
+        );
+        assert_eq!(f.0.lock().unwrap().reverified, before + 1);
+    }
+
+    #[test]
+    fn a_verified_reverify_clears_the_backoff() {
+        let f = Fake::default();
+        set(&f, seen(5, 0, false));
+        let mut core = Core::default();
+        let now = ticks(&mut core, &f, 2, 1_000, None);
+        assert!(core.reverify_next_ms.contains_key(R));
+        f.0.lock().unwrap().reverify = Some(bind(true));
+        // the next due reverify succeeds
+        ticks(&mut core, &f, 5, now, None);
+        assert!(!core.reverify_next_ms.contains_key(R) && !core.reverify_fails.contains_key(R));
+        assert!(f.0.lock().unwrap().reverified >= 2);
+    }
+
+    #[test]
+    fn the_reverify_backoff_doubles_and_is_capped() {
+        assert_eq!(reverify_backoff_ms(1), 2_000);
+        assert_eq!(reverify_backoff_ms(2), 4_000);
+        assert_eq!(reverify_backoff_ms(3), 8_000);
+        assert_eq!(reverify_backoff_ms(6), REVERIFY_BACKOFF_CAP_MS);
+        assert_eq!(reverify_backoff_ms(500), REVERIFY_BACKOFF_CAP_MS);
+    }
+
+    #[test]
+    fn the_production_ports_persist_the_budget_atomically() {
+        let src = include_str!("inbox_ports.rs");
+        assert!(src.contains("fn load_budget") && src.contains("fn save_budget"));
+        let a = src.find("fn save_budget").unwrap();
+        assert!(
+            src[a..a + 900].contains("std::fs::rename"),
+            "write-then-rename"
+        );
+    }
+
     #[test]
     fn a_message_rings_once_with_the_real_watermark_and_nothing_else() {
         let f = Fake::default();
@@ -662,7 +1066,11 @@ mod tests {
         run(&mut core, &f, 5, now);
         let w = f.0.lock().unwrap();
         assert_eq!(w.rings.len() as u32, MAX_RINGS, "no ring past the budget");
-        let deaf: Vec<_> = w.facts.iter().filter(|(_, v)| v["kind"] == "deaf").collect();
+        let deaf: Vec<_> = w
+            .facts
+            .iter()
+            .filter(|(_, v)| v["kind"] == "deaf")
+            .collect();
         assert_eq!(deaf.len(), 1, "one deaf fact per watermark");
         assert_eq!(deaf[0].1["wm"], 4);
         assert_eq!(deaf[0].1["cause"], "no_answer");
@@ -697,7 +1105,11 @@ mod tests {
         let mut core = Core::default();
         run(&mut core, &f, 3, 1_000);
         let w = f.0.lock().unwrap();
-        let binds: Vec<_> = w.facts.iter().filter(|(_, v)| v["kind"] == "bind").collect();
+        let binds: Vec<_> = w
+            .facts
+            .iter()
+            .filter(|(_, v)| v["kind"] == "bind")
+            .collect();
         assert_eq!(binds.len(), 1, "{binds:?}");
         let v = &binds[0].1;
         assert_eq!(v["npub"], R);
@@ -715,8 +1127,16 @@ mod tests {
         let mut core = Core::default();
         run(&mut core, &f, u64::from(MAX_RINGS) + 2, 1_000);
         let w = f.0.lock().unwrap();
-        assert!(w.rings.is_empty(), "negative control: no ring {:?}", w.rings);
-        let deaf: Vec<_> = w.facts.iter().filter(|(_, v)| v["kind"] == "deaf").collect();
+        assert!(
+            w.rings.is_empty(),
+            "negative control: no ring {:?}",
+            w.rings
+        );
+        let deaf: Vec<_> = w
+            .facts
+            .iter()
+            .filter(|(_, v)| v["kind"] == "deaf")
+            .collect();
         assert_eq!(deaf.len(), 1);
         assert_eq!(deaf[0].1["cause"], "unbound");
         assert_eq!(w.sup.len(), 1);
@@ -734,7 +1154,12 @@ mod tests {
         // events_lost: the generation moves; unread mail remains
         f.0.lock().unwrap().reverify = Some(bind(true));
         let now = 2_000_000;
-        round(&mut core, &mut p, vec![Input::Invalidate(Invalidate::EventsLost)], now);
+        round(
+            &mut core,
+            &mut p,
+            vec![Input::Invalidate(Invalidate::EventsLost)],
+            now,
+        );
         {
             let w = f.0.lock().unwrap();
             assert_eq!(w.reverified, 1, "re-verified");
@@ -796,7 +1221,10 @@ mod tests {
             line: wake_line(2),
         };
         execute(&mut core, &mut p, vec![stale], &mut rep);
-        assert!(f.0.lock().unwrap().rings.is_empty(), "nothing typed for a stale gen");
+        assert!(
+            f.0.lock().unwrap().rings.is_empty(),
+            "nothing typed for a stale gen"
+        );
         assert_eq!((rep.rings, rep.failed), (0, 1));
     }
 
@@ -850,8 +1278,16 @@ mod tests {
         drop(host);
         let t = threads.lock().unwrap();
         assert!(!t.is_empty());
-        assert!(t.iter().all(|(n, no_rt)| n == "flywheel-inbox-host" && *no_rt), "{t:?}");
-        assert_eq!(f.0.lock().unwrap().rings.len(), 1, "rang over the channel loop");
+        assert!(
+            t.iter()
+                .all(|(n, no_rt)| n == "flywheel-inbox-host" && *no_rt),
+            "{t:?}"
+        );
+        assert_eq!(
+            f.0.lock().unwrap().rings.len(),
+            1,
+            "rang over the channel loop"
+        );
     }
 
     #[test]
@@ -862,14 +1298,20 @@ mod tests {
         let host = include_str!("inbox_host.rs");
         let body = &host[..host.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(!body.contains("new work"), "no hand-written wake text");
-        assert!(!body.contains("wake_line("), "the host never builds the line");
+        assert!(
+            !body.contains("wake_line("),
+            "the host never builds the line"
+        );
         let ports = include_str!("inbox_ports.rs");
         assert_eq!(ports.matches("pane_write::write(").count(), 1);
         // the sink's rendering must equal the fold's line, or nothing is typed
         assert!(ports.contains("!= line"), "ring compares the fold's line");
         assert!(!ports.contains("new work"));
         // (spelled in pieces: the pane-text fence scans this file too)
-        let (a, b) = (concat!(".agent_", "prompt("), concat!(".pane_send_", "text("));
+        let (a, b) = (
+            concat!(".agent_", "prompt("),
+            concat!(".pane_send_", "text("),
+        );
         assert!(!ports.contains(a) && !ports.contains(b));
         let pw = include_str!("pane_write.rs");
         assert!(pw.contains("toron_core::wake::wake_line(wm.0)"));

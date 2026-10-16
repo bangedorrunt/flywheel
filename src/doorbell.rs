@@ -823,6 +823,19 @@ pub enum DoorbellHost {
 /// (b) this workspace's OWN lease, never a stranger's on another one.
 /// `None` asserts neither and is for generic lifecycle verbs (status/stop)
 /// that address the daemon itself rather than a workspace.
+/// Which host runs the loop for `flywheel __doorbell`. With the comms flag on
+/// the pane writer is the inbox host inside THIS process; a daemon host types
+/// nothing, so "a healthy daemon hosts this workspace" must not defer the
+/// loop to it (it left the workspace with no ringer: flywheel#22 gap S3).
+/// Flag off: the resolver decides, as before.
+pub fn host_for(comms_on: bool, resolve: impl FnOnce() -> DoorbellHost) -> DoorbellHost {
+    if comms_on {
+        DoorbellHost::Embedded
+    } else {
+        resolve()
+    }
+}
+
 pub fn resolve_host(
     state_dir: &Path,
     cfg_url: Option<String>,
@@ -1707,6 +1720,31 @@ pub fn write_unanswered(path: &Path, pins: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Follow-up (a): a daemon host that hosts the workspace but types nothing
+    /// (comms flag) must not take the loop from `flywheel __doorbell`.
+    #[test]
+    fn under_the_comms_flag_a_daemon_that_hosts_the_workspace_does_not_take_the_loop() {
+        use super::{DoorbellHost, host_for};
+        let daemon = || DoorbellHost::Proxy {
+            url: "http://127.0.0.1:18981".into(),
+        };
+        assert!(matches!(host_for(true, daemon), DoorbellHost::Embedded));
+        assert!(
+            matches!(host_for(false, daemon), DoorbellHost::Proxy { .. }),
+            "flag off: deference to a healthy daemon host, unchanged"
+        );
+        // The resolver is not even asked under the flag.
+        let mut asked = false;
+        let _ = host_for(true, || {
+            asked = true;
+            DoorbellHost::Embedded
+        });
+        assert!(!asked);
+        // And the command path goes through it.
+        let cmd = include_str!("cmd/doorbell.rs");
+        assert!(cmd.contains("crate::doorbell::host_for(comms_on"));
+    }
+
     /// bd-doorbell-daemon-sink-wake-only-yfqz: under the comms flag the local
     /// loop hosts the inbox wake, so it must not defer to a daemon host.
     #[test]
@@ -3711,6 +3749,7 @@ mod tests {
             host: "audit".into(),
             started_unix: now,
             heartbeat_unix: now,
+            kind: None,
         };
         std::fs::write(
             owner_file(&dir, "ws"),
