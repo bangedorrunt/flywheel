@@ -1149,21 +1149,28 @@ mod tests {
         assert_eq!(store.lookup(&env.msg).await.unwrap(), rows[0].offset);
     }
 
-    /// bd-harness-caps-6r1x: the sender asks the harness record before typing.
-    /// A harness with no row has no injection door, so the row says so.
+    /// bd-harness-caps-6r1x + bd-9tkm: the sender asks the harness record
+    /// before typing. A row that records no door is skipped with a note; an
+    /// unrecorded kind keeps its door, because the sink types into any herdr
+    /// pane and legacy registry rows carry no harness field at all.
     #[test]
-    fn a_sender_rings_only_when_the_harness_has_an_injection_door() {
-        assert_eq!(send_wake("opencode", false), SendWake::Ring);
-        assert_eq!(send_wake("oc", true), SendWake::Ring);
-        assert_eq!(send_wake("fake", true), SendWake::Ring);
-        let SendWake::Skip(note) = send_wake("widget", false) else {
-            panic!("an unknown harness must not be rung");
+    fn a_sender_rings_a_herdr_pane_and_skips_a_row_with_no_door() {
+        for kind in ["opencode", "oc", "fake", "claude", "codex", "", "widget"] {
+            assert_eq!(send_wake(kind, true), SendWake::Ring, "kind {kind:?}");
+        }
+        let refusing = crate::harness_caps::HarnessCaps {
+            inject: crate::harness_caps::Capability::unsupported(
+                crate::harness_caps::Fallback::Mail,
+            ),
+            ..*crate::harness_caps::row("opencode").expect("opencode row")
+        };
+        let note = match crate::harness_caps::route_for(Some(&refusing), "opencode", false) {
+            crate::harness_caps::WakeRoute::NoDoor(no_door) => {
+                crate::harness_caps::no_door_line(&no_door)
+            }
+            other => panic!("a refusing row routed {other:?}"),
         };
         assert!(note.contains("fall back to mail"), "{note}");
-        assert!(
-            !note.contains("widget"),
-            "the unknown kind word is not interpolated: {note}"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

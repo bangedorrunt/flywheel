@@ -181,6 +181,32 @@ pub const TABLE: &[HarnessCaps] = &[
         structured_question: Capability::unsupported(Fallback::Explicit),
         mcp: Capability::unsupported(Fallback::Explicit),
     },
+    // Kinds `pane_write::Harness::from_kind` already maps. They are herdr
+    // panes like any other, so they need a row: a kind with no row would be
+    // read as unrecorded, and an unrecorded kind is not a claim about the
+    // pane.
+    HarnessCaps {
+        harness: "claude",
+        hook: None,
+        verified_by: None,
+        inject: Capability::supported(SINK_WITNESS),
+        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
+        steer: Capability::unsupported(Fallback::Mail),
+        resume: Capability::supported(SINK_WITNESS),
+        structured_question: Capability::unsupported(Fallback::Explicit),
+        mcp: Capability::unsupported(Fallback::Explicit),
+    },
+    HarnessCaps {
+        harness: "codex",
+        hook: None,
+        verified_by: None,
+        inject: Capability::supported(SINK_WITNESS),
+        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
+        steer: Capability::unsupported(Fallback::Mail),
+        resume: Capability::supported(SINK_WITNESS),
+        structured_question: Capability::unsupported(Fallback::Explicit),
+        mcp: Capability::unsupported(Fallback::Explicit),
+    },
     // The live fixture harness. Not a product people run. `verified_by`
     // names the test that drives it; a real harness stays `none` until its
     // own fixture does the same.
@@ -223,8 +249,10 @@ pub fn capable(kind: &str) -> bool {
     row(kind).is_some_and(|r| r.hook.is_some() && r.verified_by.is_some())
 }
 
-/// The canonical row for a kind word. `oc`/`opencode`, `gk`/`grok`, `pi`,
-/// `omp`, `fake`. An unknown kind has no row: no door is not a door.
+/// The canonical row for a kind word. Aliases follow
+/// `pane_write::Harness::from_kind`: `oc`/`opencode`, `gk`/`grok`, `pi`,
+/// `omp`, `claude`/`claude-code`/`cc`, `codex`/`cx`, `fake`. A kind nobody
+/// mapped has no row.
 pub fn row(kind: &str) -> Option<&'static HarnessCaps> {
     let lower = kind.trim().to_ascii_lowercase();
     let name = match lower.as_str() {
@@ -232,6 +260,8 @@ pub fn row(kind: &str) -> Option<&'static HarnessCaps> {
         "gk" | "grok" => "grok",
         "pi" => "pi",
         "omp" => "omp",
+        "claude" | "claude-code" | "cc" => "claude",
+        "codex" | "cx" => "codex",
         "fake" => "fake",
         _ => return None,
     };
@@ -274,12 +304,23 @@ pub enum WakeRoute {
     NoDoor(NoDoor),
 }
 
-/// The one place a wake asks whether this harness can be poked. An unknown
-/// kind is the conservative default: no row, no injection, mail instead. A
-/// known harness is injectable through the herdr sink unless its row says
-/// otherwise.
+/// The one place a wake asks whether this harness can be poked.
+///
+/// A recorded row answers for itself. An UNRECORDED kind (no row: a legacy
+/// registry entry with no harness field, or a kind nobody mapped yet) is
+/// still a herdr pane, and the sink types into any pane it manages — the kind
+/// only picks the launch bootstrap. So the unrecorded default is today's
+/// behavior, [`WakeRoute::Inject`], never a silent refusal: bd-9tkm. A row
+/// that records `inject` unsupported is the only producer of
+/// [`WakeRoute::NoDoor`], and it names the fallback.
 pub fn wake_route(kind: &str, hook_installed: bool) -> WakeRoute {
-    match row(kind) {
+    route_for(row(kind), kind, hook_installed)
+}
+
+/// The policy for one row, or for no row (see [`wake_route`]). Split out so a
+/// test can drive a refusing row without shipping one.
+pub fn route_for(row: Option<&HarnessCaps>, kind: &str, hook_installed: bool) -> WakeRoute {
+    match row {
         Some(r) if r.inject.supported => WakeRoute::Inject {
             interrupt: interrupt_for(kind, hook_installed),
         },
@@ -289,12 +330,7 @@ pub fn wake_route(kind: &str, hook_installed: bool) -> WakeRoute {
             r.inject.fallback,
             "this harness has no injection door: wake it through the fallback",
         )),
-        None => WakeRoute::NoDoor(no_door(
-            "unknown",
-            "inject",
-            Fallback::Mail,
-            "harness is not in the capability table: add a row or wake it by mail",
-        )),
+        None => WakeRoute::Inject { interrupt: true },
     }
 }
 
@@ -532,8 +568,13 @@ mod tests {
                 }
             }
             match row.harness {
-                "opencode" | "pi" | "grok" | "omp" => {
+                "opencode" | "pi" | "grok" | "omp" | "claude" | "codex" => {
                     assert!(row.hook.is_none() && row.verified_by.is_none());
+                    assert!(
+                        row.inject.supported,
+                        "{} is a herdr pane and must stay injectable",
+                        row.harness
+                    );
                 }
                 "fake" => {
                     assert_eq!(row.hook, Some("pre_tool_use"));
@@ -554,8 +595,9 @@ mod tests {
         assert!(!interrupt_for("fake", true));
     }
 
-    /// bd-harness-caps-6r1x: a wake for a harness with no row gets a typed
-    /// no-door naming the fallback, and the pane sink types nothing.
+    /// bd-harness-caps-6r1x + bd-9tkm: a row that records no injection door
+    /// gets a typed no-door naming the fallback and the pane sink types
+    /// nothing; an unrecorded kind is still a herdr pane and still injects.
     #[test]
     fn wake_falls_back_when_harness_cannot_inject() {
         assert_eq!(
@@ -563,16 +605,44 @@ mod tests {
             WakeRoute::Inject { interrupt: true }
         );
         assert_eq!(wake_route("oc", false), wake_route("opencode", false));
+        for (alias, canonical) in [
+            ("oc", "opencode"),
+            ("gk", "grok"),
+            ("cc", "claude"),
+            ("claude-code", "claude"),
+            ("cx", "codex"),
+        ] {
+            assert_eq!(
+                row(alias).map(|r| r.harness),
+                Some(canonical),
+                "{alias} must resolve to the {canonical} row"
+            );
+        }
         assert_eq!(
             wake_route("fake", true),
             WakeRoute::Inject { interrupt: false },
             "the verified hook door keeps the ring and skips Interrupt"
         );
 
-        let WakeRoute::NoDoor(no_door) = wake_route("widget", false) else {
-            panic!("an unknown harness must not be injected into");
+        // bd-9tkm: no row is not a door verdict. Legacy registry entries carry
+        // no harness field at all, and an unmapped kind is still a pane the
+        // sink types into; refusing them went dark on working wakes.
+        for unrecorded in ["", "widget", "future-harness"] {
+            assert_eq!(
+                wake_route(unrecorded, false),
+                WakeRoute::Inject { interrupt: true },
+                "{unrecorded:?} is a herdr pane, not a refusal"
+            );
+        }
+
+        let refusing = HarnessCaps {
+            inject: Capability::unsupported(Fallback::Mail),
+            ..*row("opencode").expect("opencode row")
         };
-        assert_eq!(no_door.harness, "unknown");
+        let WakeRoute::NoDoor(no_door) = route_for(Some(&refusing), "opencode", false) else {
+            panic!("a row that records no door must not be typed into");
+        };
+        assert_eq!(no_door.harness, "opencode");
         assert_eq!(no_door.capability, "inject");
         assert_eq!(no_door.fallback, Fallback::Mail, "mail is the channel");
         assert!(
@@ -588,17 +658,17 @@ mod tests {
         );
         let done = crate::inbox_ports::ring_wake(
             &pane,
-            "w1:widget",
+            "w1:opencode",
             7,
             &line,
             toron_core::wake::Urgency::Urgent,
-            wake_route("widget", false),
+            route_for(Some(&refusing), "opencode", false),
         )
         .expect("a no-door route is not a sink failure");
         assert_eq!(done, crate::inbox_ports::RingDone::NoDoor(no_door));
         assert!(
             pane.lines().is_empty(),
-            "nothing reaches a pane that cannot be poked: {:?}",
+            "nothing reaches a pane that records no door: {:?}",
             pane.lines()
         );
     }
