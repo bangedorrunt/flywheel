@@ -311,7 +311,7 @@ pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Re
 }
 
 fn nearby_herdr_agents(cfg: &Config) -> Vec<(String, String, String)> {
-    let Ok(mut c) = crate::herdr_shim::Client::connect(Some(&cfg.socket_path())) else {
+    let Ok(c) = crate::herdr_shim::Client::connect(Some(&cfg.socket_path())) else {
         return Vec::new();
     };
     let Ok(agents) = c.agent_list() else {
@@ -443,35 +443,6 @@ fn wake_brain_status_segment(snap: Option<doorbell_rt::wake_brain::WakeBrainSnap
             s.dropped, s.wake_brain_full, s.backpressured, s.resumed, s.events_lost
         ),
         None => " wake_brain=unmeasured".to_string(),
-    }
-}
-
-#[cfg(test)]
-mod wake_brain_status_tests {
-    use super::wake_brain_status_segment;
-    use doorbell_rt::wake_brain::WakeBrainSnapshot;
-
-    /// mcc9: `doorbell status` names the exact counts; zero is printed as zero
-    /// (negative control) and a missing snapshot as `unmeasured`.
-    #[test]
-    fn doorbell_status_prints_wake_brain_counts() {
-        let flooded = WakeBrainSnapshot {
-            dropped: 499,
-            wake_brain_full: 1,
-            backpressured: 0,
-            resumed: 1,
-            events_lost: 7,
-            ..WakeBrainSnapshot::default()
-        };
-        assert_eq!(
-            wake_brain_status_segment(Some(flooded)),
-            " wake_brain=dropped:499,full:1,backpressured:0,resumed:1,lost:7"
-        );
-        assert_eq!(
-            wake_brain_status_segment(Some(WakeBrainSnapshot::default())),
-            " wake_brain=dropped:0,full:0,backpressured:0,resumed:0,lost:0"
-        );
-        assert_eq!(wake_brain_status_segment(None), " wake_brain=unmeasured");
     }
 }
 
@@ -811,7 +782,7 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
     crate::ensure_doorbell_supervisor();
     let registry = crate::state::load_spawn_registry(project);
     let peer_tpl = include_str!("../../integrations/peer-aware.md.tpl");
-    let mut c = crate::herdr_shim::Client::connect(Some(&cfg.socket_path()))?;
+    let c = crate::herdr_shim::Client::connect(Some(&cfg.socket_path()))?;
     let mut injected = 0;
     for e in &registry {
         if e.pane_id.is_empty() {
@@ -895,5 +866,34 @@ pub(crate) fn cmd_internal_doorbell(
         crate::doorbell::DoorbellHost::Embedded => {
             crate::doorbell_host::run_embedded(cfg, project, workspace)
         }
+    }
+}
+
+#[cfg(test)]
+mod wake_brain_status_tests {
+    use super::wake_brain_status_segment;
+    use doorbell_rt::wake_brain::WakeBrainSnapshot;
+
+    /// mcc9: `doorbell status` names the exact counts; zero is printed as zero
+    /// (negative control) and a missing snapshot as `unmeasured`.
+    #[test]
+    fn doorbell_status_prints_wake_brain_counts() {
+        let flooded = WakeBrainSnapshot {
+            dropped: 499,
+            wake_brain_full: 1,
+            backpressured: 0,
+            resumed: 1,
+            events_lost: 7,
+            ..WakeBrainSnapshot::default()
+        };
+        assert_eq!(
+            wake_brain_status_segment(Some(flooded)),
+            " wake_brain=dropped:499,full:1,backpressured:0,resumed:1,lost:7"
+        );
+        assert_eq!(
+            wake_brain_status_segment(Some(WakeBrainSnapshot::default())),
+            " wake_brain=dropped:0,full:0,backpressured:0,resumed:0,lost:0"
+        );
+        assert_eq!(wake_brain_status_segment(None), " wake_brain=unmeasured");
     }
 }

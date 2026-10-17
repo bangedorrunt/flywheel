@@ -89,8 +89,7 @@ impl DiedBell {
     }
 
     pub fn ring(&self) {
-        self.flag
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.flag.store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_one();
     }
 
@@ -99,10 +98,7 @@ impl DiedBell {
     pub async fn wait(&self) {
         loop {
             let notified = self.notify.notified();
-            if self
-                .flag
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
+            if self.flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 return;
             }
             notified.await;

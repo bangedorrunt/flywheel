@@ -74,6 +74,7 @@ pub struct ClassifiedFailure {
 /// Seconds to wait before retry `attempt` (1..=4) of a blip that passes by
 /// itself: 60, 120, 240, 480. The fifth try has already run. `None` means stop
 /// and hand the turn to a person or a fallback agent.
+#[cfg(test)]
 pub fn transient_wait_secs(attempt: u32) -> Option<u64> {
     match attempt {
         1 => Some(60),

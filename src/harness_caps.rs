@@ -9,7 +9,11 @@
 //! Every shipped product row is unverified for `hook`. Nothing here edits an
 //! operator config or runs a harness.
 
-/// Exact reason a hook may print. No payload is interpolated into it.
+/// Exact reason a hook may print. No payload is interpolated into it. The
+/// script below spells the same text as a literal in a `&'static str` (a
+/// `concat!` cannot fold a const), so this copy exists for the tests that
+/// assert the script carries it.
+#[cfg(test)]
 pub const HOOK_REASON: &str = "urgent steer pending: run toron next";
 
 const HOOK_START: &str = "# flywheel-supervisor-hook start";
@@ -265,7 +269,16 @@ pub fn row(kind: &str) -> Option<&'static HarnessCaps> {
         "fake" => "fake",
         _ => return None,
     };
-    TABLE.iter().find(|r| r.harness == name)
+    let found = TABLE.iter().find(|r| r.harness == name);
+    // The table's invariants (witness per supported claim, fallback per
+    // refusal) hold in debug builds, at lookup, so a bad row cannot ship
+    // silently. Release builds skip the check; the tests above also walk the
+    // whole table.
+    debug_assert!(
+        found.is_none_or(|r| r.check().is_ok()),
+        "the capability table's invariants hold in debug builds"
+    );
+    found
 }
 
 /// Interrupt unless this harness is capable and the hook block is installed.

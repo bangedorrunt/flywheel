@@ -1439,10 +1439,7 @@ mod tests {
     /// If Died were `blocking_send`'d onto that channel, the watch would tick first.
     #[tokio::test]
     async fn death_bell_restarts_while_a_watch_is_still_queued() {
-        let dir = std::env::temp_dir().join(format!(
-            "died-bell-brain-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("died-bell-brain-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -1467,7 +1464,10 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
         let got = order.lock().expect("order").clone();
         assert_eq!(got.first().map(String::as_str), Some("died"), "{got:?}");
-        let restart_at = got.iter().position(|s| s == "restart").unwrap_or_else(|| panic!("{got:?}"));
+        let restart_at = got
+            .iter()
+            .position(|s| s == "restart")
+            .unwrap_or_else(|| panic!("{got:?}"));
         if let Some(watch_at) = got.iter().position(|s| s == "watch") {
             assert!(restart_at < watch_at, "{got:?}");
         }

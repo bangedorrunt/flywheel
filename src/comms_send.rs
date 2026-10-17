@@ -295,15 +295,6 @@ pub struct SentRow {
     pub wake: String,
 }
 
-fn state_text(s: &SendState) -> (String, Option<u64>) {
-    match s {
-        SendState::Settled(o) => ("appended".into(), Some(*o)),
-        SendState::InFlight => ("unknown".into(), None),
-        SendState::Unknown(n) => (format!("unknown (reconciled {n}x)"), None),
-        SendState::Refused(why) => (format!("refused: {why}"), None),
-    }
-}
-
 /// Rounds a send may take when a concurrent sender's epoch claim fences it
 /// (the refused append never landed, so minting again cannot duplicate).
 const MAX_ROUNDS: usize = 24;
@@ -1204,7 +1195,7 @@ mod tests {
     }
 
     fn epoch_of(msg_id: &str) -> u64 {
-        msg_id.rsplitn(3, ':').nth(1).unwrap().parse().unwrap()
+        msg_id.rsplit(':').nth(1).unwrap().parse().unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

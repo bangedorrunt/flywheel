@@ -2337,7 +2337,7 @@ impl Mail {
         if multiplexer_is_herdr()
             && let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None)
         {
-            let mut client = backend.client();
+            let client = backend.client();
             if let Ok(workspaces) = client.workspace_list() {
                 for ws in workspaces {
                     let panes = client.pane_list(Some(&ws.workspace_id)).unwrap_or_default();
