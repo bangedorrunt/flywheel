@@ -2,7 +2,7 @@
 
 id = "flywheel.captain-pane"
 name = "Captain Pane"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
 # Floor note: installed binary is 0.9.1-preview but the running
 # daemon reports 0.9.0, and the link gate enforces the daemon version.

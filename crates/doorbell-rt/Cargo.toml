@@ -1,6 +1,6 @@
 [package]
 name = "doorbell-rt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Doorbell runtime actors (ADR-0012 Phase 1) — single-writer brain, sensor/sink tasks, store"
 license = "MIT"
