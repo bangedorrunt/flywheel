@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "doorbell-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "doorbell-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "doorbell-rt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "flywheel"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
