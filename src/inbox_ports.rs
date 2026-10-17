@@ -348,23 +348,38 @@ pub(crate) async fn urgency_of_head(store: &InboxStore, npub: &str, head: u64) -
     }
 }
 
+/// What a ring did. `NoDoor` is the honest "nothing was typed": the harness
+/// has no injection door (bd-harness-caps-6r1x), so the caller takes the
+/// fallback instead of counting a wake that never happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RingDone {
+    Typed,
+    NoDoor(crate::harness_caps::NoDoor),
+}
+
 /// Type the wake for `wm`.
 ///
 /// The fold always names the normal wake line; this checks that and then
 /// types from `urgency`, which the caller took from the head envelope. An
-/// urgent head is the urgent line. `interrupt` adds Escape before that
-/// line. A hook-capable pane passes `interrupt = false`: the ring stays,
-/// the next tool call is the hook's job. A normal head is the normal line
-/// only. One call is one wake.
+/// urgent head is the urgent line. `route` decides whether there is a door at
+/// all: [`crate::harness_caps::WakeRoute::Inject`] carries the Interrupt
+/// choice (a hook-capable pane passes `interrupt = false`: the ring stays, the
+/// next tool call is the hook's job), and a no-door route types nothing. A
+/// normal head is the normal line only. One call is one wake.
 pub(crate) fn ring_wake(
     typer: &dyn crate::pane_write::PaneTyper,
     pane_id: &str,
     wm: u64,
     line: &str,
     urgency: Urgency,
-    interrupt: bool,
-) -> Result<(), String> {
+    route: crate::harness_caps::WakeRoute,
+) -> Result<RingDone, String> {
+    use crate::harness_caps::WakeRoute;
     use crate::pane_write::{PaneWrite, Urgency as U, Wm};
+    let interrupt = match route {
+        WakeRoute::Inject { interrupt } => interrupt,
+        WakeRoute::NoDoor(no_door) => return Ok(RingDone::NoDoor(no_door)),
+    };
     let normal = crate::pane_write::wake_line(Wm(wm), U::Normal);
     // The fold names the line; the sink renders it. They must agree, or
     // something other than the wake line is about to reach a pane.
@@ -385,18 +400,21 @@ pub(crate) fn ring_wake(
                     urgency: U::Urgent,
                 },
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
         }
-        Urgency::Normal => crate::pane_write::write(
-            typer,
-            pane_id,
-            &PaneWrite::WakeLine {
-                wm: Wm(wm),
-                urgency: U::Normal,
-            },
-        )
-        .map_err(|e| e.to_string()),
+        Urgency::Normal => {
+            crate::pane_write::write(
+                typer,
+                pane_id,
+                &PaneWrite::WakeLine {
+                    wm: Wm(wm),
+                    urgency: U::Normal,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
+    Ok(RingDone::Typed)
 }
 
 impl Ports for FlywheelPorts {
@@ -490,16 +508,22 @@ impl Ports for FlywheelPorts {
             .find(|e| e.pane_id == pane_id)
             .and_then(|e| e.harness)
             .unwrap_or_default();
-        let interrupt =
-            crate::harness_caps::interrupt_for(&kind, crate::harness_caps::installed_from_env());
-        ring_wake(
+        // The harness record decides whether there is a door at all. An
+        // unknown kind has none: the ring fails loudly naming mail rather
+        // than typing at a pane that cannot be poked.
+        let route =
+            crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
+        match ring_wake(
             &crate::pane_write::HerdrPanes(&client),
             pane_id,
             wm,
             line,
             urgency,
-            interrupt,
-        )
+            route,
+        )? {
+            RingDone::Typed => Ok(()),
+            RingDone::NoDoor(no_door) => Err(crate::harness_caps::no_door_line(&no_door)),
+        }
     }
 
     fn load_budget(&mut self) -> BTreeMap<String, crate::inbox_host::Budget> {
@@ -683,13 +707,14 @@ mod tests {
         assert_eq!(urgency_of_envelope(&notify), Urgency::Normal);
 
         let pane = Rec::default();
+        let interrupt = crate::harness_caps::WakeRoute::Inject { interrupt: true };
         ring_wake(
             &pane,
             "w1:a",
             7,
             &fold_line(7),
             urgency_of_envelope(&urgent),
-            true,
+            interrupt,
         )
         .unwrap();
         ring_wake(
@@ -698,7 +723,7 @@ mod tests {
             8,
             &fold_line(8),
             urgency_of_envelope(&notify),
-            true,
+            interrupt,
         )
         .unwrap();
         let writes = pane.0.lock().unwrap().clone();

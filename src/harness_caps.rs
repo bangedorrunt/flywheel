@@ -1,8 +1,13 @@
-//! Harness hook capability table (Phase 4b.3).
+//! Harness capability table (Phase 4b.3, bd-harness-caps-6r1x).
 //!
-//! Every shipped row is unverified: `hook` and `verified_by` are both
-//! `None`. A row that names a hook without a verifier is not capable.
-//! Nothing here edits an operator config or runs a harness.
+//! One record per harness. A *supported* claim needs a witness name, or it is
+//! not capability: the hook row's rule, applied to every mechanism. Every
+//! unsupported mechanism names what the caller does instead, so a wake never
+//! dies as a no-op — the caller gets [`WakeRoute::NoDoor`] and the fallback
+//! (mail, digest, or an explicit refusal) is the channel.
+//!
+//! Every shipped product row is unverified for `hook`. Nothing here edits an
+//! operator config or runs a harness.
 
 /// Exact reason a hook may print. No payload is interpolated into it.
 pub const HOOK_REASON: &str = "urgent steer pending: run toron next";
@@ -10,7 +15,64 @@ pub const HOOK_REASON: &str = "urgent steer pending: run toron next";
 const HOOK_START: &str = "# flywheel-supervisor-hook start";
 const HOOK_END: &str = "# flywheel-supervisor-hook end";
 
-/// One harness's hook claim. Capability requires a verifier.
+/// What a caller does when a harness has no door for a mechanism.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fallback {
+    /// Toron mail. Needs no pane, so it reaches an unpokeable agent.
+    Mail,
+    /// Nothing stands in for it. The caller must refuse out loud.
+    Explicit,
+}
+
+/// One optional mechanism for one harness. `supported: false` names the
+/// fallback; `supported: true` names the witness that proves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capability {
+    pub supported: bool,
+    pub verified_by: Option<&'static str>,
+    pub fallback: Fallback,
+}
+
+impl Capability {
+    /// No door for this mechanism; the caller takes `fallback` instead.
+    pub const fn unsupported(fallback: Fallback) -> Self {
+        Self {
+            supported: false,
+            verified_by: None,
+            fallback,
+        }
+    }
+
+    /// The mechanism works and `verified_by` names the test that shows it.
+    pub const fn supported(verified_by: &'static str) -> Self {
+        Self {
+            supported: true,
+            verified_by: Some(verified_by),
+            fallback: Fallback::Explicit,
+        }
+    }
+
+    fn check(self, harness: &str, mechanism: &str) -> Result<(), String> {
+        if self.supported && self.verified_by.is_none() {
+            return Err(format!(
+                "{harness}.{mechanism}: supported without a witness"
+            ));
+        }
+        if !self.supported && self.verified_by.is_some() {
+            return Err(format!(
+                "{harness}.{mechanism}: unsupported claims a witness"
+            ));
+        }
+        if self.supported && self.fallback != Fallback::Explicit {
+            return Err(format!(
+                "{harness}.{mechanism}: a supported mechanism has no fallback"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One harness's capability record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HarnessCaps {
     /// Canonical harness word.
@@ -19,40 +81,105 @@ pub struct HarnessCaps {
     pub hook: Option<&'static str>,
     /// Who verified the hook. `None` with `hook: Some` is an error.
     pub verified_by: Option<&'static str>,
+    /// Typing a prompt into the pane (the wake door).
+    pub inject: Capability,
+    /// Escape before the urgent line.
+    pub interrupt: Capability,
+    /// Delivering a steer without injecting it (the hook door).
+    pub steer: Capability,
+    /// Re-typing into a live pane after a stop.
+    pub resume: Capability,
+    /// A question the harness can answer in a structured field.
+    pub structured_question: Capability,
+    /// This harness serving its own MCP surface.
+    pub mcp: Capability,
 }
 
 impl HarnessCaps {
-    /// `hook: Some` without `verified_by` is not a capable harness.
-    pub fn check(self) -> Result<(), &'static str> {
+    /// `hook: Some` without `verified_by` is not a capable harness. Each
+    /// capability carries the same rule, plus the fallback invariant.
+    pub fn check(self) -> Result<(), String> {
         if self.hook.is_some() && self.verified_by.is_none() {
-            Err("unverified harness cannot be marked capable")
-        } else {
-            Ok(())
+            return Err(format!(
+                "{}: unverified harness cannot be marked capable",
+                self.harness
+            ));
         }
+        for (name, cap) in [
+            ("inject", self.inject),
+            ("interrupt", self.interrupt),
+            ("steer", self.steer),
+            ("resume", self.resume),
+            ("structured_question", self.structured_question),
+            ("mcp", self.mcp),
+        ] {
+            cap.check(self.harness, name)?;
+        }
+        if self.steer.supported && !(self.hook.is_some() && self.verified_by.is_some()) {
+            return Err(format!(
+                "{}.steer: a steer door needs the verified hook row",
+                self.harness
+            ));
+        }
+        Ok(())
     }
 }
 
-/// Harnesses this repo already names. None are verified capable.
+/// The witnesses that prove the herdr pane sink types what it renders. An
+/// injection row names one of these; a harness an operator adds names its own.
+const SINK_WITNESS: &str = "only_the_sink_types_into_panes";
+const SINK_SHAPE_WITNESS: &str = "every_pane_write_renders_a_constant_shape";
+const FAKE_WITNESS: &str = "fake_harness_denies_once_and_types_no_interrupt";
+
+/// Harnesses this repo already names. No product row is verified for a hook,
+/// and `structured_question` / `mcp` are unsupported for every row: nothing in
+/// this repo implements them, so claiming them would be a lie the caller acts
+/// on. Injection, interrupt and resume go through the herdr sink, which the
+/// sink fence and its shape test cover.
 pub const TABLE: &[HarnessCaps] = &[
     HarnessCaps {
         harness: "opencode",
         hook: None,
         verified_by: None,
+        inject: Capability::supported(SINK_WITNESS),
+        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
+        steer: Capability::unsupported(Fallback::Mail),
+        resume: Capability::supported(SINK_WITNESS),
+        structured_question: Capability::unsupported(Fallback::Explicit),
+        mcp: Capability::unsupported(Fallback::Explicit),
     },
     HarnessCaps {
         harness: "pi",
         hook: None,
         verified_by: None,
+        inject: Capability::supported(SINK_WITNESS),
+        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
+        steer: Capability::unsupported(Fallback::Mail),
+        resume: Capability::supported(SINK_WITNESS),
+        structured_question: Capability::unsupported(Fallback::Explicit),
+        mcp: Capability::unsupported(Fallback::Explicit),
     },
     HarnessCaps {
         harness: "grok",
         hook: None,
         verified_by: None,
+        inject: Capability::supported(SINK_WITNESS),
+        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
+        steer: Capability::unsupported(Fallback::Mail),
+        resume: Capability::supported(SINK_WITNESS),
+        structured_question: Capability::unsupported(Fallback::Explicit),
+        mcp: Capability::unsupported(Fallback::Explicit),
     },
     HarnessCaps {
         harness: "omp",
         hook: None,
         verified_by: None,
+        inject: Capability::supported(SINK_WITNESS),
+        interrupt: Capability::supported(SINK_SHAPE_WITNESS),
+        steer: Capability::unsupported(Fallback::Mail),
+        resume: Capability::supported(SINK_WITNESS),
+        structured_question: Capability::unsupported(Fallback::Explicit),
+        mcp: Capability::unsupported(Fallback::Explicit),
     },
     // The live fixture harness. Not a product people run. `verified_by`
     // names the test that drives it; a real harness stays `none` until its
@@ -60,7 +187,13 @@ pub const TABLE: &[HarnessCaps] = &[
     HarnessCaps {
         harness: "fake",
         hook: Some("pre_tool_use"),
-        verified_by: Some("fake_harness_denies_once_and_types_no_interrupt"),
+        verified_by: Some(FAKE_WITNESS),
+        inject: Capability::supported(FAKE_WITNESS),
+        interrupt: Capability::supported(FAKE_WITNESS),
+        steer: Capability::supported(FAKE_WITNESS),
+        resume: Capability::supported(FAKE_WITNESS),
+        structured_question: Capability::unsupported(Fallback::Explicit),
+        mcp: Capability::unsupported(Fallback::Explicit),
     },
 ];
 
@@ -87,6 +220,12 @@ pub enum WakePick {
 /// `hook` and `verified_by` both set. An unverified row is not capable.
 /// Unknown kinds are not capable.
 pub fn capable(kind: &str) -> bool {
+    row(kind).is_some_and(|r| r.hook.is_some() && r.verified_by.is_some())
+}
+
+/// The canonical row for a kind word. `oc`/`opencode`, `gk`/`grok`, `pi`,
+/// `omp`, `fake`. An unknown kind has no row: no door is not a door.
+pub fn row(kind: &str) -> Option<&'static HarnessCaps> {
     let lower = kind.trim().to_ascii_lowercase();
     let name = match lower.as_str() {
         "oc" | "opencode" => "opencode",
@@ -94,11 +233,9 @@ pub fn capable(kind: &str) -> bool {
         "pi" => "pi",
         "omp" => "omp",
         "fake" => "fake",
-        _ => return false,
+        _ => return None,
     };
-    TABLE
-        .iter()
-        .any(|row| row.harness == name && row.hook.is_some() && row.verified_by.is_some())
+    TABLE.iter().find(|r| r.harness == name)
 }
 
 /// Interrupt unless this harness is capable and the hook block is installed.
@@ -110,6 +247,81 @@ pub fn interrupt_for(kind: &str, installed: bool) -> bool {
             WakePick::Interrupt
         },
         WakePick::Hook
+    )
+}
+
+/// Why a harness has no injection door, and what carries the message instead.
+/// Every field is static: no kind word, pin, or payload is interpolated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoDoor {
+    /// Canonical harness word, or `unknown` for a kind with no row.
+    pub harness: &'static str,
+    /// The mechanism that has no door.
+    pub capability: &'static str,
+    /// What the caller does instead.
+    pub fallback: Fallback,
+    /// One line naming the fix.
+    pub reason: &'static str,
+}
+
+/// What a wake does for a harness. Pure; the caller owns the pane sink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeRoute {
+    /// Type the wake line. `interrupt` types Escape before it.
+    Inject { interrupt: bool },
+    /// No injection door. The caller must not type: the fallback is the
+    /// channel, and the wake is reported as skipped rather than as a no-op.
+    NoDoor(NoDoor),
+}
+
+/// The one place a wake asks whether this harness can be poked. An unknown
+/// kind is the conservative default: no row, no injection, mail instead. A
+/// known harness is injectable through the herdr sink unless its row says
+/// otherwise.
+pub fn wake_route(kind: &str, hook_installed: bool) -> WakeRoute {
+    match row(kind) {
+        Some(r) if r.inject.supported => WakeRoute::Inject {
+            interrupt: interrupt_for(kind, hook_installed),
+        },
+        Some(r) => WakeRoute::NoDoor(no_door(
+            r.harness,
+            "inject",
+            r.inject.fallback,
+            "this harness has no injection door: wake it through the fallback",
+        )),
+        None => WakeRoute::NoDoor(no_door(
+            "unknown",
+            "inject",
+            Fallback::Mail,
+            "harness is not in the capability table: add a row or wake it by mail",
+        )),
+    }
+}
+
+const fn no_door(
+    harness: &'static str,
+    capability: &'static str,
+    fallback: Fallback,
+    reason: &'static str,
+) -> NoDoor {
+    NoDoor {
+        harness,
+        capability,
+        fallback,
+        reason,
+    }
+}
+
+/// One line for a human or a log. Names the harness, the mechanism, the
+/// fallback, and the fix — never a payload.
+pub fn no_door_line(no_door: &NoDoor) -> String {
+    let fallback = match no_door.fallback {
+        Fallback::Mail => "mail",
+        Fallback::Explicit => "nothing (refuse loudly)",
+    };
+    format!(
+        "no {} door for harness {}: fall back to {fallback} ({})",
+        no_door.capability, no_door.harness, no_door.reason
     )
 }
 
@@ -274,15 +486,51 @@ mod tests {
 
     #[test]
     fn an_unverified_harness_cannot_be_marked_capable() {
+        let good = *row("opencode").expect("opencode row");
         let bad = HarnessCaps {
             harness: "opencode",
             hook: Some("echo hi"),
             verified_by: None,
+            ..good
         };
-        assert!(bad.check().is_err());
+        assert!(bad.check().is_err(), "hook without a verifier");
+        let unproven = HarnessCaps {
+            inject: Capability {
+                supported: true,
+                verified_by: None,
+                fallback: Fallback::Explicit,
+            },
+            ..good
+        };
+        assert!(
+            unproven.check().is_err(),
+            "a capability is claimed with no witness"
+        );
+        let fallback_missing = HarnessCaps {
+            mcp: Capability {
+                supported: true,
+                verified_by: Some(SINK_WITNESS),
+                fallback: Fallback::Mail,
+            },
+            ..good
+        };
+        assert!(
+            fallback_missing.check().is_err(),
+            "a supported capability names no fallback"
+        );
         let src = include_str!("harness_caps.rs");
+        let sink = include_str!("pane_write.rs");
         for row in TABLE {
-            row.check().expect(row.harness);
+            row.check().unwrap_or_else(|e| panic!("{e}"));
+            for cap in [row.inject, row.interrupt, row.steer, row.resume] {
+                if let Some(witness) = cap.verified_by {
+                    assert!(
+                        src.contains(&format!("fn {witness}("))
+                            || sink.contains(&format!("fn {witness}(")),
+                        "{witness} is not a test in harness_caps.rs or pane_write.rs"
+                    );
+                }
+            }
             match row.harness {
                 "opencode" | "pi" | "grok" | "omp" => {
                     assert!(row.hook.is_none() && row.verified_by.is_none());
@@ -304,6 +552,55 @@ mod tests {
         assert!(interrupt_for("opencode", true));
         assert!(interrupt_for("fake", false), "no block, so interrupt stays");
         assert!(!interrupt_for("fake", true));
+    }
+
+    /// bd-harness-caps-6r1x: a wake for a harness with no row gets a typed
+    /// no-door naming the fallback, and the pane sink types nothing.
+    #[test]
+    fn wake_falls_back_when_harness_cannot_inject() {
+        assert_eq!(
+            wake_route("opencode", false),
+            WakeRoute::Inject { interrupt: true }
+        );
+        assert_eq!(wake_route("oc", false), wake_route("opencode", false));
+        assert_eq!(
+            wake_route("fake", true),
+            WakeRoute::Inject { interrupt: false },
+            "the verified hook door keeps the ring and skips Interrupt"
+        );
+
+        let WakeRoute::NoDoor(no_door) = wake_route("widget", false) else {
+            panic!("an unknown harness must not be injected into");
+        };
+        assert_eq!(no_door.harness, "unknown");
+        assert_eq!(no_door.capability, "inject");
+        assert_eq!(no_door.fallback, Fallback::Mail, "mail is the channel");
+        assert!(
+            no_door_line(&no_door).contains("fall back to mail"),
+            "the line names the fallback: {}",
+            no_door_line(&no_door)
+        );
+
+        let pane = WakeRec::default();
+        let line = crate::pane_write::wake_line(
+            crate::pane_write::Wm(7),
+            crate::pane_write::Urgency::Normal,
+        );
+        let done = crate::inbox_ports::ring_wake(
+            &pane,
+            "w1:widget",
+            7,
+            &line,
+            toron_core::wake::Urgency::Urgent,
+            wake_route("widget", false),
+        )
+        .expect("a no-door route is not a sink failure");
+        assert_eq!(done, crate::inbox_ports::RingDone::NoDoor(no_door));
+        assert!(
+            pane.lines().is_empty(),
+            "nothing reaches a pane that cannot be poked: {:?}",
+            pane.lines()
+        );
     }
 
     #[test]
@@ -451,7 +748,7 @@ mod tests {
                 crate::pane_write::Urgency::Normal,
             ),
             toron_core::wake::Urgency::Urgent,
-            interrupt_for("fake", true),
+            wake_route("fake", true),
         )
         .unwrap();
         crate::inbox_ports::ring_wake(
@@ -463,7 +760,7 @@ mod tests {
                 crate::pane_write::Urgency::Normal,
             ),
             toron_core::wake::Urgency::Urgent,
-            interrupt_for("pi", true),
+            wake_route("pi", true),
         )
         .unwrap();
         let writes = pane.lines();
