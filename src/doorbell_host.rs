@@ -46,7 +46,14 @@ pub struct RtHost {
     index_pins: Vec<String>,
     /// The one live wake-socket consumer. Shared with the restart task so a
     /// replacement aborts its predecessor instead of littering watchers.
-    wake_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    wake_task: std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                tokio::task::AbortHandle,
+                std::sync::Arc<std::sync::atomic::AtomicBool>,
+            )>,
+        >,
+    >,
     /// mcc9: exact wake → brain counters for this workspace, shared by every
     /// watch source this host arms (bus watch and each wake-sock consumer).
     wake_counters: Arc<doorbell_rt::wake_brain::WakeBrainCounters>,
@@ -77,6 +84,7 @@ fn wake_outcome_to_brain(
     tx: &mpsc::Sender<BrainMsg>,
     workspace: &str,
     retry: &std::sync::Mutex<doorbell_rt::WatchRetry>,
+    retired: &std::sync::atomic::AtomicBool,
 ) {
     use doorbell_rt::wake_brain::Forwarded;
     use doorbell_rt::wake_sock::WakeOutcome;
@@ -98,7 +106,10 @@ fn wake_outcome_to_brain(
             }
             Forwarded::Dropped {
                 report_death: true, ..
-            } => doorbell_rt::msg::deliver_died_blocking(tx),
+            } => {
+                retired.store(true, std::sync::atomic::Ordering::SeqCst);
+                doorbell_rt::msg::deliver_died_blocking(tx);
+            }
             // Counted by the forwarder; the consumer is already condemned.
             _ => {}
         },
@@ -113,6 +124,7 @@ fn wake_outcome_to_brain(
             crate::inbox_host::signal_invalidate(toron_core::inbox_program::Invalidate::EventsLost);
         }
         WakeOutcome::Died => {
+            retired.store(true, std::sync::atomic::Ordering::SeqCst);
             doorbell_rt::msg::deliver_died_blocking(tx);
         }
     }
@@ -705,8 +717,9 @@ impl Host for RtHost {
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Abort the predecessor first: one live consumer per host.
             if let Ok(mut g) = slot.lock()
-                && let Some(h) = g.take()
+                && let Some((h, retire)) = g.take()
             {
+                retire.store(true, std::sync::atomic::Ordering::SeqCst);
                 h.abort();
             }
             let tx_g = tx.clone();
@@ -726,13 +739,16 @@ impl Host for RtHost {
                 );
             }
             let fw = wake_forwarder(&tx_g, &workspace, counters.clone(), resume.clone());
+            let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let retired_cb = std::sync::Arc::clone(&retired);
             let handle = crate::spawn_wake_consumer(
                 &project,
                 &workspace,
                 &config::state_dir(),
                 resume_from,
+                retired,
                 move |out| {
-                    wake_outcome_to_brain(out, &fw, &tx_g, &beat_workspace, &retry);
+                    wake_outcome_to_brain(out, &fw, &tx_g, &beat_workspace, &retry, &retired_cb);
                 },
             );
             if let Ok(mut g) = slot.lock() {
@@ -986,13 +1002,16 @@ async fn run_embedded_async(
             host.wake_counters.clone(),
             host.wake_resume.clone(),
         );
+        let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retired_cb = std::sync::Arc::clone(&retired);
         let handle = crate::spawn_wake_consumer(
             &project,
             workspace,
             &config::state_dir(),
             None,
+            retired,
             move |out| {
-                wake_outcome_to_brain(out, &fw, &tx_w, &beat_workspace, &retry_w);
+                wake_outcome_to_brain(out, &fw, &tx_w, &beat_workspace, &retry_w, &retired_cb);
             },
         );
         if let Ok(mut g) = watch_slot.lock() {
@@ -1556,6 +1575,7 @@ mod events_lost_tests {
                 &tx,
                 "ws",
                 &retry,
+                &std::sync::atomic::AtomicBool::new(false),
             );
         }
         let s = counters.snapshot();
