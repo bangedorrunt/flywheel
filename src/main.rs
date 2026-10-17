@@ -61,8 +61,8 @@ mod ingress;
 mod init_scaffold;
 mod intent;
 mod lead_claim;
-mod redact;
 mod private_fs;
+mod redact;
 mod spawn_facts;
 mod stale_check;
 mod steer_delta;
@@ -1154,11 +1154,24 @@ enum Commands {
         cmd: CaptainCmd,
     },
     /// Supervisor facts and steers (Phase 4a; `TORON_COMMS_INBOX` on):
-    /// crews report `progress|done|exit`, the operator steers
-    /// `redirect|pause|resume|cancel`, `view` prints the CrewView.
+    /// crews report `progress|done|exit|proved|usage`, the operator steers
+    /// `redirect|pause|resume|cancel`, `view` prints the CrewView
+    /// (`goal_proved` is the read-only subscriber), `halt` cancels one context.
     Supervisor {
         #[command(subcommand)]
         cmd: supervisor_host::SupervisorCmd,
+    },
+    /// Cancel one supervisor context: live children get Exit, the host
+    /// stops relaunching that subtree. Escalate mail is the captain push.
+    /// `captain watch` resumes the captain when that mail lands.
+    Halt {
+        project: String,
+        /// Nested lead. Omit for the root host.
+        #[arg(long)]
+        context: Option<String>,
+        /// Epoch the sender holds. Omit to use the log's accepted epoch.
+        #[arg(long)]
+        sup_epoch: Option<u64>,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -2718,7 +2731,7 @@ fn main() {
                 "init spawn add list status decide rebind recover",
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
-            "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: the captain's poll-exit door — blocks on the captain inbox's own water and exits with a preview when new mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll, so a skewed store or missing binary wakes the captain instead of a watch that cannot act. One shot: re-arm after each resume)",
+            "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
             "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — herdr exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
@@ -2735,7 +2748,7 @@ fn main() {
             "stage remove <name> — delete a user-tier stage file (backed up as <name>.toml.bak) so the compiled-in stage resolves again",
                 "checkpoint timeline audit history changes resume analytics",
                 "backend safety guards policy deps integration config upgrade tutorial serve preflight",
-            "supervisor fact|steer|view|hooks (hooks reports the marked hook block; production harnesses stay unverified)"
+            "halt <project> [--context <lead>] [--sup-epoch N] (one control: cancel that subtree, no relaunch). supervisor fact|steer|view|hooks|halt (fact kinds progress|done|exit|proved|usage; usage is advisory and never a cost gate; view --json includes goal_proved; joins are FLYWHEEL_SUPERVISOR_JOIN=all|quorum:N|first:N, default all; quorum and first cancel the rest once k children are proved; hooks reports the marked hook block; production harnesses stay unverified)"
             ],
             "tracker": "br/bv (CLI, no MCP)",
             "coordination": "toron mail",
@@ -3026,6 +3039,11 @@ fn main() {
         Some(Commands::Crew { cmd }) => cmd_crew(&cfg, cmd),
         Some(Commands::Captain { cmd }) => cmd_captain(&cfg, cmd),
         Some(Commands::Supervisor { cmd }) => supervisor_host::run_cli(cmd),
+        Some(Commands::Halt {
+            project,
+            context,
+            sup_epoch,
+        }) => supervisor_host::queue_halt(project, context.as_deref(), *sup_epoch),
         Some(Commands::View {
             project,
             to,
