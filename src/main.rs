@@ -70,6 +70,7 @@ mod stuck_vs_busy;
 mod supervisor_hints;
 mod supervisor_host;
 mod supervisor_program;
+mod timer_watch;
 mod unanswered_triage;
 // Jev RANKS the derived crew menu; it never defines one. The ranker and its
 // rubric are built and tested here, and nothing calls them yet: bd-drlm wires
@@ -1128,8 +1129,8 @@ enum Commands {
         unsafe_plane: bool,
         /// ADR-0041 / build-plan §5: deliver as one `task@1` envelope in each
         /// recipient's comms inbox (`--to` takes npubs, pins or pin@project);
-        /// the pane gets ONLY the constant wake line. Needs
-        /// `TORON_COMMS_INBOX=1` or `[comms] inbox_log = true`.
+        /// the pane gets ONLY the constant wake line. The inbox is on unless
+        /// `TORON_COMMS_INBOX=0|false|off` or `[comms] inbox_log = false`.
         #[arg(long = "via-inbox")]
         via_inbox: bool,
         /// Sender pin or npub for --via-inbox (default: FLYWHEEL_MAIL_AS,
@@ -1172,6 +1173,12 @@ enum Commands {
         /// Epoch the sender holds. Omit to use the log's accepted epoch.
         #[arg(long)]
         sup_epoch: Option<u64>,
+    },
+    /// One-shot watch. Deadline required. One `notify@1` under
+    /// `watch:<id>:<outcome>` (`met|timer|expired|failed`). Default on.
+    Timer {
+        #[command(subcommand)]
+        cmd: timer_watch::TimerCmd,
     },
     /// Interrupt an agent (sends Escape by default — cancels the current
     /// tool call and returns to the prompt). Kill-style keys (ctrl+c) are
@@ -2748,7 +2755,7 @@ fn main() {
             "stage remove <name> — delete a user-tier stage file (backed up as <name>.toml.bak) so the compiled-in stage resolves again",
                 "checkpoint timeline audit history changes resume analytics",
                 "backend safety guards policy deps integration config upgrade tutorial serve preflight",
-            "halt <project> [--context <lead>] [--sup-epoch N] (one control: cancel that subtree, no relaunch). supervisor fact|steer|view|hooks|halt (fact kinds progress|done|exit|proved|usage; usage is advisory and never a cost gate; view --json includes goal_proved; joins are FLYWHEEL_SUPERVISOR_JOIN=all|quorum:N|first:N, default all; quorum and first cancel the rest once k children are proved; hooks reports the marked hook block; production harnesses stay unverified)"
+            "halt <project> [--context <lead>] [--sup-epoch N] (one control: cancel that subtree, no relaunch). supervisor fact|steer|view|hooks|halt (fact kinds progress|done|exit|proved|usage; usage is advisory and never a cost gate; view --json includes goal_proved; joins are FLYWHEEL_SUPERVISOR_JOIN=all|quorum:N|first:N, default all; quorum and first cancel the rest once k children are proved; hooks reports the marked hook block; production harnesses stay unverified). timer arm|meet|fail|sweep (one-shot watch, deadline required, one notify@1 under watch:<id>:<outcome> met|timer|expired|failed; default on, FLYWHEEL_TIMER=0 or [timer] enabled=false opts out; FLYWHEEL_ALLOW_EXEC=0 suppresses the ring; no stored shell)"
             ],
             "tracker": "br/bv (CLI, no MCP)",
             "coordination": "toron mail",
@@ -3044,6 +3051,7 @@ fn main() {
             context,
             sup_epoch,
         }) => supervisor_host::queue_halt(project, context.as_deref(), *sup_epoch),
+        Some(Commands::Timer { cmd }) => timer_watch::run(cmd),
         Some(Commands::View {
             project,
             to,
@@ -7852,13 +7860,14 @@ fn prime_via_send_text(c: &mut Client, pane_id: &str) {
     prime_line_via_send_text(c, pane_id, boot_prime_line());
 }
 
-/// Phase 3: is the inbox comms path on (`TORON_COMMS_INBOX=1` or
-/// `[comms] inbox_log = true`)? Spawn-time and doorbell wiring branch on it.
+/// Phase 3: is the inbox comms path on? Default on. `TORON_COMMS_INBOX=0`
+/// or `[comms] inbox_log = false` opts out. Spawn-time and doorbell wiring
+/// branch on it.
 fn comms_inbox_on() -> bool {
-    toron_core::inbox::enabled()
-        || Config::load()
-            .map(|c| comms_send::enabled(&c))
-            .unwrap_or(false)
+    match Config::load() {
+        Ok(c) => comms_send::enabled(&c),
+        Err(_) => toron_core::inbox::enabled(),
+    }
 }
 
 /// The spawn-time prime for pane `pane_id` running herdr kind `kind`. Flag on:

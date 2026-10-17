@@ -44,7 +44,7 @@
 # url = "http://127.0.0.1:18980"
 # arrival_triple = false  # presence + role auto-bind + join ring (default false)
 # beads_poller = true     # read-only br WAL poll (default true; false opts out; never writes)
-# cron_doorbell_sink = false  # cron tick journals Fact rows (default false)
+# cron_doorbell_sink = true   # cron tick journals Fact rows (default true; false opts out)
 # cross_workspace = false # N-workspace subscriptions (default false)
 # external_projects = {}  # slug -> repo dir for foreign re-ring (same host only)
 # [doorbell.services]     # name -> token hash + scope + rate; empty disables
@@ -69,3 +69,13 @@
 # Env override: FLYWHEEL_CREW_MAX.
 # [crew]
 # max = 5
+
+# Comms inbox. Absent is on. false opts out. TORON_COMMS_INBOX wins when set
+# (1|true|on on, 0|false|off off, any other set value off).
+# [comms]
+# inbox_log = true
+
+# One-shot watches (`flywheel timer`). Absent is on. false opts out.
+# FLYWHEEL_TIMER wins the same way as TORON_COMMS_INBOX. No stored shell.
+# [timer]
+# enabled = true

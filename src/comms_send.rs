@@ -29,7 +29,7 @@
 //! A different payload under an existing msg id is `PayloadConflict`
 //! (toron#18): a hard error, never a replay.
 //!
-//! Gated: `TORON_COMMS_INBOX=1` or `[comms] inbox_log = true`.
+//! Default on. Opt out with `TORON_COMMS_INBOX=0` or `[comms] inbox_log = false`.
 
 use std::path::{Path, PathBuf};
 
@@ -47,14 +47,11 @@ use toron_core::outbox::{self, SendState};
 use crate::config::Config;
 use crate::pane_write::{PaneTyper, PaneWrite, Urgency, Wm};
 
-/// The comms flag: env `TORON_COMMS_INBOX=1` or `[comms] inbox_log = true`.
+/// The comms flag. Absent config and an unset env are on.
+/// `inbox_log = false` opts out. A set `TORON_COMMS_INBOX` wins:
+/// `1|true|on` on, `0|false|off` and any other value off.
 pub fn enabled(cfg: &Config) -> bool {
-    toron_core::inbox::enabled()
-        || cfg
-            .comms
-            .as_ref()
-            .and_then(|c| c.inbox_log)
-            .unwrap_or(false)
+    toron_core::inbox::enabled_with(cfg.comms.as_ref().and_then(|c| c.inbox_log))
 }
 
 /// Typed send failures. Every one of them means: nothing was appended.
@@ -85,7 +82,7 @@ impl std::fmt::Display for SendError {
         match self {
             Self::Disabled => write!(
                 f,
-                "comms inbox is off: set TORON_COMMS_INBOX=1 or [comms] inbox_log = true (nothing sent)"
+                "comms inbox is off: TORON_COMMS_INBOX=0 or [comms] inbox_log = false (default is on; nothing sent)"
             ),
             Self::BadAddress { token } => write!(
                 f,

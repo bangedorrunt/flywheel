@@ -963,7 +963,7 @@ pub enum SupCmd {
         /// Evidence text.
         evidence: String,
     },
-    /// Hand a bead to a crew. Logged only; the host does not write a pane.
+    /// Hand a bead to a crew. The host appends `task@1` and does not write a pane.
     Assign {
         /// Task id.
         task: String,
