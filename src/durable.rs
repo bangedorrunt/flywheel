@@ -4621,10 +4621,15 @@ pub fn stall_watching_threshold_secs(threshold_secs: u64) -> u64 {
 /// Precedence: rate_limit > network > model_truncated > silent_idle.
 pub fn classify_stall_reason(evidence: &str) -> String {
     let lower = evidence.to_ascii_lowercase();
-    if lower.contains("rate limit")
-        || lower.contains("quota")
+    if lower.contains("quota")
+        || lower.contains("usage limit")
+        || lower.contains("allowance")
+    {
+        "allowance".to_string()
+    } else if lower.contains("rate limit")
         || lower.contains("429")
         || lower.contains("overloaded")
+        || lower.contains("at capacity")
     {
         "rate_limit".to_string()
     } else if lower.contains("connection")
@@ -15995,7 +16000,7 @@ mod tests {
         assert_eq!(classify_stall_reason("rate limit exceeded"), "rate_limit");
         assert_eq!(
             classify_stall_reason("Quota exceeded for model"),
-            "rate_limit"
+            "allowance"
         );
         assert_eq!(classify_stall_reason("got 429 error"), "rate_limit");
         assert_eq!(
