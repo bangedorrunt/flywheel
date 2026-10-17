@@ -5326,33 +5326,12 @@ mod adr0010_d2_tests {
     // governed-by: ADR-0010 D2 (bd-8jlv) — WakeAck generation-bound watermark.
     use super::*;
 
-    fn prompt_setup() -> WorkspaceModel {
-        let mut m = WorkspaceModel::default();
-        m.presence.insert(
-            "P".into(),
-            Presence::Idle {
-                source: "test".into(),
-            },
-        );
-        m.roles.insert("captain".into(), "P".into());
-        m
-    }
-
     fn fact(summary: &str) -> Msg {
         // bd-l72k: the D2 ledger records deliveries only, and only urgent
         // prompts deliver — so ledger tests drive urgent facts.
         Msg::Fact {
             summary: format!("plane-P urgent {summary}"),
         }
-    }
-
-    fn prompts(cmds: &[Cmd]) -> Vec<String> {
-        cmds.iter()
-            .filter_map(|c| match c {
-                Cmd::Prompt { pin, line } if pin == "P" => Some(line.clone()),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]
