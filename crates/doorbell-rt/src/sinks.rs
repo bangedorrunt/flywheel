@@ -443,17 +443,21 @@ impl PromptSink for MockSink {
         "mock"
     }
 }
-/// The comms flag as the daemon can see it: env `TORON_COMMS_INBOX` is
-/// `1`/`true`/`on` (the same words as `toron_core::inbox::resolve_enabled`;
-/// the daemon has no flywheel config, so the config-file flag must be
-/// exported to its unit).
+/// The comms flag as the daemon can see it. Unset is on, matching
+/// `toron_core::inbox::resolve_enabled` with no config key. The daemon has
+/// no flywheel config file, so `TORON_COMMS_INBOX=0` is how a unit opts out.
 pub fn comms_inbox_env() -> bool {
     comms_flag_word(std::env::var("TORON_COMMS_INBOX").ok().as_deref())
 }
 
-/// Pure: the flag words.
+/// Pure: the flag words. Unset and empty are on. `0|false|off` and any
+/// other set value are off.
 pub fn comms_flag_word(v: Option<&str>) -> bool {
-    matches!(v, Some("1" | "true" | "on"))
+    match v {
+        None | Some("") => true,
+        Some("1" | "true" | "on") => true,
+        Some(_) => false,
+    }
 }
 
 /// Sink for hosts that run under the comms flag (bd-doorbell-daemon-sink-
@@ -834,7 +838,8 @@ mod tests {
     fn no_text_sink_types_nothing_and_never_fails() {
         let mut s = NoTextSink::new();
         for l in ["BRAIN PAYLOAD", "another", ""] {
-            s.send("TealBirch", l).expect("always Ok: nothing to digest");
+            s.send("TealBirch", l)
+                .expect("always Ok: nothing to digest");
         }
         assert_eq!(s.dropped(), 3);
         assert_eq!(s.name(), "comms-inbox-no-text");
@@ -845,10 +850,11 @@ mod tests {
         for on in ["1", "true", "on"] {
             assert!(comms_flag_word(Some(on)), "{on}");
         }
-        for off in ["", "0", "false", "yes", "off"] {
+        for off in ["0", "false", "yes", "off"] {
             assert!(!comms_flag_word(Some(off)), "{off}");
         }
-        assert!(!comms_flag_word(None));
+        assert!(comms_flag_word(None));
+        assert!(comms_flag_word(Some("")));
     }
 
     use super::*;

@@ -884,9 +884,26 @@ fn run_inbox_only(cfg: &Config, project: &str, workspace: &str) -> anyhow::Resul
         crate::inbox_host::HostCfg::from_env(),
     );
     let mut beats = 0u32;
+    let mut timer_err = String::new();
     while path.exists() {
         std::thread::sleep(Duration::from_secs(1));
         beats += 1;
+        // The daemon owns the brain on this path, so the timer sweep lives
+        // here. The embedded loop spawns its own thread for the same call.
+        if crate::timer_watch::host_enabled(cfg) {
+            match crate::timer_watch::sweep_project(
+                project,
+                crate::timer_watch::now_us(),
+                crate::timer_watch::exec_allowed(),
+            ) {
+                Ok(_) => timer_err.clear(),
+                Err(e) if e == timer_err => {}
+                Err(e) => {
+                    eprintln!("timer sweep {project}: {e}");
+                    timer_err = e;
+                }
+            }
+        }
         if beats % 30 == 0 {
             doorbell_rt::lease::refresh_lease(
                 &sd,
@@ -1090,6 +1107,10 @@ async fn run_embedded_async(
         let repo = crate::project_dir(&cfg, project);
         doorbell_rt::pollers::spawn_beads_poller(tx.clone(), repo)
     });
+    // One-shot watches. A thread, not a reducer: the clock stays outside tick.
+    if crate::timer_watch::host_enabled(&cfg) {
+        crate::timer_watch::spawn_sweep(project);
+    }
     // External re-ring driver (E9, bd-4gco, flag-gated): read-only
     // foreign-close watch emitting Fact Msgs. Same-host only; the daemon
     // host gains the same spawn when the Phase-3 Brain loop lands there.

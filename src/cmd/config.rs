@@ -116,6 +116,36 @@ pub(crate) const SETTINGS: &[Setting] = &[
         summary: "Agent pin (adjective+noun) used when AGENT_NAME, TORON_AGENT, and FLYWHEEL_MAIL_AS are all unset.",
         default_hint: "unset",
     },
+    Setting {
+        key: "comms.inbox_log",
+        summary: "Comms inbox. Absent is on. false opts out. TORON_COMMS_INBOX wins when set.",
+        default_hint: "true",
+    },
+    Setting {
+        key: "doorbell.beads_poller",
+        summary: "Read-only br WAL poll. true unless set false. The poller never writes.",
+        default_hint: "true",
+    },
+    Setting {
+        key: "doorbell.cron_doorbell_sink",
+        summary: "Cron tick journals a Fact row. true unless set false.",
+        default_hint: "true",
+    },
+    Setting {
+        key: "doorbell.arrival_triple",
+        summary: "Presence, role bind, and join ring. false keeps migration byte-identical.",
+        default_hint: "false",
+    },
+    Setting {
+        key: "doorbell.cross_workspace",
+        summary: "N-workspace subscriptions. false keeps single-workspace behavior.",
+        default_hint: "false",
+    },
+    Setting {
+        key: "timer.enabled",
+        summary: "One-shot watches. Absent is on. false opts out. FLYWHEEL_TIMER wins when set.",
+        default_hint: "true",
+    },
 ];
 
 fn known_keys() -> String {
@@ -185,11 +215,13 @@ fn effective_setting(cfg: &Config, key: &str) -> String {
             .and_then(|m| m.toron.as_ref())
             .and_then(|t| t.url.clone())
             .unwrap_or_else(|| "(embedded)".into()),
-        "doorbell.url" => cfg
-            .doorbell
-            .as_ref()
-            .and_then(|d| d.url.clone())
-            .unwrap_or_else(|| "(embedded)".into()),
+        "doorbell.url" => cfg.doorbell_url().unwrap_or_else(|| "(embedded)".into()),
+        "comms.inbox_log" => crate::comms_send::enabled(cfg).to_string(),
+        "doorbell.beads_poller" => cfg.doorbell_beads_poller().to_string(),
+        "doorbell.cron_doorbell_sink" => cfg.doorbell_cron_sink().to_string(),
+        "doorbell.arrival_triple" => cfg.doorbell_arrival_triple().to_string(),
+        "doorbell.cross_workspace" => cfg.doorbell_cross_workspace().to_string(),
+        "timer.enabled" => crate::timer_watch::host_enabled(cfg).to_string(),
         "agent_mail.name" => cfg
             .agent_mail
             .as_ref()
@@ -225,12 +257,26 @@ pub(crate) fn apply_key(table: &mut toml::Table, key: &str, value: &str) -> Resu
     if key == "on_captain_death" && !matches!(value, "stop" | "continue" | "adopt") {
         bail!("{key} must be stop, continue, or adopt, got {value:?}");
     }
+    let bool_key = matches!(
+        key,
+        "comms.inbox_log"
+            | "doorbell.beads_poller"
+            | "doorbell.cron_doorbell_sink"
+            | "doorbell.arrival_triple"
+            | "doorbell.cross_workspace"
+            | "timer.enabled"
+    );
+    if bool_key && !matches!(value, "true" | "false") {
+        bail!("{key} must be true or false, got {value:?}");
+    }
     let parsed = if key == "default_timeout_ms" || key == "crew.max" {
         toml::Value::Integer(
             value
                 .parse::<i64>()
                 .map_err(|e| anyhow::anyhow!("{key} must be an integer, got {value:?}: {e}"))?,
         )
+    } else if bool_key {
+        toml::Value::Boolean(value == "true")
     } else {
         toml::Value::String(value.to_string())
     };
@@ -532,6 +578,14 @@ mod config_key_tests {
                 "5"
             } else if setting.key == "on_captain_death" {
                 "stop"
+            } else if setting.key.contains("inbox_log")
+                || setting.key.contains("beads_poller")
+                || setting.key.contains("cron_doorbell")
+                || setting.key.contains("arrival_triple")
+                || setting.key.contains("cross_workspace")
+                || setting.key.contains("timer.enabled")
+            {
+                "true"
             } else {
                 "x"
             };

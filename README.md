@@ -190,11 +190,12 @@ wake-worthy).
 
 ## Supervisor host (Phase 4a)
 
-With `TORON_COMMS_INBOX=1` (or `[comms] inbox_log=true`), `loop-mode supervise`
-runs a `SupervisorProgram` host: restart intensity (leads 3 per 30 min,
-captain 2 per 60 min), generation fencing, a steer gate, and a lease fence,
-all folded from an append-only log under the state dir. Flag off, the legacy
-supervise path runs unchanged.
+`loop-mode supervise` runs a `SupervisorProgram` host while the comms inbox
+is on (the default: env unset and `[comms] inbox_log` absent). Opt out with
+`TORON_COMMS_INBOX=0|false|off` or `inbox_log = false`. The host folds restart
+intensity (leads 3 per 30 min, captain 2 per 60 min), generation fencing, a
+steer gate, and a lease fence from an append-only log under the state dir.
+Flag off, the legacy supervise path runs unchanged.
 
 `flywheel supervisor fact|steer|view` are **not** flag-gated: they only append
 to, or read, that log. Without a running host they are inert — a fact or steer
