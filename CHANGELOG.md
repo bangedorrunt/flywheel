@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A condemned wake rings death on a side bell. The brain restarts on the next turn while the watches already accepted stay queued. A full channel can no longer freeze `forwarded` until that backlog drains.
+
 ## [0.8.0] — 2026-10-17
 
 ### Added
