@@ -2666,6 +2666,7 @@ fn settle_retry<T, E>(
         attempt,
         |_| true,
         |_, _| {},
+        crate::retry::host_draw,
         |d| {
             if !d.is_zero() {
                 std::thread::sleep(d);
@@ -7980,6 +7981,7 @@ fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) -> bool {
                 "flywheel: warn: boot-prime send_text attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying"
             );
         },
+        crate::retry::host_draw,
         std::thread::sleep,
     );
     if let Err(e) = text_res {
@@ -8002,6 +8004,7 @@ fn prime_line_via_send_text(c: &mut Client, pane_id: &str, line: &str) -> bool {
                 "flywheel: warn: boot-prime Enter attempt {attempt}/{max} failed for {pane_id}: {e:#} — retrying Enter only"
             );
         },
+        crate::retry::host_draw,
         std::thread::sleep,
     );
     if let Err(e) = enter_res {
@@ -18265,6 +18268,7 @@ mod bd_4pxy_tests {
             },
             |_| true,
             |_, _| {},
+            || 0.0,
             |_| sleeps += 1,
         );
         assert!(out.is_ok());
@@ -23725,7 +23729,9 @@ fn cmd_loop(
             if any_blocked && on_blocked == "continue" {
                 println!(
                     "{}",
-                    dim("loop: agents blocked (on_blocked=continue; pass --on-blocked stop|mail to control)")
+                    dim(
+                        "loop: agents blocked (on_blocked=continue; pass --on-blocked stop|mail to control)"
+                    )
                 );
             }
             return Ok(());
@@ -25354,7 +25360,11 @@ mod loop_tests {
             true
         });
         assert_eq!(got.as_deref(), Some("BoldKite"));
-        assert_eq!(tried, vec!["BoldKite"], "blanks are filtered before any whois");
+        assert_eq!(
+            tried,
+            vec!["BoldKite"],
+            "blanks are filtered before any whois"
+        );
     }
 
     /// Pure: order is preserved — the chain never prefers a later rung
@@ -25380,7 +25390,9 @@ mod loop_tests {
             "planner mailed"
         );
         assert_eq!(
-            crate::durable::not_ready_mail_status(&json!({"ok": false, "notified": "", "error": "unknown recipient"})),
+            crate::durable::not_ready_mail_status(
+                &json!({"ok": false, "notified": "", "error": "unknown recipient"})
+            ),
             "planner NOT mailed",
             "a failed send is reported as a failure"
         );

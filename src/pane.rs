@@ -1467,7 +1467,7 @@ pub fn pane_dispatch(
                 .map(is_transient_dispatch_reason)
                 .unwrap_or(false);
             if transient && attempts < MAX_ATTEMPTS {
-                let wait = dispatch_policy.delay_for(attempts);
+                let wait = dispatch_policy.delay_for(attempts, crate::retry::host_draw());
                 attempts += 1;
                 eprintln!(
                     "flywheel: @{attempt_profile} not ready (attempt {attempts}/{MAX_ATTEMPTS}) — retrying in {}s",
@@ -2858,23 +2858,32 @@ mod tests {
         assert_eq!(got.pane_id, "w1:p5");
     }
 
-    /// bd-gkwu: the dispatch retry schedule is pure policy data —
-    /// deterministic per attempt, bounded by the cap, no sleep inside.
+    /// bd-gkwu + bd-retry-jitter-xlh6: the dispatch retry schedule is pure
+    /// policy data — deterministic per (attempt, draw), drawn from the upper
+    /// half of the attempt's ceiling, bounded by the cap, no sleep inside.
     /// (The sleep lives at the single call site in the interpreter.)
     #[test]
     fn authority_edge_dispatch_retry_is_policy_schedule() {
         let policy = dispatch_retry_policy();
-        let d0 = policy.delay_for(0);
-        assert_eq!(d0, policy.delay_for(0), "schedule must be deterministic");
+        let d0 = policy.delay_for(0, 0.5);
+        assert_eq!(
+            d0,
+            policy.delay_for(0, 0.5),
+            "schedule must be deterministic"
+        );
         assert!(d0 <= policy.cap, "attempt 0 within cap: {d0:?}");
         assert!(
-            policy.delay_for(100) <= policy.cap + policy.cap / 10,
-            "far attempts bounded by cap plus the 10% jitter"
+            policy.delay_for(100, 1.0) <= policy.cap,
+            "far attempts bounded by the cap"
         );
         assert!(
-            policy.delay_for(1) >= d0,
+            policy.delay_for(1, 1.0) >= d0,
             "backoff must not shrink: {:?} vs {d0:?}",
-            policy.delay_for(1)
+            policy.delay_for(1, 1.0)
+        );
+        assert!(
+            policy.delay_for(1, 0.0) < policy.delay_for(1, 1.0),
+            "the draw moves the delay inside the attempt's window"
         );
     }
 
@@ -2897,6 +2906,7 @@ mod tests {
             },
             |_| true,
             |_, _| {},
+            || 0.0,
             |_| sleeps += 1,
         );
         assert_eq!(out, Ok("sent"));
