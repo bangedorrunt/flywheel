@@ -722,7 +722,10 @@ pub fn execute(
             n,
             reason,
             evidence,
-        } => ports.escalate(*n, reason, evidence).map(|_| vec![]),
+        } => ports
+            .escalate(*n, reason, evidence)
+            .and_then(|_| captain_hold(evidence, reason))
+            .map(|_| vec![]),
         SupCmd::Assign { .. } => {
             // Log-only. Assign does not append task@1.
             Ok(vec![])
@@ -1319,6 +1322,10 @@ pub struct HostCfg {
     /// `FLYWHEEL_SUPERVISOR_CLOCK_SCALE`. 1 in production. Captured at
     /// `from_env` so a later test cannot change a policy already built.
     pub clock_scale: u64,
+    /// `FLYWHEEL_SUPERVISOR_JOIN`. `None` keeps [`Join::All`].
+    pub join: Option<crate::supervisor_program::Join>,
+    /// `FLYWHEEL_SUPERVISOR_MAX_WALL_MS`. `None` does not gate on the wall.
+    pub max_wall_ms: Option<u64>,
 }
 
 impl HostCfg {
@@ -1336,12 +1343,21 @@ impl HostCfg {
                 .and_then(|v| crate::supervisor_program::Strategy::parse(&v)),
             hints: std::env::var("FLYWHEEL_SUPERVISOR_HINTS").map_or(true, |v| v != "off"),
             clock_scale: clock_scale(),
+            join: std::env::var("FLYWHEEL_SUPERVISOR_JOIN")
+                .ok()
+                .and_then(|v| crate::supervisor_program::Join::parse(&v)),
+            max_wall_ms: num("FLYWHEEL_SUPERVISOR_MAX_WALL_MS"),
         }
     }
 
     fn policy(&self) -> Option<Policy> {
         let scale = self.clock_scale.max(1);
-        if self.ack_ms.is_none() && self.lease_ms.is_none() && self.strategy.is_none() && scale == 1
+        if self.ack_ms.is_none()
+            && self.lease_ms.is_none()
+            && self.strategy.is_none()
+            && self.join.is_none()
+            && self.max_wall_ms.is_none()
+            && scale == 1
         {
             return None;
         }
@@ -1356,8 +1372,39 @@ impl HostCfg {
         if self.lease_ms.is_some() {
             p.lease_ms = lease;
         }
+        if let Some(j) = self.join {
+            p.join = j;
+        }
+        if let Some(w) = self.max_wall_ms {
+            p.max_wall_ms = Some(w);
+        }
         p.t_orphan_ms = crate::supervisor_program::scaled_orphan_ms(lease, scale);
         Some(p)
+    }
+}
+
+/// `br hold --kind captain` when the escalation names a bead.
+///
+/// A missing `br` is loud and does not fail the page. `FLYWHEEL_BR_BIN`
+/// that exits non-zero fails the command. No bead id means no process.
+fn captain_hold(evidence: &str, reason: &str) -> Result<(), String> {
+    let Some(argv) = crate::supervisor_program::bead_hold_argv(evidence, reason) else {
+        return Ok(());
+    };
+    let pinned = std::env::var("FLYWHEEL_BR_BIN").ok();
+    let program = pinned.as_deref().unwrap_or("br");
+    match std::process::Command::new(program).args(&argv).status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) if pinned.is_some() => Err(format!("br hold exited {st}")),
+        Ok(st) => {
+            eprintln!("flywheel supervisor: br hold failed ({st}); the escalate page stands");
+            Ok(())
+        }
+        Err(e) if pinned.is_some() => Err(format!("br hold: {e}")),
+        Err(e) => {
+            eprintln!("flywheel supervisor: br hold not run ({e}); the escalate page stands");
+            Ok(())
+        }
     }
 }
 
@@ -1639,6 +1686,15 @@ fn host_loop(
                 );
             }
             crate::supervisor_program::Status::Running => {}
+            crate::supervisor_program::Status::Halted => {
+                if let Some(mut c) = pass.take() {
+                    let _ = c.kill();
+                }
+                bail!(
+                    "loop-mode supervise stopping: halt cancelled the subtree in {project} at sup_epoch {}",
+                    core.model.accepted_epoch
+                );
+            }
         }
         crate::supervisor_hints::wait(&hint_rx, std::time::Duration::from_millis(hc.tick_ms));
     }
@@ -1716,12 +1772,21 @@ pub enum SupervisorCmd {
         /// Child (pin).
         #[arg(long)]
         child: String,
-        /// progress | done | exit
+        /// progress | done | exit | proved | usage
         #[arg(long)]
         kind: String,
-        /// The incarnation the report is for (required for progress/done).
+        /// The incarnation the report is for (required for progress/done/proved).
         #[arg(long, default_value_t = 0)]
         generation: u64,
+        /// `usage` only. Self-reported. Never a cost gate.
+        #[arg(long, default_value_t = 0)]
+        input_tokens: u64,
+        /// `usage` only.
+        #[arg(long, default_value_t = 0)]
+        output_tokens: u64,
+        /// `usage` only, micro-dollars.
+        #[arg(long, default_value_t = 0)]
+        usd_micros: u64,
     },
     /// Steer a child: redirect | pause | resume | cancel.
     Steer {
@@ -1750,6 +1815,16 @@ pub enum SupervisorCmd {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Cancel this context's subtree. Same door as `flywheel halt`.
+    Halt {
+        project: String,
+        /// Nested lead. Omit for the root host.
+        #[arg(long)]
+        context: Option<String>,
+        /// Epoch the sender holds. Omit to use the log's accepted epoch.
+        #[arg(long)]
+        sup_epoch: Option<u64>,
+    },
 }
 
 /// Parse a steer op word.
@@ -1771,6 +1846,9 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
             child,
             kind,
             generation,
+            input_tokens,
+            output_tokens,
+            usd_micros,
         } => {
             let p = CtxPaths::new(&CtxPaths::default_dir(), project);
             let now_ms = now_ms();
@@ -1789,7 +1867,19 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
                     child: child.clone(),
                     now_ms,
                 },
-                other => bail!("unknown fact kind {other:?} (progress|done|exit)"),
+                "proved" => SupMsg::Proved {
+                    child: child.clone(),
+                    generation: *generation,
+                    now_ms,
+                },
+                "usage" => SupMsg::Usage {
+                    child: child.clone(),
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    usd_micros: *usd_micros,
+                    now_ms,
+                },
+                other => bail!("unknown fact kind {other:?} (progress|done|exit|proved|usage)"),
             };
             append_input(&p, &msg)?;
             println!("queued {kind} for {child}");
@@ -1855,7 +1945,8 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "status": m.status, "sup_epoch": m.accepted_epoch, "leader": m.leader,
-                        "restarts_in_window": m.restarts.len(), "rows": rows,
+                        "restarts_in_window": m.restarts.len(), "goal_proved": m.goal_proved,
+                        "rows": rows,
                     }))?
                 );
             } else {
@@ -1871,17 +1962,48 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
             println!("{}", crate::harness_caps::doctor_line(path));
             Ok(())
         }
+        SupervisorCmd::Halt {
+            project,
+            context,
+            sup_epoch,
+        } => queue_halt(project, context.as_deref(), *sup_epoch),
     }
+}
+
+/// Append one `Halt` to the context's inbox. The host folds it on the next round.
+pub fn queue_halt(project: &str, context: Option<&str>, sup_epoch: Option<u64>) -> Result<()> {
+    let dir = CtxPaths::default_dir();
+    let p = match context {
+        Some(c) if !c.is_empty() => CtxPaths::with_context(&dir, project, c),
+        _ => CtxPaths::new(&dir, project),
+    };
+    let epoch = match sup_epoch {
+        Some(e) => e,
+        None => {
+            let (msgs, _, _) = read_log(&p)?;
+            crate::supervisor_program::replay(&msgs).0.accepted_epoch
+        }
+    };
+    append_input(
+        &p,
+        &SupMsg::Halt {
+            sup_epoch: epoch,
+            now_ms: now_ms(),
+        },
+    )?;
+    println!("queued halt for {project} under sup_epoch {epoch}");
+    Ok(())
 }
 
 fn print_view(m: &SupModel, rows: &[CrewRow]) {
     println!(
-        "supervisor {:?} sup_epoch {} leader {} restarts {}/{}",
+        "supervisor {:?} sup_epoch {} leader {} restarts {}/{} goal_proved {}",
         m.status,
         m.accepted_epoch,
         m.leader,
         m.restarts.len(),
-        m.policy.max_r
+        m.policy.max_r,
+        m.goal_proved
     );
     for r in rows {
         let steer = r
@@ -2543,6 +2665,8 @@ mod tests {
     fn the_strategy_word_reaches_the_policy() {
         let _g = crate::config::lock_env();
         unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_CLOCK_SCALE") };
+        unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_JOIN") };
+        unsafe { std::env::remove_var("FLYWHEEL_SUPERVISOR_MAX_WALL_MS") };
         use crate::supervisor_program::Strategy;
         let cfg = HostCfg {
             strategy: Some(Strategy::OneForAll),
@@ -2559,6 +2683,69 @@ mod tests {
             none.policy().is_none(),
             "no override: the tier default stands"
         );
+    }
+
+    #[test]
+    fn p4b_close_br_hold_uses_the_pinned_binary_and_skips_a_beadless_page() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("br");
+        let logf = dir.path().join("argv");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", logf.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = Fake::default();
+        let back = execute(
+            &mut j,
+            &mut ports,
+            &SupCmd::Escalate {
+                n: 1,
+                reason: "budget".into(),
+                evidence: "see bd-close1".into(),
+            },
+            &mut rep,
+        );
+        assert!(back.is_empty(), "{back:?}");
+        let got = std::fs::read_to_string(&logf).unwrap();
+        assert_eq!(got, "hold\n--kind\ncaptain\n--corr\nbd-close1\nbd-close1\n");
+        std::fs::remove_file(&logf).unwrap();
+        let back = execute(
+            &mut j,
+            &mut ports,
+            &SupCmd::Escalate {
+                n: 2,
+                reason: "budget".into(),
+                evidence: "no bead here".into(),
+            },
+            &mut rep,
+        );
+        assert!(back.is_empty());
+        assert!(!logf.exists(), "a page with no bead id does not spawn br");
+        std::fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut j = MemJournal::default();
+        let back = execute(
+            &mut j,
+            &mut ports,
+            &SupCmd::Escalate {
+                n: 1,
+                reason: "budget".into(),
+                evidence: "bd-close1".into(),
+            },
+            &mut rep,
+        );
+        assert!(
+            matches!(back.first(), Some(SupMsg::CmdFailed { .. })),
+            "{back:?}"
+        );
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
     }
 
     /// What a hinted loop publishes after each round.
