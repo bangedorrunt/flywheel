@@ -94,6 +94,10 @@ async fn host_workspace(
         }
     }
     let store = FileStore::new(fw_state);
+    // Death is a side bell, not another item on the watch channel. The
+    // consumer rings it; the brain selects it ahead of the backlog.
+    let died_bell = doorbell_rt::DiedBell::new();
+    host = host.with_died_bell(std::sync::Arc::clone(&died_bell));
     // Wake-sock consumer (the in-process bus needs toron-core, which the
     // lean daemon never links). Backoff + retry gate live in the host.
     host.restart_wake();
@@ -133,8 +137,9 @@ async fn host_workspace(
             None
         }
     };
-    let brain =
-        Brain::new(BrainConfig::new(&workspace), host, store, sinks).with_liveness(liveness);
+    let brain = Brain::new(BrainConfig::new(&workspace), host, store, sinks)
+        .with_liveness(liveness)
+        .with_died_bell(died_bell);
     let report = brain.run(rx).await;
     drop(sweep_ticker);
     eprintln!(

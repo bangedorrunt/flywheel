@@ -840,6 +840,9 @@ pub struct FileHost {
     /// Status-change outbox: the poll loop `tell`s `HerdrStatus` back
     /// through this channel (forwarder topology over a poll transport).
     tx: Option<tokio::sync::mpsc::Sender<BrainMsg>>,
+    /// Death side-channel. Captured into each wake consumer so a full `tx`
+    /// cannot hide `Died` behind the accepted backlog.
+    died_bell: Option<std::sync::Arc<crate::msg::DiedBell>>,
     pending_audit: Option<(String, serde_json::Value)>,
     /// The registry file whose ambiguity was last audited, so a standing
     /// ambiguity is reported once instead of once per sweep.
@@ -914,6 +917,7 @@ impl FileHost {
             daemon_exe,
             generation,
             tx: None,
+            died_bell: None,
             pending_audit: None,
             registry_ambiguous_reported: None,
             wake_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -928,6 +932,12 @@ impl FileHost {
     /// Status-change outbox (see field docs).
     pub fn with_tx(mut self, tx: tokio::sync::mpsc::Sender<BrainMsg>) -> Self {
         self.tx = Some(tx);
+        self
+    }
+
+    /// Same bell the brain selects on. Set before `restart_wake`.
+    pub fn with_died_bell(mut self, bell: std::sync::Arc<crate::msg::DiedBell>) -> Self {
+        self.died_bell = Some(bell);
         self
     }
 
@@ -1836,6 +1846,7 @@ impl Host for FileHost {
             );
         }
         let tx = self.tx.clone();
+        let died_bell = self.died_bell.clone();
         let project = self.cfg.project.clone();
         let fw_state = self.cfg.flywheel_state.clone();
         let workspace = self.cfg.workspace.clone();
@@ -1947,8 +1958,8 @@ impl Host for FileHost {
                     use crate::wake_sock::WakeOutcome;
                     // mcc9: Watch goes through the forwarder (backpressure on a
                     // full channel, never a silent shed); stamp .event only
-                    // once the brain has the line; Died via blocking_send so
-                    // Full cannot drop restart_wake.
+                    // once the brain has the line. Died rings the side bell so a
+                    // full channel cannot hide the restart behind the backlog.
                     match out {
                         WakeOutcome::Watch(l) => match forwarder.forward(l) {
                             f if f.reached_brain() => {
@@ -1976,7 +1987,7 @@ impl Host for FileHost {
                                 // std consumer stops taking lines; abort still
                                 // waits until the replacement is about to arm.
                                 retire_now.store(true, std::sync::atomic::Ordering::SeqCst);
-                                crate::msg::deliver_died_blocking(&tx);
+                                crate::msg::deliver_died(&tx, died_bell.as_deref());
                             }
                             // Counted by the forwarder; the consumer is
                             // already condemned.
@@ -2010,7 +2021,7 @@ impl Host for FileHost {
                                 );
                             }
                             retire_now.store(true, std::sync::atomic::Ordering::SeqCst);
-                            crate::msg::deliver_died_blocking(&tx);
+                            crate::msg::deliver_died(&tx, died_bell.as_deref());
                         }
                     }
                 },

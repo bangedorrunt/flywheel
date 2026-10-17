@@ -37,7 +37,7 @@ pub use file_host::{
 };
 pub use host::{CoreReducer, Effect, Host, MockHost};
 pub use lease::{Deference, OwnerLease, acquire_lease, deference_decision, lease_stale};
-pub use msg::{AskKind, AskReply, BrainMsg, deliver_died_blocking};
+pub use msg::{AskKind, AskReply, BrainMsg, DiedBell, deliver_died, deliver_died_blocking};
 pub use policy::{RestartPolicy, WatchRetry};
 pub use sensors::{SensorHandle, bridge, interval_ticker, supervise};
 pub use sinks::{

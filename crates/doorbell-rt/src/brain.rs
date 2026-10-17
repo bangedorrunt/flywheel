@@ -251,6 +251,9 @@ pub struct Brain<H: Host> {
     /// brain touches it on every select wake, the drain classifies
     /// starve/churn/lost-wake from age + wake growth.
     liveness: std::sync::Arc<BrainLiveness>,
+    /// Side signal for [`crate::msg::BrainMsg::Died`]. `None` keeps the
+    /// channel-only path (tests that enqueue Died).
+    died_bell: Option<std::sync::Arc<crate::msg::DiedBell>>,
 }
 
 impl<H: Host> Brain<H> {
@@ -327,6 +330,7 @@ impl<H: Host> Brain<H> {
             watch_seen_set: BTreeSet::new(),
             sla_seen: std::collections::BTreeSet::new(),
             liveness: std::sync::Arc::new(BrainLiveness::new()),
+            died_bell: None,
         };
         // bd-jcys: the resume row rides `journal()` like every other row, so it
         // is sequenced, attributed to this subscriber, and cannot fail silently.
@@ -346,6 +350,12 @@ impl<H: Host> Brain<H> {
     /// deadline read (spawn wires the same Arc into both).
     pub fn with_liveness(mut self, liveness: std::sync::Arc<BrainLiveness>) -> Self {
         self.liveness = liveness;
+        self
+    }
+
+    /// Death arrives on this bell, ahead of any watch already queued.
+    pub fn with_died_bell(mut self, bell: std::sync::Arc<crate::msg::DiedBell>) -> Self {
+        self.died_bell = Some(bell);
         self
     }
 
@@ -369,11 +379,34 @@ impl<H: Host> Brain<H> {
         let started = tokio::time::Instant::now();
         let mut dispatched = 0usize;
         let elapsed_ms = || started.elapsed().as_millis();
+        let died_bell = self.died_bell.clone();
         loop {
             // bd-y40k: every select wake stamps the shared probe — the drain
             // reads it at the deadline to settle churn-vs-starvation.
             self.liveness.touch();
+            let died = async {
+                match &died_bell {
+                    Some(bell) => bell.wait().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
+                biased;
+                _ = died => {
+                    // `wait` already consumed the flag. A ring during this
+                    // dispatch stays set and wins the next loop, still ahead
+                    // of whatever watches are queued.
+                    let label = brain_msg_label(&BrainMsg::Died);
+                    dispatched += 1;
+                    let ws_d = ws.clone();
+                    run_dispatch_with_slow_warn(label, self.dispatch(BrainMsg::Died), move |label| {
+                        eprintln!(
+                            "doorbell serve: brain {ws_d} dispatch {label} still running after {}s",
+                            SLOW_DISPATCH_WARN.as_secs()
+                        );
+                    })
+                    .await;
+                }
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
                     if matches!(msg, BrainMsg::Shutdown) {
@@ -1401,6 +1434,74 @@ mod tests {
     use crate::host::MockHost;
     use crate::sinks::MockSink;
     use std::collections::VecDeque;
+
+    /// Death on the bell restarts before a watch that was already queued.
+    /// If Died were `blocking_send`'d onto that channel, the watch would tick first.
+    #[tokio::test]
+    async fn death_bell_restarts_while_a_watch_is_still_queued() {
+        let dir = std::env::temp_dir().join(format!(
+            "died-bell-brain-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(BrainMsg::Watch("still-queued".into())).unwrap();
+        let bell = crate::msg::DiedBell::new();
+        bell.ring();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let host = BellOrderHost {
+            order: order.clone(),
+        };
+        let sinks = crate::sinks::SinkManager::new(tx.clone());
+        let brain = Brain::new(
+            BrainConfig::new("bell"),
+            host,
+            crate::store::FileStore::new(&dir),
+            sinks,
+        )
+        .with_died_bell(bell);
+        let run = tokio::spawn(brain.run(rx));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = tx.send(BrainMsg::Shutdown).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
+        let got = order.lock().expect("order").clone();
+        assert_eq!(got.first().map(String::as_str), Some("died"), "{got:?}");
+        let restart_at = got.iter().position(|s| s == "restart").unwrap_or_else(|| panic!("{got:?}"));
+        if let Some(watch_at) = got.iter().position(|s| s == "watch") {
+            assert!(restart_at < watch_at, "{got:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct BellOrderHost {
+        order: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Host for BellOrderHost {
+        fn tick(&mut self, msg: &BrainMsg) -> Vec<crate::host::Effect> {
+            let label = match msg {
+                BrainMsg::Died => "died",
+                BrainMsg::Watch(_) => "watch",
+                _ => "other",
+            };
+            self.order.lock().expect("order").push(label.to_string());
+            Vec::new()
+        }
+        fn now_unix(&self) -> u64 {
+            1
+        }
+        fn fetch_inbox(&self, _: &str, _: &str) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+        fn scan_ack_sla(&mut self) -> Vec<String> {
+            Vec::new()
+        }
+        fn restart_wake(&mut self) -> bool {
+            self.order.lock().expect("order").push("restart".into());
+            true
+        }
+    }
 
     /// bd-y40k: the three-way straggler diagnosis, pure. Starvation wins on
     /// age (the bead's rule: stale = starved); growth is only consulted

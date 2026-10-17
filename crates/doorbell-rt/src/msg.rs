@@ -67,6 +67,59 @@ pub fn deliver_died_blocking(tx: &tokio::sync::mpsc::Sender<BrainMsg>) {
     let _ = tx.blocking_send(BrainMsg::Died);
 }
 
+/// Death that does not need a free slot on the watch channel.
+///
+/// `blocking_send(Died)` lands at the tail. A condemned consumer has stopped
+/// reading, so the brain does not restart until it has dispatched the backlog
+/// already accepted (live: forwarded frozen, `resumed` 0). The bell is a
+/// separate wake. The flag is the message; `Notify` is only the poke, so a
+/// ring with no waiter is still visible on the next loop.
+#[derive(Debug)]
+pub struct DiedBell {
+    flag: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl DiedBell {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub fn ring(&self) {
+        self.flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    /// Resolves once, consuming the flag. A ring during the handler stays set
+    /// for the next loop. A leftover notify permit with the flag clear waits.
+    pub async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self
+                .flag
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Ring `bell` and return. With no bell, fall back to [`deliver_died_blocking`]
+/// (the two queue tests). Production hosts always pass the bell.
+pub fn deliver_died(tx: &tokio::sync::mpsc::Sender<BrainMsg>, bell: Option<&DiedBell>) {
+    if let Some(bell) = bell {
+        bell.ring();
+        return;
+    }
+    deliver_died_blocking(tx);
+}
+
 #[cfg(test)]
 mod adv5_tests {
     use super::*;
@@ -147,5 +200,21 @@ mod adv5_tests {
         assert!(matches!(rx.recv().await, Some(BrainMsg::Died)));
         join.join().expect("deliver thread");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full watch slot must not be required for the brain to see death.
+    /// Enqueueing Died here would sit behind the filler until something drains.
+    #[tokio::test(flavor = "current_thread")]
+    async fn died_bell_is_visible_while_the_watch_slot_stays_full() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BrainMsg>(1);
+        tx.try_send(BrainMsg::Watch("fill".into())).unwrap();
+        let bell = DiedBell::new();
+        deliver_died(&tx, Some(&bell));
+        bell.wait().await;
+        match rx.try_recv() {
+            Ok(BrainMsg::Watch(line)) => assert_eq!(line, "fill"),
+            other => panic!("filler must still be the only queued msg, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "Died must not occupy the channel");
     }
 }

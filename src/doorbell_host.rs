@@ -60,6 +60,9 @@ pub struct RtHost {
     /// mcc9: the last line the brain accepted; a replacement consumer resumes
     /// there instead of replaying from origin.
     wake_resume: Arc<Mutex<Option<String>>>,
+    /// Same bell the embedded brain selects on. A replacement consumer rings
+    /// this instead of queueing `Died` behind a full watch channel.
+    died_bell: std::sync::Arc<doorbell_rt::DiedBell>,
     /// bd-b2b3: the run-state recorder, `None` unless explicitly attached.
     /// The recorder is an EFFECT-layer component (it owns a store handle and a
     /// clock) and is therefore held HERE, beside the model, and never touched
@@ -85,13 +88,14 @@ fn wake_outcome_to_brain(
     workspace: &str,
     retry: &std::sync::Mutex<doorbell_rt::WatchRetry>,
     retired: &std::sync::atomic::AtomicBool,
+    died_bell: &doorbell_rt::DiedBell,
 ) {
     use doorbell_rt::wake_brain::Forwarded;
     use doorbell_rt::wake_sock::WakeOutcome;
     // mcc9: Watch goes through the forwarder (backpressure on a full channel,
     // then an exact-count drop + ONE death + cursor resume — never one death
     // per line, never a silent shed). Stamp .event only once the brain has the
-    // line; Died via blocking_send so Full cannot drop restart_wake.
+    // line. Died rings the side bell so a full channel cannot hide restart.
     match out {
         WakeOutcome::Watch(l) => match fw.forward(l) {
             f if f.reached_brain() => {
@@ -108,7 +112,7 @@ fn wake_outcome_to_brain(
                 report_death: true, ..
             } => {
                 retired.store(true, std::sync::atomic::Ordering::SeqCst);
-                doorbell_rt::msg::deliver_died_blocking(tx);
+                doorbell_rt::msg::deliver_died(tx, Some(died_bell));
             }
             // Counted by the forwarder; the consumer is already condemned.
             _ => {}
@@ -125,7 +129,7 @@ fn wake_outcome_to_brain(
         }
         WakeOutcome::Died => {
             retired.store(true, std::sync::atomic::Ordering::SeqCst);
-            doorbell_rt::msg::deliver_died_blocking(tx);
+            doorbell_rt::msg::deliver_died(tx, Some(died_bell));
         }
     }
 }
@@ -223,6 +227,7 @@ impl RtHost {
             wake_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
             wake_counters: doorbell_rt::wake_brain::counters_for(workspace),
             wake_resume: Arc::new(Mutex::new(None)),
+            died_bell: doorbell_rt::DiedBell::new(),
             // bd-b2b3: opt-in. Recording a boundary per tick changes the
             // dispatcher's storage and latency profile, so it is an explicit
             // operator choice (`FLYWHEEL_RUN_STATE_LOG=1`) rather than a silent
@@ -235,6 +240,11 @@ impl RtHost {
 
     pub fn set_generation(&mut self, generation: Option<doorbell::WatcherGen>) {
         self.generation = generation;
+    }
+
+    /// Share the brain's death bell. Call before the first wake arms.
+    pub fn set_died_bell(&mut self, bell: std::sync::Arc<doorbell_rt::DiedBell>) {
+        self.died_bell = bell;
     }
 
     fn registry_pins(&self) -> Vec<String> {
@@ -713,6 +723,7 @@ impl Host for RtHost {
         let retry = self.retry.clone();
         let counters = self.wake_counters.clone();
         let resume = self.wake_resume.clone();
+        let died_bell = std::sync::Arc::clone(&self.died_bell);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Abort the predecessor first: one live consumer per host.
@@ -741,6 +752,7 @@ impl Host for RtHost {
             let fw = wake_forwarder(&tx_g, &workspace, counters.clone(), resume.clone());
             let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let retired_cb = std::sync::Arc::clone(&retired);
+            let wake_bell = std::sync::Arc::clone(&died_bell);
             let handle = crate::spawn_wake_consumer(
                 &project,
                 &workspace,
@@ -748,7 +760,15 @@ impl Host for RtHost {
                 resume_from,
                 retired,
                 move |out| {
-                    wake_outcome_to_brain(out, &fw, &tx_g, &beat_workspace, &retry, &retired_cb);
+                    wake_outcome_to_brain(
+                        out,
+                        &fw,
+                        &tx_g,
+                        &beat_workspace,
+                        &retry,
+                        &retired_cb,
+                        &wake_bell,
+                    );
                 },
             );
             if let Ok(mut g) = slot.lock() {
@@ -940,7 +960,9 @@ async fn run_embedded_async(
 ) -> anyhow::Result<()> {
     use doorbell_rt::{Brain, BrainConfig, SinkManager};
     let (tx, rx) = tokio::sync::mpsc::channel(doorbell_rt::BRAIN_CAP);
+    let died_bell = doorbell_rt::DiedBell::new();
     let mut host = RtHost::new(cfg.clone(), project, workspace, tx.clone())?;
+    host.set_died_bell(std::sync::Arc::clone(&died_bell));
     host.set_generation(generation.clone());
     let mut sinks = SinkManager::new(tx.clone());
     // Supervised registration (audit P1): fresh adapter + reconnect on a
@@ -980,6 +1002,7 @@ async fn run_embedded_async(
             workspace.to_string(),
             tx.clone(),
         );
+        let bus_bell = std::sync::Arc::clone(&died_bell);
         crate::backend::run_mail_off_runtime(move || {
             Ok(spawn_bus_watch(
                 &cfg_b,
@@ -987,6 +1010,7 @@ async fn run_embedded_async(
                 &workspace_b,
                 tx_b,
                 bus_fw,
+                bus_bell,
             ))
         })
         .await?
@@ -1004,6 +1028,7 @@ async fn run_embedded_async(
         );
         let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let retired_cb = std::sync::Arc::clone(&retired);
+        let wake_bell = std::sync::Arc::clone(&died_bell);
         let handle = crate::spawn_wake_consumer(
             &project,
             workspace,
@@ -1011,7 +1036,15 @@ async fn run_embedded_async(
             None,
             retired,
             move |out| {
-                wake_outcome_to_brain(out, &fw, &tx_w, &beat_workspace, &retry_w, &retired_cb);
+                wake_outcome_to_brain(
+                    out,
+                    &fw,
+                    &tx_w,
+                    &beat_workspace,
+                    &retry_w,
+                    &retired_cb,
+                    &wake_bell,
+                );
             },
         );
         if let Ok(mut g) = watch_slot.lock() {
@@ -1092,7 +1125,8 @@ async fn run_embedded_async(
         }
         let _ = shutdown_tx.send(BrainMsg::Shutdown).await;
     });
-    let brain = Brain::new(BrainConfig::new(workspace), host, store, sinks);
+    let brain = Brain::new(BrainConfig::new(workspace), host, store, sinks)
+        .with_died_bell(died_bell);
     let report = brain.run(rx).await;
     drop(sweep_ticker);
     _lease_beat.abort();
@@ -1114,6 +1148,7 @@ fn spawn_bus_watch(
     workspace: &str,
     tx: mpsc::Sender<BrainMsg>,
     fw: doorbell_rt::wake_brain::WatchForwarder,
+    died_bell: std::sync::Arc<doorbell_rt::DiedBell>,
 ) -> bool {
     (|| -> Option<()> {
         let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
@@ -1173,7 +1208,7 @@ fn spawn_bus_watch(
                                 stamps.on_event();
                             } else {
                                 stamps.stop();
-                                doorbell_rt::msg::deliver_died_blocking(&tx);
+                                doorbell_rt::msg::deliver_died(&tx, Some(&died_bell));
                                 break;
                             }
                         }
@@ -1181,7 +1216,7 @@ fn spawn_bus_watch(
                     Some(toron_core::bus::SubscriptionEvent::Eose) => continue,
                     Some(toron_core::bus::SubscriptionEvent::Closed(_)) | None => {
                         stamps.stop();
-                        doorbell_rt::msg::deliver_died_blocking(&tx);
+                        doorbell_rt::msg::deliver_died(&tx, Some(&died_bell));
                         break;
                     }
                 }
@@ -1576,6 +1611,7 @@ mod events_lost_tests {
                 "ws",
                 &retry,
                 &std::sync::atomic::AtomicBool::new(false),
+                &doorbell_rt::DiedBell::new(),
             );
         }
         let s = counters.snapshot();
