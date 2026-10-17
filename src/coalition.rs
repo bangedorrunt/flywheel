@@ -1328,6 +1328,24 @@ impl CoalitionStore {
         let path = self.manifest_path(&manifest.id);
         std::fs::write(&path, serde_json::to_string_pretty(manifest)?)
             .with_context(|| format!("write {}", path.display()))?;
+        // One log fact beside the manifest. The json file stays the manifest.
+        // `.fact.jsonl` does not end in `.json`, so `list` does not load it.
+        let fact = path.with_extension("fact.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&fact)
+            .with_context(|| format!("open {}", fact.display()))?;
+        use std::io::Write;
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "id": manifest.id,
+                "status": manifest.status,
+                "members": manifest.members.len(),
+            })
+        )?;
         Ok(())
     }
 }

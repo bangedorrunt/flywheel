@@ -169,6 +169,70 @@ impl Strategy {
     }
 }
 
+/// How many proved children satisfy the goal (§6A.6).
+///
+/// `All` waits for every non-pass child. `Quorum` and `First` cancel the
+/// rest once `k` children are proved. `k` of 0 is refused at parse time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Join {
+    /// Every non-pass child must be proved.
+    #[default]
+    All,
+    /// `k` of the children, then cancel the rest.
+    Quorum(u32),
+    /// The first `k` proved children, then cancel the rest.
+    First(u32),
+}
+
+impl Join {
+    /// `all`, `quorum:N`, or `first:N`. `N` must be at least 1.
+    pub fn parse(w: &str) -> Option<Self> {
+        if w == "all" {
+            return Some(Self::All);
+        }
+        let (kind, n) = w.split_once(':')?;
+        let n: u32 = n.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        match kind {
+            "quorum" => Some(Self::Quorum(n)),
+            "first" => Some(Self::First(n)),
+            _ => None,
+        }
+    }
+
+    fn cancels_rest(self) -> bool {
+        matches!(self, Self::Quorum(_) | Self::First(_))
+    }
+}
+
+/// A sibling grant the supervisor recorded. Toron still refuses the
+/// append that would change another crew's task. This row is the grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRow {
+    /// One side.
+    pub a: String,
+    /// The other side.
+    pub b: String,
+    /// Verbs the grant allows, as the operator wrote them.
+    pub verbs: String,
+    /// When the grant stops counting. `0` means the log did not say.
+    pub until_ms: u64,
+}
+
+/// Self-reported usage. Never a hard cost gate: there is no trusted meter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageReport {
+    /// Input tokens the child reported.
+    pub input_tokens: u64,
+    /// Output tokens the child reported.
+    pub output_tokens: u64,
+    /// Micro-dollars the child reported. Advisory only.
+    pub usd_micros: u64,
+}
+
 /// The supervisor's budgets and windows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
@@ -192,6 +256,13 @@ pub struct Policy {
     /// adopt it. `max(2 * lease_ms, ORPHAN_FLOOR_MS)`, set by [`Policy::for_tier`].
     #[serde(default = "default_t_orphan_ms")]
     pub t_orphan_ms: u64,
+    /// Which proved children satisfy the goal. Missing on old logs: [`Join::All`].
+    #[serde(default)]
+    pub join: Join,
+    /// Wall clock from the first tick that sees it. `None` does not gate.
+    /// Cost is never this field: self-reported usage stays advisory.
+    #[serde(default)]
+    pub max_wall_ms: Option<u64>,
 }
 
 impl Policy {
@@ -211,6 +282,8 @@ impl Policy {
             ack_ms: DEFAULT_ACK_MS,
             lease_ms: DEFAULT_LEASE_MS,
             t_orphan_ms: orphan_window_ms(DEFAULT_LEASE_MS),
+            join: Join::All,
+            max_wall_ms: None,
         }
     }
 }
@@ -429,6 +502,8 @@ pub enum Status {
     Failed,
     /// A newer `sup_epoch` holds the lease.
     Superseded,
+    /// `flywheel halt` cancelled the subtree. No relaunch, no new steers.
+    Halted,
 }
 
 /// The model.
@@ -494,6 +569,33 @@ pub struct SupModel {
     /// Escalate fact keys already spent as one `ChildEscalated`.
     #[serde(default)]
     pub escalated_facts: BTreeSet<String>,
+    /// Children that reported `Proved`. `Done` is not this set.
+    #[serde(default)]
+    pub proved: BTreeSet<String>,
+    /// The integration child (or the operator) said the join holds together.
+    #[serde(default)]
+    pub integration_proved: bool,
+    /// Open conflict keys. Any one keeps the goal unproved.
+    #[serde(default)]
+    pub conflicts: BTreeSet<String>,
+    /// Peer grants, keyed `a` + unit separator + `b`.
+    #[serde(default)]
+    pub peers: BTreeMap<String, PeerRow>,
+    /// Last usage each child reported. A large `usd_micros` does not change status.
+    #[serde(default)]
+    pub usages: BTreeMap<String, UsageReport>,
+    /// Quorum or first-k already sent `Exit` to the children that are not proved.
+    #[serde(default)]
+    pub cancel_rest_done: bool,
+    /// Join met, integration proved, no open conflict, and no live assignment.
+    #[serde(default)]
+    pub goal_proved: bool,
+    /// First tick that a wall budget was in force. `0` means not started.
+    #[serde(default)]
+    pub wall_origin_ms: u64,
+    /// The wall budget already paused and escalated once.
+    #[serde(default)]
+    pub budget_escalated: bool,
 }
 
 impl SupModel {
@@ -526,6 +628,15 @@ impl SupModel {
             parked_tasks: BTreeSet::new(),
             adopted: BTreeSet::new(),
             escalated_facts: BTreeSet::new(),
+            proved: BTreeSet::new(),
+            integration_proved: false,
+            conflicts: BTreeSet::new(),
+            peers: BTreeMap::new(),
+            usages: BTreeMap::new(),
+            cancel_rest_done: false,
+            goal_proved: false,
+            wall_origin_ms: 0,
+            budget_escalated: false,
         }
     }
 
@@ -727,6 +838,67 @@ pub enum SupMsg {
     },
     /// Clock.
     Tick {
+        /// Time.
+        now_ms: u64,
+    },
+    /// The child proved its own acceptance at `generation`. Not `Done`.
+    Proved {
+        /// Child.
+        child: String,
+        /// Gen it reports.
+        generation: u64,
+        /// Time.
+        now_ms: u64,
+    },
+    /// The integration check. `proved: false` clears a previous pass.
+    Integration {
+        /// Whether the joined work holds together.
+        proved: bool,
+        /// Time.
+        now_ms: u64,
+    },
+    /// Open or close one conflict key. An open key blocks the goal.
+    Conflict {
+        /// Stable key.
+        key: String,
+        /// `true` opens it, `false` closes it.
+        open: bool,
+        /// Time.
+        now_ms: u64,
+    },
+    /// Record a peer grant. A stale epoch is rejected. This does not
+    /// write a toron row.
+    PeerGrant {
+        /// One side.
+        a: String,
+        /// The other side.
+        b: String,
+        /// Verbs, as written.
+        verbs: String,
+        /// Expiry. `0` if the caller did not set one.
+        until_ms: u64,
+        /// Epoch the sender holds.
+        sup_epoch: u64,
+        /// Time.
+        now_ms: u64,
+    },
+    /// Cancel the subtree and stop. A second halt at the same epoch is a no-op.
+    Halt {
+        /// Epoch the sender holds.
+        sup_epoch: u64,
+        /// Time.
+        now_ms: u64,
+    },
+    /// Self-reported usage. Recorded. Never changes `status`.
+    Usage {
+        /// Child.
+        child: String,
+        /// Input tokens.
+        input_tokens: u64,
+        /// Output tokens.
+        output_tokens: u64,
+        /// Micro-dollars. Advisory.
+        usd_micros: u64,
         /// Time.
         now_ms: u64,
     },
@@ -947,6 +1119,192 @@ fn drop_assignments(next: &mut SupModel, id: &str) {
     for t in gone {
         next.assignments.remove(&t);
     }
+}
+
+fn join_met(m: &SupModel) -> bool {
+    let proved_n = m.proved.iter().filter(|id| id.as_str() != PASS).count() as u32;
+    match m.policy.join {
+        Join::All => {
+            let crews: Vec<&str> = m
+                .children
+                .keys()
+                .filter(|id| id.as_str() != PASS)
+                .map(String::as_str)
+                .collect();
+            !crews.is_empty() && crews.iter().all(|id| m.proved.contains(*id))
+        }
+        Join::Quorum(k) | Join::First(k) => k > 0 && proved_n >= k,
+    }
+}
+
+/// P12. A join by itself is not the goal: integration, a clear conflict
+/// set, and an empty assignment book all have to hold, and only while running.
+fn refresh_goal(next: &mut SupModel, cmds: &mut Vec<SupCmd>) {
+    let met = join_met(next);
+    if met
+        && next.policy.join.cancels_rest()
+        && !next.cancel_rest_done
+        && next.status == Status::Running
+    {
+        next.cancel_rest_done = true;
+        let victims: Vec<(String, u64)> = next
+            .children
+            .iter()
+            .filter(|(id, c)| id.as_str() != PASS && !next.proved.contains(*id) && c.state.live())
+            .map(|(id, c)| (id.clone(), c.generation))
+            .collect();
+        for (id, generation) in victims {
+            if let Some(c) = next.children.get_mut(&id) {
+                c.state = ChildState::Cancelled;
+            }
+            drop_assignments(next, &id);
+            cmds.push(SupCmd::Exit {
+                child: id,
+                generation,
+            });
+        }
+    }
+    next.goal_proved = next.status == Status::Running
+        && met
+        && next.integration_proved
+        && next.conflicts.is_empty()
+        && next.assignments.is_empty();
+}
+
+fn epoch_gate(next: &mut SupModel, cmds: &mut Vec<SupCmd>, epoch: u64, child: &str) -> bool {
+    if epoch < next.accepted_epoch {
+        reject(next, cmds, RejectCause::StaleEpoch, child);
+        false
+    } else if epoch > next.accepted_epoch {
+        reject(next, cmds, RejectCause::UnclaimedEpoch, child);
+        false
+    } else if next.status != Status::Running {
+        reject(next, cmds, RejectCause::NotRunning, child);
+        false
+    } else {
+        true
+    }
+}
+
+fn pause_child(next: &mut SupModel, cmds: &mut Vec<SupCmd>, child: &str, now: u64) {
+    let Some(c) = next.children.get_mut(child) else {
+        return;
+    };
+    if !c.state.live() {
+        return;
+    }
+    c.paused = true;
+    let generation = c.generation;
+    next.steer_seq += 1;
+    let seq = next.steer_seq;
+    next.steers.insert(
+        seq,
+        Steer {
+            seq,
+            child: child.to_string(),
+            op: SteerOp::Pause,
+            generation,
+            sup_epoch: next.accepted_epoch,
+            ack_by_ms: now.saturating_add(next.policy.ack_ms),
+            offset: None,
+            delta_sha: None,
+            state: SteerState::Pending,
+        },
+    );
+    cmds.push(SupCmd::AppendSteer {
+        seq,
+        child: child.to_string(),
+        op: SteerOp::Pause,
+        generation,
+        sup_epoch: next.accepted_epoch,
+        urgent: true,
+        delta_sha: None,
+    });
+}
+
+fn halt_subtree(next: &mut SupModel, cmds: &mut Vec<SupCmd>) {
+    next.status = Status::Halted;
+    let live: Vec<(String, u64)> = next
+        .children
+        .iter()
+        .filter(|(_, c)| c.state.live())
+        .map(|(id, c)| (id.clone(), c.generation))
+        .collect();
+    for (id, generation) in live {
+        if let Some(c) = next.children.get_mut(&id) {
+            c.state = ChildState::Cancelled;
+        }
+        drop_assignments(next, &id);
+        if id != PASS {
+            cmds.push(SupCmd::Exit {
+                child: id,
+                generation,
+            });
+        }
+    }
+    for s in next.steers.values_mut() {
+        if s.state == SteerState::Pending {
+            s.state = SteerState::Escalated;
+        }
+    }
+    refresh_goal(next, cmds);
+}
+
+/// Bead ids in `text`, in order, no duplicates. `bd-` plus lowercase
+/// segments. A trailing hyphen is not part of the id.
+pub fn bead_ids(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 <= b.len() {
+        let head = b[i].is_ascii_lowercase() && &b[i..i + 3] == b"bd-" && bead_atom(b[i + 3]);
+        if !head {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 3;
+        while i < b.len() {
+            if bead_atom(b[i]) {
+                i += 1;
+            } else if b[i] == b'-' && i + 1 < b.len() && bead_atom(b[i + 1]) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if let Ok(s) = std::str::from_utf8(&b[start..i])
+            && !out.iter().any(|e: &String| e == s)
+        {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
+fn bead_atom(c: u8) -> bool {
+    c.is_ascii_digit() || c.is_ascii_lowercase()
+}
+
+/// `br hold` argv when the escalation names a bead. `None` means do not
+/// spawn `br`. The first id is `--corr`. Never calls the live tracker.
+pub fn bead_hold_argv(evidence: &str, reason: &str) -> Option<Vec<String>> {
+    let mut ids = bead_ids(evidence);
+    for id in bead_ids(reason) {
+        if !ids.iter().any(|e| e == &id) {
+            ids.push(id);
+        }
+    }
+    let corr = ids.first()?.clone();
+    let mut argv = vec![
+        "hold".into(),
+        "--kind".into(),
+        "captain".into(),
+        "--corr".into(),
+        corr,
+    ];
+    argv.extend(ids);
+    Some(argv)
 }
 
 /// The child abnormal-end path already parks at 3. This only refuses to
@@ -1290,11 +1648,13 @@ impl Program for SupervisorProgram {
                 now_ms,
             } => {
                 next.now_ms = next.now_ms.max(*now_ms);
-                if accept_report(&mut next, &mut cmds, child, *generation)
-                    && let Some(c) = next.children.get_mut(child)
-                {
-                    c.state = ChildState::Done;
-                    c.abnormal = 0;
+                if accept_report(&mut next, &mut cmds, child, *generation) {
+                    if let Some(c) = next.children.get_mut(child) {
+                        c.state = ChildState::Done;
+                        c.abnormal = 0;
+                    }
+                    drop_assignments(&mut next, child);
+                    refresh_goal(&mut next, &mut cmds);
                 }
             }
             SupMsg::Deaf { child, key, now_ms } => {
@@ -1637,7 +1997,127 @@ impl Program for SupervisorProgram {
                             abnormal_end(&mut next, &mut cmds, &id, now, true);
                         }
                     }
+                    // Wall budget. Cost is not here: usage never enters this branch.
+                    if let Some(wall) = next.policy.max_wall_ms {
+                        if next.wall_origin_ms == 0 {
+                            next.wall_origin_ms = now;
+                        } else if !next.budget_escalated
+                            && now.saturating_sub(next.wall_origin_ms) >= wall
+                        {
+                            next.budget_escalated = true;
+                            let ids: Vec<String> = next
+                                .children
+                                .iter()
+                                .filter(|(id, c)| id.as_str() != PASS && c.state.live())
+                                .map(|(id, _)| id.clone())
+                                .collect();
+                            for id in ids {
+                                pause_child(&mut next, &mut cmds, &id, now);
+                            }
+                            escalate(
+                                &mut next,
+                                &mut cmds,
+                                "budget",
+                                format!("wall {wall}ms exhausted"),
+                            );
+                        }
+                    }
                 }
+            }
+            SupMsg::Proved {
+                child,
+                generation,
+                now_ms,
+            } => {
+                next.now_ms = next.now_ms.max(*now_ms);
+                if accept_report(&mut next, &mut cmds, child, *generation) {
+                    if child != PASS {
+                        next.proved.insert(child.clone());
+                    }
+                    drop_assignments(&mut next, child);
+                    refresh_goal(&mut next, &mut cmds);
+                }
+            }
+            SupMsg::Integration { proved, now_ms } => {
+                next.now_ms = next.now_ms.max(*now_ms);
+                if next.status != Status::Running {
+                    reject(&mut next, &mut cmds, RejectCause::NotRunning, "");
+                } else {
+                    next.integration_proved = *proved;
+                    refresh_goal(&mut next, &mut cmds);
+                }
+            }
+            SupMsg::Conflict { key, open, now_ms } => {
+                next.now_ms = next.now_ms.max(*now_ms);
+                if next.status != Status::Running {
+                    reject(&mut next, &mut cmds, RejectCause::NotRunning, "");
+                } else if key.is_empty() {
+                    reject(&mut next, &mut cmds, RejectCause::BadSteer, "");
+                } else {
+                    if *open {
+                        next.conflicts.insert(key.clone());
+                    } else {
+                        next.conflicts.remove(key);
+                    }
+                    refresh_goal(&mut next, &mut cmds);
+                }
+            }
+            SupMsg::PeerGrant {
+                a,
+                b,
+                verbs,
+                until_ms,
+                sup_epoch,
+                now_ms,
+            } => {
+                next.now_ms = next.now_ms.max(*now_ms);
+                if epoch_gate(&mut next, &mut cmds, *sup_epoch, a) {
+                    let key = format!("{a}\u{1f}{b}");
+                    next.peers.insert(
+                        key,
+                        PeerRow {
+                            a: a.clone(),
+                            b: b.clone(),
+                            verbs: verbs.clone(),
+                            until_ms: *until_ms,
+                        },
+                    );
+                }
+            }
+            SupMsg::Halt { sup_epoch, now_ms } => {
+                // A second halt at the same epoch changes nothing, so the
+                // host does not log it again.
+                if next.status == Status::Halted && *sup_epoch == next.accepted_epoch {
+                } else if *sup_epoch < next.accepted_epoch {
+                    next.now_ms = next.now_ms.max(*now_ms);
+                    reject(&mut next, &mut cmds, RejectCause::StaleEpoch, "");
+                } else if *sup_epoch > next.accepted_epoch {
+                    next.now_ms = next.now_ms.max(*now_ms);
+                    reject(&mut next, &mut cmds, RejectCause::UnclaimedEpoch, "");
+                } else if next.status != Status::Running {
+                    next.now_ms = next.now_ms.max(*now_ms);
+                    reject(&mut next, &mut cmds, RejectCause::NotRunning, "");
+                } else {
+                    next.now_ms = next.now_ms.max(*now_ms);
+                    halt_subtree(&mut next, &mut cmds);
+                }
+            }
+            SupMsg::Usage {
+                child,
+                input_tokens,
+                output_tokens,
+                usd_micros,
+                now_ms,
+            } => {
+                next.now_ms = next.now_ms.max(*now_ms);
+                next.usages.insert(
+                    child.clone(),
+                    UsageReport {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        usd_micros: *usd_micros,
+                    },
+                );
             }
             SupMsg::CmdFailed { key, why: _ } => {
                 next.failed_cmds += 1;
@@ -3960,5 +4440,252 @@ mod tests {
         assert_eq!(m2, before);
         log.push(again);
         assert_eq!(replay(&log).0, m2);
+    }
+
+    fn proved_msg(id: &str, t: u64) -> SupMsg {
+        SupMsg::Proved {
+            child: id.into(),
+            generation: 1,
+            now_ms: t,
+        }
+    }
+
+    /// P12. Join, integration, an empty conflict set, and released leases
+    /// are one conjunction. A mutant that sets `goal_proved` from the join
+    /// alone fails the assertion after the first `Proved`.
+    #[test]
+    fn p4b_close_goal_proved_needs_join_integration_clear_conflicts_and_released_leases() {
+        let mut m = base();
+        m.policy.join = Join::Quorum(1);
+        let (m, c) = step(
+            &m,
+            &SupMsg::ReadyBeads {
+                beads: vec![bead("t1", "src/a.rs", "a", true)],
+                now_ms: 10,
+            },
+        );
+        assert_eq!(assigns(&c), vec![("t1".into(), "a".into())]);
+        let (m, c) = step(&m, &proved_msg("a", 20));
+        assert!(
+            c.iter()
+                .any(|x| matches!(x, SupCmd::Exit { child, .. } if child == "b")),
+            "quorum cancels the child that has not proved"
+        );
+        assert_eq!(m.children["b"].state, ChildState::Cancelled);
+        assert!(
+            m.assignments.is_empty(),
+            "the proved child and the cancelled rest both release leases"
+        );
+        assert!(!m.goal_proved, "join alone is not the goal");
+        let (m, _) = step(
+            &m,
+            &SupMsg::Integration {
+                proved: true,
+                now_ms: 30,
+            },
+        );
+        assert!(m.goal_proved);
+        let (m, _) = step(
+            &m,
+            &SupMsg::Conflict {
+                key: "scope".into(),
+                open: true,
+                now_ms: 40,
+            },
+        );
+        assert!(!m.goal_proved, "an open conflict blocks the goal");
+        let (m, _) = step(
+            &m,
+            &SupMsg::Conflict {
+                key: "scope".into(),
+                open: false,
+                now_ms: 50,
+            },
+        );
+        assert!(m.goal_proved);
+
+        let mut first = base();
+        first.policy.join = Join::First(1);
+        let (first, c) = step(&first, &proved_msg("a", 20));
+        assert!(
+            c.iter()
+                .any(|x| matches!(x, SupCmd::Exit { child, .. } if child == "b"))
+        );
+        assert!(!first.goal_proved);
+
+        let all = base();
+        let (all, c) = step(&all, &proved_msg("a", 20));
+        assert!(
+            c.iter().all(|x| !matches!(x, SupCmd::Exit { .. })),
+            "all does not cancel the child that has not proved"
+        );
+        let (all, _) = step(
+            &all,
+            &SupMsg::Integration {
+                proved: true,
+                now_ms: 30,
+            },
+        );
+        assert!(!all.goal_proved, "all waits for every child");
+        let (all, _) = step(&all, &proved_msg("b", 40));
+        assert!(all.goal_proved);
+    }
+
+    #[test]
+    fn p4b_close_usage_does_not_gate_and_wall_pauses_once() {
+        let (m, c) = step(
+            &base(),
+            &SupMsg::Usage {
+                child: "a".into(),
+                input_tokens: 9,
+                output_tokens: 8,
+                usd_micros: u64::MAX,
+                now_ms: 5,
+            },
+        );
+        assert_eq!(m.status, Status::Running);
+        assert!(c.is_empty());
+        assert_eq!(m.usages["a"].usd_micros, u64::MAX);
+
+        let mut m = base();
+        m.policy.max_wall_ms = Some(100);
+        let (m, c) = step(&m, &SupMsg::Tick { now_ms: 1_000 });
+        assert!(
+            c.is_empty(),
+            "the tick that starts the clock does not escalate"
+        );
+        assert_eq!(m.wall_origin_ms, 1_000);
+        let (m, c) = step(&m, &SupMsg::Tick { now_ms: 1_100 });
+        assert_eq!(m.status, Status::Running);
+        assert_eq!(
+            c.iter()
+                .filter(|x| matches!(x, SupCmd::Escalate { reason, .. } if reason == "budget"))
+                .count(),
+            1
+        );
+        assert!(m.children["a"].paused && m.children["b"].paused);
+        let (m, c) = step(&m, &SupMsg::Tick { now_ms: 9_000 });
+        assert!(
+            c.iter().all(|x| !matches!(x, SupCmd::Escalate { .. })),
+            "a second tick inside the same exhaustion does not page again"
+        );
+        assert!(m.budget_escalated);
+    }
+
+    #[test]
+    fn p4b_close_halt_cancels_and_a_later_tick_does_not_relaunch() {
+        let (m, c) = step(
+            &base(),
+            &SupMsg::Halt {
+                sup_epoch: 2,
+                now_ms: 50,
+            },
+        );
+        assert_eq!(m.status, Status::Halted);
+        assert!(!m.goal_proved);
+        for id in ["a", "b"] {
+            assert_eq!(m.children[id].state, ChildState::Cancelled);
+            assert!(
+                c.iter()
+                    .any(|x| matches!(x, SupCmd::Exit { child, .. } if child == id))
+            );
+        }
+        let (m2, c2) = step(&m, &SupMsg::Tick { now_ms: 9_000_000 });
+        assert!(relaunches(&c2).is_empty());
+        assert_eq!(m2.status, Status::Halted);
+        let (again, c3) = step(
+            &m,
+            &SupMsg::Halt {
+                sup_epoch: 2,
+                now_ms: 60,
+            },
+        );
+        assert!(c3.is_empty());
+        assert_eq!(again, m);
+        let (_, c4) = step(
+            &m,
+            &SupMsg::Halt {
+                sup_epoch: 1,
+                now_ms: 70,
+            },
+        );
+        assert_eq!(rejects(&c4), vec![RejectCause::StaleEpoch]);
+    }
+
+    #[test]
+    fn p4b_close_peer_grant_rejects_a_stale_epoch() {
+        let grant = SupMsg::PeerGrant {
+            a: "a".into(),
+            b: "b".into(),
+            verbs: "request,reply".into(),
+            until_ms: 500,
+            sup_epoch: 2,
+            now_ms: 10,
+        };
+        let (m, c) = step(&base(), &grant);
+        assert!(c.is_empty());
+        assert_eq!(m.peers.len(), 1);
+        let (m2, c2) = step(
+            &m,
+            &SupMsg::PeerGrant {
+                a: "a".into(),
+                b: "b".into(),
+                verbs: "notify".into(),
+                until_ms: 0,
+                sup_epoch: 1,
+                now_ms: 11,
+            },
+        );
+        assert_eq!(rejects(&c2), vec![RejectCause::StaleEpoch]);
+        assert_eq!(
+            m2.peers.values().next().map(|p| p.verbs.as_str()),
+            Some("request,reply")
+        );
+    }
+
+    /// P14. Two accepted tasks with live leases never share a scope.
+    /// Removing the overlap guard in `pick_assignee` assigns `t2` beside `t1`.
+    #[test]
+    fn p4b_close_two_accepted_tasks_never_overlap() {
+        let (m, _) = step(
+            &base(),
+            &SupMsg::ReadyBeads {
+                beads: vec![
+                    bead("t1", "src/a.rs", "a", true),
+                    bead("t2", "src/a.rs", "b", true),
+                ],
+                now_ms: 10,
+            },
+        );
+        let rows: Vec<_> = m.assignments.values().collect();
+        assert!(m.assignments.contains_key("t1"));
+        assert!(!m.assignments.contains_key("t2"));
+        for i in 0..rows.len() {
+            for j in (i + 1)..rows.len() {
+                assert!(
+                    !scopes_overlap(&rows[i].scope_paths, &rows[j].scope_paths),
+                    "{} overlaps {}",
+                    rows[i].task,
+                    rows[j].task
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn p4b_close_bead_hold_argv_needs_a_bead() {
+        assert!(bead_hold_argv("plain text", "budget").is_none());
+        let v = bead_hold_argv("page bd-close1 then BD-SKIP", "also bd-close1").unwrap();
+        assert_eq!(
+            v,
+            vec![
+                "hold",
+                "--kind",
+                "captain",
+                "--corr",
+                "bd-close1",
+                "bd-close1",
+            ]
+        );
     }
 }
