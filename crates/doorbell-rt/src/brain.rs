@@ -166,6 +166,38 @@ pub fn classify_liveness(age_ms: u64, wakes_grew: bool) -> LivenessVerdict {
     }
 }
 
+/// How many quiet watches share one journal fsync.
+pub(crate) const WATCH_SYNC_EVERY: u32 = 32;
+
+/// `Some(next)` when the plane-S cursor moves. Same-second lines stay put
+/// so a burst does not rewrite the wake file once per line.
+pub(crate) fn watch_cursor_next(prev: Option<i64>, us: i64) -> Option<i64> {
+    let next = prev.map(|c| c.max(us)).unwrap_or(us);
+    if prev == Some(next) { None } else { Some(next) }
+}
+
+/// A prompt is due now. Quiet watches are due every [`WATCH_SYNC_EVERY`].
+pub(crate) fn watch_journal_due(pending_prompts: usize, since_sync: u32) -> bool {
+    pending_prompts > 0 || since_sync >= WATCH_SYNC_EVERY
+}
+
+#[cfg(test)]
+mod watch_batch_tests {
+    use super::*;
+
+    #[test]
+    fn same_second_cursor_does_not_rewrite_and_a_prompt_syncs_now() {
+        assert_eq!(watch_cursor_next(None, 5), Some(5));
+        assert_eq!(watch_cursor_next(Some(5), 5), None);
+        assert_eq!(watch_cursor_next(Some(5), 4), None);
+        assert_eq!(watch_cursor_next(Some(5), 6), Some(6));
+        assert!(!watch_journal_due(0, 1));
+        assert!(!watch_journal_due(0, WATCH_SYNC_EVERY - 1));
+        assert!(watch_journal_due(0, WATCH_SYNC_EVERY));
+        assert!(watch_journal_due(1, 1));
+    }
+}
+
 pub struct Brain<H: Host> {
     cfg: BrainConfig,
     host: H,
@@ -197,6 +229,12 @@ pub struct Brain<H: Host> {
     journal_sync_failed: u64,
     /// bd-jcys: wake-state saves that FAILED (see `flush_wake`).
     wake_save_failed: u64,
+    /// Decided watches since the last journal fsync. A prompt flushes
+    /// immediately. Quiet lines flush every [`WATCH_SYNC_EVERY`], so a
+    /// replay cannot fsync once per line and fill the brain channel.
+    watches_since_sync: u32,
+    /// Sampled `watch` audit rows. One row per line filled the sidecar.
+    watch_audits: u64,
     /// Consecutive unanswered expiries per pin (S3 deaf digest names
     /// subscriber + attempts; corr binds in bd-asr2.11 with receipts).
     deaf_attempts: BTreeMap<String, u32>,
@@ -290,6 +328,8 @@ impl<H: Host> Brain<H> {
             journal_write_failed: 0,
             journal_sync_failed: 0,
             wake_save_failed: 0,
+            watches_since_sync: 0,
+            watch_audits: 0,
             deaf_attempts: BTreeMap::new(),
             dedup_high_us: None,
             watch_seen: std::collections::VecDeque::new(),
@@ -562,9 +602,10 @@ impl<H: Host> Brain<H> {
             }
             return;
         }
-        if let Some(us) = us {
-            self.wake.plane_s_cursor_us =
-                Some(self.wake.plane_s_cursor_us.map(|c| c.max(us)).unwrap_or(us));
+        if let Some(us) = us
+            && let Some(next) = watch_cursor_next(self.wake.plane_s_cursor_us, us)
+        {
+            self.wake.plane_s_cursor_us = Some(next);
             self.flush_wake("watch-cursor");
         }
         if let Some(id) = id {
@@ -601,14 +642,21 @@ impl<H: Host> Brain<H> {
                 serde_json::json!({ "dropped": raw.len() - injects.len() }),
             );
         }
-        self.audit("watch", serde_json::json!({}));
+        if crate::file_host::should_audit_count(self.watch_audits as usize) {
+            self.audit("watch", serde_json::json!({"n": self.watch_audits + 1}));
+        }
+        self.watch_audits = self.watch_audits.saturating_add(1);
         if let Some(pk) = doorbell_core::watch_pubkey(&line) {
             self.hear.note_heard_pubkey(&pk);
             self.persist_hear();
         }
         // Decided-before-delivery: flush the journal BEFORE any Prompt
-        // intent reaches a sink (D4.2 write-ahead invariant).
-        self.flush_journal("watch");
+        // intent reaches a sink (D4.2). Quiet lines batch; a prompt never does.
+        self.watches_since_sync = self.watches_since_sync.saturating_add(1);
+        if watch_journal_due(injects.len(), self.watches_since_sync) {
+            self.flush_journal("watch");
+            self.watches_since_sync = 0;
+        }
         let delivered = self.deliver_prompts(injects).await;
         let woke = delivered.first().cloned();
         self.persist_wake(woke.as_deref(), "watch");
