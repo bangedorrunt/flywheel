@@ -145,8 +145,8 @@ pub struct DoorbellSection {
     pub beads_poller: bool,
     /// cron doorbell sink (bd-asr2.16, D7): cron tick completion journals a
     /// Fact row and queues a pending wake (digest-visible with zero swarm;
-    /// emit/deliver binding lands in bd-asr2.17). Default false.
-    #[serde(default)]
+    /// emit/deliver binding lands in bd-asr2.17). Default true. `false` opts out.
+    #[serde(default = "default_true")]
     pub cron_doorbell_sink: bool,
     /// Service identities allowed to ring via POST /api/v1/emit
     /// (bd-asr2.17, D7): name -> token hash + channel scope + rate.
@@ -242,16 +242,25 @@ pub struct Config {
     /// ADR-0011 D2: operator-owned pane cap. Repo `.flywheel/` must not raise it.
     #[serde(default)]
     pub crew: Option<CrewBudgetConfig>,
-    /// `[comms]` (ADR-0041, build-plan §5): `inbox_log = true` turns on the
-    /// comms inbox send path, the config twin of `TORON_COMMS_INBOX=1`.
+    /// `[comms]` (ADR-0041, build-plan §5): absent means the inbox is on.
+    /// `inbox_log = false` opts out. A set `TORON_COMMS_INBOX` wins.
     #[serde(default)]
     pub comms: Option<CommsSection>,
+    /// `[timer]`: one-shot watches. Absent means on. `enabled = false` opts out.
+    #[serde(default)]
+    pub timer: Option<TimerSection>,
 }
 
-/// `[comms] inbox_log = true` (Phase 2 opt-in flag).
+/// `[comms]`. Absent `inbox_log` means on. `false` opts out.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommsSection {
     pub inbox_log: Option<bool>,
+}
+
+/// `[timer] enabled`. Absent means on. `false` opts out.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TimerSection {
+    pub enabled: Option<bool>,
 }
 
 /// `[crew] max = 5` in operator config (ADR-0011 D2).
@@ -576,12 +585,12 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// Cron doorbell-sink flag (bd-asr2.16, D7): false unless opted in.
+    /// Cron doorbell-sink flag (bd-asr2.16, D7): on unless `false`.
     pub fn doorbell_cron_sink(&self) -> bool {
         self.doorbell
             .as_ref()
             .map(|d| d.cron_doorbell_sink)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Service identities for POST /api/v1/emit (bd-asr2.17, D7):

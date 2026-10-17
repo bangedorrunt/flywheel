@@ -490,7 +490,10 @@ pub(crate) fn cmd_doorbell_start(cfg: &Config, project: &str) -> Result<()> {
         arm.push("--host".to_string());
         arm.push(format!("{project}/{ws}"));
     }
-    if crate::proxy_doorbell_verb(cfg, "start", &arm)? {
+    let proxied = crate::proxy_doorbell_verb(cfg, "start", &arm)?;
+    // A healthy daemon used to end start here. Under the comms flag that
+    // daemon types nothing, so the local loop still has to arm.
+    if !crate::doorbell::local_loop_after_proxy(proxied, crate::comms_send::enabled(cfg)) {
         return Ok(());
     }
     crate::ensure_doorbell_supervisor();
@@ -877,7 +880,7 @@ pub(crate) fn cmd_internal_doorbell(
     // lands in bd-asr2.8); embedded mode drives doorbell-rt's Brain.
     // Comms flag: the inbox host in THIS loop is the pane writer; a daemon
     // host types nothing, so it never takes the loop (follow-up a).
-    let comms_on = crate::comms_send::enabled(cfg) || toron_core::inbox::enabled();
+    let comms_on = crate::comms_send::enabled(cfg);
     match crate::doorbell::host_for(comms_on, || {
         crate::doorbell::resolve_host(
             &crate::config::state_dir(),

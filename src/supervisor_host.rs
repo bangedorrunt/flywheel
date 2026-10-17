@@ -28,8 +28,8 @@
 //! only appends. When `inbox_lead` can be read, `sup_epoch` is the epoch
 //! toron stored on `lead@1`. `FLYWHEEL_SUPERVISOR_EPOCH=fold` keeps the
 //! fold's counter and writes no lead fact. An escalation is `escalate@1`
-//! (`context`, `reason`, `evidence`). `Assign` stays log-only and does not
-//! append `task@1`. A steer the log already appended is not sent again; a
+//! (`context`, `reason`, `evidence`). `Assign` appends one `task@1` to the
+//! crew npub and does not type a pane. A steer the log already appended is not sent again; a
 //! restart resolves one that is still pending.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -77,6 +77,9 @@ pub trait Ports {
     /// Append the `steer@1` envelope. Returns the log offset. Does not type
     /// a pane: the doorbell rings from the envelope's `priority`.
     fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String>;
+    /// Append one `task@1` for an assignment. Does not type a pane.
+    /// Missing npub is an error, not a quiet success.
+    fn assign(&mut self, a: &AssignSend) -> Result<u64, String>;
     /// Tell the captain and record the fact.
     fn escalate(&mut self, n: u64, reason: &str, evidence: &str) -> Result<(), String>;
     /// Park a poisoned child.
@@ -105,6 +108,22 @@ pub struct SteerSend {
     pub urgent: bool,
     /// sha256 of the redirect's delta; its bytes are in the side store.
     pub delta_sha: Option<String>,
+}
+
+/// What `assign` appends. The journal key stays `assign:<task>:<child>:<gen>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssignSend {
+    /// Task id. A `bd-` prefix is stored as the task bead.
+    pub task: String,
+    /// Crew pin.
+    pub child: String,
+    /// The crew's generation.
+    pub generation: u64,
+}
+
+/// Refuse a missing npub before any append.
+pub(crate) fn require_npub(pin: &str, npub: Option<String>) -> Result<String, String> {
+    npub.ok_or_else(|| format!("no npub for {pin}"))
 }
 
 // ---- the context log ------------------------------------------------------
@@ -430,6 +449,45 @@ pub(crate) fn steer_envelope(
     Ok(env)
 }
 
+/// One `task@1` for an assignment. Title is the task id. Brief names the
+/// crew. A task id that starts with `bd-` is the bead. No pane text.
+pub(crate) fn assign_envelope(
+    project: &str,
+    producer: &str,
+    epoch: u64,
+    to_npub: &str,
+    task: &str,
+    child: &str,
+    generation: u64,
+) -> Result<toron_core::envelope::Envelope, String> {
+    use toron_core::contracts::task_v1::TaskV1;
+    let bead = task.starts_with("bd-").then(|| task.to_string());
+    let body = TaskV1 {
+        title: task.to_string(),
+        brief: format!("assigned to {child}"),
+        scope_paths: Vec::new(),
+        acceptance: Vec::new(),
+        bead,
+    };
+    let env = crate::comms_send::task_envelope(
+        producer,
+        to_npub,
+        toron_core::envelope::MsgId {
+            producer: producer.to_string(),
+            epoch,
+            seq: 0,
+        },
+        project,
+        task,
+        &body,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let mut env = env;
+    env.generation = u32::try_from(generation).unwrap_or(u32::MAX);
+    env.validate().map_err(|e| format!("{e:?}"))?;
+    Ok(env)
+}
+
 /// `escalate@1` body. `reason` must be non-empty. `evidence` is whatever the
 /// caller has; an empty slice is an empty list, not a missing field.
 /// `context` is prose for the reader (the project), not an envelope id.
@@ -726,10 +784,17 @@ pub fn execute(
             .escalate(*n, reason, evidence)
             .and_then(|_| captain_hold(evidence, reason))
             .map(|_| vec![]),
-        SupCmd::Assign { .. } => {
-            // Log-only. Assign does not append task@1.
-            Ok(vec![])
-        }
+        SupCmd::Assign {
+            task,
+            child,
+            generation,
+        } => ports
+            .assign(&AssignSend {
+                task: task.clone(),
+                child: child.clone(),
+                generation: *generation,
+            })
+            .map(|_| vec![]),
         SupCmd::Park {
             child,
             incarnations,
@@ -1232,6 +1297,21 @@ impl Ports for LivePorts {
             .ok_or_else(|| format!("no npub for {}", s.child))?;
         let (producer, epoch) = self.inbox.claim_producer_epoch()?;
         let env = steer_envelope(&self.project, &producer, epoch, &to, s, delta.as_ref())?;
+        self.inbox.append_env(env)
+    }
+
+    fn assign(&mut self, a: &AssignSend) -> Result<u64, String> {
+        let to = require_npub(&a.child, self.inbox.npub_of(&a.child))?;
+        let (producer, epoch) = self.inbox.claim_producer_epoch()?;
+        let env = assign_envelope(
+            &self.project,
+            &producer,
+            epoch,
+            &to,
+            &a.task,
+            &a.child,
+            a.generation,
+        )?;
         self.inbox.append_env(env)
     }
 
@@ -2036,6 +2116,7 @@ mod tests {
         parked: Vec<String>,
         pages: Vec<(String, String)>,
         rejects: Vec<(u64, String)>,
+        assigns: Vec<(String, String, u64)>,
         next_offset: u64,
         fail_relaunch: bool,
     }
@@ -2064,6 +2145,12 @@ mod tests {
             w.next_offset += 10;
             w.steers.push(s.clone());
             Ok(w.next_offset)
+        }
+        fn assign(&mut self, a: &AssignSend) -> Result<u64, String> {
+            let mut w = self.0.lock().unwrap();
+            w.assigns
+                .push((a.task.clone(), a.child.clone(), a.generation));
+            Ok(1)
         }
         fn escalate(&mut self, n: u64, r: &str, _e: &str) -> Result<(), String> {
             self.0.lock().unwrap().escalated.push((n, r.into()));
@@ -3618,7 +3705,16 @@ mod tests {
         assert!(w.exited.is_empty(), "assign must not Exit a pane");
         assert!(w.steers.is_empty(), "assign must not write pane text");
         assert!(w.relaunched.is_empty());
+        assert_eq!(w.assigns, vec![("t1".into(), "a".into(), 1)]);
         drop(w);
+        assert!(require_npub("a", None).is_err());
+        let npub = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let prod = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let env = assign_envelope("flywheel", prod, 4, npub, "bd-1", "a", 1).unwrap();
+        assert_eq!(env.contract.name, "task");
+        assert_eq!(env.body["bead"], "bd-1");
+        assert_eq!(env.body["title"], "bd-1");
+        assert!(assign_envelope("flywheel", prod, 4, "pin-not-npub", "t1", "a", 1).is_err());
         assert!(
             j.rows.keys().any(|k| k == "assign:t1:a:1"),
             "assign is journaled, not written to a pane: {:?}",

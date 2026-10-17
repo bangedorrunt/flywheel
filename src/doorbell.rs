@@ -745,8 +745,10 @@ pub fn ensure_running(
     // Comms flag: the pane writer is the inbox host inside THIS loop (wake
     // line, real watermark). A daemon host does not run it, so deferring to
     // one would leave the workspace with no writer: run the local loop.
-    let comms_on = loaded.as_ref().is_some_and(crate::comms_send::enabled)
-        || toron_core::inbox::enabled();
+    let comms_on = match &loaded {
+        Some(c) => crate::comms_send::enabled(c),
+        None => toron_core::inbox::enabled(),
+    };
     if comms_on {
         eprintln!(
             "flywheel doorbell: comms flag on — the local loop hosts the inbox wake (no deference to a daemon)"
@@ -828,6 +830,13 @@ pub enum DoorbellHost {
 /// nothing, so "a healthy daemon hosts this workspace" must not defer the
 /// loop to it (it left the workspace with no ringer: flywheel#22 gap S3).
 /// Flag off: the resolver decides, as before.
+/// Daemon `start` is the whole start only while that daemon still types.
+/// Comms on, it types nothing, so the local loop (inbox writer and the
+/// timer sweep) still arms beside it.
+pub fn local_loop_after_proxy(proxied: bool, comms_on: bool) -> bool {
+    !proxied || comms_on
+}
+
 pub fn host_for(comms_on: bool, resolve: impl FnOnce() -> DoorbellHost) -> DoorbellHost {
     if comms_on {
         DoorbellHost::Embedded
@@ -1743,6 +1752,24 @@ mod tests {
         // And the command path goes through it.
         let cmd = include_str!("cmd/doorbell.rs");
         assert!(cmd.contains("crate::doorbell::host_for(comms_on"));
+    }
+
+    /// A proxied daemon start must still arm the local loop when comms is on.
+    /// Flag off, the proxy is the whole start.
+    #[test]
+    fn a_proxied_start_still_arms_the_local_loop_when_comms_is_on() {
+        use super::local_loop_after_proxy;
+        assert!(!local_loop_after_proxy(true, false));
+        assert!(local_loop_after_proxy(true, true));
+        assert!(local_loop_after_proxy(false, false));
+        assert!(local_loop_after_proxy(false, true));
+        let cmd = include_str!("cmd/doorbell.rs");
+        let start = cmd.find("pub(crate) fn cmd_doorbell_start(").unwrap();
+        let body = &cmd[start..start + 1800];
+        assert!(
+            body.contains("local_loop_after_proxy(proxied"),
+            "start must use the gate"
+        );
     }
 
     /// bd-doorbell-daemon-sink-wake-only-yfqz: under the comms flag the local
@@ -3495,10 +3522,8 @@ mod tests {
     #[test]
     fn cron_sink_flag_off_writes_nothing() {
         // bd-asr2.16: without the flag, tick completion is a silent no-op.
-        // Hermetic home (the operator's real config may carry
-        // cron_doorbell_sink = true, which made this env-dependent): a
-        // fresh XDG config+state pair parses with the flag at its
-        // default-off, so the gate must return before any write path.
+        // Hermetic home. The compiled default is on, so this file sets the
+        // opt-out. The gate must return before any write path.
         let _home = crate::config::test_state_home();
         let cfg_dir = crate::config::config_dir();
         std::fs::create_dir_all(&cfg_dir).expect("cfg dir");
