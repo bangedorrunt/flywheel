@@ -241,10 +241,9 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 /// 2026-11-08 (build-plan §12.4). A new site anywhere else fails
 /// `only_the_sink_types_into_panes`.
 pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
-    ("crates/doorbell-rt/src/sinks.rs", 1),
     ("src/cmd/doorbell.rs", 1),
     ("src/herdr_shim.rs", 1),
-    ("src/main.rs", 10),
+    ("src/main.rs", 9),
 ];
 
 /// The file allowed to type into panes.

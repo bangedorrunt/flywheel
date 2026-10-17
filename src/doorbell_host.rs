@@ -18,55 +18,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// herdr-prompt sink adapter: the live `doorbell_prompt` delivery path
-/// (gen stamp, pa/jcode fallback, unknown-pin loud miss) behind the
-/// `PromptSink` trait. Empty delivery (unknown pin) is an Err so the brain
-/// sheds it to digest loudly instead of stamping hear on air.
-pub struct HerdrPromptSink {
-    project: String,
-    workspace: String,
-    generation: Option<doorbell::WatcherGen>,
-    client: Option<Client>,
-}
-
-impl HerdrPromptSink {
-    pub fn new(
-        cfg: &Config,
-        project: &str,
-        workspace: &str,
-        generation: Option<doorbell::WatcherGen>,
-    ) -> Self {
-        Self {
-            project: project.to_string(),
-            workspace: workspace.to_string(),
-            generation,
-            client: Client::connect(Some(&cfg.socket_path())).ok(),
-        }
-    }
-}
-
-impl doorbell_rt::PromptSink for HerdrPromptSink {
-    fn send(&mut self, pin: &str, line: &str) -> Result<(), doorbell_rt::RtError> {
-        let registry = state::load_spawn_registry(&self.project);
-        let delivered = crate::doorbell_prompt(
-            self.client.as_mut(),
-            &registry,
-            &[(pin.to_string(), line.to_string())],
-            self.generation.as_ref(),
-            &self.project,
-            &self.workspace,
-        );
-        if delivered.is_empty() {
-            return Err(doorbell_rt::RtError::UndeliveredPin(pin.to_string()));
-        }
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "herdr"
-    }
-}
-
 /// The embedded host: owns the reducer model and every flywheel-shaped
 /// capability the brain orchestrates.
 pub struct RtHost {
@@ -980,42 +931,18 @@ async fn run_embedded_async(
     // failed herdr client park (Transient policy) instead of dying until
     // process restart. The generation stamps the fresh adapter so a
     // mid-run binary upgrade still self-retires it.
-    let (fp, fw, fgen) = (
-        project.to_string(),
-        workspace.to_string(),
-        generation.clone(),
-    );
-    let cfg_for_factory = cfg.clone();
-    // Dropped (stop + join) when this function returns.
+    // Flag-off no longer types the brain line. The inbox host is the only
+    // pane writer, and only while comms is on. Operator waived the 2026-11-08
+    // hold on 2026-10-17.
     let mut _inbox_guard: Option<crate::inbox_host::InboxHost> = None;
+    sinks.add_sink_with_factory("herdr", Box::new(doorbell_rt::NoTextSink::new()), || {
+        Box::new(doorbell_rt::NoTextSink::new())
+    });
     if crate::comms_send::enabled(&cfg) {
-        // Phase 3: the inbox host owns every pane write (wake line only, the
-        // real log watermark); the brain's text is dropped.
-        sinks.add_sink_with_factory("herdr", Box::new(doorbell_rt::NoTextSink::new()), || {
-            Box::new(doorbell_rt::NoTextSink::new())
-        });
         _inbox_guard = Some(crate::inbox_host::InboxHost::spawn(
             crate::inbox_ports::FlywheelPorts::new(&cfg, project, workspace),
             crate::inbox_host::HostCfg::from_env(),
         ));
-    } else {
-        sinks.add_sink_with_factory(
-            "herdr",
-            Box::new(HerdrPromptSink::new(
-                &cfg,
-                project,
-                workspace,
-                generation.clone(),
-            )),
-            move || {
-                Box::new(HerdrPromptSink::new(
-                    &cfg_for_factory,
-                    &fp,
-                    &fw,
-                    fgen.clone(),
-                ))
-            },
-        );
     }
     let store = FileStore::new(config::state_dir());
     // Watch source: in-process bus watch first (zero fork), wake-sock fallback.
@@ -1681,16 +1608,14 @@ mod inbox_flag_tests {
     #[test]
     fn the_flag_arm_registers_no_text_sink_and_starts_the_inbox_host() {
         let src = include_str!("doorbell_host.rs");
-        let a = src.find("if crate::comms_send::enabled(&cfg) {").unwrap();
-        let tail = &src[a..a + 1100];
-        let flag_arm = &tail[..tail.find("} else {").unwrap()];
-        assert!(flag_arm.contains("doorbell_rt::NoTextSink::new()"));
-        assert!(flag_arm.contains("InboxHost::spawn("));
+        let a = src.find("fn run_embedded_async(").unwrap();
+        let tail = &src[a..a + 2500];
+        assert!(tail.contains("doorbell_rt::NoTextSink::new()"));
+        assert!(tail.contains("InboxHost::spawn("));
         assert!(
-            !flag_arm.contains("HerdrPromptSink"),
-            "no legacy sink under the flag"
+            !tail.contains("HerdrPromptSink"),
+            "flag-off typer is gone"
         );
-        assert!(tail.find("} else {").unwrap() < tail.find("HerdrPromptSink::new(").unwrap());
     }
 }
 

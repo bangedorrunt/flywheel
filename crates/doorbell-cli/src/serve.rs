@@ -28,7 +28,7 @@ async fn host_workspace(
     liveness: std::sync::Arc<doorbell_rt::brain::BrainLiveness>,
 ) -> doorbell_rt::RunReport {
     use doorbell_rt::{Brain, BrainConfig, FileHost, FileHostConfig, Host, SinkManager};
-    use doorbell_rt::{CliPromptSink, FileStore};
+    use doorbell_rt::FileStore;
     let bins = resolved_bins();
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
     fcfg.toron_bin = bins.toron.clone();
@@ -44,31 +44,24 @@ async fn host_workspace(
     // identity so a mid-run upgrade retires the loop instead of waking
     // stale (same rule as the embedded WatcherGen gate, daemon-keyed).
     doorbell_rt::ensure_daemon_gen(&fw_state, &workspace);
-    let herdr_bin = bins.herdr.clone();
     let mut sinks = SinkManager::new(tx.clone());
-    // Supervised registration (audit P1): a failed herdr CLI park gets a
-    // fresh adapter under the Transient policy instead of dying until
-    // process restart. Targets table is shared, so the factory sees the
-    // refreshed routing after registry changes.
-    let targets = host.target_table();
+    // Flag-off no longer types the brain line (operator waived 2026-11-08
+    // on 2026-10-17). The flywheel inbox host is the only pane writer, and
+    // only while comms is on.
     if doorbell_rt::comms_inbox_env() {
-        // Comms flag: the flywheel inbox host is the only pane writer (wake
-        // line, real watermark). This host must not type the brain line.
         eprintln!(
             "doorbell serve: {project}/{workspace} — comms flag on: pane writes belong to the flywheel inbox host; this host types nothing"
         );
-        sinks.add_sink_with_factory(
-            "herdr",
-            Box::new(doorbell_rt::NoTextSink::new()),
-            || Box::new(doorbell_rt::NoTextSink::new()),
-        );
     } else {
-        sinks.add_sink_with_factory(
-            "herdr",
-            Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
-            move || Box::new(CliPromptSink::new(herdr_bin.clone(), targets.clone())),
+        eprintln!(
+            "doorbell serve: {project}/{workspace} — comms flag off: the legacy typer is gone; this host types nothing"
         );
     }
+    sinks.add_sink_with_factory(
+        "herdr",
+        Box::new(doorbell_rt::NoTextSink::new()),
+        || Box::new(doorbell_rt::NoTextSink::new()),
+    );
     // bd-8ulu: a durable human wake with zero swarm needs somewhere to land.
     // The pane registry is not an option for a human pin, so register the
     // webhook adapters this workspace's rows justify — one per distinct
@@ -698,7 +691,9 @@ fn daemon_lease_kind() -> Option<&'static str> {
 }
 
 fn daemon_lease_kind_for(comms_flag_on: bool) -> Option<&'static str> {
-    comms_flag_on.then_some(doorbell_rt::lease::KIND_NO_TEXT)
+    let _ = comms_flag_on;
+    // Both flags type nothing. A flag-off daemon must not look like the ringer.
+    Some(doorbell_rt::lease::KIND_NO_TEXT)
 }
 
 pub async fn run(cfg: &Config) -> Result<()> {
@@ -2444,21 +2439,17 @@ mod tests {
     #[test]
     fn the_daemon_host_types_nothing_under_the_comms_flag() {
         let src = include_str!("serve.rs");
-        let a = src.find("if doorbell_rt::comms_inbox_env() {").unwrap();
-        let tail = &src[a..a + 1600];
-        let flag_arm = &tail[..tail.find("} else {").unwrap()];
-        assert!(flag_arm.contains("doorbell_rt::NoTextSink::new()"));
-        assert!(!flag_arm.contains("CliPromptSink"));
-        let else_arm = &tail[tail.find("} else {").unwrap()..];
-        assert!(else_arm.contains("CliPromptSink::new("), "flag-off path unchanged");
+        let a = src.find("async fn host_workspace(").unwrap();
+        let tail = &src[a..a + 2200];
+        assert!(tail.contains("doorbell_rt::NoTextSink::new()"));
+        assert!(!tail.contains("CliPromptSink"));
     }
 
-    /// Follow-up (a): under the comms flag the daemon's workspace lease says it
-    /// types nothing; flag off it is the plain ringing-writer lease.
+    /// Both flags type nothing, so the lease is no-text either way.
     #[test]
     fn the_daemon_lease_kind_follows_the_comms_flag() {
         assert_eq!(super::daemon_lease_kind_for(true), Some("no-text"));
-        assert_eq!(super::daemon_lease_kind_for(false), None);
+        assert_eq!(super::daemon_lease_kind_for(false), Some("no-text"));
         let src = include_str!("serve.rs");
         let prod = &src[..src.find("\nmod tests {").unwrap()];
         assert_eq!(prod.matches("lease::acquire_lease_kind(").count(), 2, "boot + auto-host claim");
