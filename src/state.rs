@@ -2669,8 +2669,11 @@ mod last_sent_tests {
                 let project = project.clone();
                 std::thread::spawn(move || {
                     for i in 0..5 {
-                        record_sent(&project, rec(&format!("agent-{t}-{i}"), 1, "inv1", true, false))
-                            .unwrap_or_else(|e| panic!("writer {t}.{i}: {e}"));
+                        record_sent(
+                            &project,
+                            rec(&format!("agent-{t}-{i}"), 1, "inv1", true, false),
+                        )
+                        .unwrap_or_else(|e| panic!("writer {t}.{i}: {e}"));
                     }
                 })
             })
@@ -2679,7 +2682,11 @@ mod last_sent_tests {
             w.join().unwrap();
         }
         let records = load_last_sent(&project);
-        assert_eq!(records.len(), 40, "all 40 appends survive (cap is {LAST_SENT_CAP})");
+        assert_eq!(
+            records.len(),
+            40,
+            "all 40 appends survive (cap is {LAST_SENT_CAP})"
+        );
         let names: std::collections::BTreeSet<&str> =
             records.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names.len(), 40, "no duplicate or lost record");
