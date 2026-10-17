@@ -43,6 +43,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -1447,12 +1448,13 @@ pub fn load_last_sent(project: &str) -> Vec<SentRecord> {
 
 /// Append one record and persist atomically (temp + rename — a crash
 /// mid-write cannot tear the registry). Best-effort by contract: callers log
-/// and continue on error.
+/// and continue on error. The lock keeps a loop pass and a captain `send`
+/// from each writing the registry they loaded before the other's append.
 pub fn record_sent(project: &str, record: SentRecord) -> Result<()> {
-    let mut records = load_last_sent(project);
-    records.push(record);
-    trim_last_sent(&mut records);
-    save_last_sent(project, &records)
+    update_locked(&last_sent_file(project), |records: &mut Vec<SentRecord>| {
+        records.push(record);
+        trim_last_sent(records);
+    })
 }
 
 /// Persist the registry atomically (temp + rename).
@@ -1465,6 +1467,108 @@ pub fn save_last_sent(project: &str, records: &[SentRecord]) -> Result<()> {
     std::fs::write(&tmp, serde_json::to_string_pretty(records)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+// ---- state file lock (bd-state-cas-fpwq) ----
+//
+// The map writers below used to do load -> mutate -> write -> rename with no
+// mutual exclusion. Two writers (a loop pass and a captain `send`, say) each
+// load the same snapshot and the second rename wins: the first writer's key is
+// gone and nothing reported an error. A sibling `<file>.lock` created with
+// `create_new` makes the whole read-modify-write atomic. A lock older than
+// `STALE_LOCK` is litter from a crashed writer, so it is stolen rather than
+// wedging the file forever.
+
+/// Total wait before a blocked writer gives up (`attempts * retry`). Small on
+/// purpose: bookkeeping must never stall a loop pass for long.
+const LOCK_WAIT_ATTEMPTS: u32 = 100;
+const LOCK_RETRY: Duration = Duration::from_millis(2);
+/// Older than this and the holder is gone; the lock is relocatable litter.
+const STALE_LOCK: Duration = Duration::from_secs(10);
+
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_extension("lock")
+}
+
+/// Exclusive claim on one state file. Releases on drop (including unwinding),
+/// so a panicking writer does not leave the file wedged.
+struct StateLock {
+    path: PathBuf,
+}
+
+impl StateLock {
+    /// Non-blocking. `Ok(None)` means another live writer holds it.
+    fn try_acquire(path: &Path) -> Result<Option<StateLock>> {
+        let lock = lock_path(path);
+        if let Some(parent) = lock.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Two steals at most: a third crash inside 10s is not a lock problem.
+        for _ in 0..3 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(_) => return Ok(Some(StateLock { path: lock })),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !lock_is_stale(&lock) {
+                        return Ok(None);
+                    }
+                    let _ = std::fs::remove_file(&lock);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn lock_is_stale(lock: &Path) -> bool {
+    std::fs::metadata(lock)
+        .and_then(|m| m.modified())
+        .map(|mtime| mtime.elapsed().map(|age| age > STALE_LOCK).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// Atomic read-modify-write of a JSON state file. Missing or corrupt content
+/// reads as `T::default()` (bookkeeping never breaks the loop on a bad file).
+/// A writer that cannot get the lock within the bounded wait returns an error
+/// instead of clobbering, so the loss is loud.
+fn update_locked<T: Default + Serialize + serde::de::DeserializeOwned>(
+    path: &Path,
+    op: impl FnOnce(&mut T),
+) -> Result<()> {
+    for attempt in 0..LOCK_WAIT_ATTEMPTS {
+        if let Some(_guard) = StateLock::try_acquire(path)? {
+            let mut value: T = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            op(&mut value);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+            std::fs::write(&tmp, serde_json::to_string_pretty(&value)?)?;
+            std::fs::rename(&tmp, path)?;
+            return Ok(());
+        }
+        if attempt + 1 < LOCK_WAIT_ATTEMPTS {
+            std::thread::sleep(LOCK_RETRY);
+        }
+    }
+    bail!(
+        "state file {} is locked by another writer (waited {}ms); refusing to clobber it",
+        path.display(),
+        LOCK_WAIT_ATTEMPTS as u64 * LOCK_RETRY.as_millis() as u64
+    )
 }
 
 /// bd-resume-window-lease-sweep-4sa2: the (bead, pane) resume watermark — the
@@ -1490,19 +1594,15 @@ pub fn load_resume_window(project: &str) -> BTreeMap<String, i64> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-/// Record one resume and persist atomically (temp + rename). Best-effort by
-/// contract: callers log and continue on error.
+/// Record one resume and persist atomically under the file lock. Best-effort
+/// by contract: callers log and continue on error.
 pub fn record_resume(project: &str, bead: &str, pane: &str, now_us: i64) -> Result<()> {
-    let mut map = load_resume_window(project);
-    map.insert(resume_key(bead, pane), now_us);
-    let path = resume_window_file(project);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&map)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    update_locked(
+        &resume_window_file(project),
+        |map: &mut BTreeMap<String, i64>| {
+            map.insert(resume_key(bead, pane), now_us);
+        },
+    )
 }
 
 /// bd-loop-feeds-idle-panes-rh2z: the per-pane starved-pass counter behind the
@@ -2288,6 +2388,68 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// bd-state-cas-fpwq, mechanism half: a held lock refuses the second writer
+    /// instead of letting it load the same snapshot and rename over it.
+    #[test]
+    fn a_held_state_lock_refuses_the_second_writer() {
+        let _g = crate::config::test_state_home();
+        let project = format!("lock-{}", std::process::id());
+        let file = resume_window_file(&project);
+        let held = StateLock::try_acquire(&file)
+            .unwrap()
+            .expect("first writer takes the lock");
+        assert!(
+            StateLock::try_acquire(&file).unwrap().is_none(),
+            "second writer must be refused"
+        );
+        assert!(
+            record_resume(&project, "bd-lock", "pane", 1).is_err(),
+            "a write under another writer's lock must fail loudly, never clobber"
+        );
+        assert!(
+            load_resume_window(&project).is_empty(),
+            "the refused writer wrote nothing: {:?}",
+            load_resume_window(&project)
+        );
+        drop(held);
+        record_resume(&project, "bd-lock", "pane", 1).unwrap();
+        assert_eq!(
+            load_resume_window(&project).get(&resume_key("bd-lock", "pane")),
+            Some(&1),
+            "the lock is released on drop"
+        );
+    }
+
+    /// bd-state-cas-fpwq, call-site half: every concurrent writer's key survives.
+    /// Lost-update bugs are probabilistic, so the deterministic guard above is
+    /// the mechanism proof; this is the end-to-end net on the real writers.
+    #[test]
+    fn concurrent_state_writers_do_not_clobber() {
+        let _g = crate::config::test_state_home();
+        let project = format!("cas-{}", std::process::id());
+        let writers: Vec<_> = (0..8)
+            .map(|t| {
+                let project = project.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        record_resume(&project, &format!("bd-thread-{t}-{i}"), "pane", 1)
+                            .unwrap_or_else(|e| panic!("writer {t}.{i}: {e}"));
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let window = load_resume_window(&project);
+        assert_eq!(
+            window.len(),
+            200,
+            "all 200 (bead, pane) keys survive; got {}",
+            window.len()
+        );
+    }
+
     #[test]
     fn slugify_handles_junk() {
         assert_eq!(slugify("before auth refactor"), "before-auth-refactor");
@@ -2494,6 +2656,34 @@ mod last_sent_tests {
         let _ = std::fs::remove_file(last_sent_file(project));
         let _ = std::fs::remove_file(last_sent_file(project).with_extension("json.tmp"));
         drop(dir);
+    }
+
+    /// bd-state-cas-fpwq: `last_sent` has two real writers (a loop pass and a
+    /// captain `send`); neither append may be lost to the other's snapshot.
+    #[test]
+    fn concurrent_sent_records_do_not_clobber() {
+        let _g = crate::config::test_state_home();
+        let project = format!("__test_sent_cas_{}__", std::process::id());
+        let writers: Vec<_> = (0..8)
+            .map(|t| {
+                let project = project.clone();
+                std::thread::spawn(move || {
+                    for i in 0..5 {
+                        record_sent(&project, rec(&format!("agent-{t}-{i}"), 1, "inv1", true, false))
+                            .unwrap_or_else(|e| panic!("writer {t}.{i}: {e}"));
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let records = load_last_sent(&project);
+        assert_eq!(records.len(), 40, "all 40 appends survive (cap is {LAST_SENT_CAP})");
+        let names: std::collections::BTreeSet<&str> =
+            records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names.len(), 40, "no duplicate or lost record");
+        let _ = std::fs::remove_file(last_sent_file(&project));
     }
 
     #[test]
