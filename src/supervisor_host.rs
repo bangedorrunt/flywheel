@@ -32,7 +32,9 @@
 //! crew npub and does not type a pane. A steer the log already appended is not sent again; a
 //! restart resolves one that is still pending.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -372,7 +374,9 @@ impl Core {
         Ok(u.commands)
     }
 
-    /// The paths this core reads and writes.
+    /// The paths this core reads and writes. The host loop reads them; tests
+    /// drive the core directly, which is why `paths` is read only there.
+    #[cfg(test)]
     pub fn paths(&self) -> &CtxPaths {
         &self.paths
     }
@@ -1007,13 +1011,15 @@ impl EffectJournal for ToronEffectJournal {
     }
 }
 
-/// In-memory journal (tests; also what a dry run uses).
+/// In-memory journal. Tests drive it; no production path constructs one.
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemJournal {
     /// key -> (settled?, ok, runs)
     pub rows: BTreeMap<String, (bool, bool, u64)>,
 }
 
+#[cfg(test)]
 impl EffectJournal for MemJournal {
     fn begin(&mut self, key: &str) -> Begin {
         let r = self.rows.entry(key.into()).or_insert((false, false, 0));
@@ -3327,7 +3333,7 @@ mod tests {
                 || c.model.restarts.len() >= 2,
             "each failed relaunch is another incarnation, bounded by poison/intensity"
         );
-        assert_eq!(c.model.children["a"].generation >= 2, true);
+        assert!(c.model.children["a"].generation >= 2);
     }
 
     #[test]

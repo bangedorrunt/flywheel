@@ -120,14 +120,12 @@ pub fn load(base: &Path, project: &str, sha: &str) -> Result<Delta> {
     if sha_hex(&raw) != sha {
         bail!("delta file for {sha} does not hash to its name");
     }
-    parse(&raw).map(|d| {
-        debug_assert_eq!(d.sha, sha);
-        d
-    })
+    parse(&raw).inspect(|d| debug_assert_eq!(d.sha, sha))
 }
 
 /// Text form of a steer (header, then the delta under its sha). The live
 /// mail body is `steer@1`, not this string. The pane never sees either.
+#[cfg(test)]
 pub fn body(header: &str, delta: Option<&Delta>) -> String {
     match delta {
         Some(d) => format!("{header}\ndelta sha256:{}\n{}", d.sha, d.json),
@@ -136,6 +134,7 @@ pub fn body(header: &str, delta: Option<&Delta>) -> String {
 }
 
 /// The delta JSON in a steer body, if it has one (for tests and the doctor).
+#[cfg(test)]
 pub fn delta_in_body(body: &str) -> Option<(&str, &str)> {
     let rest = body.split_once("\ndelta sha256:")?.1;
     rest.split_once('\n')

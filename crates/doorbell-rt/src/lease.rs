@@ -255,7 +255,11 @@ mod tests {
         release_lease(&d, "w", &legacy);
         let _ = std::fs::remove_file(owner_file(&d, "w"));
         let plain = acquire_lease(&d, "w", now).unwrap();
-        assert!(!std::fs::read_to_string(owner_file(&d, "w")).unwrap().contains("kind"));
+        assert!(
+            !std::fs::read_to_string(owner_file(&d, "w"))
+                .unwrap()
+                .contains("kind")
+        );
         assert_eq!(inbox_lease_key("w"), "inbox-w");
         release_lease(&d, "w", &plain);
     }

@@ -339,7 +339,7 @@ pub fn to_json(checks: &[Check]) -> Value {
 
 fn check_herdr(cfg: &Config) -> Check {
     match Client::connect(Some(&cfg.socket_path())) {
-        Ok(mut c) => match c.ping() {
+        Ok(c) => match c.ping() {
             Ok(_) => Check::pass("herdr-socket"),
             Err(e) => Check::fail("herdr-socket", format!("ping failed: {e}")),
         },

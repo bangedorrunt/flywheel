@@ -1053,6 +1053,7 @@ fn is_sha(s: &str) -> bool {
 /// acked or applied by a restart (the new incarnation reads that mail first).
 impl SupModel {
     /// See above.
+    #[cfg(test)]
     pub fn current_delta(&self, child: &str) -> Option<&str> {
         self.steers
             .values()
@@ -1265,9 +1266,7 @@ pub fn bead_ids(text: &str) -> Vec<String> {
         let start = i;
         i += 3;
         while i < b.len() {
-            if bead_atom(b[i]) {
-                i += 1;
-            } else if b[i] == b'-' && i + 1 < b.len() && bead_atom(b[i + 1]) {
+            if bead_atom(b[i]) || (b[i] == b'-' && i + 1 < b.len() && bead_atom(b[i + 1])) {
                 i += 1;
             } else {
                 break;

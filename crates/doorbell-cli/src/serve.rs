@@ -27,8 +27,8 @@ async fn host_workspace(
     rx: tokio::sync::mpsc::Receiver<doorbell_rt::BrainMsg>,
     liveness: std::sync::Arc<doorbell_rt::brain::BrainLiveness>,
 ) -> doorbell_rt::RunReport {
-    use doorbell_rt::{Brain, BrainConfig, FileHost, FileHostConfig, Host, SinkManager};
     use doorbell_rt::FileStore;
+    use doorbell_rt::{Brain, BrainConfig, FileHost, FileHostConfig, Host, SinkManager};
     let bins = resolved_bins();
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
     fcfg.toron_bin = bins.toron.clone();
@@ -57,11 +57,9 @@ async fn host_workspace(
             "doorbell serve: {project}/{workspace} — comms flag off: the legacy typer is gone; this host types nothing"
         );
     }
-    sinks.add_sink_with_factory(
-        "herdr",
-        Box::new(doorbell_rt::NoTextSink::new()),
-        || Box::new(doorbell_rt::NoTextSink::new()),
-    );
+    sinks.add_sink_with_factory("herdr", Box::new(doorbell_rt::NoTextSink::new()), || {
+        Box::new(doorbell_rt::NoTextSink::new())
+    });
     // bd-8ulu: a durable human wake with zero swarm needs somewhere to land.
     // The pane registry is not an option for a human pin, so register the
     // webhook adapters this workspace's rows justify — one per distinct
@@ -2457,11 +2455,24 @@ mod tests {
         assert_eq!(super::daemon_lease_kind_for(false), Some("no-text"));
         let src = include_str!("serve.rs");
         let prod = &src[..src.find("\nmod tests {").unwrap()];
-        assert_eq!(prod.matches("lease::acquire_lease_kind(").count(), 2, "boot + auto-host claim");
-        assert!(!prod.contains("lease::acquire_lease(&cfg"), "no unstamped daemon claim");
+        assert_eq!(
+            prod.matches("lease::acquire_lease_kind(").count(),
+            2,
+            "boot + auto-host claim"
+        );
+        assert!(
+            !prod.contains("lease::acquire_lease(&cfg"),
+            "no unstamped daemon claim"
+        );
         let d = std::env::temp_dir().join(format!("db-kind-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let held = doorbell_rt::lease::acquire_lease_kind(&d, "w", doorbell_rt::lease::unix_now(), super::daemon_lease_kind_for(true)).unwrap();
+        let held = doorbell_rt::lease::acquire_lease_kind(
+            &d,
+            "w",
+            doorbell_rt::lease::unix_now(),
+            super::daemon_lease_kind_for(true),
+        )
+        .unwrap();
         let read = doorbell_rt::lease::read_lease(&d, "w").unwrap();
         assert_eq!(read.kind.as_deref(), Some("no-text"));
         assert!(!doorbell_rt::lease::is_ringer(&read));

@@ -224,6 +224,7 @@ pub fn write(t: &dyn PaneTyper, target: &str, w: &PaneWrite) -> anyhow::Result<(
 }
 
 /// Source fence: the call shapes that type text into a pane.
+#[cfg(test)]
 pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
     ".agent_prompt(",
     ".agent_prompt_coded(",
@@ -242,6 +243,7 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 /// This list may only shrink: the legacy payload path is deleted by
 /// 2026-11-08 (build-plan §12.4). A new site anywhere else fails
 /// `only_the_sink_types_into_panes`.
+#[cfg(test)]
 pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
     ("src/cmd/doorbell.rs", 1),
     ("src/herdr_shim.rs", 1),
@@ -249,9 +251,11 @@ pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
 ];
 
 /// The file allowed to type into panes.
+#[cfg(test)]
 pub(crate) const SINK_FILE: &str = "src/pane_write.rs";
 
 /// Pure: count pane-text calls in one source text (comments skipped).
+#[cfg(test)]
 pub(crate) fn pane_text_calls(src: &str) -> usize {
     src.lines()
         .map(str::trim_start)
@@ -262,6 +266,7 @@ pub(crate) fn pane_text_calls(src: &str) -> usize {
 
 /// Pure: the fence verdict over (path, source) pairs. Returns the
 /// violations, one line each.
+#[cfg(test)]
 pub(crate) fn fence_violations(files: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
     for (path, src) in files {

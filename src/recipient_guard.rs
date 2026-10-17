@@ -62,7 +62,7 @@ pub fn binding_from_whois(whois: Option<&Value>) -> Binding {
             Binding::Unknown
         };
     }
-    if flagged || npub != pane_npub {
+    if flagged || divergent(npub, pane_npub) {
         Binding::Divergent {
             name_npub: npub.to_string(),
             pane_npub: pane_npub.to_string(),

@@ -294,6 +294,7 @@ pub fn read_gen(path: &Path) -> Option<WatcherGen> {
 
 /// Append the watcher generation to an injected line so agents can tell a
 /// stale-watcher banner from a live one (compare with `__doorbell --report`).
+#[cfg(test)]
 pub fn stamp_line(msg: &str, record: &WatcherGen) -> String {
     format!("{msg} {}", record.stamp())
 }

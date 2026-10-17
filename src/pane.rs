@@ -90,7 +90,7 @@ impl LiveRegistry {
 pub fn live_registry_for_dispatch(project: &str) -> LiveRegistry {
     let entries = crate::state::load_spawn_registry(project);
     let live: std::collections::HashSet<String> =
-        match Client::connect(None).and_then(|mut c| c.pane_list(None)) {
+        match Client::connect(None).and_then(|c| c.pane_list(None)) {
             Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
             Err(_) => entries.iter().map(|e| e.pane_id.clone()).collect(),
         };
@@ -191,7 +191,7 @@ pub fn settle_for_role_slot(project: &str, role: &str, nth: Option<usize>) -> Op
         || {
             Client::connect(None)
                 .ok()
-                .and_then(|mut c| c.pane_list(None).ok())
+                .and_then(|c| c.pane_list(None).ok())
                 .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
         },
         WINDOW_MS,
