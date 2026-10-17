@@ -11753,7 +11753,7 @@ mod s_proof_tests {
             .find("fn rebuild_assignment_from_receipts(")
             .expect("rebuild");
         let end = src[pos..]
-            .find("\nfn doorbell_prompt(")
+            .find("\nfn unpinned_registry_names(")
             .map(|i| pos + i)
             .unwrap_or(src.len());
         let slice = &src[pos..end];
@@ -11945,87 +11945,6 @@ fn rebuild_assignment_from_receipts(workspace_model: &mut crate::workspace::Work
             workspace_model.assignment.insert(r.corr.clone(), rec);
         }
     }
-}
-
-fn doorbell_prompt(
-    herdr: Option<&mut Client>,
-    registry: &[state::SpawnEntry],
-    injects: &[(String, String)],
-    generation: Option<&doorbell::WatcherGen>,
-    project: &str,
-    workspace: &str,
-) -> Vec<String> {
-    let Some(client) = herdr else {
-        return Vec::new();
-    };
-    let mut ok = Vec::new();
-    for (pin, msg) in injects {
-        let Some(entry) = registry
-            .iter()
-            .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))
-        else {
-            // GS-007 gap 9: unknown pin silently dropped with `continue` — now loud miss.
-            eprintln!(
-                "flywheel doorbell: [DoorbellMiss] pin {pin} not in registry — no pane to prompt (loud)"
-            );
-            doorbell::audit_append(
-                &config::state_dir(),
-                workspace,
-                serde_json::json!({
-                    "ts": chrono::Utc::now().to_rfc3339(),
-                    "workspace": workspace,
-                    "kind": "doorbell_miss_unknown_pin",
-                    "pin": pin,
-                    "msg": msg,
-                }),
-            );
-            continue;
-        };
-        // bd-stale-doorbell-wake-0fic: every wake banner carries the
-        // watcher generation so agents can tell stale noise from a live
-        // peer need (`flywheel __doorbell --report` prints the same fields).
-        let msg = generation.map_or(msg.clone(), |r| doorbell::stamp_line(msg, r));
-        match client.agent_prompt(&entry.name, &msg, None) {
-            Ok(_) => ok.push(pin.clone()),
-            // H2 (bd-harness-jcode): recipe-harness panes (`pa`/`jcode`)
-            // reject agent.prompt (no herdr kind -> agent_not_ready) — fall
-            // back to the pane primitives, then count the wake as delivered.
-            Err(e) if is_agent_not_ready(&e.code) => {
-                let pane = entry.pane_id.clone();
-                if try_send_text_delivery(client, project, &entry.name, &pane, &msg) {
-                    ok.push(pin.clone())
-                } else {
-                    eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name);
-                    doorbell::audit_append(
-                        &config::state_dir(),
-                        workspace,
-                        serde_json::json!({
-                            "ts": chrono::Utc::now().to_rfc3339(),
-                            "workspace": workspace,
-                            "kind": "prompt_failure",
-                            "pin": pin,
-                            "error": e.to_string(),
-                        }),
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("flywheel doorbell: prompt {} failed: {e:#}", entry.name);
-                doorbell::audit_append(
-                    &config::state_dir(),
-                    workspace,
-                    serde_json::json!({
-                        "ts": chrono::Utc::now().to_rfc3339(),
-                        "workspace": workspace,
-                        "kind": "prompt_failure",
-                        "pin": pin,
-                        "error": e.to_string(),
-                    }),
-                );
-            }
-        }
-    }
-    ok
 }
 
 /// bd-unpinned-loud-1mlt (GS-028 B6+B7): names of registry entries with no
