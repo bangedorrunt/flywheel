@@ -71,6 +71,19 @@ pub struct ClassifiedFailure {
     pub stage: &'static str,
 }
 
+/// Seconds to wait before retry `attempt` (1..=4) of a blip that passes by
+/// itself: 60, 120, 240, 480. The fifth try has already run. `None` means stop
+/// and hand the turn to a person or a fallback agent.
+pub fn transient_wait_secs(attempt: u32) -> Option<u64> {
+    match attempt {
+        1 => Some(60),
+        2 => Some(120),
+        3 => Some(240),
+        4 => Some(480),
+        _ => None,
+    }
+}
+
 pub fn classify(
     stderr_tail: &str,
     exit_code: Option<i32>,
@@ -101,12 +114,18 @@ pub fn classify_with_stage(
         };
         truncate_evidence(&raw, 512)
     };
+    // Allowance does not pass by waiting. It shares the billing hop (another
+    // agent), not the rate-limit hop (same agent, other model).
     if lower.contains("402")
         || lower.contains("insufficient balance")
         || lower.contains("insufficient_balance")
         || lower.contains("payment required")
         || lower.contains("payment_required")
         || lower.contains("billing")
+        || lower.contains("quota exceeded")
+        || lower.contains("quota_exceeded")
+        || lower.contains("usage limit")
+        || lower.contains("out of allowance")
     {
         return ClassifiedFailure {
             kind: FailureKind::Billing,
@@ -132,12 +151,15 @@ pub fn classify_with_stage(
             stage: stage.unwrap_or("execute"),
         };
     }
+    // A blip passes by itself: wait, then the same agent. Not an allowance.
     if lower.contains("429")
-        || lower.contains("quota exceeded")
-        || lower.contains("quota_exceeded")
         || lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("rate-limit")
+        || lower.contains("at capacity")
+        || lower.contains("overloaded")
+        || lower.contains("connection dropped")
+        || lower.contains("connection reset")
     {
         return ClassifiedFailure {
             kind: FailureKind::RateLimit,
@@ -302,6 +324,25 @@ mod tests {
         assert_eq!(c.kind, FailureKind::Billing);
     }
     #[test]
+    fn failure_classify_allowance_is_not_a_blip() {
+        let quota = classify("quota exceeded for model", None, None);
+        assert_eq!(quota.kind, FailureKind::Billing);
+        assert!(!quota.retryable);
+        assert!(quota.reroute_eligible);
+        let usage = classify("usage limit reached", None, None);
+        assert!(!usage.retryable);
+        assert!(usage.reroute_eligible);
+        let blip = classify("model is at capacity", None, None);
+        assert_eq!(blip.kind, FailureKind::RateLimit);
+        assert!(blip.retryable);
+        assert!(!blip.reroute_eligible);
+        assert_eq!(transient_wait_secs(1), Some(60));
+        assert_eq!(transient_wait_secs(2), Some(120));
+        assert_eq!(transient_wait_secs(3), Some(240));
+        assert_eq!(transient_wait_secs(4), Some(480));
+        assert_eq!(transient_wait_secs(5), None);
+    }
+    #[test]
     fn failure_classify_rate_limit_429() {
         let c = classify("429 Too Many Requests", None, None);
         assert_eq!(c.kind, FailureKind::RateLimit);
@@ -324,8 +365,10 @@ mod tests {
                 "402 billing and 401 unauthorized in same body",
                 FailureKind::Billing,
             ),
-            ("quota exceeded for model", FailureKind::RateLimit),
+            ("quota exceeded for model", FailureKind::Billing),
             ("rate limit hit, retry after 60s", FailureKind::RateLimit),
+            ("model is at capacity", FailureKind::RateLimit),
+            ("connection dropped", FailureKind::RateLimit),
             ("401 Unauthorized", FailureKind::Auth),
             ("invalid api key provided", FailureKind::Auth),
             ("403 forbidden authentication failed", FailureKind::Auth),
