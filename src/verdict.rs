@@ -852,10 +852,44 @@ mod note_binding_tests {
         assert!(matches!(note_binding(&note), NoteBinding::MalformedSha(_)));
         assert!(!note_has_sha(&note, &sha));
     }
+
+    #[test]
+    fn note_proved_reads_only_a_leading_pair() {
+        assert_eq!(
+            note_proved("task=run-1 verdict=v-9 receipt=/tmp/r.txt"),
+            Some(("run-1".to_string(), "v-9".to_string()))
+        );
+        assert_eq!(note_proved("proved task=run-1 verdict=v-9"), None);
+        assert_eq!(note_proved("task=run-1, verdict=v-9"), None);
+        let sha = "a".repeat(40);
+        assert_eq!(note_proved(&format!("sha={sha} task=run-1 verdict=v-9")), None);
+    }
 }
 
 fn note_has_sha(note: &str, sha: &str) -> bool {
     matches!(note_binding(note), NoteBinding::Bound(v) if v == sha)
+}
+
+/// Phase 5 proved binding. The leading pair must be `task=<id> verdict=<id>`.
+/// A later pair, a prose mention, or a comma glued to a value does not bind.
+pub(crate) fn note_proved(note: &str) -> Option<(String, String)> {
+    let tokens = note_tokens(note);
+    let (k0, v0) = tokens.first().copied()?;
+    let (k1, v1) = tokens.get(1).copied()?;
+    if k0 != "task" || k1 != "verdict" {
+        return None;
+    }
+    if !is_binding_id(v0) || !is_binding_id(v1) {
+        return None;
+    }
+    Some((v0.to_string(), v1.to_string()))
+}
+
+fn is_binding_id(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 128
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'@'))
 }
 
 fn note_receipt_path(note: &str) -> Option<PathBuf> {
@@ -1055,8 +1089,8 @@ pub fn ledger_check(cwd: &Path, bead: &BeadUnit, ac: AcShape, sha: &str) -> anyh
             continue;
         }
         // The verdict must bind to this SHA (SHA rule): the note carries
-        // `sha=<sha>`. A row with no note carries no binding and is
-        // skipped — it can never legalize a close (bd-u5yr).
+        // `sha=<sha>`. A Phase 5 `task=` `verdict=` pair is a separate hit
+        // (`ledger_proved`); it does not satisfy the SHA rule.
         if !row.note.as_deref().is_some_and(|n| note_has_sha(n, sha)) {
             continue;
         }
@@ -1081,6 +1115,52 @@ pub fn ledger_check(cwd: &Path, bead: &BeadUnit, ac: AcShape, sha: &str) -> anyh
         }
     }
     Ok(false)
+}
+
+/// A PASS row whose note leads with `task=<id> verdict=<id>` and whose kind
+/// is legal for this bead. The SHA rule is not consulted.
+pub fn ledger_proved(
+    cwd: &Path,
+    bead: &BeadUnit,
+    ac: AcShape,
+) -> anyhow::Result<Option<(String, String)>> {
+    let list = list_gates(cwd, &bead.id)?;
+    for row in &list.history {
+        if !row.passed {
+            continue;
+        }
+        let Some(kind) = VerdictKind::from_gate_name(&row.gate) else {
+            continue;
+        };
+        if matches!(
+            kind,
+            VerdictKind::VerifierBlocked | VerdictKind::VerifierFailed
+        ) {
+            continue;
+        }
+        let Some(note) = row.note.as_deref() else {
+            continue;
+        };
+        let Some((task, verdict)) = note_proved(note) else {
+            continue;
+        };
+        let Some(at) = parse_recorded_at(&row.recorded_at) else {
+            continue;
+        };
+        let verdict_row = Verdict {
+            kind,
+            bead_id: bead.id.clone(),
+            sha: String::new(),
+            at,
+            actor: AgentName::new(row.provider.clone()),
+            receipt_path: note_receipt_path(note).unwrap_or_default(),
+            verify_cmd: bead.verify.clone(),
+        };
+        if legal_close(&verdict_row, bead, ac) {
+            return Ok(Some((task, verdict)));
+        }
+    }
+    Ok(None)
 }
 
 /// Why no gate row legalized `sha`: one line per pass row whose note carries a

@@ -65,9 +65,9 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
             let cwd = dir
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-            // SHA rule first: no commit carries the bead id -> illegal
-            // regardless of verdicts.
-            let sha = crate::verdict::derive_head_sha(&cwd, bead_id)?;
+            // SHA rule first when a commit carries the bead id. A Phase 5
+            // proved note is a second legal hit and does not need that commit.
+            let sha = crate::verdict::derive_head_sha(&cwd, bead_id);
             // Crediting a close is not dispatching: a triage bead has no
             // VERIFY and its legal proof is a record review (bd-tfxv).
             let mut bead = crate::verdict::bead_from_br_show_for_close(&cwd, bead_id)?;
@@ -79,23 +79,29 @@ pub(crate) fn cmd_ledger(_cfg: &Config, cmd: &LedgerCmd) -> Result<()> {
                 "judgment" => crate::verdict::AcShape::Judgment,
                 _ => crate::verdict::AcShape::Checkable,
             };
-            if crate::verdict::ledger_check(&cwd, &bead, ac, &sha)? {
+            if let Ok(sha) = &sha
+                && crate::verdict::ledger_check(&cwd, &bead, ac, sha)?
+            {
                 println!("ledger check {bead_id}: LEGAL (sha {sha})");
-                Ok(())
-            } else {
-                // bd-0z00: name the competing `sha=` candidates so the
-                // failure is actionable, not just "no legal verdict".
-                let why = crate::verdict::ledger_check_diagnostics(&cwd, &bead, &sha)?;
-                let detail = if why.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n  {}", why.join("\n  "))
-                };
-                anyhow::bail!(
-                    "ledger check {bead_id}: no legal verdict bound to sha {sha} \
-                     (legal-close table, ADR-0019 Spec 1){detail}"
-                );
+                return Ok(());
             }
+            if let Some((task, verdict)) = crate::verdict::ledger_proved(&cwd, &bead, ac)? {
+                println!("ledger check {bead_id}: LEGAL (task {task} verdict {verdict})");
+                return Ok(());
+            }
+            let sha = sha?;
+            // bd-0z00: name the competing `sha=` candidates so the
+            // failure is actionable, not just "no legal verdict".
+            let why = crate::verdict::ledger_check_diagnostics(&cwd, &bead, &sha)?;
+            let detail = if why.is_empty() {
+                String::new()
+            } else {
+                format!("\n  {}", why.join("\n  "))
+            };
+            anyhow::bail!(
+                "ledger check {bead_id}: no legal verdict bound to sha {sha} \
+                 (legal-close table, ADR-0019 Spec 1){detail}"
+            );
         }
         LedgerCmd::Receipt {
             bead_id,
