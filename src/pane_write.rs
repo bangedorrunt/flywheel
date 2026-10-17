@@ -168,6 +168,7 @@ impl PaneTyper for BootPanes<'_> {
                 || self.0.pane_send_text(target, line),
                 |_| true,
                 |attempt, e| eprintln!("flywheel: warn: bootstrap send_text attempt {attempt} failed for {target}: {e:#} — retrying"),
+                crate::retry::host_draw,
                 std::thread::sleep,
             )
             .map_err(|e| anyhow::anyhow!("herdr pane.send_text {target}: {e}"))?;
@@ -177,6 +178,7 @@ impl PaneTyper for BootPanes<'_> {
                 || self.0.pane_send_input(target, &["Enter"]),
                 |_| true,
                 |attempt, e| eprintln!("flywheel: warn: bootstrap Enter attempt {attempt} failed for {target}: {e:#} — retrying Enter only"),
+                crate::retry::host_draw,
                 std::thread::sleep,
             )
             .map(|_| ())
