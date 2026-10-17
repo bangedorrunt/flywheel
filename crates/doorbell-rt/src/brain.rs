@@ -166,9 +166,6 @@ pub fn classify_liveness(age_ms: u64, wakes_grew: bool) -> LivenessVerdict {
     }
 }
 
-/// How many quiet watches share one journal fsync.
-pub(crate) const WATCH_SYNC_EVERY: u32 = 32;
-
 /// `Some(next)` when the plane-S cursor moves. Same-second lines stay put
 /// so a burst does not rewrite the wake file once per line.
 pub(crate) fn watch_cursor_next(prev: Option<i64>, us: i64) -> Option<i64> {
@@ -176,9 +173,10 @@ pub(crate) fn watch_cursor_next(prev: Option<i64>, us: i64) -> Option<i64> {
     if prev == Some(next) { None } else { Some(next) }
 }
 
-/// A prompt is due now. Quiet watches are due every [`WATCH_SYNC_EVERY`].
-pub(crate) fn watch_journal_due(pending_prompts: usize, since_sync: u32) -> bool {
-    pending_prompts > 0 || since_sync >= WATCH_SYNC_EVERY
+/// Fsync only to protect a prompt. A quiet watch must not `sync_data` the
+/// whole journal: that stall fills the brain channel and the 5s wait drops.
+pub(crate) fn watch_journal_due(pending_prompts: usize) -> bool {
+    pending_prompts > 0
 }
 
 #[cfg(test)]
@@ -191,10 +189,8 @@ mod watch_batch_tests {
         assert_eq!(watch_cursor_next(Some(5), 5), None);
         assert_eq!(watch_cursor_next(Some(5), 4), None);
         assert_eq!(watch_cursor_next(Some(5), 6), Some(6));
-        assert!(!watch_journal_due(0, 1));
-        assert!(!watch_journal_due(0, WATCH_SYNC_EVERY - 1));
-        assert!(watch_journal_due(0, WATCH_SYNC_EVERY));
-        assert!(watch_journal_due(1, 1));
+        assert!(!watch_journal_due(0));
+        assert!(watch_journal_due(1));
     }
 }
 
@@ -229,10 +225,6 @@ pub struct Brain<H: Host> {
     journal_sync_failed: u64,
     /// bd-jcys: wake-state saves that FAILED (see `flush_wake`).
     wake_save_failed: u64,
-    /// Decided watches since the last journal fsync. A prompt flushes
-    /// immediately. Quiet lines flush every [`WATCH_SYNC_EVERY`], so a
-    /// replay cannot fsync once per line and fill the brain channel.
-    watches_since_sync: u32,
     /// Sampled `watch` audit rows. One row per line filled the sidecar.
     watch_audits: u64,
     /// Consecutive unanswered expiries per pin (S3 deaf digest names
@@ -328,7 +320,6 @@ impl<H: Host> Brain<H> {
             journal_write_failed: 0,
             journal_sync_failed: 0,
             wake_save_failed: 0,
-            watches_since_sync: 0,
             watch_audits: 0,
             deaf_attempts: BTreeMap::new(),
             dedup_high_us: None,
@@ -651,11 +642,9 @@ impl<H: Host> Brain<H> {
             self.persist_hear();
         }
         // Decided-before-delivery: flush the journal BEFORE any Prompt
-        // intent reaches a sink (D4.2). Quiet lines batch; a prompt never does.
-        self.watches_since_sync = self.watches_since_sync.saturating_add(1);
-        if watch_journal_due(injects.len(), self.watches_since_sync) {
+        // intent reaches a sink (D4.2). Quiet lines do not fsync.
+        if watch_journal_due(injects.len()) {
             self.flush_journal("watch");
-            self.watches_since_sync = 0;
         }
         let delivered = self.deliver_prompts(injects).await;
         let woke = delivered.first().cloned();
