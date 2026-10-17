@@ -1925,6 +1925,7 @@ impl Host for FileHost {
             let absent_rows = absent.clone();
             let absent_for_audit = absent.clone();
             let retire = opts.retire_flag();
+            let retire_now = std::sync::Arc::clone(&retire);
             let handle = crate::wake_sock::spawn_wake_task(
                 opts,
                 move |kind, detail| {
@@ -1971,6 +1972,10 @@ impl Host for FileHost {
                                 // ONE death for this consumer so it is
                                 // replaced; the replacement resumes from the
                                 // last accepted line, replaying the drops.
+                                // Retire now, before the backoff sleep. The
+                                // std consumer stops taking lines; abort still
+                                // waits until the replacement is about to arm.
+                                retire_now.store(true, std::sync::atomic::Ordering::SeqCst);
                                 crate::msg::deliver_died_blocking(&tx);
                             }
                             // Counted by the forwarder; the consumer is
@@ -2004,6 +2009,7 @@ impl Host for FileHost {
                                     }),
                                 );
                             }
+                            retire_now.store(true, std::sync::atomic::Ordering::SeqCst);
                             crate::msg::deliver_died_blocking(&tx);
                         }
                     }

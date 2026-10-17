@@ -11259,8 +11259,12 @@ fn spawn_wake_consumer<F>(
     workspace: &str,
     state_dir: &std::path::Path,
     resume_from: Option<String>,
+    retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_event: F,
-) -> tokio::task::AbortHandle
+) -> (
+    tokio::task::AbortHandle,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+)
 where
     F: Fn(doorbell_rt::wake_sock::WakeOutcome) + Send + 'static,
 {
@@ -11273,9 +11277,11 @@ where
     // mcc9: a replacement consumer resumes from the last line the brain
     // accepted (`None` = first start, replay from origin).
     opts.resume_from = resume_from;
+    let stored = std::sync::Arc::clone(&retired);
+    opts.retired = retired;
     let state_dir = state_dir.to_path_buf();
     let workspace = workspace.to_string();
-    wake_sock::spawn_wake_task(
+    let handle = wake_sock::spawn_wake_task(
         opts,
         move |kind, detail| {
             doorbell::audit_append(
@@ -11285,7 +11291,8 @@ where
             );
         },
         on_event,
-    )
+    );
+    (handle, stored)
 }
 
 /// Pins plus npubs so live kind-9 `p` tags (hex) resolve to the pin.

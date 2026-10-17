@@ -359,6 +359,13 @@ pub fn spawn_wake_task(
                 eprintln!("doorbell: wake outcome forwarder panicked; inferring Died (bd-gdfe)");
                 break;
             }
+            // A condemned forwarder sets this on the first death. Stop taking
+            // lines now. The replacement resumes from the last accepted cursor.
+            // Waiting until abort-after-backoff lets the firehose shed for the
+            // whole sleep (measured: forwarded frozen, dropped past 90k).
+            if retired.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
         }
         // A RETIRED consumer is not a lost consumer. It was replaced on purpose,
         // the replacement is already armed, and forwarding a synthetic `Died` here
@@ -391,8 +398,14 @@ async fn run_wake_loop(
     tx: &tokio::sync::mpsc::UnboundedSender<WakeOutcome>,
     audit: &std::sync::Arc<impl Fn(&str, serde_json::Value) + Send + Sync>,
 ) {
-    let send = |out: WakeOutcome| {
-        let _ = tx.send(out);
+    // False means the std consumer is gone or already retired. Stop reading.
+    // A dropped receiver used to be ignored, so the socket kept filling an
+    // unbounded channel nobody drained.
+    let send = |out: WakeOutcome| -> bool {
+        if opts.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        tx.send(out).is_ok()
     };
     let mut cursor: Option<String> = opts.resume_from.clone();
     // Resyncs this loop has performed. Counted across reconnects so the audit
@@ -433,7 +446,9 @@ async fn run_wake_loop(
                         "open_fds": open_fd_count(),
                     }),
                 );
-                send(WakeOutcome::Died);
+                if !send(WakeOutcome::Died) {
+                    return;
+                }
                 return;
             }
             Err(_) => {
@@ -445,7 +460,9 @@ async fn run_wake_loop(
                         "timeout_ms": opts.handshake_timeout.as_millis() as u64,
                     }),
                 );
-                send(WakeOutcome::Died);
+                if !send(WakeOutcome::Died) {
+                    return;
+                }
                 return;
             }
         };
@@ -465,7 +482,9 @@ async fn run_wake_loop(
                     "timeout_ms": opts.handshake_timeout.as_millis() as u64,
                 }),
             );
-            send(WakeOutcome::Died);
+            if !send(WakeOutcome::Died) {
+                return;
+            }
             return;
         }
         let mut lines = BufReader::new(rd).lines();
@@ -479,8 +498,16 @@ async fn run_wake_loop(
         let exit = loop {
             match tokio::time::timeout(opts.idle_timeout, lines.next_line()).await {
                 Ok(Ok(Some(l))) => match frame_action(&l) {
-                    Ok(FrameAction::Watch(w)) => send(WakeOutcome::Watch(w)),
-                    Ok(FrameAction::Heartbeat) => send(WakeOutcome::Heartbeat),
+                    Ok(FrameAction::Watch(w)) => {
+                        if !send(WakeOutcome::Watch(w)) {
+                            return;
+                        }
+                    }
+                    Ok(FrameAction::Heartbeat) => {
+                        if !send(WakeOutcome::Heartbeat) {
+                            return;
+                        }
+                    }
                     Ok(FrameAction::Eose) => {}
                     Ok(FrameAction::EventsLost { from, through }) => {
                         // Not a reconnect: the sidecar keeps serving what it
@@ -495,7 +522,9 @@ async fn run_wake_loop(
                                 "reason": "sidecar evicted stored events after our cursor before we read them",
                             }),
                         );
-                        send(WakeOutcome::EventsLost { from, through });
+                        if !send(WakeOutcome::EventsLost { from, through }) {
+                            return;
+                        }
                     }
                     Ok(FrameAction::Shed(from)) => {
                         // Lossless, not silent: the cursor makes the resync
@@ -538,7 +567,9 @@ async fn run_wake_loop(
                     "idle_timeout_ms": opts.idle_timeout.as_millis() as u64,
                 }),
             );
-            send(WakeOutcome::Died);
+            if !send(WakeOutcome::Died) {
+                return;
+            }
             return;
         }
     }

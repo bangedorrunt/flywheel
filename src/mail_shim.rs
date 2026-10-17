@@ -2582,11 +2582,18 @@ pub fn list_own_reservations(resp: &Value) -> Vec<RenewedReservation> {
 /// AM 0/1 coerced), read_ts_us / created_ts_us (i64|null), duplicate_of
 /// (string|null). Unknown upstream keys are dropped so the shape cannot
 /// drift under callers; a non-array input yields an empty array.
+///
+/// The remote daemon wraps the same rows as `{"messages":[...]}`. Unwrap
+/// that one key. Any other object stays empty so a foreign envelope
+/// (`{"workflows":[]}`) cannot be mistaken for mail.
 pub fn inbox_json_rows(v: &serde_json::Value) -> serde_json::Value {
     use serde_json::json;
     let rows = match v.as_array() {
         Some(a) => a,
-        None => return json!([]),
+        None => match v.get("messages").and_then(serde_json::Value::as_array) {
+            Some(a) => a,
+            None => return json!([]),
+        },
     };
     let opt_str = |r: &serde_json::Value, k: &str| {
         r.get(k)
@@ -4207,6 +4214,18 @@ mod inbox_json_rows_tests {
     #[test]
     fn non_array_input_yields_empty_array() {
         assert_eq!(inbox_json_rows(&json!({"workflows": []})), json!([]));
+    }
+
+    #[test]
+    fn inbox_json_unwraps_daemon_messages() {
+        let out = inbox_json_rows(&json!({
+            "messages": [{ "id": "m-1", "subject": "landed", "body_md": "hi" }]
+        }));
+        let arr = out.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "m-1");
+        assert_eq!(arr[0]["subject"], "landed");
+        assert_eq!(arr[0]["body_md"], "hi");
     }
 }
 
