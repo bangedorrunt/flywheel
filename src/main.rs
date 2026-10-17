@@ -62,6 +62,7 @@ mod init_scaffold;
 mod intent;
 mod lead_claim;
 mod private_fs;
+mod recipient_guard;
 mod redact;
 mod spawn_facts;
 mod stale_check;

@@ -1310,6 +1310,12 @@ impl Mail {
         // (in-process mailbox + daemon tool) reject a literal "all"
         // recipient. Zero registered agents is a clear error.
         let targets = self.expand_broadcast(project_key, to)?;
+        // bd-pin-npub-binding-ggym: a name whose binding diverges from the key
+        // its pane acts under is a silent loss — the send reports ok and the
+        // recipient reads nothing. The mailbox owns name resolution, so ask it
+        // (`whois`) and refuse on positive two-sided divergence; a missing side
+        // is not evidence and still routes. One query per named recipient.
+        guard_targets(&targets, |name| self.whois(project_key, name).ok())?;
         // ADR-0010 D8 (bd-d8e4): a corr-preserving resend stamps the ORIGINAL
         // corr — toron's idempotent claim dedupes within TTL and the receipt
         // stays corr-keyed. The remote wire surface does not carry extra_tags,
@@ -2637,9 +2643,80 @@ pub fn inbox_json_rows(v: &serde_json::Value) -> serde_json::Value {
     )
 }
 
+/// bd-pin-npub-binding-ggym: the send door's recipient guard, with the whois
+/// lookup injected so the wiring (skip npubs, one query per NAME, refusal
+/// propagated) is testable without a live mailbox. `whois` returns the mailbox
+/// payload for a name, or `None` when it cannot answer — absence is not
+/// divergence and still routes.
+fn guard_targets(targets: &[String], mut whois: impl FnMut(&str) -> Option<Value>) -> Result<()> {
+    for target in targets {
+        if crate::recipient_guard::is_explicit_npub(target) {
+            continue;
+        }
+        let who = whois(target);
+        let binding = crate::recipient_guard::binding_from_whois(who.as_ref());
+        if let Err(refusal) = crate::recipient_guard::guard_recipient(target, &binding) {
+            bail!("{refusal}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-pin-npub-binding-ggym, wiring half: the send door asks whois once per
+    /// NAME, never for an explicit npub, and a divergent name refuses the send
+    /// before the backend call. `recipient_guard::tests` owns the decision.
+    #[test]
+    fn guard_targets_is_one_query_per_name_and_refuses_the_divergent_one() {
+        let divergent = serde_json::json!({
+            "npub": "6778eb30f5bb7b08ac2a47049378ff6b5c7fcc4f6a9c227f2ef5e06809999469",
+            "pane_npub": "facd8c1f2a3b4c5d6e7f8091a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5",
+            "identity_divergent": true,
+        });
+        let bound = serde_json::json!({
+            "npub": "aa11",
+            "pane_npub": "aa11",
+            "identity_divergent": false,
+        });
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let whois = |name: &str| {
+            asked.borrow_mut().push(name.to_string());
+            match name {
+                "Buffy" => Some(divergent.clone()),
+                "Someone" => Some(bound.clone()),
+                _ => None,
+            }
+        };
+
+        let targets = vec![
+            "Buffy".to_string(),
+            "npub1qqqqqqqqqq".to_string(),
+            "Someone".to_string(),
+        ];
+        let refusal = guard_targets(&targets, whois).expect_err("Buffy is divergent");
+        let refusal = refusal.to_string();
+        assert!(refusal.contains("re-register"), "{refusal}");
+        assert_eq!(
+            *asked.borrow(),
+            vec!["Buffy".to_string()],
+            "the divergent name is refused first and an explicit npub is never queried"
+        );
+
+        // Without the divergent recipient the same targets go through, and the
+        // npub target is still never queried.
+        asked.borrow_mut().clear();
+        let ok_targets = vec!["Someone".to_string(), "npub1qqqqqqqqqq".to_string()];
+        guard_targets(&ok_targets, whois).expect("bound + npub route");
+        assert_eq!(*asked.borrow(), vec!["Someone".to_string()]);
+
+        // A name the mailbox cannot answer for is not divergence.
+        asked.borrow_mut().clear();
+        guard_targets(&["Nobody".to_string()], whois).expect("absence routes");
+        assert_eq!(*asked.borrow(), vec!["Nobody".to_string()]);
+    }
 
     #[test]
     fn from_config_none_defaults_to_in_process_flywheel() {
