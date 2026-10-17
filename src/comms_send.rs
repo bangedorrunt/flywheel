@@ -560,6 +560,29 @@ async fn settle_batch(
     Ok(())
 }
 
+/// What the sender does for one recipient pane. The harness record decides
+/// whether a ring is possible at all (bd-harness-caps-6r1x): typing into a
+/// harness with no injection door is a wake nobody receives, so the send row
+/// says so instead of reporting a ring.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SendWake {
+    Ring,
+    /// Nothing was typed. The note lands in the send result row and names
+    /// the fallback.
+    Skip(String),
+}
+
+/// The one policy the sender asks. Pure; `hook_installed` is the caller's
+/// reading of the operator hook file.
+pub(crate) fn send_wake(kind: &str, hook_installed: bool) -> SendWake {
+    match crate::harness_caps::wake_route(kind, hook_installed) {
+        crate::harness_caps::WakeRoute::Inject { .. } => SendWake::Ring,
+        crate::harness_caps::WakeRoute::NoDoor(no_door) => {
+            SendWake::Skip(crate::harness_caps::no_door_line(&no_door))
+        }
+    }
+}
+
 /// Boundary: ring one recipient with the constant wake line for its head.
 /// A failed ring never re-sends the envelope; the next ring for the same
 /// head is the same line.
@@ -671,10 +694,22 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
                     if doorbell_owner(&project, ws.as_deref()).is_some() {
                         "left to the doorbell host (budgeted, level-triggered)".to_string()
                     } else {
-                        let panes = crate::pane_write::HerdrPanes(c);
-                        match crate::mail_shim::block_on(ring(&store, &panes, &target, &row.npub)) {
-                            Ok(wm) => format!("rung wm {:x}", wm.0),
-                            Err(e) => format!("failed: {e:#}"),
+                        let kind = crate::state::load_spawn_registry(&project)
+                            .into_iter()
+                            .find(|e| e.mail_identity.as_deref() == Some(pin))
+                            .and_then(|e| e.harness)
+                            .unwrap_or_default();
+                        match send_wake(&kind, crate::harness_caps::installed_from_env()) {
+                            SendWake::Skip(note) => note,
+                            SendWake::Ring => {
+                                let panes = crate::pane_write::HerdrPanes(c);
+                                match crate::mail_shim::block_on(ring(
+                                    &store, &panes, &target, &row.npub,
+                                )) {
+                                    Ok(wm) => format!("rung wm {:x}", wm.0),
+                                    Err(e) => format!("failed: {e:#}"),
+                                }
+                            }
                         }
                     }
                 }
@@ -1112,6 +1147,23 @@ mod tests {
         assert_eq!(rows[0].msg_id, env.msg.key(), "same msg id, not a new one");
         assert_eq!(rows[0].state, "appended");
         assert_eq!(store.lookup(&env.msg).await.unwrap(), rows[0].offset);
+    }
+
+    /// bd-harness-caps-6r1x: the sender asks the harness record before typing.
+    /// A harness with no row has no injection door, so the row says so.
+    #[test]
+    fn a_sender_rings_only_when_the_harness_has_an_injection_door() {
+        assert_eq!(send_wake("opencode", false), SendWake::Ring);
+        assert_eq!(send_wake("oc", true), SendWake::Ring);
+        assert_eq!(send_wake("fake", true), SendWake::Ring);
+        let SendWake::Skip(note) = send_wake("widget", false) else {
+            panic!("an unknown harness must not be rung");
+        };
+        assert!(note.contains("fall back to mail"), "{note}");
+        assert!(
+            !note.contains("widget"),
+            "the unknown kind word is not interpolated: {note}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
