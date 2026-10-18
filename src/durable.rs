@@ -323,7 +323,7 @@ pub struct LoopModel {
     pub respawn: std::collections::BTreeMap<String, crate::state::RespawnBudget>,
     pub mail_health: crate::state::MailHealth,
     pub mail_degraded: bool,
-    pub heal_states: std::collections::HashMap<String, HealState>,
+    pub heal_states: std::collections::BTreeMap<String, HealState>,
     /// Heal thresholds from LoopParams (bd-blyz, effect-layer remainder → tick).
     #[serde(default)]
     pub heal_grace: u32,
@@ -4621,10 +4621,7 @@ pub fn stall_watching_threshold_secs(threshold_secs: u64) -> u64 {
 /// Precedence: rate_limit > network > model_truncated > silent_idle.
 pub fn classify_stall_reason(evidence: &str) -> String {
     let lower = evidence.to_ascii_lowercase();
-    if lower.contains("quota")
-        || lower.contains("usage limit")
-        || lower.contains("allowance")
-    {
+    if lower.contains("quota") || lower.contains("usage limit") || lower.contains("allowance") {
         "allowance".to_string()
     } else if lower.contains("rate limit")
         || lower.contains("429")
@@ -16515,6 +16512,25 @@ mod resume_dedup_tests {
         assert_eq!(a, b);
         // never exceeds T3 (bounded, not infinite spin)
         assert_eq!(escalation_tier(0, i64::MAX, 30), EscalationTier::T3);
+    }
+
+    #[test]
+    fn heal_states_deterministic() {
+        // migrate-flywheel step 6: heal_states iteration must not depend on
+        // insertion order, or same-log-same-effects breaks. BTreeMap keeps
+        // keys sorted; a HashMap here would make command order flaky.
+        let mut a = LoopModel::default();
+        a.heal_states.insert("zebra".to_string(), HealState::default());
+        a.heal_states.insert("apple".to_string(), HealState::default());
+        a.heal_states.insert("mango".to_string(), HealState::default());
+        let mut b = LoopModel::default();
+        b.heal_states.insert("mango".to_string(), HealState::default());
+        b.heal_states.insert("zebra".to_string(), HealState::default());
+        b.heal_states.insert("apple".to_string(), HealState::default());
+        let ka: Vec<&String> = a.heal_states.keys().collect();
+        let kb: Vec<&String> = b.heal_states.keys().collect();
+        assert_eq!(ka, kb);
+        assert_eq!(ka, ["apple", "mango", "zebra"]);
     }
 
     /// review-fix F4: the bounded-halt decision table. `mail` mode halts at
