@@ -1,9 +1,10 @@
-# Resonate inventory (bd-xt1e) — the full-replacement removal backlog
+# Resonate inventory (bd-xt1e) — the spine-program migration map
 
-Operator decision: the Elm Loop becomes the dispatch spine everywhere;
-`resonate-sdk` leaves both workspaces at the end-state. Each entry names
-the touchpoint, the SDK API used, and its spine replacement. Counts taken
-2026-10-18 at toron `ede6b34`..`d3b60d5`, flywheel `3817f7f`, vendor `00bac79`.
+Operator decision (revised): Resonate SDK stays as the durable substrate;
+the Elm Loop becomes the dispatch spine driving over it. Removal is off
+the table. Read each row below as a drive-path onto `Program`/`Interpret`/
+`Loop`, not as a deletion: the SDK API in column 3 keeps working until its
+Loop replacement proves parity, then the call site moves.
 
 ## Flywheel (`resonate-sdk = "0.6.0"`, `src/`)
 
