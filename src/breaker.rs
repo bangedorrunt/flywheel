@@ -104,24 +104,17 @@ impl Default for ConsecutiveBreaker {
     }
 }
 
-/// Mirror of elm-effect `policy::remote::BreakerConfig` (`max_failures` +
-/// `reset`). Kept local so this slice proves the seam without adding the
-/// `elm-effect` crate dep; the real import swaps this type for
-/// `elm_effect::policy::BreakerConfig` with no behavior change.
-// ponytail: mapping only; real elm-effect import lands when phase-3 green and versions align.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub struct ElmBreakerConfig {
-    pub max_failures: u32,
-    pub reset: Duration,
-}
-
+/// Breaker bounds as elm-effect's `policy::remote::BreakerConfig`
+/// (`max_failures` + `reset`), via `toron_core::kernel` (ADR-0040: only the
+/// kernel port names the framework). One source of truth: this converts the
+/// host-held threshold/cooldown into the type the policy stack consumes.
 impl ConsecutiveBreaker {
-    #[allow(dead_code)]
-    pub fn to_elm_breaker_config(&self) -> ElmBreakerConfig {
-        ElmBreakerConfig {
+    pub fn to_elm_breaker_config(&self) -> toron_core::kernel::BreakerConfig {
+        toron_core::kernel::BreakerConfig {
             max_failures: self.threshold,
-            reset: self.cooldown,
+            reset: toron_core::kernel::Duration::from_millis(
+                self.cooldown.as_millis().min(u64::MAX as u128) as u64,
+            ),
         }
     }
 }
@@ -164,10 +157,10 @@ mod tests {
         let b = ConsecutiveBreaker::new(3, Duration::from_secs(50));
         let cfg = b.to_elm_breaker_config();
         assert_eq!(cfg.max_failures, 3);
-        assert_eq!(cfg.reset, Duration::from_secs(50));
+        assert_eq!(cfg.reset.as_millis(), 50_000);
         let d = ConsecutiveBreaker::default().to_elm_breaker_config();
         assert_eq!(d.max_failures, 5);
-        assert_eq!(d.reset, Duration::from_secs(60));
+        assert_eq!(d.reset.as_millis(), 60_000);
     }
 
     #[test]
