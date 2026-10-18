@@ -33,26 +33,32 @@ pub enum Gate {
     Conflict,
 }
 
-/// The gate for one request key. `offered_digest` is the digest of the plan
-/// the caller is asking for ([`plan_digest`]); a row recorded under the same
-/// key with another digest is [`Gate::Conflict`].
+/// The pure gate core. One rule, two row shapes ([`spawn_gate`] over an agent
+/// effect, [`receipt_gate`] over a door receipt): `offered_digest` is the
+/// digest of what the caller is asking for; a row recorded under the same slot
+/// with another digest is [`Gate::Conflict`].
 ///
-/// `Unknown`/`Failed` rows proceed: the spawn path is at-least-once by
-/// documented residual, the key's job is to make the retry land on the same
-/// slot, and the workspace/name guard stays the last line.
-pub fn spawn_gate(row: Option<&AgentEffect>, offered_digest: &str) -> Gate {
-    let Some(row) = row else {
-        return Gate::Proceed;
-    };
-    match row.state {
+/// `Unknown`/`Failed` rows proceed: both paths are at-least-once by documented
+/// residual, the key's job is to make the retry land on the same slot, and the
+/// door's own guards stay the last line.
+fn gate_core(state: EffectState, recorded: Option<&str>, offered_digest: &str) -> Gate {
+    match state {
         EffectState::Prepared | EffectState::InFlight => Gate::InFlight,
-        EffectState::Settled => match row.plan_digest.as_deref() {
+        EffectState::Settled => match recorded {
             Some(recorded) if recorded != offered_digest => Gate::Conflict,
-            // A row from before plan digests were recorded cannot be
-            // compared; the slot settled, so the replay is still the answer.
+            // A row from before digests were recorded cannot be compared; the
+            // slot settled, so the replay is still the answer.
             _ => Gate::Replay,
         },
         EffectState::Failed | EffectState::Unknown => Gate::Proceed,
+    }
+}
+
+/// The gate for one spawn/add request key.
+pub fn spawn_gate(row: Option<&AgentEffect>, offered_digest: &str) -> Gate {
+    match row {
+        None => Gate::Proceed,
+        Some(row) => gate_core(row.state, row.plan_digest.as_deref(), offered_digest),
     }
 }
 
@@ -85,6 +91,139 @@ pub fn plan_digest(items: &[(String, u32, Option<String>)]) -> String {
     h.update(b"gs043-spawn-plan-v1\0");
     h.update(rows.join("\n").as_bytes());
     format!("plan:{}", hex::encode(h.finalize()))
+}
+
+/// One request-key slot for a door that is NOT an agent lifecycle: a steer
+/// dispatch or a halt. Same four answers as the agent shape (one rule, through
+/// [`gate_core`]), but the row is the door's own, tagged `door_receipt` in the
+/// log so a reader can tell it from an agent effect row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DoorReceipt {
+    pub door: String,
+    pub slot: String,
+    pub state: EffectState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+impl DoorReceipt {
+    pub fn prepare(door: &str, slot: &str, digest: &str) -> Self {
+        Self {
+            door: door.to_string(),
+            slot: slot.to_string(),
+            state: EffectState::Prepared,
+            digest: Some(digest.to_string()),
+            evidence: None,
+        }
+    }
+}
+
+/// Intent-before-dispatch for a door: `Prepared` then `InFlight`, journaled
+/// before the door performs anything. A dispatch whose intent cannot be
+/// committed does not run — the caller gets the error and must not proceed.
+pub struct DoorReceiptGuard {
+    project: String,
+    receipt: DoorReceipt,
+}
+
+impl DoorReceiptGuard {
+    pub fn begin(project: &str, door: &str, slot: &str, digest: &str) -> anyhow::Result<Self> {
+        let mut receipt = DoorReceipt::prepare(door, slot, digest);
+        journal_receipt(project, &receipt)?;
+        receipt.state = EffectState::InFlight;
+        journal_receipt(project, &receipt)?;
+        Ok(Self {
+            project: project.to_string(),
+            receipt,
+        })
+    }
+
+    /// Apply evidence observed (the dispatch really ran): `Settled`.
+    pub fn settle(mut self, evidence: &str) {
+        self.receipt.state = EffectState::Settled;
+        self.receipt.evidence = Some(evidence.to_string());
+        let _ = journal_receipt(&self.project, &self.receipt);
+    }
+
+    /// The dispatch ran and its outcome is unobservable: `Unknown` — never a
+    /// silent absence, never an invented `Settled`.
+    pub fn mark_unknown(mut self, evidence: &str) {
+        self.receipt.state = EffectState::Unknown;
+        self.receipt.evidence = Some(evidence.to_string());
+        let _ = journal_receipt(&self.project, &self.receipt);
+    }
+
+    /// The dispatch was refused before it could run (an aborted gate, a failed
+    /// precondition): `Failed`. A later attempt under the same key proceeds.
+    pub fn mark_failed(mut self, evidence: &str) {
+        self.receipt.state = EffectState::Failed;
+        self.receipt.evidence = Some(evidence.to_string());
+        let _ = journal_receipt(&self.project, &self.receipt);
+    }
+}
+
+fn journal_receipt(project: &str, receipt: &DoorReceipt) -> anyhow::Result<()> {
+    let mut entry = serde_json::to_value(receipt)?;
+    // Tagged so a reader can tell a door row from an agent effect row.
+    if let serde_json::Value::Object(map) = &mut entry {
+        map.insert(
+            "journal".to_string(),
+            serde_json::Value::String("door_receipt".to_string()),
+        );
+    }
+    crate::state::log_event(project, crate::state::EventKind::State, entry)?;
+    eprintln!(
+        "flywheel: door receipt {} slot={} state={:?}",
+        receipt.door, receipt.slot, receipt.state
+    );
+    Ok(())
+}
+
+/// The slot a door's request key pins: `"<project>-<door>-rk-<key>"`, slugged.
+/// Deterministic, so a retry reads the same row the first attempt wrote, and
+/// namespaced per door so a steer key can never collide with a halt key.
+pub fn door_slot(project: &str, door: &str, key: &str) -> String {
+    label_for_request_key(&format!("{project}-{door}"), key)
+}
+
+/// A stable digest of a door's payload, version-tagged like [`plan_digest`] so
+/// a later payload shape cannot collide with an older digest. Parts are
+/// trimmed and joined with a separator that cannot appear in a trimmed field.
+pub fn payload_digest(tag: &str, parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(tag.as_bytes());
+    h.update(b"\0");
+    for p in parts {
+        h.update(p.trim().as_bytes());
+        h.update(b"\x1f");
+    }
+    format!("{tag}:{}", hex::encode(h.finalize()))
+}
+
+/// The gate for one door request key.
+pub fn receipt_gate(row: Option<&DoorReceipt>, offered_digest: &str) -> Gate {
+    match row {
+        None => Gate::Proceed,
+        Some(row) => gate_core(row.state, row.digest.as_deref(), offered_digest),
+    }
+}
+
+/// The last journaled door row for `(door, slot)`. Missing log, unreadable
+/// rows, and rows of another door all read `None` — an absent receipt is not a
+/// settled one.
+pub fn load_door_receipt(project: &str, door: &str, slot: &str) -> Option<DoorReceipt> {
+    let log = crate::state::read_log(project).ok()?;
+    log.into_iter().rev().find_map(|e| {
+        let data = e.data;
+        if data.get("journal").and_then(|v| v.as_str()) != Some("door_receipt") {
+            return None;
+        }
+        let row: DoorReceipt = serde_json::from_value(data).ok()?;
+        (row.door == door && row.slot == slot).then_some(row)
+    })
 }
 
 /// The last journaled spawn row for `subject`, read from the project event
@@ -216,5 +355,83 @@ mod tests {
             );
         }
         assert_eq!(spawn_gate(None, &plan), Gate::Proceed);
+    }
+
+    /// bd-4fgc: the same one-key-one-dispatch contract for the doors that are
+    /// not agent lifecycles (steer, halt) — the row, the slot namespace, the
+    /// payload digest, and the four answers driven through the gate the doors
+    /// actually call.
+    #[test]
+    fn door_receipt_replay_is_idempotent() {
+        let digest = payload_digest("steer-v1", &["ship the auth refactor", "auto", "goal"]);
+        assert_eq!(
+            digest,
+            payload_digest("steer-v1", &["ship the auth refactor", "auto", "goal"]),
+            "the same payload digests the same"
+        );
+        assert_eq!(
+            digest,
+            payload_digest("steer-v1", &["ship the auth refactor ", "auto", "goal"]),
+            "a trimmed field is the same field"
+        );
+        assert_ne!(
+            digest,
+            payload_digest("steer-v1", &["ship the auth refactor", "auto", "direct"]),
+            "another mode is another payload"
+        );
+
+        // Doors namespace their slots: one key on two doors is two slots, and
+        // the same key on the same door is the same slot.
+        let steer = door_slot("flywheel", "steer", "Deploy 42");
+        let halt = door_slot("flywheel", "halt", "Deploy 42");
+        assert_eq!(steer, "flywheel-steer-rk-deploy-42");
+        assert_eq!(steer, door_slot("flywheel", "steer", "Deploy 42"));
+        assert_ne!(steer, halt, "a steer key never names a halt slot");
+
+        // The door's contract, driven through the same gate it uses: the
+        // second attempt must not send anything.
+        let mut rows: std::collections::BTreeMap<String, DoorReceipt> =
+            std::collections::BTreeMap::new();
+        let mut sent = 0u32;
+        let attempt =
+            |rows: &mut std::collections::BTreeMap<String, DoorReceipt>, sent: &mut u32| -> Gate {
+                let slot = door_slot("flywheel", "steer", "Deploy 42");
+                let gate = receipt_gate(rows.get(&slot), &digest);
+                if gate == Gate::Proceed {
+                    *sent += 1;
+                    let mut settled = DoorReceipt::prepare("steer", &slot, &digest);
+                    settled.state = EffectState::Settled;
+                    rows.insert(slot, settled);
+                }
+                gate
+            };
+        assert_eq!(attempt(&mut rows, &mut sent), Gate::Proceed);
+        assert_eq!(sent, 1, "the first attempt dispatches");
+        assert_eq!(
+            attempt(&mut rows, &mut sent),
+            Gate::Replay,
+            "a retry replays the settled slot"
+        );
+        assert_eq!(sent, 1, "and sends nothing");
+
+        // An unresolved slot refuses (a dispatch may be running right now),
+        // another payload under the same key is a typed conflict, and an
+        // unsettled row proceeds.
+        let slot = door_slot("flywheel", "steer", "Deploy 42");
+        for state in [EffectState::Prepared, EffectState::InFlight] {
+            let mut row = DoorReceipt::prepare("steer", &slot, &digest);
+            row.state = state;
+            assert_eq!(receipt_gate(Some(&row), &digest), Gate::InFlight);
+        }
+        let mut settled = DoorReceipt::prepare("steer", &slot, &digest);
+        settled.state = EffectState::Settled;
+        let other = payload_digest("steer-v1", &["a different objective", "auto", "goal"]);
+        assert_eq!(receipt_gate(Some(&settled), &other), Gate::Conflict);
+        for state in [EffectState::Failed, EffectState::Unknown] {
+            let mut row = DoorReceipt::prepare("steer", &slot, &digest);
+            row.state = state;
+            assert_eq!(receipt_gate(Some(&row), &digest), Gate::Proceed);
+        }
+        assert_eq!(receipt_gate(None, &digest), Gate::Proceed);
     }
 }

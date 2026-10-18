@@ -1910,6 +1910,10 @@ pub enum SupervisorCmd {
         /// Epoch the sender holds. Omit to use the log's accepted epoch.
         #[arg(long)]
         sup_epoch: Option<u64>,
+        /// bd-4fgc: stable request key for this halt (same slot contract as
+        /// `flywheel halt --request-key`).
+        #[arg(long)]
+        request_key: Option<String>,
     },
 }
 
@@ -2052,12 +2056,30 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
             project,
             context,
             sup_epoch,
-        } => queue_halt(project, context.as_deref(), *sup_epoch),
+            request_key,
+        } => queue_halt(
+            project,
+            context.as_deref(),
+            *sup_epoch,
+            request_key.as_deref(),
+        ),
     }
 }
 
 /// Append one `Halt` to the context's inbox. The host folds it on the next round.
-pub fn queue_halt(project: &str, context: Option<&str>, sup_epoch: Option<u64>) -> Result<()> {
+///
+/// bd-4fgc: a halt is an effectful dispatch (it stops a subtree), so it carries
+/// the same request-key receipt as the other doors. The slot is
+/// `<project>-halt`, namespaced per door, and the gate runs BEFORE the append —
+/// a settled slot replays and an unresolved one refuses instead of queueing a
+/// second halt. The accepted epoch is resolved before the gate on purpose: a
+/// read that fails must not burn the receipt.
+pub fn queue_halt(
+    project: &str,
+    context: Option<&str>,
+    sup_epoch: Option<u64>,
+    request_key: Option<&str>,
+) -> Result<()> {
     let dir = CtxPaths::default_dir();
     let p = match context {
         Some(c) if !c.is_empty() => CtxPaths::with_context(&dir, project, c),
@@ -2070,6 +2092,52 @@ pub fn queue_halt(project: &str, context: Option<&str>, sup_epoch: Option<u64>) 
             crate::supervisor_program::replay(&msgs).0.accepted_epoch
         }
     };
+    let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
+    // The digest rides the OFFERED inputs, not the resolved epoch: a retry of
+    // the same call always matches, while a different context (or a new
+    // explicit epoch) is a different halt and needs its own key.
+    let epoch_part = match sup_epoch {
+        Some(e) => e.to_string(),
+        None => "auto".to_string(),
+    };
+    let halt_digest = crate::request_receipts::payload_digest(
+        "halt-v1",
+        &[context.unwrap_or("-"), epoch_part.as_str()],
+    );
+    let mut receipt: Option<crate::request_receipts::DoorReceiptGuard> = None;
+    if let Some(key) = request_key {
+        let slot = crate::request_receipts::door_slot(project, "halt", key);
+        match crate::request_receipts::receipt_gate(
+            crate::request_receipts::load_door_receipt(project, "halt", &slot).as_ref(),
+            &halt_digest,
+        ) {
+            crate::request_receipts::Gate::Proceed => {
+                receipt = Some(crate::request_receipts::DoorReceiptGuard::begin(
+                    project,
+                    "halt",
+                    &slot,
+                    &halt_digest,
+                )?);
+            }
+            crate::request_receipts::Gate::Replay => {
+                println!(
+                    "halt request key {key:?} already settled this slot ({slot}) — replaying, no \
+                     second halt queued (sup_epoch {epoch})"
+                );
+                return Ok(());
+            }
+            crate::request_receipts::Gate::InFlight => bail!(
+                "halt request key {key:?} is IN FLIGHT (slot {slot}) — a second halt could land \
+                 while the first is still folding. Retry with a fresh --request-key once it \
+                 settles."
+            ),
+            crate::request_receipts::Gate::Conflict => bail!(
+                "halt request key {key:?} was already used for a DIFFERENT context or epoch (the \
+                 recorded payload digest differs) — refusing to hand back another halt's slot \
+                 under this key. Use a fresh --request-key for the new halt."
+            ),
+        }
+    }
     append_input(
         &p,
         &SupMsg::Halt {
@@ -2078,6 +2146,9 @@ pub fn queue_halt(project: &str, context: Option<&str>, sup_epoch: Option<u64>) 
         },
     )?;
     println!("queued halt for {project} under sup_epoch {epoch}");
+    if let Some(g) = receipt {
+        g.settle(&format!("halt queued sup_epoch={epoch}"));
+    }
     Ok(())
 }
 
