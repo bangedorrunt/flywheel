@@ -64,6 +64,7 @@ mod lead_claim;
 mod private_fs;
 mod recipient_guard;
 mod redact;
+mod request_receipts;
 mod spawn_facts;
 mod stale_check;
 mod steer_delta;
@@ -877,6 +878,13 @@ enum Commands {
         /// ADR-0011 D5: join the live fleet instead of refusing / killing it.
         #[arg(long)]
         join: bool,
+        /// bd-command-receipts-zile: stable request key for this spawn. The
+        /// workspace label derives from it, so a retried call lands on the
+        /// same slot: a settled slot REPLAYS (no second crew), an in-flight
+        /// slot refuses, and the same key with a different plan is a typed
+        /// conflict instead of a replay of somebody else's crew.
+        #[arg(long)]
+        request_key: Option<String>,
     },
     /// Extend a running swarm with more agent panes
     Add {
@@ -893,6 +901,12 @@ enum Commands {
         /// `agent_not_ready` until a manual prime.
         #[arg(long, default_value_t = 30)]
         settle_secs: u64,
+        /// bd-command-receipts-zile: stable request key for this add. Its
+        /// slot is the swarm's label plus `-add`, so a retry with the same key
+        /// REPLAYS instead of adding a second time, an in-flight slot refuses,
+        /// and the same key with a different plan is a typed conflict.
+        #[arg(long)]
+        request_key: Option<String>,
     },
     /// List flywheel swarms and their agents
     List {
@@ -2843,6 +2857,7 @@ fn main() {
             escape,
             yes,
             join,
+            request_key,
         }) => cmd_spawn(
             &cfg,
             project,
@@ -2866,6 +2881,7 @@ fn main() {
                 bare_model: model.clone().unwrap_or_default(),
                 bare_provider: provider.clone().unwrap_or_default(),
                 escape: *escape,
+                request_key: request_key.clone(),
                 yes: *yes,
                 join: *join,
             },
@@ -2875,7 +2891,15 @@ fn main() {
             counts,
             kinds,
             settle_secs,
-        }) => cmd_add(&cfg, project, counts, kinds, *settle_secs),
+            request_key,
+        }) => cmd_add(
+            &cfg,
+            project,
+            counts,
+            kinds,
+            *settle_secs,
+            request_key.as_deref(),
+        ),
         Some(Commands::List { all }) => cmd_list(&cfg, *all),
         Some(Commands::Status { project }) => cmd_status(&cfg, project.as_deref()),
         Some(Commands::Progress { project, json }) => cmd_progress(&cfg, project.as_deref(), *json),
@@ -6549,6 +6573,98 @@ mod adr0013_spawn_effect_tests {
         );
     }
 
+    /// bd-command-receipts-zile: the receipt check is a precondition, not a
+    /// postscript. `spawn_gate` reads the journal for the key's slot BEFORE
+    /// the effect guard journals anything and before the workspace dispatch,
+    /// so a replay returns without a second crew and an unresolved slot
+    /// refuses instead of racing one.
+    #[test]
+    fn the_spawn_receipt_gate_precedes_dispatch() {
+        let src = include_str!("main.rs");
+        let spawn = body_of(src, "\nfn cmd_spawn(", "\nfn doorbell_project_workspaces(");
+        let gate = spawn
+            .find("request_receipts::spawn_gate(")
+            .expect("cmd_spawn must consult the request-key receipt");
+        let guard = spawn
+            .find("AgentEffectGuard::begin")
+            .expect("cmd_spawn must journal the spawn intent");
+        let dispatch = spawn
+            .find("c.workspace_create(")
+            .expect("cmd_spawn must create the workspace");
+        assert!(
+            gate < guard,
+            "the receipt is read before the intent is journaled"
+        );
+        assert!(guard < dispatch, "and the intent before the dispatch");
+        // The replay arm itself must return: a substring anywhere else in the
+        // body would make this fence pass with the early return deleted.
+        let replay_arm = spawn
+            .split_once("request_receipts::Gate::Replay =>")
+            .map(|(_, rest)| rest)
+            .expect("the replay arm exists");
+        let replay_arm = replay_arm
+            .split("request_receipts::Gate::InFlight")
+            .next()
+            .expect("the in-flight arm follows the replay arm");
+        assert!(
+            replay_arm.contains("return Ok(())"),
+            "a settled slot must return before dispatch: {replay_arm}"
+        );
+        assert!(
+            spawn.contains("with_plan_digest"),
+            "the keyed attempt records the plan it was dispatched for"
+        );
+    }
+
+    /// bd-command-receipts-zile: `add` creates panes, so its receipt gate and
+    /// intent row stand before the first split for the same reason spawn's do
+    /// — a retried call must add nothing, not add again.
+    #[test]
+    fn the_add_receipt_gate_precedes_dispatch() {
+        let src = include_str!("main.rs");
+        let add = body_of(src, "\nfn cmd_add(", "\n// ---- list / status ----");
+        let gate = add
+            .find("request_receipts::spawn_gate(")
+            .expect("cmd_add must consult the request-key receipt");
+        let guard = add
+            .find("AgentEffectGuard::begin")
+            .expect("cmd_add must journal the add intent");
+        let dispatch = add
+            .find("herdr_shim::pane_split(")
+            .expect("cmd_add must split panes");
+        assert!(
+            gate < guard,
+            "the receipt is read before the intent is journaled"
+        );
+        assert!(
+            guard < dispatch,
+            "and the intent before the first pane split"
+        );
+        let replay_arm = add
+            .split_once("request_receipts::Gate::Replay =>")
+            .map(|(_, rest)| rest)
+            .expect("the replay arm exists");
+        let replay_arm = replay_arm
+            .split("request_receipts::Gate::InFlight")
+            .next()
+            .expect("the in-flight arm follows the replay arm");
+        assert!(
+            replay_arm.contains("return Ok(())"),
+            "a settled slot must return before dispatch: {replay_arm}"
+        );
+        // The slot is namespaced under the swarm label: sharing the swarm's
+        // own subject would let an add row overwrite the spawn row, since the
+        // journal key is (project, subject, phase).
+        assert!(
+            add.contains("let add_base = format!(\"{}-add\", swarm_label(project));"),
+            "the add slot must not be the swarm's own spawn subject"
+        );
+        assert!(
+            add.contains("add_effect.settle("),
+            "the add row settles with its own evidence"
+        );
+    }
+
     /// I5: Settled needs apply evidence; `--no-verify` journals Unknown.
     #[test]
     fn spawn_never_settles_without_apply_evidence() {
@@ -8176,6 +8292,8 @@ struct SpawnOpts {
     yes: bool,
     /// ADR-0011 D5: join live fleet.
     join: bool,
+    /// bd-command-receipts-zile: request key pinned to this spawn's slot.
+    request_key: Option<String>,
 }
 
 impl Default for SpawnOpts {
@@ -8197,6 +8315,7 @@ impl Default for SpawnOpts {
             settle_secs: 30,
             profile_name: None,
             profile_count: 1,
+            request_key: None,
             bare_model: String::new(),
             bare_provider: String::new(),
             escape: false,
@@ -9177,14 +9296,32 @@ projects available: {}",
     if items.is_empty() {
         bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
     }
-    let label = opts
+    let base_label = opts
         .label_override
         .as_deref()
         .map(String::from)
         .unwrap_or_else(|| swarm_label(project));
+    // bd-command-receipts-zile: a request key pins the SLOT. The label
+    // derives from it, so a retried call computes the same subject — and
+    // therefore the same effect-journal row — as the first attempt.
+    let request_key = opts
+        .request_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let plan = request_receipts::plan_digest(
+        &items
+            .iter()
+            .map(|i| (i.short.clone(), i.count, i.kind.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let raw_label = match request_key {
+        Some(key) => request_receipts::label_for_request_key(&base_label, key),
+        None => base_label,
+    };
     // bd-vik C: labels are workspace metadata — normalize to a slug
     // (lowercase alphanumerics + hyphens) and warn when changed.
-    let (label, changed) = slugify_label(&label);
+    let (label, changed) = slugify_label(&raw_label);
     if changed && opts.label_override.is_some() {
         eprintln!(
             "flywheel: label {:?} normalized to {label:?} (slugs: lowercase + hyphens)",
@@ -9193,6 +9330,40 @@ projects available: {}",
     }
     if label.is_empty() {
         bail!("workspace label must contain at least one alphanumeric character");
+    }
+    // The receipt check runs BEFORE any dispatch (and before the hook-file and
+    // model-reconfirm steps below, which are gates, not spawns). A settled
+    // slot replays; an unresolved one refuses rather than racing a fork.
+    if let Some(key) = request_key {
+        match request_receipts::spawn_gate(
+            request_receipts::load_spawn_row(project, &label).as_ref(),
+            &plan,
+        ) {
+            request_receipts::Gate::Proceed => {}
+            request_receipts::Gate::Replay => {
+                print_json(&json!({
+                    "request_key": key,
+                    "label": label,
+                    "already_exists": true,
+                    "replay": true,
+                }));
+                eprintln!(
+                    "flywheel: request key {key:?} already settled this slot ({label}) — replaying, \
+                     no second dispatch. Its panes: flywheel list --json."
+                );
+                return Ok(());
+            }
+            request_receipts::Gate::InFlight => bail!(
+                "spawn request key {key:?} is IN FLIGHT (workspace label {label}) — a second \
+                 dispatch could fork a crew into one workspace. Inspect it with `flywheel status \
+                 {project}`, or retry with a fresh --request-key once the first attempt settles."
+            ),
+            request_receipts::Gate::Conflict => bail!(
+                "spawn request key {key:?} was already used for a DIFFERENT plan (the recorded plan \
+                 digest differs) — refusing to hand back another crew's slot under this key. Use a \
+                 fresh --request-key for the new plan."
+            ),
+        }
     }
     // bd-ll3k: pre-spawn model reconfirm — interactive TTY only, skipped
     // by --yes (non-TTY/loop drivers never block, byte-identical). Shows
@@ -9435,8 +9606,13 @@ projects available: {}",
     // rows and the wake observation are SEPARATE evidence, never settlements
     // of this row. The `?` is deliberate: a dispatch whose intent cannot be
     // committed does not run (I4 is a precondition).
-    let spawn_effect =
-        agent_ref::AgentEffectGuard::begin(project, &label, agent_ref::AgentPhase::Spawn)?;
+    let spawn_effect = match request_key {
+        Some(_) => agent_ref::AgentEffectGuard::begin_with(
+            agent_ref::AgentEffect::prepare(project, &label, agent_ref::AgentPhase::Spawn)
+                .with_plan_digest(plan.clone()),
+        )?,
+        None => agent_ref::AgentEffectGuard::begin(project, &label, agent_ref::AgentPhase::Spawn)?,
+    };
     let (ws, root) = c.workspace_create(
         Some(&utf8_path(&dir, "workspace dir")?),
         Some(&label),
@@ -14247,10 +14423,70 @@ fn cmd_add(
     counts: &AgentCounts,
     kinds: &[(String, u32)],
     settle_secs: u64,
+    request_key: Option<&str>,
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "add")?;
     let plan = recipe_counts(None, counts, kinds)?;
+    // bd-command-receipts-zile: add creates panes, so it carries the same
+    // intent-before-dispatch row as spawn (D9) and answers a request key from
+    // that row. Its slot is the swarm label plus `-add`, so an add row never
+    // overwrites the swarm's own spawn row (same project+subject+phase key).
+    let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
+    let add_base = format!("{}-add", swarm_label(project));
+    let add_subject = match request_key {
+        Some(key) => request_receipts::label_for_request_key(&add_base, key),
+        None => slugify_label(&add_base).0,
+    };
+    let add_plan = request_receipts::plan_digest(
+        &plan
+            .iter()
+            .map(|(short, n)| (cfg.resolve_kind(short), *n, None))
+            .collect::<Vec<_>>(),
+    );
+    // The receipt check runs BEFORE any pane is split: a settled slot replays
+    // and an unresolved one refuses rather than adding a second time into a
+    // workspace that may already be receiving the first add's panes.
+    if let Some(key) = request_key {
+        match request_receipts::spawn_gate(
+            request_receipts::load_spawn_row(project, &add_subject).as_ref(),
+            &add_plan,
+        ) {
+            request_receipts::Gate::Proceed => {}
+            request_receipts::Gate::Replay => {
+                print_json(&json!({
+                    "request_key": key,
+                    "slot": add_subject,
+                    "already_added": true,
+                    "replay": true,
+                }));
+                eprintln!(
+                    "flywheel: add request key {key:?} already settled this slot ({add_subject}) — \
+                     replaying, no second add. Its panes: flywheel list --json."
+                );
+                return Ok(());
+            }
+            request_receipts::Gate::InFlight => bail!(
+                "add request key {key:?} is IN FLIGHT (slot {add_subject}) — a second dispatch \
+                 could add panes into a workspace that is still receiving the first. Inspect it \
+                 with `flywheel status {project}`, or retry with a fresh --request-key."
+            ),
+            request_receipts::Gate::Conflict => bail!(
+                "add request key {key:?} was already used for a DIFFERENT plan (the recorded plan \
+                 digest differs) — refusing to hand back another add's slot under this key. Use a \
+                 fresh --request-key for the new plan."
+            ),
+        }
+    }
+    let add_effect = match request_key {
+        Some(_) => agent_ref::AgentEffectGuard::begin_with(
+            agent_ref::AgentEffect::prepare(project, &add_subject, agent_ref::AgentPhase::Spawn)
+                .with_plan_digest(add_plan),
+        )?,
+        None => {
+            agent_ref::AgentEffectGuard::begin(project, &add_subject, agent_ref::AgentPhase::Spawn)?
+        }
+    };
     let dir = project_dir(cfg, project);
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     // bd-bug-add-foreign-workspace-m7dg: add targets the flywheel-OWNED swarm
@@ -14437,6 +14673,10 @@ fn cmd_add(
         EventKind::Add,
         json!({ "workspace_id": ws_id, "agents": spawned }),
     );
+    // The apply evidence for this row is the same one the caller waits for:
+    // the panes it just booted. A bail above leaves the row IN FLIGHT on
+    // purpose — a half-added swarm is not a settled add.
+    add_effect.settle(Some(&format!("workspace={ws_id} added={}", spawned.len())));
     Ok(())
 }
 
