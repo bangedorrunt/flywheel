@@ -67,7 +67,10 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// The Unix mode bits of `path` (0 elsewhere).
+/// The Unix mode bits of `path` (0 elsewhere). Only the tests read it back,
+/// so it is test-only — a production reader would have to exist for it to be
+/// part of the binary (clippy `dead_code`).
+#[cfg(test)]
 pub fn mode_of(path: &Path) -> u32 {
     #[cfg(unix)]
     {
