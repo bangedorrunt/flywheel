@@ -367,6 +367,12 @@ pub struct AgentEffect {
     /// snippets. Never a raw provider blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// bd-command-receipts-zile: the digest of the plan this slot was
+    /// dispatched for, when the caller pinned one with a request key. A
+    /// retry under the same key with a different plan is a typed conflict
+    /// (`request_receipts::Gate::Conflict`), not a replay of another crew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<String>,
 }
 
 impl AgentEffect {
@@ -399,7 +405,15 @@ impl AgentEffect {
             phase,
             state: EffectState::Prepared,
             evidence: None,
+            plan_digest: None,
         }
+    }
+
+    /// The same row, pinned to the plan a request key was used for. The digest
+    /// is what turns a reused key into a conflict instead of a replay.
+    pub fn with_plan_digest(mut self, digest: impl Into<String>) -> Self {
+        self.plan_digest = Some(digest.into());
+        self
     }
 }
 
@@ -454,10 +468,18 @@ pub struct AgentEffectGuard {
 impl AgentEffectGuard {
     /// I4: Prepared then InFlight, journaled before the caller dispatches.
     pub fn begin(project: &str, subject: &str, phase: AgentPhase) -> anyhow::Result<Self> {
-        let mut effect = AgentEffect::prepare(project, subject, phase);
-        journal_effect(project, &effect)?;
+        Self::begin_with(AgentEffect::prepare(project, subject, phase))
+    }
+
+    /// [`Self::begin`] for a row the caller already shaped — a request key's
+    /// plan digest rides here, so the receipt a retry reads carries the plan
+    /// it was dispatched for.
+    pub fn begin_with(effect: AgentEffect) -> anyhow::Result<Self> {
+        let mut effect = effect;
+        let project = effect.project.clone();
+        journal_effect(&project, &effect)?;
         effect.state = EffectState::InFlight;
-        journal_effect(project, &effect)?;
+        journal_effect(&project, &effect)?;
         Ok(Self {
             effect,
             resolved: false,
