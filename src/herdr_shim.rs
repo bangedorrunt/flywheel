@@ -1464,7 +1464,10 @@ enum StreamItem {
 /// Outcome of one stream read, distinguishing `events_lost` from EOF / I/O.
 #[derive(Debug)]
 pub enum StreamOutcome {
-    Event(PushEvent),
+    /// Boxed on purpose: the push payload is large next to the unit variants
+    /// and one of these is returned per read, so the box keeps the enum small
+    /// on the reader thread's stack.
+    Event(Box<PushEvent>),
     Closed,
     EventsLost,
 }
@@ -1538,7 +1541,7 @@ impl EventStream {
     /// [`Self::read_outcome`] to classify without string matching).
     pub fn read_event(&mut self) -> Result<Option<PushEvent>> {
         match self.read_outcome()? {
-            StreamOutcome::Event(e) => Ok(Some(e)),
+            StreamOutcome::Event(e) => Ok(Some(*e)),
             StreamOutcome::Closed => Ok(None),
             StreamOutcome::EventsLost => Err(anyhow!("events_lost")),
         }
@@ -1559,7 +1562,7 @@ impl EventStream {
             None => self.rx.recv().map_err(|_| anyhow!("herdr stream closed")),
         }?;
         match item {
-            StreamItem::Event(e) => Ok(StreamOutcome::Event(e)),
+            StreamItem::Event(e) => Ok(StreamOutcome::Event(Box::new(e))),
             StreamItem::Closed => Ok(StreamOutcome::Closed),
             StreamItem::EventsLost => Ok(StreamOutcome::EventsLost),
             StreamItem::Error(msg) => Err(anyhow!("{msg}")),

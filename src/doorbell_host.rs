@@ -18,6 +18,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// The one live wake-socket consumer slot: the abort handle of the running
+/// consumer plus its stop flag. Named so the field does not read as a tower of
+/// generics (clippy::type_complexity).
+type WakeTaskSlot =
+    Arc<Mutex<Option<(tokio::task::AbortHandle, Arc<std::sync::atomic::AtomicBool>)>>>;
+
 /// The embedded host: owns the reducer model and every flywheel-shaped
 /// capability the brain orchestrates.
 pub struct RtHost {
@@ -46,14 +52,7 @@ pub struct RtHost {
     index_pins: Vec<String>,
     /// The one live wake-socket consumer. Shared with the restart task so a
     /// replacement aborts its predecessor instead of littering watchers.
-    wake_task: std::sync::Arc<
-        std::sync::Mutex<
-            Option<(
-                tokio::task::AbortHandle,
-                std::sync::Arc<std::sync::atomic::AtomicBool>,
-            )>,
-        >,
-    >,
+    wake_task: WakeTaskSlot,
     /// mcc9: exact wake → brain counters for this workspace, shared by every
     /// watch source this host arms (bus watch and each wake-sock consumer).
     wake_counters: Arc<doorbell_rt::wake_brain::WakeBrainCounters>,
@@ -324,6 +323,7 @@ impl RtHost {
             loop {
                 match stream.read_outcome() {
                     Ok(StreamOutcome::Event(ev)) => {
+                        let ev = *ev;
                         if let crate::herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
                         | crate::herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(
                             change,
@@ -891,7 +891,7 @@ fn run_inbox_only(cfg: &Config, project: &str, workspace: &str) -> anyhow::Resul
                 }
             }
         }
-        if beats % 30 == 0 {
+        if beats.is_multiple_of(30) {
             doorbell_rt::lease::refresh_lease(
                 &sd,
                 &key,
