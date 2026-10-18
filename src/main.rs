@@ -1188,6 +1188,12 @@ enum Commands {
         /// Epoch the sender holds. Omit to use the log's accepted epoch.
         #[arg(long)]
         sup_epoch: Option<u64>,
+        /// bd-4fgc: stable request key for this halt. Its slot is
+        /// `<project>-halt`, so a retry after a timeout REPLAYS the recorded
+        /// halt instead of queueing it twice; the same key with another
+        /// context/epoch is a typed conflict.
+        #[arg(long)]
+        request_key: Option<String>,
     },
     /// One-shot watch. Deadline required. One `notify@1` under
     /// `watch:<id>:<outcome>` (`met|timer|expired|failed`). Default on.
@@ -1573,6 +1579,13 @@ enum Commands {
         /// and an explicit --crew)
         #[arg(long)]
         yes: bool,
+        /// bd-4fgc: stable request key for this steer. Its slot is
+        /// `<project>-steer`, so a retry after a timeout REPLAYS the recorded
+        /// dispatch instead of steering twice, an unresolved slot refuses
+        /// rather than racing the first attempt, and the same key with another
+        /// payload is a typed conflict.
+        #[arg(long)]
+        request_key: Option<String>,
     },
     /// Unified workflow surface (ADR-0005 Spec 5 / P3.7) — catalog, lint,
     /// run, scaffold, history, and auto-crew preview. One vocabulary, one
@@ -3082,7 +3095,13 @@ fn main() {
             project,
             context,
             sup_epoch,
-        }) => supervisor_host::queue_halt(project, context.as_deref(), *sup_epoch),
+            request_key,
+        }) => supervisor_host::queue_halt(
+            project,
+            context.as_deref(),
+            *sup_epoch,
+            request_key.as_deref(),
+        ),
         Some(Commands::Timer { cmd }) => timer_watch::run(cmd),
         Some(Commands::View {
             project,
@@ -3349,6 +3368,7 @@ fn main() {
             retire_orphans,
             json,
             yes,
+            request_key,
         }) => preflight_gate(
             &cfg,
             cli.skip_preflight,
@@ -3367,6 +3387,7 @@ fn main() {
                 *retire_orphans,
                 *json,
                 *yes,
+                request_key.as_deref(),
             )
         }),
         Some(Commands::Workflow { cmd }) => {
@@ -6662,6 +6683,94 @@ mod adr0013_spawn_effect_tests {
         assert!(
             add.contains("add_effect.settle("),
             "the add row settles with its own evidence"
+        );
+    }
+
+    /// bd-4fgc: the steer door is effectful (a MaterialContext fact plus a
+    /// workflow run), so its receipt gate and intent row stand before the first
+    /// effect. A retried steer replays; it never queues a second fact or
+    /// dispatches a second run.
+    #[test]
+    fn the_steer_receipt_gate_precedes_dispatch() {
+        let src = include_str!("main.rs");
+        let steer = body_of(src, "\nfn cmd_steer(", "\n/// ADR-0022 W4 testable seam");
+        let gate = steer
+            .find("request_receipts::receipt_gate(")
+            .expect("cmd_steer must consult the request-key receipt");
+        let guard = steer
+            .find("DoorReceiptGuard::begin(")
+            .expect("cmd_steer must journal the steer intent");
+        let fact = steer
+            .find("append_pending_fact(")
+            .expect("cmd_steer must queue the MaterialContext fact");
+        let dispatch = steer
+            .find("cmd_workflow(cfg, &run)")
+            .expect("cmd_steer must dispatch the run");
+        assert!(
+            gate < guard,
+            "the receipt is read before the intent is journaled"
+        );
+        assert!(guard < fact, "and the intent before the first effect");
+        assert!(fact < dispatch, "and the fact before the run dispatch");
+        let replay_arm = steer
+            .split_once("request_receipts::Gate::Replay =>")
+            .map(|(_, rest)| rest)
+            .expect("the replay arm exists");
+        let replay_arm = replay_arm
+            .split("request_receipts::Gate::InFlight")
+            .next()
+            .expect("the in-flight arm follows the replay arm");
+        assert!(
+            replay_arm.contains("return Ok(())"),
+            "a settled slot must return before dispatch: {replay_arm}"
+        );
+        assert!(
+            steer.contains("g.settle(") && steer.contains("mark_unknown("),
+            "the steer row settles on the observed outcome, never by assumption"
+        );
+    }
+
+    /// bd-4fgc: the halt door is effectful too (it appends a `Halt` the host
+    /// folds), so the same ordering holds — and one `queue_halt` serves both
+    /// `flywheel halt` and `supervisor halt`.
+    #[test]
+    fn the_halt_receipt_gate_precedes_dispatch() {
+        let src = include_str!("supervisor_host.rs");
+        let halt = body_of(src, "\npub fn queue_halt(", "\nfn print_view(");
+        let gate = halt
+            .find("crate::request_receipts::receipt_gate(")
+            .expect("queue_halt must consult the request-key receipt");
+        let guard = halt
+            .find("DoorReceiptGuard::begin(")
+            .expect("queue_halt must journal the halt intent");
+        let effect = halt
+            .find("append_input(")
+            .expect("queue_halt must append the Halt");
+        assert!(
+            gate < guard,
+            "the receipt is read before the intent is journaled"
+        );
+        assert!(
+            guard < effect,
+            "and the intent before the Halt is queued: {halt}"
+        );
+        let replay_arm = halt
+            .split_once("crate::request_receipts::Gate::Replay =>")
+            .map(|(_, rest)| rest)
+            .expect("the replay arm exists");
+        let replay_arm = replay_arm
+            .split("crate::request_receipts::Gate::InFlight")
+            .next()
+            .expect("the in-flight arm follows the replay arm");
+        assert!(
+            replay_arm.contains("return Ok(())"),
+            "a settled slot must return before the append: {replay_arm}"
+        );
+        // The slot is namespaced per door, or a halt key would name whatever
+        // the other doors put under the same shape.
+        assert!(
+            halt.contains("door_slot(project, \"halt\", key)"),
+            "the halt slot names its own door"
         );
     }
 
@@ -28744,6 +28853,7 @@ fn cmd_steer(
     retire_orphans: bool,
     json: bool,
     yes: bool,
+    request_key: Option<&str>,
 ) -> Result<()> {
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
@@ -28765,11 +28875,79 @@ fn cmd_steer(
         eprintln!("flywheel: steer: inheriting --project={project_owned} from workspace cwd");
     }
     let project: Option<&str> = Some(project_owned.as_str());
+    // bd-4fgc: a steer is an effectful dispatch (a MaterialContext fact plus a
+    // workflow run), so it carries the same request-key receipt as the pane
+    // doors. The slot is namespaced per door, so a steer key never names a halt
+    // slot. The gate runs BEFORE the first effect (the fact queue below) and
+    // before the intent row, so a settled slot replays and an unresolved one
+    // refuses instead of steering twice.
+    let request_key = request_key.map(str::trim).filter(|k| !k.is_empty());
+    let direct_flag = if direct { "direct" } else { "goal" };
+    let retain_flag = if retain { "retain" } else { "reap" };
+    let orphans_flag = if retire_orphans { "orphans" } else { "keep" };
+    let steer_digest = request_receipts::payload_digest(
+        "steer-v1",
+        &[
+            objective,
+            crew.unwrap_or("-"),
+            direct_flag,
+            reuse.unwrap_or("-"),
+            retain_flag,
+            orphans_flag,
+        ],
+    );
+    let mut steer_receipt: Option<request_receipts::DoorReceiptGuard> = None;
+    if let Some(key) = request_key {
+        let slot = request_receipts::door_slot(&project_owned, "steer", key);
+        match request_receipts::receipt_gate(
+            request_receipts::load_door_receipt(&project_owned, "steer", &slot).as_ref(),
+            &steer_digest,
+        ) {
+            request_receipts::Gate::Proceed => {
+                steer_receipt = Some(request_receipts::DoorReceiptGuard::begin(
+                    &project_owned,
+                    "steer",
+                    &slot,
+                    &steer_digest,
+                )?);
+            }
+            request_receipts::Gate::Replay => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "request_key": key,
+                        "slot": slot,
+                        "already_steered": true,
+                        "replay": true,
+                    }))?
+                );
+                eprintln!(
+                    "flywheel: steer request key {key:?} already settled this slot ({slot}) — \
+                     replaying, no second dispatch. Its run: flywheel history --project \
+                     {project_owned}."
+                );
+                return Ok(());
+            }
+            request_receipts::Gate::InFlight => bail!(
+                "steer request key {key:?} is IN FLIGHT (slot {slot}) — a second dispatch could \
+                 start a second run under the same objective. Inspect it with `flywheel status \
+                 {project_owned}`, or retry with a fresh --request-key once the first settles."
+            ),
+            request_receipts::Gate::Conflict => bail!(
+                "steer request key {key:?} was already used for a DIFFERENT objective or mode (the \
+                 recorded payload digest differs) — refusing to hand back another steer's slot \
+                 under this key. Use a fresh --request-key for the new steer."
+            ),
+        }
+    }
     // GS-048/049: AUTHORITATIVE steer objective is material — queue into the
     // live doorbell Fact drain so Host::tick emits Msg::MaterialContext (not a
     // parallel classifier plane).
     let summary = format!("AUTHORITATIVE OPERATOR OBJECTIVE: {objective}");
     if let Err(e) = append_pending_fact(&crate::config::state_dir(), &project_owned, &summary) {
+        if let Some(g) = steer_receipt.take() {
+            g.mark_failed(&format!("material fact queue failed: {e:#}"));
+        }
         bail!(
             "steer: could not queue material MaterialContext fact for project {project_owned}: {e:#}"
         );
@@ -28807,6 +28985,11 @@ fn cmd_steer(
             steer_brief::run_briefing(&ctx, &mut std::io::stdin().lock(), &mut std::io::stdout())?;
         match outcome {
             steer_brief::BriefingOutcome::Abort => {
+                // A refused gate is a known refusal, not an unobservable
+                // dispatch: `Failed`, so the same key may be retried.
+                if let Some(g) = steer_receipt.take() {
+                    g.mark_failed("aborted by the operator at the briefing gate");
+                }
                 bail!("steer: aborted by the operator at the briefing gate");
             }
             steer_brief::BriefingOutcome::Go {
@@ -28844,7 +29027,16 @@ fn cmd_steer(
         &role_model_owned,
         &role_harness_owned,
     );
-    cmd_workflow(cfg, &run)
+    let out = cmd_workflow(cfg, &run);
+    if let Some(g) = steer_receipt.take() {
+        match &out {
+            Ok(()) => g.settle("steer workflow run dispatched"),
+            // The dispatch was attempted and its outcome is unobservable from
+            // here: Unknown, never an invented Settled.
+            Err(e) => g.mark_unknown(&format!("steer dispatch failed: {e:#}")),
+        }
+    }
+    out
 }
 
 /// ADR-0022 W4 testable seam: the exact Run command `flywheel steer`

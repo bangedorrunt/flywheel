@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Request keys make a retried mutation converge on its slot (bd-command-receipts-zile, bd-4fgc).** `spawn`, `add`, `steer`, and `halt` accept `--request-key`. A retry with the same key reads the intent-before-dispatch row its first attempt wrote instead of dispatching again: a settled slot REPLAYS with no second effect (no second crew, no second steer run, no second halt queued), an unresolved slot refuses loudly rather than racing a fork, and the same key with another plan or payload is a typed conflict instead of handing back another request's slot. Spawn and add key the workspace label (`<label>-rk-<key>`, add namespaced with `-add` so an add row can never overwrite the swarm's spawn row); steer and halt key `<project>-steer` / `<project>-halt`, so one key never names two doors. `send` keeps its existing `--param task_id` reconcile — one spelling per door.
+
 ### Fixed
 - A condemned wake rings death on a side bell. The brain restarts on the next turn while the watches already accepted stay queued. A full channel can no longer freeze `forwarded` until that backlog drains.
 
