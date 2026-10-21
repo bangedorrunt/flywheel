@@ -1392,16 +1392,9 @@ pub fn pane_dispatch(
     // itself needs a live pane, so the fail-twice test pins this config
     // through the shared driver with an injected no-op sleep.
     let dispatch_policy = dispatch_retry_policy();
-    const MAX_ATTEMPTS: u32 = 6;
-    {
-        let mut b = dispatch_breaker().lock().expect("dispatch breaker");
-        if !b.allows_at(crate::authority::SystemClock.now_unix()) {
-            let st = b.state();
-            bail!(
-                "pane dispatch: consecutive-failure breaker {st:?} — fast escalate, waiting out cooldown instead of hammering the pane"
-            );
-        }
-    }
+    // bd-jvka: the breaker check moved INTO the chain below — consulted
+    // before every attempt, so an open breaker stops the chain instead of
+    // letting it hammer the pane for six more tries.
     // bd-fen3: the busy-owner fence, adopted from toron-workflow. This replaces
     // the bd-5llv in-process idle gate, which is DELETED rather than kept
     // alongside — one concern, one mechanism. The fence owns the hold bound and
@@ -1435,7 +1428,6 @@ pub fn pane_dispatch(
             ));
         }
     };
-    let mut attempts = 0;
     // bd-mukq: 429 reroute state — the CURRENT send target (starts at the
     // resolved entry) plus the attempted profiles (starts at the step's
     // own). A 429 swaps the target to a live fallback-profile pane and
@@ -1446,230 +1438,292 @@ pub fn pane_dispatch(
     let mut attempted: Vec<String> = vec![profile_name.to_string()];
     let mut reroute_trail: Vec<Value> = Vec::new();
     let rate_limit_kind = crate::failure::FailureKind::RateLimit.to_string();
-    loop {
-        let mut cmd = Command::new(std::env::current_exe()?);
-        cmd.arg("__send")
-            .arg(project)
-            .arg(&attempt_entry.name)
-            .arg(&prompt)
-            .arg("--confirm")
-            .arg("--profile")
-            .arg(&attempt_profile);
-        let output = cmd
-            .output()
-            .with_context(|| format!("__send for @{attempt_profile} ({})", attempt_entry.name))?;
-        let raw = String::from_utf8_lossy(&output.stdout).to_string();
-        let trimmed = raw.trim();
-        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-            let transient = v
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(is_transient_dispatch_reason)
-                .unwrap_or(false);
-            if transient && attempts < MAX_ATTEMPTS {
-                let wait = dispatch_policy.delay_for(attempts, crate::retry::host_draw());
-                attempts += 1;
-                eprintln!(
-                    "flywheel: @{attempt_profile} not ready (attempt {attempts}/{MAX_ATTEMPTS}) — retrying in {}s",
-                    wait.as_secs()
+    // bd-jvka: the ROUTE chain and the FALLBACK are separate. The chain
+    // retries ONE route — the breaker is consulted INSIDE it, the budget
+    // bounds it, the attempt timeout is ON the call. The 429 fallback picks
+    // the NEXT route and runs a NEW chain, so the fallback is OUTSIDE the
+    // retry (effect-kernel law 10) and the new route gets its own budget.
+    'route: loop {
+        let chain = dispatch_chain(
+            &dispatch_policy,
+            dispatch_chain_budget(),
+            BreakerGate {
+                open: &|| {
+                    let mut b = dispatch_breaker().lock().expect("dispatch breaker");
+                    if b.allows_at(crate::authority::SystemClock.now_unix()) {
+                        None
+                    } else {
+                        Some(format!("{:?}", b.state()))
+                    }
+                },
+                // bd-jvka: a strike PER FAILURE. The old code charged one
+                // strike per exhausted dispatch, so six transient retries
+                // cost one strike and the breaker never opened.
+                strike: &|| {
+                    dispatch_breaker()
+                        .lock()
+                        .expect("dispatch breaker")
+                        .record_failure_at(crate::authority::SystemClock.now_unix());
+                },
+            },
+            &mut |_attempt: u32| -> Result<Value, DispatchErr> {
+                let mut cmd = Command::new(
+                    std::env::current_exe().map_err(|e| DispatchErr::Fatal(e.to_string()))?,
                 );
-                std::thread::sleep(wait);
-                continue;
-            }
-            // bd-lifecycle-occupied-pane-wedge-07tx: bounded-fail-loud. The
-            // old code fell through after MAX_ATTEMPTS and returned the
-            // failure payload as Ok — the engine re-drove the same dead step
-            // forever (idle crews + endless "@not ready (attempt 1/6)").
-            // Transiency was exhausted: the pane is not coming up (occupied
-            // bind, dead split, stuck boot). Surface a per-step ERROR so the
-            // engine's failure handling sees it instead of a soft ok-payload.
-            if transient {
-                let reason = v
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("transient")
-                    .to_string();
-                dispatch_breaker()
-                    .lock()
-                    .expect("dispatch breaker")
-                    .record_failure_at(crate::authority::SystemClock.now_unix());
+                cmd.arg("__send")
+                    .arg(project)
+                    .arg(&attempt_entry.name)
+                    .arg(&prompt)
+                    .arg("--confirm")
+                    .arg("--profile")
+                    .arg(&attempt_profile);
+                // bd-jvka: the attempt timeout ON the call — a `__send` child
+                // that never exits must not park the dispatch.
+                let output = crate::proc::run_bounded(&mut cmd, dispatch_attempt_timeout())
+                    .map_err(|e| match e {
+                        crate::proc::ProcError::Timeout { .. } => DispatchErr::Fatal(format!(
+                            "__send for @{attempt_profile} ({}) exceeded the attempt timeout ({:?}) — the child never exited",
+                            attempt_entry.name,
+                            dispatch_attempt_timeout()
+                        )),
+                        crate::proc::ProcError::Io(e) => DispatchErr::Fatal(format!(
+                            "__send for @{attempt_profile} ({}) failed: {e}",
+                            attempt_entry.name
+                        )),
+                    })?;
+                let raw = String::from_utf8_lossy(&output.stdout).to_string();
+                let trimmed = raw.trim();
+                if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                    let transient = v
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(is_transient_dispatch_reason)
+                        .unwrap_or(false);
+                    if transient {
+                        // bd-lifecycle-occupied-pane-wedge-07tx: bounded-fail-loud.
+                        // The pane is not coming up (occupied bind, dead split,
+                        // stuck boot). The CHAIN turns this into a typed
+                        // transient failure and the step fails loudly once the
+                        // chain is spent — never the old soft ok-payload the
+                        // engine re-drove forever (idle crews + endless
+                        // "@not ready (attempt 1/6)").
+                        let reason = v
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("transient")
+                            .to_string();
+                        return Err(DispatchErr::Transient { reason });
+                    }
+                    // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): same
+                    // contract as the headless path — warn + tag, never block
+                    // (the W5 flip owns blocking).
+                    if crate::phase_chain::plan_artifact_missing(spec, inputs) {
+                        eprintln!(
+                            "flywheel: phase implement dispatch has NO completed plan artifact — \
+                     warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
+                        );
+                    }
+                    // bd-5llv: carry the verdict's `ok` at the TOP level, always.
+                    //
+                    // It used to be set only on the failure path, which meant a
+                    // SUCCESSFUL send produced a receipt with no top-level `ok` at
+                    // all. The breaker branch below reads `out["ok"] == Some(true)`, so
+                    // every success fell to the else and recorded a breaker FAILURE.
+                    // The breaker therefore charged once per dispatch regardless of
+                    // outcome and opened after 5 — so the dispatch COUNT predicted
+                    // failure, not the result. That is why wave-swarm (6 dispatches)
+                    // failed every single time while a 2-prompt compose always
+                    // succeeded, and why the error blamed an "unavailable pane" when
+                    // every prompt had in fact landed.
+                    let mut out = json!({
+                        "profile": attempt_profile.clone(),
+                        "agent": attempt_entry.name,
+                        "ok": dispatch_receipt_ok(&v),
+                        "send": v.clone(),
+                    });
+                    // ADR-0024 W1a: classify pane dispatch failures (rate_limit/timeout/auth)
+                    if v.get("ok").and_then(Value::as_bool) == Some(false) {
+                        // bd-5yzp: every failure payload carries ok:false + a
+                        // non-empty error + kind (unknown included) — an
+                        // error-less or kind-less ok:false misroutes as bare
+                        // {error: step failed} downstream (bd-nyrn).
+                        let leaf_err = v.get("error").and_then(Value::as_str).unwrap_or("");
+                        let err_str = dispatch_failure_error(
+                            &attempt_profile,
+                            &attempt_entry.name,
+                            &raw,
+                            leaf_err,
+                        );
+                        let cf = crate::failure::classify(&err_str, None, None);
+                        out["stage"] = json!(cf.stage);
+                        out["ok"] = json!(false);
+                        out["error"] = json!(err_str.clone());
+                        out["kind"] = json!(cf.kind.to_string());
+                        out["retryable"] = json!(cf.retryable);
+                    }
+                    return Ok(out);
+                }
+                let err = String::from_utf8_lossy(&output.stderr).to_string();
+                // bd-5yzp: never error:'' — stderr, stdout, then scoped fallback.
+                let err_str =
+                    dispatch_failure_error(&attempt_profile, &attempt_entry.name, &raw, &err);
+                let cf = crate::failure::classify(&err_str, None, None);
+                Ok(json!({
+                    "ok": false,
+                    "error": err_str,
+                    "profile": attempt_profile.clone(),
+                    "agent": attempt_entry.name,
+                    // GS-049 P1-3: phase-bearing failure (ActionStage)
+                    "stage": cf.stage,
+                    "kind": cf.kind.to_string(),
+                    "retryable": cf.retryable,
+                }))
+            },
+            &mut |d| std::thread::sleep(d),
+        );
+        // bd-jvka: the FALLBACK is OUTSIDE the chain. The chain is done; only
+        // now may a 429 reroute pick the next route and start a NEW chain (with
+        // its own retry budget).
+        let mut out = match chain {
+            Ok(out) => out,
+            Err(DispatchErr::Transient { reason }) => {
                 return Err(anyhow!(
                     "dispatch @{attempt_profile} ({}) failed after {MAX_ATTEMPTS} transient retries: {reason} — the target pane never became available; fix the pane (occupied/dead) or fail the step",
                     attempt_entry.name
                 ));
             }
-            // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): same
-            // contract as the headless path — warn + tag, never block
-            // (the W5 flip owns blocking).
-            if crate::phase_chain::plan_artifact_missing(spec, inputs) {
-                eprintln!(
-                    "flywheel: phase implement dispatch has NO completed plan artifact — \
-                     warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
-                );
+            Err(DispatchErr::BreakerOpen { state, reason }) => {
+                let because = reason
+                    .map(|r| format!(" (last failure: {r})"))
+                    .unwrap_or_default();
+                return Err(anyhow!(
+                    "pane dispatch: consecutive-failure breaker {state} — fast escalate, waiting out cooldown instead of hammering the pane{because}"
+                ));
             }
-            // bd-5llv: carry the verdict's `ok` at the TOP level, always.
-            //
-            // It used to be set only on the failure path, which meant a
-            // SUCCESSFUL send produced a receipt with no top-level `ok` at
-            // all. The breaker branch below reads `out["ok"] == Some(true)`, so
-            // every success fell to the else and recorded a breaker FAILURE.
-            // The breaker therefore charged once per dispatch regardless of
-            // outcome and opened after 5 — so the dispatch COUNT predicted
-            // failure, not the result. That is why wave-swarm (6 dispatches)
-            // failed every single time while a 2-prompt compose always
-            // succeeded, and why the error blamed an "unavailable pane" when
-            // every prompt had in fact landed.
-            let mut out = json!({
-                "profile": attempt_profile.clone(),
-                "agent": attempt_entry.name,
-                "ok": dispatch_receipt_ok(&v),
-                "send": v.clone(),
-            });
-            // ADR-0024 W1a: classify pane dispatch failures (rate_limit/timeout/auth)
-            if v.get("ok").and_then(Value::as_bool) == Some(false) {
-                // bd-5yzp: every failure payload carries ok:false + a
-                // non-empty error + kind (unknown included) — an
-                // error-less or kind-less ok:false misroutes as bare
-                // {error: step failed} downstream (bd-nyrn).
-                let leaf_err = v.get("error").and_then(Value::as_str).unwrap_or("");
-                let err_str =
-                    dispatch_failure_error(&attempt_profile, &attempt_entry.name, &raw, leaf_err);
-                let cf = crate::failure::classify(&err_str, None, None);
-                out["stage"] = json!(cf.stage);
-                out["ok"] = json!(false);
-                out["error"] = json!(err_str.clone());
-                out["kind"] = json!(cf.kind.to_string());
-                out["retryable"] = json!(cf.retryable);
-                // bd-mukq: 429 reroute — ONE hop to a live fallback-profile
-                // pane (ADR-0026 shared chain; the running agent keeps its
-                // model and session, the self-contained prompt reroutes).
-                // No chain or no live pane, or the second 429, fails LOUD
-                // with a trail + hint instead of redriving exhausted quota.
-                if out.get("kind").and_then(Value::as_str) == Some(rate_limit_kind.as_str()) {
-                    match dispatch_reroute_target(catalog, entries, &attempt_profile, &attempted) {
-                        Some((next_profile, next_name)) => {
-                            attempted.push(next_profile.clone());
-                            crate::record_reroute_audit(
-                                project,
-                                0,
-                                &attempt_profile,
-                                crate::failure::FailureKind::RateLimit,
-                                &err_str,
-                            );
-                            // GS-043 B2 / I4: ProfileFallback full lifecycle —
-                            // Prepared → InFlight → Settled|Unknown (not Prepared-only).
-                            // Pane path cannot swap model in-session; profile.fallback
-                            // pane hop is the rate_limit reroute here.
-                            eprintln!(
-                                "flywheel: dispatch @{attempt_profile} rate-limited (429) — rerouting prompt to @{next_profile} ({next_name}), one hop"
-                            );
-                            reroute_trail.push(json!({
-                                "from": attempt_profile.clone(),
-                                "to": next_profile.clone(),
-                                "evidence": err_str,
-                            }));
-                            if crate::agent_ref::RebindIntent::allowed_from_failure(
-                                crate::failure::FailureKind::RateLimit,
-                                &err_str,
-                            ) {
-                                let intent = crate::agent_ref::RebindIntent::prepare(
-                                    crate::agent_ref::AgentRef::new(project, &attempt_entry.name),
-                                    crate::agent_ref::AgentBinding::profile(&attempt_profile),
-                                    crate::agent_ref::AgentBinding::profile(&next_profile),
-                                    crate::agent_ref::RebindReason::ProfileFallback {
-                                        kind: "rate_limit".into(),
-                                        evidence: err_str.clone(),
-                                    },
-                                    0,
-                                );
-                                match crate::agent_ref::commit_rebind_opt(project, intent, |_| {
-                                    Ok(resolve_pane_entry(entries, &next_profile))
-                                }) {
-                                    Ok(Some(e)) => {
-                                        attempt_entry = e;
-                                        attempt_profile = next_profile;
-                                        continue;
-                                    }
-                                    Ok(None) => {
-                                        // Settled as Unknown: target pane gone mid-hop.
-                                        out["reroute"] = json!("target-pane-gone");
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "flywheel: pane 429 ProfileFallback journal/apply failed: {e:#}"
-                                        );
-                                        out["reroute"] = json!("target-pane-gone");
-                                    }
-                                }
-                            } else {
-                                // B2 residual / I4: empty or disallowed evidence must NOT
-                                // invent a profile hop without journal. Fail-closed —
-                                // journal Unknown, refuse hop (no silent continue).
+            Err(DispatchErr::BudgetExhausted { reason }) => {
+                let because = reason
+                    .map(|r| format!(" (last failure: {r})"))
+                    .unwrap_or_default();
+                return Err(anyhow!(
+                    "pane dispatch: the dispatch chain spent its {:?} budget{because} — the target pane never became available",
+                    dispatch_chain_budget()
+                ));
+            }
+            Err(DispatchErr::Fatal(msg)) => return Err(anyhow!(msg)),
+        };
+        // bd-mukq: 429 reroute — ONE hop to a live fallback-profile pane
+        // (ADR-0026 shared chain; the running agent keeps its model and
+        // session, the self-contained prompt reroutes). No chain or no live
+        // pane, or the second 429, fails LOUD with a trail + hint instead of
+        // redriving exhausted quota.
+        if out.get("kind").and_then(Value::as_str) == Some(rate_limit_kind.as_str()) {
+            let err_str = out
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match dispatch_reroute_target(catalog, entries, &attempt_profile, &attempted) {
+                Some((next_profile, next_name)) => {
+                    attempted.push(next_profile.clone());
+                    crate::record_reroute_audit(
+                        project,
+                        0,
+                        &attempt_profile,
+                        crate::failure::FailureKind::RateLimit,
+                        &err_str,
+                    );
+                    // GS-043 B2 / I4: ProfileFallback full lifecycle —
+                    // Prepared → InFlight → Settled|Unknown (not Prepared-only).
+                    // Pane path cannot swap model in-session; profile.fallback
+                    // pane hop is the rate_limit reroute here.
+                    eprintln!(
+                        "flywheel: dispatch @{attempt_profile} rate-limited (429) — rerouting prompt to @{next_profile} ({next_name}), one hop"
+                    );
+                    reroute_trail.push(json!({
+                        "from": attempt_profile.clone(),
+                        "to": next_profile.clone(),
+                        "evidence": err_str,
+                    }));
+                    if crate::agent_ref::RebindIntent::allowed_from_failure(
+                        crate::failure::FailureKind::RateLimit,
+                        &err_str,
+                    ) {
+                        let intent = crate::agent_ref::RebindIntent::prepare(
+                            crate::agent_ref::AgentRef::new(project, &attempt_entry.name),
+                            crate::agent_ref::AgentBinding::profile(&attempt_profile),
+                            crate::agent_ref::AgentBinding::profile(&next_profile),
+                            crate::agent_ref::RebindReason::ProfileFallback {
+                                kind: "rate_limit".into(),
+                                evidence: err_str.clone(),
+                            },
+                            0,
+                        );
+                        match crate::agent_ref::commit_rebind_opt(project, intent, |_| {
+                            Ok(resolve_pane_entry(entries, &next_profile))
+                        }) {
+                            Ok(Some(e)) => {
+                                attempt_entry = e;
+                                attempt_profile = next_profile;
+                                continue 'route;
+                            }
+                            Ok(None) => {
+                                // Settled as Unknown: target pane gone mid-hop.
+                                out["reroute"] = json!("target-pane-gone");
+                            }
+                            Err(e) => {
                                 eprintln!(
-                                    "flywheel: pane 429 ProfileFallback refused — evidence gate closed (I4); no silent hop to @{next_profile}"
+                                    "flywheel: pane 429 ProfileFallback journal/apply failed: {e:#}"
                                 );
-                                let intent = crate::agent_ref::RebindIntent::prepare(
-                                    crate::agent_ref::AgentRef::new(project, &attempt_entry.name),
-                                    crate::agent_ref::AgentBinding::profile(&attempt_profile),
-                                    crate::agent_ref::AgentBinding::profile(&next_profile),
-                                    crate::agent_ref::RebindReason::ProfileFallback {
-                                        kind: "rate_limit".into(),
-                                        evidence: if err_str.trim().is_empty() {
-                                            "(empty)".into()
-                                        } else {
-                                            err_str
-                                        },
-                                    },
-                                    0,
-                                );
-                                let _ =
-                                    crate::agent_ref::commit_rebind_opt(project, intent, |_| {
-                                        Ok(None::<()>)
-                                    });
-                                out["reroute"] = json!("refused-empty-evidence");
+                                out["reroute"] = json!("target-pane-gone");
                             }
                         }
-                        None => {
-                            out["reroute"] = json!("none-available");
-                            out["hint"] = json!(format!(
-                                "429 on @{attempt_profile} with no further fallback pane live — spawn the fallback profile or wait for quota; redriving the same route hammers quota"
-                            ));
-                        }
+                    } else {
+                        // B2 residual / I4: empty or disallowed evidence must NOT
+                        // invent a profile hop without journal. Fail-closed —
+                        // journal Unknown, refuse hop (no silent continue).
+                        eprintln!(
+                            "flywheel: pane 429 ProfileFallback refused — evidence gate closed (I4); no silent hop to @{next_profile}"
+                        );
+                        let intent = crate::agent_ref::RebindIntent::prepare(
+                            crate::agent_ref::AgentRef::new(project, &attempt_entry.name),
+                            crate::agent_ref::AgentBinding::profile(&attempt_profile),
+                            crate::agent_ref::AgentBinding::profile(&next_profile),
+                            crate::agent_ref::RebindReason::ProfileFallback {
+                                kind: "rate_limit".into(),
+                                evidence: if err_str.trim().is_empty() {
+                                    "(empty)".into()
+                                } else {
+                                    err_str
+                                },
+                            },
+                            0,
+                        );
+                        let _ = crate::agent_ref::commit_rebind_opt(project, intent, |_| {
+                            Ok(None::<()>)
+                        });
+                        out["reroute"] = json!("refused-empty-evidence");
                     }
                 }
+                None => {
+                    out["reroute"] = json!("none-available");
+                    out["hint"] = json!(format!(
+                        "429 on @{attempt_profile} with no further fallback pane live — spawn the fallback profile or wait for quota; redriving the same route hammers quota"
+                    ));
+                }
             }
-            if !reroute_trail.is_empty() {
-                out["reroute_trail"] = json!(reroute_trail);
-            }
-            let mut breaker = dispatch_breaker().lock().expect("dispatch breaker");
-            if out.get("ok").and_then(Value::as_bool) == Some(true) {
-                breaker.record_success_at();
-            } else {
-                breaker.record_failure_at(crate::authority::SystemClock.now_unix());
-            }
-            return Ok(crate::phase_chain::annotate_dispatch_output(
-                spec, inputs, out,
-            ));
         }
-        let err = String::from_utf8_lossy(&output.stderr).to_string();
-        // bd-5yzp: never error:'' — stderr, stdout, then scoped fallback.
-        let err_str = dispatch_failure_error(profile_name, &entry.name, &raw, &err);
-        let cf = crate::failure::classify(&err_str, None, None);
-        let out = json!({
-            "ok": false,
-            "error": err_str,
-            "profile": profile_name,
-            "agent": entry.name,
-            // GS-049 P1-3: phase-bearing failure (ActionStage)
-            "stage": cf.stage,
-            "kind": cf.kind.to_string(),
-            "retryable": cf.retryable,
-        });
-        dispatch_breaker()
-            .lock()
-            .expect("dispatch breaker")
-            .record_failure_at(crate::authority::SystemClock.now_unix());
-        return Ok(out);
+        if !reroute_trail.is_empty() {
+            out["reroute_trail"] = json!(reroute_trail);
+        }
+        let mut breaker = dispatch_breaker().lock().expect("dispatch breaker");
+        if out.get("ok").and_then(Value::as_bool) == Some(true) {
+            breaker.record_success_at();
+        } else {
+            breaker.record_failure_at(crate::authority::SystemClock.now_unix());
+        }
+        return Ok(crate::phase_chain::annotate_dispatch_output(
+            spec, inputs, out,
+        ));
     }
 }
 
@@ -1685,12 +1739,120 @@ fn dispatch_failure_error(profile: &str, agent: &str, raw_stdout: &str, err: &st
     format!("pane dispatch: @{profile} ({agent}) __send returned empty stdout+stderr — no payload")
 }
 
+/// Pane-dispatch attempts per route (bd-8pjr): 6 attempts, 5s base, 10s cap
+/// — the same envelope as the old fixed 10s x6, now with a backoff ramp.
+const MAX_ATTEMPTS: u32 = 6;
+
+/// bd-jvka: the typed outcome of one dispatch chain.
+#[derive(Debug)]
+pub enum DispatchErr {
+    /// The attempt failed transiently; the chain may retry it.
+    Transient { reason: String },
+    /// The consecutive-failure breaker was open before an attempt.
+    BreakerOpen {
+        state: String,
+        reason: Option<String>,
+    },
+    /// The chain's wall-clock budget was spent.
+    BudgetExhausted { reason: Option<String> },
+    /// The call itself failed (spawn, timeout, ...) — not retryable here.
+    Fatal(String),
+}
+
+/// bd-jvka: the breaker's view for the chain: is it open, and one strike.
+pub struct BreakerGate<'a> {
+    /// `Some(state)` when the breaker is OPEN: the chain stops there.
+    pub open: &'a dyn Fn() -> Option<String>,
+    /// One strike for a failed attempt. A strike PER FAILURE — six transient
+    /// retries are six failures, not one.
+    pub strike: &'a dyn Fn(),
+}
+
+/// bd-jvka: the dispatch chain — the ONE order for a remote command
+/// (effect-kernel law 10): the breaker is consulted INSIDE the retry (before
+/// every attempt), the budget bounds the chain AROUND it, the attempt timeout
+/// is ON the call (the caller's `attempt` owns it), and the fallback is
+/// OUTSIDE (the caller reroutes when the chain ends).
+///
+/// The seams are injected so the ORDER is provable without a live pane: a
+/// test drives the chain with a fake attempt, a fake breaker and a no-op
+/// sleep.
+pub fn dispatch_chain(
+    policy: &crate::retry::RetryPolicy,
+    budget: std::time::Duration,
+    breaker: BreakerGate<'_>,
+    attempt: &mut dyn FnMut(u32) -> Result<Value, DispatchErr>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> Result<Value, DispatchErr> {
+    // bd-lf1u classification: this monotonic read is a HOST-side deadline on
+    // a real subprocess chain, not a decision input, so it is deliberately
+    // NOT migrated to an injected clock — the same class as the `timeout`
+    // wrapped around a live effect. Nothing it selects is recorded.
+    let deadline = std::time::Instant::now() + budget;
+    let mut last_reason: Option<String> = None;
+    let mut attempt_no = 0u32;
+    policy.retry_with_backoff(
+        || {
+            // budget AROUND the chain
+            if std::time::Instant::now() >= deadline {
+                return Err(DispatchErr::BudgetExhausted {
+                    reason: last_reason.clone(),
+                });
+            }
+            // breaker INSIDE the retry: consulted before EVERY attempt, so an
+            // open breaker stops the chain instead of letting it hammer the
+            // pane six more times.
+            if let Some(state) = (breaker.open)() {
+                return Err(DispatchErr::BreakerOpen {
+                    state,
+                    reason: last_reason.clone(),
+                });
+            }
+            let n = attempt_no;
+            attempt_no += 1;
+            match attempt(n) {
+                Ok(v) => Ok(v),
+                Err(DispatchErr::Transient { reason }) => {
+                    // a transient failure IS a failure: one strike per attempt
+                    (breaker.strike)();
+                    last_reason = Some(reason.clone());
+                    Err(DispatchErr::Transient { reason })
+                }
+                Err(e) => Err(e),
+            }
+        },
+        |e| matches!(e, DispatchErr::Transient { .. }),
+        |n, e| {
+            if let DispatchErr::Transient { reason } = e {
+                eprintln!("flywheel: dispatch attempt {n} not ready ({reason}) — retrying");
+            }
+        },
+        crate::retry::host_draw,
+        sleep,
+    )
+}
+
+/// bd-jvka: the attempt timeout ON the call. The `__send` child waits 45s for
+/// the prompt to land (`--confirm` default), so this sits above the child's
+/// own bound: the child's clean timeout is what the operator sees, and this
+/// only catches a child that never exits at all.
+fn dispatch_attempt_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(120)
+}
+
+/// bd-jvka: the budget AROUND the chain. Six attempts x 120s plus five
+/// backoff sleeps (10s cap) fit inside it, so a legitimate chain is never cut
+/// short, while a pathological one cannot run unbounded.
+fn dispatch_chain_budget() -> std::time::Duration {
+    std::time::Duration::from_secs(900)
+}
+
 /// Pane-dispatch retry budget (bd-8pjr): 6 attempts, 5s base, 10s cap —
 /// same envelope as the old fixed 10s x6, now with backoff ramp + headroom.
 /// Named so the per-site fail-twice test pins the config.
 fn dispatch_retry_policy() -> crate::retry::RetryPolicy {
     crate::retry::RetryPolicy {
-        max_attempts: 6,
+        max_attempts: MAX_ATTEMPTS,
         base: std::time::Duration::from_secs(5),
         cap: std::time::Duration::from_secs(10),
     }
@@ -2986,6 +3148,112 @@ mod tests {
         );
     }
 
+    /// bd-jvka: the ORDER, provable without a live pane. The breaker is
+    /// consulted INSIDE the retry — before EVERY attempt — so an open
+    /// breaker stops the chain instead of letting it hammer the pane six
+    /// more times. And a transient failure is a FAILURE: one strike per
+    /// attempt, so the breaker opens on the failures, not on the dispatches.
+    #[test]
+    fn dispatch_watchdog_consults_the_breaker_inside_the_chain() {
+        let policy = dispatch_retry_policy();
+        let attempts = std::cell::Cell::new(0u32);
+        let strikes = std::cell::Cell::new(0u32);
+        let breaker_opened = std::cell::Cell::new(false);
+        let out = dispatch_chain(
+            &policy,
+            dispatch_chain_budget(),
+            BreakerGate {
+                open: &|| {
+                    if breaker_opened.get() {
+                        Some("open".to_string())
+                    } else {
+                        None
+                    }
+                },
+                strike: &|| {
+                    strikes.set(strikes.get() + 1);
+                    breaker_opened.set(true);
+                },
+            },
+            &mut |_n| {
+                attempts.set(attempts.get() + 1);
+                Err(DispatchErr::Transient {
+                    reason: "agent_not_ready".into(),
+                })
+            },
+            &mut |_| {},
+        );
+        assert!(
+            matches!(out, Err(DispatchErr::BreakerOpen { .. })),
+            "the open breaker must stop the chain: {out:?}"
+        );
+        assert_eq!(strikes.get(), 1, "one failure is one strike");
+        assert_eq!(
+            attempts.get(),
+            1,
+            "the breaker is consulted before every attempt, so the chain stopped after the first failure"
+        );
+    }
+
+    /// bd-jvka: the budget bounds the chain AROUND it — a spent budget must
+    /// not attempt at all, and it must not be spent by the breaker check
+    /// either.
+    #[test]
+    fn dispatch_watchdog_budget_bounds_the_chain() {
+        let policy = dispatch_retry_policy();
+        let mut attempts = 0u32;
+        let out = dispatch_chain(
+            &policy,
+            std::time::Duration::ZERO,
+            BreakerGate {
+                open: &|| None,
+                strike: &|| {},
+            },
+            &mut |_n| {
+                attempts += 1;
+                Err(DispatchErr::Transient {
+                    reason: "agent_not_ready".into(),
+                })
+            },
+            &mut |_| {},
+        );
+        assert!(
+            matches!(out, Err(DispatchErr::BudgetExhausted { .. })),
+            "a spent budget must end the chain: {out:?}"
+        );
+        assert_eq!(attempts, 0, "a spent budget must not attempt at all");
+    }
+
+    /// bd-jvka: the FALLBACK is outside the chain — the chain hands the
+    /// rate-limit verdict back as a FINAL answer, so only the caller picks
+    /// the next route. A chain that rerouted itself would hide the fallback
+    /// inside the retry.
+    #[test]
+    fn dispatch_watchdog_hands_the_fallback_verdict_back_to_the_caller() {
+        let policy = dispatch_retry_policy();
+        let mut attempts = 0u32;
+        let out = dispatch_chain(
+            &policy,
+            dispatch_chain_budget(),
+            BreakerGate {
+                open: &|| None,
+                strike: &|| {},
+            },
+            &mut |_n| {
+                attempts += 1;
+                Ok(json!({"ok": false, "kind": "rate_limit"}))
+            },
+            &mut |_| {},
+        )
+        .expect("a final verdict");
+        assert_eq!(attempts, 1, "a final verdict ends the chain");
+        assert_eq!(
+            out["kind"],
+            json!("rate_limit"),
+            "the verdict is handed back as-is"
+        );
+    }
+
     /// bd-mukq: 429 reroute target — the next fallback profile in the
     /// chain that has a LIVE pane in this run wins, exactly once.
     /// Empty chain, no live pane, or already-attempted → None (fail loud
@@ -3061,7 +3329,12 @@ mod tests {
             "pane 429 empty-evidence path must expose refused-empty-evidence"
         );
         let dispatch = src.find("bd-mukq: 429 reroute").expect("429 reroute block");
-        let arm = &src[dispatch..dispatch.saturating_add(12000)];
+        // Scope the slice to the FUNCTION, not a fixed byte count. The magic
+        // 12000-byte window silently excluded the arm's tail as soon as the
+        // dispatch grew (bd-jvka moved the chain in front of it), which reads
+        // as "the marker is missing" when it is merely further down.
+        let end = src[dispatch..].find("\nfn ").map_or(dispatch, |i| dispatch + i);
+        let arm = &src[dispatch..end];
         assert!(
             !arm.contains("still hop (legacy"),
             "429 reroute arm must not silent-continue hop without I4 journal"

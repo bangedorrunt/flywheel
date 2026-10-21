@@ -62,6 +62,7 @@ mod init_scaffold;
 mod intent;
 mod lead_claim;
 mod private_fs;
+mod proc;
 mod recipient_guard;
 mod redact;
 mod request_receipts;
@@ -40266,9 +40267,11 @@ mod reservation_identity_tests {
     /// other attribution (the ~6 blocked commits failure mode).
     #[test]
     fn reservation_identity_holder_passes_own_commit_guard() {
-        let holder = crate::authority::select_agent_identity(None, &|k| {
-            (k == "AGENT_NAME").then(|| "IronSummit".to_string())
-        }, None)
+        let holder = crate::authority::select_agent_identity(
+            None,
+            &|k| (k == "AGENT_NAME").then(|| "IronSummit".to_string()),
+            None,
+        )
         .expect("env-bound identity");
         let staged = vec!["src/main.rs".to_string(), "src/stages.rs".to_string()];
         let own = vec![Reservation {

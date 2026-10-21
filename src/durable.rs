@@ -2203,74 +2203,20 @@ async fn run_leaf_cmd_bounded(
     watchdog: std::time::Duration,
 ) -> Result<std::process::Output> {
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        use std::os::unix::process::CommandExt as _;
-        let mut child = match cmd
-            .process_group(0)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return Err(e),
-        };
-        let mut out = child.stdout.take().expect("piped stdout");
-        let mut err = child.stderr.take().expect("piped stderr");
-        let out_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = out.read_to_string(&mut buf);
-            buf
-        });
-        let err_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = err.read_to_string(&mut buf);
-            buf
-        });
-        // bd-lf1u classification: this monotonic read is a HOST-side deadline
-        // on a real subprocess, not a decision input, so it is deliberately NOT
-        // migrated to an injected clock. The child runs in real time; polling a
-        // supplied clock would never advance relative to it, so the watchdog
-        // would either never fire or fire immediately. Same class as a
-        // `timeout` wrapped around a live effect: the bound is part of the
-        // effect, so it must be measured in real time. What the lens forbids is
-        // an ambient read feeding a DURABLE RESULT; `Instant::now()` here only
-        // decides when to stop waiting, and nothing it selects is recorded.
-        let deadline = std::time::Instant::now() + watchdog;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        // GS-025: `kill -9 -<pgid>` is unreliable across
-                        // procps on GHA (watchdog tests saw full 30s sleep).
-                        // Prefer `kill -s KILL -- -<pgid>` + direct child.kill.
-                        let pgid = i64::from(child.id());
-                        let _ = std::process::Command::new("kill")
-                            .args(["-s", "KILL", "--", &format!("-{pgid}")])
-                            .status();
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            format!(
-                                "{label} leaf exceeded {watchdog:?} — process group {pgid} killed (watchdog; a hung leaf must never park the loop, and its children must not orphan)"
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    return Err(e);
-                }
-            }
-        };
-        let stdout = out_handle.join().unwrap_or_default().into_bytes();
-        let stderr = err_handle.join().unwrap_or_default().into_bytes();
-        Ok(std::process::Output {
-            status,
-            stdout,
-            stderr,
+        // bd-jvka: the CHILD bound and the DRAIN bound are two failures. The
+        // child runs in its own process group, so the timeout kills the whole
+        // group (a leaf's own children die with it instead of orphaning to
+        // PPID 1). And a grandchild that inherited the pipe's write end keeps
+        // it open after the leaf exits: EOF never comes, so the old unbounded
+        // join parked the loop FOREVER with the watchdog already satisfied.
+        crate::proc::run_bounded(&mut cmd, watchdog).map_err(|e| match e {
+            crate::proc::ProcError::Timeout { pid } => std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{label} leaf exceeded {watchdog:?} — process group {pid} killed (watchdog; a hung leaf must never park the loop, and its children must not orphan)"
+                ),
+            ),
+            crate::proc::ProcError::Io(e) => e,
         })
     })
     .await
