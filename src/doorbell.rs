@@ -645,25 +645,17 @@ pub fn inject_wake_in(
             }
         }
     }
-    let mut budgets = inject_budget_load(state_dir, project);
-    let stamps = budgets.entry(pin.to_string()).or_default();
-    stamps.retain(|t| now_unix.saturating_sub(*t) < 1800);
-    if stamps.len() >= 3 {
-        return Err(InjectDeny::Budget);
-    }
-    stamps.push(now_unix);
+    // bd-0gup: the budget is a LOCKED read-modify-write with an ATOMIC
+    // write. The old code did an unlocked load -> check -> `std::fs::write`
+    // (truncating in place): two injectors could both pass `len >= 3`, and
+    // a crash mid-write left a truncated file that `inject_budget_load`
+    // reads as EMPTY — the budget reset. The write now goes through the
+    // shared locked update (temp file + rename), and the CHECK and the
+    // CHARGE happen under ONE lock.
+    //
+    // The effect (the journal append) happens INSIDE that lock, BEFORE the
+    // charge: a failed inject must not consume a slot.
     let budget_path = inject_budget_path(state_dir, project);
-    if let Some(parent) = budget_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::write(
-        budget_path,
-        serde_json::to_string(&budgets).unwrap_or_default(),
-    )
-    .is_err()
-    {
-        return Err(InjectDeny::Budget);
-    }
     let summary = format!("inject {pin}: {line}");
     let msg = crate::workspace::Msg::Fact {
         summary: summary.clone(),
@@ -672,20 +664,38 @@ pub fn inject_wake_in(
     // a Fact row carries no pin field, so `doorbell why <pin>` (which reads
     // `entry.pins` and Prompt/Audit cmds) could never attribute an injected
     // row to its pin — the operator console door was unexplainable.
-    journal_append_workspace(
-        state_dir,
-        workspace,
-        &msg,
-        &[],
-        serde_json::json!({
-            "stage": "inject",
-            "pin": pin,
-            "workspace": workspace,
-            "project": project,
-            "inject_ts": now_unix,
-        }),
-        Some(&[pin.to_string()]),
-    );
+    let mut denied = false;
+    crate::state::update_locked(
+        &budget_path,
+        |budgets: &mut std::collections::BTreeMap<String, Vec<u64>>| {
+            let stamps = budgets.entry(pin.to_string()).or_default();
+            stamps.retain(|t| now_unix.saturating_sub(*t) < 1800);
+            if stamps.len() >= 3 {
+                denied = true;
+                return;
+            }
+            journal_append_workspace(
+                state_dir,
+                workspace,
+                &msg,
+                &[],
+                serde_json::json!({
+                    "stage": "inject",
+                    "pin": pin,
+                    "workspace": workspace,
+                    "project": project,
+                    "inject_ts": now_unix,
+                }),
+                Some(&[pin.to_string()]),
+            );
+            // Charged AFTER the effect: a failed inject costs no slot.
+            stamps.push(now_unix);
+        },
+    )
+    .map_err(|_| InjectDeny::Budget)?;
+    if denied {
+        return Err(InjectDeny::Budget);
+    }
     let _ = crate::append_pending_fact(&crate::config::state_dir(), project, &summary);
     Ok(summary)
 }
@@ -1730,6 +1740,55 @@ pub fn write_unanswered(path: &Path, pins: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// bd-0gup: the inject budget must be charged under ONE lock.
+    ///
+    /// The old code did an unlocked load -> check -> `std::fs::write`
+    /// (truncating in place): every concurrent injector could read the same
+    /// budget, all pass `len >= 3`, and the file could be left truncated (a
+    /// crash mid-write reset the budget to empty). The charge now happens
+    /// under the shared state lock with an atomic write, so the budget holds
+    /// under concurrency.
+    #[test]
+    fn inject_budget_lock_serializes_the_charge() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("fw-inject-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let dir = dir.clone();
+            let ok = ok.clone();
+            handles.push(std::thread::spawn(move || {
+                // A distinct line per thread, so the same-second ratchet is
+                // not what refuses the extra injects.
+                if super::inject_wake_in(
+                    &dir,
+                    "proj",
+                    "ws",
+                    "AmberOwl",
+                    &format!("line-{i}"),
+                    1_000_000,
+                )
+                .is_ok()
+                {
+                    ok.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        let landed = ok.load(Ordering::SeqCst);
+        assert!(
+            landed <= 3,
+            "the budget of 3 injects per window must hold under concurrency: {landed}"
+        );
+        assert!(landed >= 1, "at least one inject must land: {landed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Follow-up (a): a daemon host that hosts the workspace but types nothing
     /// (comms flag) must not take the loop from `flywheel __doorbell`.
     #[test]

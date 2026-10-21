@@ -15914,7 +15914,11 @@ pub(crate) fn arrive_identity_verdict(
     let registry_pin = clean(registry_pin);
     let env_pin = clean(env_pin);
     let injected = registry_pin.or(env_pin);
-    if registry_pin.is_some() && captain_pin == Some(requested) {
+    if registry_pin.is_some() && captain_pin == Some(requested) && injected != Some(requested) {
+        // bd-0gup: the refusal must ALSO require that the requested pin is
+        // not the pane's OWN injected identity. The captain pane arriving as
+        // itself is a CORRECT arrival; the old guard refused it and then told
+        // the operator to re-run with the pin it had just rejected.
         return ArriveIdentityVerdict::Refused {
             injected: injected.map(str::to_string),
             reason: "the captain pin is not a valid arrival target for a spawned pane",
@@ -21094,6 +21098,35 @@ pub(crate) fn spawn_agent_profile(name: &str, kind: &str, project: &str) -> back
 #[cfg(test)]
 mod spawn_identity_divergence_tests {
     use super::*;
+
+    /// bd-0gup: the captain pane arriving as ITSELF is a CORRECT arrival.
+    ///
+    /// The old guard refused every arrival whose requested pin was the
+    /// captain pin AND whose pane had a registry row — including the pane
+    /// whose OWN injected identity IS that captain pin. The refusal then
+    /// told the operator to re-run with the pin it had just rejected.
+    #[test]
+    fn arrive_identity_captain_pane_may_arrive_as_itself() {
+        assert_eq!(
+            arrive_identity_verdict("EmberOtter", Some("EmberOtter"), None, Some("EmberOtter")),
+            ArriveIdentityVerdict::Match,
+            "the captain pane arriving as its own injected identity is not a refusal"
+        );
+        // The env-injected identity counts the same way.
+        assert_eq!(
+            arrive_identity_verdict("EmberOtter", None, Some("EmberOtter"), Some("EmberOtter")),
+            ArriveIdentityVerdict::Match,
+            "the env-injected captain identity is the pane's own identity too"
+        );
+        // And a SPAWNED pane arriving as the captain pin is still refused.
+        assert!(
+            matches!(
+                arrive_identity_verdict("EmberOtter", Some("SilverPond"), None, Some("EmberOtter")),
+                ArriveIdentityVerdict::Refused { .. }
+            ),
+            "a spawned pane must not arrive as the captain pin"
+        );
+    }
 
     /// bd-spawn-identity-divergence-2vzw: a spawned pane may only arrive as
     /// its injected pin; the captain pin is refused for spawned panes; an
