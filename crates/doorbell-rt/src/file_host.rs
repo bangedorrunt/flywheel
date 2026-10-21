@@ -257,6 +257,150 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
 
 /// Per-call ceiling for brain-task CLIs (inbox, list, whois).
 pub const CLI_TIMEOUT_SECS: u64 = 15;
+
+/// bd-1i8c: the ack-SLA REMINDER's kind. toron rides the reminder on
+/// `ACK_SLA_WAKE` (30015) since bd-4v1a — NOT the kind-9 room plane, where
+/// every reminder competed with real crew posts for the bus's capped rows
+/// (measured live: 95,077 of 100,000 rows were this one reminder) and the
+/// doorbell forwarded every one of them into its single-serial wake brain,
+/// which dropped 1,879 real wake lines.
+///
+/// The literal is pinned here because the two repos cannot share a constant
+/// (doorbell-rt does not depend on toron-core). It is a REMINDER, not crew
+/// traffic: the wake stream carries wakes, not the room's whole traffic.
+pub const ACK_SLA_WAKE_KIND: u16 = 30015;
+
+/// bd-1i8c: the ack-SLA scan's OWN ceiling. The scan walks every overdue
+/// ack-required post in the project, so it is minutes-scale, not
+/// seconds-scale: the shared 15s per-call ceiling killed it every minute and
+/// it never converged (live: 5,029 `ack_sla_error` rows).
+///
+/// A function, not a const: the ceiling is policy, and the test that pins it
+/// against the per-call ceiling must not compare two compile-time constants.
+pub fn ack_sla_scan_timeout_secs() -> u64 {
+    300
+}
+
+/// Fetch one pin's inbox rows. A free fn so the off-loop lane (which owns no
+/// `&self`) uses the SAME fetch and the SAME audit shape as the inline path.
+///
+/// Failures audit LOUD to the audit file and yield empty rows — the cursor
+/// holds and the batch re-sweeps (at-least-once).
+fn fetch_inbox_rows(
+    toron_bin: &str,
+    project: &str,
+    state_dir: &std::path::Path,
+    workspace: &str,
+    pin: &str,
+    since: &str,
+) -> Vec<serde_json::Value> {
+    let out = run_cli(
+        toron_bin,
+        &[
+            "mail",
+            "inbox",
+            "--as",
+            pin,
+            "--project",
+            project,
+            "--since",
+            since,
+            "--limit",
+            "50",
+        ],
+        CLI_TIMEOUT_SECS,
+    );
+    let Some(out) = out else {
+        FileHost::append_audit_row(
+            state_dir,
+            workspace,
+            "inbox_error",
+            serde_json::json!({ "pin": pin, "error": "toron spawn/timeout failed" }),
+        );
+        return Vec::new();
+    };
+    if !out.status.success() {
+        let error = String::from_utf8_lossy(&out.stderr).to_string();
+        FileHost::append_audit_row(
+            state_dir,
+            workspace,
+            inbox_fail_kind(&error),
+            serde_json::json!({
+                "pin": pin,
+                "error": error,
+            }),
+        );
+        return Vec::new();
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+    match &parsed {
+        serde_json::Value::Array(arr) => arr.clone(),
+        v if v.get("messages").is_some() => v
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        other if other.is_object() => vec![other.clone()],
+        _ => vec![],
+    }
+}
+
+/// The ack-SLA scan, as a free fn for the same reason as
+/// [`fetch_inbox_rows`]. The deadline is the scan's own (minutes-scale),
+/// NOT the shared per-call ceiling.
+fn scan_ack_sla_rows(
+    toron_bin: &str,
+    project: &str,
+    state_dir: &std::path::Path,
+    workspace: &str,
+) -> Vec<String> {
+    let out = run_cli(
+        toron_bin,
+        &["ack-sla", "--project", project],
+        ack_sla_scan_timeout_secs(),
+    );
+    let Some(out) = out else {
+        FileHost::append_audit_row(
+            state_dir,
+            workspace,
+            "ack_sla_error",
+            serde_json::json!({ "error": "toron spawn/timeout failed" }),
+        );
+        return Vec::new();
+    };
+    if !out.status.success() {
+        let error = String::from_utf8_lossy(&out.stderr).to_string();
+        // bd-r39p: name the skew here too. This arm opens the SAME shared
+        // store as the inbox arm, so it refuses for the same reason, but it
+        // wrote `ack_sla_error` and the fault was invisible under a probe
+        // keyed on the inbox kind.
+        FileHost::append_audit_row(
+            state_dir,
+            workspace,
+            if is_store_skew_refusal(&error) {
+                "ack_sla_store_skew"
+            } else {
+                "ack_sla_error"
+            },
+            serde_json::json!({
+                "error": error,
+            }),
+        );
+        return Vec::new();
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+    parsed
+        .get("expired")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 fn file_identity(exe: &Path) -> Option<(u64, u64)> {
     let md = std::fs::metadata(exe).ok()?;
     let mtime = md
@@ -1718,55 +1862,85 @@ impl Host for FileHost {
     }
 
     fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value> {
-        // `&self` receiver (F6 narrow): failures audit LOUD to the audit
-        // file (same entry shape as the embedded path) and yield empty
-        // rows — the cursor holds and the batch re-sweeps (at-least-once).
-        let out = run_cli(
+        fetch_inbox_rows(
             &self.cfg.toron_bin,
-            &[
-                "mail",
-                "inbox",
-                "--as",
-                pin,
-                "--project",
-                &self.cfg.project,
-                "--since",
-                since,
-                "--limit",
-                "50",
-            ],
-            CLI_TIMEOUT_SECS,
-        );
-        let Some(out) = out else {
-            self.audit_file(
-                "inbox_error",
-                serde_json::json!({ "pin": pin, "error": "toron spawn/timeout failed" }),
-            );
+            &self.cfg.project,
+            &self.cfg.flywheel_state,
+            &self.cfg.workspace,
+            pin,
+            since,
+        )
+    }
+
+    /// bd-1i8c: DETACH the fetch — the brain is a single-serial writer: an
+    /// inline fetch parked it for the whole scan (one CLI per pin, each with
+    /// its own ceiling), so the wake channel filled and real wake lines were
+    /// DROPPED (live: 196,167 forwarded, 27,791 brain_full, 1,879 dropped).
+    ///
+    /// The lane keeps the pins SEQUENTIAL (the store is one SQLite file)
+    /// and the brain continues meanwhile. The rows come back as
+    /// `InboxFetched` messages, so nothing is returned here.
+    fn fetch_inbox_detached(
+        &mut self,
+        pins: Vec<(String, String)>,
+    ) -> Vec<(String, Vec<serde_json::Value>)> {
+        if pins.is_empty() {
+            return Vec::new();
+        }
+        let Some(tx) = self.tx.clone() else {
             return Vec::new();
         };
-        if !out.status.success() {
-            let error = String::from_utf8_lossy(&out.stderr).to_string();
-            self.audit_file(
-                inbox_fail_kind(&error),
-                serde_json::json!({
-                    "pin": pin,
-                    "error": error,
-                }),
-            );
+        let bin = self.cfg.toron_bin.clone();
+        let project = self.cfg.project.clone();
+        let state_dir = self.cfg.flywheel_state.clone();
+        let workspace = self.cfg.workspace.clone();
+        let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+            // No runtime (a sync caller): fetch inline rather than drop the
+            // rows — the cursor holds, so the next sweep re-fetches.
+            for (pin, since) in pins {
+                let rows = fetch_inbox_rows(&bin, &project, &state_dir, &workspace, &pin, &since);
+                let _ = tx.try_send(BrainMsg::InboxFetched { pin, rows });
+            }
             return Vec::new();
-        }
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
-        match &parsed {
-            serde_json::Value::Array(arr) => arr.clone(),
-            v if v.get("messages").is_some() => v
-                .get("messages")
-                .and_then(|m| m.as_array())
-                .cloned()
-                .unwrap_or_default(),
-            other if other.is_object() => vec![other.clone()],
-            _ => vec![],
-        }
+        };
+        handle.spawn_blocking(move || {
+            for (pin, since) in pins {
+                let rows = fetch_inbox_rows(&bin, &project, &state_dir, &workspace, &pin, &since);
+                // try_send: a full brain channel drops the batch, and the
+                // cursor only advances on delivery — so the next sweep
+                // re-fetches it (at-least-once, never at-most-once).
+                if tx.try_send(BrainMsg::InboxFetched { pin, rows }).is_err() {
+                    break;
+                }
+            }
+        });
+        Vec::new()
+    }
+
+    /// bd-1i8c: DETACH the ack-SLA scan. The scan walks every overdue
+    /// ack-required post in the project, so it is minutes-scale — it must
+    /// not sit inside the serial dispatch, and its own deadline must match
+    /// the scan (the shared 15s per-call ceiling killed it every minute, so
+    /// it never converged: 5,029 `ack_sla_error` rows). The overdue ids
+    /// come back as a `SlaFired` message.
+    fn scan_ack_sla_detached(&mut self) -> Vec<String> {
+        let Some(tx) = self.tx.clone() else {
+            return Vec::new();
+        };
+        let bin = self.cfg.toron_bin.clone();
+        let project = self.cfg.project.clone();
+        let state_dir = self.cfg.flywheel_state.clone();
+        let workspace = self.cfg.workspace.clone();
+        let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+            let posts = scan_ack_sla_rows(&bin, &project, &state_dir, &workspace);
+            let _ = tx.try_send(BrainMsg::SlaFired { posts });
+            return Vec::new();
+        };
+        handle.spawn_blocking(move || {
+            let posts = scan_ack_sla_rows(&bin, &project, &state_dir, &workspace);
+            let _ = tx.try_send(BrainMsg::SlaFired { posts });
+        });
+        Vec::new()
     }
 
     fn scan_ack_sla(&mut self) -> Vec<String> {
@@ -1774,47 +1948,15 @@ impl Host for FileHost {
         // overdue ack wakes; the daemon relays the expired ids it returns
         // and never invents overdue posts. Failures audit LOUD and yield
         // empty — the same at-least-once rule as `fetch_inbox`.
-        let out = run_cli(
+        //
+        // bd-1i8c: the scan's deadline is its OWN (minutes-scale), not the
+        // shared per-call ceiling that killed it every minute.
+        scan_ack_sla_rows(
             &self.cfg.toron_bin,
-            &["ack-sla", "--project", &self.cfg.project],
-            CLI_TIMEOUT_SECS,
-        );
-        let Some(out) = out else {
-            self.audit_file(
-                "ack_sla_error",
-                serde_json::json!({ "error": "toron spawn/timeout failed" }),
-            );
-            return Vec::new();
-        };
-        if !out.status.success() {
-            let error = String::from_utf8_lossy(&out.stderr).to_string();
-            // bd-r39p: name the skew here too. This arm opens the SAME shared
-            // store as the inbox arm, so it refuses for the same reason, but it
-            // wrote `ack_sla_error` and the fault was invisible under a probe
-            // keyed on the inbox kind.
-            self.audit_file(
-                if is_store_skew_refusal(&error) {
-                    "ack_sla_store_skew"
-                } else {
-                    "ack_sla_error"
-                },
-                serde_json::json!({
-                    "error": error,
-                }),
-            );
-            return Vec::new();
-        }
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
-        parsed
-            .get("expired")
-            .and_then(|e| e.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+            &self.cfg.project,
+            &self.cfg.flywheel_state,
+            &self.cfg.workspace,
+        )
     }
 
     /// Returns `true` when this death took the restart slot, `false` when it
@@ -2246,6 +2388,40 @@ mod tests {
 
     /// bd-r39p: the ack-SLA arm opens the SAME shared store as the inbox arm, so
     /// it refuses for the same reason — but it wrote `ack_sla_error` and a
+    /// bd-1i8c: the wake stream must NOT carry the ack-SLA reminder traffic.
+    ///
+    /// The reminder used to ride the kind-9 ROOM plane, where it competed
+    /// with real crew posts for the bus's capped rows (measured live: 95,077
+    /// of 100,000 rows were this one reminder) and every one of them was
+    /// forwarded into the doorbell's single-serial wake brain, which dropped
+    /// 1,879 real wake lines. toron moved the reminder to `ACK_SLA_WAKE`
+    /// (30015); the doorbell side owns the other half of that contract — the
+    /// watched kinds must not carry it.
+    #[test]
+    fn the_ack_sla_reminder_kind_is_not_watched() {
+        let watched: Vec<u16> = WATCH_KINDS
+            .split(',')
+            .filter_map(|k| k.trim().parse::<u16>().ok())
+            .collect();
+        assert!(
+            !watched.contains(&ACK_SLA_WAKE_KIND),
+            "the ack-SLA reminder must not ride the wake stream: {WATCH_KINDS}"
+        );
+    }
+
+    /// bd-1i8c: the ack-SLA scan's deadline must match the SCAN, not the
+    /// shared per-call ceiling. The scan walks every overdue ack-required
+    /// post in the project: under the 15s ceiling it was killed every minute
+    /// and never converged (5,029 `ack_sla_error` rows).
+    #[test]
+    fn the_ack_sla_scan_deadline_matches_the_scan() {
+        assert!(
+            ack_sla_scan_timeout_secs() > CLI_TIMEOUT_SECS,
+            "the scan is minutes-scale; the shared {}s ceiling killed it every minute",
+            CLI_TIMEOUT_SECS
+        );
+    }
+
     /// `/health` probe keyed on the inbox kind never saw it. Live 2026-09-28:
     /// the store refused every minute and the health body read `degraded: []`.
     /// The row kind is what an operator reads, so it has to name the fault.
