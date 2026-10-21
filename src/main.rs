@@ -5811,7 +5811,6 @@ mod steer_engine_tests {
     fn jev_live_enrich_keeps_table_without_key() {
         let authority = crate::authority::RuntimeAuthority {
             host: crate::authority::HostAuthority {
-                agent_name: None,
                 home: String::new(),
                 cwd: std::env::temp_dir(),
                 exe: std::env::temp_dir().join("flywheel"),
@@ -15579,12 +15578,11 @@ fn cmd_briefing(
         // bd-compose-plumbing-zdzi: the arriving pin — the ONE identity
         // ladder (env over config name), so the emitted wave-swarm argv can
         // bind `captain_pin` to the agent actually briefing.
-        agent_pin: select_reservation_identity(None, &|k| std::env::var(k).ok()).or_else(|| {
-            cfg.agent_mail
-                .as_ref()
-                .and_then(|m| m.name.clone())
-                .filter(|s| !s.trim().is_empty())
-        }),
+        agent_pin: crate::authority::select_agent_identity(
+            None,
+            &|k| std::env::var(k).ok(),
+            cfg.agent_mail.as_ref().and_then(|m| m.name.as_deref()),
+        ),
     };
     if world.joinable {
         eprintln!("{}", briefing::join_banner(&world));
@@ -20080,46 +20078,26 @@ fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
 /// ladder (bd-mail-actor-identity-nze, bd-reservation-identity-tlnf,
 /// bd-2mdo).
 ///
-/// Priority: explicit `--as` → `TORON_AGENT` → `FLYWHEEL_MAIL_AS` →
-/// `AGENT_NAME` → config `[agent_mail].name`; the env ladder mirrors toron's
+/// The selection half lives in [`crate::authority::select_agent_identity`] —
+/// explicit `--as` → `TORON_AGENT` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME` →
+/// config `[agent_mail].name`, the env ladder mirroring toron's
 /// `guard_agent` attribution order exactly (TORON_AGENT > FLYWHEEL_MAIL_AS >
-/// AGENT_NAME) — two orders was the seam where leases landed under one
-/// identity and commits were attributed to another. A selected token naming
-/// a REGISTERED mailbox identity passes through verbatim; only unregistered
-/// tokens defer to the spawn-registry → hash resolver.
+/// AGENT_NAME). One ladder, one implementation: two orders was the seam where
+/// leases landed under one identity and commits were attributed to another.
+/// A selected token naming a REGISTERED mailbox identity passes through
+/// verbatim; only unregistered tokens defer to the spawn-registry → hash
+/// resolver.
 fn resolve_mail_actor_roster(
     project: &str,
     explicit: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
     roster: &[String],
 ) -> Option<String> {
-    let token = select_reservation_identity(explicit, env)?;
+    let token = crate::authority::select_agent_identity(explicit, env, None)?;
     if roster.iter().any(|n| n == &token) {
         return Some(token);
     }
     Some(resolve_mail_target_registry(project, &token))
-}
-
-/// bd-reservation-identity-tlnf: the pure selection half of reservation
-/// identity — explicit `--as`, then the env ladder in the guard's exact
-/// order ([`resolve_mail_actor`] docs), empty values never winning. The
-/// caller feeds the real env lookup; tests inject closures.
-fn select_reservation_identity(
-    explicit: Option<&str>,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    if let Some(a) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(a.to_string());
-    }
-    for key in ["TORON_AGENT", "FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
-        if let Some(v) = env(key)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return Some(v);
-        }
-    }
-    None
 }
 
 /// Mail facade acting as resolved actor (registers identity best-effort).
@@ -40243,60 +40221,8 @@ mod reservation_identity_tests {
     use super::*;
     use toron_core::mailbox::guard::{Reservation, SHARED_SAFE_PATHS, guard_check_strict};
 
-    /// Pure selection: explicit --as wins, then the env ladder in the SAME
-    /// order the toron guard attributes commits (TORON_AGENT >
-    /// FLYWHEEL_MAIL_AS > AGENT_NAME); empty strings never win.
-    #[test]
-    fn reservation_identity_selection_matches_guard_order() {
-        let env = |k: &str| -> Option<String> {
-            match k {
-                "TORON_AGENT" => None,
-                "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
-                "AGENT_NAME" => Some("AgentName".into()),
-                _ => None,
-            }
-        };
-        // explicit beats everything
-        assert_eq!(
-            select_reservation_identity(Some("Explicit"), &env).as_deref(),
-            Some("Explicit")
-        );
-        // FLYWHEEL_MAIL_AS before AGENT_NAME (TORON_AGENT unset here)
-        assert_eq!(
-            select_reservation_identity(None, &env).as_deref(),
-            Some("MailAs")
-        );
-        // TORON_AGENT jumps the queue when set (guard parity)
-        let env_t = |k: &str| -> Option<String> {
-            match k {
-                "TORON_AGENT" => Some("Toron".into()),
-                "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
-                "AGENT_NAME" => Some("AgentName".into()),
-                _ => None,
-            }
-        };
-        assert_eq!(
-            select_reservation_identity(None, &env_t).as_deref(),
-            Some("Toron")
-        );
-        // empty-string vars are skipped, not selected
-        let env_empty = |k: &str| -> Option<String> {
-            match k {
-                "TORON_AGENT" => Some("  ".into()),
-                "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
-                _ => None,
-            }
-        };
-        assert_eq!(
-            select_reservation_identity(None, &env_empty).as_deref(),
-            Some("MailAs")
-        );
-        // nothing anywhere -> config default
-        assert_eq!(
-            select_reservation_identity(None, &|_| None).as_deref(),
-            None
-        );
-    }
+    // bd-05ar: the ladder's order test moved to `authority::tests` — it now
+    // lives with the ONE implementation it tests.
 
     /// bd-2mdo RED: an actor token that names a REGISTERED mailbox identity
     /// passes through VERBATIM — it is an address, not a herdr slug to
@@ -40340,9 +40266,9 @@ mod reservation_identity_tests {
     /// other attribution (the ~6 blocked commits failure mode).
     #[test]
     fn reservation_identity_holder_passes_own_commit_guard() {
-        let holder = select_reservation_identity(None, &|k| {
+        let holder = crate::authority::select_agent_identity(None, &|k| {
             (k == "AGENT_NAME").then(|| "IronSummit".to_string())
-        })
+        }, None)
         .expect("env-bound identity");
         let staged = vec!["src/main.rs".to_string(), "src/stages.rs".to_string()];
         let own = vec![Reservation {
