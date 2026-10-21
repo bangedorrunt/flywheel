@@ -9,9 +9,9 @@ spot-verified before it went in; the verification is stated inline.
 Live measurements are against the running system on 2026-10-21 (macOS, `~/.local/state`,
 `~/.local/share/toron`).
 
-**Summary: 9 S1, 16 S2, 10 S3.** The S1s are not nine bugs: five of them are the same
-defect seen from five ends (an ack-SLA flood), and the rest are identity, verdict
-preservation, and timeout faults.
+**Summary: 10 S1, 18 S2, 21 S3, 3 docs mismatches.** The S1s are not ten bugs: five of
+them are the same defect seen from five ends (an ack-SLA flood), and the rest are
+identity, verdict-preservation, replay-idempotency, and timeout faults.
 
 | Section | Severity | One line |
 |---------|----------|----------|
@@ -24,6 +24,7 @@ preservation, and timeout faults.
 | 7 | S1 | `br doctor --repair --allow-repeated-repair` destroys every gate verdict row: the "cannot be bypassed" guard has an ordinary-flag bypass |
 | 8 | S1 | three more paths rebuild the beads DB from the issues-only JSONL with **no** verdict guard |
 | 9 | S1 | one orphan FK row aborts the whole gates-sidecar reload, and the failure is swallowed at warn level |
+| 26 | S1 | toron: the durable-effect key is render-derived and the replay guard `check_replay` has **no production caller**: a changed re-render mints a second effect key and fires the external effect twice |
 | 10 | S2 | `flywheel arrive` refuses a **correct** arrival when the pane's pin is the captain alias |
 | 11 | S2 | `toron contact captain --pin` refuses a fold that **does** route in open mode; the error says the opposite |
 | 12 | S2 | the state lock's stale-steal is a TOCTOU: two writers can both hold "the lock" |
@@ -39,7 +40,12 @@ preservation, and timeout faults.
 | 22 | S2 | the spawn registry is append-only and resolves first-match: 12 pane ids carry 2-7 rows each |
 | 23 | S2 | the toron daemon runs a 3-day-old build |
 | 24 | S2 | the shipped claim recipe omits `--claim`, so the atomic claim guard does not run: two lanes can work one bead. And `br update --claim` without `--actor` stores `$USER` as the assignee |
-| 25 | S3 | waste and latent risk: hyphen pins, 6 legacy slug inboxes, ~100 fixture project dirs, unbounded full-file reads, `br ready` O(n^2), a full gates-sidecar rewrite per flush, the breaker cooldown, a blocking join on a Tokio worker, dead flags, and seven AGENTS.md claims the code contradicts |
+| 27 | S2 | toron-mcp: the shipped `action: park` is **refused** under `Enforced` and journals nothing under `Recording` - the park action cannot run, and a crash mid-park leaves no resume point |
+| 25 | S3 | waste and latent risk (flywheel + beads): hyphen pins, 6 legacy slug inboxes, ~100 fixture project dirs, unbounded full-file reads, `br ready` O(n^2), a full gates-sidecar rewrite per flush, the breaker cooldown, a blocking join on a Tokio worker, dead flags, and seven AGENTS.md claims the code contradicts |
+| 28 | S3 | toron: a second persisted `EffectState` bridged by a hand-written map, a poisoned-lock `.expect` on the delivery cursor, and a `--no-input` flag read by nobody |
+| 29 | S3 | toron perf: `fold_projected` scans the whole `events` log on every single-row read - including the dispatch hot path - and that table has no retention anywhere |
+| 30 | - | toron unwired/dead: four modules with no production caller (http_guard, bus/reconcile, verify_tripwire, and four `kernel.rs` re-exports) |
+| 31 | - | toron docs-vs-code: the workflow-engine park-resume claim, the buzz-parity busy-owner "Landed" claim, and ADR-0032 I8a all describe behavior the code does not have |
 
 ---
 
@@ -790,7 +796,187 @@ Two more claim-dialect problems in the same area:
 
 ---
 
-## 26. What was checked and found clean
+## 26. S1 - toron: the durable-effect key is render-derived, and the replay guard has no production caller
+
+`toron` `crates/toron-workflow/src/engine/boundary.rs:720-738` `derive_effect_key`
+hashes the **rendered** `action_digest`:
+
+```rust
+h.update(action_digest.as_bytes());   // <- the CURRENT render
+```
+
+`toron-mcp` `crates/toron-mcp/src/workflow_host.rs:296-309` `scoped_effect_key`
+computes that digest from the action **as it renders right now**
+(`action_digest_of(&redacted)`), and the production path never pre-mints a stable
+`run.effect_key` (no `effect_key = Some` anywhere in `workflow_host.rs`), so the
+render decides the key.
+
+`toron-core` `src/index/workflow_effects.rs:866-919` `prepare_effect` is idempotent
+**only on the key**: `INSERT ... ON CONFLICT (effect_key) DO NOTHING`. The stored
+`action_digest` is never compared with the incoming one, and the schema
+(`crates/toron-core/migrations/0010_workflow_effects.sql:31`) is
+`effect_key TEXT PRIMARY KEY` with **no** `(run_id, node_path)` uniqueness.
+
+The guard that would catch this exists and is **not wired**:
+
+- `crates/toron-workflow/src/engine/reconcile.rs:132` `check_replay` - and a second
+  copy at `crates/toron-workflow/src/identity.rs:222`.
+- Its only callers are `reconcile.rs:381` (inside the `#[cfg(test)]` mod that starts
+  at line 280) and `tests/jido_contracts.rs:387`. **No production caller.**
+
+**Break path:** a run parks at node M; the operator edits M's template, or M renders
+a timestamp / counter / step-output that differs on re-drive; the re-drive renders a
+different digest, mints a different key, and `prepare_effect` inserts a **second**
+`workflow_effects` row for the same logical node. Both rows are independent, so the
+same external effect fires twice and neither row knows about the other.
+
+That is exactly the invariant ADR-0032 states twice
+(`docs/decisions/0032-*.md:146` - "once an effect reaches `prepared`, its normalized
+action identity and effect key are fixed for that logical node; retry/recovery cannot
+re-render a different logical effect under the same run/node"; and `:759` - "a changed
+replay render cannot silently mint a new effect key"), and it is the checklist item
+`~/.agents/skills/elm-effect/references/migrate-toron.md:24` ("A replay digest
+mismatch does not mint a second effect key").
+
+**Correction to my own earlier reading:** I had recorded that item as SATISFIED
+because `check_replay` exists. It exists; it is never called. The toron audit
+checked the callers, and the callers are the finding.
+
+---
+
+## 27. S2 - toron: the shipped park action cannot run at all
+
+`toron` `crates/toron-workflow/src/engine/control_flow.rs:719-735` - the park path
+reads the **sync** runner:
+
+```rust
+let stored: Arc<Option<EffectRunner>> = ctx.get_dependency::<Option<EffectRunner>>();
+let Some(runner) = (*stored).clone() else {
+    if *mode == EffectJournalMode::Enforced {
+        return Err(... "park REFUSED - no EffectRunner is injected ..." );
+    }
+    eprintln!("... park wrote NO effect-journal row ({EFFECT_JOURNAL_BYPASSED}) ...");
+    return Ok(None);
+};
+```
+
+The production host injects only the **async** runner
+(`crates/toron-mcp/src/workflow_host.rs:1148-1151`
+`local_with_async_effect_runner(effect: Option<AsyncEffectRunner>)`); the sync
+`Option<EffectRunner>` dependency has exactly one injection site
+(`crates/toron-workflow/src/engine/mod.rs:503`) and the MCP host never uses it.
+`Action::Park` is `ActionPartition::EngineControl`
+(`crates/toron-workflow/src/engine/boundary.rs:423`), so it never reaches the async
+runner either.
+
+**Both branches are broken:**
+
+- Under `Enforced`: every `action: park` step returns "park REFUSED - no
+  EffectRunner is injected". The shipped park action cannot run.
+- Under `Recording`: `journal_park_intent` returns `Ok(None)` and **no `Parked` row
+  is written at all**.
+
+The only live park test (`crates/toron-workflow/src/engine/tests.rs:3595`) uses
+`Recording`, which takes the bypass branch and can never see the enforced failure.
+
+**Scope:** toron-mcp-local. flywheel does not use toron's `Action::Park` - its
+`FenceAction::Park` (`flywheel/src/pane.rs:1079`) is its own in-process busy-owner
+sleep, a different mechanism.
+
+---
+
+## 28. S3 - toron: a second persisted EffectState, a poisoned-lock panic, a dead flag
+
+- **A second persisted `EffectState` inside toron-core itself.**
+  `crates/toron-core/src/index/workflow_effects.rs:162` persists toron's own enum in
+  `workflow_effects.state`, while `crates/toron-core/src/journal.rs:196-209` persists
+  the framework's state (`row.state.to_string()`) into `effect_journal.state`. The
+  two vocabularies are bridged by a hand-written variant-for-variant map at
+  `crates/toron-workflow/src/engine/reconcile.rs:54-68` (`kernel_state`). The parity
+  test (`crates/toron-workflow/src/engine/elm.rs:66-77`) pins only `can_transition`;
+  the persisted **spellings** agree today but nothing pins them, and a variant added
+  to one enum fails to compile rather than failing a test.
+- **`crates/toron-workflow/src/delivery_cursor.rs:84`** (also `:103`, `:135`, `:183`,
+  `:217`, `:233`, `:263`) - `.expect("delivery cursor lock")` on a `std::sync::Mutex`:
+  a panic while the lock is held poisons it, and every later call panics instead of
+  degrading. Every guarded body is currently panic-free (`BTreeMap`/`String` only),
+  so it is latent - but the rest of the repo uses `PoisonError::into_inner` (41 sites
+  in `workflow_host.rs`, 10 in `send_armor.rs`), so this file is the odd one out.
+- **`crates/toron-cli/src/cli.rs:60`** - `--no-input` is declared as a global flag
+  and read **nowhere** in the repo (the only occurrence of the identifier is the
+  definition). A user passing it gets no behavior change and no warning.
+
+---
+
+## 29. S3 - toron perf: full-log folds on the dispatch hot path
+
+- **`crates/toron-core/src/index/workflow_effects.rs:1040`** - `fold_projected` does
+  `read_since(0)`, a full scan of the `events` table, and `get_effect`
+  (`:1261-1268`) calls it for **every single-row read**. `get_effect` sits on the
+  dispatch hot path (`claim_attempt:1354`, `settle_with_fence:1498`). The `events`
+  table has **no retention anywhere** (no `DELETE FROM events` in the repo), so the
+  scan grows without bound; the `ponytail:` note at `:1035` assumes "run-scoped
+  (hundreds of rows)", which the table shape does not enforce.
+  (`bus/event_store.rs:26` `MAX_STORED_EVENTS` bounds a *different* table,
+  `bus_events`.)
+- **`crates/toron-core/src/mailbox/receipts.rs:475`** - `fold_projected` also does
+  `read_since(0)`, so every `get` (`:508-509`) and `list` (`:513-523`) folds the
+  whole log. A corr-scoped reader exists
+  (`crates/toron-core/src/index/event_log.rs:191` `read_for_corr`, indexed by
+  migration 0014) but is used only by `is_tombstoned` (`receipts.rs:310`).
+- **`crates/toron-core/src/mailbox/receipts.rs:656-667` and `:691-702`** - the prune
+  loops append one log event per deleted corr **inside the open transaction**: N
+  round-trips per prune, all held under the write lock.
+- **`crates/toron-core/src/mailbox/reservations.rs:563`** - `next_epoch_at`
+  (`:1618-1635`) replays the **entire bus** to compute one epoch, and it is called
+  **inside** the per-path loop (`:506-599`); `kernel_model_for` (`:510`) is rebuilt
+  per path as well, so an N-path acquire does N full bus replays.
+
+---
+
+## 30. Unwired / dead (toron)
+
+- `crates/toron-core/src/bus/http_guard.rs:16` (`is_private_ip`), `:80`
+  (`clamp_feed_limit`) - no production caller in toron or flywheel; only the unit
+  tests and the `bus/mod.rs:44` re-export. Already documented as a deliberate park
+  because `call_webhook` is fail-closed `Unsupported`
+  (`docs/decisions/0039-*.md:28`).
+- `crates/toron-core/src/bus/reconcile.rs:76` (`sync_delta`), `:132` (`sync_replay`) -
+  reachable only from `crates/toron-e2e/tests/sc14b_negentropy_rejoin.rs:51,94`; no
+  production DR/rejoin path calls them, so negentropy sync is e2e-only.
+- `crates/toron-core/src/bus/verify_tripwire.rs:22` (`assert_stage_before`), `:39`
+  (`StageTrace`), `:75` (`publish_source_verify_before_side_effects`) - no production
+  caller; the live guard is `bus/common.rs:12` (`verify_publish_event`), called from
+  `bus/in_process.rs:446` and `bus/relay_bus.rs:247`.
+- `crates/toron-core/src/kernel.rs:47` (`FileLog`), `:49` (`EpochLog`, `Fence`), `:59`
+  (`Gone`), `:60` (`TransitionError`, `transition`) - re-exported with zero
+  consumers (`kernel::X` matches nowhere in toron); `kernel::JournalRead` **is**
+  used, so this is per-item, not per-line.
+
+---
+
+## 31. Docs-vs-code mismatches (toron)
+
+- `docs/guides/workflow-engine.mdx:67` - "the intent is journaled **before** waiting,
+  so a crash mid-park leaves a `Parked` row a later run resumes from": false in the
+  shipped host on both branches (see §27). Under `Enforced` the park is refused;
+  under `Recording` no row is written at all. The only writer of that row is
+  `park_effect` (`crates/toron-core/src/index/workflow_effects.rs:928-1023`), whose
+  sole production caller is the approval/spawn **pending drain**
+  (`crates/toron-mcp/src/workflow_host.rs:2491-2522`) - a different key scheme
+  (`park:<run>:<node>:<promise>`) on a different trigger.
+- `docs/guides/buzz-parity.mdx:34` - "SleepUntilDeadline journal/park -> **Journaled
+  park effect on fenced busy-owner** | **Landed**": the busy-owner `SleepUntilDeadline`
+  park is an in-process `tokio::time::sleep` + `pool.deadline_wake`
+  (`crates/toron-mcp/src/workflow_host.rs:811-830`) with no `Parked` row, no journal
+  row, and nothing to resume from after a crash. The journaled `Parked` effect that
+  exists belongs to the approval/spawn path, not to the busy-owner fence.
+- `docs/decisions/0032-*.md:146` and `:759` - I8a and the "changed replay render
+  cannot silently mint a new effect key" invariant are **not implemented** (§26).
+
+---
+
+## 32. What was checked and found clean
 
 - **Reducer purity (the Tick Law) holds.** `flywheel/src/workspace.rs:1567`
   `workspace::tick`, `crates/doorbell-core/src/lib.rs:760` `doorbell_core::tick`, and
@@ -827,12 +1013,65 @@ Two more claim-dialect problems in the same area:
   twice into the same state and commands; `:203` a close with no PASS row leaves the
   status open; `:280` importing issues without `gates.jsonl` leaves the verdict table
   empty. All three "Done" items on the beads checklist are **satisfied**.
-- **The toron "Done" checklist is satisfied**: one persisted `EffectState`
-  (`crates/toron-core/src/index/workflow_effects.rs:162`; `boundary::EffectState` is
-  gone), `plan_attempt` parity against the framework on every transition pair
-  (`crates/toron-workflow/src/engine/elm.rs:64-79`), `PARK_MAX_WAIT_SECS` still 86400
-  (`engine/park.rs:70`), and a replay digest mismatch mints no second effect key
-  (`engine/reconcile.rs:132`).
+- **The toron "Done" checklist is satisfied except for the replay-key item** (§26):
+  `plan_attempt` (`crates/toron-workflow/src/engine/reconcile.rs:72-114`) matches
+  the framework arm-for-arm (`elm-effect-rs/crates/elm-effect-journal/src/plan.rs:199-234`)
+  - `Prepared` dispatches, `ReconcilePending` refuses, `ResumeParked` uses
+  `attempt.max(1)`, `RetrySameKey` uses `attempt + 1`, query beats idempotency, a
+  live lease beats both; only reason strings differ, which `reconcile.rs:402`
+  deliberately ignores. The vendored copy matches framework HEAD.
+  `may_settle` is a single copy; `settle_with_fence` refuses an empty presented
+  token and a claim-token mismatch. No `Parked` edge in either transition table
+  (framework `elm-effect-journal/src/lib.rs:118-145`, toron
+  `workflow_effects.rs:242-265`), pinned pairwise by `engine/elm.rs:66-77`.
+  `PARK_MAX_WAIT_SECS = 86_400` (`crates/toron-workflow/src/engine/park.rs:70`),
+  matched against the framework ceiling in `engine/elm.rs:60-64`; a longer wait is
+  a typed `RefusedTooLong`, never a truncation. `park_effect` writes the `Parked`
+  row and the `workflow_pending` row in one transaction, keyed
+  `UNIQUE (run_id, promise_id, park_generation)`.
+  **The one item that fails is the replay-key item** (§26) - I had marked it
+  satisfied from the function's existence; it is never called.
+- **toron's durable identity is exact.** `parse_l16` requires the full producer
+  triple or returns `PartialIdentity` (`crates/toron-core/src/inbox.rs:235-257`);
+  `append_checked` (`:388`) enforces the seq gap and the stale-epoch fence;
+  `UNIQUE (producer, epoch, seq)` (`migrations/0019_comms_inbox_log.sql:23`); offsets
+  are minted zero-padded to the framework's 20-digit format (`inbox.rs:229-232`) -
+  no hand-built offset, no seq gap, no epoch-only producer id, no `UpToDate`-as-EOF.
+- **toron's dispatch ordering holds.** `prepare_and_claim`
+  (`crates/toron-mcp/src/workflow_host.rs:2773-2859`) prepares, claims under a fence,
+  runs the provider once, then `settle_with_fence`: no provider-before-intent, no
+  double-settle, and `unknown` is never reported as success (`journal.rs:517` writes
+  `Unknown` + `Reconcile`, `JOURNAL_BRIDGE_TIMEOUT` 30 s at `journal.rs:39`).
+- **toron's send armor has the mandated order.** Breaker outside, timeout and
+  bulkhead inside, fallback at the call site, no hand-rolled retry
+  (`crates/toron-mcp/src/send_armor.rs:198-200`, `:117-176`, `:369-434`); a hung send
+  maps to `Ambiguous`, a proven failure to a typed error, never a provider failure;
+  a cancelled probe releases the breaker (`send_armor.rs:148-161`).
+- **toron's fences release.** `with-lease` always releases - success, failure,
+  refusal, and signal (128+signum) (`crates/toron-cli/src/with_lease.rs:155-159`,
+  `:208-212`, `:241-253`, `:353-365`). `try_acquire_fenced` compares generations and
+  rolls back on a race loss (`crates/toron-workflow/src/dispatch.rs:266-310`); the
+  permit's `Drop` emits a generation-aware release (`:547`).
+  `DeliveryCursor::restore` takes the max cursor and never shrinks a live store
+  (`delivery_cursor.rs:102-108`); `ReservationGuard::Drop` releases in-flight ids on
+  cancel/panic/early return (`:270-282`); agent-key signing is explicitly **not**
+  delivery proof (`:324`).
+- **toron's Buzz-parity honesty list holds.** Presence is fail-closed on the store
+  health probe (`bus/in_process.rs:466-469`); `Deferred`/`Buffered` map to
+  `EffectState::Accepted`, never `Settled` (`workflow_host.rs:2671`, `:120`);
+  `Exhausted` Transient becomes `ProvenFailed` plus a whole-batch DLQ with no
+  force-retry (`:229-252`); a timer `NoSigner` becomes a DLQ, never a silent drop
+  (`:1985-1996`). Verify-before-route is live: `bus/common.rs:12`
+  `verify_publish_event` runs before the store insert and before fanout in both
+  `bus/in_process.rs:446` and `bus/relay_bus.rs:247`.
+- **toron's catalog matches the tool surface.** `docs/catalog/toron-mcp.json`
+  (38 tools / 25 resources / 34 CLI commands) matches
+  `toron_mcp::catalog::PARITY_TOOL_COUNT = 38` (`crates/toron-cli/src/catalog.rs:138`);
+  the `catalog_freshness` gate exists (`catalog.rs:234`). Every `cli.rs` arg field
+  is read in non-test code **except** `--no-input` (§28).
+- **`crates/toron-core/src/journal.rs` is not dead code** - `ToronJournal` is
+  consumed in production by flywheel (`/Users/bangedorrunt/workspace/flywheel/src/supervisor_host.rs:948-973,1643`),
+  and `mailbox/newest_call_sites.rs` is `#![cfg(test)]` test support.
 - **Every flywheel -> toron/beads/doorbell/herdr CLI argv matches the real surface.**
   All 8 herdr verbs flywheel invokes exist on this machine (`attach`, `api schema`,
   `agent list`, `agent prompt`, `agent rename`, `agent status`, `pane list`,
@@ -880,7 +1119,7 @@ Two more claim-dialect problems in the same area:
 
 ---
 
-## 27. Operator actions (not taken here)
+## 33. Operator actions (not taken here)
 
 | Action | Why | Risk |
 |---|---|---|
@@ -891,6 +1130,9 @@ Two more claim-dialect problems in the same area:
 | restart the doorbell daemon | it has been up 3 d 15 h and is the component dropping wakes | wakes pause for the drain window |
 | **do not** run `br doctor --repair` on this repo | `--allow-repeated-repair` bypasses the verdict guard; 744 gate rows are at risk | the guard works only while the flag is absent |
 | gate `--allow-repeated-repair` behind `BR_OPERATOR` in beads | it is the only unguarded verdict-loss path | needs a beads release |
+| wire `check_replay` into toron's dispatch path, or pre-mint a stable `RunContext.effect_key` | ADR-0032 I8a is unenforced: a changed re-render mints a second effect key and fires the external effect twice | needs a toron release; the fix is one comparison at the prepare site |
+| make toron's park path read the async runner (or inject the sync one in the MCP host) | every `action: park` in toron-mcp is refused under `Enforced`, and writes no journal row under `Recording` | toron-mcp-local; needs a toron release |
+| prune toron's `events` table or index `fold_projected` by run | `get_effect` folds the whole log on the dispatch hot path and the table has no retention | needs a toron release; the live store is small today |
 
 ---
 
