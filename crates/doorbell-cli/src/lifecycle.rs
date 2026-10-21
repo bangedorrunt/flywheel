@@ -1499,6 +1499,21 @@ pub fn strip_host_args(args: &[String]) -> Vec<String> {
 /// autostarted daemon hosts the same live workspaces as a `start` child
 /// and the unit and the pidfile path never diverge (bd-0zcr.2 unit 4).
 /// Empty hosts = standby (bind + reads only), same as `start`.
+/// The absolute path of a CLI the daemon must spawn, or an empty string when
+/// it cannot be resolved (bd-24mm).
+///
+/// The rendered unit carries these so the daemon does not have to resolve
+/// them inside launchd's minimal environment. An empty value renders as an
+/// empty `<string>` — the daemon's own resolver then falls back to its
+/// search, and its fail-closed gate refuses loudly if the bin is still
+/// missing. That is the right place for the failure: the installer does not
+/// invent a path.
+fn resolved_bin_value(name: &str) -> String {
+    doorbell_rt::binpath::resolve_cli(name)
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
 pub fn render_autostart(
     exe: &str,
     state_dir: &str,
@@ -1525,6 +1540,29 @@ pub fn render_autostart(
             .replace("DOORBELL_TORON_MCP_URL_VALUE", toron_mcp_url)
             .replace("DOORBELL_TORON_MCP_URL_KEY", "TORON_MCP_URL")
             .replace("DOORBELL_SERVE_ARGS", &args.join("\n        "))
+            // bd-24mm: launchd gives the job no HOME and a PATH without
+            // ~/.local/bin, so the daemon cannot resolve herdr and its
+            // fail-closed boot gate (bd-fuql) refuses to host anything. The
+            // installer resolves both bins while HOME is still available and
+            // names them here; the daemon's env override wins verbatim. A bin
+            // that does not resolve is left out: the install must not invent
+            // a path, and the daemon then refuses loudly on its own terms.
+            .replace(
+                "DOORBELL_TORON_BIN_KEY",
+                doorbell_rt::binpath::TORON_BIN_ENV,
+            )
+            .replace(
+                "DOORBELL_HERDR_BIN_KEY",
+                doorbell_rt::binpath::HERDR_BIN_ENV,
+            )
+            .replace(
+                "DOORBELL_TORON_BIN_VALUE",
+                &resolved_bin_value("toron"),
+            )
+            .replace(
+                "DOORBELL_HERDR_BIN_VALUE",
+                &resolved_bin_value("herdr"),
+            )
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2042,6 +2080,49 @@ mod tests {
     }
 
     #[test]
+    /// bd-24mm: launchd runs the job with no HOME and a PATH that does not
+    /// include ~/.local/bin, so the daemon cannot resolve herdr and its
+    /// fail-closed boot gate (bd-fuql) refuses to host anything. The unit
+    /// must carry the absolute bin paths.
+    #[test]
+    fn the_unit_carries_the_absolute_bin_paths_the_daemon_must_spawn() {
+        let hosts = vec![("proj".to_string(), "ws".to_string())];
+        let body = render_autostart(
+            "/opt/doorbell",
+            "/var/dbll",
+            18980,
+            "/var/fw",
+            &hosts,
+            "http://127.0.0.1:18080/mcp",
+        );
+        for key in [
+            doorbell_rt::binpath::TORON_BIN_ENV,
+            doorbell_rt::binpath::HERDR_BIN_ENV,
+        ] {
+            assert!(
+                body.contains(key),
+                "the unit must carry {key}: launchd gives the job no HOME"
+            );
+        }
+        // The placeholder tokens must be resolved, not shipped verbatim.
+        for token in [
+            "DOORBELL_TORON_BIN_KEY",
+            "DOORBELL_HERDR_BIN_KEY",
+            "DOORBELL_TORON_BIN_VALUE",
+            "DOORBELL_HERDR_BIN_VALUE",
+        ] {
+            assert!(!body.contains(token), "{token} placeholder resolved");
+        }
+        // A bin that resolves is named by its ABSOLUTE path: the daemon's
+        // env override wins verbatim, so a relative name would not help.
+        if let Some(toron) = doorbell_rt::binpath::resolve_cli("toron") {
+            assert!(
+                body.contains(&toron.display().to_string()),
+                "the unit names the resolved toron path"
+            );
+        }
+    }
+
     fn render_substitutes_live_paths() {
         let hosts = vec![("proj".to_string(), "ws".to_string())];
         let body = render_autostart(
