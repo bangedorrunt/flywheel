@@ -534,6 +534,19 @@ fn commit_is_bookkeeping_only(cwd: &Path, sha: &str) -> anyhow::Result<bool> {
 /// subject-carries-bracketed-id)` rows. Pure so both occurrence shapes are
 /// unit-testable without git. Tiers, newest-first inside each: bracketed
 /// subject citation, bare subject mention, body-only fallback.
+/// Rank the candidates by citation tier.
+///
+/// The tiers ORDER the candidates, strongest first: a bracketed subject
+/// citation, then a bare subject mention, then a body-only
+/// mention, newest first inside a tier.
+///
+/// The tiers EXCLUDE the lower ones when a stronger tier is present - that is
+/// what keeps a prose thief from moving the binding off the commit that
+/// carries the work. The caller therefore filters the bookkeeping-only
+/// commits out of the candidate set BEFORE calling this: a bookkeeping
+/// commit that cites the id in its subject would otherwise hide the work
+/// commit that cites it in its body, and the bound revision would become the
+/// ceremony's own bookkeeping commit.
 fn rank_binding<'a>(parsed: &'a [(String, bool, bool)], candidates: &[&'a str]) -> Vec<&'a str> {
     let cited: Vec<&str> = parsed
         .iter()
@@ -628,15 +641,41 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     // each tier. Every close this crew ships cites `[bd-xxxx]` in the
     // subject, so tier 1 resolves exactly as before; only prose thieves
     // move down.
-    let ranked: Vec<&str> = rank_binding(&parsed, &candidates);
-    for sha in &ranked {
-        if !commit_is_bookkeeping_only(cwd, sha)? {
-            return Ok((*sha).to_string());
+    //
+    // The bookkeeping-only commits are dropped BEFORE the ranking, not after
+    // it: the ranking returns only the strongest citation tier,
+    // so a bookkeeping commit that cites the id in its SUBJECT - which is
+    // exactly what `chore(beads): close <id>` does - used to hide the work
+    // commit that cites it in its BODY. The bound revision then became the
+    // ceremony's own bookkeeping commit: a LEGAL close that proves nothing,
+    // because that commit carries no work. Measured on the toron repo:
+    // two beads were both bound to a `chore(beads)` commit.
+    let mut work_candidates: Vec<&str> = Vec::new();
+    let mut bookkeeping_candidates: Vec<&str> = Vec::new();
+    for sha in &candidates {
+        if commit_is_bookkeeping_only(cwd, sha)? {
+            bookkeeping_candidates.push(sha);
+        } else {
+            work_candidates.push(sha);
         }
     }
-    // Every candidate is bookkeeping-only: the id is still attributable and
-    // "no commit carries the id" would be a lie that reopens a legal close.
-    Ok(ranked[0].to_string())
+    if work_candidates.is_empty() {
+        // Every candidate is bookkeeping-only: the id is still attributable
+        // and "no commit carries the id" would be a lie that reopens a legal
+        // close. Bind the strongest citation among them.
+        let ranked = rank_binding(&parsed, &bookkeeping_candidates);
+        return Ok(ranked
+            .first()
+            .copied()
+            .unwrap_or_else(|| candidates.first().copied().unwrap_or_default())
+            .to_string());
+    }
+    let ranked = rank_binding(&parsed, &work_candidates);
+    Ok(ranked
+        .first()
+        .copied()
+        .unwrap_or_else(|| work_candidates.first().copied().unwrap_or_default())
+        .to_string())
 }
 
 /// Git stdout for `args` in `cwd`, trimmed of the trailing newline.
@@ -2278,6 +2317,54 @@ mod tests {
             .output()
             .expect("resolve HEAD");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A bookkeeping commit that cites the bead id in its SUBJECT must not
+    /// replace the work commit that cites it in its BODY.
+    ///
+    /// The tiers used to be exclusive: a subject citation returned only the
+    /// subject candidates, so the body-only work commit was never a candidate.
+    /// The ceremony's own bookkeeping commit (`chore(beads): close <id>`)
+    /// cites the id in its subject, so it won outright and the bound revision
+    /// became the commit that carries no work - a LEGAL close that proves
+    /// nothing.
+    ///
+    /// This workspace has no subject citation other than the bookkeeping one,
+    /// so the bound revision has exactly one possible answer: the work commit.
+    #[test]
+    fn derive_head_sha_falls_through_to_a_body_cited_work_commit() {
+        let dir = std::env::temp_dir().join(format!("sha-body-fallthrough-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".beads")).unwrap();
+        let init = StdCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init");
+        let bead_id = "bead-fixture-body";
+        // The WORK commit: the id rides the BODY, as a lane that forgot the
+        // subject writes it.
+        std::fs::write(dir.join("work.txt"), "work\n").unwrap();
+        commit_all(
+            &dir,
+            &format!("fix(engine): the change\n\nBead: {bead_id}\n"),
+        );
+        let work = head_sha(&dir);
+        // The ceremony's bookkeeping commit: the id rides the SUBJECT.
+        std::fs::write(
+            dir.join(".beads/gates.jsonl"),
+            "{\"gate\":\"command-verified\",\"passed\":true}\n",
+        )
+        .unwrap();
+        commit_all(&dir, &format!("chore(beads): close {bead_id}"));
+        assert_ne!(work, head_sha(&dir), "HEAD moved past the work commit");
+        assert_eq!(
+            derive_head_sha(&dir, bead_id).unwrap(),
+            work,
+            "a bookkeeping commit that cites the id in its subject must not become the bound \
+             revision: the bound revision is the commit that carries the work"
+        );
     }
 
     // ---- harden the SHA binding against bookkeeping-only commits ----
