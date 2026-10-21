@@ -8,8 +8,6 @@
 
 use std::time::Duration;
 
-use crate::authority::{Clock, SystemClock};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerState {
     Closed,
@@ -37,12 +35,6 @@ impl ConsecutiveBreaker {
         }
     }
 
-    /// Compatibility boundary for callers not yet migrated to authority.
-    #[allow(dead_code)]
-    pub fn allows(&mut self) -> bool {
-        self.allows_at(SystemClock.now_unix())
-    }
-
     pub fn allows_at(&mut self, now_unix: u64) -> bool {
         if self.half_open {
             return false;
@@ -51,28 +43,22 @@ impl ConsecutiveBreaker {
             return true;
         };
         if now_unix.saturating_sub(opened_at) >= self.cooldown.as_secs() {
+            // bd-722a: the cooldown RESETS the count. The old code kept it, so
+            // the count stayed at the threshold and every later failure
+            // re-opened the breaker immediately — the pane could never
+            // recover. The half-open probe is ONE trial: its failure counts as
+            // one failure, not as threshold-plus-one.
+            self.failures = 0;
             self.half_open = true;
             return true;
         }
         false
     }
 
-    /// Compatibility boundary for callers not yet migrated to authority.
-    #[allow(dead_code)]
-    pub fn record_success(&mut self) {
-        self.record_success_at();
-    }
-
     pub fn record_success_at(&mut self) {
         self.failures = 0;
         self.opened_at = None;
         self.half_open = false;
-    }
-
-    /// Compatibility boundary for callers not yet migrated to authority.
-    #[allow(dead_code)]
-    pub fn record_failure(&mut self) {
-        self.record_failure_at(SystemClock.now_unix());
     }
 
     pub fn record_failure_at(&mut self, now_unix: u64) {
@@ -141,6 +127,28 @@ mod tests {
         assert!(b.allows_at(203));
         b.record_success_at();
         assert_eq!(b.state(), BreakerState::Closed);
+    }
+
+    /// bd-722a: the cooldown RESETS the failure count.
+    ///
+    /// The old code kept it, so the count stayed at the threshold and the
+    /// breaker could never recover: every later failure re-opened it
+    /// immediately. The cooldown is the reset.
+    #[test]
+    fn breaker_cooldown_resets_the_failure_count() {
+        let mut b = ConsecutiveBreaker::new(2, Duration::from_secs(50));
+        b.record_failure_at(100);
+        b.record_failure_at(101);
+        assert_eq!(b.failures, 2, "two failures hit the threshold");
+        assert_eq!(b.state(), BreakerState::Open);
+        // The cooldown elapses: the count is reset and the next call is
+        // allowed as the ONE half-open trial.
+        assert!(b.allows_at(151));
+        assert_eq!(
+            b.failures, 0,
+            "the cooldown resets the failure count — a pane that failed twice must be able to recover"
+        );
+        assert_eq!(b.state(), BreakerState::HalfOpen);
     }
 
     #[test]

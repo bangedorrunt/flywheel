@@ -620,9 +620,16 @@ pub fn inject_wake_in(
 ) -> Result<String, InjectDeny> {
     // Same-second ratchet: scan the scope journal tail for an identical
     // pin+line stamped this same second.
+    //
+    // bd-722a: the journal is rotation-bounded (4,000 lines) and the ratchet
+    // only ever looks at the LAST 32 rows, but the old code read the WHOLE
+    // file to find them. The tail is seeked to (the same shape as
+    // `rotate_audit_if_oversized`), so the read is bounded by bytes.
     let journal_path = doorbell_rt::FileStore::new(state_dir).journal_file(workspace);
-    if let Ok(raw) = std::fs::read_to_string(&journal_path) {
-        for row in raw.lines().rev().take(32) {
+    let journal_tail =
+        crate::state::read_tail_lines(&journal_path, 32, 256 * 1024).unwrap_or_default();
+    {
+        for row in journal_tail.iter().rev().take(32) {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(row) else {
                 break;
             };

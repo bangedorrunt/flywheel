@@ -106,14 +106,56 @@ where
     // The wait must never park an async worker: inside a runtime it hops to
     // a plain thread for the block (the old per-leaf spawn did the same by
     // accident of design); outside one it blocks inline with no spawn.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || wait.blocking_recv())
+    //
+    // bd-722a: the hop alone did NOT unblock the worker — the `.join()` right
+    // after it parked the async worker for the whole wait, which is the exact
+    // case this module's doc cites as its motivation. On a multi-threaded
+    // runtime `block_in_place` hands the worker back to the pool while we
+    // wait; on a current-thread runtime there is no other worker to hand it
+    // to, so the plain-thread hop stays.
+    let reply = match tokio::runtime::Handle::try_current().ok() {
+        Some(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(move || wait.blocking_recv())
+        }
+        Some(_) => std::thread::spawn(move || wait.blocking_recv())
             .join()
-            .map_err(|_| anyhow::anyhow!("journal wait thread panicked"))?
-            .map_err(|_| anyhow::anyhow!("journal executor died before settling the submit"))?
+            .map_err(|_| anyhow::anyhow!("journal wait thread panicked"))?,
+        None => wait.blocking_recv(),
+    };
+    reply.map_err(|_| anyhow::anyhow!("journal executor died before settling the submit"))?
+}
+
+/// Drive one provider-nested future to completion on its own runtime, never
+/// on the shared journal pool. Provider code runs inside a dispatched journal
+/// future (the mail sender, the roster lookup, the intent probe); sending
+/// that work back through the pool nests pool work inside pool work, which
+/// deadlocks once every worker is waiting on a nested submit (four such
+/// dispatches exhaust the four workers and nothing ever completes).
+///
+/// This lane owns no shared worker: a fresh current-thread runtime per call,
+/// on this thread in sync contexts or on one spawned plain thread inside an
+/// async context. One thread plus one runtime per call is the whole cost, and
+/// it cannot deadlock no matter how deep the nesting goes — nothing it waits
+/// on holds a journal worker. Do not use it for journal writes: those need
+/// the pool's FIFO ordering, which this lane deliberately does not provide.
+fn submit_provider_wait<F, T>(fut: F) -> Result<T>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let run = move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("provider runtime: {e}"))?
+            .block_on(fut)
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(run)
+            .join()
+            .map_err(|_| anyhow::anyhow!("provider wait thread panicked"))?
     } else {
-        wait.blocking_recv()
-            .map_err(|_| anyhow::anyhow!("journal executor died before settling the submit"))?
+        run()
     }
 }
 
@@ -938,7 +980,10 @@ mod tests {
         let inner: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
             let store = probe_store.clone();
             let k = probe_key.clone();
-            let row = submit_journal_wait(async move { store.get_effect(&k).await })
+            // The probe runs inside the dispatched provider, so it takes the
+            // nested lane: the pool path would nest pool work inside pool
+            // work and starve under parallel tests.
+            let row = submit_provider_wait(async move { store.get_effect(&k).await })
                 .expect("probe read")
                 .expect("the intent row exists before the provider runs");
             *seen_c.lock().unwrap() = Some(row.state);
