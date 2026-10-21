@@ -34,6 +34,16 @@
         <string>DOORBELL_STATE_DIR_VALUE</string>
         <key>DOORBELL_TORON_MCP_URL_KEY</key>
         <string>DOORBELL_TORON_MCP_URL_VALUE</string>
+        <!-- bd-24mm: launchd runs the job with a minimal environment - no
+             HOME, and a PATH that does not include ~/.local/bin - so the
+             daemon cannot resolve herdr and its fail-closed boot gate
+             (bd-fuql) refuses to host anything. The installer resolves both
+             bins while HOME is still available and writes the absolute paths
+             here; the daemon's env override wins verbatim. -->
+        <key>DOORBELL_TORON_BIN_KEY</key>
+        <string>DOORBELL_TORON_BIN_VALUE</string>
+        <key>DOORBELL_HERDR_BIN_KEY</key>
+        <string>DOORBELL_HERDR_BIN_VALUE</string>
     </dict>
 </dict>
 </plist>
