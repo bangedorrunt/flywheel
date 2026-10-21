@@ -41,7 +41,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -760,7 +760,7 @@ pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
         .unwrap_or_default();
     let merged = fold_legacy_alias(project, &spawn_registry_key(project), current);
     if !merged.is_empty() {
-        return merged;
+        return dedupe_spawn_entries(merged);
     }
     // bd-enov (F12): the state-dir registry reads EMPTY — a lost/rebuilt state
     // dir or a `close` that cleared it — while the project-local mirror
@@ -771,6 +771,39 @@ pub fn load_spawn_registry(project: &str) -> Vec<SpawnEntry> {
     // regression. The mirror lives INSIDE the project, so it survives the
     // state loss that is the whole reason it exists.
     load_agent_names(&project_dir_hint(project))
+}
+
+/// bd-722a: ONE row per pane (and per mail identity).
+///
+/// The registry is append-per-registration: `record_spawn_entry` replaces a
+/// row with the SAME NAME, but a pane that was re-registered under a new name
+/// left its old row behind (measured: 75 rows, 12 pane_ids carrying more than
+/// one, one file with 7 rows for a single pane). Every consumer then resolved
+/// a pane with a FIRST-match find, so it read whichever row was written FIRST
+/// — the stale binding. The LAST row for a pane is its current one, so the
+/// dedupe happens HERE, at the one load every consumer goes through.
+fn dedupe_spawn_entries(entries: Vec<SpawnEntry>) -> Vec<SpawnEntry> {
+    let mut last_pane: BTreeMap<String, usize> = BTreeMap::new();
+    let mut last_identity: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        last_pane.insert(e.pane_id.clone(), i);
+        if let Some(id) = e.mail_identity.as_ref().filter(|s| !s.trim().is_empty()) {
+            last_identity.insert(id.clone(), i);
+        }
+    }
+    entries
+        .into_iter()
+        .enumerate()
+        .filter(|(i, e)| {
+            let pane_current = last_pane.get(&e.pane_id) == Some(i);
+            let identity_current = match e.mail_identity.as_ref().filter(|s| !s.trim().is_empty()) {
+                Some(id) => last_identity.get(id) == Some(i),
+                None => true,
+            };
+            pane_current && identity_current
+        })
+        .map(|(_, e)| e)
+        .collect()
 }
 
 /// Best-effort project dir for a project argument (bare name or absolute
@@ -1678,13 +1711,15 @@ pub fn load_pane_starvation(project: &str) -> BTreeMap<String, u32> {
 /// callers log and continue on error.
 pub fn record_pane_starvation(project: &str, starved: &BTreeMap<String, u32>) -> Result<()> {
     let path = pane_starvation_file(project);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(starved)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    // bd-722a: write it under the shared state lock, like its sibling
+    // `record_resume`. The old code wrote a FIXED temp path with no lock, so
+    // two concurrent passes interleaved their bytes into one file and
+    // `load_pane_starvation` read the wreckage as an EMPTY map — the counter
+    // reset. `update_locked` takes the lock and names the temp file per
+    // process, so the rename is atomic against the other writer.
+    update_locked(&path, |map: &mut BTreeMap<String, u32>| {
+        *map = starved.clone();
+    })
 }
 
 /// Keep the newest `LAST_SENT_CAP` records (FIFO: drop the oldest).
@@ -1888,16 +1923,59 @@ pub fn log_event(project: &str, kind: EventKind, data: serde_json::Value) -> Res
     Ok(())
 }
 
+/// bd-722a: the LAST `max_lines` lines of a JSONL file, read from the END.
+///
+/// These readers want the NEWEST rows, and the file can be large: a full read
+/// parses every row of a log with no rotation, on every reclassify and every
+/// history read. The window is bounded by BYTES (the tail is seeked to) and
+/// by LINES (the tail is taken).
+///
+/// The seek usually lands mid-row, so the first line of the window is
+/// dropped. A missing file is an empty tail (not an error).
+pub fn read_tail_lines(path: &Path, max_lines: usize, max_bytes: u64) -> Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(md) = std::fs::metadata(path) else {
+        return Ok(Vec::new());
+    };
+    let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let start = md.len().saturating_sub(max_bytes);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start))
+            .with_context(|| format!("seek {}", path.display()))?;
+    }
+    let mut raw = Vec::new();
+    f.read_to_end(&mut raw)
+        .with_context(|| format!("read {}", path.display()))?;
+    let buf = String::from_utf8_lossy(&raw).to_string();
+    let body = if start > 0 {
+        match buf.find('\n') {
+            Some(i) => &buf[i + 1..],
+            None => "",
+        }
+    } else {
+        &buf
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let from = lines.len().saturating_sub(max_lines);
+    Ok(lines[from..].iter().map(|s| s.to_string()).collect())
+}
+
+/// bd-722a: the project log is read as a BOUNDED tail, never as a full-file
+/// parse. The log has no rotation, so `read_log` used to parse every row
+/// every time `workflow history`, `runs list`, `--robot-snapshot` or
+/// `cron history` asked for it.
+pub const LOG_TAIL_LINES: usize = 5_000;
+pub const LOG_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The project's JSONL log, newest-last, bounded to the tail window.
 pub fn read_log(project: &str) -> Result<Vec<LogEntry>> {
     let path = project_log_path(project);
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-    let reader = BufReader::new(f);
+    let lines = read_tail_lines(&path, LOG_TAIL_LINES, LOG_TAIL_BYTES)?;
     let mut out = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
+    for line in lines {
         if line.trim().is_empty() {
             continue;
         }
@@ -2401,6 +2479,106 @@ mod loops_schema_v2_tests {
 
 #[cfg(test)]
 mod tests {
+    /// bd-722a: the registry resolves a pane's CURRENT row.
+    ///
+    /// The registry is append-per-registration, so a pane that was
+    /// re-registered under a new name left its old row behind (measured: 75
+    /// rows, 12 pane_ids carrying more than one, one file with 7 rows for a
+    /// single pane). Every consumer then resolved a pane with a FIRST-match
+    /// find, so it read whichever row was written FIRST — the stale binding.
+    /// The LAST row for a pane is its current one.
+    #[test]
+    fn spawn_registry_reads_the_current_row_for_a_pane() {
+        let _g = crate::config::test_state_home();
+        let project = "registry-dedupe";
+        let stale = SpawnEntry::profiled(
+            "w1:p1",
+            "old-name",
+            "coder",
+            "omp",
+            Some("stale-pin".into()),
+        );
+        let current = SpawnEntry::profiled(
+            "w1:p1",
+            "new-name",
+            "coder",
+            "omp",
+            Some("current-pin".into()),
+        );
+        save_spawn_registry(project, &[stale, current]).expect("save registry");
+        let registry = load_spawn_registry(project);
+        assert_eq!(registry.len(), 1, "one row per pane: {registry:?}");
+        assert_eq!(registry[0].name, "new-name", "the CURRENT row wins");
+        assert_eq!(
+            registry[0].mail_identity.as_deref(),
+            Some("current-pin"),
+            "the current binding is the one a resolve must read"
+        );
+    }
+
+    /// bd-722a: the starvation counter is written under the state lock.
+    ///
+    /// The old code wrote a FIXED temp path with no lock, so two concurrent
+    /// passes interleaved their bytes into one file and the loader read the
+    /// wreckage as an EMPTY map — the counter reset. The write goes through
+    /// the shared lock, so a writer that cannot take it REFUSES instead of
+    /// writing anyway.
+    #[test]
+    fn starvation_counter_is_written_under_the_state_lock() {
+        let _g = crate::config::test_state_home();
+        let project = "starvation-locked";
+        let path = pane_starvation_file(project);
+        // Another writer holds the lock (a fresh lock file is not stale).
+        let lock = lock_path(&path);
+        if let Some(parent) = lock.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&lock, b"another-writer").unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("pane-1".to_string(), 1);
+        let err = record_pane_starvation(project, &map)
+            .expect_err("a writer that cannot take the lock must not write anyway");
+        assert!(
+            err.to_string().contains("locked by another writer"),
+            "the refusal must name the lock: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "the counter must not be written by a writer that lost the lock"
+        );
+        let _ = std::fs::remove_file(&lock);
+    }
+
+    /// bd-722a: the tail read is bounded — it returns the NEWEST lines and
+    /// never yields a half row.
+    #[test]
+    fn read_tail_lines_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("fw-tail-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rows.jsonl");
+        let mut body = String::new();
+        for i in 0..1000 {
+            body.push_str(&format!("{{\"n\":{i}}}\n"));
+        }
+        std::fs::write(&path, body).unwrap();
+        let tail = read_tail_lines(&path, 10, 1024 * 1024).expect("tail");
+        assert_eq!(tail.len(), 10, "the tail is the newest lines: {tail:?}");
+        assert!(
+            tail.last().unwrap().contains("\"n\":999"),
+            "the newest line must be last: {tail:?}"
+        );
+        // A byte window smaller than the file still yields whole lines only.
+        let windowed = read_tail_lines(&path, 10, 64).expect("windowed tail");
+        assert!(
+            windowed
+                .iter()
+                .all(|l| l.starts_with('{') && l.ends_with('}')),
+            "a byte-windowed tail must not yield a half row: {windowed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// bd-0gup: the Drop of a lock must NOT remove a lock that is no longer
     /// ours.
     ///

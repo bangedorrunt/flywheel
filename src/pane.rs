@@ -2415,7 +2415,7 @@ pub fn local_engine_journaled(
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
     let server_url = cli_engine_store_url();
-    local_engine_with(cfg, rt, server_url, runner, profile, workflow, true)
+    local_engine_with(cfg, rt, server_url, runner, profile, workflow)
 }
 
 /// CLI engine store selection (bd-adr22-local-resonate-tx8q). The
@@ -2443,9 +2443,9 @@ pub fn cli_engine_store_url() -> Option<String> {
 /// Store-selection seam: `Some(url)` => remote HttpNetwork-backed engine
 /// (durable), `None` => embedded in-memory runtime. Construction stays lazy;
 /// the URL is only dialed when runs/promise ops execute.
-/// [`local_engine`] / [`local_engine_journaled`] funnel: the only difference is
-/// whether an effect journal is built for this runner (and which
-/// [`EffectJournalMode`] the engine enforces).
+/// [`local_engine_journaled`] is the only caller: the journal is always
+/// built here (bd-722a — the `journal` flag was always `true`, so its
+/// un-journaled branch was unreachable).
 fn local_engine_with(
     cfg: &crate::config::Config,
     rt: &tokio::runtime::Runtime,
@@ -2453,7 +2453,6 @@ fn local_engine_with(
     runner: toron_workflow::engine::EffectRunner,
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
-    journal: bool,
 ) -> Result<toron_workflow::WorkflowEngine> {
     // bd-mi9n: the journal is claimed in TWO halves — the effect runner the
     // leaves dispatch through, and the run-lifecycle journal the engine feeds
@@ -2464,25 +2463,18 @@ fn local_engine_with(
     // code degraded to Recording when the journal could not be opened, so the
     // leaves would perform their external effects with NO journal row — the
     // exact thing `Enforced` exists to prevent, and it was silent.
-    let (effect, run_journal) = match (
-        journal,
-        crate::effect_journal::journals(cfg, runner.clone()),
-    ) {
-        (true, Some(j)) => (Some(j.effect), Some(j.run)),
-        (true, None) => {
+    let (effect, run_journal) = match crate::effect_journal::journals(cfg, runner.clone()) {
+        Some(j) => (Some(j.effect), Some(j.run)),
+        None => {
             anyhow::bail!(
                 "journaled engine requested but the effect journal could not be opened (the toron index is unavailable) — refusing to run unjournaled"
             );
         }
-        (false, _) => (None, None),
     };
     // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): a journaled
     // constructor is Enforced — its leaves really perform external effects,
-    // so an uncovered sink must refuse, never run unjournaled. The plain
-    // constructor (dry arms: `workflow run` without `--execute`, `cron run`
-    // without `--live`) stays Recording — it records instead of performs, so
-    // its leaves MUST stay unjournaled, visibly.
-    let mode = engine_journal_mode(journal, effect.is_some())?;
+    // so an uncovered sink must refuse, never run unjournaled.
+    let mode = engine_journal_mode(true, effect.is_some())?;
     local_engine_with_journal(
         rt,
         server_url,

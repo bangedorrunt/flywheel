@@ -712,13 +712,21 @@ pub fn journal_reclassify(project: &str, intent: &ReclassifyIntent) -> anyhow::R
 }
 
 /// Newest reclassify journal row for `effect_key`, if any (primary-key load).
+///
+/// bd-722a: the scan is BOUNDED and newest-first. The project log has no
+/// rotation, and this used to parse EVERY row of it on every reclassify to
+/// find one row by effect_key.
 pub fn load_reclassify_by_key(
     project: &str,
     effect_key: &str,
 ) -> anyhow::Result<Option<ReclassifyIntent>> {
-    let log = state::read_log(project)?;
-    let mut found: Option<ReclassifyIntent> = None;
-    for entry in log {
+    let path = state::project_log_path(project);
+    let lines = state::read_tail_lines(&path, state::LOG_TAIL_LINES, state::LOG_TAIL_BYTES)?;
+    // Newest first: the first match wins, and no row after it is parsed.
+    for line in lines.iter().rev() {
+        let Ok(entry) = serde_json::from_str::<state::LogEntry>(line) else {
+            continue;
+        };
         let Some(j) = entry.data.get("journal").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -732,10 +740,10 @@ pub fn load_reclassify_by_key(
             continue;
         }
         if let Ok(intent) = serde_json::from_value::<ReclassifyIntent>(entry.data.clone()) {
-            found = Some(intent);
+            return Ok(Some(intent));
         }
     }
-    Ok(found)
+    Ok(None)
 }
 
 /// Insert Prepared if absent; else attach to the same `effect_key` primary key

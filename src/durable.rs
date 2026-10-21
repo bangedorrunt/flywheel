@@ -6107,14 +6107,6 @@ pub const DEFAULT_CLAIM_NUDGE_AFTER_POLLS: u32 = 2;
 pub const FLYWHEEL_RECLAIM_SWARM_SECS: u64 = 7200;
 pub const FLYWHEEL_RECLAIM_HUMAN_SECS: u64 = 86400;
 
-#[allow(dead_code)]
-pub fn reclaim_swarm_secs() -> u64 {
-    crate::durable_policy::ReclaimPolicy::from_environment().swarm_secs
-}
-#[allow(dead_code)]
-pub fn reclaim_human_secs() -> u64 {
-    crate::durable_policy::ReclaimPolicy::from_environment().human_secs
-}
 pub fn is_swarm_assignee(assignee: &str) -> bool {
     if assignee.contains('-') {
         return true;
