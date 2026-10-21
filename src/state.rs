@@ -1494,6 +1494,15 @@ fn lock_path(path: &Path) -> PathBuf {
 /// so a panicking writer does not leave the file wedged.
 struct StateLock {
     path: PathBuf,
+    /// This owner's token, written INTO the lock file.
+    ///
+    /// bd-0gup: the metadata read and the stale-remove are not atomic, so a
+    /// steal can remove a lock that a LIVE writer created in the meantime.
+    /// The token makes that RECOVERABLE: the write path verifies the lock
+    /// still holds OUR token before it writes, so a writer whose lock was
+    /// taken under it refuses to clobber the new owner's state instead of
+    /// racing it. Verify before write, not a hopeful remove.
+    token: String,
 }
 
 impl StateLock {
@@ -1510,7 +1519,23 @@ impl StateLock {
                 .create_new(true)
                 .open(&lock)
             {
-                Ok(_) => return Ok(Some(StateLock { path: lock })),
+                Ok(mut file) => {
+                    let token = format!(
+                        "{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or_default()
+                    );
+                    if let Err(e) = std::io::Write::write_all(&mut file, token.as_bytes()) {
+                        // The token is the ownership proof: a lock we cannot
+                        // stamp is a lock we do not own.
+                        let _ = std::fs::remove_file(&lock);
+                        return Err(e.into());
+                    }
+                    return Ok(Some(StateLock { path: lock, token }));
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if !lock_is_stale(&lock) {
                         return Ok(None);
@@ -1522,11 +1547,23 @@ impl StateLock {
         }
         Ok(None)
     }
+
+    /// Is the lock file still OURS? A lock taken under us (the stale-steal
+    /// race) holds a different token, and a missing lock holds none.
+    fn still_ours(&self) -> bool {
+        std::fs::read_to_string(&self.path)
+            .map(|content| content.trim() == self.token)
+            .unwrap_or(false)
+    }
 }
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // bd-0gup: only remove the path while it is STILL ours — a lock that
+        // was taken under us belongs to somebody else now.
+        if self.still_ours() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1541,17 +1578,28 @@ fn lock_is_stale(lock: &Path) -> bool {
 /// reads as `T::default()` (bookkeeping never breaks the loop on a bad file).
 /// A writer that cannot get the lock within the bounded wait returns an error
 /// instead of clobbering, so the loss is loud.
-fn update_locked<T: Default + Serialize + serde::de::DeserializeOwned>(
+pub(crate) fn update_locked<T: Default + Serialize + serde::de::DeserializeOwned>(
     path: &Path,
     op: impl FnOnce(&mut T),
 ) -> Result<()> {
     for attempt in 0..LOCK_WAIT_ATTEMPTS {
-        if let Some(_guard) = StateLock::try_acquire(path)? {
+        if let Some(guard) = StateLock::try_acquire(path)? {
             let mut value: T = std::fs::read_to_string(path)
                 .ok()
                 .and_then(|raw| serde_json::from_str(&raw).ok())
                 .unwrap_or_default();
             op(&mut value);
+            // bd-0gup: VERIFY the lock is still ours before writing. The
+            // stale-steal is not atomic with the metadata read, so a lock can
+            // be taken under us while we hold it; writing then would clobber
+            // the new owner's state. A writer that lost the lock errors out
+            // instead — the same rule the lock wait already follows.
+            if !guard.still_ours() {
+                bail!(
+                    "state file {} lost its lock to another writer (the lock was taken under us) — refusing to clobber it",
+                    path.display()
+                );
+            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -2353,6 +2401,64 @@ mod loops_schema_v2_tests {
 
 #[cfg(test)]
 mod tests {
+    /// bd-0gup: the Drop of a lock must NOT remove a lock that is no longer
+    /// ours.
+    ///
+    /// The old Drop removed the path unconditionally, so a lock that had
+    /// been stolen (a stale-steal race) took the NEW owner's lock with it.
+    /// The lock now carries the identity of the file it created and removes
+    /// the path only while that file is still there.
+    #[test]
+    fn state_lock_drop_does_not_remove_a_stolen_lock() {
+        let dir = std::env::temp_dir().join(format!("fw-lock-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let guard = StateLock::try_acquire(&path)
+            .expect("acquire")
+            .expect("free lock");
+        // Someone else took the lock: the path now names a DIFFERENT file.
+        let lock = lock_path(&path);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::write(&lock, b"someone-else").unwrap();
+        drop(guard);
+        assert!(
+            lock.exists(),
+            "the new owner's lock must survive the old owner's drop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-0gup: a writer whose lock was taken under it must REFUSE to write.
+    ///
+    /// The stale-steal is not atomic with the metadata read, so a lock can be
+    /// removed and re-created by another writer while we hold it. The write
+    /// path now verifies the lock still holds OUR token: the writer errors
+    /// out (loudly) instead of clobbering the new owner's state. Before the
+    /// fix the write went through and the new owner's update was lost.
+    #[test]
+    fn state_lock_lost_lock_refuses_to_clobber() {
+        let dir = std::env::temp_dir().join(format!("fw-lock-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counter.json");
+        let err = update_locked(&path, |v: &mut u64| {
+            *v += 1;
+            // Another writer takes the lock under us, mid-update.
+            std::fs::write(lock_path(&path), b"another-owner").unwrap();
+        })
+        .expect_err("a writer that lost its lock must not write");
+        assert!(
+            err.to_string().contains("lost its lock"),
+            "the refusal must name the lost lock: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "the state file must not be written by a writer that lost the lock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     mod crew_recipients_tests {
         use super::*;
 
