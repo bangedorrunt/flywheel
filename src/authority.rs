@@ -43,7 +43,10 @@ pub fn select_agent_identity(
         return Some(v.to_string());
     }
     for key in ["TORON_AGENT", "FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
-        if let Some(v) = env(key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if let Some(v) = env(key)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             return Some(v);
         }
     }
