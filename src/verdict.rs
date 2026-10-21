@@ -556,10 +556,16 @@ fn rank_binding<'a>(parsed: &'a [(String, bool, bool)], candidates: &[&'a str]) 
 
 pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
     // The subject rides along so the ranking is decided from ONE git call.
+    // bd-ozpj: the grep is CASE-INSENSITIVE, like beads' own
+    // `sha_message_cites_bead`. The case-sensitive grep made a commit that
+    // cites BD-2QU9 invisible to this rule while closing legally in beads —
+    // and a closed bead cannot be re-gated, so the ledger check was stuck
+    // clean-false with no way out.
     let out = StdCommand::new("git")
         .args([
             "log",
             "--all",
+            "--regexp-ignore-case",
             &format!("--grep={bead_id}"),
             "--format=%H%x1f%s",
         ])
@@ -573,19 +579,25 @@ pub fn derive_head_sha(cwd: &Path, bead_id: &str) -> anyhow::Result<String> {
         );
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let wanted = bead_id.to_ascii_lowercase();
     let parsed: Vec<(String, bool, bool)> = stdout
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(|l| match l.split_once('\u{1f}') {
-            Some((sha, subject)) => (
-                sha.to_string(),
-                subject.contains(bead_id),
-                // bd-pi4p: structural citation `[bd-xxxx]` outranks a bare
-                // prose mention, so a later sentence can no longer steal the
-                // binding from the commit that cites it.
-                subject.contains(&format!("[{bead_id}]")),
-            ),
+            Some((sha, subject)) => {
+                let lower = subject.to_ascii_lowercase();
+                (
+                    sha.to_string(),
+                    lower.contains(&wanted),
+                    // bd-pi4p: structural citation `[bd-xxxx]` outranks a bare
+                    // prose mention, so a later sentence can no longer steal the
+                    // binding from the commit that cites it. bd-ozpj: the
+                    // ranking reads the subject case-insensitively, like the
+                    // grep that found it.
+                    lower.contains(&format!("[{wanted}]")),
+                )
+            }
             None => (l.to_string(), false, false),
         })
         .collect();
@@ -862,7 +874,10 @@ mod note_binding_tests {
         assert_eq!(note_proved("proved task=run-1 verdict=v-9"), None);
         assert_eq!(note_proved("task=run-1, verdict=v-9"), None);
         let sha = "a".repeat(40);
-        assert_eq!(note_proved(&format!("sha={sha} task=run-1 verdict=v-9")), None);
+        assert_eq!(
+            note_proved(&format!("sha={sha} task=run-1 verdict=v-9")),
+            None
+        );
     }
 }
 
@@ -1352,6 +1367,43 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+
+    /// bd-ozpj: the citation lookup is CASE-INSENSITIVE, like beads' own
+    /// `sha_message_cites_bead`.
+    ///
+    /// The case-sensitive grep made a commit that cites `BD-2QU9` invisible
+    /// to this rule while it closed legally in beads — and a closed bead
+    /// cannot be re-gated, so the ledger check was stuck clean-false with
+    /// no way out.
+    #[test]
+    fn citation_lookup_is_case_insensitive() {
+        let dir = std::env::temp_dir().join(format!("fw-cite-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "fix: cite BD-2QU9 in the subject"]);
+        let head = git_stdout(&dir, &["log", "-1", "--format=%H"]).expect("head");
+        let bound = derive_head_sha(&dir, "bd-2qu9")
+            .expect("the lowercase bead id must find the uppercase citation");
+        assert_eq!(bound, head, "the uppercase citation must bind the bead");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn bead(priority: u8, blast: Blast, runnable: bool) -> BeadUnit {
         BeadUnit {

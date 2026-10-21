@@ -2459,14 +2459,22 @@ fn local_engine_with(
     // leaves dispatch through, and the run-lifecycle journal the engine feeds
     // its own Started → Running → terminal rows through. Both come from one
     // store, so the run row and its effect rows are keyed by the same run_id.
-    let built = if journal {
-        crate::effect_journal::journals(cfg, runner.clone())
-    } else {
-        None
-    };
-    let (effect, run_journal) = match built {
-        Some(j) => (Some(j.effect), Some(j.run)),
-        None => (None, None),
+    //
+    // bd-ozpj: a JOURNALED constructor that cannot journal REFUSES. The old
+    // code degraded to Recording when the journal could not be opened, so the
+    // leaves would perform their external effects with NO journal row — the
+    // exact thing `Enforced` exists to prevent, and it was silent.
+    let (effect, run_journal) = match (
+        journal,
+        crate::effect_journal::journals(cfg, runner.clone()),
+    ) {
+        (true, Some(j)) => (Some(j.effect), Some(j.run)),
+        (true, None) => {
+            anyhow::bail!(
+                "journaled engine requested but the effect journal could not be opened (the toron index is unavailable) — refusing to run unjournaled"
+            );
+        }
+        (false, _) => (None, None),
     };
     // bd-engine-run-path-journaling-fwlx (the Spec 6 flip): a journaled
     // constructor is Enforced — its leaves really perform external effects,
@@ -2474,11 +2482,7 @@ fn local_engine_with(
     // constructor (dry arms: `workflow run` without `--execute`, `cron run`
     // without `--live`) stays Recording — it records instead of performs, so
     // its leaves MUST stay unjournaled, visibly.
-    let mode = if journal && effect.is_some() {
-        toron_workflow::engine::EffectJournalMode::Enforced
-    } else {
-        toron_workflow::engine::EffectJournalMode::Recording
-    };
+    let mode = engine_journal_mode(journal, effect.is_some())?;
     local_engine_with_journal(
         rt,
         server_url,
@@ -2493,6 +2497,32 @@ fn local_engine_with(
 
 /// The store-selection + constructor tail shared by both entry points.
 #[allow(clippy::too_many_arguments)]
+/// The journal mode of a constructed engine (bd-ozpj).
+///
+/// A JOURNALED constructor is `Enforced`: its leaves really perform external
+/// effects, so an uncovered sink must refuse, never run unjournaled. The
+/// plain constructor (the dry arms: `workflow run` without `--execute`,
+/// `cron run` without `--live`) stays `Recording` — it records instead of
+/// performing, so its leaves MUST stay unjournaled, visibly.
+///
+/// A journaled constructor that could NOT open its journal REFUSES: the old
+/// code degraded to `Recording` and the leaves then performed their effects
+/// with no journal row at all, silently.
+pub fn engine_journal_mode(
+    journal: bool,
+    journal_built: bool,
+) -> Result<toron_workflow::engine::EffectJournalMode> {
+    if !journal {
+        return Ok(toron_workflow::engine::EffectJournalMode::Recording);
+    }
+    if !journal_built {
+        anyhow::bail!(
+            "journaled engine requested but the effect journal could not be opened (the toron index is unavailable) — refusing to run unjournaled"
+        );
+    }
+    Ok(toron_workflow::engine::EffectJournalMode::Enforced)
+}
+
 fn local_engine_with_journal(
     rt: &tokio::runtime::Runtime,
     server_url: Option<String>,
@@ -3254,6 +3284,32 @@ mod tests {
         );
     }
 
+    /// bd-ozpj: a JOURNALED constructor that cannot journal REFUSES. The old
+    /// code degraded to Recording, so the leaves would perform their
+    /// external effects with NO journal row — the exact thing `Enforced`
+    /// exists to prevent, and it was silent.
+    #[test]
+    fn effect_state_journaled_constructor_refuses_without_a_journal() {
+        use toron_workflow::engine::EffectJournalMode;
+        // A journaled constructor with a journal: Enforced.
+        assert_eq!(
+            crate::pane::engine_journal_mode(true, true).expect("journaled"),
+            EffectJournalMode::Enforced
+        );
+        // A journaled constructor whose journal could NOT be opened: refuse.
+        let err = crate::pane::engine_journal_mode(true, false)
+            .expect_err("a journaled constructor that cannot journal must refuse");
+        assert!(
+            err.to_string().contains("refusing to run unjournaled"),
+            "the refusal must say what it refuses: {err}"
+        );
+        // The dry arm (no journal requested): Recording, visibly.
+        assert_eq!(
+            crate::pane::engine_journal_mode(false, false).expect("dry"),
+            EffectJournalMode::Recording
+        );
+    }
+
     /// bd-mukq: 429 reroute target — the next fallback profile in the
     /// chain that has a LIVE pane in this run wins, exactly once.
     /// Empty chain, no live pane, or already-attempted → None (fail loud
@@ -3333,7 +3389,9 @@ mod tests {
         // 12000-byte window silently excluded the arm's tail as soon as the
         // dispatch grew (bd-jvka moved the chain in front of it), which reads
         // as "the marker is missing" when it is merely further down.
-        let end = src[dispatch..].find("\nfn ").map_or(dispatch, |i| dispatch + i);
+        let end = src[dispatch..]
+            .find("\nfn ")
+            .map_or(dispatch, |i| dispatch + i);
         let arm = &src[dispatch..end];
         assert!(
             !arm.contains("still hop (legacy"),

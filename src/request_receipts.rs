@@ -43,14 +43,24 @@ pub enum Gate {
 /// door's own guards stay the last line.
 fn gate_core(state: EffectState, recorded: Option<&str>, offered_digest: &str) -> Gate {
     match state {
-        EffectState::Prepared | EffectState::InFlight => Gate::InFlight,
+        // Prepared, InFlight, Accepted, ReconcilePending and Parked are all
+        // "the effect has not reached a terminal verdict" (bd-ozpj: the
+        // adopted enum is toron-core's nine-state one, so the states that
+        // flywheel's old five-state copy could not express arrive here).
+        EffectState::Prepared
+        | EffectState::InFlight
+        | EffectState::Accepted
+        | EffectState::ReconcilePending
+        | EffectState::Parked => Gate::InFlight,
         EffectState::Settled => match recorded {
             Some(recorded) if recorded != offered_digest => Gate::Conflict,
             // A row from before digests were recorded cannot be compared; the
             // slot settled, so the replay is still the answer.
             _ => Gate::Replay,
         },
-        EffectState::Failed | EffectState::Unknown => Gate::Proceed,
+        // A cancelled effect did NOT happen: the slot is free for a new
+        // attempt, exactly like a failed or unknown one.
+        EffectState::Failed | EffectState::Unknown | EffectState::Cancelled => Gate::Proceed,
     }
 }
 

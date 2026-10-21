@@ -233,18 +233,16 @@ pub enum RebindReason {
 }
 
 /// Effect-journal states for one agent-lifecycle effect — a rebind attempt
-/// ([`RebindIntent`]) or a spawn / register / presence row ([`AgentEffect`])
-/// (ADR-0032 Spec 5 subset). `Unknown` is a first-class terminal: a crash or
-/// timeout is never absence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EffectState {
-    Prepared,
-    InFlight,
-    Settled,
-    Failed,
-    Unknown,
-}
+/// ([`RebindIntent`]) or a spawn / register / presence row ([`AgentEffect`]).
+///
+/// bd-ozpj: ONE persisted effect state. flywheel kept its own five-state
+/// copy, which cannot express `Accepted`, `ReconcilePending`, `Cancelled` or
+/// `Parked` — so a rebind row and a workflow-effect row of the SAME effect
+/// were not comparable, and the copy was on the elm-effect skill's hard
+/// Never list ("a second EffectState"). This is toron-core's enum: the one
+/// that is actually persisted. `Unknown` stays a first-class terminal: a
+/// crash or timeout is never absence.
+pub use toron_core::index::workflow_effects::EffectState;
 
 /// One logical rebind effect. Stable `effect_key` excludes attempt number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -844,6 +842,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-ozpj: ONE persisted effect state — toron-core's nine-state enum.
+    ///
+    /// flywheel's own five-state copy could not express `Accepted`,
+    /// `ReconcilePending`, `Cancelled` or `Parked`, so a rebind row and a
+    /// workflow-effect row of the SAME effect were not comparable. The
+    /// adopted enum is the one that is actually persisted.
+    #[test]
+    fn effect_state_is_the_one_persisted_enum() {
+        // The four states the old copy could not express exist here.
+        let _ = EffectState::Accepted;
+        let _ = EffectState::ReconcilePending;
+        let _ = EffectState::Cancelled;
+        let _ = EffectState::Parked;
+        // And it IS toron-core's type: a row written here and a row written
+        // by the workflow engine are the same value, not two vocabularies.
+        let same: toron_core::index::workflow_effects::EffectState = EffectState::Parked;
+        assert_eq!(
+            same,
+            toron_core::index::workflow_effects::EffectState::Parked
+        );
+    }
 
     #[test]
     fn timeout_alone_never_allows_rebind() {
