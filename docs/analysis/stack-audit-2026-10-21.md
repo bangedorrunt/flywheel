@@ -1119,6 +1119,58 @@ sleep, a different mechanism.
 
 ---
 
+## 34. Fix status (2026-10-22)
+
+The findings are being fixed as beads in each repo's own tracker. The ids live in the
+tracker (`br list`); the titles are below.
+
+### Fixed and landed
+
+| Section | Severity | Repo | What landed |
+|---------|----------|------|-------------|
+| 9 | S1 | beads | The gates sidecar refuses ONE orphan row **per row** instead of aborting the whole load behind a foreign-key error, so one stale row no longer takes every good verdict row with it. The refusal is counted and reported at warn level. Commit `36668abf`. |
+| 7 + 8 | S1 | beads | A rebuild now **restores** the verdict rows it drops (the one shared rebuild entry calls the one restore), so the refusal only fires when the sidecar cannot restore them. Losing them on purpose is a separate, operator-gated decision (`--allow-gate-verdict-loss`, BR_OPERATOR=1); the ordinary `--allow-repeated-repair` no longer reaches the verdict refusal at all. Commit `5b9e42cd`. |
+| 18 + 20 | S2 | beads | `strict: true` with no `gates:` block keeps the fail-closed close default **in force** (it used to turn it off AND left the gate-record path with no rule to record a verdict against, so the gate discipline was unreachable), and a commit that touches only `.beads/**` or `.flywheel/**` no longer passes the "carries work" test - both sides now agree on which commit proves a bead. Commit `2fa057cd`. |
+
+Every fix carries a test that goes red when the fix is inverted (verified by
+inverting it, not by assertion): the orphan-row test fails when the per-row
+refusal is removed, and the end-to-end repair test fails when the restore is
+removed.
+
+### In flight
+
+- **toron** (lane `BlueRidge`): the ack-SLA flood (its own kind, a terminal mute, a
+  per-scan cap, a deadline); the render-derived durable-effect key (`check_replay`
+  wired into the prepare path); the park action that cannot run; the identity fold
+  (the 8-char holder compared against a pin, the raw-keyed yield board, the captain
+  write gate that refuses a fold that routes); the perf and waste set; the
+  docs-vs-code set.
+- **flywheel** (lane `EmeraldSparrow`): one identity ladder; the leaf watchdog's
+  unbounded pipe drain plus the pane dispatch timeout order; the doorbell side of
+  the ack-SLA flood; the arrive guard, the state-lock TOCTOU, the inject-budget
+  read-modify-write and the leaf intent journal; the second `EffectState`, the
+  journaled constructor's `Recording` fallback and the citation/derivation
+  agreement; the spawn registry, the unbounded reads, the dead code and the
+  AGENTS.md claims.
+
+### Residual
+
+- **§19** (the sha-citation check is warn-only when the sha resolves nowhere):
+  **not fixed.** The refusal needs the 24 close tests to carry a real commit instead
+  of the `test_sha()` placeholder, so it belongs in a bead of its own rather than
+  inside a fix that would change the close's error precedence silently.
+- **§16** (the case-sensitivity split): the beads side is already case-insensitive;
+  the flywheel side (`git --grep` is case-sensitive) is part of the flywheel lane's
+  citation/derivation bead.
+
+### Also found while fixing
+
+The beads repo's lib suite was **red at HEAD**: the gated-close fixture used the id
+`px1`, which the id validator rejects ("expected prefix-hash"), so that test
+panicked before any of these changes. Repaired in the same commit.
+
+---
+
 ## 33. Operator actions (not taken here)
 
 | Action | Why | Risk |
