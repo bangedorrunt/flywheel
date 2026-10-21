@@ -987,11 +987,15 @@ impl EffectJournal for ToronEffectJournal {
             return Begin::Skip;
         }
         let now = chrono::Utc::now().timestamp_millis();
-        let claimed = match self.j.try_claim(key, &self.owner, now + self.lease_ms) {
-            Ok(Some(r)) => r,
-            Ok(None) => return Begin::Unavailable("claim refused".into()),
-            Err(e) => return Begin::Unavailable(e.to_string()),
-        };
+        let claimed =
+            match self
+                .j
+                .try_claim(key, &self.owner, now + self.lease_ms, now, row.generation)
+            {
+                Ok(Some(r)) => r,
+                Ok(None) => return Begin::Unavailable("claim refused".into()),
+                Err(e) => return Begin::Unavailable(e.to_string()),
+            };
         if claimed.state == EffectState::Prepared {
             let _ = self
                 .j
