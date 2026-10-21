@@ -823,14 +823,17 @@ impl<H: Host> Brain<H> {
         self.sweep_last = Some(now);
         let effects = self.host.tick(&BrainMsg::Sweep { now });
         // F6: fetch only when tick asks (need_fetch arm) — was unconditional
-        // per-pin I/O every 1s sweep. Full pipe (fetch off-loop as Msgs)
-        // stays the follow-up; this cuts the steady-state sweep to tick
-        // plus presence when no inbox work is due.
-        let fetched = if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
-            self.fetch_all_inbox(now)
-        } else {
-            Vec::new()
-        };
+        // per-pin I/O every 1s sweep. bd-1i8c: the host decides HOW the
+        // fetch leaves this dispatch — a host that shells out DETACHES it
+        // and the rows re-enter as `InboxFetched` messages; the serial
+        // dispatch must never wait on a subprocess.
+        if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
+            let targets = self.fetch_targets(now);
+            let inline = self.host.fetch_inbox_detached(targets);
+            for (pin, rows) in inline {
+                self.on_inbox_fetched(pin, rows).await;
+            }
+        }
         self.journal(
             &serde_json::json!({"rt_kind": "Sweep"}),
             &effects,
@@ -838,9 +841,6 @@ impl<H: Host> Brain<H> {
             &[],
         );
         self.deliver(effects, "sweep").await;
-        for (pin, rows) in fetched {
-            self.on_inbox_fetched(pin, rows).await;
-        }
         for pin in self.hear.expire(now, doorbell_core::UNANSWERED_SECS) {
             *self.deaf_attempts.entry(pin).or_insert(0) += 1;
         }
@@ -878,9 +878,16 @@ impl<H: Host> Brain<H> {
     // plane-P deafness for fresh spawns and post-state-loss restarts).
     // bd-bpj1 (F4): the floor derives from the sweep's `now`, never a fresh
     // wall-clock read — the fetch window reproduces from the journaled Msg.
-    fn fetch_all_inbox(&self, now_unix: u64) -> Vec<(String, Vec<serde_json::Value>)> {
+    //
+    // bd-1i8c: this now hands the `(pin, since)` pairs to the host's
+    // OFF-LOOP lane instead of fetching inline. The brain is a
+    // single-serial writer: an inline fetch parked it for the whole scan
+    // (one CLI per pin, each with its own ceiling), so the wake channel
+    // filled and real wake lines were dropped. The rows re-enter as
+    // `BrainMsg::InboxFetched` — the pipe pattern this module documents.
+    fn fetch_targets(&self, now_unix: u64) -> Vec<(String, String)> {
         let floor = doorbell_core::redelivery_floor_rfc3339(now_unix);
-        let mut fetched = Vec::new();
+        let mut targets = Vec::new();
         for pin in self.host.pins() {
             let pin_since = self
                 .wake
@@ -888,12 +895,9 @@ impl<H: Host> Brain<H> {
                 .get(&pin)
                 .cloned()
                 .unwrap_or_else(|| floor.clone());
-            let rows = self.host.fetch_inbox(&pin, &pin_since);
-            if !rows.is_empty() {
-                fetched.push((pin, rows));
-            }
+            targets.push((pin, pin_since));
         }
-        fetched
+        targets
     }
 
     async fn on_ack_sla(&mut self, now: u64) {
@@ -906,36 +910,47 @@ impl<H: Host> Brain<H> {
             &[],
         );
         if scan {
-            let posts = self.host.scan_ack_sla();
-            // bd-adms: `toron ack-sla` re-reports every corr still past SLA,
-            // so an unchanged backlog re-fired the same wake + journal row
-            // every 60s (live: `SlaFired count: 89` ~1440×/day, which is
-            // exactly the noise that hides a genuine regression). Fire only
-            // on a CHANGE: new overdue ids (the signal), or none left.
-            let current: std::collections::BTreeSet<String> = posts.iter().cloned().collect();
-            if current != self.sla_seen {
-                let cleared = self.sla_seen.len();
-                self.sla_seen = current;
-                if !posts.is_empty() {
-                    self.on_sla_fired(posts).await;
-                } else if cleared > 0 {
-                    self.audit("ack_sla_cleared", serde_json::json!({ "cleared": cleared }));
-                }
-            }
+            // bd-1i8c: the scan shells out and is minutes-scale, so the host
+            // DETACHES it — the overdue ids re-enter as `SlaFired`. The
+            // serial dispatch must never wait on a subprocess.
+            let posts = self.host.scan_ack_sla_detached();
+            // Always fold it: an EMPTY list is news too — the backlog
+            // cleared, and the fold names that once (bd-adms).
+            self.on_sla_fired(posts).await;
         }
         // Live AckSla arm also sweeps the inbox when tick asks for it.
         // F4: route fetched rows via on_inbox_fetched (was fire-and-drop).
         if effects.iter().any(|e| matches!(e, Effect::FetchInbox)) {
-            for (pin, rows) in self.fetch_all_inbox(now) {
+            let targets = self.fetch_targets(now);
+            let inline = self.host.fetch_inbox_detached(targets);
+            for (pin, rows) in inline {
                 self.on_inbox_fetched(pin, rows).await;
             }
         }
         self.deliver(effects, "acksla").await;
     }
     async fn on_sla_fired(&mut self, posts: Vec<String>) {
-        if !posts.is_empty() {
-            self.audit("ack_sla_fired", serde_json::json!({ "count": posts.len() }));
+        // bd-adms: `toron ack-sla` re-reports every corr still past SLA, so
+        // an unchanged backlog re-fired the same wake + journal row every
+        // 60s (live: `SlaFired count: 89` ~1440×/day, which is exactly the
+        // noise that hides a genuine regression). Fire only on a CHANGE: new
+        // overdue ids (the signal), or none left.
+        //
+        // bd-1i8c: the dedupe lives HERE because the scan now answers
+        // DETACHED (off the dispatch) and lands as this message.
+        let current: std::collections::BTreeSet<String> = posts.iter().cloned().collect();
+        if current == self.sla_seen {
+            return;
         }
+        let cleared = self.sla_seen.len();
+        self.sla_seen = current;
+        if posts.is_empty() {
+            if cleared > 0 {
+                self.audit("ack_sla_cleared", serde_json::json!({ "cleared": cleared }));
+            }
+            return;
+        }
+        self.audit("ack_sla_fired", serde_json::json!({ "count": posts.len() }));
         let effects = self.host.tick(&BrainMsg::SlaFired {
             posts: posts.clone(),
         });
@@ -952,7 +967,10 @@ impl<H: Host> Brain<H> {
         let fetch = effects.iter().any(|e| matches!(e, Effect::FetchInbox));
         self.deliver(effects, "sla").await;
         if fetch {
-            for (pin, rows) in self.fetch_all_inbox(self.host.now_unix()) {
+            // bd-1i8c: detached like every other fetch.
+            let targets = self.fetch_targets(self.host.now_unix());
+            let inline = self.host.fetch_inbox_detached(targets);
+            for (pin, rows) in inline {
                 self.on_inbox_fetched(pin, rows).await;
             }
         }
@@ -1474,6 +1492,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// bd-1i8c: the brain must hand the inbox fetch to the host's OFF-LOOP
+    /// lane, never fetch inline.
+    ///
+    /// The brain is a SINGLE-SERIAL writer: an inline fetch parked it for
+    /// the whole scan (one CLI per pin, each with its own ceiling), so the
+    /// wake channel filled and real wake lines were DROPPED (live: 196,167
+    /// forwarded, 27,791 brain_full, 1,879 dropped). The rows re-enter as
+    /// `InboxFetched` messages instead.
+    ///
+    /// The host's inline `fetch_inbox` and `scan_ack_sla` PANIC here: an
+    /// inline fetch must fail this test, not merely change its output.
+    #[tokio::test]
+    async fn brain_hands_the_inbox_fetch_off_the_dispatch() {
+        struct FetchHost {
+            handed: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+            scanned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Host for FetchHost {
+            fn tick(&mut self, _msg: &BrainMsg) -> Vec<crate::host::Effect> {
+                vec![crate::host::Effect::FetchInbox]
+            }
+            fn now_unix(&self) -> u64 {
+                1
+            }
+            fn fetch_inbox(&self, _pin: &str, _since: &str) -> Vec<serde_json::Value> {
+                panic!("bd-1i8c: the brain must not fetch inline");
+            }
+            fn scan_ack_sla(&mut self) -> Vec<String> {
+                panic!("bd-1i8c: the brain must not scan the SLA inline");
+            }
+            fn fetch_inbox_detached(
+                &mut self,
+                pins: Vec<(String, String)>,
+            ) -> Vec<(String, Vec<serde_json::Value>)> {
+                self.handed.lock().expect("handed").extend(pins);
+                Vec::new()
+            }
+            fn scan_ack_sla_detached(&mut self) -> Vec<String> {
+                self.scanned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            }
+            fn restart_wake(&mut self) -> bool {
+                false
+            }
+            fn pins(&self) -> Vec<String> {
+                vec!["AmberOwl".to_string()]
+            }
+        }
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scanned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let host = FetchHost {
+            handed: handed.clone(),
+            scanned: scanned.clone(),
+        };
+        let dir = std::env::temp_dir().join(format!("dbrt-1i8c-brain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut brain = Brain::new(
+            BrainConfig::new("dbrt-1i8c"),
+            host,
+            crate::store::FileStore::new(&dir),
+            crate::sinks::SinkManager::new(tx),
+        );
+        brain.dispatch(BrainMsg::Sweep { now: 1 }).await;
+        let handed = handed.lock().expect("handed").clone();
+        assert_eq!(
+            handed.len(),
+            1,
+            "the sweep must hand the (pin, since) pair to the off-loop lane: {handed:?}"
+        );
+        assert_eq!(handed[0].0, "AmberOwl", "the pin is the sweep's pin");
+        assert!(
+            !handed[0].1.is_empty(),
+            "the hand-off carries the cursor, not an empty window"
+        );
+        assert!(
+            !scanned.load(std::sync::atomic::Ordering::SeqCst),
+            "a sweep does not scan the SLA"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     struct BellOrderHost {
         order: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
@@ -1495,6 +1597,18 @@ mod tests {
             Vec::new()
         }
         fn scan_ack_sla(&mut self) -> Vec<String> {
+            Vec::new()
+        }
+        /// bd-1i8c: the order host has no mailbox — the default (inline)
+        /// fetch is the honest shape for it.
+        fn fetch_inbox_detached(
+            &mut self,
+            _pins: Vec<(String, String)>,
+        ) -> Vec<(String, Vec<serde_json::Value>)> {
+            Vec::new()
+        }
+        /// bd-1i8c: same — no SLA set to scan.
+        fn scan_ack_sla_detached(&mut self) -> Vec<String> {
             Vec::new()
         }
         fn restart_wake(&mut self) -> bool {

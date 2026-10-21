@@ -50,6 +50,40 @@ pub trait Host: Send {
     /// &mut; pipe worker in .5 calls this off-loop, immediate here).
     fn fetch_inbox(&self, pin: &str, since: &str) -> Vec<serde_json::Value>;
     fn scan_ack_sla(&mut self) -> Vec<String>;
+    /// Fetch the inbox rows for `pins` and hand them to the brain.
+    ///
+    /// The host decides HOW they arrive: returned INLINE (the default —
+    /// hosts whose fetch is in-process and cheap) or delivered later as
+    /// [`BrainMsg::InboxFetched`](crate::msg::BrainMsg::InboxFetched)
+    /// messages when the host DETACHED the fetch.
+    ///
+    /// bd-1i8c: the brain is a SINGLE-SERIAL writer. A host that SHELLS OUT
+    /// must detach the fetch (return nothing and deliver the rows as
+    /// messages): an inline subprocess parked the brain for the whole scan
+    /// (one CLI per pin, each with its own ceiling), so the wake channel
+    /// filled and real wake lines were DROPPED (live: 196,167 forwarded,
+    /// 27,791 brain_full, 1,879 dropped, 45 events lost).
+    fn fetch_inbox_detached(
+        &mut self,
+        pins: Vec<(String, String)>,
+    ) -> Vec<(String, Vec<serde_json::Value>)> {
+        pins.into_iter()
+            .map(|(pin, since)| {
+                let rows = self.fetch_inbox(&pin, &since);
+                (pin, rows)
+            })
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect()
+    }
+    /// Scan the ack-SLA and hand the overdue ids to the brain. Same
+    /// contract as [`Host::fetch_inbox_detached`]: returned INLINE by
+    /// default, or delivered later as
+    /// [`BrainMsg::SlaFired`](crate::msg::BrainMsg::SlaFired) when the host
+    /// detached the scan. A host that SHELLS OUT must detach it — the scan
+    /// is minutes-scale and must never sit inside the serial dispatch.
+    fn scan_ack_sla_detached(&mut self) -> Vec<String> {
+        self.scan_ack_sla()
+    }
     /// Restart the wake consumer with backoff (GS-007 never-deaf rule).
     /// The brain calls this on `Died`; results re-enter as watch Msgs.
     ///
@@ -187,6 +221,9 @@ impl Host for MockHost {
     fn scan_ack_sla(&mut self) -> Vec<String> {
         std::mem::take(&mut self.sla)
     }
+
+    // bd-1i8c: the mock's mailbox is in RAM, so the default (inline) fetch
+    // and scan are the honest shape for it — no override needed.
 
     fn restart_wake(&mut self) -> bool {
         if self.restart_pending {
