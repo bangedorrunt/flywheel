@@ -1129,45 +1129,61 @@ tracker (`br list`); the titles are below.
 | Section | Severity | Repo | What landed |
 |---------|----------|------|-------------|
 | 9 | S1 | beads | The gates sidecar refuses ONE orphan row **per row** instead of aborting the whole load behind a foreign-key error, so one stale row no longer takes every good verdict row with it. The refusal is counted and reported at warn level. Commit `36668abf`. |
-| 7 + 8 | S1 | beads | A rebuild now **restores** the verdict rows it drops (the one shared rebuild entry calls the one restore), so the refusal only fires when the sidecar cannot restore them. Losing them on purpose is a separate, operator-gated decision (`--allow-gate-verdict-loss`, BR_OPERATOR=1); the ordinary `--allow-repeated-repair` no longer reaches the verdict refusal at all. Commit `5b9e42cd`. |
-| 18 + 20 | S2 | beads | `strict: true` with no `gates:` block keeps the fail-closed close default **in force** (it used to turn it off AND left the gate-record path with no rule to record a verdict against, so the gate discipline was unreachable), and a commit that touches only `.beads/**` or `.flywheel/**` no longer passes the "carries work" test - both sides now agree on which commit proves a bead. Commit `2fa057cd`. |
+| 7 + 8 | S1 | beads | A rebuild now **restores** the verdict rows it drops (the one shared rebuild entry calls the one restore), so the refusal only fires when the sidecar cannot restore them. Losing them on purpose is a separate, operator-gated decision (`--allow-gate-verdict-loss`, BR_OPERATOR=1); the ordinary `--allow-repeated-repair` no longer reaches the verdict refusal at all - and the three rebuild paths that had no guard at all are covered by the shared entry. Commit `5b9e42cd`. |
+| 18 + 20 | S2 | beads | A project that configured no gate rules runs the fail-closed default, and the ADR default's **gate rules** apply to it while the project's own statuses and transitions still govern - "strict" is no longer a word that means the opposite of what it says. A commit that touches only `.beads/**` or `.flywheel/**` no longer passes the "carries work" test, so both sides agree on which commit proves a bead. Commits `2fa057cd` + the §18 refinement. |
+| 19 | S2 | beads | A close whose `--commit-sha` resolves in no searched repo is **refused** (naming `--repo <path>` as the remedy) instead of warned about, and the close fixtures across the e2e suite now carry a REAL commit that cites the bead instead of a placeholder sha - a fixture that proves nothing about the rule it tests. |
+| 24 | S2 | beads | A `--claim` with no named claimant is refused (fail closed) instead of storing the host username, which matches no live pane. Commit `20ed9410`. |
+| 24 | S2 | flywheel | The taught dispatch claim recipe is `br update <id> --claim --actor <the coder pin>`: the atomic guard runs, and the assignee is the dialect the tracker actually stores (a registered herdr slug folds to its pin). Commit `3017d67`. |
+| 1 (toron half) | S1 | toron | The ack-SLA reminder rides its own kind (30015), the obligation is scoped to the conversation with a budget and a terminal state, and the scan no longer re-resolves the signing key per candidate. Commit `dbe2a68`. |
+| 26 | S1 | toron | A re-render that changes a node's action digest **refuses** instead of minting a second effect key, so the external effect cannot fire twice for one logical node. Commit `8d4e0d2`. |
+| 27 | S2 | toron | The shipped `action: park` reads the runner the host actually injects, and the enforced branch refuses loudly when there is genuinely no runner. Commit `7d88968`. |
+| 3 + 6 + 11 | S1/S2 | toron | The identity fold: the lease holder is canonicalized instead of being reported as an 8-char pubkey compared against a pin, the yield board joins on the canonical project key, and the captain write gate no longer refuses a fold that routes. Commit `1f10ecc4`. |
+| 31 | - | toron | The park-resume claim, the busy-owner "Landed" claim and ADR-0032's I8a now say what the code does. Commit `87ce9e0`. |
+| 2 | S1 | flywheel | One identity ladder, one order, used by every resolver. |
+| 4 + 5 | S1 | flywheel | The leaf watchdog bounds the pipe drain and not only the child exit, and the pane dispatch retry runs attempt timeout, breaker inside the retry, budget timeout around the chain. |
+| 1 (flywheel half) | S1 | flywheel | The ack-SLA flood no longer saturates the doorbell wake stream, and the brain's serial dispatch no longer blocks on a subprocess. |
+| 10 + 12 + 13 + 14 | S2 | flywheel | The arrive guard accepts a correct arrival, the state lock's stale-steal is no longer a TOCTOU, the inject budget is an atomic write, and the durable-intent journal is keyed per attempt instead of one fixed file deleted on success. |
+| 15 + 16 + 17 + 21 | S2 | flywheel | One persisted effect state, a journaled constructor that refuses instead of falling back to `Recording`, one citation rule (case-insensitive on both sides), and one rule for which commit proves a bead. |
+| 16 + 17 | S2 | flywheel | The citation tiers no longer **replace** the lower tiers: the bookkeeping-only commits are dropped before the ranking, so the ceremony's own `chore(beads): close <id>` can no longer become the bound revision (it did: two toron beads were bound to a bookkeeping commit that proves nothing). Commit `93dc182`. |
+| 22 + 25 | S3 | flywheel | The spawn registry resolves last-write-wins, the unbounded full-file reads are bounded, the starvation counter is written atomically, the blocking join is off the Tokio worker, the breaker clears its failure count at cooldown, the dead code is deleted, and the AGENTS.md claims match the code. |
+| - | S2 | flywheel | The audit document itself records this status (bd-zhbi). Commit `363a3fd`. |
 
 Every fix carries a test that goes red when the fix is inverted (verified by
 inverting it, not by assertion): the orphan-row test fails when the per-row
-refusal is removed, and the end-to-end repair test fails when the restore is
-removed.
+refusal is removed, the end-to-end repair test fails when the restore is
+removed, and the dispatch-contract test fails when the old recipe is restored.
 
 ### In flight
 
-- **toron** (lane `BlueRidge`): the ack-SLA flood (its own kind, a terminal mute, a
-  per-scan cap, a deadline); the render-derived durable-effect key (`check_replay`
-  wired into the prepare path); the park action that cannot run; the identity fold
-  (the 8-char holder compared against a pin, the raw-keyed yield board, the captain
-  write gate that refuses a fold that routes); the perf and waste set; the
-  docs-vs-code set.
-- **flywheel** (lane `EmeraldSparrow`): one identity ladder; the leaf watchdog's
-  unbounded pipe drain plus the pane dispatch timeout order; the doorbell side of
-  the ack-SLA flood; the arrive guard, the state-lock TOCTOU, the inject-budget
-  read-modify-write and the leaf intent journal; the second `EffectState`, the
-  journaled constructor's `Recording` fallback and the citation/derivation
-  agreement; the spawn registry, the unbounded reads, the dead code and the
-  AGENTS.md claims.
+- **flywheel** (lane `EmeraldSparrow`): the spawn registry, the unbounded reads,
+  the starvation temp write, the blocking join, the breaker cooldown, the dead code
+  and the AGENTS.md corrections.
+- **toron** (lane `BlueRidge`): the perf and waste set - the full-log folds on the
+  dispatch hot path, the prune loop writing inside the transaction, `next_epoch_at`
+  replaying the whole bus per path, the second persisted `EffectState`, the
+  poisoned-lock `.expect`, the dead `--no-input` flag and the dead modules.
+- **beads** (lane `PinkMarsh`): the perf set - `br ready` without the O(n^2) scan,
+  the JSONL hash memo, and the incremental gates-sidecar export.
 
 ### Residual
 
-- **§19** (the sha-citation check is warn-only when the sha resolves nowhere):
-  **not fixed.** The refusal needs the 24 close tests to carry a real commit instead
-  of the `test_sha()` placeholder, so it belongs in a bead of its own rather than
-  inside a fix that would change the close's error precedence silently.
-- **§16** (the case-sensitivity split): the beads side is already case-insensitive;
-  the flywheel side (`git --grep` is case-sensitive) is part of the flywheel lane's
-  citation/derivation bead.
+- **§19** (the sha-citation check): fixed in the close path (see the table above).
+  The remaining piece is the OPERATOR side: `br doctor --repair` on a workspace
+  whose sidecar cannot restore the verdicts still needs the operator-gated flag,
+  and the refusal it hands out names the remedy.
+- **§23** (the toron daemon runs a 3-day-old build): an operator action - the
+  daemon is still on the old binary, so the ack-SLA flood only stops when the
+  new build is installed and the daemon is restarted.
 
 ### Also found while fixing
 
-The beads repo's lib suite was **red at HEAD**: the gated-close fixture used the id
-`px1`, which the id validator rejects ("expected prefix-hash"), so that test
-panicked before any of these changes. Repaired in the same commit.
+- The beads repo's lib suite was **red at HEAD**: the gated-close fixture used the
+  id `px1`, which the id validator rejects ("expected prefix-hash"), so that test
+  panicked before any of these changes. Repaired.
+- The commit guard charges every `bd-*` token a diff **adds** to the commit message.
+  A stage-text edit re-adds the provenance ids of the stage it edits, so the
+  dispatch-contract commit carries three foreign ids in its body - the tiers keep
+  their bindings, because a body mention never outranks a subject citation.
 
 ---
 
