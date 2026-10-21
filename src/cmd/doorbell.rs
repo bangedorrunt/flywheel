@@ -157,6 +157,19 @@ pub(crate) enum DoorbellCmd {
     },
 }
 
+/// The `--as` actor of a doorbell: the ONE identity ladder (bd-05ar).
+///
+/// Pure so the order is provable without mutating the process env — the
+/// doorbell actor must be the same pin that holds the lease and attributes
+/// the commit, or the wake lands on a stranger's pin.
+pub(crate) fn resolve_as_pin(
+    explicit: Option<&str>,
+    config_name: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    crate::authority::select_agent_identity(explicit, env, config_name)
+}
+
 #[allow(clippy::too_many_arguments)] // clap leaf: one param per CLI flag, single call site.
 pub(crate) fn cmd_doorbell_introduce(
     cfg: &Config,
@@ -169,16 +182,19 @@ pub(crate) fn cmd_doorbell_introduce(
     json: bool,
 ) -> Result<()> {
     crate::check_project_spelling(project, "doorbell introduce")?;
-    let _ = cfg;
     if pin.trim().is_empty() {
         anyhow::bail!("doorbell introduce requires --pin <adjectiveNoun>");
     }
-    let as_pin = as_pin
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| crate::authority::HostAuthority::resolve().agent_name)
-        .ok_or_else(|| anyhow::anyhow!("doorbell introduce needs --as <pin> (or AGENT_NAME)"))?;
+    let as_pin = resolve_as_pin(
+        as_pin,
+        cfg.agent_mail.as_ref().and_then(|m| m.name.as_deref()),
+        &|k| std::env::var(k).ok(),
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "doorbell introduce needs --as <pin> (or TORON_AGENT / FLYWHEEL_MAIL_AS / AGENT_NAME / [agent_mail].name)"
+        )
+    })?;
     let channel = channel
         .map(str::trim)
         .filter(|s| !s.is_empty())

@@ -605,14 +605,17 @@ pub fn store() -> Result<InboxStore> {
     Ok(InboxStore::new(pool))
 }
 
-/// The sender pin/npub: explicit, else `FLYWHEEL_MAIL_AS`, else `AGENT_NAME`.
-pub fn sender_token(from: Option<&str>) -> Result<String, SendError> {
-    from.map(str::to_string)
-        .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok())
-        .or_else(|| std::env::var("AGENT_NAME").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or(SendError::NoSender)
+/// The sender pin/npub: the ONE identity ladder (bd-05ar) — explicit, then
+/// `TORON_AGENT` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME`, then the configured
+/// `[agent_mail].name`. The env rungs are toron's `guard_agent` order, so the
+/// pin that sends mail is the pin that holds the lease and attributes the
+/// commit.
+pub fn sender_token(
+    from: Option<&str>,
+    config_name: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, SendError> {
+    crate::authority::select_agent_identity(from, env, config_name).ok_or(SendError::NoSender)
 }
 
 /// One full send from sync code (CLI and the `__send` leaf).
@@ -647,7 +650,11 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         .iter()
         .map(|t| parse_address(t))
         .collect::<Result<_, _>>()?;
-    let sender_tok = sender_token(req.from)?;
+    let sender_tok = sender_token(
+        req.from,
+        cfg.agent_mail.as_ref().and_then(|m| m.name.as_deref()),
+        &|k| std::env::var(k).ok(),
+    )?;
     let store = store()?;
     let mb = crate::mail_shim::mailbox();
     let project = req.project.to_string();
