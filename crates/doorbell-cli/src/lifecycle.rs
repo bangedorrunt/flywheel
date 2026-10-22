@@ -2095,6 +2095,16 @@ mod tests {
             &hosts,
             "http://127.0.0.1:18080/mcp",
         );
+        // bd-m7yp: launchd's default soft maxfiles for a job is 256, and this
+        // daemon is a SERVER - it holds one descriptor per wake subscriber
+        // and one per hosted workspace. Measured: 257 descriptors against the
+        // 256 cap, so it could not open a socket and the wake brain could not
+        // reach a pane. The budget has to match the working set.
+        assert!(
+            body.contains("<key>LimitMaxFiles</key>"),
+            "the unit must raise the fd budget: launchd's default is 256 and the daemon holds \
+             one descriptor per subscriber"
+        );
         for key in [
             doorbell_rt::binpath::TORON_BIN_ENV,
             doorbell_rt::binpath::HERDR_BIN_ENV,
