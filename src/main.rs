@@ -2329,11 +2329,9 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
         // scan below cannot see it and the tie falls to list order — the stale
         // room carrying the bare project label. The spawn registry is the
         // project→pane map, so its panes name the live swarm.
-        if let Some(ws) = herdr_shim::resolve_workspace_from_registry(
-            &matches,
-            &agents,
-            &registry_panes(project),
-        ) {
+        if let Some(ws) =
+            herdr_shim::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
+        {
             return Ok(ws);
         }
         return Ok(herdr_shim::resolve_workspace_id(&matches, &agents, &prefix));
@@ -23091,114 +23089,22 @@ fn cmd_loop_supervise(
     if interval_secs < 5 {
         bail!("--interval must be >= 5 seconds");
     }
-    // Phase 4a: under the comms flag the same cadence runs on
-    // SupervisorProgram (MaxR/MaxT instead of "3 failed passes"). Flag off:
-    // the legacy loop below, unchanged.
-    if comms_send::enabled(cfg) {
-        return supervisor_host::run_supervise(
-            cfg,
-            project,
-            work,
-            interval_secs,
-            to,
-            stall_minutes,
-            context,
-        );
-    }
-    let exe = std::env::current_exe().context("resolve the flywheel executable")?;
-    let project_dir = crate::project_dir(cfg, project);
-    let stall_secs = stall_minutes.max(1) * 60;
-    let mut consecutive_failures = 0u32;
-    let mut escalated = false;
-    // bd-pane-wedge-detect-respawn-pnyi: pins already paged for a wedge. Kept
-    // across passes so a wedge pages ONCE; cleared when work moves again, so a
-    // later wedge (even in the same pane) pages again.
-    let mut wedge_paged: std::collections::HashSet<String> = std::collections::HashSet::new();
-    loop {
-        let argv = durable::supervise_pass_argv(project, work, to);
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(&argv);
-        let status = cmd
-            .status()
-            .with_context(|| format!("spawn `{}`", argv.join(" ")))?;
-        consecutive_failures =
-            durable::supervise_failure_count(status.success(), consecutive_failures);
-        if consecutive_failures >= durable::SUPERVISE_MAX_CONSECUTIVE_FAILURES {
-            bail!(
-                "loop-mode supervise stopping after {consecutive_failures} consecutive failed passes — see the failing pass above, or run one by hand: `flywheel loop-mode run {project} --once{}`, then re-run supervise",
-                if work { " --work" } else { "" }
-            );
-        }
-        // Dead-stop probe. A stall cannot be judged from one pass's exit code
-        // (the pass SUCCEEDS against an idle fleet), so it needs its own look.
-        let now = chrono::Utc::now().timestamp().max(0) as u64;
-        let probe = cmd::captain::probe_stall(cfg, project, &project_dir, now, stall_secs);
-        let action = durable::dead_stop_action(&durable::DeadStopInputs {
-            work_remaining: probe.work_remaining,
-            fleet_knowable: probe.fleet_knowable,
-            any_pane_working: probe.any_pane_working,
-            last_commit_age_secs: probe.last_commit_age_secs,
-            stall_secs,
-            already_escalated: escalated,
-        });
-        match action {
-            durable::DeadStopAction::Escalate(kind) => {
-                escalated = true;
-                let age = probe.last_commit_age_secs.unwrap_or(0);
-                let line = match kind {
-                    durable::DeadStopKind::SilentPanes => format!(
-                        "loop-mode supervise: DEAD STOP in {project} — no pane working and no commit for {age}s (>{stall_secs}s) with work remaining"
-                    ),
-                    durable::DeadStopKind::StuckWorking => format!(
-                        "loop-mode supervise: STUCK PANES in {project} — pane(s) report working but nothing moved for {age}s (>{stall_secs}s) with work remaining; a working verdict is not progress"
-                    ),
-                };
-                eprintln!(
-                    "{line} — paging the captain once (a recovering fleet clears this without a second)"
-                );
-                page_captain_dead_stop(cfg, project, &line);
-            }
-            durable::DeadStopAction::Hold | durable::DeadStopAction::Wait => {}
-            durable::DeadStopAction::Clear if escalated => {
-                escalated = false;
-                eprintln!(
-                    "loop-mode supervise: {project} recovered — work moved inside the window; dead-stop probe re-armed"
-                );
-            }
-            durable::DeadStopAction::Clear => {}
-        }
-        // A commit inside the window re-arms the wedge probe as well, so a
-        // pane that recovers and wedges again is paged a second time.
-        if probe
-            .last_commit_age_secs
-            .is_some_and(|age| age < stall_secs)
-        {
-            wedge_paged.clear();
-        }
-        for action in probe_pane_wedges(cfg, project, &project_dir, now, stall_secs, &wedge_paged) {
-            if let durable::PaneWedgeAction::Page {
-                pin,
-                pane_id,
-                error,
-            } = action
-            {
-                let line = redact::wedge_notice(
-                    project,
-                    &pin,
-                    &pane_id,
-                    &error,
-                    probe.last_commit_age_secs.unwrap_or(0),
-                );
-                eprintln!(
-                    "{line} — paging the captain once (clear it with a fresh session: \
-                     `flywheel crew control {project} {pin} relaunch`)"
-                );
-                page_captain_dead_stop(cfg, project, &line);
-                wedge_paged.insert(pin);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
-    }
+    // ADR-0018 §3 item 4: the supervisor is ONE mechanism. The rehost
+    // landed behind the comms flag (d4b8412) with the legacy child-process
+    // loop kept for the flag-off case, which left the supervisor with two
+    // implementations and a config flag to choose between them. The program
+    // does everything the legacy loop did — the pass child, the dead-stop
+    // probe, the pane-wedge probe, the restart intensity (MaxR/MaxT) and
+    // the epoch fence — so the legacy loop goes with the gate.
+    supervisor_host::run_supervise(
+        cfg,
+        project,
+        work,
+        interval_secs,
+        to,
+        stall_minutes,
+        context,
+    )
 }
 
 /// Page the captain about a dead stop. Best-effort but LOUD: a failed page
