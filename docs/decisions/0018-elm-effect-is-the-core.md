@@ -33,6 +33,13 @@ were duplicated in every plane:
 | Policy | `policy::remote` (retry, timeout, rate limit, bulkhead) | `toron_core::kernel` |
 | The durable identity | `Producer` (producer id + epoch + seq), `Offset` | `toron_core::kernel` |
 
+**No second spelling.** A duplicate adapter (`src/elm_framework.rs`, weaker
+semantics: a breaker config that truncated the cooldown to whole seconds, and
+a `decide_commands` alias with a vacuous drop test) is gone, along with its
+`mod` line; flywheel's one adapter is `src/elm/` (bd-t13a, bd-1io4). A
+sibling that wants the framework's shapes reaches them through its port
+module, or the ADR-0002 "third spelling" rule is broken again.
+
 **One persisted `EffectState`, the core one.** toron's boundary mirror is
 gone (flywheel `bd-ozpj`). The journal's identity is the framework's
 `(producer_id, epoch, seq)`, and the resume field is `offset` — never `seq`,
