@@ -1170,9 +1170,35 @@ Both are recorded because the failure modes are the interesting part.
   --once`: that client **half-closes** after subscribing, and EOF cannot tell a
   half-close from a death. The write is the only sound signal.
 
-### In flight
+### The elm-effect port, in two crews
 
-None. Every bead opened by this work is closed.
+ADR-0018 makes elm-effect-rs the core of the stack. Two crews worked the
+remaining migrations in parallel, one per repo, with the captain owning the
+reserves, the ceremony and the deploy.
+
+| Repo | What landed |
+|------|-------------|
+| toron | The mail send is a **durable command keyed by its event id**. The claim row IS the command: it carries the `created_at` that rebuilds the same event and whether the publish completed. A crash between the claim and the publish used to leave a claim for a rumor that never hit the bus, and every retry inside the 24h TTL then suppressed that mail. A claim whose publish never finished is re-published; one whose publish finished replays its deliveries and publishes nothing. `f4571bd` |
+| flywheel | The doorbell's models become **ONE program** (`src/elm/inbox.rs`): a tick, a herdr event and a mail ingress are MESSAGES, the fold is pure, the interpreter runs the commands at the edge, and the framework's log and producer carry the durable identity `(producer_id, epoch, seq)` with `offset` as the resume field. The fold DELEGATES to the core's dispatcher and router ticks, so there is no second copy of a decision. `9990ec4` |
+| flywheel | The outbox's recovery claim ran OUTSIDE the sender's turn, so it fenced a live peer's in-flight append: twelve concurrent runs of one sender failed 4 of 12 with "stale epoch for producer". The claim now takes the sender's turn. `c9c79ad` |
+
+Both beads are closed with a LEGAL ledger row, and both proofs are a **clean
+export** of HEAD, never the working tree.
+
+### Still open
+
+- **The gap counter fans out.** Every hosted workspace's wake-brain counter
+  moved by +1 in the same 75-second window (19 workspaces at once; one of them
+  also dropped a real event, 826 -> 827). One upstream herdr status-stream gap
+  therefore reaches every subscriber of the same ring. The status path
+  recovers - it clears coverage and re-reconciles from `session.snapshot` - so
+  no mail is lost, but the counter degrades `/health` the way a drop does, and
+  the one real drop is not recovered. Filed as `bd-v9k6`.
+- **The arrival heal was filed in the wrong tracker.** The fix (the heal marker
+  is durable and the heal runs once, so a restart stops re-inserting every
+  event into the arrival log) is tracked in the repo that OWNS it, toron. The
+  flywheel tracker carries the audit-wide record of the same finding
+  (`bd-dtua`), and this document is the cross-repo record.
 
 ### Residual
 
@@ -1196,6 +1222,8 @@ None. Every bead opened by this work is closed.
 | Stop the ack-SLA flood | **Done.** `toron ack-sla --project flywheel` returns `expired: []` where it returned thousands; the reminder rides kind 30015, off the kind-9 room plane the wake brain reads. |
 | Restart the doorbell daemon | **Done**, after the autostart unit was fixed. The wake brain reports `dropped: 0` and `events_lost: 0`, where it had dropped 3,588 and lost 1,352. |
 | Deploy the committed fixes | **Done.** `toron` and `flywheel` are built from clean exports of HEAD and installed, so every fix above is live. |
+| Deploy the 2026-10-22 fixes (the durable arrival heal, the durable send, the doorbell program, the epoch) | **Done.** Both binaries are built from `git archive HEAD` of the committed tree, installed, and both daemons restarted: the toron daemon holds 21 wake sockets (it held 230 before the heal fix and died of EMFILE at 264), the doorbell holds 40 descriptors against launchd's 256. |
+| The proof for a change | **Done.** The rule is in both repos' standing orders: the proof is a clean export of the commit (`git archive HEAD` into a scratch dir, build THERE), a commit that names a module ships the file, and `git add` covers only your own paths. |
 | `toron agent prune --project flywheel` | **Run.** One duplicate slug identity was listed and **kept** - the prune asks for a human on a row whose canonical pin is not a live one. Nothing was absorbed. |
 | The ack-SLA backlog | **Done.** 96,484 of the 100,857 bus rows were this one reminder plane; they are deleted and the archive is vacuumed (the store went 297MB -> 117MB). The 4,752 real events are untouched. |
 | The `quiet-spark` identity (a forbidden hyphenated slug, so mail to it went to a key nobody read) | **Done - rebound, not released.** The identity keeps its key and its npub and now answers to the pin `QuietCedar`; the live leases follow it. `toron mail whois flywheel QuietCedar` reports `identity_divergent: false`, and the board has no hyphenated holder left. |
