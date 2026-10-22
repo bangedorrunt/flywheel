@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 /// workspace `Presence` adds the evidence source, the daemon host reads
 /// the verdict directly. blocked reads as Busy (occupied, digest not
 /// prompt); done reads as Idle; anything unparseable is Unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PresenceVerdict {
     Idle,
     Busy,
@@ -232,7 +232,7 @@ pub fn why_flood(decision: &FloodGate, total: usize, unseen: usize) -> String {
 /// Spec-5 routing verdict (bd-fuql): exactly one of these per wake.
 /// Distinct from [`FloodGate`] (dispatch pausing) — this governs where
 /// one wake GOES.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GateDecision {
     /// Prompt the pin now with this line.
     Inject { pin: String, line: String },
@@ -246,7 +246,7 @@ pub enum GateDecision {
 
 /// What `route_wake` decides on (all inputs are already-resolved facts:
 /// presence word, route existence, budget state — never lookups).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RouteInput {
     pub pin: String,
     pub line: String,
