@@ -1176,16 +1176,12 @@ None. Every bead opened by this work is closed.
 
 ### Residual
 
-- **The 95,077 ack-SLA reminder rows** stay in the bus archive. The flood that
-  produced them is stopped (the reminder rides its own kind, and the scan has a
-  deadline and a terminal mute), but the rows are history and deleting them is a
-  separate decision.
-- **The `quiet-spark` lease** (bd-0g5l, an open bead) is held by a hyphenated
-  slug identity, which the pin convention forbids: mail to it is addressed to a
-  key nobody reads. It is NOT a stale lease - it belongs to open work (the
-  abandoned elm refactor that is still uncommitted in the working trees), so
-  releasing it would drop a live lane's protection. The fix is to rebind the
-  identity, which is the operator's call.
+- **The ack-SLA backlog is swept** (96,484 rows deleted, the archive vacuumed).
+  The real events are untouched.
+- **The forbidden `quiet-spark` identity is rebound** to the pin `QuietCedar`:
+  the same key, the same npub, `identity_divergent: false`, and the live leases
+  (bd-0g5l, bd-b61z) follow it. Its work is still open - the abandoned elm
+  refactor - so the lease stays, now held by a name the pin convention allows.
 - **The abandoned elm refactor** (the uncommitted `src/elm/` in flywheel and
   the `engine/elm.rs` rename in toron) is still in the working trees. The
   committed trees no longer depend on it.
@@ -1201,8 +1197,9 @@ None. Every bead opened by this work is closed.
 | Restart the doorbell daemon | **Done**, after the autostart unit was fixed. The wake brain reports `dropped: 0` and `events_lost: 0`, where it had dropped 3,588 and lost 1,352. |
 | Deploy the committed fixes | **Done.** `toron` and `flywheel` are built from clean exports of HEAD and installed, so every fix above is live. |
 | `toron agent prune --project flywheel` | **Run.** One duplicate slug identity was listed and **kept** - the prune asks for a human on a row whose canonical pin is not a live one. Nothing was absorbed. |
-| `toron reserve release` for the `quiet-spark` lease | **Not taken, deliberately.** It belongs to an open bead with uncommitted work (see the residual above); releasing it would drop a live lane's protection. |
-| The ~91 fixture project dirs in `~/.local/share/toron/projects/` | **Not taken.** They are inert test leftovers (a few MB); removing them is a destructive sweep with no upside. |
+| The ack-SLA backlog | **Done.** 96,484 of the 100,857 bus rows were this one reminder plane; they are deleted and the archive is vacuumed (the store went 297MB -> 117MB). The 4,752 real events are untouched. |
+| The `quiet-spark` identity (a forbidden hyphenated slug, so mail to it went to a key nobody read) | **Done - rebound, not released.** The identity keeps its key and its npub and now answers to the pin `QuietCedar`; the live leases follow it. `toron mail whois flywheel QuietCedar` reports `identity_divergent: false`, and the board has no hyphenated holder left. |
+| The fixture project dirs in `~/.local/share/toron/projects/` | **Done.** 53 test leftovers removed (`fw-gate-*`, `fw-osc-*`, scratch ids, probe dirs); the 38 live project dirs are untouched. |
 | **Do not** run `br doctor --repair` on the beads repo | Superseded: a rebuild now restores the verdict rows it drops, so the flag no longer reaches the verdict refusal (`5b9e42cd`). |
 | Gate `--allow-repeated-repair` behind `BR_OPERATOR` in beads | Superseded: the ordinary flag no longer reaches the verdict refusal at all; losing verdicts on purpose needs `--allow-gate-verdict-loss` with BR_OPERATOR=1. |
 | Wire `check_replay` into toron's dispatch path | Done (`8d4e0d2`). |
