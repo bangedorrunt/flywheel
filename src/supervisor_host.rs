@@ -3740,24 +3740,43 @@ mod tests {
         assert_eq!(f.0.lock().unwrap().relaunched.len(), 1);
     }
 
-    // ---- flag gate and shape ----------------------------------------------
+    // ---- the one path ------------------------------------------------------
 
+    /// ADR-0018 §3 item 4: the supervisor is ONE mechanism.
+    ///
+    /// The rehost landed behind the comms flag with the legacy child-process
+    /// loop kept for the flag-off case, so `loop-mode supervise` had two
+    /// implementations and a config flag to choose between them. The program
+    /// does everything the legacy loop did, so the legacy loop and its gate
+    /// are gone.
+    ///
+    /// INVERTED: put the gate or the legacy pass back and this goes red —
+    /// which is the defect it pins.
     #[test]
-    fn the_flag_off_supervise_path_is_unchanged_and_the_flag_on_path_is_this_host() {
+    fn supervise_has_one_path_the_program() {
         let src = include_str!("main.rs");
         let a = src.find("fn cmd_loop_supervise(").unwrap();
         let body = &src[a..a + 2_600];
-        let gate = body
-            .find("if comms_send::enabled(cfg) {")
-            .expect("flag gate");
-        let legacy = body
-            .find("supervise_failure_count(")
-            .expect("legacy path kept");
-        assert!(gate < legacy, "the gate precedes the unchanged legacy loop");
-        assert!(body[gate..legacy].contains("supervisor_host::run_supervise("));
         assert!(
-            src.contains("SUPERVISE_MAX_CONSECUTIVE_FAILURES"),
-            "legacy rule still defined for flag-off"
+            body.contains("supervisor_host::run_supervise("),
+            "the command runs the SupervisorProgram"
+        );
+        assert!(
+            !body.contains("comms_send::enabled(cfg)"),
+            "no config flag picks between two supervisors"
+        );
+        assert!(
+            !body.contains("supervise_pass_argv("),
+            "the legacy child-process pass is gone"
+        );
+        assert!(
+            !body.contains("std::process::Command::new(&exe)"),
+            "the legacy loop spawned the pass itself"
+        );
+        assert!(
+            !src.contains("SUPERVISE_MAX_CONSECUTIVE_FAILURES")
+                && !src.contains("supervise_failure_count("),
+            "the legacy failure-count rule is gone with the legacy loop"
         );
     }
 

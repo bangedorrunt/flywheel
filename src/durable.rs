@@ -2240,10 +2240,6 @@ pub fn poll_swarm_argv(project: &str, to: &str) -> Vec<String> {
     vec!["__poll".to_string(), project.to_string(), to.to_string()]
 }
 
-/// bd-swarm-loop-durable-panic-atlo: consecutive failed `--once` passes that
-/// stop `loop-mode supervise` with one actionable line.
-pub const SUPERVISE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
-
 /// argv for one supervised pass (pure; the CLI spawns it as a child process
 /// so a crashed pass cannot kill the supervisor). Deliberately NO `--force`:
 /// a crashed pass leaves a DEAD pid entry which the next pass replaces
@@ -2262,16 +2258,6 @@ pub fn supervise_pass_argv(project: &str, work: bool, to: &str) -> Vec<String> {
         args.push("--work".to_string());
     }
     args
-}
-
-/// Consecutive-failed-pass accounting for supervise: a success resets the
-/// count, a non-zero pass exit accumulates. Pure so the stop rule is tested.
-pub fn supervise_failure_count(success: bool, consecutive: u32) -> u32 {
-    if success {
-        0
-    } else {
-        consecutive.saturating_add(1)
-    }
 }
 
 /// bd-supervise-dead-stop-escalation-rweq: default dead-stop window (minutes).
@@ -14611,7 +14597,7 @@ mod tests {
     /// live loop over (no `--force`), and the stop rule counts consecutive
     /// failures, resetting on any success.
     #[test]
-    fn supervise_pass_argv_never_forces_and_stops_after_consecutive_failures() {
+    fn supervise_pass_argv_never_forces() {
         let argv = supervise_pass_argv("proj", true, "all");
         assert_eq!(argv[0], "loop-mode");
         assert_eq!(argv[1], "run");
@@ -14625,15 +14611,6 @@ mod tests {
         let no_work = supervise_pass_argv("proj", false, "all");
         assert!(!no_work.contains(&"--work".to_string()));
         assert!(!no_work.contains(&"--force".to_string()));
-
-        assert_eq!(supervise_failure_count(true, 0), 0);
-        assert_eq!(supervise_failure_count(true, 2), 0);
-        assert_eq!(supervise_failure_count(false, 0), 1);
-        let mut n = 0;
-        for _ in 0..SUPERVISE_MAX_CONSECUTIVE_FAILURES {
-            n = supervise_failure_count(false, n);
-        }
-        assert_eq!(n, SUPERVISE_MAX_CONSECUTIVE_FAILURES);
     }
 
     /// bd-resume-window-lease-sweep-4sa2: resumes dedupe per (bead, pane)
