@@ -2383,16 +2383,26 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             })
             .collect()
     } else {
         to.split(',')
             .map(|s| {
                 let t = s.trim();
-                let name = registry_entry_for_token(&registry, project, t)
+                let entry = registry_entry_for_token(&registry, project, t);
+                let name = entry
                     .map(|e| e.name.clone())
                     .unwrap_or_else(|| t.to_string());
-                to_want_token(project, &name)
+                let mut want = to_want_token(project, &name);
+                // The registry resolved the token to a PANE: keep it. The
+                // agent's herdr name may be the mail PIN (herdr lowercases
+                // it), so the canonical registry name and the herdr name can
+                // never meet — the pane id always can.
+                if let Some(e) = entry {
+                    want.pane = Some(e.pane_id.clone());
+                }
+                want
             })
             .collect()
     };
@@ -2495,16 +2505,26 @@ fn resolve_agents_dyn(
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             })
             .collect()
     } else {
         to.split(',')
             .map(|s| {
                 let t = s.trim();
-                let name = registry_entry_for_token(&registry, project, t)
+                let entry = registry_entry_for_token(&registry, project, t);
+                let name = entry
                     .map(|e| e.name.clone())
                     .unwrap_or_else(|| t.to_string());
-                to_want_token(project, &name)
+                let mut want = to_want_token(project, &name);
+                // The registry resolved the token to a PANE: keep it. The
+                // agent's herdr name may be the mail PIN (herdr lowercases
+                // it), so the canonical registry name and the herdr name can
+                // never meet — the pane id always can.
+                if let Some(e) = entry {
+                    want.pane = Some(e.pane_id.clone());
+                }
+                want
             })
             .collect()
     };
@@ -2550,6 +2570,12 @@ struct WantToken {
     short: Option<String>,
     /// 1-based ordinal of the kind short (`omp1` → 1, `omp2` → 2).
     ordinal: u32,
+    /// The PANE the token resolved to through the spawn registry. The
+    /// registry is the project→pane map, so the pane is the ground truth:
+    /// a spawned crew's herdr name is its mail PIN (herdr lowercases it),
+    /// and the registry's canonical name and the herdr name can therefore
+    /// never meet — the pane id always can.
+    pane: Option<String>,
 }
 
 fn to_want_token(project: &str, token: &str) -> WantToken {
@@ -2563,6 +2589,7 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
             broaden: false,
             short: None,
             ordinal: 1,
+            pane: None,
         }
     } else if let Some((kind, ordinal)) = split_short_ordinal(t) {
         // bd-eign.14: a numbered short resolves to THAT ordinal's agent —
@@ -2573,6 +2600,7 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
             broaden: false,
             short: Some(kind.to_string()),
             ordinal,
+            pane: None,
         }
     } else {
         let broaden = matches!(t, "oc" | "pi" | "gk") && t.chars().all(|c| c.is_ascii_lowercase());
@@ -2581,6 +2609,7 @@ fn to_want_token(project: &str, token: &str) -> WantToken {
             broaden,
             short: Some(t.to_string()),
             ordinal: 1,
+            pane: None,
         }
     }
 }
@@ -2650,6 +2679,12 @@ fn match_indices(agents: &[AgentInfo], wants: &[WantToken]) -> Vec<usize> {
             for i in name_hits {
                 out[i] = true;
             }
+        } else if let Some(pane) = &want.pane
+            && let Some(i) = agents.iter().position(|a| &a.pane_id == pane)
+        {
+            // The registry resolved the token to this PANE: the pane is the
+            // ground truth, whatever herdr calls the agent.
+            out[i] = true;
         } else if let Some(i) = agents.iter().position(|a| a.pane_id == want.name) {
             // bd-a2bw: pane-id tokens never sit in `a.name`. Match the pane
             // even when herdr reports name=null (omp profile splits).
@@ -14384,6 +14419,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             }
         );
         assert_eq!(
@@ -14393,6 +14429,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             }
         );
         // numbered short: exact, no broadening to oc20; carries kind+ordinal
@@ -14404,6 +14441,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: Some("oc".into()),
                 ordinal: 2,
+                pane: None,
             }
         );
         // bd-eign.14: oc1 (the first oc agent) resolves — the first agent
@@ -14415,6 +14453,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: Some("oc".into()),
                 ordinal: 1,
+                pane: None,
             }
         );
         assert_eq!(
@@ -14424,6 +14463,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: Some("pi".into()),
                 ordinal: 2,
+                pane: None,
             }
         );
         assert_eq!(
@@ -14433,6 +14473,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: Some("gk".into()),
                 ordinal: 1,
+                pane: None,
             }
         );
         // a bare digit is not a numbered short (no kind prefix)
@@ -14443,6 +14484,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: Some("2".into()),
                 ordinal: 1,
+                pane: None,
             }
         );
         // bare shorts expand to first ordinal AND broaden to numbered agents
@@ -14453,6 +14495,7 @@ mod agent_mail_name_tests {
                 broaden: true,
                 short: Some("oc".into()),
                 ordinal: 1,
+                pane: None,
             }
         );
         assert_eq!(
@@ -14462,6 +14505,7 @@ mod agent_mail_name_tests {
                 broaden: true,
                 short: Some("pi".into()),
                 ordinal: 1,
+                pane: None,
             }
         );
         // raw pane id passes through
@@ -14472,6 +14516,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             }
         );
         // empty passes through (caller validates distinctness)
@@ -14482,6 +14527,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             }
         );
     }
@@ -14498,6 +14544,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             }
         );
         assert_eq!(
@@ -14507,6 +14554,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             }
         );
         // whitespace-trimmed crew names still pass through
@@ -14517,6 +14565,7 @@ mod agent_mail_name_tests {
                 broaden: false,
                 short: None,
                 ordinal: 1,
+                pane: None,
             }
         );
     }
@@ -18791,6 +18840,43 @@ mod bd_4pxy_tests {
     }
 
     #[test]
+    /// bd-k8jn (the token half): a spawned crew's herdr name is its mail PIN
+    /// (herdr lowercases it) while the spawn registry keeps the canonical
+    /// name. The two can never meet, so the registry's PANE has to be the
+    /// match: `--to <pin>` and `--to <pane id>` both name a live crew.
+    #[test]
+    fn a_registry_pane_matches_the_agent_whatever_herdr_calls_it() {
+        let crew = agent(
+            Some("opencode"),
+            Some("blueridge"),
+            "w7W",
+            false,
+            AgentStatus::Idle,
+        );
+        let want = WantToken {
+            // the registry's canonical name — which herdr never reports
+            name: "flywheel-toron-coder".to_string(),
+            broaden: false,
+            short: None,
+            ordinal: 1,
+            pane: Some("w7W:p1".to_string()),
+        };
+        assert_eq!(
+            match_indices(std::slice::from_ref(&crew), std::slice::from_ref(&want)),
+            vec![0],
+            "the pane is the ground truth"
+        );
+        // INVERTED: with no pane the name never matches, which is the bug.
+        let no_pane = WantToken {
+            pane: None,
+            ..want.clone()
+        };
+        assert!(
+            match_indices(std::slice::from_ref(&crew), std::slice::from_ref(&no_pane)).is_empty(),
+            "without the pane the pin-named crew is unreachable"
+        );
+    }
+
     fn match_indices_kind_fallback_resolves_omp1() {
         // the bd-4pxy witness shape: an omp agent NAMED flywheel-<base>-coder
         let omp1 = agent(
@@ -25637,6 +25723,7 @@ mod loop_tests {
             broaden: true,
             short: None,
             ordinal: 1,
+            pane: None,
         };
         assert!(name_matches_want(&format!("{base}oc"), &want_oc));
         assert!(name_matches_want(&format!("{base}oc2"), &want_oc));
@@ -25650,6 +25737,7 @@ mod loop_tests {
             broaden: false,
             short: None,
             ordinal: 1,
+            pane: None,
         };
         assert!(name_matches_want(&format!("{base}oc"), &want_exact));
         assert!(!name_matches_want(&format!("{base}oc2"), &want_exact));
@@ -25659,6 +25747,7 @@ mod loop_tests {
             broaden: false,
             short: None,
             ordinal: 1,
+            pane: None,
         };
         assert!(name_matches_want(&format!("{base}oc2"), &want_oc2));
         assert!(!name_matches_want(&format!("{base}oc20"), &want_oc2));
