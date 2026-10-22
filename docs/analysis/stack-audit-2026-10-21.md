@@ -1257,3 +1257,95 @@ toron daemon status --json; toron doctor                        # stale daemon b
 toron mail whois flywheel captain                              # the captain fold that routes
 git log --all --grep=<id> --regexp-ignore-case --oneline         # the citation case split
 ```
+
+## 35. The fd exhaustion, the dispatch path, and the deploy (2026-10-22, second round)
+
+The daemon did not die of one cause but of three stacked ones, and each was
+measured before it was fixed.
+
+### 35.1 What the daemon actually died of
+
+At 04:27Z the toron daemon held **266 fds, 229 of them unix sockets on
+`wake.sock`**. Its axum accept loop then spun on `accept error: Too many open
+files (os error 24)` — 3203 rows in `serve.out.log` — and the MCP plane
+stopped accepting. `toron mail send`, `toron reserve acquire` and the
+pre-commit guard's roster read all failed against `127.0.0.1:18080`, so the
+control plane could not even be asked for help. A restart cleared it (53 fds,
+16 wake sockets).
+
+The fd count grew at the **gap rate**: the daemon's wake sockets went 44 → 61
+in 100 s, while the doorbell's gap counter moved +1 across 19 workspaces in
+the same 75 s window. Every gap made the doorbell's forwarder exit and the
+sweep re-subscribe, and the daemon reclaims an old subscriber's socket only
+on its next heartbeat write, so the count grew at *gap rate × heartbeat
+interval*. The flywheel side is fixed in `5d7217e` (bd-v9k6, "a gap is a
+notice, not a death"): a gap is delivered in band, the stream keeps reading,
+the coverage stays and no new socket is opened.
+
+The toron side is fixed in `f4cc847` (bd-j2vo): the daemon caps its live
+subscribers and refuses a new one with a counted warning instead of taking the
+whole control plane down over a subscriber; and `start_supervised` now
+**installs before it starts**, because `kickstart` restarts the LOADED job and
+a plist edited on disk (the fd budget, `LimitMaxFiles 4096`) never reached the
+running job. That also retired the operator action that needed sudo.
+
+### 35.2 The real source of the pressure: the subscription store
+
+The daemon's subscriber count is the doorbell's subscription count, and the
+store held **73 rows of which only 2 named a workspace herdr still knows**.
+The other 71 were dead: old swarm labels (`flywheel-elm-effect-rs` ×18,
+`flywheel-flywheel` ×13, `flywheel-toron` ×7) and **20 `flywheel-fw-gate-*`
+test artifacts**, one set per test run. At 73 rows the daemon started
+*refusing* new subscribers, so a live workspace could not subscribe and its
+pane could not be woken. Pruning the dead rows by hand took the daemon from
+23 wake sockets to 6 and the refusals stopped — but the hand prune is not a
+fix, so the reaper is fixed instead:
+
+- **bd-oub3** — `reap_candidates` only considers ids starting with `spawn-`
+  and only reaps a workspace whose journal has been silent for
+  `REAP_AFTER_SECS = 7 days`. A `cli-` subscription (what the CLI writes) is
+  never reaped. The workspace is the ground truth: herdr knows which
+  workspaces exist now.
+- **bd-3dge** — the test suite writes real subscriptions into the operator's
+  state dir, so a suite run pushes the daemon's fd count up for days. A test
+  subscribes into a temp state dir; a suite run must leave the operator's
+  state dir byte-identical.
+
+### 35.3 The dispatch path was broken in two independent ways
+
+`flywheel send toron --to BlueRidge` failed with *"no agents in workspace w23
+— is the swarm spawned?"* while the swarm was alive in `w7W`: `w23` is a stale
+room from an earlier session that carries the bare project label.
+
+- **bd-k8jn** — `find_workspace` matched a project to a workspace by LABEL and
+  broke a tie by scanning for an agent named `flywheel-<project>-*`. A spawned
+  crew's herdr name is its **mail pin**, so the scan found nothing and the tie
+  fell to list order — the stale room. The spawn **registry is the
+  project→pane map**, so its panes now name the live swarm.
+- **bd-ba1y** — `--to <pin>` and `--to <pane id>` both missed, because the
+  send mapped a token to the registry's canonical name while herdr reports the
+  agent's name as its **lowercased** pin: the two names could never meet. The
+  resolved token now carries the **pane id**, which always matches.
+
+Both proofs are clean exports of HEAD (2505 and 2506 passed, 0 failed).
+
+### 35.4 Two more identity splits found in the same round
+
+- **bd-rtkx** (toron) — the agents table holds identities under both `toron`
+  and `/Users/bangedorrunt/workspace/toron` — the same identity under two
+  spellings — and the alias table has **no** path→slug row, so ADR-0017's
+  read expansion sees only `{toron}` and the path-keyed identities are
+  invisible. That is why a mail addressed to `toron` reports *"no such agent
+  … it looks like a host OS username"* while the agent plainly exists.
+- **bd-fize** (toron) — the operator's `agents` table holds 20+ rows for
+  `/tmp/toron-am-parity-*` and 16 for `/tmp/fwgate-proj`: test artifacts that
+  are permanent identities, issued by a test, in the operator's live index.
+
+### 35.5 The general lesson
+
+A lookup keyed on a **name another layer rewrites** is a lookup that can
+miss. The spawn names an agent by the identity it was given; herdr lowercases
+that display name; the registry keeps the canonical name. Two of the three
+lookups in the dispatch path were keyed on a name, and both missed. The
+registry (project → pane) is the only spelling that all three layers agree
+on — so key on the pane, and treat a name as a display label.
