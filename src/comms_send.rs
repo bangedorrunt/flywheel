@@ -381,9 +381,20 @@ pub async fn append_task(
     // 1. Reconcile whatever a crashed earlier run journaled (toron's
     //    mail.append recovery): present -> settled, absent -> appended with
     //    the SAME triple.
-    outbox::send_and_recover(store.clone(), sender.to_string(), Vec::new())
-        .await
-        .map_err(|e| anyhow!("recover sender intents: {e}"))?;
+    //
+    //    The recovery takes the sender's turn (bd-3s2q). The outbox CLAIMS a
+    //    journal epoch, and a claim fences every lower epoch at once, so a
+    //    recovery outside the turn fenced a live peer's in-flight append:
+    //    "stale epoch for producer <npub>#journal: sent 12, current 13".
+    //    One sender, one turn: the claim and the appends it fences are the
+    //    same critical section, so a run's own epoch is never fenced by a
+    //    peer that is still writing under it.
+    {
+        let _turn = gate.lock().await;
+        outbox::send_and_recover(store.clone(), sender.to_string(), Vec::new())
+            .await
+            .map_err(|e| anyhow!("recover sender intents: {e}"))?;
+    }
 
     // (msg key, state, offset) once a recipient is settled; `last_why` keeps
     // the latest refusal for a recipient still pending.
