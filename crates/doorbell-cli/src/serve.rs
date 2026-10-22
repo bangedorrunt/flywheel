@@ -456,23 +456,102 @@ fn retire_keys(hosted: &[String], boot: &[String], live: &[String]) -> Vec<Strin
         .collect()
 }
 
-/// Spawn-scoped rows whose workspace journal has been silent past
-/// [`REAP_AFTER_SECS`]. No journal yet (fresh spawn) or a live journal
-/// keeps the row; operator/cli rows always stay.
+/// The workspace a subscription row names — the daemon's auto-host key half.
+/// A row whose scope names no workspace names no host, so it is never reaped.
+fn row_workspace(sub: &doorbell_rt::subscribe::Subscription) -> Option<String> {
+    sub.scope.workspaces().into_iter().next()
+}
+
+/// Is the row's workspace still live, per herdr (bd-oub3)?
+///
+/// Two scope shapes exist, and the id says which wrote the row:
+/// - a spawn row names the spawn's OWN workspace label (`elm-comms-kernel`),
+///   which IS a herdr workspace label;
+/// - a CLI row names a stable per-project scope (`flywheel-<project>`), which
+///   is NOT a herdr label — the project's own workspace is what says the
+///   project lives.
+///
+/// A row whose workspace herdr no longer lists is DEAD, whatever its id and
+/// however old its journal: the workspace is the ground truth.
+fn row_workspace_live(
+    sub: &doorbell_rt::subscribe::Subscription,
+    live: &std::collections::BTreeSet<String>,
+) -> bool {
+    let Some(ws) = row_workspace(sub) else {
+        return true; // no scope names no host: nothing to prune
+    };
+    if live.contains(&ws) {
+        return true;
+    }
+    if sub.id.starts_with("cli-")
+        && let Some(project) = sub.project.as_deref()
+    {
+        let base = project.rsplit('/').next().unwrap_or(project);
+        if !base.is_empty() && live.contains(base) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Subscription rows to reap (bd-oub3).
+///
+/// The workspace is the ground truth: herdr enumerates the live workspaces,
+/// so a row whose workspace is gone is dead whatever its id and however old
+/// its journal. The rule this replaces considered only `spawn-` ids AND a
+/// week of journal silence, so a `cli-` row — what the CLI writes — was
+/// NEVER reaped. The store grew until the daemon held one wake subscription
+/// per dead workspace, the toron daemon ran out of descriptors, and it began
+/// refusing LIVE subscribers.
+///
+/// `live_workspaces` is `None` when herdr did not answer. That is NOT "every
+/// workspace is gone", it is "we do not know": nothing is pruned by the
+/// workspace rule then, and the journal age decides instead — the only rule
+/// that can act on a workspace herdr cannot answer for.
 fn reap_candidates(
     subs: &[doorbell_rt::subscribe::Subscription],
+    live_workspaces: Option<&std::collections::BTreeSet<String>>,
     journal_age_secs: impl Fn(&str) -> Option<u64>,
 ) -> Vec<String> {
     subs.iter()
-        .filter(|s| s.id.starts_with("spawn-"))
         .filter_map(|s| {
-            let ws = s.scope.workspaces().into_iter().next()?;
-            match journal_age_secs(&ws) {
-                Some(age) if age > REAP_AFTER_SECS => Some(s.id.clone()),
-                _ => None,
+            let ws = row_workspace(s)?;
+            match live_workspaces {
+                Some(live) => (!row_workspace_live(s, live)).then(|| s.id.clone()),
+                None => match journal_age_secs(&ws) {
+                    Some(age) if age > REAP_AFTER_SECS => Some(s.id.clone()),
+                    _ => None,
+                },
             }
         })
         .collect()
+}
+
+/// The live herdr workspace labels, or `None` when herdr did not answer.
+///
+/// `None` is "we do not know" (a herdr restart, a timeout, an unparseable
+/// answer) and never "every workspace is gone" — the caller falls back to the
+/// journal age rather than pruning on absence of evidence.
+fn herdr_workspace_labels(herdr_bin: &str) -> Option<std::collections::BTreeSet<String>> {
+    let out = doorbell_rt::file_host::run_cli(herdr_bin, &["workspace", "list"], 5)?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let labels: std::collections::BTreeSet<String> = parsed
+        .get("result")?
+        .get("workspaces")?
+        .as_array()?
+        .iter()
+        .filter_map(|w| w.get("label")?.as_str())
+        .map(str::to_string)
+        .collect();
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels)
+    }
 }
 
 /// Mtime age of a workspace's journal file, in seconds (None = no journal).
@@ -1233,14 +1312,23 @@ fn reconcile_once(
     use doorbell_rt::lease;
     use doorbell_rt::subscribe::{Actor, SubscriptionStore};
     let mut store = SubscriptionStore::open(&cfg.flywheel_state);
-    for id in reap_candidates(&store.list(), |ws| {
+    // bd-oub3: herdr enumerates the live workspaces, so a row whose workspace
+    // is gone is dead whatever its id and however old its journal. When herdr
+    // does not answer there is no evidence, and the journal age decides.
+    let live = herdr_workspace_labels(&resolved_bins().herdr);
+    let reason = if live.is_some() {
+        "workspace gone from herdr".to_string()
+    } else {
+        format!("journal silent > {REAP_AFTER_SECS}s")
+    };
+    for id in reap_candidates(&store.list(), live.as_ref(), |ws| {
         journal_age_secs(&cfg.flywheel_state, ws)
     }) {
         match store.unsubscribe(Actor::operator(), &id) {
             Ok(dropped) => {
                 eprintln!(
-                    "doorbell serve: reaped stale subscription {} (journal silent > {}s)",
-                    dropped.id, REAP_AFTER_SECS
+                    "doorbell serve: reaped stale subscription {} ({reason})",
+                    dropped.id
                 );
             }
             Err(e) => eprintln!("doorbell serve: reap {id} failed: {e:?}"),
@@ -2894,8 +2982,8 @@ mod tests {
         assert!(super::straggler_note(&clean).is_none());
     }
     use super::{
-        REAP_AFTER_SECS, any_fresh, bins_allow_hosting, inbox_path_down, reap_candidates,
-        unhosted_subscribed,
+        REAP_AFTER_SECS, any_fresh, bins_allow_hosting, herdr_workspace_labels, inbox_path_down,
+        reap_candidates, unhosted_subscribed,
     };
 
     /// bd-xwgh round 2: a mid-shutdown doorbell whose accept loop is gone
@@ -3600,10 +3688,69 @@ mod tests {
         );
     }
 
+    /// bd-oub3: the workspace is the ground truth. A row whose workspace
+    /// herdr no longer lists is dead whatever its id and however old its
+    /// journal; a row whose workspace is live survives.
+    ///
+    /// The rule this replaces reaped only `spawn-` rows whose journal had
+    /// been silent for a week, so `cli-dead-p` — a CLI row, which is what the
+    /// CLI writes — SURVIVED it, and every dead workspace kept a wake
+    /// subscription on the toron daemon until it ran out of descriptors.
     #[test]
-    fn reap_candidates_only_quiet_spawn_rows() {
+    fn reap_candidates_prunes_by_live_workspace_not_by_id_or_journal_age() {
         use doorbell_rt::subscribe::*;
-        let spawn = |id: &str, ws: &str| Subscription {
+        let row = |id: &str, ws: &str, project: &str| Subscription {
+            id: id.into(),
+            identity: Identity::Pin("p".into()),
+            scope: Scope::One(ws.into()),
+            filter: Filter::default(),
+            sink: SinkKind::Herdr,
+            budget: Budget::default_530(),
+            project: Some(project.into()),
+            endpoint: None,
+        };
+        let live: std::collections::BTreeSet<String> = ["live-ws", "proj-live"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = vec![
+            row("spawn-dead-p", "dead-ws", "proj"),
+            row("cli-dead-p", "dead-ws-2", "proj"),
+            row("spawn-live-p", "live-ws", "proj"),
+            row("cli-arrival-p", "flywheel-proj-live", "proj-live"),
+            row("cli-arrival-dead-p", "flywheel-proj-dead", "proj-dead"),
+        ];
+        // A FRESH journal everywhere: age must not decide anything.
+        let aged = |_ws: &str| Some(0);
+        let mut reaped = reap_candidates(&rows, Some(&live), aged);
+        reaped.sort();
+        assert_eq!(
+            reaped,
+            vec![
+                "cli-arrival-dead-p".to_string(),
+                "cli-dead-p".to_string(),
+                "spawn-dead-p".to_string()
+            ],
+            "a row whose workspace is gone is dead whatever its id and its journal age"
+        );
+        assert!(
+            !reaped.contains(&"spawn-live-p".to_string()),
+            "a live workspace's row must survive"
+        );
+        assert!(
+            !reaped.contains(&"cli-arrival-p".to_string()),
+            "the CLI's arrival scope names a stable per-project name, not a herdr \
+             workspace: the PROJECT's workspace is what says the project lives"
+        );
+    }
+
+    /// bd-oub3: herdr not answering is "we do not know", not "every workspace
+    /// is gone". Nothing is pruned by the workspace rule then; the journal age
+    /// decides, and it decides for a CLI row too.
+    #[test]
+    fn no_herdr_answer_falls_back_to_the_journal_age_for_every_row() {
+        use doorbell_rt::subscribe::*;
+        let row = |id: &str, ws: &str| Subscription {
             id: id.into(),
             identity: Identity::Pin("p".into()),
             scope: Scope::One(ws.into()),
@@ -3613,22 +3760,63 @@ mod tests {
             project: Some("proj".into()),
             endpoint: None,
         };
-        let cli = spawn("cli-w-p", "w");
         let rows = vec![
-            spawn("spawn-old-p", "old"),
-            spawn("spawn-fresh-p", "fresh"),
-            spawn("spawn-never-p", "never"),
-            cli,
+            row("spawn-old-p", "old"),
+            row("spawn-fresh-p", "fresh"),
+            row("spawn-never-p", "never"),
+            row("cli-old-p", "old"),
         ];
         let aged = |ws: &str| match ws {
             "old" => Some(REAP_AFTER_SECS + 1),
             "fresh" => Some(10),
             _ => None,
         };
+        let mut reaped = reap_candidates(&rows, None, aged);
+        reaped.sort();
         assert_eq!(
-            reap_candidates(&rows, aged),
-            vec!["spawn-old-p".to_string()]
+            reaped,
+            vec!["cli-old-p".to_string(), "spawn-old-p".to_string()],
+            "with no herdr answer only the journal age decides — and it decides \
+             for a CLI row as well"
         );
+    }
+
+    /// bd-oub3: herdr's answer is read in its own shape. A wrong parse would
+    /// read as "no workspaces" and fall back to the journal age, which is
+    /// safe — but a parse that invents labels would prune live rows, so the
+    /// shape is pinned here.
+    #[test]
+    fn herdr_workspace_labels_reads_the_live_labels_or_reports_no_evidence() {
+        let dir = std::env::temp_dir().join(format!("db-herdr-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("herdr");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"workspace\" ]; then \
+             echo '{\"result\":{\"type\":\"workspace_list\",\"workspaces\":[{\"label\":\"one\"},{\"label\":\"two\"}]}}'; \
+             else echo 'not json'; fi\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        let bin = script.to_string_lossy().into_owned();
+        let labels = herdr_workspace_labels(&bin).expect("herdr answered");
+        assert_eq!(
+            labels,
+            ["one".to_string(), "two".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<String>>()
+        );
+        // An answer that is not herdr's shape is NO EVIDENCE, never an empty
+        // set that would read as "every workspace is gone".
+        assert!(
+            herdr_workspace_labels("/nonexistent-herdr-binary").is_none(),
+            "a herdr that cannot be run reports no evidence"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-8ulu: the daemon registers exactly the webhook adapters the
