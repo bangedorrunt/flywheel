@@ -1520,52 +1520,71 @@ pub struct EventStream {
 /// Delegation: the subscription handshake + socket lifecycle are entirely
 /// toron-core's.
 pub fn subscribe(c: &mut Client, subscriptions: &[Subscription]) -> Result<EventStream> {
-    let inner = c
+    let mut inner = c
         .subscribe(subscriptions)
         .map_err(|e| anyhow!("herdr subscribe failed: {e}"))?;
     let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
     std::thread::spawn(move || {
-        let mut inner = inner;
-        loop {
-            match inner.read_event() {
-                Ok(Some((kind, data))) => {
-                    let ev = match HerdrEventKind::parse(&kind) {
-                        Ok(k) => match HerdrEventData::from_kind(k, data) {
-                            Ok(data) => PushEvent { kind: k, data },
-                            Err(e) => {
-                                let _ = tx.send(StreamItem::Error(format!(
-                                    "malformed herdr event {kind}: {e}"
-                                )));
-                                break;
-                            }
-                        },
+        pump_events(|| inner.read_event(), &tx);
+    });
+    Ok(EventStream { rx, timeout: None })
+}
+
+/// The reader loop, over any source of pushed events.
+///
+/// A gap (`events_lost`) is a NOTICE, not a death: toron-core's
+/// `read_event` returns a typed error and leaves the reader on the open
+/// socket, so the stream is still good. This loop used to BREAK on a gap,
+/// which killed the subscription: the doorbell then cleared its coverage
+/// and re-subscribed from scratch - a NEW socket per gap (the daemon's
+/// socket count grew at the gap rate) and a fresh subscriber that starts
+/// BEHIND the ring, so it was told `events_lost` again. One upstream gap
+/// fanned out into a gap per subscriber and a socket per re-subscribe.
+fn pump_events<R>(mut read: R, tx: &std::sync::mpsc::Sender<StreamItem>)
+where
+    R: FnMut() -> Result<Option<(String, serde_json::Value)>, BackendError>,
+{
+    loop {
+        match read() {
+            Ok(Some((kind, data))) => {
+                let ev = match HerdrEventKind::parse(&kind) {
+                    Ok(k) => match HerdrEventData::from_kind(k, data) {
+                        Ok(data) => PushEvent { kind: k, data },
                         Err(e) => {
                             let _ = tx.send(StreamItem::Error(format!(
-                                "unknown herdr event kind {kind}: {e}"
+                                "malformed herdr event {kind}: {e}"
                             )));
                             break;
                         }
-                    };
-                    if tx.send(StreamItem::Event(ev)).is_err() {
+                    },
+                    Err(e) => {
+                        let _ = tx.send(StreamItem::Error(format!(
+                            "unknown herdr event kind {kind}: {e}"
+                        )));
                         break;
                     }
-                }
-                Ok(None) => {
-                    let _ = tx.send(StreamItem::Closed);
-                    break;
-                }
-                Err(e) if e.code == BackendErrorCode::EventsLost => {
-                    let _ = tx.send(StreamItem::EventsLost);
-                    break;
-                }
-                Err(e) => {
-                    let _ = tx.send(StreamItem::Error(format!("herdr read failed: {e}")));
+                };
+                if tx.send(StreamItem::Event(ev)).is_err() {
                     break;
                 }
             }
+            Ok(None) => {
+                let _ = tx.send(StreamItem::Closed);
+                break;
+            }
+            Err(e) if e.code == BackendErrorCode::EventsLost => {
+                // In band, and the stream goes on: the caller reconciles the
+                // status facts and keeps the subscription.
+                if tx.send(StreamItem::EventsLost).is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(StreamItem::Error(format!("herdr read failed: {e}")));
+                break;
+            }
         }
-    });
-    Ok(EventStream { rx, timeout: None })
+    }
 }
 
 impl EventStream {
@@ -1606,6 +1625,57 @@ impl EventStream {
     /// Bound (or unbound) each blocking read. `None` restores blocking reads.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
+    }
+}
+
+#[cfg(test)]
+mod events_lost_tests {
+    use super::*;
+
+    /// bd-v9k6: a gap is a NOTICE, not a death. The reader loop used to
+    /// break on `events_lost`, which killed the subscription: the doorbell
+    /// cleared its coverage and re-subscribed (a NEW socket per gap, and the
+    /// daemon's socket count grew at the gap rate), and the fresh subscriber
+    /// started BEHIND the ring, so it was told `events_lost` again. One
+    /// upstream gap fanned out into a gap and a socket per subscriber.
+    #[test]
+    fn a_gap_is_delivered_in_band_and_the_stream_keeps_reading() {
+        let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
+        let mut calls = 0u32;
+        pump_events(
+            || {
+                calls += 1;
+                match calls {
+                    1 => Err(BackendError::new(
+                        BackendErrorCode::EventsLost,
+                        "subscriber fell behind".to_string(),
+                    )),
+                    2 => Ok(Some((
+                        "pane.agent_status_changed".to_string(),
+                        serde_json::json!({
+                            "pane_id": "w7X:p1",
+                            "workspace_id": "w7X",
+                            "agent_status": "idle",
+                        }),
+                    ))),
+                    _ => Ok(None),
+                }
+            },
+            &tx,
+        );
+        let items: Vec<StreamItem> = rx.try_iter().collect();
+        assert!(
+            matches!(items.first(), Some(StreamItem::EventsLost)),
+            "the gap is delivered in band"
+        );
+        assert!(
+            calls >= 3,
+            "the loop kept reading past the gap (calls={calls})"
+        );
+        assert!(
+            items.iter().any(|i| matches!(i, StreamItem::Event(_))),
+            "the event after the gap still arrives"
+        );
     }
 }
 
