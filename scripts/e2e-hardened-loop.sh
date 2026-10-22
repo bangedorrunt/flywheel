@@ -33,6 +33,17 @@ case " $LOOP_EXTRA " in
   *) PROMISE_PREFIX="swarm-loop" ;;
 esac
 EV_DIR="$HOME/.local/state/flywheel"
+# bd-3dge: the gate runs against a SCRATCH state dir. The operator's
+# ~/.local/state is not a test fixture: a subscription written there is a
+# REAL row the live doorbell hosts, and every host holds a wake socket on
+# the toron daemon (measured: 20 "flywheel-fw-gate-<pid>" rows in the
+# operator's store, and the daemon refusing LIVE subscribers at 73 rows).
+# Every state path this gate reads must follow XDG_STATE_HOME.
+GATE_STATE="$(mktemp -d)/state"
+mkdir -p "$GATE_STATE/flywheel"
+export XDG_STATE_HOME="$GATE_STATE"
+STATE_DIR="$GATE_STATE/flywheel"
+EV_DIR="$STATE_DIR"
 PASS=0
 FAIL=0
 START=$(date +%s)
@@ -81,7 +92,8 @@ if '/' in p:
         h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
     key = f"{p.rsplit('/',1)[-1]}-{h & 0xffffffff:08x}"
 try:
-    d = json.load(open(os.path.expanduser("~/.local/state/flywheel/loops/" + key + ".json")))
+    base = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "flywheel", "loops")
+    d = json.load(open(os.path.join(base, key + ".json")))
     print(d.get("id", ""))
 except Exception:
     print("")

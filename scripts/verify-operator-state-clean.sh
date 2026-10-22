@@ -1,0 +1,73 @@
+#!/bin/bash
+# verify-operator-state-clean — bd-3dge: a suite run must not write into the
+# operator's state dir.
+#
+# Why the gate exists: the operator's ~/.local/state/flywheel is not a test
+# fixture. A subscription written there is a REAL row — the live doorbell
+# hosts it, and every host holds a wake socket on the toron daemon — so a
+# test that writes there spends the operator's descriptors on rows nobody
+# asked for. Measured: 20 "flywheel-fw-gate-<pid>" rows in the operator's
+# store, one set per gate run, and the daemon refusing LIVE subscribers at
+# 73 rows.
+#
+# What it compares, and why only that:
+#   - the FILE LIST of the state dir: a new file is a new artifact;
+#   - the BYTES of doorbell/subscriptions.json: the store the daemon hosts
+#     from.
+# The rest of the dir is written by the LIVE doorbell (journals, heartbeats,
+# wake stamps), so its content changes on the wrong day — comparing it would
+# make this gate fail for the wrong reason.
+#
+# Usage: scripts/verify-operator-state-clean.sh [test command...]
+#   default: mbx +nightly-aarch64-apple-darwin test -p flywheel --bin flywheel
+set -u
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/flywheel"
+if [ ! -d "$STATE_DIR" ]; then
+  echo "no state dir at $STATE_DIR — nothing to compare"
+  exit 0
+fi
+
+BEFORE="$(mktemp -d)"
+AFTER="$(mktemp -d)"
+( cd "$STATE_DIR" && find . -type f | sort ) > "$BEFORE/files.txt"
+if [ -f "$STATE_DIR/doorbell/subscriptions.json" ]; then
+  cp "$STATE_DIR/doorbell/subscriptions.json" "$BEFORE/subscriptions.json"
+fi
+
+if [ "$#" -gt 0 ]; then
+  "$@"
+else
+  mbx +nightly-aarch64-apple-darwin test -p flywheel --bin flywheel
+fi
+suite_rc=$?
+
+( cd "$STATE_DIR" && find . -type f | sort ) > "$AFTER/files.txt"
+if [ -f "$STATE_DIR/doorbell/subscriptions.json" ]; then
+  cp "$STATE_DIR/doorbell/subscriptions.json" "$AFTER/subscriptions.json"
+fi
+
+rc=0
+if [ "$suite_rc" -ne 0 ]; then
+  echo "FAIL: the suite itself failed (exit $suite_rc)" >&2
+  rc=1
+fi
+new="$(comm -13 "$BEFORE/files.txt" "$AFTER/files.txt")"
+gone="$(comm -23 "$BEFORE/files.txt" "$AFTER/files.txt")"
+if [ -n "$new" ] || [ -n "$gone" ]; then
+  echo "FAIL: the suite changed the operator's state dir file list" >&2
+  if [ -n "$new" ]; then echo "  new: $new" >&2; fi
+  if [ -n "$gone" ]; then echo "  gone: $gone" >&2; fi
+  rc=1
+fi
+if [ -f "$BEFORE/subscriptions.json" ] && [ -f "$AFTER/subscriptions.json" ]; then
+  if ! diff -q "$BEFORE/subscriptions.json" "$AFTER/subscriptions.json" >/dev/null; then
+    echo "FAIL: the suite changed the operator's subscription store" >&2
+    diff "$BEFORE/subscriptions.json" "$AFTER/subscriptions.json" >&2
+    rc=1
+  fi
+fi
+if [ "$rc" -eq 0 ]; then
+  echo "PASS: the operator's state dir is untouched"
+fi
+exit "$rc"
