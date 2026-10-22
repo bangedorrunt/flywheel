@@ -1488,8 +1488,15 @@ fn doorbell_slice(
     model: &crate::doorbell_tick::DoorbellModel,
     msg: crate::doorbell_tick::DoorbellMsg,
 ) -> (crate::doorbell_tick::DoorbellModel, Vec<Cmd>) {
-    let (next, actions) = crate::doorbell_tick::tick(model, &msg);
-    let cmds = actions.into_iter().map(Cmd::from_doorbell).collect();
+    // The doorbell's decision folds through the port (ADR-0018 §3 item 3):
+    // `doorbell_core::tick` stays the ONE implementation of the decision and
+    // the program owns the shape around it, so the live path and the
+    // program can never drift apart.
+    let (next, cmds) = crate::elm::inbox::InboxProgram::fold(model, &msg);
+    let cmds = cmds
+        .into_iter()
+        .map(|c| Cmd::from_doorbell(c.action))
+        .collect();
     (next, cmds)
 }
 

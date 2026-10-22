@@ -15,15 +15,16 @@
 //! re-exports the vendored elm-effect crates, so this workspace carries a
 //! single framework copy in its lockfile.
 
+pub mod inbox;
 pub mod leaf;
 
 use crate::decide::{Snapshot, decide};
 use serde::{Deserialize, Serialize};
 use toron_core::kernel::{Boot, Cmd as CmdTrait, Durability, Failure, Program, Update};
 
-/// The shared journal executor owns the pool construction
-/// (`effect_journal`, 4 workers and a 4096 bound pinned by its own test);
-/// this module keeps no second constructor beside it.
+// The shared journal executor owns the pool construction
+// (`effect_journal`, 4 workers and a 4096 bound pinned by its own test);
+// this module keeps no second constructor beside it.
 
 /// The classifier as a framework `Program`: the model is the briefing
 /// snapshot, a `Classify` message folds into one `DecideCmd`, and the
