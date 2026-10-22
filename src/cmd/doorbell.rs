@@ -649,17 +649,23 @@ pub(crate) fn cmd_doorbell_digest(
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     crate::check_project_spelling(project, "doorbell digest")?;
-    let _ = cfg;
-    let _ = project;
-    let entries = crate::doorbell::journal_read_all(&crate::config::state_dir());
+    // x3s2: the required PROJECT is the scope of the answer. Reading every
+    // workspace's journal made a scoped question return the whole host's
+    // wakes, so a project with no state of its own read as though it held a
+    // long list of unanswered pins.
+    let state_dir = crate::config::state_dir();
+    let scoped = crate::doorbell::project_workspaces(&state_dir, project);
+    let entries: Vec<(String, serde_json::Value)> = crate::doorbell::journal_read_all(&state_dir)
+        .into_iter()
+        .filter(|(ws, _)| scoped.contains(ws))
+        .collect();
     let since_us = since.and_then(|s| doorbell_core::parse_rfc3339_micros(s).ok());
     // Unanswered pins escalate first (deaf services surface, S3).
     let mut unanswered: std::collections::BTreeSet<String> = Default::default();
-    for ws in crate::doorbell::journal_workspaces_list(&crate::config::state_dir()) {
-        for pin in crate::doorbell::read_unanswered(&crate::doorbell::unanswered_file(
-            &crate::config::state_dir(),
-            &ws,
-        )) {
+    for ws in &scoped {
+        for pin in
+            crate::doorbell::read_unanswered(&crate::doorbell::unanswered_file(&state_dir, ws))
+        {
             if identity.is_none_or(|id| pin == id) {
                 unanswered.insert(pin);
             }

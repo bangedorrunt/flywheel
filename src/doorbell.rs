@@ -1379,6 +1379,34 @@ pub fn journal_workspaces_list(state_dir: &Path) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// The workspace labels one project's doorbell state lives under.
+///
+/// Two labels mean the same project: the project-scoped one
+/// (`flywheel-{project}`, which is also what the unanswered file is named),
+/// and any dispatcher whose `.project` sidecar names the project under a
+/// label of its own (`adrx2728` for `bd-…`). Both are honoured because a
+/// digest asked about one project must never answer with another's wakes
+/// (`elm-effect-rs-doorbell-digest-project-scope-x3s2`), and picking only the
+/// canonical spelling would go silent on exactly the dispatchers the sidecar
+/// exists to record.
+///
+/// A workspace that has an unanswered file but no journal yet is claimed by
+/// the canonical label: that file is created before the first wake, and it is
+/// the one piece of state the digest escalates.
+pub fn project_workspaces(state_dir: &Path, project: &str) -> std::collections::BTreeSet<String> {
+    let canonical = format!("flywheel-{project}");
+    let mut out: std::collections::BTreeSet<String> = journal_workspaces_list(state_dir)
+        .into_iter()
+        .filter(|ws| {
+            ws == &canonical || read_project_sidecar(state_dir, ws).as_deref() == Some(project)
+        })
+        .collect();
+    if unanswered_file(state_dir, &canonical).exists() {
+        out.insert(canonical);
+    }
+    out
+}
+
 /// Scope-bound roster row (bd-asr2.14, D5/E2): who is around to be woken.
 /// Pure: the digest commands assemble inputs (registry, binds, presence,
 /// bead map) and render headers from rows.
@@ -2148,6 +2176,57 @@ mod tests {
             dir.join("journals").join("doorbell-journal-ws1.jsonl"),
             "journal path contract violated: {path:?}"
         );
+    }
+
+    /// x3s2: a project's digest scope is its own workspaces, never the host's.
+    ///
+    /// Three workspaces are present: the project's canonical label, a
+    /// dispatcher carrying the project in its sidecar under a label of its
+    /// own, and a third workspace belonging to nobody asked about. The scope
+    /// must hold the first two and refuse the third, because the digest's
+    /// whole job is answering "what is queued for THIS project".
+    #[test]
+    fn project_workspaces_scopes_to_the_named_project() {
+        let dir = std::env::temp_dir().join(format!("fw-x3s2-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("journals")).unwrap();
+        std::fs::create_dir_all(dir.join("doorbell")).unwrap();
+        for ws in ["flywheel-beads", "flywheel-other", "adrx1"] {
+            std::fs::write(
+                dir.join("journals")
+                    .join(format!("doorbell-journal-{ws}.jsonl")),
+                "",
+            )
+            .unwrap();
+        }
+        // A dispatcher whose label is not the canonical one still belongs to
+        // the project its sidecar names.
+        std::fs::write(dir.join("doorbell").join("adrx1.project"), "beads").unwrap();
+        // A project with only an unanswered file (no journal yet) is claimed
+        // by the canonical label: that file is created before the first wake.
+        std::fs::write(
+            dir.join("doorbell")
+                .join("flywheel-elm-effect-rs.unanswered"),
+            "SomePin\n",
+        )
+        .unwrap();
+
+        let beads = project_workspaces(&dir, "beads");
+        assert!(beads.contains("flywheel-beads"), "{beads:?}");
+        assert!(beads.contains("adrx1"), "sidecar mapping lost: {beads:?}");
+        assert!(
+            !beads.contains("flywheel-other"),
+            "another project's workspace leaked into the scope: {beads:?}"
+        );
+
+        let effect = project_workspaces(&dir, "elm-effect-rs");
+        assert_eq!(
+            effect.into_iter().collect::<Vec<_>>(),
+            vec!["flywheel-elm-effect-rs".to_string()],
+            "the canonical label must be claimed from its unanswered file alone"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
