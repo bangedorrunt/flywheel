@@ -2325,9 +2325,30 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
     if matches.len() > 1 {
         let prefix = format!("flywheel-{}-", project_base(project));
         let agents = c.agent_list()?;
+        // bd-k8jn: a spawned crew's herdr name is its MAIL PIN, so the prefix
+        // scan below cannot see it and the tie falls to list order — the stale
+        // room carrying the bare project label. The spawn registry is the
+        // project→pane map, so its panes name the live swarm.
+        if let Some(ws) = herdr_shim::resolve_workspace_from_registry(
+            &matches,
+            &agents,
+            &registry_panes(project),
+        ) {
+            return Ok(ws);
+        }
         return Ok(herdr_shim::resolve_workspace_id(&matches, &agents, &prefix));
     }
     Ok(matches[0].workspace_id.clone())
+}
+
+/// The project's registered pane ids (the spawn registry is the project→pane
+/// map). Empty when the project has no registered swarm.
+fn registry_panes(project: &str) -> Vec<String> {
+    state::load_spawn_registry(project)
+        .into_iter()
+        .map(|e| e.pane_id)
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// Resolve target shorts (oc/pi/gk/all) to live agent infos in a workspace.
