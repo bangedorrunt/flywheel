@@ -48,10 +48,6 @@ if [ -f "$STATE_DIR/doorbell/subscriptions.json" ]; then
 fi
 
 rc=0
-if [ "$suite_rc" -ne 0 ]; then
-  echo "FAIL: the suite itself failed (exit $suite_rc)" >&2
-  rc=1
-fi
 new="$(comm -13 "$BEFORE/files.txt" "$AFTER/files.txt")"
 gone="$(comm -23 "$BEFORE/files.txt" "$AFTER/files.txt")"
 if [ -n "$new" ] || [ -n "$gone" ]; then
@@ -67,7 +63,13 @@ if [ -f "$BEFORE/subscriptions.json" ] && [ -f "$AFTER/subscriptions.json" ]; th
     rc=1
   fi
 fi
+# The state dir's verdict prints on its own: a suite that fails for another
+# reason must not read as "the state dir moved" (or as "it did not").
 if [ "$rc" -eq 0 ]; then
   echo "PASS: the operator's state dir is untouched"
+fi
+if [ "$suite_rc" -ne 0 ]; then
+  echo "FAIL: the suite itself failed (exit $suite_rc)" >&2
+  rc=1
 fi
 exit "$rc"
