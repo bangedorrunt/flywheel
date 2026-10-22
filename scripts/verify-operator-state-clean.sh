@@ -11,16 +11,37 @@
 # 73 rows.
 #
 # What it compares, and why only that:
-#   - the FILE LIST of the state dir: a new file is a new artifact;
+#   - the FILE LIST of the state dir, minus the paths the live daemons own
+#     (their owner/wake/journal files, their run rows, their pid and log): a
+#     new file is a new artifact;
 #   - the BYTES of doorbell/subscriptions.json: the store the daemon hosts
 #     from.
-# The rest of the dir is written by the LIVE doorbell (journals, heartbeats,
-# wake stamps), so its content changes on the wrong day — comparing it would
-# make this gate fail for the wrong reason.
+# The rest of the dir is written by the LIVE doorbell and flywheel daemon
+# (journals, heartbeats, run rows), so its content changes on the wrong day —
+# comparing it would make this gate fail for the wrong reason.
 #
 # Usage: scripts/verify-operator-state-clean.sh [test command...]
 #   default: mbx +nightly-aarch64-apple-darwin test -p flywheel --bin flywheel
 set -u
+
+# The live daemons write into this dir while the suite runs, so their files
+# are excluded from the file-list comparison: a daemon-owned path that moves
+# is the daemon's, not the suite's. Everything else counts.
+daemon_owned() {
+  case "$1" in
+    ./doorbell/owner-*|./doorbell-wake-*|./doorbell-journal-*) return 0 ;;
+    ./journals/doorbell-journal-*) return 0 ;;
+    ./runs/*|./last_sent/*) return 0 ;;
+    ./doorbell.pid|./doorbell.log|./loop-pids.json) return 0 ;;
+  esac
+  return 1
+}
+
+filter_list() {
+  while IFS= read -r f; do
+    if ! daemon_owned "$f"; then echo "$f"; fi
+  done
+}
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/flywheel"
 if [ ! -d "$STATE_DIR" ]; then
@@ -30,7 +51,7 @@ fi
 
 BEFORE="$(mktemp -d)"
 AFTER="$(mktemp -d)"
-( cd "$STATE_DIR" && find . -type f | sort ) > "$BEFORE/files.txt"
+( cd "$STATE_DIR" && find . -type f | sort ) | filter_list > "$BEFORE/files.txt"
 if [ -f "$STATE_DIR/doorbell/subscriptions.json" ]; then
   cp "$STATE_DIR/doorbell/subscriptions.json" "$BEFORE/subscriptions.json"
 fi
@@ -42,7 +63,7 @@ else
 fi
 suite_rc=$?
 
-( cd "$STATE_DIR" && find . -type f | sort ) > "$AFTER/files.txt"
+( cd "$STATE_DIR" && find . -type f | sort ) | filter_list > "$AFTER/files.txt"
 if [ -f "$STATE_DIR/doorbell/subscriptions.json" ]; then
   cp "$STATE_DIR/doorbell/subscriptions.json" "$AFTER/subscriptions.json"
 fi
