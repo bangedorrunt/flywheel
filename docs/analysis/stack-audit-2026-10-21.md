@@ -1121,88 +1121,103 @@ sleep, a different mechanism.
 
 ## 34. Fix status (2026-10-22)
 
-The findings are being fixed as beads in each repo's own tracker. The ids live in the
-tracker (`br list`); the titles are below.
+Every finding is a bead in its own repo's tracker (`br list`); the table gives the
+section, the repo and what landed. **21 beads closed, every ledger row LEGAL**
+(`flywheel ledger check <id> --dir .`).
 
 ### Fixed and landed
 
-| Section | Severity | Repo | What landed |
-|---------|----------|------|-------------|
-| 9 | S1 | beads | The gates sidecar refuses ONE orphan row **per row** instead of aborting the whole load behind a foreign-key error, so one stale row no longer takes every good verdict row with it. The refusal is counted and reported at warn level. Commit `36668abf`. |
-| 7 + 8 | S1 | beads | A rebuild now **restores** the verdict rows it drops (the one shared rebuild entry calls the one restore), so the refusal only fires when the sidecar cannot restore them. Losing them on purpose is a separate, operator-gated decision (`--allow-gate-verdict-loss`, BR_OPERATOR=1); the ordinary `--allow-repeated-repair` no longer reaches the verdict refusal at all - and the three rebuild paths that had no guard at all are covered by the shared entry. Commit `5b9e42cd`. |
-| 18 + 20 | S2 | beads | A project that configured no gate rules runs the fail-closed default, and the ADR default's **gate rules** apply to it while the project's own statuses and transitions still govern - "strict" is no longer a word that means the opposite of what it says. A commit that touches only `.beads/**` or `.flywheel/**` no longer passes the "carries work" test, so both sides agree on which commit proves a bead. Commits `2fa057cd` + the §18 refinement. |
-| 19 | S2 | beads | A close whose `--commit-sha` resolves in no searched repo is **refused** (naming `--repo <path>` as the remedy) instead of warned about, and the close fixtures across the e2e suite now carry a REAL commit that cites the bead instead of a placeholder sha - a fixture that proves nothing about the rule it tests. |
-| 24 | S2 | beads | A `--claim` with no named claimant is refused (fail closed) instead of storing the host username, which matches no live pane. Commit `20ed9410`. |
-| 24 | S2 | flywheel | The taught dispatch claim recipe is `br update <id> --claim --actor <the coder pin>`: the atomic guard runs, and the assignee is the dialect the tracker actually stores (a registered herdr slug folds to its pin). Commit `3017d67`. |
-| 1 (toron half) | S1 | toron | The ack-SLA reminder rides its own kind (30015), the obligation is scoped to the conversation with a budget and a terminal state, and the scan no longer re-resolves the signing key per candidate. Commit `dbe2a68`. |
-| 26 | S1 | toron | A re-render that changes a node's action digest **refuses** instead of minting a second effect key, so the external effect cannot fire twice for one logical node. Commit `8d4e0d2`. |
-| 27 | S2 | toron | The shipped `action: park` reads the runner the host actually injects, and the enforced branch refuses loudly when there is genuinely no runner. Commit `7d88968`. |
-| 3 + 6 + 11 | S1/S2 | toron | The identity fold: the lease holder is canonicalized instead of being reported as an 8-char pubkey compared against a pin, the yield board joins on the canonical project key, and the captain write gate no longer refuses a fold that routes. Commit `1f10ecc4`. |
-| 31 | - | toron | The park-resume claim, the busy-owner "Landed" claim and ADR-0032's I8a now say what the code does. Commit `87ce9e0`. |
-| 2 | S1 | flywheel | One identity ladder, one order, used by every resolver. |
-| 4 + 5 | S1 | flywheel | The leaf watchdog bounds the pipe drain and not only the child exit, and the pane dispatch retry runs attempt timeout, breaker inside the retry, budget timeout around the chain. |
-| 1 (flywheel half) | S1 | flywheel | The ack-SLA flood no longer saturates the doorbell wake stream, and the brain's serial dispatch no longer blocks on a subprocess. |
-| 10 + 12 + 13 + 14 | S2 | flywheel | The arrive guard accepts a correct arrival, the state lock's stale-steal is no longer a TOCTOU, the inject budget is an atomic write, and the durable-intent journal is keyed per attempt instead of one fixed file deleted on success. |
-| 15 + 16 + 17 + 21 | S2 | flywheel | One persisted effect state, a journaled constructor that refuses instead of falling back to `Recording`, one citation rule (case-insensitive on both sides), and one rule for which commit proves a bead. |
-| 16 + 17 | S2 | flywheel | The citation tiers no longer **replace** the lower tiers: the bookkeeping-only commits are dropped before the ranking, so the ceremony's own `chore(beads): close <id>` can no longer become the bound revision (it did: two toron beads were bound to a bookkeeping commit that proves nothing). Commit `93dc182`. |
-| 22 + 25 | S3 | flywheel | The spawn registry resolves last-write-wins, the unbounded full-file reads are bounded, the starvation counter is written atomically, the blocking join is off the Tokio worker, the breaker clears its failure count at cooldown, the dead code is deleted, and the AGENTS.md claims match the code. |
-| - | S2 | flywheel | The audit document itself records this status (bd-zhbi). Commit `363a3fd`. |
+| Section | Repo | What landed |
+|---------|------|-------------|
+| 9 | beads | The gates sidecar refuses ONE orphan row **per row** instead of aborting the whole load behind a foreign-key error. `36668abf` |
+| 7 + 8 | beads | A rebuild **restores** the verdict rows it drops; losing them on purpose is a separate operator-gated decision (`--allow-gate-verdict-loss`, BR_OPERATOR=1). `5b9e42cd` |
+| 18 + 20 | beads | A project that configured no gate rules runs the fail-closed default, and the ADR default's **gate rules** apply to it while the project's own statuses and transitions still govern. A commit that touches only `.beads/**` or `.flywheel/**` no longer passes the "carries work" test. `2fa057cd`, `01bc48c` |
+| 19 | beads | A close whose `--commit-sha` resolves in no searched repo is **refused** (naming `--repo <path>` as the remedy), and every close fixture carries a REAL commit that cites the bead. `08ae315a` |
+| 24 (beads half) | beads | A `--claim` with no named claimant is refused instead of storing the host username. `20ed9410` |
+| 24 (flywheel half) | flywheel | The taught dispatch claim recipe is `br update <id> --claim --actor <the coder pin>`: the atomic guard runs, and the assignee is the dialect the tracker stores. `3017d67` |
+| 16 + 17 | flywheel | The citation tiers no longer **replace** the lower tiers, and the bookkeeping-only commits are dropped before the ranking: the ceremony's own `chore(beads): close <id>` can no longer become the bound revision (it did: two toron beads were bound to a bookkeeping commit that proves nothing). `93dc182` |
+| 1 (toron half) | toron | The ack-SLA reminder rides its own kind (30015), is scoped to the conversation, has a budget and a terminal state, and no longer re-resolves the signing key per candidate. `dbe2a68` |
+| 26 | toron | A re-render that changes a node's action digest **refuses** instead of minting a second effect key. `8d4e0d2` |
+| 27 | toron | The shipped `action: park` reads the runner the host actually injects, and the enforced branch refuses loudly when there is genuinely no runner. `7d88968` |
+| 3 + 6 + 11 | toron | The identity fold: the lease holder is canonicalized instead of being reported as an 8-char pubkey compared against a pin, the yield board joins on the canonical project key, and the captain write gate no longer refuses a fold that routes. `1f10ecc4` |
+| 31 | toron | The park-resume claim, the busy-owner "Landed" claim and ADR-0032's I8a now say what the code does. `87ce9e0` |
+| 2, 4, 5, 10, 12, 13, 14, 15, 21, 22, 25 | flywheel | One identity ladder; the leaf watchdog bounds the pipe drain; the pane dispatch retry runs attempt timeout, breaker inside the retry, budget timeout around the chain; the arrive guard accepts a correct arrival; the state lock's stale-steal is no longer a TOCTOU; the inject budget is an atomic write; the durable-intent journal is keyed per attempt; one persisted effect state and a journaled constructor that refuses instead of falling back to `Recording`; the spawn registry resolves last-write-wins with bounded reads; the AGENTS.md claims match the code. `035142d`, `46bf588`, `98b17eb`, `470f0ad`, `8e16bb1`, `1d0a62c` |
+| - | flywheel | The audit document itself records this status. `3c403e4` |
 
-Every fix carries a test that goes red when the fix is inverted (verified by
-inverting it, not by assertion): the orphan-row test fails when the per-row
-refusal is removed, the end-to-end repair test fails when the restore is
-removed, and the dispatch-contract test fails when the old recipe is restored.
+### Found while deploying the fixes (not in the audit)
+
+The fixes above were committed but **not live**: the daemon ran a 4-day-old build
+and nobody could rebuild it. Six defects stood in the way, each found by building
+a clean export of HEAD instead of the working tree.
+
+| What | Repo | The fix |
+|------|------|---------|
+| **toron's HEAD did not compile.** `engine/mod.rs` declared `pub mod framework;` but no `framework.rs` was ever committed: the module was renamed to `engine/elm.rs` in the working tree 4 days earlier and only the untracked file survived. The tree had not built since that commit. | toron | `cf93adc` — commit the module the tree declares, renamed to `elm` (the house convention: beads `src/elm`, flywheel `src/elm`). |
+| **flywheel's HEAD did not compile against toron's HEAD** (it depends on toron-core and toron-mcp by path). The journal claim had gained two arguments; the call site was never ported. | flywheel | `45eb857` — port the call site, with the generation argument the claim is scoped by. |
+| **The doorbell autostart unit gave the daemon no `HOME`**, so it could not resolve `herdr` and its fail-closed boot gate refused to host anything: the daemon started and hosted nothing. | flywheel | `8503eda` — the installer resolves both bins while `HOME` is available and writes the absolute paths into the unit. |
+| **The toron daemon died of EMFILE**: it holds one fd per wake subscriber, the write that would notice a dead peer was unbounded, and launchd's soft `maxfiles` for a job is 256. It died at 264 fds and stopped accepting connections, which is why the pre-commit guard could not reach it and every commit was blocked. | toron | `34e665d` — the frame write is bounded (a minute, so a slow-but-alive reader still gets its whole burst), and the unit asks for 4096 fds. |
+| **toron HEAD's own suite was red**: the committed catalog was stale, and a config test read the operator's real `~/.config/toron/config.toml` (it asserts on the file it wrote, not the merged ambient config). | toron | `01bc48c` |
+| **The dead `--no-input` flag was deleted but nine call sites still passed it**, and the crew allow-list test still named the pre-escalate set. | toron | `129f1df` |
+
+### Two attempts that were wrong, and why
+
+Both are recorded because the failure modes are the interesting part.
+
+- **A 5-second write bound** broke the lossless guarantee: a slow-but-alive reader
+  must still receive a burst larger than every internal queue, with no shed and no
+  loss. A tighter bound kills a healthy reader. The bound is now a minute.
+- **An EOF watch** (keeping the subscriber's read half) killed `toron watch
+  --once`: that client **half-closes** after subscribing, and EOF cannot tell a
+  half-close from a death. The write is the only sound signal.
 
 ### In flight
 
-- **flywheel** (lane `EmeraldSparrow`): the spawn registry, the unbounded reads,
-  the starvation temp write, the blocking join, the breaker cooldown, the dead code
-  and the AGENTS.md corrections.
-- **toron** (lane `BlueRidge`): the perf and waste set - the full-log folds on the
-  dispatch hot path, the prune loop writing inside the transaction, `next_epoch_at`
-  replaying the whole bus per path, the second persisted `EffectState`, the
-  poisoned-lock `.expect`, the dead `--no-input` flag and the dead modules.
-- **beads** (lane `PinkMarsh`): the perf set - `br ready` without the O(n^2) scan,
-  the JSONL hash memo, and the incremental gates-sidecar export.
+None. Every bead opened by this work is closed.
 
 ### Residual
 
-- **§19** (the sha-citation check): fixed in the close path (see the table above).
-  The remaining piece is the OPERATOR side: `br doctor --repair` on a workspace
-  whose sidecar cannot restore the verdicts still needs the operator-gated flag,
-  and the refusal it hands out names the remedy.
-- **§23** (the toron daemon runs a 3-day-old build): an operator action - the
-  daemon is still on the old binary, so the ack-SLA flood only stops when the
-  new build is installed and the daemon is restarted.
-
-### Also found while fixing
-
-- The beads repo's lib suite was **red at HEAD**: the gated-close fixture used the
-  id `px1`, which the id validator rejects ("expected prefix-hash"), so that test
-  panicked before any of these changes. Repaired.
-- The commit guard charges every `bd-*` token a diff **adds** to the commit message.
-  A stage-text edit re-adds the provenance ids of the stage it edits, so the
-  dispatch-contract commit carries three foreign ids in its body - the tiers keep
-  their bindings, because a body mention never outranks a subject citation.
+- **The 95,077 ack-SLA reminder rows** stay in the bus archive. The flood that
+  produced them is stopped (the reminder rides its own kind, and the scan has a
+  deadline and a terminal mute), but the rows are history and deleting them is a
+  separate decision.
+- **The `quiet-spark` lease** (bd-0g5l, an open bead) is held by a hyphenated
+  slug identity, which the pin convention forbids: mail to it is addressed to a
+  key nobody reads. It is NOT a stale lease - it belongs to open work (the
+  abandoned elm refactor that is still uncommitted in the working trees), so
+  releasing it would drop a live lane's protection. The fix is to rebind the
+  identity, which is the operator's call.
+- **The abandoned elm refactor** (the uncommitted `src/elm/` in flywheel and
+  the `engine/elm.rs` rename in toron) is still in the working trees. The
+  committed trees no longer depend on it.
 
 ---
 
-## 33. Operator actions (not taken here)
+## 33. Operator actions
 
-| Action | Why | Risk |
-|---|---|---|
-| `toron daemon restart` | the daemon runs a 3-day-old build (`toron doctor` fails) | brief mailbox outage; the doorbell's `toron` CLI arms keep working |
-| stop the ack-SLA flood (terminal state for unacked posts, or a kind that is not 9) | the bus is 99.9 % noise and the wake brain is dropping lines | needs a decision on which of the 2,300 posts are still live |
-| `toron agent prune --project flywheel` | 6 duplicate slug identities | prune reports `kept`/`held` rows and asks for a human on those |
-| `toron reserve release` for the stale `quiet-spark` lease on `docs/analysis/resonate-inventory.md` | held by an identity the policy forbids | that file is another lane's work - check the bead first |
-| restart the doorbell daemon | it has been up 3 d 15 h and is the component dropping wakes | wakes pause for the drain window |
-| **do not** run `br doctor --repair` on this repo | `--allow-repeated-repair` bypasses the verdict guard; 744 gate rows are at risk | the guard works only while the flag is absent |
-| gate `--allow-repeated-repair` behind `BR_OPERATOR` in beads | it is the only unguarded verdict-loss path | needs a beads release |
-| wire `check_replay` into toron's dispatch path, or pre-mint a stable `RunContext.effect_key` | ADR-0032 I8a is unenforced: a changed re-render mints a second effect key and fires the external effect twice | needs a toron release; the fix is one comparison at the prepare site |
-| make toron's park path read the async runner (or inject the sync one in the MCP host) | every `action: park` in toron-mcp is refused under `Enforced`, and writes no journal row under `Recording` | toron-mcp-local; needs a toron release |
-| prune toron's `events` table or index `fold_projected` by run | `get_effect` folds the whole log on the dispatch hot path and the table has no retention | needs a toron release; the live store is small today |
+| Action | State |
+|--------|-------|
+| `toron daemon restart` | **Done.** The daemon runs the build of HEAD (`verdict: current`, `restart_required: false`), and the fd count holds flat instead of growing into EMFILE. |
+| Stop the ack-SLA flood | **Done.** `toron ack-sla --project flywheel` returns `expired: []` where it returned thousands; the reminder rides kind 30015, off the kind-9 room plane the wake brain reads. |
+| Restart the doorbell daemon | **Done**, after the autostart unit was fixed. The wake brain reports `dropped: 0` and `events_lost: 0`, where it had dropped 3,588 and lost 1,352. |
+| Deploy the committed fixes | **Done.** `toron` and `flywheel` are built from clean exports of HEAD and installed, so every fix above is live. |
+| `toron agent prune --project flywheel` | **Run.** One duplicate slug identity was listed and **kept** - the prune asks for a human on a row whose canonical pin is not a live one. Nothing was absorbed. |
+| `toron reserve release` for the `quiet-spark` lease | **Not taken, deliberately.** It belongs to an open bead with uncommitted work (see the residual above); releasing it would drop a live lane's protection. |
+| The ~91 fixture project dirs in `~/.local/share/toron/projects/` | **Not taken.** They are inert test leftovers (a few MB); removing them is a destructive sweep with no upside. |
+| **Do not** run `br doctor --repair` on the beads repo | Superseded: a rebuild now restores the verdict rows it drops, so the flag no longer reaches the verdict refusal (`5b9e42cd`). |
+| Gate `--allow-repeated-repair` behind `BR_OPERATOR` in beads | Superseded: the ordinary flag no longer reaches the verdict refusal at all; losing verdicts on purpose needs `--allow-gate-verdict-loss` with BR_OPERATOR=1. |
+| Wire `check_replay` into toron's dispatch path | Done (`8d4e0d2`). |
+| Make toron's park path read the async runner | Done (`7d88968`). |
+| Prune toron's `events` table or index `fold_projected` by run | Done (`c2b3712`): the folds read one row, not the whole log. |
 
----
+### The appendix: how the live numbers were taken
+
+```bash
+curl -s http://127.0.0.1:18980/health | jq .wake_brain          # dropped / events_lost
+sqlite3 ~/.local/share/toron/index.sqlite "SELECT COUNT(*) FROM bus_events;"
+toron daemon status --json; toron doctor                        # the build the daemon runs
+lsof -p "$(pgrep -f 'toron serve --mcp-http')" | grep -c wake.sock   # the daemon's fd budget
+git archive HEAD | tar -x -C /tmp/clean && cd /tmp/clean && mbx build   # the committed tree
+```
 
 ## Appendix: how the live numbers were taken
 
