@@ -486,6 +486,40 @@ pub fn resolve_workspace_id(
     matches[0].workspace_id.clone()
 }
 
+/// The workspace holding the project's REGISTERED panes.
+///
+/// A spawned crew's herdr name is its MAIL PIN (the spawn names agents by the
+/// identity they were given), so the prefix scan in [`resolve_workspace_id`]
+/// cannot see it and the tie falls to list order — the stale room that merely
+/// carries the bare project label. The spawn registry is the project→pane
+/// map, so the panes it names identify the live swarm: a stale room holds no
+/// registered pane. Returns `None` when no registered pane is in one of the
+/// candidate workspaces, so the caller keeps its existing resolution.
+/// Deterministic — ties keep the candidate list's order.
+pub fn resolve_workspace_from_registry(
+    matches: &[WorkspaceInfo],
+    agents: &[AgentInfo],
+    registered_panes: &[String],
+) -> Option<String> {
+    if registered_panes.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, &str)> = None;
+    for ws in matches {
+        let n = agents
+            .iter()
+            .filter(|a| {
+                a.workspace_id == ws.workspace_id
+                    && registered_panes.iter().any(|p| p == &a.pane_id)
+            })
+            .count();
+        if n > 0 && best.map(|(bn, _)| n > bn).unwrap_or(true) {
+            best = Some((n, &ws.workspace_id));
+        }
+    }
+    best.map(|(_, id)| id.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // flywheel-local wire types (deleted `src/herdr.rs` — verbatim). toron-core
 // models the client, not the per-event payload shapes flywheel routes on.
@@ -3071,6 +3105,78 @@ mod shell_prompt_tests {
                 "flywheel-toron-"
             ),
             "w37"
+        );
+    }
+
+    /// bd-k8jn: a crew spawned under a mail PIN is named by that PIN, so the
+    /// prefix scan in [`resolve_workspace_id`] cannot see it and the tie
+    /// falls to list order — the STALE room that carries the bare project
+    /// label. The registry's panes are the truth.
+    #[test]
+    fn a_crew_named_by_its_pin_resolves_to_its_registered_workspace() {
+        use crate::herdr_shim::{AgentInfo, AgentStatus, WorkspaceInfo};
+        let mk = |id: &str, label: &str| WorkspaceInfo {
+            workspace_id: id.into(),
+            number: 0,
+            label: label.into(),
+            focused: false,
+            pane_count: 0,
+            tab_count: 0,
+            active_tab_id: String::new(),
+            agent_status: AgentStatus::Unknown,
+            cwd: None,
+        };
+        let mk_agent = |ws: &str, pane: &str, name: &str| AgentInfo {
+            agent: Some("opencode".into()),
+            agent_status: AgentStatus::Unknown,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: false,
+            name: Some(name.into()),
+            pane_id: pane.into(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: format!("{ws}:t1"),
+            terminal_id: "term".into(),
+            terminal_title: Some(String::new()),
+            workspace_id: ws.into(),
+        };
+        // The stale room comes FIRST in list order and carries the bare
+        // project label; the live crew sits in a room labelled by the spawn.
+        let stale = mk("w23", "toron");
+        let live = mk("w7W", "elm-comms-kernel");
+        let agents = vec![mk_agent("w7W", "w7W:p1", "blueridge")];
+        let panes = vec!["w7W:p1".to_string()];
+
+        assert_eq!(
+            super::resolve_workspace_from_registry(&[stale.clone(), live.clone()], &agents, &panes)
+                .as_deref(),
+            Some("w7W"),
+            "the registered pane names the live room, not the stale one"
+        );
+
+        // INVERTED: without the registry the tie falls to list order and the
+        // stale room wins — which is exactly the bug.
+        assert_eq!(
+            super::resolve_workspace_id(
+                &[stale.clone(), live.clone()],
+                &agents,
+                "flywheel-toron-"
+            ),
+            "w23",
+            "the prefix scan cannot see a pin-named crew, so list order wins"
+        );
+
+        // No registered pane: the helper declines and the caller's existing
+        // resolution stands.
+        assert_eq!(
+            super::resolve_workspace_from_registry(&[stale.clone(), live.clone()], &agents, &[]),
+            None
         );
     }
 }
