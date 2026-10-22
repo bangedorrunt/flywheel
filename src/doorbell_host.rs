@@ -343,21 +343,26 @@ impl RtHost {
                         }
                     }
                     Ok(StreamOutcome::EventsLost) => {
-                        // Typed events_lost: clear covered, snapshot-reconcile,
-                        // then exit so the next sweep re-subscribes.
+                        // A gap is a NOTICE, not a death: the subscription is
+                        // still good (the reader keeps reading), so the
+                        // coverage STAYS and the loop continues. Tearing the
+                        // subscription down here cost a socket per gap (the
+                        // daemon's socket count grew at the gap rate) and
+                        // re-armed a subscriber that starts BEHIND the ring,
+                        // so it was told `events_lost` again - one upstream
+                        // gap fanned out into a gap and a socket per
+                        // subscriber.
                         eprintln!(
-                            "flywheel doorbell: events_lost — clearing coverage and reconciling via session.snapshot"
+                            "flywheel doorbell: events_lost — reconciling status via session.snapshot"
                         );
                         crate::inbox_host::signal_invalidate(
                             toron_core::inbox_program::Invalidate::EventsLost,
                         );
-                        clear_covered(&covered_shared, &clear_ids);
                         reconcile_status_after_events_lost(
                             &socket_for_reconcile,
                             &pin_by_pane,
                             &tx,
                         );
-                        break;
                     }
                     Ok(StreamOutcome::Closed) | Err(_) => {
                         // Stream death: clear coverage so the next sweep re-arms.
