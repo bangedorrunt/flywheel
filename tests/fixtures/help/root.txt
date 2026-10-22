@@ -29,7 +29,9 @@ Commands:
   send               Send a prompt to one or more agents (with optional wait)
   crew               Crew plane: preview + lifecycle control (ADR-0010 D7). Control has NO arbitrary-text entry point — the verbs are interrupt|exit|relaunch only; text the worker reads is not a lifecycle verb
   captain            Captain door (bd-captain-watch-poll-exit-bbwm): the captain's own poll-exit watch. `captain watch <project>` blocks on the captain inbox water (or a stall, with --stall, or a preflight failure, with --preflight), prints a preview, and exits so the harness completion callback resumes the captain. One shot — re-arm
-  supervisor         Supervisor facts and steers (Phase 4a; `TORON_COMMS_INBOX` on): crews report `progress|done|exit`, the operator steers `redirect|pause|resume|cancel`, `view` prints the CrewView
+  supervisor         Supervisor facts and steers (Phase 4a; `TORON_COMMS_INBOX` on): crews report `progress|done|exit|proved|usage`, the operator steers `redirect|pause|resume|cancel`, `view` prints the CrewView (`goal_proved` is the read-only subscriber), `halt` cancels one context
+  halt               Cancel one supervisor context: live children get Exit, the host stops relaunching that subtree. Escalate mail is the captain push. `captain watch` resumes the captain when that mail lands
+  timer              One-shot watch. Deadline required. One `notify@1` under `watch:<id>:<outcome>` (`met|timer|expired|failed`). Default on
   interrupt          Interrupt an agent (sends Escape by default — cancels the current tool call and returns to the prompt). Kill-style keys (ctrl+c) are REFUSED unless --force: they terminate the agent process and drop the pane to a shell (bd-fw-interrupt-kills-agent-or3)
   view               Read an agent's terminal output
   output             Read an agent's output from the opencode structured session store (bd-eign.5) — the SQLite session log, not TUI scrollback (which the alternate screen garbles). Resolves the latest session for the project directory, optionally narrowed by opencode role; --session targets an exact session id
