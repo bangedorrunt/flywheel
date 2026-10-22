@@ -8,7 +8,10 @@
 //! governed-by: ADR-0005/0010/0011/0012, bd-5inr
 
 /// Live facts the classifier may read. Absent facts stay zero/false.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Serializable: the fold's model must round-trip through the durable log so
+/// a restarted loop recovers the same briefing snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub ready_bead_count: u32,
     pub profiled_panes: u32,

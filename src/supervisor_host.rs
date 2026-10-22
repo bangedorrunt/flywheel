@@ -3943,8 +3943,15 @@ mod tests {
     #[test]
     fn the_host_loop_waits_on_the_hint_channel_and_arms_the_watcher_unless_hints_are_off() {
         let me = include_str!("supervisor_host.rs");
-        let host = &me[..me.find("#[cfg(test)]").unwrap()];
-        let body = &host[host.find("fn host_loop(").unwrap()..];
+        // Production slice only: the loop starts at the single `fn host_loop`
+        // and ends where the test module starts, so neither the test-only
+        // imports at the top nor this test's own assertions below can match.
+        // (Truncating at the first `#[cfg(test)]` broke when test-only
+        // imports moved above the loop; searching the whole file
+        // self-matched this very assertion.)
+        let start = me.find("fn host_loop(").expect("host loop exists");
+        let end = me.find("mod tests").expect("test module exists");
+        let body = &me[start..end];
         assert!(
             body.contains("supervisor_hints::wait(&hint_rx"),
             "the loop waits on the hints"

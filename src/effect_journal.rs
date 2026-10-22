@@ -24,6 +24,7 @@ use serde_json::Value;
 
 use anyhow::bail;
 use toron_core::index::workflow_effects::{EffectState, NewRun, RunStatus, WorkflowEffectStore};
+use toron_core::kernel::{Executor, TokioExecutor};
 use toron_core::mailbox::SendMessage;
 use toron_core::nostr::Tag;
 use toron_mcp::workflow_host::{DispatchRequest, EffectDispatcher};
@@ -35,17 +36,21 @@ use toron_workflow::engine::{
 use toron_workflow::identity::{action_digest_of, redact_value};
 use toron_workflow::stamp_workflow_emitted;
 
-/// The shared journal executor (bd-k0iq, ADR-0035 Spec 2.7).
+/// The shared journal executor (bd-k0iq, ADR-0035 Spec 2.7; bd-b61z runs it
+/// on the framework's [`TokioExecutor`]).
 ///
-/// ONE bounded worker pool drains a FIFO queue of journal futures. Every
-/// former per-leaf thread+runtime spawn submits here instead: under
+/// ONE bounded queue of journal futures, drained FIFO onto the executor.
+/// Every former per-leaf thread+runtime spawn submits here instead: under
 /// wave-swarm fanout this is a fixed 4 workers instead of one thread AND one
 /// runtime build per effectful leaf, and the bounded queue applies
 /// backpressure (loud saturation error) instead of spawning unbounded threads.
 ///
-/// ponytail: fixed 4-worker pool — nesting deeper than 4 simultaneous
-/// submits-per-worker (today: max 1, a provider probe inside a dispatch)
-/// would starve; raise workers if a deeper nesting ever lands.
+/// Pool knobs live on the executor constructor (`worker_threads: 4`,
+/// `queue_bound: 4096`), never inside combinators.
+///
+/// Provider-nested work never touches this pool (see
+/// [`submit_provider_wait`]): journal futures submitted here never wait on
+/// another pooled future, so no nesting depth can starve the workers.
 ///
 /// The submitter blocks on the reply until its future completes. That block
 /// is the sync-seam price the engine contract charges (runners are sync
@@ -56,7 +61,13 @@ type ExecutorTask = std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>
 
 /// Bound on the executor queue (Spec 2.5: every queue a bound): past this
 /// many parked submits, new submits fail loud instead of growing memory.
+/// Mirrors the [`TokioExecutor`] queue bound below; the two must stay equal.
 const EXECUTOR_QUEUE_BOUND: usize = 4096;
+
+fn journal_runtime() -> &'static TokioExecutor {
+    static EXEC: std::sync::OnceLock<TokioExecutor> = std::sync::OnceLock::new();
+    EXEC.get_or_init(|| TokioExecutor::with_options(4, EXECUTOR_QUEUE_BOUND))
+}
 
 fn journal_executor() -> &'static tokio::sync::mpsc::Sender<ExecutorTask> {
     static QUEUE: std::sync::OnceLock<tokio::sync::mpsc::Sender<ExecutorTask>> =
@@ -64,25 +75,13 @@ fn journal_executor() -> &'static tokio::sync::mpsc::Sender<ExecutorTask> {
     QUEUE.get_or_init(|| {
         // Bounded: saturation is a loud error at submit, never silent growth.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ExecutorTask>(EXECUTOR_QUEUE_BOUND);
-        std::thread::Builder::new()
-            .name("flywheel-journal-exec".into())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(4)
-                    .thread_name("flywheel-journal-worker")
-                    .enable_all()
-                    .build()
-                    .expect("journal executor runtime");
-                // The pool driver: pool workers pump the queue, so a submit
-                // nested inside a running task (provider probe) lands on a
-                // sibling worker instead of deadlocking one thread.
-                rt.block_on(async move {
-                    while let Some(task) = rx.recv().await {
-                        tokio::spawn(task);
-                    }
-                });
-            })
-            .expect("spawn journal executor");
+        // One pump task: submission order stays FIFO through the channel,
+        // and each task runs on the shared 4-worker pool.
+        journal_runtime().spawn_boxed(Box::pin(async move {
+            while let Some(task) = rx.recv().await {
+                journal_runtime().spawn_boxed(task);
+            }
+        }));
         tx
     })
 }
@@ -91,7 +90,13 @@ fn journal_executor() -> &'static tokio::sync::mpsc::Sender<ExecutorTask> {
 /// Replaces every per-leaf thread+runtime spawn: FIFO order, one thread,
 /// one runtime. A saturated queue or a dead executor fails loud — a journal
 /// write that cannot run must never read as success.
-fn submit_journal_wait<F, T>(fut: F) -> Result<T>
+///
+/// Never call this from inside a provider the executor is already driving:
+/// a nested submit waits on a pool worker while holding one, and four such
+/// nests exhaust the 4-worker pool into a silent deadlock. Provider-nested
+/// work (mail delivery, roster lookup, test probes) goes through
+/// [`submit_provider_wait`], which owns no shared worker at all.
+pub(crate) fn submit_journal_wait<F, T>(fut: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
@@ -354,6 +359,18 @@ pub struct MailPlane {
 /// Run one effectful leaf through the fenced journal: commit prepared intent,
 /// claim the attempt, invoke the provider EXACTLY once, settle (or fail, or
 /// record `unknown`). The journal observes a real effect; it never invents one.
+/// One provider invoke as a framework `Effect` value (bd-b61z): the thunk
+/// runs when the effect is interpreted on the journal executor, never when
+/// it is built — dropping the value performs no I/O. This is the Interpret
+/// seam of the runner: intent, claim, one invoke, settle-or-`unknown` keep
+/// their order in [`dispatch_once`], and the invoke itself is a value the
+/// host executes exactly once.
+fn interpret_invoke(
+    thunk: Box<dyn FnOnce() -> ProviderOutcome + Send>,
+) -> toron_core::kernel::Effect<ProviderOutcome, String> {
+    toron_core::kernel::Effect::sync(thunk)
+}
+
 fn dispatch_once(
     dispatcher: &EffectDispatcher,
     inv: &ActionInvocation,
@@ -361,7 +378,23 @@ fn dispatch_once(
 ) -> Result<toron_mcp::workflow_host::DispatchResult> {
     let req = dispatch_request(inv);
     let dispatcher = dispatcher.clone();
-    submit_journal_wait(async move { dispatcher.dispatch(&req, move |_req| provider()).await })
+    submit_journal_wait(async move {
+        dispatcher
+            .dispatch(&req, move |_req| run_invoke(provider))
+            .await
+    })
+}
+
+/// Run one invoke-Effect to its outcome. The value is built in
+/// [`interpret_invoke`] and executed here, once, on the journal worker —
+/// never inline in the constructor, never twice.
+fn run_invoke(provider: Box<dyn FnOnce() -> ProviderOutcome + Send>) -> ProviderOutcome {
+    match toron_core::kernel::Runtime::run(interpret_invoke(provider)) {
+        toron_core::kernel::Exit::Success(outcome) => outcome,
+        toron_core::kernel::Exit::Failure(cause) => {
+            ProviderOutcome::ProvenFailed(format!("invoke defect: {cause:?}"))
+        }
+    }
 }
 
 /// The leaf's delivery data, before any identity is attached: what a
@@ -588,7 +621,10 @@ fn mail_plane(cfg: &crate::config::Config) -> Option<MailPlane> {
         let mailbox = mailbox.clone();
         Arc::new(move |message: SendMessage| {
             let mailbox = mailbox.clone();
-            submit_journal_wait(
+            // Provider-nested work runs on its own runtime, never the shared
+            // journal pool: this closure executes inside a dispatched journal
+            // future, so the pool path would nest pool work inside pool work.
+            submit_provider_wait(
                 async move { mailbox.send_message(&message).await.map(|r| r.count) },
             )
         })
@@ -602,7 +638,9 @@ fn mail_plane(cfg: &crate::config::Config) -> Option<MailPlane> {
         Arc::new(move |project: &str| {
             let mailbox = mailbox.clone();
             let project = project.to_string();
-            submit_journal_wait(async move {
+            // Same nested-lane rule as `send` above: this runs inside a
+            // dispatched journal future.
+            submit_provider_wait(async move {
                 let roster: Vec<String> = mailbox
                     .list_agents(&project, toron_core::mailbox::ListAgentsOptions::default())
                     .await
@@ -761,6 +799,50 @@ fn fenced_outcome(result: Result<toron_mcp::workflow_host::DispatchResult>) -> V
 
 #[cfg(test)]
 mod tests {
+    /// bd-722a: the journal wait must not PARK an async worker.
+    ///
+    /// The old code hopped to a plain thread and then JOINED it — the join
+    /// parks the async worker for the whole wait, exactly the case this
+    /// module's doc cites as its motivation. On a multi-threaded runtime
+    /// `block_in_place` hands the worker back, so other tasks keep running
+    /// while the submit is pending.
+    ///
+    /// The submit runs INSIDE a spawned task (a spawned task runs on a
+    /// worker; `block_on` runs on the caller's thread, which would hide the
+    /// parking) and the runtime has ONE worker, so a parked worker is
+    /// visible: the ticker cannot run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn journal_wait_does_not_park_the_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = ticks.clone();
+        // The submit FIRST: it takes the only worker for the wait.
+        let submit = tokio::spawn(async move {
+            super::submit_journal_wait(async {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                Ok::<u32, anyhow::Error>(7)
+            })
+        });
+        let ticker = tokio::spawn(async move {
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let out = submit
+            .await
+            .expect("the submit task joins")
+            .expect("the submit settles");
+        ticker.abort();
+        assert_eq!(out, 7, "the submit's own value comes back");
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 5,
+            "the wait must not park the only worker: another task has to keep running while it is pending (ticks: {})",
+            ticks.load(Ordering::SeqCst)
+        );
+    }
+
     use super::*;
 
     use serde_json::json;
@@ -1582,5 +1664,110 @@ mod tests {
             "the run row is the index its effect rows hang off — one run_id"
         );
         assert_eq!(run.status, RunStatus::Succeeded, "{run:?}");
+    }
+
+    /// bd-b61z: the invoke is a framework `Effect` value — built without
+    /// running. Dropping it performs no I/O: the provider thunk fires only
+    /// when the value is interpreted.
+    #[test]
+    fn dropped_invoke_command_performs_no_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_c = ran.clone();
+        let fx = super::interpret_invoke(Box::new(move || {
+            ran_c.fetch_add(1, Ordering::SeqCst);
+            toron_workflow::engine::ProviderOutcome::Delivered(json!({ "ok": true }))
+        }));
+        drop(fx);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a dropped invoke-Effect never runs its provider"
+        );
+    }
+
+    /// bd-b61z: the Interpret path end to end — success settles, an
+    /// ambiguous attempt leaves `unknown` and the re-drive refuses a blind
+    /// second dispatch (one invoke, never two), and a permanently ambiguous
+    /// provider never settles as success.
+    #[tokio::test]
+    async fn effect_runner_interpret() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Success: one invoke, settled row, provider's own value.
+        let (_dir, store) = test_store().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let inner: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "ok": true }))
+        });
+        let fx = effect_runner(inner, store.clone(), None);
+        let inv = invocation(dispatch_job(), "run-interp-ok", "ship");
+        let out = fx(&inv).expect("runner returns a value");
+        assert_eq!(out, json!({ "ok": true }));
+        assert_eq!(
+            store
+                .get_effect(&effect_key_for(&inv))
+                .await
+                .unwrap()
+                .expect("row")
+                .state,
+            EffectState::Settled
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one invoke per dispatch");
+        // Retry is refused, not blind: an ambiguous first attempt leaves
+        // `unknown`, and the re-drive refuses a second dispatch when the
+        // provider offers no query or idempotency contract — the row stays
+        // `unknown` and the provider runs exactly once, never twice.
+        let (_dir2, store2) = test_store().await;
+        let tries = Arc::new(AtomicUsize::new(0));
+        let tries_c = tries.clone();
+        let flaky: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
+            tries_c.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("connection reset by peer"))
+        });
+        let fx2 = effect_runner(flaky, store2.clone(), None);
+        let inv2 = invocation(dispatch_job(), "run-interp-retry", "ship");
+        let first = fx2(&inv2).expect("a fenced runner returns a value");
+        assert_eq!(first["ok"], json!(false), "unproven first attempt: {first}");
+        assert_eq!(first["effect_state"], json!("unknown"), "{first}");
+        let second = fx2(&inv2).expect("re-drive answers, never blind-retries");
+        assert_eq!(second["ok"], json!(false), "refused, not retried: {second}");
+        assert_eq!(
+            store2
+                .get_effect(&effect_key_for(&inv2))
+                .await
+                .unwrap()
+                .expect("row")
+                .state,
+            EffectState::Unknown
+        );
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "exactly one invoke");
+        // Unknown never settles as success while the provider stays
+        // ambiguous.
+        let (_dir3, store3) = test_store().await;
+        let down: EffectRunner =
+            Arc::new(|_inv: &ActionInvocation| Err(anyhow::anyhow!("connection reset by peer")));
+        let fx3 = effect_runner(down, store3.clone(), None);
+        let inv3 = invocation(dispatch_job(), "run-interp-unknown", "ship");
+        let once = fx3(&inv3).expect("a fenced runner returns a value");
+        assert_eq!(once["ok"], json!(false));
+        assert_eq!(once["effect_state"], json!("unknown"), "{once}");
+        // Again: refused, not retried — still unknown, never success.
+        let twice = fx3(&inv3).expect("a fenced runner returns a value");
+        assert_eq!(twice["ok"], json!(false), "{twice}");
+        assert_eq!(
+            store3
+                .get_effect(&effect_key_for(&inv3))
+                .await
+                .unwrap()
+                .expect("row")
+                .state,
+            EffectState::Unknown
+        );
+        // Pool knobs are still 4 workers and a 4096 bound.
+        assert_eq!(super::EXECUTOR_QUEUE_BOUND, 4096);
+        let rt = super::journal_runtime();
+        assert_eq!(rt.queue_bound(), 4096);
     }
 }

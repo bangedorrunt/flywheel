@@ -55,6 +55,14 @@ scratch() {
   # — scratch projects need it registered or every tick logs a toron
   # mail-key error (the documented bd-3aen env issue; harmless but noisy)
   "$FW" mail register "$PROJ" --name CoralFinch >/dev/null 2>&1 || true
+  # comms-inbox senders (default-on since bd-131a): the loop's `__send`
+  # appends task@1 envelopes AS FLYWHEEL_MAIL_AS, and loop mails
+  # (done/notify) send AS FLYWHEEL_MAIL_NAME — both fail-closed without a
+  # registered identity. Bootstrap the shared captain pin (key reused
+  # across scratch projects by possession proof) and export both.
+  export TORON_MCP_URL="${TORON_MCP_URL:-http://127.0.0.1:18080/mcp}"
+  toron agent bootstrap --project "$PROJ" --as GateCaptain >/dev/null 2>&1 || true
+  export FLYWHEEL_MAIL_AS="GateCaptain" FLYWHEEL_MAIL_NAME="GateCaptain"
 }
 
 bead() { # bead <title> <desc> <verify-cmd>
@@ -62,10 +70,10 @@ bead() { # bead <title> <desc> <verify-cmd>
   # needs a VERIFY command, and a P<=2 bead also needs a principles citation,
   # or `br ready` returns it to nobody. Without this the loop looks broken when
   # it is behaving correctly: `loop run --work` finds no ready bead and exits
-  # `loop: complete`. `br create` has no --verify flag; set it with `br update`.
+  # `loop: complete`. `br create` is fail-closed and requires --verify.
   local id
   [ -n "${3:-}" ] || { say "bead: missing verify-cmd for '$1' (would not be dispatchable)"; return 1; }
-  id=$(cd "$SCRATCH" && br create --title="$1" --description="$2" --type=task --priority=3 --json 2>/dev/null \
+  id=$(cd "$SCRATCH" && br create --title="$1" --description="$2" --type=task --priority=3 --verify="$3" --json 2>/dev/null \
     | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
   [ -n "$id" ] || return 1
   (cd "$SCRATCH" && br update "$id" --verify "$3" >/dev/null 2>&1)
@@ -137,8 +145,8 @@ scenario_3_loop_chain() { # bd-bvwf.3
   say "--- scenario 3: LOOP-CHAIN (A -> B dependency runs in ONE loop)"
   scratch s3 || { fail "S3 setup"; return; }
   local A B
-  A=$(cd "$SCRATCH" && br create --title="chain-A" --description="Create done-a.txt with ok, close." --type=task --priority=3 --json | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
-  B=$(cd "$SCRATCH" && br create --title="chain-B" --description="Create done-b.txt with ok, close." --type=task --priority=3 --json | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+  A=$(cd "$SCRATCH" && br create --title="chain-A" --description="Create done-a.txt with ok, close." --type=task --priority=3 --verify='test -f done-a.txt' --json | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+  B=$(cd "$SCRATCH" && br create --title="chain-B" --description="Create done-b.txt with ok, close." --type=task --priority=3 --verify='test -f done-b.txt' --json | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
   # same dispatchability gate as bead(): VERIFY or the chain never becomes ready
   (cd "$SCRATCH" && br update "$A" --verify 'test -f done-a.txt' >/dev/null 2>&1)
   (cd "$SCRATCH" && br update "$B" --verify 'test -f done-b.txt' >/dev/null 2>&1)

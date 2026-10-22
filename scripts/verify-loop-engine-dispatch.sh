@@ -77,6 +77,12 @@ if herdr server status >/dev/null 2>&1 || herdr pane list >/dev/null 2>&1; then
 
   PROJ="$SCRATCH/proj"
   mkdir -p "$PROJ"
+  # inbox-path __send resolves the sender first: register the shared
+  # captain pin or this negative-path check fails NoSender instead of
+  # reaching agent lookup (same harness contract as e2e-hardened-loop).
+  export TORON_MCP_URL="${TORON_MCP_URL:-http://127.0.0.1:18080/mcp}"
+  toron agent bootstrap --project "$PROJ" --as GateCaptain >/dev/null 2>&1 || true
+  export FLYWHEEL_MAIL_AS="GateCaptain" FLYWHEEL_MAIL_NAME="GateCaptain"
   OUT=$("$FW" __send "$PROJ" no-such-agent "hello" --profile verify-loop-dispatch 2>&1)
   if echo "$OUT" | grep -qE "not found|no flywheel swarm"; then
     say "  (no agent — send rejected as expected; conditioning path exercised via unit tests)"
