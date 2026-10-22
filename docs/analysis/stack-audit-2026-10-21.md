@@ -1187,13 +1187,17 @@ export** of HEAD, never the working tree.
 
 ### Still open
 
-- **The gap counter fans out.** Every hosted workspace's wake-brain counter
-  moved by +1 in the same 75-second window (19 workspaces at once; one of them
-  also dropped a real event, 826 -> 827). One upstream herdr status-stream gap
-  therefore reaches every subscriber of the same ring. The status path
-  recovers - it clears coverage and re-reconciles from `session.snapshot` - so
-  no mail is lost, but the counter degrades `/health` the way a drop does, and
-  the one real drop is not recovered. Filed as `bd-v9k6`.
+- ~~**The gap counter fans out.**~~ **Fixed** (`5d7217e`, bd-v9k6, closed
+  LEGAL): the gap is delivered IN BAND and the stream keeps reading, so the
+  coverage stays, no new socket is opened, and the loss that is counted is a
+  real one. The fan-out was the fd leak's source - the daemon's socket count
+  grew at the gap rate - so the fix is also the fix for the EMFILE wedge. See
+  §35.
+- **The subscription store never gets pruned.** 71 of its 73 rows named a
+  workspace herdr no longer knows, and at that count the daemon refused new
+  subscribers, so a live workspace could not subscribe and its pane could not
+  be woken. The rows are pruned and the reaper that failed to prune them is
+  bd-oub3, with the suite that wrote them as bd-3dge. See §35.2.
 - **The arrival heal was filed in the wrong tracker.** The fix (the heal marker
   is durable and the heal runs once, so a restart stops re-inserting every
   event into the arrival log) is tracked in the repo that OWNS it, toron. The
