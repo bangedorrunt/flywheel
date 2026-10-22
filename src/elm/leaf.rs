@@ -28,6 +28,10 @@ pub struct LeafModel {
     pub argv: Vec<String>,
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// The defect, when the run hit one (a bug, not the child's answer).
+    pub defect: Option<String>,
+    /// The run was interrupted (cancelled), so it did not settle.
+    pub interrupted: bool,
     pub done: bool,
 }
 
@@ -36,7 +40,13 @@ pub struct LeafModel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LeafMsg {
     Completed { value: serde_json::Value },
+    /// The child's own typed failure (a non-zero exit it reports).
     Failed { error: String },
+    /// A defect: a bug in the leaf or the host, not the child's answer.
+    Defected { detail: String },
+    /// Cancellation. NOT a failure: the run was interrupted, so it must not
+    /// settle as one.
+    Interrupted,
 }
 
 /// One durable intent: run this argv under this key. The key is the leaf's
@@ -94,15 +104,34 @@ impl Program for LeafProgram {
                 next.error = Some(error.clone());
                 next.done = true;
             }
+            LeafMsg::Defected { detail } => {
+                next.defect = Some(detail.clone());
+                next.done = true;
+            }
+            LeafMsg::Interrupted => {
+                next.interrupted = true;
+                next.done = true;
+            }
         }
         Update::quiet(next)
     }
 
     fn failure(failure: &Failure<String>) -> LeafMsg {
         match failure {
+            // The child's own typed failure.
             Failure::Fail(e) => LeafMsg::Failed { error: e.clone() },
-            other => LeafMsg::Failed {
-                error: format!("leaf defect or interrupt: {other:?}"),
+            // A defect is a bug, not an answer: it is recorded apart so a
+            // caller never reads it as the child having failed.
+            Failure::Defect(d) => LeafMsg::Defected {
+                detail: format!("{d:?}"),
+            },
+            // Cancellation is not a failure and must not settle as one.
+            Failure::Interrupted => LeafMsg::Interrupted,
+            // The durable log refused the append, so the command never ran.
+            // That is neither the child's failure nor a defect: the run never
+            // happened, so it must not settle as a failed attempt.
+            Failure::NotAppended(e) => LeafMsg::Defected {
+                detail: format!("the journal refused the append: {e:?}"),
             },
         }
     }
@@ -272,6 +301,12 @@ pub fn run_leaf_on(
     let model = loop_.model().clone();
     if let Some(error) = model.error {
         return Err(anyhow::anyhow!("{error}"));
+    }
+    if let Some(detail) = model.defect {
+        return Err(anyhow::anyhow!("leaf defect: {detail}"));
+    }
+    if model.interrupted {
+        return Err(anyhow::anyhow!("leaf run was interrupted"));
     }
     model
         .result
@@ -445,7 +480,52 @@ mod tests {
                 assert!(value.get("raw").is_some(), "{value}");
             }
             LeafMsg::Failed { error } => panic!("self-exe --help failed: {error}"),
+            LeafMsg::Defected { detail } => panic!("self-exe --help hit a defect: {detail}"),
+            LeafMsg::Interrupted => panic!("self-exe --help was interrupted"),
         }
+    }
+
+    /// A defect is a bug and an interruption is cancellation: neither is the
+    /// child's typed failure, and the fold must keep them apart (a cancelled
+    /// run that settles as a failed attempt is a lie the ledger repeats).
+    #[test]
+    fn a_defect_and_an_interruption_are_not_the_child_s_typed_failure() {
+        let model = LeafModel::default();
+
+        let defect = LeafProgram::update(
+            &model,
+            &LeafMsg::Defected {
+                detail: "boom".into(),
+            },
+        );
+        assert!(
+            defect.model.defect.is_some(),
+            "a defect is recorded as a defect"
+        );
+        assert!(
+            defect.model.error.is_none(),
+            "a defect must not settle as the child's typed failure"
+        );
+
+        let interrupted = LeafProgram::update(&model, &LeafMsg::Interrupted);
+        assert!(
+            interrupted.model.interrupted,
+            "an interruption is recorded as an interruption"
+        );
+        assert!(
+            interrupted.model.error.is_none(),
+            "cancellation must not settle as a typed failure"
+        );
+
+        // The framework's own arms map to the same three messages.
+        assert!(matches!(
+            LeafProgram::failure(&Failure::Interrupted),
+            LeafMsg::Interrupted
+        ));
+        assert!(matches!(
+            LeafProgram::failure(&Failure::Fail("boom".to_string())),
+            LeafMsg::Failed { .. }
+        ));
     }
 
     #[test]
