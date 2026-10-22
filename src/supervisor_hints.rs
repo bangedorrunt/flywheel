@@ -19,9 +19,9 @@
 //! be unused; dropping it keeps the channel a unit and the fold untouched.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// How often the watcher looks at the files.
@@ -73,7 +73,11 @@ fn signature(paths: &[PathBuf]) -> Vec<Sig> {
 pub fn watched_paths(index_db: &std::path::Path, inbox: &std::path::Path) -> Vec<PathBuf> {
     let mut wal = index_db.as_os_str().to_os_string();
     wal.push("-wal");
-    vec![index_db.to_path_buf(), PathBuf::from(wal), inbox.to_path_buf()]
+    vec![
+        index_db.to_path_buf(),
+        PathBuf::from(wal),
+        inbox.to_path_buf(),
+    ]
 }
 
 /// A thread that sends a hint when any watched file changes.
@@ -85,7 +89,12 @@ pub struct Watcher {
 impl Watcher {
     /// Start watching `paths`; hints go to `tx` (a full channel drops the
     /// hint: one is already pending).
-    pub fn spawn(paths: Vec<PathBuf>, tx: SyncSender<()>, poll: Duration, min_gap: Duration) -> Self {
+    pub fn spawn(
+        paths: Vec<PathBuf>,
+        tx: SyncSender<()>,
+        poll: Duration,
+        min_gap: Duration,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let sp = stop.clone();
         let join = std::thread::Builder::new()
@@ -111,7 +120,10 @@ impl Watcher {
                 }
             })
             .expect("spawn flywheel-supervisor-hints");
-        Self { stop, join: Some(join) }
+        Self {
+            stop,
+            join: Some(join),
+        }
     }
 }
 
@@ -141,7 +153,11 @@ mod tests {
         std::thread::sleep(ms(30));
         tx.send(()).unwrap();
         assert_eq!(h.join().unwrap(), Woke::Hint);
-        assert!(t.elapsed() < ms(500), "a 5 s tick did not delay the hinted round: {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < ms(500),
+            "a 5 s tick did not delay the hinted round: {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
@@ -175,7 +191,10 @@ mod tests {
 
     #[test]
     fn the_watched_paths_are_the_index_its_wal_and_the_input_file() {
-        let p = watched_paths(std::path::Path::new("/d/index.sqlite"), std::path::Path::new("/s/k.in.jsonl"));
+        let p = watched_paths(
+            std::path::Path::new("/d/index.sqlite"),
+            std::path::Path::new("/s/k.in.jsonl"),
+        );
         assert_eq!(
             p,
             vec![
@@ -200,10 +219,19 @@ mod tests {
     #[test]
     fn a_change_to_any_watched_file_sends_a_hint_and_quiet_sends_none() {
         let d = tempfile::tempdir().unwrap();
-        let (db, wal, inbox) = (d.path().join("i.sqlite"), d.path().join("i.sqlite-wal"), d.path().join("in"));
+        let (db, wal, inbox) = (
+            d.path().join("i.sqlite"),
+            d.path().join("i.sqlite-wal"),
+            d.path().join("in"),
+        );
         std::fs::write(&db, b"x").unwrap();
         let (tx, rx) = sync_channel::<()>(4);
-        let _w = Watcher::spawn(vec![db.clone(), wal.clone(), inbox.clone()], tx, ms(10), ms(20));
+        let _w = Watcher::spawn(
+            vec![db.clone(), wal.clone(), inbox.clone()],
+            tx,
+            ms(10),
+            ms(20),
+        );
         assert!(!recv_within(&rx, ms(150)), "nothing changed: no hint");
         std::fs::write(&wal, b"first").unwrap(); // the file did not exist: appearing is a change
         assert!(recv_within(&rx, ms(500)), "the WAL appeared");
@@ -234,8 +262,14 @@ mod tests {
         }
         std::thread::sleep(ms(150));
         let hints = std::iter::from_fn(|| rx.try_recv().ok()).count();
-        assert!(hints >= 2, "a long burst is not collapsed to nothing: {hints}");
-        assert!(hints <= 6, "at most one per 100 ms over ~0.6 s, not one per write ({n} writes): {hints}");
+        assert!(
+            hints >= 2,
+            "a long burst is not collapsed to nothing: {hints}"
+        );
+        assert!(
+            hints <= 6,
+            "at most one per 100 ms over ~0.6 s, not one per write ({n} writes): {hints}"
+        );
     }
 
     #[test]
@@ -251,7 +285,10 @@ mod tests {
         std::thread::sleep(ms(20)); // still inside the 150 ms gap of that hint
         while rx.try_recv().is_ok() {}
         std::fs::write(&f, b"222").unwrap(); // inside the gap of the first
-        assert!(recv_within(&rx, ms(600)), "the held change arrives once the gap ends");
+        assert!(
+            recv_within(&rx, ms(600)),
+            "the held change arrives once the gap ends"
+        );
     }
 
     #[test]
@@ -264,6 +301,9 @@ mod tests {
         std::thread::sleep(ms(60));
         drop(w);
         std::fs::write(&f, b"changed after the drop").unwrap();
-        assert!(!recv_within(&rx, ms(150)), "no hint after drop (and the channel is closed)");
+        assert!(
+            !recv_within(&rx, ms(150)),
+            "no hint after drop (and the channel is closed)"
+        );
     }
 }

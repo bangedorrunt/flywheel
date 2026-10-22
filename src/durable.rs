@@ -2180,7 +2180,7 @@ const DEFAULT_LEAF_WATCHDOG: std::time::Duration = std::time::Duration::from_sec
 /// knows it (poll_events `--timeout-ms`, confirm timeout, VERIFY TIMEBOX).
 const LEAF_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
-async fn run_leaf_cmd(
+pub(crate) async fn run_leaf_cmd(
     cmd: std::process::Command,
     label: &'static str,
 ) -> Result<std::process::Output> {
@@ -7269,25 +7269,28 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 .map(|b| b.id.clone())
                 .collect();
             if !stranded.is_empty() {
-                match ctx
-                    .run(
-                        reclaim_stranded,
-                        ReclaimArgs {
-                            project: params.project.clone(),
-                            live: live_names.clone(),
-                        },
-                    )
-                    .await
-                {
+                let live_arg = live_names.join(",");
+                match crate::elm::leaf::run_leaf_journaled(
+                    &params.project,
+                    "__reclaim-stranded",
+                    &[&params.project, "--live", &live_arg],
+                    &format!("reclaim-stranded:{}", params.project),
+                ) {
                     Ok(r) => {
                         // Reclaimed beads return to ready → re-dispatched
                         // below (same poll) — the strand is healed in one
                         // cycle. Reclaim failures are logged, not fatal.
-                        for id in &r.reclaimed {
-                            eprintln!("flywheel: reclaimed stranded bead {id} (re-dispatching)");
+                        if let Some(ids) = r.get("reclaimed").and_then(|v| v.as_array()) {
+                            for id in ids.iter().filter_map(|v| v.as_str()) {
+                                eprintln!(
+                                    "flywheel: reclaimed stranded bead {id} (re-dispatching)"
+                                );
+                            }
                         }
-                        for f in &r.failed {
-                            eprintln!("flywheel: reclaim failed for {f}");
+                        if let Some(failed) = r.get("failed").and_then(|v| v.as_array()) {
+                            for f in failed {
+                                eprintln!("flywheel: reclaim failed for {f}");
+                            }
                         }
                     }
                     Err(e) => {
@@ -7311,16 +7314,20 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 assigned.push(bead.id.clone());
             }
 
-            let ready: Vec<ReadyBead> = match ctx
-                .run(
-                    poll_ready,
-                    ReadyArgs {
-                        project: params.project.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(b) => b,
+            let ready: Vec<ReadyBead> = match crate::elm::leaf::run_leaf_journaled(
+                &params.project,
+                "__ready",
+                &[&params.project],
+                &format!("ready:{}", params.project),
+            ) {
+                Ok(v) => match parse_bead_list(&v, "__ready") {
+                    Ok(b) => b,
+                    Err(e) => {
+                        critical_leaf_failed_this_iter = true;
+                        eprintln!("flywheel: poll_ready parse failed (continuing): {e}");
+                        vec![]
+                    }
+                },
                 Err(e) => {
                     // cg6.2: leaf errors never abort the loop. bd-87hq:
                     // flag for the completion gate.
@@ -7578,13 +7585,21 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     // sent the captain chasing the wrong parser.
                     let reason = not_ready_reason(bead)
                         .unwrap_or_else(|| "not dispatchable (see loop)".to_string());
-                    let args = NotReadyMailArgs {
-                        project: params.project.clone(),
-                        bead_id: bead.id.clone(),
-                        title: bead.title.clone(),
-                        reason: Some(reason.clone()),
-                    };
-                    match ctx.run(mail_not_ready, args).await {
+                    // The leaf takes --reason; the old call always set it
+                    // (Some), so the argv keeps it unconditionally.
+                    let argv = vec![
+                        params.project.as_str(),
+                        bead.id.as_str(),
+                        bead.title.as_str(),
+                        "--reason",
+                        reason.as_str(),
+                    ];
+                    match crate::elm::leaf::run_leaf_journaled(
+                        &params.project,
+                        "__mail-not-ready",
+                        &argv,
+                        &format!("mail-not-ready:{}", bead.id),
+                    ) {
                         // bd-not-ready-alert-recipient-2yd1: the leaf's own
                         // `ok` flag decides the status word. A send that
                         // resolved to nobody is a FAILURE, so it must not be
@@ -7713,11 +7728,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // get TWO consecutive missing ticks of grace (the
                         // receipt can race the close write): the bead is
                         // re-watched so the next tick re-checks.
-                        let args = CloseCheckArgs {
-                            project: params.project.clone(),
-                            bead_id: bead_id.clone(),
-                        };
-                        match ctx.run(close_check, args).await {
+                        // The check runs through the journaled leaf loop:
+                        // same subcommand and argv, checkpointed per bead.
+                        match crate::elm::leaf::run_leaf_journaled(
+                            &params.project,
+                            "__close-check",
+                            &[&params.project, &bead_id],
+                            &format!("close-check:{bead_id}"),
+                        ) {
                             Ok(v) => {
                                 let status = v.get("status").and_then(Value::as_str).unwrap_or("?");
                                 match status {
@@ -7739,11 +7757,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         // + once per bead (bd-55nx.8: dedup on
                                         // swarm.done_mailed, crash-safe).
                                         if swarm.done_mailed.insert(bead_id.clone()) {
-                                            let md = MailDoneArgs {
-                                                project: params.project.clone(),
-                                                bead_id: bead_id.clone(),
-                                            };
-                                            match ctx.run(mail_done, md).await {
+                                            // The done-mail leaf now runs through the journaled
+                                            // leaf loop instead of a Resonate checkpoint: same
+                                            // self-exe, same parse, same best-effort logging,
+                                            // one intent journaled per run for the audit trail.
+                                            match crate::elm::leaf::run_leaf_journaled(
+                                                &params.project,
+                                                "__mail-done",
+                                                &[&params.project, &bead_id],
+                                                &format!("mail-done:{bead_id}"),
+                                            ) {
                                                 Ok(r) => eprintln!(
                                                     "flywheel: done-mail sent for {bead_id}: {r}"
                                                 ),
@@ -7761,12 +7784,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             &bead_id,
                                             LedgerEvent::Reopened,
                                         );
-                                        let rb = ReopenBeadArgs {
-                                            project: params.project.clone(),
-                                            bead_id: bead_id.clone(),
-                                            sha: String::new(),
-                                        };
-                                        match ctx.run(reopen_bead, rb).await {
+                                        match crate::elm::leaf::run_leaf_journaled(
+                                            &params.project,
+                                            "__reopen-bead",
+                                            &[&params.project, &bead_id, ""],
+                                            &format!("reopen:{bead_id}:nocommit"),
+                                        ) {
                                             Ok(r) => eprintln!(
                                                 "flywheel: {bead_id} closed without a commit — reopened: {r}"
                                             ),
@@ -7845,12 +7868,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                                     &bead_id,
                                                     LedgerEvent::Reopened,
                                                 );
-                                                let rb = ReopenBeadArgs {
-                                                    project: params.project.clone(),
-                                                    bead_id: bead_id.clone(),
-                                                    sha,
-                                                };
-                                                match ctx.run(reopen_bead, rb).await {
+                                                let rb_sha = sha.clone();
+                                                match crate::elm::leaf::run_leaf_journaled(
+                                                    &params.project,
+                                                    "__reopen-bead",
+                                                    &[&params.project, &bead_id, &rb_sha],
+                                                    &format!("reopen:{bead_id}:{rb_sha}"),
+                                                ) {
                                                     Ok(r) => eprintln!(
                                                         "flywheel: {bead_id} unverified close — reopened: {r}"
                                                     ),
@@ -7889,15 +7913,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // captain once (marker-deduped) + never respawns;
                         // dispatch returns the reviewer model for the pane.
                         if verifier_dispatched.insert(bead_id.clone()) {
-                            let v_args = VerifyDispatchArgs {
-                                project: params.project.clone(),
-                                bead_id: bead_id.clone(),
-                                worker_model: None,
-                                candidates: None,
-                                blast: None,
-                                ac: None,
-                            };
-                            match ctx.run(verify_dispatch, v_args).await {
+                            match crate::elm::leaf::run_leaf_journaled(
+                                &params.project,
+                                "__verify-dispatch",
+                                &[&params.project, &bead_id],
+                                &format!("verify-dispatch:{bead_id}"),
+                            ) {
                                 Ok(v) => {
                                     let plan = v.get("plan").and_then(Value::as_str).unwrap_or("?");
                                     if plan == "degrade" {
@@ -7919,18 +7940,15 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         }
                         // bd-h3oj: the bead closed — release its file
                         // reservations (reason == bead id) so they never
-                        // linger to TTL. Checkpointed leaf; best-effort:
-                        // a failed release must not kill the loop.
-                        match ctx
-                            .run(
-                                release_bead_locks,
-                                ReleaseBeadLocksArgs {
-                                    project: params.project.clone(),
-                                    bead_id: bead_id.clone(),
-                                },
-                            )
-                            .await
-                        {
+                        // linger to TTL. Same subprocess through the journaled
+                        // loop; best-effort: a failed release must not kill
+                        // the loop.
+                        match crate::elm::leaf::run_leaf_journaled(
+                            &params.project,
+                            "__release-bead-locks",
+                            &[&params.project, &bead_id],
+                            &format!("release-locks:{bead_id}"),
+                        ) {
                             Ok(_) => {}
                             Err(e) => eprintln!(
                                 "flywheel: release of closed bead {bead_id} locks failed (continuing): {e}"
@@ -7971,14 +7989,17 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // hazard; the renewal threshold check must observe NOW too.
             let board: Vec<(String, String)> = reservation_board_live(&params.project).await;
             let inprog_for_renew: Vec<ReadyBead> = if params.work {
-                ctx.run(
-                    poll_inprogress,
-                    ReadyArgs {
-                        project: params.project.clone(),
-                    },
-                )
-                .await
-                .unwrap_or_default()
+                // Read-only poll leaf through the journaled loop: same
+                // subcommand, same parse, fail-open default on any error.
+                match crate::elm::leaf::run_leaf_journaled(
+                    &params.project,
+                    "__inprogress",
+                    &[&params.project],
+                    &format!("inprogress:{}", params.project),
+                ) {
+                    Ok(v) => parse_bead_list(&v, "__inprogress").unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                }
             } else {
                 Vec::new()
             };
@@ -8041,15 +8062,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             let now_secs = authority.now_unix() as i64;
             let threshold = params.pane_stall_secs;
             let inprog_for_stall: Vec<ReadyBead> = if params.work {
-                // reuse already-fetched inprog_for_renew if available, else fetch
-                ctx.run(
-                    poll_inprogress,
-                    ReadyArgs {
-                        project: params.project.clone(),
-                    },
-                )
-                .await
-                .unwrap_or_default()
+                // Reuse already-fetched inprog_for_renew if available, else fetch.
+                match crate::elm::leaf::run_leaf_journaled(
+                    &params.project,
+                    "__inprogress",
+                    &[&params.project],
+                    &format!("inprogress:{}", params.project),
+                ) {
+                    Ok(v) => parse_bead_list(&v, "__inprogress").unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                }
             } else {
                 Vec::new()
             };
@@ -16458,13 +16480,19 @@ mod resume_dedup_tests {
         // insertion order, or same-log-same-effects breaks. BTreeMap keeps
         // keys sorted; a HashMap here would make command order flaky.
         let mut a = LoopModel::default();
-        a.heal_states.insert("zebra".to_string(), HealState::default());
-        a.heal_states.insert("apple".to_string(), HealState::default());
-        a.heal_states.insert("mango".to_string(), HealState::default());
+        a.heal_states
+            .insert("zebra".to_string(), HealState::default());
+        a.heal_states
+            .insert("apple".to_string(), HealState::default());
+        a.heal_states
+            .insert("mango".to_string(), HealState::default());
         let mut b = LoopModel::default();
-        b.heal_states.insert("mango".to_string(), HealState::default());
-        b.heal_states.insert("zebra".to_string(), HealState::default());
-        b.heal_states.insert("apple".to_string(), HealState::default());
+        b.heal_states
+            .insert("mango".to_string(), HealState::default());
+        b.heal_states
+            .insert("zebra".to_string(), HealState::default());
+        b.heal_states
+            .insert("apple".to_string(), HealState::default());
         let ka: Vec<&String> = a.heal_states.keys().collect();
         let kb: Vec<&String> = b.heal_states.keys().collect();
         assert_eq!(ka, kb);

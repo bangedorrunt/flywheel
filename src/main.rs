@@ -49,6 +49,7 @@ mod durable_policy;
 mod durable_resume;
 mod durable_transition;
 mod effect_journal;
+mod elm;
 mod failure;
 mod fs_util;
 mod harness_caps;
@@ -14935,27 +14936,40 @@ fn cmd_decide(
     if let Err(e) = decide::check_profile_routes(&affinity, &known_profiles) {
         bail!("{e}");
     }
-    let mut d = decide::decide(target, &snap);
-    d.role = affinity
+    // The fold is the classifier: `update` calls `decide` and builds the
+    // command list, so this print path and the loop agree by construction.
+    use toron_core::kernel::Program as _;
+    let classify = crate::elm::DecideProgram::update(
+        &snap,
+        &crate::elm::DecideMsg::Classify {
+            target: target.to_string(),
+        },
+    );
+    let cmd = classify
+        .commands
+        .into_iter()
+        .next()
+        .expect("classify folds to one command");
+    let role = affinity
         .iter()
-        .find(|(p, _)| *p == d.primitive)
+        .find(|(p, _)| *p == cmd.primitive)
         .and_then(|(_, r)| r.clone());
     if json {
         print_json(&serde_json::json!({
-            "primitive": d.primitive,
-            "reason": d.reason,
-            "argv": d.argv,
-            "topology": d.topology,
-            "role": d.role,
+            "primitive": cmd.primitive,
+            "reason": cmd.reason,
+            "argv": cmd.argv,
+            "topology": cmd.topology,
+            "role": role,
         }));
     } else {
         println!(
             "{}\n{}\n{}\ntopology {}\nrole {}",
-            d.primitive,
-            d.reason,
-            d.argv.join(" "),
-            d.topology,
-            d.role.as_deref().unwrap_or("-"),
+            cmd.primitive,
+            cmd.reason,
+            cmd.argv.join(" "),
+            cmd.topology,
+            role.as_deref().unwrap_or("-"),
         );
     }
     Ok(())

@@ -233,8 +233,7 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         "cover_new_panes must multiplex-subscribe, not poll agent_list"
     );
     assert!(
-        host.contains("reconcile_status_after_events_lost")
-            || !host.contains("refresh_status"),
+        host.contains("reconcile_status_after_events_lost") || !host.contains("refresh_status"),
         "no retired refresh_status poll spine"
     );
 }

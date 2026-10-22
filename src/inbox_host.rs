@@ -1001,9 +1001,17 @@ mod tests {
     fn the_production_ports_persist_the_budget_atomically() {
         let src = include_str!("inbox_ports.rs");
         assert!(src.contains("fn load_budget") && src.contains("fn save_budget"));
+        // Atomicity lives in one helper now: save_budget must route through
+        // it, and the helper itself must rename (not truncate in place).
         let a = src.find("fn save_budget").unwrap();
         assert!(
-            src[a..a + 900].contains("std::fs::rename"),
+            src[a..a + 900].contains("write_private_atomic"),
+            "save_budget must persist via the atomic helper"
+        );
+        let helper = include_str!("private_fs.rs");
+        let w = helper.find("fn write_private_atomic").unwrap();
+        assert!(
+            helper[w..w + 1200].contains("std::fs::rename"),
             "write-then-rename"
         );
     }
@@ -1302,8 +1310,14 @@ mod tests {
             !body.contains("wake_line("),
             "the host never builds the line"
         );
-        let ports = include_str!("inbox_ports.rs");
-        assert_eq!(ports.matches("pane_write::write(").count(), 1);
+        // The sink's only writes: an interrupt control plus the urgent and
+        // normal wake-line renders. (Was one before the urgency split.)
+        // Truncated at the test module: the fold's own "new work" text
+        // appears in the tests' assertions below, and the fence guards
+        // production code, not its own checks.
+        let ports_all = include_str!("inbox_ports.rs");
+        let ports = &ports_all[..ports_all.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(ports.matches("pane_write::write(").count(), 3);
         // the sink's rendering must equal the fold's line, or nothing is typed
         assert!(ports.contains("!= line"), "ring compares the fold's line");
         assert!(!ports.contains("new work"));

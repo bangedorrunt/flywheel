@@ -126,6 +126,11 @@ fi
 # ---- T1: loop-side reply verification -------------------------------------
 if [ "$SKIP_T1" = "0" ] && [ -n "$SCRATCH" ]; then
   say "=== T1: loop-side reply verification (own thread) ==="
+  # inbox-path loop sends resolve the sender first: register the shared
+  # captain pin (same harness contract as e2e-hardened-loop).
+  export TORON_MCP_URL="${TORON_MCP_URL:-http://127.0.0.1:18080/mcp}"
+  toron agent bootstrap --project "$SCRATCH" --as GateCaptain >/dev/null 2>&1 || true
+  export FLYWHEEL_MAIL_AS="GateCaptain" FLYWHEEL_MAIL_NAME="GateCaptain"
   EV_FILE="$EV_DIR/$SCRATCH.jsonl"
   # a FRESH collab ask (T4 already satisfied its own thread)
   T1_COLLAB=$("$FW" collab "$SCRATCH" --to "flywheel-$SCRATCH-oc" --subject "rv-t1" --body "reply with the t1 magic word" --timeout-secs 3 2>&1)

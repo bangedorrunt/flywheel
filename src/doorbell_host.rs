@@ -1125,8 +1125,8 @@ async fn run_embedded_async(
         }
         let _ = shutdown_tx.send(BrainMsg::Shutdown).await;
     });
-    let brain = Brain::new(BrainConfig::new(workspace), host, store, sinks)
-        .with_died_bell(died_bell);
+    let brain =
+        Brain::new(BrainConfig::new(workspace), host, store, sinks).with_died_bell(died_bell);
     let report = brain.run(rx).await;
     drop(sweep_ticker);
     _lease_beat.abort();
@@ -1668,10 +1668,7 @@ mod inbox_flag_tests {
         let tail = &src[a..a + 2500];
         assert!(tail.contains("doorbell_rt::NoTextSink::new()"));
         assert!(tail.contains("InboxHost::spawn("));
-        assert!(
-            !tail.contains("HerdrPromptSink"),
-            "flag-off typer is gone"
-        );
+        assert!(!tail.contains("HerdrPromptSink"), "flag-off typer is gone");
     }
 }
 

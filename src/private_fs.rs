@@ -12,7 +12,10 @@ pub fn create_private_dir_all(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
         let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -28,7 +31,10 @@ pub fn create_private_dir_all(dir: &Path) -> io::Result<()> {
 /// Create (or truncate) `path` as 0600. An existing file with looser bits is
 /// tightened too.
 pub fn create_private_file(path: &Path) -> io::Result<File> {
-    open_private(OpenOptions::new().write(true).create(true).truncate(true), path)
+    open_private(
+        OpenOptions::new().write(true).create(true).truncate(true),
+        path,
+    )
 }
 
 /// Open `path` for append as 0600, creating it if absent.
@@ -75,7 +81,9 @@ pub fn mode_of(path: &Path) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0)
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0)
     }
     #[cfg(not(unix))]
     {
@@ -131,6 +139,10 @@ mod tests {
         write_private_atomic(&p, b"two").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         assert_eq!(mode_of(&p), 0o600);
-        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1, "no temp left behind");
+        assert_eq!(
+            std::fs::read_dir(d.path()).unwrap().count(),
+            1,
+            "no temp left behind"
+        );
     }
 }

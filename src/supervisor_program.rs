@@ -2921,8 +2921,11 @@ mod tests {
         let (m, c) = step(&base(), &redirect("a", Some(D)));
         let json = serde_json::to_string(&(m, c)).unwrap();
         assert!(json.contains(D));
-        assert!(
-            !json.contains("goal"),
+        // "goal" may appear only as the `goal_proved` key: delta prose must
+        // never be inlined beside its sha.
+        assert_eq!(
+            json.matches("goal").count(),
+            json.matches("\"goal_proved\"").count(),
             "no delta content in the model or the commands"
         );
     }
