@@ -24,6 +24,13 @@
     </dict>
     <key>ThrottleInterval</key>
     <integer>5</integer>
+    <!-- bd-m7yp: launchd's default soft maxfiles for a job is 256, and this
+         daemon is a SERVER: it holds one descriptor per wake subscriber and
+         one per hosted workspace. Measured: 257 descriptors against the 256
+         cap, so it could not open a socket and the wake brain could not reach
+         a pane. The budget has to match the working set. -->
+    <key>LimitMaxFiles</key>
+    <integer>4096</integer>
     <key>StandardOutPath</key>
     <string>DOORBELL_STATE_DIR_VALUE/doorbell.log</string>
     <key>StandardErrorPath</key>
