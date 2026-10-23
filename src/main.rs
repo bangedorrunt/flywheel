@@ -92,6 +92,7 @@ mod mcp_http;
 mod models;
 mod output;
 mod pane;
+mod pane_keep;
 mod pane_write;
 mod phase_chain;
 mod phase_contracts;
