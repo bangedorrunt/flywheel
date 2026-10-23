@@ -43,9 +43,6 @@ pub struct FlywheelPorts {
     warned_store: bool,
     /// Head urgency from the last `observe`, keyed by npub. `ring` reads it.
     urgencies: BTreeMap<String, Urgency>,
-    /// rv23 #4: the unread head each npub's urgency was read at, so an
-    /// unchanged head is not read again. One entry per unread recipient.
-    head_urgency: BTreeMap<String, (u64, Urgency)>,
 }
 
 /// Pure: herdr's word to the wake rule's pane state.
@@ -111,7 +108,6 @@ impl FlywheelPorts {
             facts_seen: BTreeSet::new(),
             warned_store: false,
             urgencies: BTreeMap::new(),
-            head_urgency: BTreeMap::new(),
         };
         p.load_facts();
         p
@@ -318,43 +314,22 @@ pub(crate) fn urgency_of_envelope(env: &Envelope) -> Urgency {
 }
 
 /// The envelope stored at `offset` on the inbox stream, if it parses.
-///
-/// rv23 #4: one row by its key (`log_offset` is the table's integer primary
-/// key), not the head and everything newer, and never the whole log when the
-/// previous offset was a gap.
 async fn envelope_at(store: &InboxStore, offset: u64) -> Option<Envelope> {
-    let offset = i64::try_from(offset).ok()?;
-    let payload: Option<String> =
-        sqlx::query_scalar("SELECT payload FROM inbox_log WHERE log_offset = ?1 AND stream = ?2")
-            .bind(offset)
-            .bind(toron_core::inbox::INBOX_STREAM)
-            .fetch_optional(store.pool())
-            .await
-            .ok()?;
-    serde_json::from_str(&payload?).ok()
-}
-
-/// The urgency `observe` hands `ring`, and whether it read the store for it.
-///
-/// rv23 #4: nothing unread (`head <= cursor`) is no read at all: there is
-/// nothing to ring. An unread head already read at this same offset reuses
-/// that answer: a stored row never changes. Otherwise one point read.
-pub(crate) async fn urgency_of_unread(
-    store: &InboxStore,
-    npub: &str,
-    head: u64,
-    cursor: u64,
-    cached: Option<(u64, Urgency)>,
-) -> (Urgency, bool) {
-    if head <= cursor {
-        return (Urgency::Normal, false);
-    }
-    if let Some((h, u)) = cached
-        && h == head
-    {
-        return (u, false);
-    }
-    (urgency_of_head(store, npub, head).await, true)
+    let stream = toron_core::inbox::INBOX_STREAM;
+    // `offset - 1` is the previous row when offsets are contiguous, so the
+    // read is the head and anything newer, not the whole log. A gap (the
+    // previous offset was never committed) falls back to a full read.
+    let narrow = if offset > 1 {
+        store.read_stream(stream, Some(offset - 1)).await.ok()
+    } else {
+        None
+    };
+    let rows = match narrow {
+        Some(rows) if rows.iter().any(|(o, _)| *o == offset) => rows,
+        _ => store.read_stream(stream, None).await.ok()?,
+    };
+    let payload = rows.into_iter().find(|(o, _)| *o == offset)?.1;
+    serde_json::from_str(&payload).ok()
 }
 
 /// Urgency of `npub`'s head mail. `head == 0` is an empty inbox (the log's
@@ -467,17 +442,11 @@ impl Ports for FlywheelPorts {
             };
             let store = store.clone();
             let n2 = npub.clone();
-            let cached = self.head_urgency.get(&npub).copied();
             let (head, cursor, urgency) = crate::mail_shim::block_on(async move {
                 let (head, cursor) = head_and_cursor(&store, &n2).await;
-                let (urgency, _) = urgency_of_unread(&store, &n2, head, cursor, cached).await;
+                let urgency = urgency_of_head(&store, &n2, head).await;
                 (head, cursor, urgency)
             });
-            if head > cursor {
-                self.head_urgency.insert(npub.clone(), (head, urgency));
-            } else {
-                self.head_urgency.remove(&npub);
-            }
             self.urgencies.insert(npub.clone(), urgency);
             let pane = panes.iter().find(|p| p.pane_id == e.pane_id);
             let (state, bind) = match pane {
@@ -797,111 +766,6 @@ mod tests {
         let mut e = env(name, 1, class, body, task);
         e.msg.seq = seq;
         e
-    }
-
-    /// rv23 #4: the urgency check is no read with nothing unread, one point
-    /// read per new unread head, and none for a head it already read, and the
-    /// head row is found past other recipients' newer rows and a gap.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_urgency_check_reads_one_row_once_and_nothing_when_all_is_read() {
-        let store = mem_store().await;
-        let steer = stored(
-            0,
-            Class::Control,
-            "steer",
-            json!({"op": "pause", "priority": "urgent", "sup_epoch": 0}),
-            true,
-        );
-        store.append_envelope(&steer).await.unwrap();
-        let head = store.head(B).await.unwrap();
-        // Other recipients' rows land after B's head.
-        for seq in 1..40u64 {
-            let mut e = stored(seq, Class::Notify, "notify", json!({"text": "x"}), false);
-            e.to = Recipient::Npub(A.to_string());
-            store.append_envelope(&e).await.unwrap();
-        }
-        assert_eq!(
-            urgency_of_unread(&store, B, head, head, None).await,
-            (Urgency::Normal, false),
-            "nothing unread: no read"
-        );
-        assert_eq!(
-            urgency_of_unread(&store, B, head, head - 1, None).await,
-            (Urgency::Urgent, true),
-            "one read finds the head past newer rows"
-        );
-        assert_eq!(
-            urgency_of_unread(&store, B, head, 0, Some((head, Urgency::Urgent))).await,
-            (Urgency::Urgent, false),
-            "an unchanged unread head is not read again"
-        );
-        assert_eq!(
-            urgency_of_unread(&store, B, head, 0, Some((head - 1, Urgency::Normal))).await,
-            (Urgency::Urgent, true),
-            "a new head is read"
-        );
-        assert_eq!(envelope_at(&store, head).await.unwrap().msg, steer.msg);
-        assert!(envelope_at(&store, 10_000).await.is_none(), "no such row");
-    }
-
-    /// rv23 #4 measurement (ignored; `--ignored --nocapture`): the head read
-    /// of 52937c7 (the head and every newer row; the whole log on a gap)
-    /// against the point read, with `n` other recipients' rows after the head.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore]
-    async fn bench_head_read_point_vs_52937c7() {
-        async fn old_read(store: &InboxStore, offset: u64) -> (Option<Envelope>, usize) {
-            let stream = toron_core::inbox::INBOX_STREAM;
-            let narrow = if offset > 1 {
-                store.read_stream(stream, Some(offset - 1)).await.ok()
-            } else {
-                None
-            };
-            let rows = match narrow {
-                Some(rows) if rows.iter().any(|(o, _)| *o == offset) => rows,
-                _ => store.read_stream(stream, None).await.unwrap(),
-            };
-            let n = rows.len();
-            let p = rows.into_iter().find(|(o, _)| *o == offset).map(|r| r.1);
-            (p.and_then(|p| serde_json::from_str(&p).ok()), n)
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("index.sqlite");
-        let pool = toron_core::index::schema::connect(&db.to_string_lossy())
-            .await
-            .unwrap();
-        toron_core::index::schema::migrate(&pool).await.unwrap();
-        let store = InboxStore::new(pool);
-        let pad = stored(0, Class::Notify, "notify", json!({"text": "pad"}), false);
-        store.append_envelope(&pad).await.unwrap();
-        let mut steer = stored(
-            1,
-            Class::Control,
-            "steer",
-            json!({"op": "pause", "priority": "urgent", "sup_epoch": 0}),
-            true,
-        );
-        steer.msg.seq = 1;
-        store.append_envelope(&steer).await.unwrap();
-        let head = store.head(B).await.unwrap();
-        let n: u64 = std::env::var("BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
-        for seq in 0..n {
-            let mut e = stored(seq, Class::Notify, "notify", json!({"text": "x"}), false);
-            e.msg.producer = "d".repeat(64);
-            e.from = "d".repeat(64);
-            e.to = Recipient::Npub("c".repeat(64));
-            store.append_envelope(&e).await.unwrap();
-        }
-        let t = std::time::Instant::now();
-        let (old, rows) = old_read(&store, head).await;
-        let old_t = t.elapsed();
-        let t = std::time::Instant::now();
-        let new = envelope_at(&store, head).await;
-        let new_t = t.elapsed();
-        assert_eq!(old.unwrap().msg, new.unwrap().msg);
-        println!(
-            "rows after head: {n}; 52937c7 read: {rows} rows in {old_t:?}; point read: 1 row in {new_t:?}"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
