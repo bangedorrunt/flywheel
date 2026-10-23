@@ -37783,17 +37783,38 @@ mod hosted_workspaces_from_registry_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fresh state dir per call. It was `<pid>-<now in ns>`, but the clock
+    /// is microsecond-grained on macOS, so two of these tests starting in the
+    /// same microsecond shared one dir and read each other's labels
+    /// (`daemon_only_fleet_yields_slug` saw `["flywheel-only", "zzz"]`).
     fn tempfile_state() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fw-hosted-reg-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("state dir");
-        dir
+        tempfile::Builder::new()
+            .prefix("fw-hosted-reg-")
+            .tempdir()
+            .expect("state dir")
+            .keep()
+    }
+
+    /// Every call is its own dir, also when many tests start at once.
+    #[test]
+    fn concurrent_state_dirs_are_distinct() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    (0..64).map(|_| tempfile_state()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let dirs: Vec<std::path::PathBuf> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let unique: std::collections::BTreeSet<_> = dirs.iter().collect();
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        assert_eq!(unique.len(), dirs.len(), "state dirs collided");
     }
 }
 
