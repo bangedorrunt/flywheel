@@ -1833,12 +1833,34 @@ fn dispatch_chain_budget() -> std::time::Duration {
 /// open it for 60s (ADR-0015 §3 P2), and the framework resets the count on a
 /// success and lets one probe through after the cooldown, so a pane that
 /// failed can recover.
+/// bd-ja69: the framework's default jitter seed is a constant (42), so every
+/// process would draw the SAME backoff sequence and retry in lockstep after
+/// a shared outage — the failure class bd-retry-jitter-xlh6 removed from the
+/// old driver. Seed from process entropy instead (pid + nanos + counter, the
+/// same convention as `retry::host_draw`); tests build their own policies, so
+/// no test observes this.
+fn dispatch_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(N.fetch_add(1, Ordering::Relaxed));
+    h.write_u32(std::process::id());
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish() | 1
+}
+
 fn dispatch_policy() -> RemotePolicy<Value, String> {
     RemotePolicy {
         // The framework counts RETRIES after the first attempt.
         retries: MAX_ATTEMPTS.saturating_sub(1),
         backoff: kernel_millis(DISPATCH_BACKOFF),
         ceiling: kernel_millis(DISPATCH_BACKOFF_CAP),
+        seed: dispatch_seed(),
         attempt_timeout: kernel_millis(dispatch_attempt_timeout()),
         budget: kernel_millis(dispatch_chain_budget()),
         breaker: Some(BreakerConfig {
@@ -3047,12 +3069,28 @@ mod tests {
     /// bd-8pjr: the dispatch retry schedule is the framework's now, so the
     /// envelope the stack runs with is pinned against the real policy type:
     /// six attempts (five retries), 5s base, 10s cap.
+    /// dispatch_chain_carries_the_breaker_as_its_argument below pins the
+    /// 5/60s the stack runs with.
     #[test]
     fn dispatch_chain_carries_the_retry_envelope_as_its_argument() {
         let policy = dispatch_policy();
         assert_eq!(policy.retries, MAX_ATTEMPTS - 1, "five retries after the first attempt");
         assert_eq!(policy.backoff.as_millis(), 5_000, "5s backoff base");
         assert_eq!(policy.ceiling.as_millis(), 10_000, "10s backoff cap");
+    }
+
+    /// bd-ja69: the stack must not run the framework's default jitter seed.
+    /// A constant seed draws the same backoff sequence in every process, so
+    /// all dispatchers retry in lockstep after a shared outage. The seed is
+    /// drawn from process entropy — pin that it differs from the default,
+    /// not any particular value (tests build their own policies).
+    #[test]
+    fn dispatch_chain_seeds_its_jitter_from_process_entropy() {
+        let def = RemotePolicy::<Value, String>::default();
+        assert_ne!(
+            dispatch_policy().seed, def.seed,
+            "the dispatch stack must not run the framework default seed"
+        );
     }
 
     /// bd-wave-swarm-graduation-fix-98io: both boot-race signatures are
