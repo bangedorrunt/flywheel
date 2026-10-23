@@ -1212,7 +1212,7 @@ steps:
     step:
       name: gate_marker
       action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-gate.done || { echo 'wave in flight: gate has not written .flywheel/wave/{{inputs.wave_label}}-gate.done after the step budget (240 x 30s) — the wave waits for real work; extend with a larger --timeout or fix the planner, never dispatch over a held gate'; exit 1; }"
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-gate.done || { echo 'wave in flight: {{inputs.wave_label}}-gate.done not present yet — the wave waits for real work; widen the outer bound or fix the planner, never dispatch over a held gate'; exit 1; }"
   - name: dispatch
     action: dispatch_job
     assignee: x
@@ -1229,7 +1229,7 @@ steps:
     step:
       name: dispatch_marker
       action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-dispatch.done || { echo 'wave in flight: dispatch has not written .flywheel/wave/{{inputs.wave_label}}-dispatch.done after the step budget (240 x 30s) — EXECUTE must not start until every payload is posted; extend with a larger --timeout if the dispatcher is really working'; exit 1; }"
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-dispatch.done || { echo 'wave in flight: {{inputs.wave_label}}-dispatch.done not present yet — EXECUTE must not start until every payload is posted; widen the outer bound if the dispatcher is really working'; exit 1; }"
   - name: execute
     action: dispatch_job
     assignee: x
@@ -1246,7 +1246,7 @@ steps:
     step:
       name: execute_marker
       action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-execute.done || { echo 'wave in flight: execute has not written .flywheel/wave/{{inputs.wave_label}}-execute.done after the step budget (240 x 30s) — REVIEW must not start with closes still landing; extend with a larger --timeout if the wave is really working'; exit 1; }"
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-execute.done || { echo 'wave in flight: {{inputs.wave_label}}-execute.done not present yet — REVIEW must not start with closes still landing; widen the outer bound if the wave is really working'; exit 1; }"
   - name: observe
     action: dispatch_job
     assignee: x
@@ -1271,7 +1271,7 @@ steps:
     step:
       name: review_marker
       action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-review.done || { echo 'wave in flight: review has not written .flywheel/wave/{{inputs.wave_label}}-review.done after the step budget (240 x 30s) — VERIFY needs the findings first; extend with a larger --timeout if the reviewer is really working'; exit 1; }"
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-review.done || { echo 'wave in flight: {{inputs.wave_label}}-review.done not present yet — VERIFY needs the findings first; widen the outer bound if the reviewer is really working'; exit 1; }"
   - name: verify
     action: dispatch_job
     assignee: x
@@ -1288,7 +1288,7 @@ steps:
     step:
       name: verify_marker
       action: verify
-      command: "test -f .flywheel/wave/{{inputs.wave_label}}-verify.done || { echo 'wave in flight: verify has not written .flywheel/wave/{{inputs.wave_label}}-verify.done after the step budget (240 x 30s) — COMPOUND must not run before the wave is verified; extend with a larger --timeout if the verifier is really working'; exit 1; }"
+      command: "test -f .flywheel/wave/{{inputs.wave_label}}-verify.done || { echo 'wave in flight: {{inputs.wave_label}}-verify.done not present yet — COMPOUND must not run before the wave is verified; widen the outer bound if the verifier is really working'; exit 1; }"
   - name: compound
     action: dispatch_job
     assignee: x
@@ -3264,6 +3264,68 @@ mod tests {
             Some("{{inputs.coder_profile}}"),
             "implement forwards the input to wave-swarm"
         );
+    }
+
+    /// bd-mszc: a wave-swarm await message must not contain an ambiguity
+    /// signal, or the journal classifies the first miss as Unknown instead
+    /// of failed and the retry never re-observes (the run parks from second
+    /// one). The signal list mirrors toron-workflow's
+    /// `classify_provider_error_msg` (boundary.rs) — the single source of
+    /// truth; this fence only stops OUR template from tripping it.
+    #[test]
+    fn wave_swarm_awaits_name_no_ambiguity_signal() {
+        use toron_workflow::schema::Action;
+        // Keep in sync with boundary.rs AMBIGUOUS (conservative substring
+        // match there; exact containment here).
+        const SIGNALS: &[&str] = &[
+            "timeout",
+            "timed out",
+            "timed-out",
+            "deadline",
+            "transport",
+            "connection",
+            "network",
+            "unavailable",
+            "ambiguous",
+            "not confirmed",
+            "unknown outcome",
+            "may have",
+            "broken pipe",
+            "reset by peer",
+            "eof",
+        ];
+        let wfs = builtin_workflows();
+        let wave = &wfs["wave-swarm"];
+        let mut awaits = Vec::new();
+        for s in &wave.steps {
+            let Action::Retry { step, .. } = &s.action else {
+                continue;
+            };
+            let Action::Verify { command } = &step.action else {
+                panic!(
+                    "retry step {} must wrap a verify, not {:?}",
+                    s.name.as_deref().unwrap_or("?"),
+                    step.action.type_name()
+                );
+            };
+            awaits.push((s.name.clone().unwrap_or_default(), command.clone()));
+        }
+        // Five gated phases; fewer means an await lost its fence (or this
+        // test lost its coverage) — either way, loud.
+        assert_eq!(
+            awaits.len(),
+            5,
+            "wave-swarm carries five retry-over-verify awaits: {awaits:?}"
+        );
+        for (name, cmd) in &awaits {
+            let lower = cmd.to_lowercase();
+            for sig in SIGNALS {
+                assert!(
+                    !lower.contains(sig),
+                    "await {name} echo trips the Ambiguous classifier ({sig:?}): {cmd}"
+                );
+            }
+        }
     }
 
     /// bd-h4fc: every decisive step fails the run on error (on_error:
