@@ -90,6 +90,12 @@ pub trait Ports {
     fn page(&mut self, kind: &str, pin: &str, line: &str) -> Result<(), String>;
     /// Record a rejected input.
     fn reject(&mut self, n: u64, cause: &str, child: &str) -> Result<(), String>;
+    /// The directory a captain hold runs `br` in: the project's, where its
+    /// `.beads` is (the same dir `br ready` and `br init` use). `None`
+    /// inherits the host's cwd.
+    fn tracker_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// What `append_steer` needs.
@@ -784,10 +790,13 @@ pub fn execute(
             n,
             reason,
             evidence,
-        } => ports
-            .escalate(*n, reason, evidence)
-            .and_then(|_| captain_hold(evidence, reason, rep))
-            .map(|_| vec![]),
+        } => {
+            let dir = ports.tracker_dir();
+            ports
+                .escalate(*n, reason, evidence)
+                .and_then(|_| captain_hold(evidence, reason, dir.as_deref(), rep))
+                .map(|_| vec![])
+        }
         SupCmd::Assign {
             task,
             child,
@@ -1141,6 +1150,10 @@ impl LivePorts {
 }
 
 impl Ports for LivePorts {
+    fn tracker_dir(&self) -> Option<PathBuf> {
+        Some(crate::project_dir(&self.cfg, &self.project))
+    }
+
     fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg> {
         let mut out = Vec::new();
         // Lead facts and a dead lease, before the herdr edge, so a lead
@@ -1483,7 +1496,12 @@ impl HostCfg {
 /// does not run `br` (a suppressed line names it). The run is bounded by
 /// `br_hold_timeout()`: a hung `br` is killed at the deadline and fails the
 /// command instead of parking the supervisor loop.
-fn captain_hold(evidence: &str, reason: &str, rep: &mut RoundReport) -> Result<(), String> {
+fn captain_hold(
+    evidence: &str,
+    reason: &str,
+    cwd: Option<&Path>,
+    rep: &mut RoundReport,
+) -> Result<(), String> {
     let Some(argv) = crate::supervisor_program::bead_hold_argv(evidence, reason) else {
         return Ok(());
     };
@@ -1498,7 +1516,7 @@ fn captain_hold(evidence: &str, reason: &str, rep: &mut RoundReport) -> Result<(
     }
     let pinned = std::env::var("FLYWHEEL_BR_BIN").ok();
     let program = pinned.as_deref().unwrap_or("br");
-    match run_bounded(program, &argv, br_hold_timeout()) {
+    match run_bounded(program, &argv, cwd, br_hold_timeout()) {
         Err(Bounded::TimedOut(after)) if pinned.is_some() => Err(format!(
             "br hold timed out after {}ms (killed)",
             after.as_millis()
@@ -1548,13 +1566,15 @@ enum Bounded {
 fn run_bounded(
     program: &str,
     argv: &[String],
+    cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<std::process::ExitStatus, Bounded> {
-    let mut child = std::process::Command::new(program)
-        .args(argv)
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .map_err(Bounded::Spawn)?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(argv).stdin(std::process::Stdio::null());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd.spawn().map_err(Bounded::Spawn)?;
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -3046,6 +3066,77 @@ mod tests {
                 .any(|l| l.contains("br hold") && l.contains("FLYWHEEL_ALLOW_EXEC=0")),
             "the skipped hold is named: {:?}",
             rep.suppressed
+        );
+    }
+
+    /// rv23 #5 (review S3): the hold runs `br` in the ports' tracker dir
+    /// (the project's, where its `.beads` is), not the host's cwd.
+    #[test]
+    fn br_hold_runs_in_the_tracker_dir() {
+        struct InDir(Fake, PathBuf);
+        impl Ports for InDir {
+            fn observe(&mut self, m: &SupModel, now: u64) -> Vec<SupMsg> {
+                self.0.observe(m, now)
+            }
+            fn relaunch(&mut self, c: &str, g: u64, k: ChildKind) -> Result<(), String> {
+                self.0.relaunch(c, g, k)
+            }
+            fn exit(&mut self, c: &str, g: u64) -> Result<(), String> {
+                self.0.exit(c, g)
+            }
+            fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {
+                self.0.append_steer(s)
+            }
+            fn assign(&mut self, a: &AssignSend) -> Result<u64, String> {
+                self.0.assign(a)
+            }
+            fn escalate(&mut self, n: u64, r: &str, e: &str) -> Result<(), String> {
+                self.0.escalate(n, r, e)
+            }
+            fn park(&mut self, c: &str, i: u32) -> Result<(), String> {
+                self.0.park(c, i)
+            }
+            fn page(&mut self, k: &str, p: &str, l: &str) -> Result<(), String> {
+                self.0.page(k, p, l)
+            }
+            fn reject(&mut self, n: u64, c: &str, ch: &str) -> Result<(), String> {
+                self.0.reject(n, c, ch)
+            }
+            fn tracker_dir(&self) -> Option<PathBuf> {
+                Some(self.1.clone())
+            }
+        }
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cwdf = dir.path().join("cwd");
+        let (script, logf) = br_script(dir.path(), &format!("pwd -P > {}", cwdf.display()));
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = InDir(Fake::default(), proj.clone());
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        assert!(back.is_empty(), "{back:?}");
+        assert!(logf.exists(), "br ran");
+        assert_eq!(
+            std::fs::read_to_string(&cwdf).unwrap().trim(),
+            proj.canonicalize().unwrap().to_string_lossy(),
+            "br hold runs in the tracker dir"
+        );
+    }
+
+    /// rv23 #5: the live ports' tracker dir is the project dir `br ready`
+    /// and `br init` already use.
+    #[test]
+    fn live_ports_hold_br_in_the_project_dir() {
+        let src = include_str!("supervisor_host.rs");
+        let at = src.find("impl Ports for LivePorts {").expect("LivePorts");
+        assert!(
+            src[at..at + 200].contains("Some(crate::project_dir(&self.cfg, &self.project))"),
+            "{}",
+            &src[at..at + 200]
         );
     }
 
