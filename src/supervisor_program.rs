@@ -589,6 +589,12 @@ pub struct SupModel {
     pub paged: BTreeSet<String>,
     /// Dead-stop already paged.
     pub stalled: bool,
+    /// Dead doorbell workspaces already paged; a live pid clears.
+    #[serde(default)]
+    pub dead_doorbells: BTreeSet<String>,
+    /// Pins already paged for a stale heartbeat; a fresh beat clears.
+    #[serde(default)]
+    pub stale_pins: BTreeSet<String>,
     /// Commands that failed.
     pub failed_cmds: u64,
     /// Deaf facts already acted on.
@@ -665,6 +671,8 @@ impl SupModel {
             herdr_escalated: false,
             paged: BTreeSet::new(),
             stalled: false,
+            dead_doorbells: BTreeSet::new(),
+            stale_pins: BTreeSet::new(),
             failed_cmds: 0,
             deaf_seen: RecentKeys::default(),
             now_ms: 0,
@@ -866,6 +874,30 @@ pub enum SupMsg {
     Stalled {
         /// The page text.
         line: String,
+    },
+    /// A doorbell dispatcher's pid file names no live process.
+    DeadDoorbell {
+        /// Doorbell workspace label.
+        label: String,
+        /// The page text.
+        line: String,
+    },
+    /// The dispatcher's pid is live again (or the workspace is gone).
+    DoorbellRecovered {
+        /// Doorbell workspace label.
+        label: String,
+    },
+    /// A herdr-bound pin passed the presence TTL.
+    StaleHeartbeat {
+        /// Agent pin.
+        pin: String,
+        /// The page text.
+        line: String,
+    },
+    /// The pin's heartbeat is fresh again (or the pin is gone).
+    HeartbeatRecovered {
+        /// Agent pin.
+        pin: String,
     },
     /// A commit landed: wedge and dead-stop probes re-arm.
     WorkMoved,
@@ -1942,6 +1974,34 @@ impl Program for SupervisorProgram {
                         line: line.clone(),
                     });
                 }
+            }
+            SupMsg::DeadDoorbell { label, line } => {
+                if next.dead_doorbells.insert(label.clone()) {
+                    next.pages += 1;
+                    cmds.push(SupCmd::Page {
+                        n: next.pages,
+                        kind: "dead_doorbell".into(),
+                        pin: label.clone(),
+                        line: line.clone(),
+                    });
+                }
+            }
+            SupMsg::DoorbellRecovered { label } => {
+                next.dead_doorbells.remove(label);
+            }
+            SupMsg::StaleHeartbeat { pin, line } => {
+                if next.stale_pins.insert(pin.clone()) {
+                    next.pages += 1;
+                    cmds.push(SupCmd::Page {
+                        n: next.pages,
+                        kind: "stale_heartbeat".into(),
+                        pin: pin.clone(),
+                        line: line.clone(),
+                    });
+                }
+            }
+            SupMsg::HeartbeatRecovered { pin } => {
+                next.stale_pins.remove(pin);
             }
             SupMsg::WorkMoved => {
                 next.paged.clear();
