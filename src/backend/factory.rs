@@ -64,11 +64,10 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
                     .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
             Ok(Box::new(backend))
         }
-        // superlogical: stub backend (bd-toron-superlogical-stubs). With
-        // the feature on, construct the stub (name() enumerable, method
-        // defaults give the clear "not yet released / on hold" error). With
-        // the feature off, the arm is compiled out and the name falls through
-        // to `other` -> "not compiled in".
+        // superlogical: rex CLI (feature `backend-superlogical`). With the
+        // feature off, the arm is compiled out and the name falls through
+        // to `other` -> "not compiled in". subscribe, agent_wait, and
+        // agent_send_keys stay Unsupported and name the method.
         #[cfg(feature = "backend-superlogical")]
         "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
         other => Err(backend_not_compiled_or_unknown(
@@ -291,16 +290,18 @@ mod tests {
         assert!(s.contains("FLYWHEEL_BACKEND"), "points at the env var: {s}");
     }
 
-    /// Stub contract (runs only in `--all-features` builds where the stub
-    /// feature is on): the stub is name()-enumerable and every operation
-    /// returns an honest Unsupported naming it (no Ok, no panic).
+    /// Unsupported-honesty contract (runs only in `--all-features` builds):
+    /// the superlogical backend is name()-enumerable and the operations it
+    /// does not implement stay honest Unsupported naming the method. Probed
+    /// through `subscribe`, not `workspace_list`: the latter now shells out to
+    /// `rex` and would reach the operator's live server.
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn superlogical_stub_is_honest_unsupported() {
         let b = crate::backend::superlogical::SuperlogicalBackend;
         assert_eq!(b.name(), "superlogical");
         let m: Box<dyn MultiplexerBackend> = Box::new(b);
-        match m.workspace_list() {
+        match m.subscribe(&[]) {
             Err(toron_core::backend::BackendError {
                 code: toron_core::backend::BackendErrorCode::Unsupported,
                 message,
@@ -308,6 +309,11 @@ mod tests {
                 assert!(
                     message.contains("superlogical"),
                     "names the backend: {message}"
+                );
+                assert!(message.contains("subscribe"), "names the method: {message}");
+                assert!(
+                    !message.contains("not yet released"),
+                    "unimplemented is not a release excuse: {message}"
                 );
             }
             Ok(_) => panic!("stub must not Ok"),
