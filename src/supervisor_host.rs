@@ -90,6 +90,12 @@ pub trait Ports {
     fn page(&mut self, kind: &str, pin: &str, line: &str) -> Result<(), String>;
     /// Record a rejected input.
     fn reject(&mut self, n: u64, cause: &str, child: &str) -> Result<(), String>;
+    /// The directory a captain hold runs `br` in: the project's, where its
+    /// `.beads` is (the same dir `br ready` and `br init` use). `None`
+    /// inherits the host's cwd.
+    fn tracker_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// What `append_steer` needs.
@@ -784,10 +790,13 @@ pub fn execute(
             n,
             reason,
             evidence,
-        } => ports
-            .escalate(*n, reason, evidence)
-            .and_then(|_| captain_hold(evidence, reason))
-            .map(|_| vec![]),
+        } => {
+            let dir = ports.tracker_dir();
+            ports
+                .escalate(*n, reason, evidence)
+                .and_then(|_| captain_hold(evidence, reason, dir.as_deref(), rep))
+                .map(|_| vec![])
+        }
         SupCmd::Assign {
             task,
             child,
@@ -1141,6 +1150,10 @@ impl LivePorts {
 }
 
 impl Ports for LivePorts {
+    fn tracker_dir(&self) -> Option<PathBuf> {
+        Some(crate::project_dir(&self.cfg, &self.project))
+    }
+
     fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg> {
         let mut out = Vec::new();
         // Lead facts and a dead lease, before the herdr edge, so a lead
@@ -1477,23 +1490,108 @@ impl HostCfg {
 ///
 /// A missing `br` is loud and does not fail the page. `FLYWHEEL_BR_BIN`
 /// that exits non-zero fails the command. No bead id means no process.
-fn captain_hold(evidence: &str, reason: &str) -> Result<(), String> {
+///
+/// rv23 #5 (review S3): the ids come from untrusted escalation text, so the
+/// hold is gated like every other exec. `FLYWHEEL_ALLOW_EXEC=0` pages but
+/// does not run `br` (a suppressed line names it). The run is bounded by
+/// `br_hold_timeout()`: a hung `br` is killed at the deadline and fails the
+/// command instead of parking the supervisor loop.
+fn captain_hold(
+    evidence: &str,
+    reason: &str,
+    cwd: Option<&Path>,
+    rep: &mut RoundReport,
+) -> Result<(), String> {
     let Some(argv) = crate::supervisor_program::bead_hold_argv(evidence, reason) else {
         return Ok(());
     };
+    if !exec_allowed() {
+        let line = format!(
+            "suppressed br hold {}: FLYWHEEL_ALLOW_EXEC=0",
+            argv[5..].join(" ")
+        );
+        eprintln!("flywheel supervisor: {line}");
+        rep.suppressed.push(line);
+        return Ok(());
+    }
     let pinned = std::env::var("FLYWHEEL_BR_BIN").ok();
     let program = pinned.as_deref().unwrap_or("br");
-    match std::process::Command::new(program).args(&argv).status() {
+    match run_bounded(program, &argv, cwd, br_hold_timeout()) {
+        Err(Bounded::TimedOut(after)) if pinned.is_some() => Err(format!(
+            "br hold timed out after {}ms (killed)",
+            after.as_millis()
+        )),
+        Err(Bounded::TimedOut(after)) => {
+            eprintln!(
+                "flywheel supervisor: br hold timed out after {}ms (killed); the escalate page stands",
+                after.as_millis()
+            );
+            Ok(())
+        }
+        Err(Bounded::Spawn(e)) if pinned.is_some() => Err(format!("br hold: {e}")),
+        Err(Bounded::Spawn(e)) => {
+            eprintln!("flywheel supervisor: br hold not run ({e}); the escalate page stands");
+            Ok(())
+        }
         Ok(st) if st.success() => Ok(()),
         Ok(st) if pinned.is_some() => Err(format!("br hold exited {st}")),
         Ok(st) => {
             eprintln!("flywheel supervisor: br hold failed ({st}); the escalate page stands");
             Ok(())
         }
-        Err(e) if pinned.is_some() => Err(format!("br hold: {e}")),
-        Err(e) => {
-            eprintln!("flywheel supervisor: br hold not run ({e}); the escalate page stands");
-            Ok(())
+    }
+}
+
+use std::time::Duration;
+
+/// Default deadline for one `br hold`. `FLYWHEEL_BR_HOLD_TIMEOUT_MS`
+/// overrides it (tests, slow trackers).
+const BR_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn br_hold_timeout() -> Duration {
+    std::env::var("FLYWHEEL_BR_HOLD_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(BR_HOLD_TIMEOUT, Duration::from_millis)
+}
+
+enum Bounded {
+    Spawn(std::io::Error),
+    TimedOut(Duration),
+}
+
+/// Run `program argv` with stdin closed and wait at most `timeout`. Past
+/// the deadline the child is killed and reaped, so nothing is left behind.
+fn run_bounded(
+    program: &str,
+    argv: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, Bounded> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(argv).stdin(std::process::Stdio::null());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd.spawn().map_err(Bounded::Spawn)?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Ok(st),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Bounded::TimedOut(started.elapsed()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Bounded::Spawn(e));
+            }
         }
     }
 }
@@ -2914,6 +3012,161 @@ mod tests {
             "{back:?}"
         );
         unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+    }
+
+    /// rv23 #5: a `br` that writes its argv to `logf`, then runs `tail`.
+    fn br_script(dir: &Path, tail: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("br");
+        let logf = dir.join("argv");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n{tail}\n",
+                logf.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, logf)
+    }
+
+    fn escalate_bd(n: u64) -> SupCmd {
+        SupCmd::Escalate {
+            n,
+            reason: "budget".into(),
+            evidence: "see bd-hold1".into(),
+        }
+    }
+
+    /// rv23 #5 (review S3): log-only mode must not exec `br` either. The page
+    /// still goes out; the hold is a suppressed line, like Relaunch and Exit.
+    #[test]
+    fn allow_exec_zero_pages_but_does_not_run_br_hold() {
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let (script, logf) = br_script(dir.path(), "exit 0");
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        let _off = ForceOff::new();
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = Fake::default();
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        assert!(back.is_empty(), "{back:?}");
+        assert_eq!(
+            ports.0.lock().unwrap().escalated,
+            vec![(1, "budget".to_string())],
+            "the page is not an exec: it still goes out"
+        );
+        assert!(!logf.exists(), "FLYWHEEL_ALLOW_EXEC=0 must not spawn br");
+        assert!(
+            rep.suppressed
+                .iter()
+                .any(|l| l.contains("br hold") && l.contains("FLYWHEEL_ALLOW_EXEC=0")),
+            "the skipped hold is named: {:?}",
+            rep.suppressed
+        );
+    }
+
+    /// rv23 #5 (review S3): the hold runs `br` in the ports' tracker dir
+    /// (the project's, where its `.beads` is), not the host's cwd.
+    #[test]
+    fn br_hold_runs_in_the_tracker_dir() {
+        struct InDir(Fake, PathBuf);
+        impl Ports for InDir {
+            fn observe(&mut self, m: &SupModel, now: u64) -> Vec<SupMsg> {
+                self.0.observe(m, now)
+            }
+            fn relaunch(&mut self, c: &str, g: u64, k: ChildKind) -> Result<(), String> {
+                self.0.relaunch(c, g, k)
+            }
+            fn exit(&mut self, c: &str, g: u64) -> Result<(), String> {
+                self.0.exit(c, g)
+            }
+            fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {
+                self.0.append_steer(s)
+            }
+            fn assign(&mut self, a: &AssignSend) -> Result<u64, String> {
+                self.0.assign(a)
+            }
+            fn escalate(&mut self, n: u64, r: &str, e: &str) -> Result<(), String> {
+                self.0.escalate(n, r, e)
+            }
+            fn park(&mut self, c: &str, i: u32) -> Result<(), String> {
+                self.0.park(c, i)
+            }
+            fn page(&mut self, k: &str, p: &str, l: &str) -> Result<(), String> {
+                self.0.page(k, p, l)
+            }
+            fn reject(&mut self, n: u64, c: &str, ch: &str) -> Result<(), String> {
+                self.0.reject(n, c, ch)
+            }
+            fn tracker_dir(&self) -> Option<PathBuf> {
+                Some(self.1.clone())
+            }
+        }
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cwdf = dir.path().join("cwd");
+        let (script, logf) = br_script(dir.path(), &format!("pwd -P > {}", cwdf.display()));
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = InDir(Fake::default(), proj.clone());
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        assert!(back.is_empty(), "{back:?}");
+        assert!(logf.exists(), "br ran");
+        assert_eq!(
+            std::fs::read_to_string(&cwdf).unwrap().trim(),
+            proj.canonicalize().unwrap().to_string_lossy(),
+            "br hold runs in the tracker dir"
+        );
+    }
+
+    /// rv23 #5: the live ports' tracker dir is the project dir `br ready`
+    /// and `br init` already use.
+    #[test]
+    fn live_ports_hold_br_in_the_project_dir() {
+        let src = include_str!("supervisor_host.rs");
+        let at = src.find("impl Ports for LivePorts {").expect("LivePorts");
+        assert!(
+            src[at..at + 200].contains("Some(crate::project_dir(&self.cfg, &self.project))"),
+            "{}",
+            &src[at..at + 200]
+        );
+    }
+
+    /// rv23 #5 (review S3): a hung `br` must not park the supervisor loop.
+    /// The hold is bounded; past the deadline the child is killed and the
+    /// command fails loud (pinned binary), instead of waiting it out.
+    #[test]
+    fn a_hung_br_hold_is_killed_at_its_deadline() {
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let (script, logf) = br_script(dir.path(), "exec sleep 20");
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        unsafe { std::env::set_var("FLYWHEEL_BR_HOLD_TIMEOUT_MS", "300") };
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = Fake::default();
+        let started = std::time::Instant::now();
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        let took = started.elapsed();
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        unsafe { std::env::remove_var("FLYWHEEL_BR_HOLD_TIMEOUT_MS") };
+        assert!(logf.exists(), "br did run");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "the hold waits for its deadline, not for br: {took:?}"
+        );
+        assert!(
+            matches!(back.first(), Some(SupMsg::CmdFailed { why, .. }) if why.contains("timed out")),
+            "{back:?}"
+        );
     }
 
     /// What a hinted loop publishes after each round.
