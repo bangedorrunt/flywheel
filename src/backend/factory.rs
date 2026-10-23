@@ -290,35 +290,36 @@ mod tests {
         assert!(s.contains("FLYWHEEL_BACKEND"), "points at the env var: {s}");
     }
 
-    /// Unsupported-honesty contract (runs only in `--all-features` builds):
-    /// the superlogical backend is name()-enumerable and the operations it
-    /// does not implement stay honest Unsupported naming the method. Probed
-    /// through `subscribe`, not `workspace_list`: the latter now shells out to
-    /// `rex` and would reach the operator's live server.
+    /// A missing rex binary is an install error, not "not yet released",
+    /// and it must not fall through to the operator's live server.
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn superlogical_stub_is_honest_unsupported() {
+        let dir = tempfile::tempdir().expect("empty rex dir");
+        let prev = std::env::var_os("REX_BIN_DIR");
+        unsafe { std::env::set_var("REX_BIN_DIR", dir.path()) };
         let b = crate::backend::superlogical::SuperlogicalBackend;
         assert_eq!(b.name(), "superlogical");
         let m: Box<dyn MultiplexerBackend> = Box::new(b);
-        match m.subscribe(&[]) {
-            Err(toron_core::backend::BackendError {
-                code: toron_core::backend::BackendErrorCode::Unsupported,
-                message,
-            }) => {
-                assert!(
-                    message.contains("superlogical"),
-                    "names the backend: {message}"
-                );
-                assert!(message.contains("subscribe"), "names the method: {message}");
-                assert!(
-                    !message.contains("not yet released"),
-                    "unimplemented is not a release excuse: {message}"
-                );
+        let err = match m.subscribe(&[]) {
+            Err(err) => err,
+            Ok(_) => panic!("missing rex must not open a stream"),
+        };
+        unsafe {
+            match &prev {
+                Some(value) => std::env::set_var("REX_BIN_DIR", value),
+                None => std::env::remove_var("REX_BIN_DIR"),
             }
-            Ok(_) => panic!("stub must not Ok"),
-            Err(e) => panic!("expected Unsupported, got {e:?}"),
         }
+        let message = err.to_string();
+        assert!(
+            message.contains("rex CLI not installed"),
+            "names the fix: {message}"
+        );
+        assert!(
+            !message.contains("not yet released"),
+            "a missing binary is not a release excuse: {message}"
+        );
     }
 
     #[cfg(feature = "mail-toron")]

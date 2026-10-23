@@ -8,12 +8,13 @@
 //! status), [`RexFail::Interrupted`] (we killed the child at the bound),
 //! and a spawn or JSON failure. A hang is not a rex failure.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
 use serde_json::Value;
-use toron_core::backend::{BackendError, BackendErrorCode};
+use toron_core::backend::{BackendError, BackendErrorCode, BackendEvent};
 
 use crate::proc::{ProcError, run_bounded};
 
@@ -151,6 +152,139 @@ impl Rex {
         let out = self.run(args)?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+
+    /// A long-lived `rex events` child. Drop kills it. The 12s call bound
+    /// does not apply: the stream ends when the caller drops it.
+    pub fn spawn(&self, args: &[String]) -> Result<std::process::Child, RexFail> {
+        let mut cmd = std::process::Command::new(&self.bin);
+        cmd.arg("--color")
+            .arg("never")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .args(args);
+        cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                RexFail::NotInstalled {
+                    detail: self.bin.display().to_string(),
+                }
+            } else {
+                RexFail::Spawn {
+                    message: format!("rex spawn: {e}"),
+                }
+            }
+        })
+    }
+}
+
+/// Newline-delimited `rex events --json`. Dropping the stream kills rex.
+pub struct RexEventStream {
+    child: Option<std::process::Child>,
+    rx: std::sync::mpsc::Receiver<std::io::Result<String>>,
+    timeout: Option<Duration>,
+    panes: Vec<String>,
+}
+
+impl RexEventStream {
+    pub fn start(mut child: std::process::Child, panes: Vec<String>) -> Result<Self, RexFail> {
+        let stdout = child.stdout.take().ok_or_else(|| RexFail::Spawn {
+            message: "rex events has no stdout".into(),
+        })?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            child: Some(child),
+            rx,
+            timeout: None,
+            panes,
+        })
+    }
+
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
+    }
+
+    pub fn next_line(&self) -> Result<Option<String>, RexFail> {
+        let received = match self.timeout {
+            Some(timeout) => self.rx.recv_timeout(timeout),
+            None => self
+                .rx
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match received {
+            Ok(Ok(line)) => Ok(Some(line)),
+            Ok(Err(e)) => Err(RexFail::Spawn {
+                message: format!("rex events read: {e}"),
+            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(RexFail::Interrupted {
+                    waited: self.timeout.unwrap_or(Duration::ZERO),
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+        }
+    }
+}
+
+impl Drop for RexEventStream {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl toron_core::backend::EventStream for RexEventStream {
+    fn read_event(&mut self) -> Result<Option<BackendEvent>, BackendError> {
+        loop {
+            let line = match self.next_line() {
+                Ok(Some(line)) => line,
+                Ok(None) => return Ok(None),
+                Err(err) => return Err(err.into_backend()),
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = rex_map::event_from_line(&line);
+            if self.panes.is_empty() || pane_wanted(&event, &self.panes) {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), BackendError> {
+        self.set_timeout(timeout);
+        Ok(())
+    }
+}
+
+fn pane_wanted(event: &BackendEvent, panes: &[String]) -> bool {
+    let pane = match event {
+        BackendEvent::AgentStatusChanged { pane, .. }
+        | BackendEvent::AgentDetected { pane, .. }
+        | BackendEvent::PaneExited { pane } => pane.as_str(),
+        BackendEvent::EventsLost | BackendEvent::Raw(_) => return true,
+    };
+    panes.iter().any(|want| want == pane)
 }
 
 pub fn ls_args() -> Vec<String> {
@@ -239,6 +373,44 @@ pub fn split_args(session: &str, block: &str, direction: &str, cwd: Option<&str>
     if let Some(cwd) = cwd {
         args.push("-c".into());
         args.push(cwd.to_string());
+    }
+    args
+}
+
+pub fn session_kill_args(session: &str) -> Vec<String> {
+    vec!["session".into(), "kill".into(), session.into()]
+}
+
+pub fn rename_args(session: &str, block: &str, label: &str) -> Vec<String> {
+    vec![
+        "block".into(),
+        "rename".into(),
+        "-s".into(),
+        session.into(),
+        "-b".into(),
+        block.into(),
+        label.into(),
+    ]
+}
+
+pub fn send_key_args(session: &str, block: &str, keys: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "block".into(),
+        "send-key".into(),
+        "-s".into(),
+        session.into(),
+        "-b".into(),
+        block.into(),
+    ];
+    args.extend(keys.iter().map(|key| (*key).to_string()));
+    args
+}
+
+pub fn events_args(session: Option<&str>) -> Vec<String> {
+    let mut args = vec!["events".into(), "--json".into()];
+    if let Some(session) = session {
+        args.push("-s".into());
+        args.push(session.into());
     }
     args
 }
@@ -443,7 +615,7 @@ fn bound_label(waited: Duration) -> String {
 /// `src/backend/mod.rs` are exclusively leased by PurpleGorge for bd-i328.
 pub mod rex_map {
     use serde_json::Value;
-    use toron_core::backend::AgentStatus;
+    use toron_core::backend::{AgentStatus, BackendEvent, PaneId};
     use toron_core::osc7501::{ProgramState, parse_report};
 
     /// Map one `program_status` payload to the trait status.
@@ -573,6 +745,48 @@ pub mod rex_map {
             "clear" => ProgramState::Clear,
             _ => return None,
         })
+    }
+
+    /// One `rex events --json` line. Unknown shapes stay `Raw`.
+    pub fn event_from_line(line: &str) -> BackendEvent {
+        let line = line.trim();
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return BackendEvent::Raw(line.to_string());
+        };
+        let inner = value.pointer("/payload/event").unwrap_or(&value);
+        let kind = inner.get("type").and_then(Value::as_str).unwrap_or("");
+        let payload = inner.get("payload").cloned().unwrap_or(Value::Null);
+        let pane = payload
+            .get("block_id")
+            .or_else(|| payload.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if kind.ends_with("program_status_changed") {
+            let record = payload.get("record").cloned().unwrap_or(Value::Null);
+            let status = status_from_program_status(&json_records(&record));
+            return BackendEvent::AgentStatusChanged {
+                pane: PaneId::new(pane),
+                agent: payload
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                status,
+            };
+        }
+        if kind.ends_with("block_closed") {
+            return BackendEvent::PaneExited {
+                pane: PaneId::new(pane),
+            };
+        }
+        BackendEvent::Raw(line.to_string())
+    }
+
+    fn json_records(record: &Value) -> Value {
+        if record.get("records").is_some() {
+            return record.clone();
+        }
+        serde_json::json!({ "records": [record] })
     }
 
     fn map_state(state: ProgramState) -> AgentStatus {
