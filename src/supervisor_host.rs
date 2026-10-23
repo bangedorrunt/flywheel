@@ -1057,6 +1057,9 @@ pub struct LivePorts {
     relaunch_bin: PathBuf,
     /// Set on a nested lead host so its facts file is not the root's.
     context: Option<String>,
+    /// rv23 #6: the `sup_epoch` this host holds the lead at. `None` holds
+    /// every steer (see [`steer_gate`]).
+    lead: Option<u64>,
 }
 
 impl LivePorts {
@@ -1075,10 +1078,17 @@ impl LivePorts {
             deaf_off: 0,
             relaunch_bin,
             context: None,
+            lead: None,
         }
     }
 
     /// This host is the lead for `context` (its own facts file and lease).
+    /// The lead this host claimed at startup (rv23 #6).
+    pub(crate) fn with_lead(mut self, lead: Option<u64>) -> Self {
+        self.lead = lead;
+        self
+    }
+
     pub fn in_context(mut self, context: &str) -> Self {
         if context_token(context) {
             self.context = Some(context.to_string());
@@ -1291,6 +1301,8 @@ impl Ports for LivePorts {
     }
 
     fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {
+        // rv23 #6: never steer without a lead claimed at this epoch.
+        steer_gate(self.lead, s.sup_epoch)?;
         // The delta comes from the side store by sha and is refused unless its
         // bytes hash to that sha. It rides the steer@1 body, never a pane.
         // The supervisor log keeps the sha (the fold's message), not these bytes.
@@ -1513,30 +1525,99 @@ fn now_ms() -> u64 {
 /// Startup claim. The store is the authority when `inbox_lead` can be read,
 /// unless `FLYWHEEL_SUPERVISOR_EPOCH=fold`. The fold's counter runs only on
 /// the other side of that gate.
-fn claim_for_host(core: &mut Core, project: &str, me: &str) -> Result<u64> {
+fn claim_for_host(core: &mut Core, project: &str, me: &str) -> Result<HostClaim> {
     let forced = std::env::var("FLYWHEEL_SUPERVISOR_EPOCH").ok();
     let opened = crate::comms_send::store()
         .ok()
         .map(|store| store.with_operator(crate::inbox_ports::system_producer(project)));
+    claim_with(core, project, me, forced.as_deref(), opened)
+}
+
+/// What the startup claim settled: the fold's epoch, and the `sup_epoch` a
+/// `lead@1` row on record names for this host's steering key, if one does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostClaim {
+    pub epoch: u64,
+    /// `Some(e)`: toron's lead row names [`crate::lead_claim::lead_holder`]
+    /// at `e`. `None`: no lead was claimed, so this host must not steer.
+    pub lead: Option<u64>,
+}
+
+/// [`claim_for_host`] with the store and the switch passed in.
+///
+/// rv23 #6 (toron F7): the lead holder is the key the host steers with
+/// ([`crate::lead_claim::lead_holder`]), never `me`; `me` (it carries the
+/// pid) stays the fold's claimant. Fold mode claims the lead too: the fold
+/// picks the epoch and the store records `lead@1` at it, so no mode steers
+/// without a lead.
+pub(crate) fn claim_with(
+    core: &mut Core,
+    project: &str,
+    me: &str,
+    forced: Option<&str>,
+    opened: Option<toron_core::inbox::InboxStore>,
+) -> Result<HostClaim> {
     let readable = match &opened {
         Some(store) => crate::mail_shim::block_on(store.lead_of(project)).is_ok(),
         None => false,
     };
-    if forced.as_deref() == Some("toron") && (opened.is_none() || !readable) {
+    if forced == Some("toron") && (opened.is_none() || !readable) {
         bail!("FLYWHEEL_SUPERVISOR_EPOCH=toron but inbox_lead cannot be read");
     }
-    match crate::lead_claim::epoch_authority(forced.as_deref(), readable) {
-        crate::lead_claim::EpochAuthority::Fold => core.claim(me),
+    let holder = crate::lead_claim::lead_holder(project);
+    match crate::lead_claim::epoch_authority(forced, readable) {
+        crate::lead_claim::EpochAuthority::Fold => {
+            let epoch = core.claim(me)?;
+            let lead = match opened.as_ref().filter(|_| readable) {
+                Some(store) => match crate::mail_shim::block_on(
+                    crate::lead_claim::append_lead_at(store, project, &holder, epoch),
+                ) {
+                    Ok(()) => Some(epoch),
+                    Err(e) => {
+                        eprintln!(
+                            "flywheel supervisor: fold epoch {epoch} has no lead@1 ({e}); steers are held"
+                        );
+                        None
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "flywheel supervisor: no readable lead table; steers are held (no lead claim)"
+                    );
+                    None
+                }
+            };
+            Ok(HostClaim { epoch, lead })
+        }
         crate::lead_claim::EpochAuthority::Toron => {
             let store = opened.context("comms store required for a lead claim")?;
             let step = crate::mail_shim::block_on(crate::lead_claim::sync_lead(
                 &store,
                 project,
-                me,
+                &holder,
                 core.model.accepted_epoch,
             ));
-            apply_lead(core, me, step)
+            let epoch = apply_lead(core, me, step)?;
+            Ok(HostClaim {
+                epoch,
+                lead: Some(epoch),
+            })
         }
+    }
+}
+
+/// rv23 #6: a steer goes out only under a lead this host claimed at the
+/// steer's own `sup_epoch`. toron would refuse it anyway (NoLead,
+/// NotLeadHolder, StaleSupEpoch); refusing here names why before a send.
+pub(crate) fn steer_gate(lead: Option<u64>, sup_epoch: u64) -> Result<(), String> {
+    match lead {
+        Some(e) if e == sup_epoch => Ok(()),
+        Some(e) => Err(format!(
+            "steer at sup_epoch {sup_epoch} but this host holds the lead at {e}; not sent"
+        )),
+        None => Err(format!(
+            "no lead claim: this host holds no lead@1, so the steer at sup_epoch {sup_epoch} is not sent"
+        )),
     }
 }
 
@@ -1639,12 +1720,13 @@ fn host_loop(
     context: Option<&str>,
 ) -> Result<()> {
     let mut core = Core::open(paths.clone(), me, Tier::Lead, hc.policy())?;
-    let epoch = claim_for_host(&mut core, project, me)?;
+    let claim = claim_for_host(&mut core, project, me)?;
+    let epoch = claim.epoch;
     let mut journal = ToronEffectJournal::open(
         &format!("supervise:{}", crate::state::state_key(project)),
         me,
     )?;
-    let mut ports = LivePorts::new(cfg, project, project);
+    let mut ports = LivePorts::new(cfg, project, project).with_lead(claim.lead);
     if let Some(c) = context {
         ports = ports.in_context(c);
     }
@@ -2430,6 +2512,104 @@ mod tests {
         assert_eq!(epoch, 8);
         assert_eq!(c.model.accepted_epoch, 8);
         assert_eq!(store.lead_of("proj").await.unwrap().unwrap().sup_epoch, 8);
+    }
+
+    /// rv23 #6: an operated in-memory comms store for `project`.
+    fn op_store(project: &str) -> toron_core::inbox::InboxStore {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = dir.join("index.sqlite");
+        crate::mail_shim::block_on(async move {
+            let pool = toron_core::index::schema::connect(&db.to_string_lossy())
+                .await
+                .unwrap();
+            toron_core::index::schema::migrate(&pool).await.unwrap();
+            toron_core::inbox::InboxStore::new(pool)
+        })
+        .with_operator(crate::inbox_ports::system_producer(project))
+    }
+
+    fn lead_row(store: &toron_core::inbox::InboxStore, project: &str) -> (String, u64) {
+        let s = store.clone();
+        let p = project.to_string();
+        let row = crate::mail_shim::block_on(async move { s.lead_of(&p).await })
+            .unwrap()
+            .expect("a lead@1 row");
+        (row.holder, row.sup_epoch)
+    }
+
+    /// rv23 #6 (toron F7): the lead holder on record is the key the host
+    /// steers with. toron accepts a steer only when `from` equals the holder,
+    /// and the old holder (`supervise-<project>-<pid>`) fenced every steer.
+    #[test]
+    fn the_lead_holder_is_the_key_the_host_steers_with() {
+        let store = op_store("proj");
+        let d = tempfile::tempdir().unwrap();
+        let me = "supervise-proj-4242";
+        let mut c = Core::open(CtxPaths::new(d.path(), "proj"), me, Tier::Lead, None).unwrap();
+        let claim = claim_with(&mut c, "proj", me, None, Some(store.clone())).unwrap();
+        assert_eq!(claim.lead, Some(claim.epoch), "toron mode holds the lead");
+        let (holder, epoch) = lead_row(&store, "proj");
+        assert_eq!(epoch, claim.epoch);
+        let s = SteerSend {
+            sup_epoch: claim.epoch,
+            ..send(SteerOp::Pause, None)
+        };
+        let producer = crate::inbox_ports::system_producer("proj");
+        let env = steer_envelope("proj", &producer, 0, NPUB, &s, None).unwrap();
+        assert_eq!(holder, env.from, "the holder is the steer's `from`");
+        assert_ne!(holder, me, "the pid-bearing name is not the holder");
+        // And the store keeps the steer (F7: from == holder at the epoch).
+        let st = store.clone();
+        let kept = crate::mail_shim::block_on(async move {
+            let claim = st.claim_epoch(&producer, "test").await.unwrap();
+            let mut env = env;
+            env.msg.epoch = claim.epoch;
+            st.append_envelope(&env).await
+        });
+        assert!(kept.is_ok(), "the holder's steer is accepted: {kept:?}");
+    }
+
+    /// rv23 #6: fold mode claims the lead too. The fold picks the epoch and
+    /// the store records `lead@1` at it, so no mode steers without a lead.
+    #[test]
+    fn fold_mode_claims_the_lead_at_the_fold_epoch() {
+        let store = op_store("proj");
+        let d = tempfile::tempdir().unwrap();
+        let me = "supervise-proj-4243";
+        let mut c = Core::open(CtxPaths::new(d.path(), "proj"), me, Tier::Lead, None).unwrap();
+        let claim = claim_with(&mut c, "proj", me, Some("fold"), Some(store.clone())).unwrap();
+        assert_eq!(claim.lead, Some(claim.epoch));
+        assert_eq!(
+            lead_row(&store, "proj"),
+            (crate::lead_claim::lead_holder("proj"), claim.epoch)
+        );
+    }
+
+    /// rv23 #6: no store, no lead, no steer. The gate names why.
+    #[test]
+    fn no_lead_claim_holds_every_steer() {
+        let d = tempfile::tempdir().unwrap();
+        let me = "supervise-proj-4244";
+        let mut c = Core::open(CtxPaths::new(d.path(), "proj"), me, Tier::Lead, None).unwrap();
+        let claim = claim_with(&mut c, "proj", me, None, None).unwrap();
+        assert_eq!(claim.lead, None);
+        let e = claim.epoch;
+        assert!(steer_gate(claim.lead, e).unwrap_err().contains("no lead claim"));
+        assert!(steer_gate(Some(e), e + 1).is_err(), "another epoch is not ours");
+        assert!(steer_gate(Some(e), e).is_ok());
+    }
+
+    /// rv23 #6: the live port checks the gate before it builds anything.
+    #[test]
+    fn live_append_steer_is_gated_on_the_lead() {
+        let src = include_str!("supervisor_host.rs");
+        let at = src
+            .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {\n        // rv23")
+            .expect("LivePorts::append_steer");
+        let body = &src[at..at + 400];
+        assert!(body.contains("steer_gate(self.lead, s.sup_epoch)?;"), "{body}");
+        let main = src.find("fn host_loop(").expect("host_loop");
+        assert!(src[main..].contains(".with_lead(claim.lead)"));
     }
 
     #[test]
