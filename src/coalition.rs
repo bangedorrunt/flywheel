@@ -1587,6 +1587,13 @@ mod tests {
     #[test]
     fn mailbox_roots_follow_xdg_not_per_pid() {
         let _g = crate::config::lock_env();
+        // bd-3dge: snapshot everything this test touches. The old shape
+        // removed TORON_*/XDG and never restored them, so every later test
+        // in the process — and any toron CLI child they spawn from the repo
+        // root — resolved the ambient/relative store (./toron-data).
+        let prev_data = std::env::var_os("TORON_DATA_DIR");
+        let prev_mcp = std::env::var_os("TORON_MCP_DATA_DIR");
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
         unsafe {
             std::env::remove_var("TORON_DATA_DIR");
             std::env::remove_var("TORON_MCP_DATA_DIR");
@@ -1604,8 +1611,17 @@ mod tests {
             "must not be per-pid: {}",
             db.display()
         );
-        unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
+        match prev_data {
+            Some(v) => unsafe { std::env::set_var("TORON_DATA_DIR", v) },
+            None => unsafe { std::env::remove_var("TORON_DATA_DIR") },
+        }
+        match prev_mcp {
+            Some(v) => unsafe { std::env::set_var("TORON_MCP_DATA_DIR", v) },
+            None => unsafe { std::env::remove_var("TORON_MCP_DATA_DIR") },
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
         }
     }
 

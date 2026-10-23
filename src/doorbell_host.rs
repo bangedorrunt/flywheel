@@ -1353,6 +1353,11 @@ mod parity_tests {
         let _ = std::fs::remove_dir_all(&toron_dir);
         std::fs::create_dir_all(&toron_dir).unwrap();
         // SAFETY: under ENV_LOCK via _home; restored below.
+        // bd-3dge: snapshot everything touched — dropping the MCP pin or
+        // the original data dir leaves later tests (and any toron CLI child
+        // they spawn) resolving the ambient/relative store (./toron-data).
+        let prev_toron_data = std::env::var_os("TORON_DATA_DIR");
+        let prev_toron_mcp = std::env::var_os("TORON_MCP_DATA_DIR");
         unsafe {
             std::env::set_var("TORON_DATA_DIR", &toron_dir);
             std::env::remove_var("TORON_MCP_DATA_DIR");
@@ -1602,7 +1607,14 @@ mod parity_tests {
             assert_eq!(ra, rb, "journal row {i} differs:\n{ra:?}\n{rb:?}");
         }
         unsafe {
-            std::env::remove_var("TORON_DATA_DIR");
+            match prev_toron_data {
+                Some(v) => std::env::set_var("TORON_DATA_DIR", v),
+                None => std::env::remove_var("TORON_DATA_DIR"),
+            }
+            match prev_toron_mcp {
+                Some(v) => std::env::set_var("TORON_MCP_DATA_DIR", v),
+                None => std::env::remove_var("TORON_MCP_DATA_DIR"),
+            }
         }
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);

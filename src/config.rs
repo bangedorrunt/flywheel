@@ -1378,10 +1378,14 @@ daily = [
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
         let tmp = std::env::temp_dir().join(format!("flywheel-cfg-xdg-{}", std::process::id()));
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
         assert_eq!(config_dir(), tmp.join("flywheel"));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
     }
 
     /// No XDG_CONFIG_HOME → `~/.config/flywheel` (NOT macOS Application
@@ -1391,6 +1395,11 @@ daily = [
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // bd-3dge: snapshot everything this test touches — an unrestored
+        // HOME/XDG leaves later tests (and any toron CLI child they spawn)
+        // resolving the ambient/relative store instead of the pinned root.
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         let home = std::env::temp_dir().join(format!("flywheel-cfg-home-{}", std::process::id()));
         unsafe { std::env::set_var("HOME", &home) };
@@ -1399,7 +1408,14 @@ daily = [
             home.join(".config/flywheel"),
             "XDG default is ~/.config/flywheel, not dirs::config_dir()"
         );
-        unsafe { std::env::remove_var("HOME") };
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 
     /// is1.6: the herdr socket fallback converges with `config_dir()`
