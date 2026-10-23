@@ -298,11 +298,11 @@ pub fn mailbox_roots() -> (PathBuf, PathBuf) {
         toron_data_dir,
         xdg_data_home: env_non_empty_os("XDG_DATA_HOME"),
         home: env_non_empty_os("HOME"),
-        // bd-fize: the toron side grew this field so a cargo TEST binary
-        // resolves a temp root instead of the operator's live store. The
-        // flywheel's caller must say the same thing, or a test writes into
-        // the operator's index.
-        test_process: toron_core::config::is_test_process(),
+        // bd-fize: a cargo TEST binary, or a binary inside a cargo target dir
+        // (what a test spawns), resolves its sandbox instead of the
+        // operator's live store. The flywheel's caller takes toron's own
+        // ambient answer, or a test writes into the operator's index.
+        sandbox: toron_core::config::DataRootEnv::from_ambient().sandbox,
     };
     let root = toron_core::config::resolve_data_root(&env);
     (mailbox_data_dir(&root), db_at(&root))
@@ -2908,13 +2908,17 @@ mod tests {
     /// outside a test binary.
     #[test]
     fn data_root_production_contract_is_pure() {
-        use toron_core::config::{DataRootEnv, resolve_data_root};
+        use toron_core::config::{DataRootEnv, Sandbox, SandboxKind, resolve_data_root};
         // An explicit pin wins even in a test process.
         let env = DataRootEnv {
             toron_data_dir: Some(PathBuf::from("/env/root")),
             xdg_data_home: None,
             home: Some(PathBuf::from("/home/alice")),
-            test_process: true,
+            sandbox: Some(Sandbox {
+                kind: SandboxKind::TestBinary,
+                temp_dir: PathBuf::from("/tmp"),
+                root: PathBuf::from("/tmp/toron-test-root-1"),
+            }),
         };
         assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
         // Production HOME fallback, unchanged.
@@ -2922,7 +2926,7 @@ mod tests {
             toron_data_dir: None,
             xdg_data_home: None,
             home: Some(PathBuf::from("/home/alice")),
-            test_process: false,
+            sandbox: None,
         };
         assert_eq!(
             resolve_data_root(&env),
