@@ -756,7 +756,7 @@ fn owner_of_workspace(
 /// owner lease and inbox lease ([`crate::doorbell::inbox_owner_key`]) all
 /// carry the herdr workspace LABEL (prod: `owner-inbox-flywheel-flywheel.json`).
 fn host_key(ws: &crate::herdr_shim::WorkspaceInfo) -> &str {
-    &ws.workspace_id
+    &ws.label
 }
 
 fn doorbell_owner_in(
