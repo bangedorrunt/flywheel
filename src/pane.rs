@@ -1802,7 +1802,13 @@ fn map_dispatch_cause(cause: Cause<RemoteError<String>>) -> DispatchErr {
             DispatchErr::Fatal("the dispatch attempt exceeded its timeout".to_string())
         }
         Some(RemoteError::BulkheadFull) => {
-            DispatchErr::Fatal("the dispatch bulkhead is full".to_string())
+            // bd-fa58: name what it means, not just the kind — the shared
+            // stack admitted no permit in time, so this dispatch never ran.
+            // Dispatches are sequential, so reaching this means the shared
+            // stack itself is saturated, not the pane.
+            DispatchErr::Fatal(
+                "the dispatch bulkhead admitted no permit in time — the shared stack is saturated".to_string(),
+            )
         }
         Some(RemoteError::Filtered) => DispatchErr::Fatal("the dispatch was filtered".to_string()),
         None => DispatchErr::Fatal("the dispatch failed with no cause".to_string()),
@@ -1854,6 +1860,10 @@ fn dispatch_seed() -> u64 {
     h.finish() | 1
 }
 
+/// Boundary (bd-fa58): this stack is for the REMOTE dispatch chain only.
+/// Local herdr IPC (settle re-reads, text primes) stays on the small `retry`
+/// driver — unifying the two under one breaker or bulkhead would couple
+/// unrelated failures, so the two spellings coexist on purpose.
 fn dispatch_policy() -> RemotePolicy<Value, String> {
     RemotePolicy {
         // The framework counts RETRIES after the first attempt.
@@ -3274,6 +3284,41 @@ mod tests {
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a spent budget must not attempt at all"
+        );
+    }
+
+    /// bd-fa58: a saturated bulkhead is a loud fatal, never a silent drop.
+    /// The dispatch never ran (zero attempts), and the message says the
+    /// shared stack is saturated — not the pane.
+    #[test]
+    fn dispatch_chain_bulkhead_full_is_a_loud_fatal() {
+        // No field names the Bulkhead type: zero the default's bounds
+        // through field assignment, so the port gains no new name.
+        let mut policy = RemotePolicy::<Value, String>::default();
+        policy.bulkhead.permits = 0;
+        policy.bulkhead.queue = 0;
+        let remote = Remote::new(policy);
+        let clock: std::sync::Arc<dyn ClockImpl> = std::sync::Arc::new(TestClock::new());
+        let rt = Runtime::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let out = dispatch_chain(&remote, &rt, &clock, {
+            let attempts = attempts.clone();
+            move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Effect::succeed(json!({"ok": true}))
+            }
+        });
+        let Err(DispatchErr::Fatal(msg)) = out else {
+            panic!("a saturated bulkhead must be a loud fatal");
+        };
+        assert!(
+            msg.contains("saturated"),
+            "the fatal must name the saturated stack: {msg}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a rejected dispatch never attempts"
         );
     }
 
