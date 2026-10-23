@@ -429,16 +429,27 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
         }
     }
 }
-/// bd-nwnb: the dead-row gauge core — rows whose pane is gone, as
-/// (pane_id, name) pairs. Pure; [`dead_registry_rows`] supplies the live
-/// set and reads the file.
+/// bd-nwnb: the dead-row gauge core — rows herdr may clear, as
+/// (pane_id, name) pairs. bd-p09m: a row is dead only when
+/// [`crate::pane_keep::pane_binding_may_clear`] is true, so a mail-only row
+/// the reap keeps never shows as dead. Pure; [`dead_registry_rows`] supplies
+/// the live set and reads the file.
 pub fn find_dead_rows(
     entries: &[SpawnEntry],
     live_pane_ids: &std::collections::HashSet<String>,
+    backend: &str,
 ) -> Vec<(String, String)> {
     entries
         .iter()
-        .filter(|e| !live_pane_ids.contains(&e.pane_id))
+        .filter(|e| {
+            !live_pane_ids.contains(&e.pane_id)
+                && crate::pane_keep::pane_binding_may_clear(
+                    e.harness.as_deref().unwrap_or(""),
+                    backend,
+                    &e.pane_id,
+                    Some(live_pane_ids),
+                )
+        })
         .map(|e| (e.pane_id.clone(), e.name.clone()))
         .collect()
 }
@@ -450,7 +461,14 @@ pub fn dead_registry_rows(project: &str, c: &mut Client) -> Vec<(String, String)
         return Vec::new();
     };
     let live: std::collections::HashSet<String> = panes.into_iter().map(|p| p.pane_id).collect();
-    find_dead_rows(&state::load_spawn_registry(project), &live)
+    // bd-p09m: same backend resolution as the reap, so the gauge agrees
+    // with the clear.
+    let backend = crate::config::Config::load()
+        .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
+        .unwrap_or_else(|_| {
+            crate::backend::factory::resolve_backend_name(&crate::config::Config::default())
+        });
+    find_dead_rows(&state::load_spawn_registry(project), &live, &backend)
 }
 /// bd-lvyi: resolve a per-step harness override to a crew pane running THAT
 /// harness. The pane's `harness` column is authoritative; a legacy entry
@@ -4081,7 +4099,7 @@ mod tests {
             mk("wLive:p1", "crew-new-planner"),
         ];
         let live: HashSet<String> = ["wLive:p1".to_string()].into_iter().collect();
-        let dead = find_dead_rows(&entries, &live);
+        let dead = find_dead_rows(&entries, &live, "herdr");
         assert_eq!(
             dead,
             vec![("wDead:p1".to_string(), "crew-old-planner".to_string())]
@@ -4092,7 +4110,42 @@ mod tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            "herdr",
         );
+        assert_eq!(none, [] as [(String, String); 0]);
+    }
+
+    /// bd-p09m: the gauge agrees with the clear — a mail-only row the reap
+    /// keeps is not a dead row. Only a gone pane of a herdr-injectable
+    /// harness on herdr is dead.
+    #[test]
+    fn a_kept_mail_only_row_is_not_a_dead_row() {
+        use std::collections::HashSet;
+        let mk = |pane: &str, name: &str, harness: Option<&str>| SpawnEntry {
+            pane_id: pane.into(),
+            name: name.into(),
+            profile: None,
+            harness: harness.map(str::to_string),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: Some(name.into()),
+            skills_injected: false,
+            incarnation: 0,
+        };
+        let entries = vec![
+            mk("wDead:p1", "freebuff-pin", Some("freebuff")),
+            mk("wGone:p2", "gone-opencode", Some("opencode")),
+            mk("wLegacy:p3", "legacy-pin", None),
+        ];
+        let live: HashSet<String> = HashSet::new();
+        let dead = find_dead_rows(&entries, &live, "herdr");
+        assert_eq!(
+            dead,
+            vec![("wGone:p2".to_string(), "gone-opencode".to_string())]
+        );
+        // A superlogical process clears nothing, whatever the harness.
+        let none = find_dead_rows(&entries, &live, "superlogical");
         assert_eq!(none, [] as [(String, String); 0]);
     }
 
