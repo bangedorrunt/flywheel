@@ -2309,8 +2309,17 @@ fn workspace_label_aliases(project: &str, spawn_meta: Option<&str>) -> Vec<Strin
 }
 
 pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
+    find_workspace_info(c, project).map(|ws| ws.workspace_id)
+}
+
+/// [`find_workspace`]'s pick, whole: the sender needs its LABEL, which is
+/// what a doorbell host is keyed by (`crate::doorbell::inbox_owner_key`).
+pub(crate) fn find_workspace_info(
+    c: &mut Client,
+    project: &str,
+) -> Result<herdr_shim::WorkspaceInfo> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
-    let matches: Vec<herdr_shim::WorkspaceInfo> = c
+    let mut matches: Vec<herdr_shim::WorkspaceInfo> = c
         .workspace_list()?
         .into_iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
@@ -2331,11 +2340,24 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
         if let Some(ws) =
             herdr_shim::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
         {
-            return Ok(ws);
+            return Ok(pick_workspace(matches, &ws));
         }
-        return Ok(herdr_shim::resolve_workspace_id(&matches, &agents, &prefix));
+        let id = herdr_shim::resolve_workspace_id(&matches, &agents, &prefix);
+        return Ok(pick_workspace(matches, &id));
     }
-    Ok(matches[0].workspace_id.clone())
+    Ok(matches.swap_remove(0))
+}
+
+/// The entry with workspace id `id` (one of `matches` by construction).
+fn pick_workspace(
+    mut matches: Vec<herdr_shim::WorkspaceInfo>,
+    id: &str,
+) -> herdr_shim::WorkspaceInfo {
+    let i = matches
+        .iter()
+        .position(|w| w.workspace_id == id)
+        .unwrap_or(0);
+    matches.swap_remove(i)
 }
 
 /// The project's registered pane ids (the spawn registry is the project→pane
