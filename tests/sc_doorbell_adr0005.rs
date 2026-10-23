@@ -195,9 +195,16 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         brain_journal.contains("append_journal"),
         "live path must journal ticks for `doorbell why`"
     );
+    // 329d66d (bd-delete-flag-off-legacy-wake-27ll) deleted the flag-off pane
+    // typer: the herdr sink is a NoTextSink, and a wake is a ring, never typed
+    // text. The old pin (`doorbell_prompt`) asserted the deleted path.
     assert!(
-        host.contains("doorbell_prompt"),
-        "live inject must go through the herdr prompt delivery path"
+        host.contains("doorbell_rt::NoTextSink::new()"),
+        "the live herdr sink is the NoTextSink (rings, never typed text)"
+    );
+    assert!(
+        !host.contains("doorbell_prompt("),
+        "the flag-off pane typer stays deleted"
     );
     // One watch source: in-process bus watch with the wake-sock fallback.
     assert!(

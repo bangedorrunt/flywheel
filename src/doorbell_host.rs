@@ -898,7 +898,7 @@ impl RtHost {
 /// spawn path uses, and nothing of the journal or the brain.
 fn run_inbox_only(cfg: &Config, project: &str, workspace: &str) -> anyhow::Result<()> {
     let sd = config::state_dir();
-    let key = doorbell_rt::lease::inbox_lease_key(workspace);
+    let key = crate::doorbell::inbox_owner_key(workspace);
     let mut lease = doorbell_rt::lease::acquire_lease(&sd, &key, doorbell_rt::lease::unix_now())
         .map_err(|e| {
             anyhow::anyhow!("flywheel doorbell: inbox host refuse double-run (live lease): {e:?}")
@@ -914,14 +914,14 @@ fn run_inbox_only(cfg: &Config, project: &str, workspace: &str) -> anyhow::Resul
     );
     let mut beats = 0u32;
     let mut timer_err = String::new();
+    let mut sweeper = crate::timer_watch::Sweeper::new(project);
     while path.exists() {
         std::thread::sleep(Duration::from_secs(1));
         beats += 1;
         // The daemon owns the brain on this path, so the timer sweep lives
         // here. The embedded loop spawns its own thread for the same call.
         if crate::timer_watch::host_enabled(cfg) {
-            match crate::timer_watch::sweep_project(
-                project,
+            match sweeper.sweep(
                 crate::timer_watch::now_us(),
                 crate::timer_watch::exec_allowed(),
             ) {
@@ -1702,7 +1702,8 @@ mod inbox_flag_tests {
         );
         let b = src.find("fn run_inbox_only(").unwrap();
         let body = &src[b..src.find("pub fn run_embedded(").unwrap()];
-        assert!(body.contains("inbox_lease_key(workspace)"));
+        // The one key the sender looks up too (rv23 S1/S2).
+        assert!(body.contains("crate::doorbell::inbox_owner_key(workspace)"));
         assert!(body.contains("InboxHost::spawn("));
         for banned in [
             "Brain::",

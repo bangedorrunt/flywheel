@@ -1828,10 +1828,17 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
         let Some(ws) = hosted_workspace(hw) else {
             continue;
         };
-        let path = fw_state
+        // rv23 #3: the sweep stamp is the beat (a no-op sweep writes no
+        // journal row); the journal's mtime is the fallback.
+        let store = doorbell_rt::FileStore::new(fw_state);
+        let journal = fw_state
             .join("journals")
             .join(format!("doorbell-journal-{ws}.jsonl"));
-        if let Ok(md) = std::fs::metadata(&path) {
+        let newest = [store.sweep_stamp_file(ws), journal]
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .max_by_key(|md| md.modified().ok());
+        if let Some(md) = newest {
             let age = md
                 .modified()
                 .ok()
@@ -1842,7 +1849,6 @@ fn hosted_sweep_age(fw_state: &std::path::Path, hosted: &[String]) -> (Option<u6
                 (a, b) => a.or(b).unwrap_or(u64::MAX),
             });
         }
-        let store = doorbell_rt::FileStore::new(fw_state);
         max_seq = max_seq.max(store.last_seq(ws));
     }
     (min_age.filter(|a| *a != u64::MAX), max_seq)

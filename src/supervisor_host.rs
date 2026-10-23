@@ -32,9 +32,7 @@
 //! crew npub and does not type a pane. A steer the log already appended is not sent again; a
 //! restart resolves one that is still pending.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -57,6 +55,9 @@ pub enum Begin {
     Skip,
     /// The journal could not be reached: do not run blind.
     Unavailable(String),
+    /// A live claim by another owner (not this host's predecessor) holds the
+    /// key. Nothing ran and nothing failed: the holder settles it (rv23 S2).
+    Held(String),
 }
 
 /// The effect journal a command runs under.
@@ -90,6 +91,12 @@ pub trait Ports {
     fn page(&mut self, kind: &str, pin: &str, line: &str) -> Result<(), String>;
     /// Record a rejected input.
     fn reject(&mut self, n: u64, cause: &str, child: &str) -> Result<(), String>;
+    /// The directory a captain hold runs `br` in: the project's, where its
+    /// `.beads` is (the same dir `br ready` and `br init` use). `None`
+    /// inherits the host's cwd.
+    fn tracker_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// What `append_steer` needs.
@@ -232,6 +239,10 @@ fn scrub_msg(m: SupMsg) -> SupMsg {
             key,
             why: flatten(&why),
         },
+        SupMsg::CmdHeld { key, holder } => SupMsg::CmdHeld {
+            key,
+            holder: flatten(&holder),
+        },
         other => other,
     }
 }
@@ -299,6 +310,8 @@ pub struct RoundReport {
     pub skipped: u64,
     /// Commands that failed.
     pub failed: u64,
+    /// Commands another live owner's claim held (not failures).
+    pub held: u64,
     /// Effects `FLYWHEEL_ALLOW_EXEC=0` refused. One line each.
     pub suppressed: Vec<String>,
 }
@@ -585,6 +598,108 @@ fn lead_facts_file(project: &str, context: Option<&str>) -> PathBuf {
     crate::config::state_dir().join("facts").join(name)
 }
 
+/// A facts file read from where this host left off (rv23 #4).
+///
+/// `next` is how far this host has read; `committed` is what the sidecar
+/// (`<file>.read-<reader>`) says. [`FactsCursor::commit`] runs at the start
+/// of the next `observe`, after the round that folded those facts, so a
+/// restart re-reads at most the last round's lines (and the fold's bounded
+/// [`crate::supervisor_program::RecentKeys`] still holds their keys). A file
+/// shorter than `next` was replaced, and is read from the start.
+#[derive(Debug)]
+pub(crate) struct FactsCursor {
+    path: PathBuf,
+    sidecar: PathBuf,
+    next: u64,
+    committed: u64,
+    /// Bytes read so far by this host (evidence and tests).
+    pub(crate) bytes_read: u64,
+}
+
+impl FactsCursor {
+    pub(crate) fn open(path: PathBuf, reader: &str) -> Self {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".read-{reader}"));
+        let sidecar = path.with_file_name(name);
+        let committed = std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        Self {
+            path,
+            sidecar,
+            next: committed,
+            committed,
+            bytes_read: 0,
+        }
+    }
+
+    /// Persist how far the last round read. A failed write only means a
+    /// restart re-reads more.
+    pub(crate) fn commit(&mut self) {
+        if self.next == self.committed {
+            return;
+        }
+        if crate::private_fs::write_private_atomic(&self.sidecar, self.next.to_string().as_bytes())
+            .is_ok()
+        {
+            self.committed = self.next;
+        }
+    }
+
+    /// The complete lines after `next`, and the offset just past them. The
+    /// caller moves `next` there with [`FactsCursor::consume`] once it has
+    /// used them; a partial last line is left for the next read.
+    pub(crate) fn read_new(&mut self) -> (String, u64) {
+        let Ok(mut f) = std::fs::File::open(&self.path) else {
+            return (String::new(), self.next);
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < self.next {
+            self.next = 0;
+        }
+        if len == self.next
+            || std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(self.next)).is_err()
+        {
+            return (String::new(), self.next);
+        }
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_err() {
+            return (String::new(), self.next);
+        }
+        self.bytes_read += buf.len() as u64;
+        let used = buf.rfind('\n').map_or(0, |i| i + 1);
+        buf.truncate(used);
+        (buf, self.next + used as u64)
+    }
+
+    pub(crate) fn consume(&mut self, end: u64) {
+        self.next = end;
+    }
+}
+
+/// [`child_upward`] over the lines `cur` has not spent yet (rv23 #4: the
+/// file is no longer re-read whole every round). A line is spent only while
+/// the lead runs, because `child_upward` skips it otherwise; a stopped
+/// lead's lines are read again once it runs.
+fn lead_upward(
+    cur: &mut FactsCursor,
+    model: &SupModel,
+    child: &str,
+    now_ms: u64,
+    host_dead: bool,
+) -> Vec<SupMsg> {
+    let (text, end) = cur.read_new();
+    if model
+        .children
+        .get(child)
+        .is_some_and(|c| c.state == ChildState::Running)
+    {
+        cur.consume(end);
+    }
+    child_upward(model, child, now_ms, &text, host_dead)
+}
+
 /// What a parent may learn from one lead's facts file. Pass, progress, and
 /// done lines stay in the lead. An escalate line is one `ChildEscalated`.
 /// A dead lease past `t_orphan_ms` is one `Adopt`.
@@ -741,6 +856,11 @@ pub fn execute(
                 why: format!("journal unavailable: {why}"),
             }];
         }
+        // Not a failure of the child: a refused claim spends no restart.
+        Begin::Held(holder) => {
+            rep.held += 1;
+            return vec![SupMsg::CmdHeld { key, holder }];
+        }
         Begin::Run(g) => g,
     };
     let res: Result<Vec<SupMsg>, String> = match cmd {
@@ -784,10 +904,13 @@ pub fn execute(
             n,
             reason,
             evidence,
-        } => ports
-            .escalate(*n, reason, evidence)
-            .and_then(|_| captain_hold(evidence, reason))
-            .map(|_| vec![]),
+        } => {
+            let dir = ports.tracker_dir();
+            ports
+                .escalate(*n, reason, evidence)
+                .and_then(|_| captain_hold(evidence, reason, dir.as_deref(), rep))
+                .map(|_| vec![])
+        }
         SupCmd::Assign {
             task,
             child,
@@ -908,6 +1031,7 @@ pub fn recover(
                         why: format!("journal unavailable: {why}"),
                     });
                 }
+                Begin::Held(_) => rep.held += 1,
             }
             continue;
         }
@@ -955,6 +1079,27 @@ pub(crate) fn journal_scope(project: &str, context: Option<&str>) -> String {
     }
 }
 
+/// The journal owner for supervisor context `ctx` (its lease key, one live
+/// host each) at `sup_epoch`. No pid: a restarted host is recognised by its
+/// context and its higher epoch, not by a process id.
+pub(crate) fn journal_owner(ctx: &str, sup_epoch: u64) -> String {
+    format!("{ctx}@e{sup_epoch}")
+}
+
+/// Pure: may `mine` take over a claim owned by `theirs`? Only a claim of the
+/// SAME context at a LOWER sup_epoch (the dead predecessor). Another context,
+/// an equal or newer epoch, or an owner of another shape is never taken.
+pub(crate) fn takes_over(mine: &str, theirs: &str) -> bool {
+    let split = |o: &str| {
+        o.rsplit_once("@e")
+            .and_then(|(c, e)| e.parse::<u64>().ok().map(|e| (c.to_string(), e)))
+    };
+    match (split(mine), split(theirs)) {
+        (Some((mc, me)), Some((tc, te))) => mc == tc && te < me,
+        _ => false,
+    }
+}
+
 /// toron's `ToronJournal` as the effect journal.
 pub struct ToronEffectJournal {
     j: toron_core::journal::ToronJournal,
@@ -999,15 +1144,30 @@ impl EffectJournal for ToronEffectJournal {
             return Begin::Skip;
         }
         let now = chrono::Utc::now().timestamp_millis();
-        let claimed =
-            match self
-                .j
-                .try_claim(key, &self.owner, now + self.lease_ms, now, row.generation)
-            {
-                Ok(Some(r)) => r,
-                Ok(None) => return Begin::Unavailable("claim refused".into()),
-                Err(e) => return Begin::Unavailable(e.to_string()),
-            };
+        let claim = |owner: &str| {
+            self.j
+                .try_claim(key, owner, now + self.lease_ms, now, row.generation)
+        };
+        let claimed = match claim(&self.owner) {
+            Ok(Some(r)) => r,
+            // Refused: another owner's lease is live. If that owner is this
+            // context's predecessor (a lower sup_epoch, so a host that is
+            // dead: the context lease admits one live host and the epoch
+            // claim fenced it), take its claim over and run the key under it.
+            // Waiting out its lease instead made the fold count the refusal
+            // as a child failure: an extra generation and a spent restart
+            // slot per host crash (rv23 S2).
+            Ok(None) => match row.owner.as_deref() {
+                Some(theirs) if takes_over(&self.owner, theirs) => match claim(theirs) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return Begin::Held(theirs.to_string()),
+                    Err(e) => return Begin::Unavailable(e.to_string()),
+                },
+                Some(theirs) => return Begin::Held(theirs.to_string()),
+                None => return Begin::Held(String::new()),
+            },
+            Err(e) => return Begin::Unavailable(e.to_string()),
+        };
         if claimed.state == EffectState::Prepared {
             let _ = self
                 .j
@@ -1065,7 +1225,10 @@ pub struct LivePorts {
     inbox: crate::inbox_ports::FlywheelPorts,
     herdr_up: Option<bool>,
     facts_seen: BTreeSet<String>,
-    deaf_off: u64,
+    /// rv23 #4: the inbox host's facts file, read incrementally.
+    deaf: Option<FactsCursor>,
+    /// rv23 #4: each lead child's facts file, read incrementally.
+    lead_facts: BTreeMap<String, FactsCursor>,
     relaunch_bin: PathBuf,
     /// Set on a nested lead host so its facts file is not the root's.
     context: Option<String>,
@@ -1087,7 +1250,8 @@ impl LivePorts {
             inbox: crate::inbox_ports::FlywheelPorts::new(cfg, project, workspace),
             herdr_up: None,
             facts_seen: BTreeSet::new(),
-            deaf_off: 0,
+            deaf: None,
+            lead_facts: BTreeMap::new(),
             relaunch_bin,
             context: None,
             lead: None,
@@ -1168,8 +1332,18 @@ impl LivePorts {
 }
 
 impl Ports for LivePorts {
+    fn tracker_dir(&self) -> Option<PathBuf> {
+        Some(crate::project_dir(&self.cfg, &self.project))
+    }
+
     fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg> {
         let mut out = Vec::new();
+        // rv23 #4: the last round's facts are folded by now; record how far
+        // they were read.
+        let reader = self.context.clone().unwrap_or_else(|| "root".into());
+        for c in self.lead_facts.values_mut() {
+            c.commit();
+        }
         // Lead facts and a dead lease, before the herdr edge, so a lead
         // failure still restarts while herdr reads up.
         let leads: Vec<String> = model
@@ -1179,15 +1353,13 @@ impl Ports for LivePorts {
             .map(|(id, _)| id.clone())
             .collect();
         for id in leads {
-            let text = std::fs::read_to_string(lead_facts_file(&self.project, Some(&id)))
-                .unwrap_or_default();
-            out.extend(child_upward(
-                model,
-                &id,
-                now_ms,
-                &text,
-                self.lead_host_dead(&id),
-            ));
+            let dead = self.lead_host_dead(&id);
+            let project = self.project.clone();
+            let cur = self
+                .lead_facts
+                .entry(id.clone())
+                .or_insert_with(|| FactsCursor::open(lead_facts_file(&project, Some(&id)), &reader));
+            out.extend(lead_upward(cur, model, &id, now_ms, dead));
         }
         // herdr edges.
         let up = self.client().is_some();
@@ -1244,17 +1416,16 @@ impl Ports for LivePorts {
             }
         }
         // The inbox host's deaf facts, by the npub they name.
-        if let Ok(mut f) = std::fs::File::open(self.inbox_facts_path())
-            && std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(self.deaf_off)).is_ok()
+        let deaf_path = self.inbox_facts_path();
+        let deaf = self
+            .deaf
+            .get_or_insert_with(|| FactsCursor::open(deaf_path, &reader));
+        deaf.commit();
+        let (buf, end) = deaf.read_new();
+        deaf.consume(end);
         {
-            let mut buf = String::new();
-            if f.read_to_string(&mut buf).is_ok() {
-                let mut used = 0usize;
+            {
                 for l in buf.split_inclusive('\n') {
-                    if !l.ends_with('\n') {
-                        break;
-                    }
-                    used += l.len();
                     let Ok(v) = serde_json::from_str::<Value>(l.trim()) else {
                         continue;
                     };
@@ -1276,7 +1447,6 @@ impl Ports for LivePorts {
                         });
                     }
                 }
-                self.deaf_off += used as u64;
             }
         }
         out
@@ -1510,23 +1680,124 @@ impl HostCfg {
 ///
 /// A missing `br` is loud and does not fail the page. `FLYWHEEL_BR_BIN`
 /// that exits non-zero fails the command. No bead id means no process.
-fn captain_hold(evidence: &str, reason: &str) -> Result<(), String> {
+///
+/// rv23 #5 (review S3): the ids come from untrusted escalation text, so the
+/// hold is gated like every other exec. `FLYWHEEL_ALLOW_EXEC=0` pages but
+/// does not run `br` (a suppressed line names it). The run is bounded by
+/// `br_hold_timeout()`: a hung `br` is killed at the deadline and fails the
+/// command instead of parking the supervisor loop.
+fn captain_hold(
+    evidence: &str,
+    reason: &str,
+    cwd: Option<&Path>,
+    rep: &mut RoundReport,
+) -> Result<(), String> {
     let Some(argv) = crate::supervisor_program::bead_hold_argv(evidence, reason) else {
         return Ok(());
     };
+    if !exec_allowed() {
+        let line = format!(
+            "suppressed br hold {}: FLYWHEEL_ALLOW_EXEC=0",
+            argv[5..].join(" ")
+        );
+        eprintln!("flywheel supervisor: {line}");
+        rep.suppressed.push(line);
+        return Ok(());
+    }
     let pinned = std::env::var("FLYWHEEL_BR_BIN").ok();
     let program = pinned.as_deref().unwrap_or("br");
-    match std::process::Command::new(program).args(&argv).status() {
+    match run_bounded(program, &argv, cwd, br_hold_timeout()) {
+        Err(Bounded::TimedOut(after)) if pinned.is_some() => Err(format!(
+            "br hold timed out after {}ms (killed)",
+            after.as_millis()
+        )),
+        Err(Bounded::TimedOut(after)) => {
+            eprintln!(
+                "flywheel supervisor: br hold timed out after {}ms (killed); the escalate page stands",
+                after.as_millis()
+            );
+            Ok(())
+        }
+        Err(Bounded::Spawn(e)) if pinned.is_some() => Err(format!("br hold: {e}")),
+        Err(Bounded::Spawn(e)) => {
+            eprintln!("flywheel supervisor: br hold not run ({e}); the escalate page stands");
+            Ok(())
+        }
         Ok(st) if st.success() => Ok(()),
         Ok(st) if pinned.is_some() => Err(format!("br hold exited {st}")),
         Ok(st) => {
             eprintln!("flywheel supervisor: br hold failed ({st}); the escalate page stands");
             Ok(())
         }
-        Err(e) if pinned.is_some() => Err(format!("br hold: {e}")),
-        Err(e) => {
-            eprintln!("flywheel supervisor: br hold not run ({e}); the escalate page stands");
-            Ok(())
+    }
+}
+
+use std::time::Duration;
+
+/// Default deadline for one `br hold`. `FLYWHEEL_BR_HOLD_TIMEOUT_MS`
+/// overrides it (tests, slow trackers).
+const BR_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn br_hold_timeout() -> Duration {
+    std::env::var("FLYWHEEL_BR_HOLD_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(BR_HOLD_TIMEOUT, Duration::from_millis)
+}
+
+enum Bounded {
+    Spawn(std::io::Error),
+    TimedOut(Duration),
+}
+
+/// Run `program argv` with stdin closed and wait at most `timeout`. Past
+/// the deadline the child is killed and reaped, so nothing is left behind.
+fn run_bounded(
+    program: &str,
+    argv: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, Bounded> {
+    let mut started = None;
+    run_bounded_on(program, argv, cwd, timeout, &mut || {
+        started.get_or_insert_with(std::time::Instant::now).elapsed()
+    })
+}
+
+/// [`run_bounded`] on an injected clock: `elapsed` says how long the child
+/// has run (first asked right after the spawn). Tests drive the deadline
+/// with it instead of racing the machine's load.
+fn run_bounded_on(
+    program: &str,
+    argv: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    elapsed: &mut dyn FnMut() -> Duration,
+) -> Result<std::process::ExitStatus, Bounded> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(argv).stdin(std::process::Stdio::null());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd.spawn().map_err(Bounded::Spawn)?;
+    elapsed();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Ok(st),
+            Ok(None) if elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Bounded::TimedOut(elapsed()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Bounded::Spawn(e));
+            }
         }
     }
 }
@@ -1750,7 +2021,10 @@ fn host_loop(
     let lead_ctx = crate::lead_claim::lead_context(project, context);
     let claim = claim_for_host(&mut core, project, &lead_ctx, me)?;
     let epoch = claim.epoch;
-    let mut journal = ToronEffectJournal::open(&journal_scope(project, context), me)?;
+    let mut journal = ToronEffectJournal::open(
+        &journal_scope(project, context),
+        &journal_owner(lease_ws, epoch),
+    )?;
     let mut ports = LivePorts::new(cfg, project, project).with_lead(claim.lead);
     if let Some(c) = context {
         ports = ports.in_context(c);
@@ -2793,6 +3067,80 @@ mod tests {
         spawn_as(id, ChildKind::Crew)
     }
 
+    fn lead_model(state: ChildState) -> SupModel {
+        let (mut m, _) = crate::supervisor_program::replay(&[spawn_as("plane", ChildKind::Lead)]);
+        m.children.get_mut("plane").unwrap().state = state;
+        m
+    }
+
+    fn escalated_keys(out: &[SupMsg]) -> Vec<String> {
+        out.iter()
+            .filter_map(|m| match m {
+                SupMsg::ChildEscalated { fact_key, .. } => fact_key.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// rv23 #4: a lead's facts are read from where this host left off (not
+    /// the whole file every round). A partial line waits for its newline, a
+    /// stopped lead's lines are read again once it runs, a restart resumes at
+    /// the committed offset, and a replaced (shorter) file is read from the
+    /// start.
+    #[test]
+    fn lead_facts_are_read_incrementally() {
+        use std::io::Write as _;
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("proj--plane-supervisor.jsonl");
+        let line = |k: &str| format!("{}\n", json!({"kind": "escalate", "key": k, "reason": "r"}));
+        let add = |s: &str| {
+            let mut h = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+            h.write_all(s.as_bytes()).unwrap();
+        };
+        let run = lead_model(ChildState::Running);
+        std::fs::write(&f, line("k1")).unwrap();
+        let mut c = FactsCursor::open(f.clone(), "root");
+        assert_eq!(escalated_keys(&lead_upward(&mut c, &run, "plane", 1, false)), ["k1"]);
+        let after_first = c.bytes_read;
+        assert!(escalated_keys(&lead_upward(&mut c, &run, "plane", 2, false)).is_empty());
+        assert_eq!(c.bytes_read, after_first, "nothing new is no bytes read");
+        add(&format!("{}{{\"kind\":\"esc", line("k2")));
+        assert_eq!(escalated_keys(&lead_upward(&mut c, &run, "plane", 3, false)), ["k2"]);
+        add("alate\",\"key\":\"k3\",\"reason\":\"r\"}\n");
+        let stopped = lead_model(ChildState::Restarting);
+        assert!(escalated_keys(&lead_upward(&mut c, &stopped, "plane", 4, false)).is_empty());
+        assert_eq!(
+            escalated_keys(&lead_upward(&mut c, &run, "plane", 5, false)),
+            ["k3"],
+            "a line a stopped lead skipped is read once it runs"
+        );
+        c.commit();
+        let mut again = FactsCursor::open(f.clone(), "root");
+        assert!(
+            escalated_keys(&lead_upward(&mut again, &run, "plane", 6, false)).is_empty(),
+            "a restart resumes at the committed offset"
+        );
+        let mut other = FactsCursor::open(f.clone(), "plane");
+        assert_eq!(
+            escalated_keys(&lead_upward(&mut other, &run, "plane", 6, false)),
+            ["k1", "k2", "k3"],
+            "each reader keeps its own offset"
+        );
+        std::fs::write(&f, line("k9")).unwrap();
+        assert_eq!(escalated_keys(&lead_upward(&mut again, &run, "plane", 7, false)), ["k9"]);
+    }
+
+    /// rv23 #4: the live observe reads lead and deaf facts through cursors.
+    #[test]
+    fn live_observe_reads_facts_through_cursors() {
+        let src = include_str!("supervisor_host.rs");
+        let at = src.find("impl Ports for LivePorts {").expect("LivePorts");
+        let body = &src[at..at + 4000];
+        assert!(body.contains("out.extend(lead_upward(cur, model, &id, now_ms, dead));"));
+        assert!(body.contains("let (buf, end) = deaf.read_new();"));
+        assert!(!body.contains("std::fs::read_to_string(lead_facts_file"));
+    }
+
     fn spawn_as(id: &str, kind: ChildKind) -> SupMsg {
         SupMsg::Spawn {
             spec: ChildSpec {
@@ -3204,6 +3552,203 @@ mod tests {
             "{back:?}"
         );
         unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+    }
+
+    /// rv23 #5: a `br` that writes its argv to `logf`, then runs `tail`.
+    fn br_script(dir: &Path, tail: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("br");
+        let logf = dir.join("argv");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n{tail}\n",
+                logf.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, logf)
+    }
+
+    fn escalate_bd(n: u64) -> SupCmd {
+        SupCmd::Escalate {
+            n,
+            reason: "budget".into(),
+            evidence: "see bd-hold1".into(),
+        }
+    }
+
+    /// rv23 #5 (review S3): log-only mode must not exec `br` either. The page
+    /// still goes out; the hold is a suppressed line, like Relaunch and Exit.
+    #[test]
+    fn allow_exec_zero_pages_but_does_not_run_br_hold() {
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let (script, logf) = br_script(dir.path(), "exit 0");
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        let _off = ForceOff::new();
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = Fake::default();
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        assert!(back.is_empty(), "{back:?}");
+        assert_eq!(
+            ports.0.lock().unwrap().escalated,
+            vec![(1, "budget".to_string())],
+            "the page is not an exec: it still goes out"
+        );
+        assert!(!logf.exists(), "FLYWHEEL_ALLOW_EXEC=0 must not spawn br");
+        assert!(
+            rep.suppressed
+                .iter()
+                .any(|l| l.contains("br hold") && l.contains("FLYWHEEL_ALLOW_EXEC=0")),
+            "the skipped hold is named: {:?}",
+            rep.suppressed
+        );
+    }
+
+    /// rv23 #5 (review S3): the hold runs `br` in the ports' tracker dir
+    /// (the project's, where its `.beads` is), not the host's cwd.
+    #[test]
+    fn br_hold_runs_in_the_tracker_dir() {
+        struct InDir(Fake, PathBuf);
+        impl Ports for InDir {
+            fn observe(&mut self, m: &SupModel, now: u64) -> Vec<SupMsg> {
+                self.0.observe(m, now)
+            }
+            fn relaunch(&mut self, c: &str, g: u64, k: ChildKind) -> Result<(), String> {
+                self.0.relaunch(c, g, k)
+            }
+            fn exit(&mut self, c: &str, g: u64) -> Result<(), String> {
+                self.0.exit(c, g)
+            }
+            fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {
+                self.0.append_steer(s)
+            }
+            fn assign(&mut self, a: &AssignSend) -> Result<u64, String> {
+                self.0.assign(a)
+            }
+            fn escalate(&mut self, n: u64, r: &str, e: &str) -> Result<(), String> {
+                self.0.escalate(n, r, e)
+            }
+            fn park(&mut self, c: &str, i: u32) -> Result<(), String> {
+                self.0.park(c, i)
+            }
+            fn page(&mut self, k: &str, p: &str, l: &str) -> Result<(), String> {
+                self.0.page(k, p, l)
+            }
+            fn reject(&mut self, n: u64, c: &str, ch: &str) -> Result<(), String> {
+                self.0.reject(n, c, ch)
+            }
+            fn tracker_dir(&self) -> Option<PathBuf> {
+                Some(self.1.clone())
+            }
+        }
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cwdf = dir.path().join("cwd");
+        let (script, logf) = br_script(dir.path(), &format!("pwd -P > {}", cwdf.display()));
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = InDir(Fake::default(), proj.clone());
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        assert!(back.is_empty(), "{back:?}");
+        assert!(logf.exists(), "br ran");
+        assert_eq!(
+            std::fs::read_to_string(&cwdf).unwrap().trim(),
+            proj.canonicalize().unwrap().to_string_lossy(),
+            "br hold runs in the tracker dir"
+        );
+    }
+
+    /// rv23 #5: the live ports' tracker dir is the project dir `br ready`
+    /// and `br init` already use.
+    #[test]
+    fn live_ports_hold_br_in_the_project_dir() {
+        let src = include_str!("supervisor_host.rs");
+        let at = src.find("impl Ports for LivePorts {").expect("LivePorts");
+        assert!(
+            src[at..at + 200].contains("Some(crate::project_dir(&self.cfg, &self.project))"),
+            "{}",
+            &src[at..at + 200]
+        );
+    }
+
+    /// rv23 #5 (review S3): a hung `br` must not park the supervisor loop.
+    /// Past the deadline the child is killed and reaped. The deadline is an
+    /// injected clock that passes only once `br` has written its pid, so the
+    /// test does not race the machine's load (it was flaky at a real 300 ms).
+    #[test]
+    fn a_hung_br_hold_is_killed_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidf = dir.path().join("pid");
+        let (script, logf) = br_script(
+            dir.path(),
+            &format!("echo $$ > {}\nexec sleep 20", pidf.display()),
+        );
+        let deadline = Duration::from_secs(10);
+        // Zero until br is up and has its pid written, then the deadline.
+        let mut clock = || match std::fs::read_to_string(&pidf) {
+            Ok(s) if s.ends_with('\n') => deadline,
+            _ => Duration::ZERO,
+        };
+        let started = std::time::Instant::now();
+        let got = run_bounded_on(
+            script.to_str().unwrap(),
+            &["hold".into()],
+            None,
+            deadline,
+            &mut clock,
+        );
+        let took = started.elapsed();
+        assert!(logf.exists(), "br did run");
+        assert!(matches!(got, Err(Bounded::TimedOut(_))), "past the deadline is a timeout");
+        assert!(
+            took < Duration::from_secs(15),
+            "killed at the deadline, not waited out (br hangs 20 s): {took:?}"
+        );
+        let pid = std::fs::read_to_string(&pidf).unwrap();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the hung br (pid {}) is gone", pid.trim());
+    }
+
+    /// The same deadline through `execute`, on the real clock: a pinned `br`
+    /// that hangs fails the escalate loud as "timed out", well before the hang
+    /// ends. Only the upper bound is timed, with a wide margin.
+    #[test]
+    fn a_hung_pinned_br_hold_fails_the_escalate_as_timed_out() {
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let (script, _) = br_script(dir.path(), "exec sleep 20");
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        unsafe { std::env::set_var("FLYWHEEL_BR_HOLD_TIMEOUT_MS", "300") };
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = Fake::default();
+        let started = std::time::Instant::now();
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        let took = started.elapsed();
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        unsafe { std::env::remove_var("FLYWHEEL_BR_HOLD_TIMEOUT_MS") };
+        assert!(
+            took < Duration::from_secs(15),
+            "the hold waits for its deadline, not for br (20 s): {took:?}"
+        );
+        assert!(
+            matches!(back.first(), Some(SupMsg::CmdFailed { why, .. }) if why.contains("timed out")),
+            "{back:?}"
+        );
     }
 
     /// What a hinted loop publishes after each round.
@@ -4000,6 +4545,104 @@ mod tests {
             matches!(lead.begin("steer:1"), Begin::Run(_)),
             "the nested lead's steer:1 is not the root's"
         );
+    }
+
+    /// Two hosts' journals over ONE store (a kill -9 and a restart).
+    fn toron_journals(
+        owners: &[&str],
+    ) -> (Vec<ToronEffectJournal>, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = dir.join("index.sqlite");
+        let pool = rt.block_on(async {
+            let pool = toron_core::index::schema::connect(&db.to_string_lossy())
+                .await
+                .unwrap();
+            toron_core::index::schema::migrate(&pool).await.unwrap();
+            pool
+        });
+        let js = owners
+            .iter()
+            .map(|o| {
+                let jd = toron_core::journal::JournalDb::new(pool.clone(), "supervise:test", 64);
+                ToronEffectJournal::new(toron_core::journal::ToronJournal::spawn(jd, rt.handle()), o)
+            })
+            .collect();
+        (js, rt)
+    }
+
+    /// rv23 S2, the regression: the host dies (kill -9) holding a live claim
+    /// on `relaunch:b:2`. The restarted host (same context, next sup_epoch)
+    /// must take that claim over and run the relaunch, not be refused (a
+    /// refusal became `CmdFailed`, an extra generation and a spent slot).
+    #[test]
+    fn a_restarted_host_takes_over_its_dead_predecessors_relaunch_claim() {
+        let dead = journal_owner("supervise-p", 1);
+        let next = journal_owner("supervise-p", 2);
+        let other_ctx = journal_owner("supervise-p--lead", 1);
+        let newer = journal_owner("supervise-p", 3);
+        let (mut js, _rt) = toron_journals(&[&dead, &next, &other_ctx, &newer]);
+        let g1 = match js[0].begin("relaunch:b:2") {
+            Begin::Run(g) => g,
+            other => panic!("{other:?}"),
+        };
+        // The predecessor never settles: it was killed.
+        let g2 = match js[1].begin("relaunch:b:2") {
+            Begin::Run(g) => g,
+            other => panic!("the restarted host must take over: {other:?}"),
+        };
+        assert!(g2 > g1, "the takeover fences the dead claim");
+        js[1].finish("relaunch:b:2", g2, true);
+        assert_eq!(js[1].begin("relaunch:b:2"), Begin::Skip);
+        // Never taken: another context's live claim, or a NEWER epoch's.
+        assert!(matches!(js[2].begin("relaunch:x:2"), Begin::Run(_)));
+        assert_eq!(js[1].begin("relaunch:x:2"), Begin::Held(other_ctx.clone()));
+        assert!(matches!(js[3].begin("relaunch:y:2"), Begin::Run(_)));
+        assert_eq!(js[1].begin("relaunch:y:2"), Begin::Held(newer.clone()));
+    }
+
+    #[test]
+    fn takes_over_only_the_same_context_at_a_lower_epoch() {
+        assert!(takes_over("supervise-p@e2", "supervise-p@e1"));
+        assert!(!takes_over("supervise-p@e2", "supervise-p@e2"));
+        assert!(!takes_over("supervise-p@e2", "supervise-p@e3"));
+        assert!(!takes_over("supervise-p@e2", "supervise-p--lead@e1"));
+        assert!(!takes_over("supervise-p@e2", "supervise-p-123"));
+        assert!(!takes_over("supervise-p-123", "supervise-p@e1"));
+    }
+
+    /// A held claim reaches the fold as `CmdHeld`, never `CmdFailed`.
+    #[test]
+    fn a_held_claim_is_reported_as_held_not_failed() {
+        struct HeldJ;
+        impl EffectJournal for HeldJ {
+            fn begin(&mut self, _: &str) -> Begin {
+                Begin::Held("supervise-p@e1".into())
+            }
+            fn finish(&mut self, _: &str, _: u64, _: bool) {}
+        }
+        let f = Fake::default();
+        let mut p = f.clone();
+        let mut rep = RoundReport::default();
+        let back = execute(
+            &mut HeldJ,
+            &mut p,
+            &SupCmd::Relaunch {
+                child: "b".into(),
+                generation: 2,
+                kind: ChildKind::Crew,
+            },
+            &mut rep,
+        );
+        assert_eq!(
+            back,
+            vec![SupMsg::CmdHeld {
+                key: "relaunch:b:2".into(),
+                holder: "supervise-p@e1".into()
+            }]
+        );
+        assert_eq!((rep.failed, rep.held), (0, 1));
+        assert!(f.0.lock().unwrap().relaunched.is_empty(), "nothing ran");
     }
 
     #[test]
