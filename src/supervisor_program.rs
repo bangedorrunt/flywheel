@@ -1285,15 +1285,24 @@ fn bead_atom(c: u8) -> bool {
     c.is_ascii_digit() || c.is_ascii_lowercase()
 }
 
+/// Longest bead id `bead_hold_argv` accepts. The ids come from untrusted
+/// escalation text; anything longer is not an id the tracker minted.
+pub const BEAD_ID_MAX: usize = 64;
+/// Most beads one escalation may hold. First seen win.
+pub const BEAD_HOLD_MAX: usize = 8;
+
 /// `br hold` argv when the escalation names a bead. `None` means do not
 /// spawn `br`. The first id is `--corr`. Never calls the live tracker.
 pub fn bead_hold_argv(evidence: &str, reason: &str) -> Option<Vec<String>> {
-    let mut ids = bead_ids(evidence);
-    for id in bead_ids(reason) {
-        if !ids.iter().any(|e| e == &id) {
+    let mut ids: Vec<String> = Vec::new();
+    for id in bead_ids(evidence).into_iter().chain(bead_ids(reason)) {
+        // rv23 #5: untrusted text. An over-long id is not one the tracker
+        // minted, and one page holds a bounded number of beads.
+        if id.len() <= BEAD_ID_MAX && !ids.iter().any(|e| e == &id) {
             ids.push(id);
         }
     }
+    ids.truncate(BEAD_HOLD_MAX);
     let corr = ids.first()?.clone();
     let mut argv = vec![
         "hold".into(),
@@ -4672,6 +4681,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// rv23 #5 (review S3): the ids come from untrusted escalation text, so
+    /// the argv is bounded: an over-long id is not an id, and one page holds
+    /// at most `BEAD_HOLD_MAX` beads (first seen win).
+    #[test]
+    fn bead_hold_argv_refuses_overlong_ids_and_caps_the_count() {
+        let long = format!("bd-{}", "a".repeat(BEAD_ID_MAX));
+        assert!(
+            bead_hold_argv(&format!("see {long}"), "budget").is_none(),
+            "an id past BEAD_ID_MAX is not held"
+        );
+        let many: Vec<String> = (0..BEAD_HOLD_MAX + 5).map(|i| format!("bd-x{i}")).collect();
+        let v = bead_hold_argv(&many.join(" "), "budget").unwrap();
+        let ids = &v[5..];
+        assert_eq!(ids.len(), BEAD_HOLD_MAX, "{v:?}");
+        assert_eq!(ids, &many[..BEAD_HOLD_MAX]);
+        assert_eq!(v[4], "bd-x0", "the first id is still --corr");
+        let ok = format!("bd-{}", "a".repeat(BEAD_ID_MAX - 3));
+        assert_eq!(ok.len(), BEAD_ID_MAX);
+        assert!(bead_hold_argv(&ok, "").is_some(), "BEAD_ID_MAX itself is fine");
     }
 
     #[test]
