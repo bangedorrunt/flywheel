@@ -909,6 +909,14 @@ pub enum SupMsg {
         /// Why.
         why: String,
     },
+    /// A command's journal claim is held by another live owner: it did not
+    /// run and did not fail. Logged, never an abnormal end (rv23 S2).
+    CmdHeld {
+        /// Its durable key.
+        key: String,
+        /// The holder the journal named (empty if unnamed).
+        holder: String,
+    },
 }
 
 /// Intents. The Durable ones carry a key, so the host's journal runs each
@@ -2142,6 +2150,10 @@ impl Program for SupervisorProgram {
                     abnormal_end(&mut next, &mut cmds, id, now, true);
                 }
             }
+            // The child is unchanged: its holder settles the relaunch, and a
+            // relaunch nobody confirms is caught by the lease, not by a claim
+            // refusal counted as a failed incarnation (rv23 S2).
+            SupMsg::CmdHeld { .. } => {}
         }
         Update::with_commands(next, cmds)
     }
@@ -2373,6 +2385,103 @@ mod tests {
 
     fn rl(v: &[(&str, u64)]) -> Vec<(String, u64)> {
         v.iter().map(|(a, g)| (a.to_string(), *g)).collect()
+    }
+
+    /// rv23 S2: after a kill -9 the new host's relaunch claim can be refused
+    /// by a live lease. That refusal is not a failed incarnation: no extra
+    /// generation, no restart slot, no command. A real failure still is.
+    #[test]
+    fn a_refused_relaunch_claim_is_not_an_abnormal_end() {
+        for strategy in [
+            Strategy::OneForOne,
+            Strategy::RestForOne,
+            Strategy::OneForAll,
+        ] {
+            let (m, _) = step(&strat(strategy, &["a", "b", "c"]), &exit("b", 10));
+            assert_eq!(m.children["b"].generation, 2);
+            let slots = m.restarts.len();
+            let (n, c) = step(
+                &m,
+                &SupMsg::CmdHeld {
+                    key: "relaunch:b:2".into(),
+                    holder: "supervise-p@e1".into(),
+                },
+            );
+            assert!(c.is_empty(), "{strategy:?}: a held claim emits nothing");
+            assert_eq!(n.children["b"].generation, 2, "{strategy:?}: no extra generation");
+            assert_eq!(n.children["b"].abnormal, m.children["b"].abnormal);
+            assert_eq!(n.restarts.len(), slots, "{strategy:?}: no restart slot spent");
+            assert_eq!(n.children["b"].state, ChildState::Restarting);
+            // The same key failing for real is still a failed incarnation.
+            let (f, _) = step(
+                &m,
+                &SupMsg::CmdFailed {
+                    key: "relaunch:b:2".into(),
+                    why: "spawn relaunch: boom".into(),
+                },
+            );
+            assert_eq!(f.children["b"].generation, 3, "{strategy:?}");
+        }
+    }
+
+    /// The lead's condition from #30, pinned: the restart set a replay
+    /// recomputes is a pure function of (strategy, log). Folding the same log
+    /// twice, or the log cut at any point and re-folded (a host restart),
+    /// gives the same relaunch commands as the live fold, in START order, not
+    /// id order (children are spawned d, b, c, a here).
+    #[test]
+    fn the_restart_set_recomputed_on_replay_is_deterministic_per_strategy_and_log() {
+        let order = ["d", "b", "c", "a"];
+        for strategy in [
+            Strategy::OneForOne,
+            Strategy::RestForOne,
+            Strategy::OneForAll,
+        ] {
+            let mut policy = Policy::for_tier(Tier::Lead);
+            policy.strategy = strategy;
+            let mut log = vec![
+                SupMsg::Hello {
+                    me: ME.into(),
+                    tier: Tier::Lead,
+                    policy: Some(policy),
+                },
+                SupMsg::Claim {
+                    holder: ME.into(),
+                    sup_epoch: 2,
+                },
+            ];
+            for id in order {
+                log.push(SupMsg::Spawn {
+                    spec: spec(id),
+                    now_ms: 0,
+                });
+            }
+            log.push(exit("b", 10));
+            let (live_m, live_c) = replay(&log);
+            let want: Vec<(String, u64)> = match strategy {
+                Strategy::OneForOne => rl(&[("b", 2)]),
+                Strategy::RestForOne => rl(&[("b", 2), ("c", 2), ("a", 2)]),
+                Strategy::OneForAll => rl(&[("d", 2), ("b", 2), ("c", 2), ("a", 2)]),
+            };
+            assert_eq!(relaunches(&live_c), want, "{strategy:?}: start order");
+            for _ in 0..3 {
+                let (m, c) = replay(&log);
+                assert_eq!(c, live_c, "{strategy:?}: same log, same commands");
+                assert_eq!(m, live_m, "{strategy:?}: same log, same model");
+            }
+            // A host restart at every cut re-folds the prefix and then the rest.
+            for cut in 0..=log.len() {
+                let (m0, mut c) = replay(&log[..cut]);
+                let mut m = m0;
+                for msg in &log[cut..] {
+                    let (n, more) = step(&m, msg);
+                    m = n;
+                    c.extend(more);
+                }
+                assert_eq!(c, live_c, "{strategy:?}: cut {cut}");
+                assert_eq!(m, live_m, "{strategy:?}: cut {cut}");
+            }
+        }
     }
 
     #[test]
