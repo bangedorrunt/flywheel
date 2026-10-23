@@ -65,19 +65,65 @@ fn statement_head(source: &str, at: usize) -> &str {
     &prefix[boundary..]
 }
 
-/// Every `Enforced` mention must be introduced by a journal-present `if`.
+/// Line span of the top-level item starting at `start_line` (0-based),
+/// closed by the first column-0 `}` — the rustfmt shape of top-level items.
+/// Panics when absent, so a moved item fails loud instead of silently
+/// escaping the exclusion below.
+fn top_level_span(lines: &[&str], start_line: usize) -> (usize, usize) {
+    let mut j = start_line + 1;
+    while j < lines.len() && lines[j] != "}" {
+        j += 1;
+    }
+    assert!(
+        j < lines.len(),
+        "no column-0 close for the item at line {} — not top-level rustfmt",
+        start_line + 1
+    );
+    (start_line + 1, j + 1)
+}
+
+/// 1-based line ranges that are NOT production selections: the vetted
+/// gate's own body (its shape is pinned by
+/// `engine_journal_mode_gate_is_fail_closed`, not by the scans below).
+fn gate_spans(source: &str) -> Vec<(usize, usize)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("pub fn engine_journal_mode(")
+            || line.starts_with("fn engine_journal_mode(")
+        {
+            out.push(top_level_span(&lines, i));
+        }
+    }
+    out
+}
+
+fn in_ranges(ranges: &[(usize, usize)], lineno: usize) -> bool {
+    ranges.iter().any(|&(s, e)| lineno >= s && lineno <= e)
+}
+
+fn line_of(source: &str, at: usize) -> usize {
+    source[..at].matches('\n').count() + 1
+}
+
+/// Every `Enforced` mention must be introduced by a journal-present `if` or
+/// delegated to the vetted gate (`engine_journal_mode` in the statement
+/// head — a unit-test assertion pins the gate, it never selects a mode).
 ///
 /// Returns the offsets that are NOT guarded, so the caller can fail with
 /// them. A bare `let mode = EffectJournalMode::Enforced;` has no `if` in its
 /// statement head, which is exactly the journal-outage bug.
 fn unguarded_enforced(source: &str) -> Vec<(usize, String)> {
     let needle = "EffectJournalMode::Enforced";
+    let gate = gate_spans(source);
     let mut out = Vec::new();
     let mut from = 0usize;
     while let Some(rel) = source[from..].find(needle) {
         let at = from + rel;
         let head = statement_head(source, at);
-        if !head.contains("if ") {
+        let delegated = head.contains("engine_journal_mode");
+        let gated = head.contains("if ");
+        if !gated && !delegated && !in_ranges(&gate, line_of(source, at)) {
             out.push((at, head.trim().to_string()));
         }
         from = at + needle.len();
@@ -93,7 +139,7 @@ fn no_production_site_selects_enforced_unconditionally() {
         assert!(
             unguarded.is_empty(),
             "{name}: unguarded EffectJournalMode::Enforced at {unguarded:?} — a journal \
-             outage would fail every live fire instead of keeping the bypass visible"
+             outage must fail closed with a loud refusal (bd-ozpj), never a silent bypass"
         );
         checked += count(source, "EffectJournalMode::Enforced");
     }
@@ -108,17 +154,26 @@ fn no_production_site_selects_enforced_unconditionally() {
 fn every_enforced_selection_is_gated_on_a_present_journal() {
     let needle = "EffectJournalMode::Enforced";
     for (name, source) in mode_bearing_sources() {
+        let gate = gate_spans(source);
         let mut total = 0usize;
         let mut gated = 0usize;
         let mut from = 0usize;
         while let Some(rel) = source[from..].find(needle) {
             let at = from + rel;
+            // The gate's own return and unit-test assertions are vetted
+            // elsewhere — they are not selections.
+            if in_ranges(&gate, line_of(source, at)) {
+                from = at + needle.len();
+                continue;
+            }
             total += 1;
             // The gate is the journal actually opening. `effect.is_some()` is
             // how both files learn that, and it is the only thing that makes
             // Enforced safe: with no runner there is nothing to journal
-            // through, so Enforced would just fail the arm.
-            if statement_head(source, at).contains("effect.is_some()") {
+            // through, so Enforced would just fail the arm. A call into the
+            // vetted `engine_journal_mode` gate delegates that same check.
+            let head = statement_head(source, at);
+            if head.contains("effect.is_some()") || head.contains("engine_journal_mode") {
                 gated += 1;
             }
             from = at + needle.len();
@@ -136,17 +191,55 @@ fn every_enforced_selection_is_gated_on_a_present_journal() {
 }
 
 #[test]
-fn pane_gates_enforced_on_the_journal_flag_not_only_on_the_runner() {
+fn pane_routes_live_mode_selection_through_the_vetted_gate() {
     let pane = include_str!("../src/pane.rs");
-    // `pane.rs`'s constructor serves BOTH live and dry arms (`workflow run`
-    // with and without `--execute`, `cron run` with and without `--live`), so
-    // its condition must require the caller's live flag as well as the
-    // journal. Gating on `effect.is_some()` alone would let a dry arm be
-    // promoted to Enforced the moment a journal happens to be open.
+    // `pane.rs`'s live constructor serves live arms only (the dry arms use a
+    // separate constructor that hardcodes Recording). Its call passes the
+    // live flag into the vetted gate; gating on `effect.is_some()` alone
+    // would let a dry arm be promoted to Enforced the moment a journal
+    // happens to be open, which the split constructors prevent.
+    // Live arms delegate the Enforced decision to the vetted gate below;
+    // the dry constructor never reaches it (it hardcodes Recording, pinned
+    // by `dry_arms_stay_on_recording...`). A second inline spelling beside
+    // the gate would drift, which is what this suite guards against.
     assert!(
-        pane.contains("if journal && effect.is_some()"),
-        "pane.rs must select Enforced only when the live `journal` flag AND a \
-         journal runner are both present"
+        pane.contains("engine_journal_mode(true, effect.is_some())"),
+        "the live engine construction routes Enforced through engine_journal_mode with the journal flag"
+    );
+}
+
+/// The gate itself, pinned as fail-closed source shape (bd-ozpj): the live
+/// flag must refuse without a journal, a present journal alone must never
+/// promote, and `Enforced` is returned only past both checks.
+#[test]
+fn engine_journal_mode_gate_is_fail_closed() {
+    let pane = include_str!("../src/pane.rs");
+    let lines: Vec<&str> = pane.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| {
+            l.starts_with("pub fn engine_journal_mode(") || l.starts_with("fn engine_journal_mode(")
+        })
+        .expect("engine_journal_mode is defined in pane.rs");
+    let (s, e) = top_level_span(&lines, start);
+    let body = lines[s..e].join("\n");
+    // Braced: a bare "if !journal" substring also matches
+    // "if !journal_built", which would let a dropped live-flag check pass.
+    assert!(
+        body.contains("if !journal {"),
+        "the gate must refuse when the live flag is off"
+    );
+    assert!(
+        body.contains("Recording"),
+        "the gate must fall back to Recording, never Enforced, without the flag"
+    );
+    assert!(
+        body.contains("if !journal_built {"),
+        "the gate must refuse when no journal runner was built"
+    );
+    assert!(
+        body.contains("Enforced"),
+        "the gate still names its terminal selection"
     );
 }
 
