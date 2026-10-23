@@ -786,7 +786,7 @@ pub fn execute(
             evidence,
         } => ports
             .escalate(*n, reason, evidence)
-            .and_then(|_| captain_hold(evidence, reason))
+            .and_then(|_| captain_hold(evidence, reason, rep))
             .map(|_| vec![]),
         SupCmd::Assign {
             task,
@@ -1477,23 +1477,101 @@ impl HostCfg {
 ///
 /// A missing `br` is loud and does not fail the page. `FLYWHEEL_BR_BIN`
 /// that exits non-zero fails the command. No bead id means no process.
-fn captain_hold(evidence: &str, reason: &str) -> Result<(), String> {
+///
+/// rv23 #5 (review S3): the ids come from untrusted escalation text, so the
+/// hold is gated like every other exec. `FLYWHEEL_ALLOW_EXEC=0` pages but
+/// does not run `br` (a suppressed line names it). The run is bounded by
+/// `br_hold_timeout()`: a hung `br` is killed at the deadline and fails the
+/// command instead of parking the supervisor loop.
+fn captain_hold(evidence: &str, reason: &str, rep: &mut RoundReport) -> Result<(), String> {
     let Some(argv) = crate::supervisor_program::bead_hold_argv(evidence, reason) else {
         return Ok(());
     };
+    if !exec_allowed() {
+        let line = format!(
+            "suppressed br hold {}: FLYWHEEL_ALLOW_EXEC=0",
+            argv[5..].join(" ")
+        );
+        eprintln!("flywheel supervisor: {line}");
+        rep.suppressed.push(line);
+        return Ok(());
+    }
     let pinned = std::env::var("FLYWHEEL_BR_BIN").ok();
     let program = pinned.as_deref().unwrap_or("br");
-    match std::process::Command::new(program).args(&argv).status() {
+    match run_bounded(program, &argv, br_hold_timeout()) {
+        Err(Bounded::TimedOut(after)) if pinned.is_some() => Err(format!(
+            "br hold timed out after {}ms (killed)",
+            after.as_millis()
+        )),
+        Err(Bounded::TimedOut(after)) => {
+            eprintln!(
+                "flywheel supervisor: br hold timed out after {}ms (killed); the escalate page stands",
+                after.as_millis()
+            );
+            Ok(())
+        }
+        Err(Bounded::Spawn(e)) if pinned.is_some() => Err(format!("br hold: {e}")),
+        Err(Bounded::Spawn(e)) => {
+            eprintln!("flywheel supervisor: br hold not run ({e}); the escalate page stands");
+            Ok(())
+        }
         Ok(st) if st.success() => Ok(()),
         Ok(st) if pinned.is_some() => Err(format!("br hold exited {st}")),
         Ok(st) => {
             eprintln!("flywheel supervisor: br hold failed ({st}); the escalate page stands");
             Ok(())
         }
-        Err(e) if pinned.is_some() => Err(format!("br hold: {e}")),
-        Err(e) => {
-            eprintln!("flywheel supervisor: br hold not run ({e}); the escalate page stands");
-            Ok(())
+    }
+}
+
+use std::time::Duration;
+
+/// Default deadline for one `br hold`. `FLYWHEEL_BR_HOLD_TIMEOUT_MS`
+/// overrides it (tests, slow trackers).
+const BR_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn br_hold_timeout() -> Duration {
+    std::env::var("FLYWHEEL_BR_HOLD_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(BR_HOLD_TIMEOUT, Duration::from_millis)
+}
+
+enum Bounded {
+    Spawn(std::io::Error),
+    TimedOut(Duration),
+}
+
+/// Run `program argv` with stdin closed and wait at most `timeout`. Past
+/// the deadline the child is killed and reaped, so nothing is left behind.
+fn run_bounded(
+    program: &str,
+    argv: &[String],
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, Bounded> {
+    let mut child = std::process::Command::new(program)
+        .args(argv)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(Bounded::Spawn)?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Ok(st),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Bounded::TimedOut(started.elapsed()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Bounded::Spawn(e));
+            }
         }
     }
 }
@@ -2914,6 +2992,90 @@ mod tests {
             "{back:?}"
         );
         unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+    }
+
+    /// rv23 #5: a `br` that writes its argv to `logf`, then runs `tail`.
+    fn br_script(dir: &Path, tail: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("br");
+        let logf = dir.join("argv");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n{tail}\n",
+                logf.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, logf)
+    }
+
+    fn escalate_bd(n: u64) -> SupCmd {
+        SupCmd::Escalate {
+            n,
+            reason: "budget".into(),
+            evidence: "see bd-hold1".into(),
+        }
+    }
+
+    /// rv23 #5 (review S3): log-only mode must not exec `br` either. The page
+    /// still goes out; the hold is a suppressed line, like Relaunch and Exit.
+    #[test]
+    fn allow_exec_zero_pages_but_does_not_run_br_hold() {
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let (script, logf) = br_script(dir.path(), "exit 0");
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        let _off = ForceOff::new();
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = Fake::default();
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        assert!(back.is_empty(), "{back:?}");
+        assert_eq!(
+            ports.0.lock().unwrap().escalated,
+            vec![(1, "budget".to_string())],
+            "the page is not an exec: it still goes out"
+        );
+        assert!(!logf.exists(), "FLYWHEEL_ALLOW_EXEC=0 must not spawn br");
+        assert!(
+            rep.suppressed
+                .iter()
+                .any(|l| l.contains("br hold") && l.contains("FLYWHEEL_ALLOW_EXEC=0")),
+            "the skipped hold is named: {:?}",
+            rep.suppressed
+        );
+    }
+
+    /// rv23 #5 (review S3): a hung `br` must not park the supervisor loop.
+    /// The hold is bounded; past the deadline the child is killed and the
+    /// command fails loud (pinned binary), instead of waiting it out.
+    #[test]
+    fn a_hung_br_hold_is_killed_at_its_deadline() {
+        let _g = crate::config::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let (script, logf) = br_script(dir.path(), "exec sleep 20");
+        unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
+        unsafe { std::env::set_var("FLYWHEEL_BR_HOLD_TIMEOUT_MS", "300") };
+        let mut j = MemJournal::default();
+        let mut rep = RoundReport::default();
+        let mut ports = Fake::default();
+        let started = std::time::Instant::now();
+        let back = execute(&mut j, &mut ports, &escalate_bd(1), &mut rep);
+        let took = started.elapsed();
+        unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
+        unsafe { std::env::remove_var("FLYWHEEL_BR_HOLD_TIMEOUT_MS") };
+        assert!(logf.exists(), "br did run");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "the hold waits for its deadline, not for br: {took:?}"
+        );
+        assert!(
+            matches!(back.first(), Some(SupMsg::CmdFailed { why, .. }) if why.contains("timed out")),
+            "{back:?}"
+        );
     }
 
     /// What a hinted loop publishes after each round.

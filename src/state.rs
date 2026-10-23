@@ -1512,12 +1512,30 @@ pub fn save_last_sent(project: &str, records: &[SentRecord]) -> Result<()> {
 // `STALE_LOCK` is litter from a crashed writer, so it is stolen rather than
 // wedging the file forever.
 
-/// Total wait before a blocked writer gives up (`attempts * retry`). Small on
-/// purpose: bookkeeping must never stall a loop pass for long.
-const LOCK_WAIT_ATTEMPTS: u32 = 100;
+/// Total wall-clock wait before a blocked writer gives up. Small on purpose:
+/// bookkeeping must never stall a loop pass for long.
+///
+/// rv23 #5: this used to be an attempt count (100 polls of 2 ms, so about
+/// 200 ms). Under load a writer lost every poll to its siblings for longer
+/// than that and `concurrent_state_writers_do_not_clobber` flaked. The budget
+/// is now time, measured from the first try, and long enough to wait out a
+/// loaded holder; the poll backs off so waiters do not spin the lock file.
+const LOCK_WAIT: Duration = Duration::from_millis(2000);
 const LOCK_RETRY: Duration = Duration::from_millis(2);
+const LOCK_RETRY_MAX: Duration = Duration::from_millis(20);
 /// Older than this and the holder is gone; the lock is relocatable litter.
 const STALE_LOCK: Duration = Duration::from_secs(10);
+
+/// The per-file mutex in-process writers queue on before the lock file.
+fn in_process_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut map = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    Arc::clone(map.entry(lock_path(path)).or_default())
+}
 
 fn lock_path(path: &Path) -> PathBuf {
     path.with_extension("lock")
@@ -1615,7 +1633,17 @@ pub(crate) fn update_locked<T: Default + Serialize + serde::de::DeserializeOwned
     path: &Path,
     op: impl FnOnce(&mut T),
 ) -> Result<()> {
-    for attempt in 0..LOCK_WAIT_ATTEMPTS {
+    // rv23 #5: writers in THIS process queue on a per-file mutex first, so the
+    // lock-file poll below only ever races other processes. Without it, eight
+    // threads polling one lock file starve each other: a waiter that backs off
+    // loses every round to the thread that just released and re-acquires at
+    // once (measured: 266 of 320 runs failed under a 32-way load). The mutex
+    // holder's own wait is bounded by LOCK_WAIT, so the queue is bounded too.
+    let file_mutex = in_process_lock(path);
+    let _in_process = file_mutex.lock().unwrap_or_else(|p| p.into_inner());
+    let started = std::time::Instant::now();
+    let mut retry = LOCK_RETRY;
+    loop {
         if let Some(guard) = StateLock::try_acquire(path)? {
             let mut value: T = std::fs::read_to_string(path)
                 .ok()
@@ -1641,15 +1669,17 @@ pub(crate) fn update_locked<T: Default + Serialize + serde::de::DeserializeOwned
             std::fs::rename(&tmp, path)?;
             return Ok(());
         }
-        if attempt + 1 < LOCK_WAIT_ATTEMPTS {
-            std::thread::sleep(LOCK_RETRY);
+        let waited = started.elapsed();
+        if waited >= LOCK_WAIT {
+            bail!(
+                "state file {} is locked by another writer (waited {}ms); refusing to clobber it",
+                path.display(),
+                waited.as_millis()
+            )
         }
+        std::thread::sleep(retry.min(LOCK_WAIT - waited));
+        retry = (retry * 2).min(LOCK_RETRY_MAX);
     }
-    bail!(
-        "state file {} is locked by another writer (waited {}ms); refusing to clobber it",
-        path.display(),
-        LOCK_WAIT_ATTEMPTS as u64 * LOCK_RETRY.as_millis() as u64
-    )
 }
 
 /// bd-resume-window-lease-sweep-4sa2: the (bead, pane) resume watermark — the
@@ -2732,6 +2762,44 @@ mod tests {
             "all 200 (bead, pane) keys survive; got {}",
             window.len()
         );
+    }
+
+    /// rv23 #5: the lock wait is a WALL-CLOCK budget, not an attempt count.
+    /// A holder that keeps the lock 400 ms (a loaded box: 8 writers each
+    /// rewriting the file) must be waited out. The old wait was 100 polls of
+    /// 2 ms, which gave up at ~200 ms and failed
+    /// `concurrent_state_writers_do_not_clobber` under load.
+    #[test]
+    fn a_writer_waits_out_a_holder_inside_the_lock_budget() {
+        let _g = crate::config::test_state_home();
+        let path = resume_window_file(&format!("lockwait-{}", std::process::id()));
+        let held = StateLock::try_acquire(&path).unwrap().expect("free lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let r = update_locked::<BTreeMap<String, u64>>(&path, |m| {
+            m.insert("k".into(), 1);
+        });
+        release.join().unwrap();
+        assert!(r.is_ok(), "waited {:?}: {r:?}", started.elapsed());
+        assert!(LOCK_WAIT >= Duration::from_millis(400));
+    }
+
+    /// rv23 #5: and the budget still ends: a lock that is never released
+    /// (and is not stale) is refused at LOCK_WAIT, not waited on forever.
+    #[test]
+    fn a_writer_gives_up_at_the_lock_budget() {
+        let _g = crate::config::test_state_home();
+        let path = resume_window_file(&format!("lockgive-{}", std::process::id()));
+        let _held = StateLock::try_acquire(&path).unwrap().expect("free lock");
+        let started = std::time::Instant::now();
+        let r = update_locked::<BTreeMap<String, u64>>(&path, |_| {});
+        let took = started.elapsed();
+        assert!(r.is_err());
+        assert!(took >= LOCK_WAIT, "{took:?}");
+        assert!(took < LOCK_WAIT + Duration::from_secs(1), "{took:?}");
     }
 
     #[test]
