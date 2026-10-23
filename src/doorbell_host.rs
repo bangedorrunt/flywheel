@@ -914,14 +914,14 @@ fn run_inbox_only(cfg: &Config, project: &str, workspace: &str) -> anyhow::Resul
     );
     let mut beats = 0u32;
     let mut timer_err = String::new();
+    let mut sweeper = crate::timer_watch::Sweeper::new(project);
     while path.exists() {
         std::thread::sleep(Duration::from_secs(1));
         beats += 1;
         // The daemon owns the brain on this path, so the timer sweep lives
         // here. The embedded loop spawns its own thread for the same call.
         if crate::timer_watch::host_enabled(cfg) {
-            match crate::timer_watch::sweep_project(
-                project,
+            match sweeper.sweep(
                 crate::timer_watch::now_us(),
                 crate::timer_watch::exec_allowed(),
             ) {
