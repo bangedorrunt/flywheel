@@ -31,6 +31,19 @@ pub use doorbell_core::{
     parse_watch_ndjson, should_inject, watch_pubkey, watch_targets,
 };
 
+/// The ONE inbox-lease key for a doorbell host (rv23 S1/S2).
+///
+/// A doorbell host is spawned as `__doorbell --workspace <label>` and keys
+/// every file and lease by that herdr workspace LABEL, never by the herdr
+/// workspace id (`w1`). The inbox host leases this key and the sender looks
+/// up this key, so the two cannot drift: when the sender looked up
+/// `inbox-<workspace id>` it never found the host's `inbox-<label>` lease and
+/// rang the pane itself, a second unbudgeted wake per send (22 sends + 5 deaf
+/// rings gave 53 pane writes).
+pub(crate) fn inbox_owner_key(label: &str) -> String {
+    doorbell_rt::lease::inbox_lease_key(label)
+}
+
 /// Pid file: `~/.local/state/flywheel/doorbell/<workspace>.pid`.
 pub fn pid_file(state_dir: &Path, workspace: &str) -> PathBuf {
     state_dir.join("doorbell").join(format!("{workspace}.pid"))

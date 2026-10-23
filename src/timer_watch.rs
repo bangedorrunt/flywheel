@@ -166,6 +166,27 @@ fn watch_path(root: &Path, project: &str, id: &str) -> PathBuf {
     root.join("timer").join(project).join(format!("{id}.json"))
 }
 
+/// A settled watch moves here, out of the directory every sweep reads.
+fn done_path(root: &Path, project: &str, id: &str) -> PathBuf {
+    root.join("timer")
+        .join(project)
+        .join("done")
+        .join(format!("{id}.json"))
+}
+
+/// A watch file that does not parse moves here, so one bad file is named
+/// once and does not fail every later sweep.
+fn bad_path(root: &Path, project: &str, name: &str) -> PathBuf {
+    root.join("timer").join(project).join("bad").join(name)
+}
+
+fn move_to(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(dir) = to.parent() {
+        crate::private_fs::create_private_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(from, to).map_err(|e| e.to_string())
+}
+
 fn intent_path(root: &Path, project: &str, id: &str, outcome: Outcome) -> PathBuf {
     root.join("timer")
         .join(project)
@@ -218,6 +239,10 @@ pub fn arm(
     if read_json::<Watch>(&path)?.is_some() {
         return Err(format!("timer {id} is already armed"));
     }
+    // A settled watch was pruned to done/; its intents still name the id.
+    if done_path(root, project, id).exists() {
+        return Err(format!("timer {id} is already settled"));
+    }
     write_json(
         &path,
         &Watch {
@@ -236,6 +261,9 @@ pub fn arm(
 pub fn signal(root: &Path, project: &str, id: &str, signal: Signal) -> Result<(), String> {
     let path = watch_path(root, project, id);
     let Some(mut w) = read_json::<Watch>(&path)? else {
+        if done_path(root, project, id).exists() {
+            return Err(format!("timer {id} is already settled"));
+        }
         return Err(format!("no timer {id}"));
     };
     if w.settled.is_some() {
@@ -246,6 +274,12 @@ pub fn signal(root: &Path, project: &str, id: &str, signal: Signal) -> Result<()
 }
 
 /// One sweep of `project`. Already-settled watches send nothing.
+///
+/// rv23 #4: one watch's failure does not stop the others. Every watch is
+/// tried; the failures come back together as one `Err` (so a caller still
+/// sees them), after the rest were sent. A file that does not parse moves to
+/// `bad/` and is named once. A settled watch moves to `done/`, so a sweep
+/// reads only the open ones.
 pub fn sweep_at(
     root: &Path,
     project: &str,
@@ -260,23 +294,69 @@ pub fn sweep_at(
         Err(e) => return Err(e.to_string()),
     };
     let mut n = 0;
+    let mut errs: Vec<String> = Vec::new();
     for ent in rd {
-        let ent = ent.map_err(|e| e.to_string())?;
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(e) => {
+                errs.push(e.to_string());
+                continue;
+            }
+        };
         let name = ent.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.ends_with(".json") {
             continue;
         }
         let path = ent.path();
-        let Some(mut w) = read_json::<Watch>(&path)? else {
-            continue;
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                errs.push(format!("{name}: {e}"));
+                continue;
+            }
         };
-        if fire_one(root, project, &mut w, now_us, exec_allowed, port)? {
-            write_json(&path, &w)?;
-            n += 1;
+        let mut w = match serde_json::from_slice::<Watch>(&bytes) {
+            Ok(w) => w,
+            Err(e) => {
+                // Writes are tmp + rename, so a file that does not parse is
+                // not a half-written one. Move it aside and name it once.
+                let moved = move_to(&path, &bad_path(root, project, name));
+                errs.push(match moved {
+                    Ok(()) => format!("{name}: {e} (moved to bad/)"),
+                    Err(m) => format!("{name}: {e} (not moved: {m})"),
+                });
+                continue;
+            }
+        };
+        if w.settled.is_some() {
+            // Settled before this sweep (or before pruning existed).
+            if let Err(e) = move_to(&path, &done_path(root, project, &w.id)) {
+                errs.push(format!("{}: prune: {e}", w.id));
+            }
+            continue;
+        }
+        match fire_one(root, project, &mut w, now_us, exec_allowed, port) {
+            Ok(true) => {
+                if let Err(e) = write_json(&path, &w) {
+                    errs.push(format!("{}: {e}", w.id));
+                    continue;
+                }
+                n += 1;
+                if let Err(e) = move_to(&path, &done_path(root, project, &w.id)) {
+                    errs.push(format!("{}: prune: {e}", w.id));
+                }
+            }
+            Ok(false) => {}
+            Err(e) => errs.push(format!("{}: {e}", w.id)),
         }
     }
-    Ok(n)
+    if errs.is_empty() {
+        Ok(n)
+    } else {
+        Err(errs.join("; "))
+    }
 }
 
 fn fire_one(
@@ -366,32 +446,100 @@ fn root() -> PathBuf {
     crate::config::state_dir()
 }
 
-struct LivePort {
-    inner: crate::inbox_ports::FlywheelPorts,
+/// The config file's identity for the cache: modified time and length.
+/// `None` when it cannot be read (no file); a change either way reloads.
+fn config_stamp() -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(crate::config::config_file()).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// The live inbox port, built on first use and kept (rv23 #4).
+///
+/// A sweep with nothing due never loads the config or the inbox facts. Once
+/// built, the port (its config, facts and npub cache) is reused across
+/// sweeps, and rebuilt only when the config file changes.
+pub struct LivePort {
+    project: String,
+    inner: Option<(Option<(std::time::SystemTime, u64)>, crate::inbox_ports::FlywheelPorts)>,
+    /// How many times the config and facts were loaded (tests, evidence).
+    pub loads: u64,
+}
+
+impl LivePort {
+    pub fn new(project: &str) -> Self {
+        Self {
+            project: project.to_string(),
+            inner: None,
+            loads: 0,
+        }
+    }
+
+    fn ports(&mut self) -> Result<&mut crate::inbox_ports::FlywheelPorts, String> {
+        let stamp = config_stamp();
+        if self.inner.as_ref().is_none_or(|(s, _)| *s != stamp) {
+            let cfg = crate::config::Config::load().map_err(|e| e.to_string())?;
+            self.loads += 1;
+            self.inner = Some((
+                stamp,
+                crate::inbox_ports::FlywheelPorts::new(&cfg, &self.project, &self.project),
+            ));
+        }
+        Ok(&mut self.inner.as_mut().expect("just built").1)
+    }
 }
 
 impl NotifyPort for LivePort {
     fn prepare(&mut self, pin: &str) -> Result<(String, u64, String), String> {
-        let npub = self
-            .inner
+        let inner = self.ports()?;
+        let npub = inner
             .npub_of(pin)
             .ok_or_else(|| format!("no npub for {pin}"))?;
-        let (producer, epoch) = self.inner.claim_producer_epoch()?;
+        let (producer, epoch) = inner.claim_producer_epoch()?;
         Ok((producer, epoch, npub))
     }
 
     fn append(&mut self, env: &Envelope) -> Result<u64, String> {
-        self.inner.append_env(env.clone())
+        self.ports()?.append_env(env.clone())
     }
 }
 
-/// Sweep one project against the live inbox. Used by the CLI and the host thread.
+/// Sweep one project against the live inbox, once (the CLI).
 pub fn sweep_project(project: &str, now_us: u64, exec_allowed: bool) -> Result<usize, String> {
-    let cfg = crate::config::Config::load().map_err(|e| e.to_string())?;
-    let mut port = LivePort {
-        inner: crate::inbox_ports::FlywheelPorts::new(&cfg, project, project),
-    };
-    sweep_at(&root(), project, now_us, exec_allowed, &mut port)
+    sweep_at(
+        &root(),
+        project,
+        now_us,
+        exec_allowed,
+        &mut LivePort::new(project),
+    )
+}
+
+/// The repeating sweep (host thread, daemon loop). Keeps one [`LivePort`]
+/// across sweeps; see there for what is cached.
+pub struct Sweeper {
+    project: String,
+    root: PathBuf,
+    pub port: LivePort,
+}
+
+impl Sweeper {
+    pub fn new(project: &str) -> Self {
+        Self {
+            project: project.to_string(),
+            root: root(),
+            port: LivePort::new(project),
+        }
+    }
+
+    pub fn sweep(&mut self, now_us: u64, exec_allowed: bool) -> Result<usize, String> {
+        sweep_at(
+            &self.root,
+            &self.project,
+            now_us,
+            exec_allowed,
+            &mut self.port,
+        )
+    }
 }
 
 /// Host thread gate. Same rule as the CLI.
@@ -413,9 +561,10 @@ pub fn spawn_sweep(project: &str) {
         .name("timer-sweep".into())
         .spawn(move || {
             let mut last = String::new();
+            let mut sweeper = Sweeper::new(&project);
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                match sweep_project(&project, now_us(), exec_allowed()) {
+                match sweeper.sweep(now_us(), exec_allowed()) {
                     Ok(_) => last.clear(),
                     Err(e) if e == last => {}
                     Err(e) => {
@@ -677,6 +826,108 @@ mod tests {
         assert_eq!(rec.appended.len(), 1);
         assert_eq!(rec.appended[0].msg.epoch, 1);
         assert_eq!(sweep_at(d.path(), "p", 99, true, &mut rec).unwrap(), 0);
+    }
+
+    fn rec() -> Rec {
+        Rec {
+            prepares: 0,
+            appended: vec![],
+            fail_appends: 0,
+            epoch: 0,
+        }
+    }
+
+    /// rv23 #4: one watch file that does not parse does not stop the sweep.
+    /// The good watch is sent, the bad file is named and moved to `bad/`, and
+    /// the next sweep is clean.
+    #[test]
+    fn one_bad_watch_file_does_not_stop_the_sweep() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("timer").join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Sorts before and after the good one, so either order is covered.
+        std::fs::write(dir.join("a-bad.json"), b"{not json").unwrap();
+        arm(d.path(), "p", "m1", "Buffy", 10, false).unwrap();
+        std::fs::write(dir.join("z-bad.json"), b"[]").unwrap();
+        let mut rec = rec();
+        let err = sweep_at(d.path(), "p", 10, true, &mut rec).unwrap_err();
+        assert_eq!(rec.appended.len(), 1, "the good watch was sent: {err}");
+        assert!(err.contains("a-bad.json") && err.contains("z-bad.json"), "{err}");
+        assert!(dir.join("bad").join("a-bad.json").exists());
+        assert!(dir.join("bad").join("z-bad.json").exists());
+        assert!(!dir.join("a-bad.json").exists());
+        assert_eq!(sweep_at(d.path(), "p", 11, true, &mut rec).unwrap(), 0);
+        assert_eq!(rec.appended.len(), 1);
+    }
+
+    /// rv23 #4: a settled watch leaves the swept directory (pruned to
+    /// `done/`), still counts as settled for arm and signal, and a watch
+    /// settled before pruning existed is pruned without a send.
+    #[test]
+    fn a_settled_watch_is_pruned_and_stays_settled() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("timer").join("p");
+        arm(d.path(), "p", "w1", "Buffy", 10, false).unwrap();
+        let mut rec = rec();
+        assert_eq!(sweep_at(d.path(), "p", 10, true, &mut rec).unwrap(), 1);
+        assert!(!dir.join("w1.json").exists(), "pruned from the swept dir");
+        assert!(dir.join("done").join("w1.json").exists());
+        assert!(arm(d.path(), "p", "w1", "Buffy", 99, false)
+            .unwrap_err()
+            .contains("already settled"));
+        assert!(signal(d.path(), "p", "w1", Signal::Met)
+            .unwrap_err()
+            .contains("already settled"));
+        // A settled file from before pruning: moved, nothing sent.
+        let old = Watch {
+            id: "old".into(),
+            project: "p".into(),
+            pin: "Buffy".into(),
+            deadline_us: 1,
+            timer_only: false,
+            signal: Signal::Open,
+            settled: Some("expired".into()),
+        };
+        write_json(&dir.join("old.json"), &old).unwrap();
+        assert_eq!(sweep_at(d.path(), "p", 50, true, &mut rec).unwrap(), 0);
+        assert!(!dir.join("old.json").exists());
+        assert!(dir.join("done").join("old.json").exists());
+        assert_eq!(rec.appended.len(), 1);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .collect();
+        assert!(left.is_empty(), "no watch file is left to re-read");
+    }
+
+    /// rv23 #4: a sweep with nothing due never loads the config or the
+    /// inbox facts; once loaded they are kept until the config changes.
+    #[test]
+    fn the_live_port_loads_config_and_facts_once() {
+        let _g = crate::config::lock_env();
+        let cfgd = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", cfgd.path()) };
+        std::fs::create_dir_all(cfgd.path().join("flywheel")).unwrap();
+        std::fs::write(crate::config::config_file(), b"").unwrap();
+        let d = tempfile::tempdir().unwrap();
+        arm(d.path(), "p", "later", "Buffy", 1_000, false).unwrap();
+        let mut port = LivePort::new("p");
+        for now in [1, 2, 3] {
+            assert_eq!(sweep_at(d.path(), "p", now, true, &mut port).unwrap(), 0);
+        }
+        assert_eq!(port.loads, 0, "nothing due: no config, no facts");
+        port.ports().unwrap();
+        port.ports().unwrap();
+        assert_eq!(port.loads, 1, "kept across uses");
+        std::fs::write(crate::config::config_file(), b"\n\n").unwrap();
+        port.ports().unwrap();
+        assert_eq!(port.loads, 2, "a changed config is reloaded");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
     }
 
     #[test]

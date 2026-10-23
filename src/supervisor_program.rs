@@ -514,6 +514,44 @@ pub enum Status {
     Halted,
 }
 
+/// How many fact keys a dedup list keeps (rv23 #4). The host reads facts
+/// incrementally from a persisted offset, so a key comes back only for the
+/// round before a crash; the newest keys are the ones that can repeat.
+pub const SEEN_KEYS_MAX: usize = 1024;
+
+/// Fact keys already acted on, newest last, at most [`SEEN_KEYS_MAX`]
+/// (rv23 #4: these grew by one per fact for the host's life). Serialized as
+/// a plain list, so an older snapshot's set reads back as one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RecentKeys(std::collections::VecDeque<String>);
+
+impl RecentKeys {
+    /// Whether `key` is held.
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.iter().any(|k| k == key)
+    }
+
+    /// Hold `key`; `false` if it was already held. Past the cap the oldest
+    /// key is dropped.
+    pub fn insert(&mut self, key: String) -> bool {
+        if self.contains(&key) {
+            return false;
+        }
+        self.0.push_back(key);
+        while self.0.len() > SEEN_KEYS_MAX {
+            self.0.pop_front();
+        }
+        true
+    }
+
+    /// How many keys are held.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// The model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupModel {
@@ -554,7 +592,7 @@ pub struct SupModel {
     /// Commands that failed.
     pub failed_cmds: u64,
     /// Deaf facts already acted on.
-    pub deaf_seen: BTreeSet<String>,
+    pub deaf_seen: RecentKeys,
     /// Latest time seen.
     pub now_ms: u64,
     /// Generation floor for crews a failure halted: a re-adopted crew starts
@@ -576,7 +614,7 @@ pub struct SupModel {
     pub adopted: BTreeSet<String>,
     /// Escalate fact keys already spent as one `ChildEscalated`.
     #[serde(default)]
-    pub escalated_facts: BTreeSet<String>,
+    pub escalated_facts: RecentKeys,
     /// Children that reported `Proved`. `Done` is not this set.
     #[serde(default)]
     pub proved: BTreeSet<String>,
@@ -628,14 +666,14 @@ impl SupModel {
             paged: BTreeSet::new(),
             stalled: false,
             failed_cmds: 0,
-            deaf_seen: BTreeSet::new(),
+            deaf_seen: RecentKeys::default(),
             now_ms: 0,
             retired_gen: BTreeMap::new(),
             assignments: BTreeMap::new(),
             task_abnormal: BTreeMap::new(),
             parked_tasks: BTreeSet::new(),
             adopted: BTreeSet::new(),
-            escalated_facts: BTreeSet::new(),
+            escalated_facts: RecentKeys::default(),
             proved: BTreeSet::new(),
             integration_proved: false,
             conflicts: BTreeSet::new(),
@@ -916,6 +954,14 @@ pub enum SupMsg {
         key: String,
         /// Why.
         why: String,
+    },
+    /// A command's journal claim is held by another live owner: it did not
+    /// run and did not fail. Logged, never an abnormal end (rv23 S2).
+    CmdHeld {
+        /// Its durable key.
+        key: String,
+        /// The holder the journal named (empty if unnamed).
+        holder: String,
     },
 }
 
@@ -1293,15 +1339,24 @@ fn bead_atom(c: u8) -> bool {
     c.is_ascii_digit() || c.is_ascii_lowercase()
 }
 
+/// Longest bead id `bead_hold_argv` accepts. The ids come from untrusted
+/// escalation text; anything longer is not an id the tracker minted.
+pub const BEAD_ID_MAX: usize = 64;
+/// Most beads one escalation may hold. First seen win.
+pub const BEAD_HOLD_MAX: usize = 8;
+
 /// `br hold` argv when the escalation names a bead. `None` means do not
 /// spawn `br`. The first id is `--corr`. Never calls the live tracker.
 pub fn bead_hold_argv(evidence: &str, reason: &str) -> Option<Vec<String>> {
-    let mut ids = bead_ids(evidence);
-    for id in bead_ids(reason) {
-        if !ids.iter().any(|e| e == &id) {
+    let mut ids: Vec<String> = Vec::new();
+    for id in bead_ids(evidence).into_iter().chain(bead_ids(reason)) {
+        // rv23 #5: untrusted text. An over-long id is not one the tracker
+        // minted, and one page holds a bounded number of beads.
+        if id.len() <= BEAD_ID_MAX && !ids.iter().any(|e| e == &id) {
             ids.push(id);
         }
     }
+    ids.truncate(BEAD_HOLD_MAX);
     let corr = ids.first()?.clone();
     let mut argv = vec![
         "hold".into(),
@@ -2141,6 +2196,10 @@ impl Program for SupervisorProgram {
                     abnormal_end(&mut next, &mut cmds, id, now, true);
                 }
             }
+            // The child is unchanged: its holder settles the relaunch, and a
+            // relaunch nobody confirms is caught by the lease, not by a claim
+            // refusal counted as a failed incarnation (rv23 S2).
+            SupMsg::CmdHeld { .. } => {}
         }
         Update::with_commands(next, cmds)
     }
@@ -2372,6 +2431,103 @@ mod tests {
 
     fn rl(v: &[(&str, u64)]) -> Vec<(String, u64)> {
         v.iter().map(|(a, g)| (a.to_string(), *g)).collect()
+    }
+
+    /// rv23 S2: after a kill -9 the new host's relaunch claim can be refused
+    /// by a live lease. That refusal is not a failed incarnation: no extra
+    /// generation, no restart slot, no command. A real failure still is.
+    #[test]
+    fn a_refused_relaunch_claim_is_not_an_abnormal_end() {
+        for strategy in [
+            Strategy::OneForOne,
+            Strategy::RestForOne,
+            Strategy::OneForAll,
+        ] {
+            let (m, _) = step(&strat(strategy, &["a", "b", "c"]), &exit("b", 10));
+            assert_eq!(m.children["b"].generation, 2);
+            let slots = m.restarts.len();
+            let (n, c) = step(
+                &m,
+                &SupMsg::CmdHeld {
+                    key: "relaunch:b:2".into(),
+                    holder: "supervise-p@e1".into(),
+                },
+            );
+            assert!(c.is_empty(), "{strategy:?}: a held claim emits nothing");
+            assert_eq!(n.children["b"].generation, 2, "{strategy:?}: no extra generation");
+            assert_eq!(n.children["b"].abnormal, m.children["b"].abnormal);
+            assert_eq!(n.restarts.len(), slots, "{strategy:?}: no restart slot spent");
+            assert_eq!(n.children["b"].state, ChildState::Restarting);
+            // The same key failing for real is still a failed incarnation.
+            let (f, _) = step(
+                &m,
+                &SupMsg::CmdFailed {
+                    key: "relaunch:b:2".into(),
+                    why: "spawn relaunch: boom".into(),
+                },
+            );
+            assert_eq!(f.children["b"].generation, 3, "{strategy:?}");
+        }
+    }
+
+    /// The lead's condition from #30, pinned: the restart set a replay
+    /// recomputes is a pure function of (strategy, log). Folding the same log
+    /// twice, or the log cut at any point and re-folded (a host restart),
+    /// gives the same relaunch commands as the live fold, in START order, not
+    /// id order (children are spawned d, b, c, a here).
+    #[test]
+    fn the_restart_set_recomputed_on_replay_is_deterministic_per_strategy_and_log() {
+        let order = ["d", "b", "c", "a"];
+        for strategy in [
+            Strategy::OneForOne,
+            Strategy::RestForOne,
+            Strategy::OneForAll,
+        ] {
+            let mut policy = Policy::for_tier(Tier::Lead);
+            policy.strategy = strategy;
+            let mut log = vec![
+                SupMsg::Hello {
+                    me: ME.into(),
+                    tier: Tier::Lead,
+                    policy: Some(policy),
+                },
+                SupMsg::Claim {
+                    holder: ME.into(),
+                    sup_epoch: 2,
+                },
+            ];
+            for id in order {
+                log.push(SupMsg::Spawn {
+                    spec: spec(id),
+                    now_ms: 0,
+                });
+            }
+            log.push(exit("b", 10));
+            let (live_m, live_c) = replay(&log);
+            let want: Vec<(String, u64)> = match strategy {
+                Strategy::OneForOne => rl(&[("b", 2)]),
+                Strategy::RestForOne => rl(&[("b", 2), ("c", 2), ("a", 2)]),
+                Strategy::OneForAll => rl(&[("d", 2), ("b", 2), ("c", 2), ("a", 2)]),
+            };
+            assert_eq!(relaunches(&live_c), want, "{strategy:?}: start order");
+            for _ in 0..3 {
+                let (m, c) = replay(&log);
+                assert_eq!(c, live_c, "{strategy:?}: same log, same commands");
+                assert_eq!(m, live_m, "{strategy:?}: same log, same model");
+            }
+            // A host restart at every cut re-folds the prefix and then the rest.
+            for cut in 0..=log.len() {
+                let (m0, mut c) = replay(&log[..cut]);
+                let mut m = m0;
+                for msg in &log[cut..] {
+                    let (n, more) = step(&m, msg);
+                    m = n;
+                    c.extend(more);
+                }
+                assert_eq!(c, live_c, "{strategy:?}: cut {cut}");
+                assert_eq!(m, live_m, "{strategy:?}: cut {cut}");
+            }
+        }
     }
 
     #[test]
@@ -3726,6 +3882,35 @@ mod tests {
         );
     }
 
+    /// rv23 #4: the fact-key lists are bounded with the newest kept, and a
+    /// snapshot that stored them as sets reads back.
+    #[test]
+    fn the_seen_fact_lists_are_bounded() {
+        let mut m = base();
+        for i in 0..SEEN_KEYS_MAX + 10 {
+            let (n, _) = step(
+                &m,
+                &SupMsg::Deaf {
+                    child: "nobody".into(),
+                    key: format!("deaf:{i}"),
+                    now_ms: 1,
+                },
+            );
+            m = n;
+        }
+        assert_eq!(m.deaf_seen.len(), SEEN_KEYS_MAX);
+        assert!(m.deaf_seen.contains(&format!("deaf:{}", SEEN_KEYS_MAX + 9)));
+        assert!(!m.deaf_seen.contains("deaf:0"), "the oldest key is dropped");
+        let mut k = RecentKeys::default();
+        for i in 0..SEEN_KEYS_MAX + 3 {
+            assert!(k.insert(format!("e{i}")));
+        }
+        assert!(!k.insert(format!("e{}", SEEN_KEYS_MAX + 2)), "a held key is not new");
+        assert_eq!(k.len(), SEEN_KEYS_MAX);
+        let old: RecentKeys = serde_json::from_str(r#"["a","b"]"#).unwrap();
+        assert!(old.contains("a") && old.contains("b"));
+    }
+
     #[test]
     fn a_deaf_fact_ends_the_incarnation_once_however_often_it_is_read() {
         let d = |t| SupMsg::Deaf {
@@ -4680,6 +4865,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// rv23 #5 (review S3): the ids come from untrusted escalation text, so
+    /// the argv is bounded: an over-long id is not an id, and one page holds
+    /// at most `BEAD_HOLD_MAX` beads (first seen win).
+    #[test]
+    fn bead_hold_argv_refuses_overlong_ids_and_caps_the_count() {
+        let long = format!("bd-{}", "a".repeat(BEAD_ID_MAX));
+        assert!(
+            bead_hold_argv(&format!("see {long}"), "budget").is_none(),
+            "an id past BEAD_ID_MAX is not held"
+        );
+        let many: Vec<String> = (0..BEAD_HOLD_MAX + 5).map(|i| format!("bd-x{i}")).collect();
+        let v = bead_hold_argv(&many.join(" "), "budget").unwrap();
+        let ids = &v[5..];
+        assert_eq!(ids.len(), BEAD_HOLD_MAX, "{v:?}");
+        assert_eq!(ids, &many[..BEAD_HOLD_MAX]);
+        assert_eq!(v[4], "bd-x0", "the first id is still --corr");
+        let ok = format!("bd-{}", "a".repeat(BEAD_ID_MAX - 3));
+        assert_eq!(ok.len(), BEAD_ID_MAX);
+        assert!(bead_hold_argv(&ok, "").is_some(), "BEAD_ID_MAX itself is fine");
     }
 
     #[test]

@@ -206,6 +206,24 @@ impl FileStore {
             .join(format!("doorbell-journal-{workspace}.{generation}.jsonl"))
     }
 
+    /// rv23 #3: the sweep beat. A no-op sweep writes no journal row any more,
+    /// so `/health`'s `sweep.last_age_s` reads this stamp (its mtime) first
+    /// and the journal's mtime only as the fallback for an older daemon.
+    pub fn sweep_stamp_file(&self, workspace: &str) -> PathBuf {
+        self.state_dir
+            .join("doorbell")
+            .join(format!("{workspace}.sweep"))
+    }
+
+    /// Stamp the sweep beat: one small overwrite, never an append.
+    pub fn touch_sweep(&self, workspace: &str, now_unix: u64) -> std::io::Result<()> {
+        let path = self.sweep_stamp_file(workspace);
+        if let Some(parent) = path.parent() {
+            private_dir(parent)?;
+        }
+        std::fs::write(&path, now_unix.to_string())
+    }
+
     pub fn audit_file(&self, workspace: &str) -> PathBuf {
         self.state_dir
             .join("doorbell")
@@ -602,17 +620,20 @@ impl FileStore {
     /// order the reader folds them, and a rotation that dropped a contiguous range
     /// still reads as 0% holes rather than as a burn.
     pub fn journal_seq_holes(&self, workspace: &str) -> SeqHoles {
-        let mut lines: Vec<String> = Vec::new();
+        // rv23 #3: borrow the lines from the file buffers. This runs on every
+        // `/health` refresh, and an owned `String` per retained row was the
+        // probe's second-largest share of the idle RSS climb.
+        let mut raws: Vec<String> = Vec::new();
         for n in (1..=RETENTION_GENS).rev() {
             let p = self.journal_gen_file(workspace, n);
             if let Ok(raw) = std::fs::read_to_string(&p) {
-                lines.extend(raw.lines().map(str::to_string));
+                raws.push(raw);
             }
         }
         if let Ok(raw) = std::fs::read_to_string(self.journal_file(workspace)) {
-            lines.extend(raw.lines().map(str::to_string));
+            raws.push(raw);
         }
-        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let refs: Vec<&str> = raws.iter().flat_map(|raw| raw.lines()).collect();
         seq_holes(&refs)
     }
 
@@ -709,6 +730,25 @@ impl FileStore {
     /// legacy (tolerated, no contiguity check). Every torn fold appends a
     /// `LoudMiss journal_torn_tail` audit row — silence is the bug.
     pub fn fold_workspace(&self, workspace: &str) -> Fold {
+        self.fold_chain(workspace, true)
+    }
+
+    /// rv23 #3: the same loud fold, for a caller that only wants `torn` (and
+    /// `first_seq`). `rows` comes back EMPTY: every row is parsed, checked and
+    /// dropped on the spot instead of being held.
+    ///
+    /// Root cause of the idle daemon's RSS climb: `/health` refreshes every
+    /// 15 s and its torn-tail probe called `fold_workspace`, which builds a
+    /// `serde_json::Value` tree for EVERY retained row and holds them all at
+    /// once, only to read `torn`. The peak grew with the journal (about 1.4
+    /// no-op rows/s idle), and the freed small-zone pages stayed resident.
+    /// Measured A/B, 240 s idle: 9.7 KB/s with the probe, 3.4 KB/s without
+    /// `torn_tails_among`, 0.6 KB/s with no health refresh at all.
+    pub fn torn_probe(&self, workspace: &str) -> Fold {
+        self.fold_chain(workspace, false)
+    }
+
+    fn fold_chain(&self, workspace: &str, keep_rows: bool) -> Fold {
         let mut rows = Vec::new();
         let mut first_seq: Option<u64> = None;
         let mut prev_seq: Option<u64> = None;
@@ -776,7 +816,9 @@ impl FileStore {
                     }
                     prev_seq = Some(s);
                 }
-                rows.push(v);
+                if keep_rows {
+                    rows.push(v);
+                }
             }
         }
         if let Some(t) = torn.as_mut() {
@@ -843,7 +885,7 @@ impl FileStore {
     pub fn any_torn_tail_among(&self, hosted: &[&str]) -> bool {
         hosted
             .iter()
-            .any(|ws| self.fold_workspace(ws).torn.is_some())
+            .any(|ws| self.torn_probe(ws).torn.is_some())
     }
 
     /// The SAME rule as [`Self::any_torn_tail_among`] (a tear on a workspace we
@@ -857,7 +899,7 @@ impl FileStore {
     pub fn torn_tails_among(&self, hosted: &[&str]) -> Vec<(String, TornTail)> {
         hosted
             .iter()
-            .filter_map(|ws| self.fold_workspace(ws).torn.map(|t| ((*ws).to_string(), t)))
+            .filter_map(|ws| self.torn_probe(ws).torn.map(|t| ((*ws).to_string(), t)))
             .collect()
     }
 
@@ -1517,6 +1559,39 @@ mod tests {
                 .any(|l| l.contains("journal_torn_tail") || l.contains(".jsonl")),
             "the marker must name the tear, not just exist: {marker:?}"
         );
+    }
+
+    /// rv23 #3: the `/health` probe reads the tear WITHOUT holding the rows.
+    /// Same verdict as the full fold (tear and seq gap), but `rows` is empty,
+    /// so a 15 s probe no longer builds one `Value` tree per retained row.
+    #[test]
+    fn the_torn_probe_agrees_with_the_fold_and_holds_no_rows() {
+        let (st, _dir) = test_store("rv23-probe");
+        for seq in 1..=50u64 {
+            append_seq(&st, "w", seq);
+        }
+        let clean = st.torn_probe("w");
+        assert!(clean.torn.is_none());
+        assert_eq!(clean.first_seq, Some(1));
+        assert!(clean.rows.is_empty(), "the probe holds no rows");
+        assert_eq!(st.fold_workspace("w").rows.len(), 50, "the fold still does");
+        append_seq(&st, "w", 60);
+        let (probe, fold) = (st.torn_probe("w"), st.fold_workspace("w"));
+        let (p, f) = (probe.torn.expect("gap"), fold.torn.expect("gap"));
+        assert_eq!((p.at_line, p.missing_seqs), (f.at_line, f.missing_seqs));
+        assert!(probe.rows.is_empty());
+    }
+
+    /// rv23 #3: and the health entry points use the probe, not the fold.
+    #[test]
+    fn the_health_tear_probes_do_not_fold_the_rows() {
+        let src = include_str!("store.rs");
+        for name in ["pub fn torn_tails_among", "pub fn any_torn_tail_among"] {
+            let at = src.find(name).expect(name);
+            let body = &src[at..at + src[at..].find("\n    }\n").expect("body end")];
+            assert!(body.contains("torn_probe("), "{name} must use torn_probe: {body}");
+            assert!(!body.contains("fold_workspace("), "{name} folds the rows: {body}");
+        }
     }
 
     #[test]
