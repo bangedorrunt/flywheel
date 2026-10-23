@@ -2727,9 +2727,11 @@ steps:
     /// following await verifies. If the two ever name different paths, a green
     /// await proves nothing — which is why this is asserted (and mutation-
     /// proven red) rather than assumed. The waits carry their own budget and
-    /// fail loud with a "wave in flight ... extend" message so a real wave is
+    /// fail loud with a "wave in flight ... widen" message so a real wave is
     /// never silently dispatched over (boundary-discipline: per-step budgets,
-    /// not one total): `--timeout` stays the run's outer bound.
+    /// not one total): the CLI `--timeout` flag stays the run's outer bound,
+    /// but the await echo must never spell it (bd-mszc: the classifier reads
+    /// "--timeout" as transport ambiguity).
     #[test]
     fn compose_stage_awaits_completion() {
         use toron_workflow::schema::Action;
@@ -2805,9 +2807,19 @@ steps:
                 command.contains("wave in flight"),
                 "await_{stage_name} fails loud when the wave is in flight: {command}"
             );
+            // The message must name the extension point WITHOUT the literal
+            // `--timeout`: that string trips the journal's Ambiguous
+            // classifier (it contains "timeout"), which journals the first
+            // miss as unknown instead of failed — and a retry that never
+            // re-observes parks the run forever (bd-mszc). "outer bound"
+            // names the same --timeout / FLYWHEEL_COMPOSE_MAX_SECONDS knob.
             assert!(
-                command.contains("--timeout"),
-                "await_{stage_name} names the extension point (--timeout): {command}"
+                command.contains("outer bound"),
+                "await_{stage_name} names the extension point (outer bound): {command}"
+            );
+            assert!(
+                !command.contains("--timeout"),
+                "await_{stage_name} must not spell --timeout: the classifier reads it as ambiguity: {command}"
             );
             // Per-step, not one total: the retry budget is this step's own bound.
             assert!(

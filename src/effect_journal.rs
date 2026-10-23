@@ -276,10 +276,13 @@ pub fn effect_runner(
             // the engine runs the embedding's VerifySink FIRST and hands the
             // already-executed result to this runner via
             // `RunContext.provider_result` — the sink stays the executor
-            // (ADR-0024 Spec 2); the journal observes the result, it never
-            // re-runs the command. No provider_result means the invocation
-            // came from outside the engine's verify path, so there is no
-            // observed effect to journal and the row would be a lie.
+            // (ADR-0024 Spec 2). The result is returned as the step value
+            // with no journal row: a verify is an observation, not an
+            // effect, and a persisted outcome would replay stale checks
+            // instead of re-observing (bd-mszc). No provider_result means
+            // the invocation came from outside the engine's verify path, so
+            // there is no observed result to return and refusing is the
+            // only honest answer.
             SINK_VERIFY => {
                 let Some(result) = inv.run.provider_result.clone() else {
                     // bd-v9em: no observed effect, no row, no run — refuse
@@ -298,11 +301,14 @@ pub fn effect_runner(
                 // `{action: …}` no-op, so calling it adds no evidence, and
                 // calling it wholesale would double-perform the command the
                 // moment a runner grew real verify handling.
-                Ok(fenced_outcome(dispatch_once(
-                    &dispatcher,
-                    inv,
-                    Box::new(move || provider_outcome(Ok(result))),
-                )))
+                //
+                // A verify is an observation the sink already executed, not
+                // an external effect: journaling it would replay a stale
+                // check instead of re-observing, so a retry-over-verify could
+                // never see a newly written marker (bd-mszc). Return the
+                // observed result as the step value with no journal row —
+                // same shape the fenced path produced, minus the journal.
+                Ok(verify_step_value(inv, result))
             }
             // A sink this runner does not cover is refused loud (fail-closed):
             // journaling it would settle work nobody did, and running it
@@ -310,6 +316,27 @@ pub fn effect_runner(
             other => Ok(refuse_unjournaled(other, "no provider performs this sink")),
         }
     })
+}
+
+/// The step value for an observed verify result, journal-free (bd-mszc). The
+/// sink already executed the check; persisting the outcome would replay a
+/// stale check on every re-dispatch instead of re-observing, so a
+/// retry-over-verify could never see a newly written marker. Shape matches
+/// what the fenced path produced, so callers read the same fields — minus
+/// the journal row. `effect_state` names the outcome classification, never
+/// a persisted row.
+fn verify_step_value(inv: &ActionInvocation, result: Value) -> Value {
+    match in_band_failure(&result) {
+        None => result,
+        Some(msg) => serde_json::json!({
+            "ok": false,
+            "error": msg,
+            "effect_key": effect_key_for(inv),
+            "effect_state": "failed",
+            "outcome": result,
+            "stage": "effect",
+        }),
+    }
 }
 
 /// Refuse an effectful leaf with no journaled provider (bd-v9em, ADR-0035
@@ -1451,10 +1478,11 @@ mod tests {
         );
     }
 
-    /// bd-engine-run-path-journaling-fwlx (the Spec 6 flip): verify journals
-    /// around the engine-observed VerifySink result carried on the invocation.
+    /// bd-mszc: a verify is an observation, not an effect — the observed
+    /// result returns as the step value with NO journal row, so a later
+    /// re-dispatch re-observes instead of replaying a stale check.
     #[tokio::test]
-    async fn verify_sink_journals_around_the_engine_observed_result() {
+    async fn verify_observation_returns_without_a_journal_row() {
         let (_dir, store) = test_store().await;
         let inner: EffectRunner =
             Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
@@ -1468,22 +1496,22 @@ mod tests {
 
         let out = fx(&inv).expect("runner returns a value");
 
-        assert_eq!(out["ok"], json!(true), "the observed result replays: {out}");
-        let key = effect_key_for(&inv);
-        let row = store.get_effect(&key).await.unwrap().expect("row");
-        assert_eq!(row.state, EffectState::Settled);
-        assert_eq!(row.action_type, "verify");
-        let attempts = store.list_attempts(&key).await.unwrap();
+        assert_eq!(out["ok"], json!(true), "the observed result passes through: {out}");
         assert!(
-            attempts.iter().any(|a| a.state == EffectState::Settled),
-            "the settle is journaled evidence: {attempts:?}"
+            store
+                .get_effect(&effect_key_for(&inv))
+                .await
+                .unwrap()
+                .is_none(),
+            "no journal row for a re-observable check"
         );
     }
 
-    /// A failed verify (the command exited non-zero) journals a PROVEN
-    /// failure — the process exit is evidence, not transport ambiguity.
+    /// A failed verify (the command exited non-zero) returns a FAILED step
+    /// value with no journal row — the process exit is evidence, and the
+    /// next evaluation re-observes instead of replaying the failure.
     #[tokio::test]
-    async fn failed_verify_journals_failed_not_unknown() {
+    async fn failed_verify_returns_failed_without_a_row() {
         let (_dir, store) = test_store().await;
         let inner: EffectRunner =
             Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
@@ -1495,12 +1523,15 @@ mod tests {
         let out = fx(&inv).expect("runner returns a value");
 
         assert_eq!(out["effect_state"], json!("failed"), "{out}");
-        let row = store
-            .get_effect(&effect_key_for(&inv))
-            .await
-            .unwrap()
-            .expect("row");
-        assert_eq!(row.state, EffectState::Failed);
+        assert_eq!(out["ok"], json!(false), "{out}");
+        assert!(
+            store
+                .get_effect(&effect_key_for(&inv))
+                .await
+                .unwrap()
+                .is_none(),
+            "no journal row for a re-observable check"
+        );
     }
 
     /// A verify invocation with NO observed result (outside the engine's
@@ -1531,24 +1562,32 @@ mod tests {
         );
     }
 
-    /// A journaled verify replays its stored outcome without re-running — the
-    /// second dispatch must not re-execute the command.
+    /// bd-mszc: a verify re-dispatch re-observes — it must NOT replay a
+    /// stale outcome. Fail once (marker absent), then succeed (marker
+    /// written): the second evaluation returns the NEW outcome, which is
+    /// what lets a retry-over-verify poll converge instead of parking
+    /// forever on the first miss.
     #[tokio::test]
-    async fn terminal_verify_effect_replays_without_rerunning() {
+    async fn verify_redispatch_reobserves_the_latest_result() {
         let (_dir, store) = test_store().await;
         let inner: EffectRunner =
             Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
         let fx = effect_runner(inner, store.clone(), None);
-        let mut inv = invocation(verify(), "run-verify-replay", "gate");
-        inv.run.provider_result = Some(json!({ "ok": true, "exit": 0 }));
+        let mut inv = invocation(verify(), "run-verify-reobserve", "gate");
+        inv.run.provider_result = Some(json!({ "ok": false, "error": "missing" }));
 
-        fx(&inv).expect("first");
-        let second = fx(&inv).expect("replay");
+        let first = fx(&inv).expect("first evaluation");
+        assert_eq!(first["ok"], json!(false), "{first}");
+
+        // The marker appears between evaluations: same invocation, new
+        // observed result — the runner must hand back the new outcome.
+        inv.run.provider_result = Some(json!({ "ok": true, "exit": 0 }));
+        let second = fx(&inv).expect("re-observation");
 
         assert_eq!(
             second["ok"],
             json!(true),
-            "the stored outcome replays: {second}"
+            "a re-dispatched verify returns the latest observation, never a replay: {second}"
         );
     }
 
