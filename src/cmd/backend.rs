@@ -40,7 +40,13 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             let compiled = crate::backend::compiled_backends();
             let mut rows: Vec<Value> = Vec::new();
             // multiplexers
-            for (name, stub) in [("herdr", false), ("superlogical", true)] {
+            // Ready only when this binary was built with the rex backend.
+            // A default build still lists the name so the env contract is
+            // visible, and marks it stub because the feature is off.
+            for (name, stub) in [
+                ("herdr", false),
+                ("superlogical", cfg!(not(feature = "backend-superlogical"))),
+            ] {
                 rows.push(json!({
                     "name": name,
                     "kind": "multiplexer",

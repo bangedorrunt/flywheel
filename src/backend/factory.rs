@@ -64,11 +64,10 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
                     .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
             Ok(Box::new(backend))
         }
-        // superlogical: stub backend (bd-toron-superlogical-stubs). With
-        // the feature on, construct the stub (name() enumerable, method
-        // defaults give the clear "not yet released / on hold" error). With
-        // the feature off, the arm is compiled out and the name falls through
-        // to `other` -> "not compiled in".
+        // superlogical: rex CLI (feature `backend-superlogical`). With the
+        // feature off, the arm is compiled out and the name falls through
+        // to `other` -> "not compiled in". subscribe, agent_wait, and
+        // agent_send_keys stay Unsupported and name the method.
         #[cfg(feature = "backend-superlogical")]
         "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
         other => Err(backend_not_compiled_or_unknown(
@@ -310,6 +309,11 @@ mod tests {
                 assert!(
                     message.contains("superlogical"),
                     "names the backend: {message}"
+                );
+                assert!(message.contains("subscribe"), "names the method: {message}");
+                assert!(
+                    !message.contains("not yet released"),
+                    "unimplemented is not a release excuse: {message}"
                 );
             }
             Ok(_) => panic!("stub must not Ok"),
