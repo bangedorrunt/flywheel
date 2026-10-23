@@ -1968,9 +1968,25 @@ mod durable_tests {
             &[("k".to_string(), "p".to_string(), "d".to_string())]
         );
         assert!(matches!(msg, Msg::DiagnoseFailed { .. }));
-        let (next, cmds) = workspace::tick(&workspace::WorkspaceModel::default(), &msg);
+        // The bell-fold fence forbids the default-model literal (production
+        // Facts must tick the live model), so fold against an inhabited one:
+        // stronger anyway — a quiet fold must preserve what it does not
+        // change. The message names __shadow_failure__, so the probe key is
+        // untouched by construction.
+        let mut model = workspace::WorkspaceModel::default();
+        model.swarm.heal_states.insert(
+            "probe".into(),
+            crate::durable::HealState {
+                awaiting_clear: true,
+                ..Default::default()
+            },
+        );
+        let (next, cmds) = workspace::tick(&model, &msg);
         assert!(cmds.is_empty());
-        assert!(next.swarm.heal_states.is_empty());
+        assert!(
+            next.swarm.heal_states.get("probe").expect("kept").awaiting_clear,
+            "a quiet fold preserves the model"
+        );
     }
 
     #[test]
@@ -1986,9 +2002,22 @@ mod durable_tests {
         assert_eq!(rec.ran.lock().unwrap().len(), 1);
         let msg = workspace::WorkspaceProgram::failure(&Failure::of_cause(cause));
         assert!(matches!(msg, Msg::DiagnoseFailed { ref name } if name == SHADOW_FAILURE_NAME));
-        let (next, cmds) = workspace::tick(&workspace::WorkspaceModel::default(), &msg);
+        // Same inhabited-model fold as above: the fence owns the literal,
+        // quietness is proven by preservation, not by an empty model.
+        let mut model = workspace::WorkspaceModel::default();
+        model.swarm.heal_states.insert(
+            "probe".into(),
+            crate::durable::HealState {
+                awaiting_clear: true,
+                ..Default::default()
+            },
+        );
+        let (next, cmds) = workspace::tick(&model, &msg);
         assert!(cmds.is_empty());
-        assert!(next.swarm.heal_states.is_empty());
+        assert!(
+            next.swarm.heal_states.get("probe").expect("kept").awaiting_clear,
+            "a quiet fold preserves the model"
+        );
     }
 
     #[test]
