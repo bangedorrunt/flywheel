@@ -6541,3 +6541,435 @@ mod gs048_reclassify_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// T2 shadow Loop (bd-gwdh): WorkspaceProgram + ShadowDriver.
+//
+// The live fold as a framework Program: Model = WorkspaceModel,
+// Msg = workspace::Msg, Cmd = workspace::Cmd. update() IS tick, so the
+// fold stays correct by construction; the tests pin the agreement.
+// failure() names an outcome for every cause kind: all four land on a
+// DiagnoseFailed sentinel no real pane ever carries, which folds quiet
+// (no model change, no commands). ShadowInterpret completes every command
+// as that quiet message: shadow replays stored outcomes, never performs
+// effects. Production use is ShadowDriver::observe (pure fold + compare,
+// no I/O, no clock, no Loop); the one-line live hook is captain-placed
+// (doorbell.rs is held by a sibling lane) — residual on bd-gwdh.
+// ---------------------------------------------------------------------------
+
+use toron_core::kernel::{Boot, Cmd as CmdTrait, Durability, Effect, Failure, Interpret, Program, Update};
+
+/// Failure re-entry no real pane ever carries: heal_states is keyed by
+/// pane name, so this emits no commands and touches no domain state on any
+/// live model (only the ambient per-message bookkeeping every tick does).
+pub const SHADOW_FAILURE_NAME: &str = "__shadow_failure__";
+
+/// Stable content hash for durable intent keys (std hashes are randomly
+/// seeded per process; journal keys must survive a restart).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+impl CmdTrait for Cmd {
+    fn durability(&self) -> Durability {
+        match self {
+            // Reads, signals, registrations, observations: journal nothing.
+            Cmd::FetchInbox | Cmd::CheckAckSla | Cmd::RestartWatch | Cmd::FactMiss { .. }
+            | Cmd::Audit { .. } | Cmd::WaitCorr { .. } | Cmd::Wait | Cmd::LoudMiss { .. } => {
+                Durability::Ephemeral
+            }
+            // Delivered batch: durable under its content identity. T3 assigns
+            // executor-owned keys per arm; shadow only needs stability.
+            Cmd::Digest { entries } => Durability::Durable {
+                key: format!("digest:{:x}", fnv1a64(format!("{entries:?}").as_bytes())),
+            },
+            // Sends/dispatches: durable intent keyed by (kind, identity).
+            Cmd::Prompt { pin, line } => Durability::Durable {
+                key: format!("prompt:{pin}:{:x}", fnv1a64(line.as_bytes())),
+            },
+            Cmd::Send { name, text } => Durability::Durable {
+                key: format!("send:{name}:{:x}", fnv1a64(text.as_bytes())),
+            },
+            Cmd::DispatchImmediate { name, text } => Durability::Durable {
+                key: format!("dispatch:{name}:{:x}", fnv1a64(text.as_bytes())),
+            },
+            Cmd::PinStamp { bead_id, pin } => Durability::Durable {
+                key: format!("pinstamp:{bead_id}:{pin}"),
+            },
+            Cmd::Blocked { name } => Durability::Durable {
+                key: format!("blocked:{name}"),
+            },
+            Cmd::Nudge { name } => Durability::Durable {
+                key: format!("nudge:{name}"),
+            },
+            Cmd::Diagnose { name, reason } => Durability::Durable {
+                key: format!("diagnose:{name}:{:x}", fnv1a64(reason.as_bytes())),
+            },
+            Cmd::Respawn { name, reason } => Durability::Durable {
+                key: format!("respawn:{name}:{:x}", fnv1a64(reason.as_bytes())),
+            },
+            Cmd::Reclaim {
+                bead_id,
+                pin,
+                herdr_name,
+                ..
+            } => Durability::Durable {
+                key: format!("reclaim:{bead_id}:{pin}:{herdr_name}"),
+            },
+            Cmd::SqliteUpsert { corr, .. } => Durability::Durable {
+                key: format!("upsert:{corr}"),
+            },
+            Cmd::Publish { corr, .. } => Durability::Durable {
+                key: format!("publish:{corr}"),
+            },
+            Cmd::Invoke { corr, .. } => Durability::Durable {
+                key: format!("invoke:{corr}"),
+            },
+            Cmd::RebindBinding { effect_key, .. } => Durability::Durable {
+                key: effect_key.clone(),
+            },
+            Cmd::Reclassify { effect_key, .. } => Durability::Durable {
+                key: effect_key.clone(),
+            },
+        }
+    }
+}
+
+pub struct WorkspaceProgram;
+
+impl Program for WorkspaceProgram {
+    type Model = WorkspaceModel;
+    type Msg = Msg;
+    type Cmd = Cmd;
+    type Err = String;
+
+    fn init(_boot: &Boot) -> Update<WorkspaceModel, Cmd> {
+        Update::quiet(WorkspaceModel::default())
+    }
+
+    fn update(model: &WorkspaceModel, msg: &Msg) -> Update<WorkspaceModel, Cmd> {
+        let (model, commands) = tick(model, msg);
+        Update { model, commands }
+    }
+
+    fn failure(failure: &Failure<String>) -> Msg {
+        let _ = failure;
+        Msg::DiagnoseFailed {
+            name: SHADOW_FAILURE_NAME.into(),
+        }
+    }
+}
+
+/// Shadow interpreter: completes every command as the quiet sentinel.
+/// Outcomes are replayed, never performed — no services, no I/O.
+pub struct ShadowInterpret;
+
+impl Interpret<WorkspaceProgram> for ShadowInterpret {
+    fn interpret(_cmd: &Cmd) -> Effect<Msg, String> {
+        Effect::succeed(Msg::DiagnoseFailed {
+            name: SHADOW_FAILURE_NAME.into(),
+        })
+    }
+}
+
+/// Production shadow: pure fold + compare. No I/O, no clock, no Loop —
+/// the caller logs what drain_divergences returns. The Loop-boot half of
+/// T2 is proven in tests; this is the zero-observable-cost half.
+pub struct ShadowDriver {
+    divergences: Vec<String>,
+}
+
+impl ShadowDriver {
+    pub fn new() -> Self {
+        Self {
+            divergences: Vec::new(),
+        }
+    }
+
+    /// Fold msg through the Program and compare with the live outcome.
+    /// Pure: records, never logs.
+    pub fn observe(
+        &mut self,
+        model: &WorkspaceModel,
+        msg: &Msg,
+        live_next: &WorkspaceModel,
+        live_cmds: &[Cmd],
+    ) -> bool {
+        let out = WorkspaceProgram::update(model, msg);
+        if out.model == *live_next && out.commands == *live_cmds {
+            true
+        } else {
+            self.divergences.push(format!(
+                "shadow divergence on {msg:?}: live {} cmds vs shadow {} cmds",
+                live_cmds.len(),
+                out.commands.len()
+            ));
+            false
+        }
+    }
+
+    pub fn drain_divergences(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.divergences)
+    }
+}
+
+impl Default for ShadowDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+    use std::sync::Arc;
+    use toron_core::kernel::{
+        AppendError, Defect, DurableLog, Exit, FileLog, Layer, Loop, ManagedRuntime, Producer,
+        Runtime, ServiceTag,
+    };
+
+    #[derive(Clone)]
+    struct NoopSvc;
+    struct NoopTag;
+    impl ServiceTag for NoopTag {
+        type Service = NoopSvc;
+        const ID: &'static str = "workspace-shadow-test-noop";
+    }
+
+    fn test_runtime() -> ManagedRuntime {
+        let layer = Layer::<NoopTag, std::convert::Infallible, ()>::from_value(NoopSvc);
+        ManagedRuntime::make(&layer).expect("value layer builds")
+    }
+
+    fn msg_battery() -> Vec<Msg> {
+        vec![
+            Msg::Tick { now: 1 },
+            Msg::Tick { now: 1_000_000 },
+            Msg::Sweep { now: 7 },
+            Msg::AckSlaTick { now: 9 },
+            Msg::WatchDied,
+            Msg::DiagnoseFailed { name: "pane".into() },
+            Msg::WatchNdjson { line: "not json".into() },
+            Msg::InboxItems { raw: "blob".into(), pin: "Pin".into() },
+            Msg::InboxRows { rows: vec![], pin: "Pin".into() },
+            Msg::HerdrStatus { pin: "P".into(), status: "idle".into() },
+            Msg::Fact { summary: "s".into() },
+            Msg::SlaFired { posts: vec!["c1".into()] },
+            Msg::Reclaim {
+                bead_id: "bd-x".into(),
+                holder_pin: "H".into(),
+                claimant_pin: "C".into(),
+                is_live: false,
+                reason: "test".into(),
+            },
+            Msg::Heal { name: "N".into(), status: "dead".into(), exited: true },
+            Msg::ClaimNudge { name: "N".into(), bead_id: "bd-x".into() },
+            Msg::CloseNudge { name: "N".into(), bead_id: "bd-x".into(), title: "t".into() },
+            Msg::Receipt { corr: "k".into(), receipt: Receipt::default() },
+            Msg::RoleBound { role: "captain".into(), pin: "P".into() },
+            Msg::Presence { pin: "P".into(), state: "bogus".into() },
+            Msg::HumanDecision { corr: "nope".into(), verdict: "approve".into() },
+            Msg::MaterialContext {
+                goal: "g".into(),
+                explicit_topology: None,
+                reason: "r".into(),
+            },
+            Msg::DecisionReady {
+                goal: "g".into(),
+                primitive: "none".into(),
+                topology: "open".into(),
+                argv: vec![],
+                decide_reason: "d".into(),
+                explicit_topology: None,
+            },
+            Msg::Herdr {
+                event: crate::durable::PollEvent {
+                    event_type: "status".into(),
+                    pane_id: "w1:p1".into(),
+                    agent: None,
+                    status: Some("idle".into()),
+                    seq: 1,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn workspace_program_fold_matches_live_tick() {
+        let seeded = tick(&WorkspaceModel::default(), &Msg::Tick { now: 1 }).0;
+        for model in [WorkspaceModel::default(), seeded] {
+            for msg in msg_battery() {
+                let live = tick(&model, &msg);
+                let shadow = WorkspaceProgram::update(&model, &msg);
+                assert_eq!((shadow.model, shadow.commands), live, "divergence on {msg:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn init_is_quiet_default() {
+        let out = WorkspaceProgram::init(&Boot::default());
+        assert_eq!(out.model, WorkspaceModel::default());
+        assert!(out.commands.is_empty());
+    }
+
+    /// Every tick bumps ambient per-message bookkeeping (seq, wake
+    /// counters) even when it changes no domain state. Mask those before
+    /// comparing, so the tests pin domain quiet, not bookkeeping.
+    fn without_ambient(m: &WorkspaceModel) -> WorkspaceModel {
+        let mut m = m.clone();
+        m.seq = 0;
+        m.wake_counters.clear();
+        m
+    }
+
+    #[test]
+    fn failure_names_quiet_outcome_for_every_cause_kind() {
+        let failures: Vec<Failure<String>> = vec![
+            Failure::Fail("boom".into()),
+            Failure::Defect(Defect::new("defect")),
+            Failure::Interrupted,
+            Failure::NotAppended(AppendError::PartialIdentity),
+        ];
+        let mut model = WorkspaceModel::default();
+        model.swarm.heal_states.insert(
+            "live-pane".into(),
+            crate::durable::HealState { awaiting_clear: true, ..Default::default() },
+        );
+        for f in &failures {
+            let msg = WorkspaceProgram::failure(f);
+            let (next, cmds) = tick(&model, &msg);
+            assert!(cmds.is_empty(), "failure outcome must emit nothing");
+            assert_eq!(
+                without_ambient(&next),
+                without_ambient(&model),
+                "failure outcome must touch no domain state"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_keys_are_stable_and_variant_scoped() {
+        let a = Cmd::Send { name: "n".into(), text: "t".into() };
+        let b = Cmd::Send { name: "n".into(), text: "t".into() };
+        let c = Cmd::Send { name: "n".into(), text: "other".into() };
+        let key = |c: &Cmd| match c.durability() {
+            Durability::Durable { key } => key,
+            Durability::Ephemeral => "ephemeral".into(),
+        };
+        assert_eq!(key(&a), key(&b));
+        assert_ne!(key(&a), key(&c));
+        assert_ne!(key(&a), key(&Cmd::DispatchImmediate { name: "n".into(), text: "t".into() }));
+        for ephemeral in [Cmd::FetchInbox, Cmd::CheckAckSla, Cmd::RestartWatch, Cmd::Wait] {
+            assert_eq!(ephemeral.durability(), Durability::Ephemeral);
+        }
+        let reclassify = Cmd::Reclassify {
+            goal: "g".into(),
+            pin: "p".into(),
+            explicit_topology: None,
+            reason: "r".into(),
+            effect_key: "k".into(),
+        };
+        match reclassify.durability() {
+            Durability::Durable { key } => assert_eq!(key, "k"),
+            Durability::Ephemeral => panic!("reclassify is durable"),
+        }
+    }
+
+    #[test]
+    fn interpret_completes_commands_as_quiet_followup() {
+        let cmd = Cmd::Send { name: "n".into(), text: "t".into() };
+        let exit = Runtime::run(ShadowInterpret::interpret(&cmd));
+        assert!(exit.is_success());
+        let Exit::Success(msg) = exit else {
+            panic!("shadow interpret succeeds");
+        };
+        let (next, cmds) = tick(&WorkspaceModel::default(), &msg);
+        assert_eq!(without_ambient(&next), without_ambient(&WorkspaceModel::default()));
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn loop_boots_and_recovers_across_crash() {
+        let dir = std::env::temp_dir().join(format!("flywheel-ws-shadow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("shadow.jsonl");
+        let msgs = vec![Msg::Tick { now: 1 }, Msg::Tick { now: 2 }, Msg::Sweep { now: 3 }];
+
+        let rt = test_runtime();
+        let log: Arc<dyn DurableLog> = Arc::new(FileLog::open(&path).expect("open log"));
+        let mut loop_ = Loop::<WorkspaceProgram, ShadowInterpret>::boot(
+            &Boot::default(),
+            rt,
+            log,
+            Producer::new("ws-shadow-file"),
+        )
+        .expect("boot runs init");
+        for msg in &msgs {
+            loop_.send(msg.clone()).expect("send folds");
+        }
+        assert!(path.exists(), "the journal reached disk");
+        drop(loop_); // Crash: no shutdown, no snapshot.
+
+        let rt = test_runtime();
+        let log: Arc<dyn DurableLog> = Arc::new(FileLog::open(&path).expect("reopen log"));
+        let recovered = Loop::<WorkspaceProgram, ShadowInterpret>::recover(
+            &Boot::default(),
+            rt,
+            log,
+            Producer::new("ws-shadow-file"),
+        )
+        .expect("recover replays the journal");
+        let sentinel = Msg::DiagnoseFailed { name: SHADOW_FAILURE_NAME.into() };
+        let mut live = WorkspaceModel::default();
+        for msg in &msgs {
+            let (m, cmds) = tick(&live, msg);
+            live = m;
+            // The loop journals interpreter follow-ups too, so the live
+            // model must fold them to match what recover replays.
+            for _ in &cmds {
+                let (m2, follow) = tick(&live, &sentinel);
+                assert!(follow.is_empty());
+                live = m2;
+            }
+        }
+        assert_eq!(recovered.model(), &live, "recover converges to the live model");
+        assert!(recovered.in_flight().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shadow_driver_soak_reports_zero_divergence() {
+        let mut driver = ShadowDriver::new();
+        let mut model = WorkspaceModel::default();
+        for (i, msg) in msg_battery().into_iter().enumerate() {
+            let (next, cmds) = tick(&model, &msg);
+            assert!(driver.observe(&model, &msg, &next, &cmds), "divergence on {msg:?}");
+            model = next;
+            let _ = i;
+        }
+        // Second pass over the evolved model: divergence must stay zero.
+        for msg in msg_battery() {
+            let (next, cmds) = tick(&model, &msg);
+            assert!(driver.observe(&model, &msg, &next, &cmds), "divergence on {msg:?}");
+            model = next;
+        }
+        assert!(driver.drain_divergences().is_empty());
+        let _ = model;
+    }
+
+    #[test]
+    fn shadow_driver_records_divergence_instead_of_crashing() {
+        let mut driver = ShadowDriver::new();
+        let model = WorkspaceModel::default();
+        let msg = Msg::Tick { now: 1 };
+        let (next, _) = tick(&model, &msg);
+        assert!(!driver.observe(&model, &msg, &next, &[Cmd::Wait]));
+        assert_eq!(driver.drain_divergences().len(), 1);
+    }
+}
