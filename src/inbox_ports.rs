@@ -13,7 +13,8 @@
 //! - notify: a `notify@1` envelope appended to the supervisor's / captain's
 //!   inbox under a synthetic, stable system producer (the doorbell has no
 //!   key of its own); the normal wake then rings that pane like any other.
-//! - urgency: the head envelope. A `steer@1` body whose `priority` is
+//! - urgency: an unread urgent row (toron's `pending_urgent`, the rule of
+//!   `toron next --peek --urgent`). A `steer@1` body whose `priority` is
 //!   `urgent` is an urgent wake (interrupt, then the urgent line). Anything
 //!   else, including a `notify@1` whose text says "urgent", is normal.
 //!   The supervisor does not type that wake; appending is its job.
@@ -24,7 +25,6 @@ use crate::inbox_host::{Bind, Observation, Ports, Seen};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use toron_core::backend::herdr::{TOKEN_NPUB, TOKEN_PIN};
-use toron_core::envelope::{Envelope, Recipient};
 use toron_core::inbox::InboxStore;
 use toron_core::inbox_program::DeafCause;
 use toron_core::wake::{PaneState, Urgency};
@@ -41,7 +41,7 @@ pub struct FlywheelPorts {
     herdr_was_down: bool,
     facts_seen: BTreeSet<String>,
     warned_store: bool,
-    /// Head urgency from the last `observe`, keyed by npub. `ring` reads it.
+    /// Unread urgency from the last `observe`, keyed by npub. `ring` reads it.
     urgencies: BTreeMap<String, Urgency>,
 }
 
@@ -299,53 +299,34 @@ pub(crate) async fn head_and_cursor(store: &InboxStore, npub: &str) -> (u64, u64
     (head, cursor)
 }
 
-/// Urgency of one envelope. Only a `steer@1` body whose `priority` field is
-/// the string `urgent` is urgent. A `normal` priority, any other value, and
-/// every non-steer contract (including a `notify@1` whose text says "urgent")
-/// are normal. This does not read `op` and does not parse message text.
-pub(crate) fn urgency_of_envelope(env: &Envelope) -> Urgency {
-    if env.contract.name != "steer" || env.contract.major != 1 {
-        return Urgency::Normal;
+/// The urgency `observe` hands `ring`, and whether it read the store for it.
+///
+/// `Urgent` while `npub` has an unread urgent row: toron's `pending_urgent`,
+/// the same rule as `toron next --peek --urgent`. An unread urgent steer stays
+/// urgent when newer normal mail lands behind it, and a read one no longer
+/// counts. Nothing unread (`head <= cursor`) is no read. A failed read is
+/// normal: a missing read must not invent an urgent wake.
+pub(crate) async fn urgency_of_unread(
+    store: &InboxStore,
+    npub: &str,
+    head: u64,
+    cursor: u64,
+) -> (Urgency, bool) {
+    if head <= cursor {
+        return (Urgency::Normal, false);
     }
-    match env.body.get("priority").and_then(Value::as_str) {
-        Some("urgent") => Urgency::Urgent,
-        _ => Urgency::Normal,
-    }
-}
-
-/// The envelope stored at `offset` on the inbox stream, if it parses.
-async fn envelope_at(store: &InboxStore, offset: u64) -> Option<Envelope> {
-    let stream = toron_core::inbox::INBOX_STREAM;
-    // `offset - 1` is the previous row when offsets are contiguous, so the
-    // read is the head and anything newer, not the whole log. A gap (the
-    // previous offset was never committed) falls back to a full read.
-    let narrow = if offset > 1 {
-        store.read_stream(stream, Some(offset - 1)).await.ok()
+    let pending = store
+        .pending_urgent(npub, cursor)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let urgency = if pending {
+        Urgency::Urgent
     } else {
-        None
+        Urgency::Normal
     };
-    let rows = match narrow {
-        Some(rows) if rows.iter().any(|(o, _)| *o == offset) => rows,
-        _ => store.read_stream(stream, None).await.ok()?,
-    };
-    let payload = rows.into_iter().find(|(o, _)| *o == offset)?.1;
-    serde_json::from_str(&payload).ok()
-}
-
-/// Urgency of `npub`'s head mail. `head == 0` is an empty inbox (the log's
-/// first offset is 1). A head that is not this recipient's envelope, or that
-/// does not parse, is normal: a missing read must not invent an urgent wake.
-pub(crate) async fn urgency_of_head(store: &InboxStore, npub: &str, head: u64) -> Urgency {
-    if head == 0 {
-        return Urgency::Normal;
-    }
-    let Some(env) = envelope_at(store, head).await else {
-        return Urgency::Normal;
-    };
-    match &env.to {
-        Recipient::Npub(n) if n == npub => urgency_of_envelope(&env),
-        _ => Urgency::Normal,
-    }
+    (urgency, true)
 }
 
 /// What a ring did. `NoDoor` is the honest "nothing was typed": the harness
@@ -360,12 +341,12 @@ pub(crate) enum RingDone {
 /// Type the wake for `wm`.
 ///
 /// The fold always names the normal wake line; this checks that and then
-/// types from `urgency`, which the caller took from the head envelope. An
-/// urgent head is the urgent line. `route` decides whether there is a door at
+/// types from `urgency`, which the caller took from the unread mail
+/// ([`urgency_of_unread`]). Urgent is the urgent line. `route` decides whether there is a door at
 /// all: [`crate::harness_caps::WakeRoute::Inject`] carries the Interrupt
 /// choice (a hook-capable pane passes `interrupt = false`: the ring stays, the
-/// next tool call is the hook's job), and a no-door route types nothing. A
-/// normal head is the normal line only. One call is one wake.
+/// next tool call is the hook's job), and a no-door route types nothing.
+/// Normal is the normal line only. One call is one wake.
 pub(crate) fn ring_wake(
     typer: &dyn crate::pane_write::PaneTyper,
     pane_id: &str,
@@ -444,7 +425,7 @@ impl Ports for FlywheelPorts {
             let n2 = npub.clone();
             let (head, cursor, urgency) = crate::mail_shim::block_on(async move {
                 let (head, cursor) = head_and_cursor(&store, &n2).await;
-                let urgency = urgency_of_head(&store, &n2, head).await;
+                let (urgency, _) = urgency_of_unread(&store, &n2, head, cursor).await;
                 (head, cursor, urgency)
             });
             self.urgencies.insert(npub.clone(), urgency);
@@ -612,8 +593,12 @@ impl Ports for FlywheelPorts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use toron_core::envelope::{Class, ContextId, ContractId, ENVELOPE_V, MsgId, TaskId};
+    use toron_core::envelope::{
+        Class, ContextId, ContractId, ENVELOPE_V, Envelope, MsgId, Recipient, TaskId,
+    };
     use toron_core::inbox::InboxStore;
+    /// The rule `pending_urgent` applies, row by row (toron's, not a copy).
+    use toron_core::inbox::urgency_of as urgency_of_envelope;
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -768,8 +753,17 @@ mod tests {
         e
     }
 
+    /// B's urgency as `observe` reads it, and whether it read the store.
+    async fn urgency_now(store: &InboxStore) -> (Urgency, bool) {
+        let (head, cursor) = head_and_cursor(store, B).await;
+        urgency_of_unread(store, B, head, cursor).await
+    }
+
+    /// The urgency is toron's `pending_urgent` (the same rule as `toron next
+    /// --peek --urgent`): an unread urgent steer stays urgent when a notify or
+    /// a normal steer lands behind it, and turns normal once it is read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stored_steer_head_is_urgent_and_a_later_notify_head_is_not() {
+    async fn an_unread_steer_stays_urgent_behind_later_mail_and_is_normal_once_read() {
         let store = mem_store().await;
         let steer = stored(
             0,
@@ -780,8 +774,7 @@ mod tests {
         );
         steer.validate().unwrap();
         store.append_envelope(&steer).await.unwrap();
-        let head = store.head(B).await.unwrap();
-        assert_eq!(urgency_of_head(&store, B, head).await, Urgency::Urgent);
+        assert_eq!(urgency_now(&store).await.0, Urgency::Urgent);
         let notify = stored(
             1,
             Class::Notify,
@@ -791,8 +784,11 @@ mod tests {
         );
         notify.validate().unwrap();
         store.append_envelope(&notify).await.unwrap();
-        let head = store.head(B).await.unwrap();
-        assert_eq!(urgency_of_head(&store, B, head).await, Urgency::Normal);
+        assert_eq!(
+            urgency_now(&store).await.0,
+            Urgency::Urgent,
+            "the unread steer is still pending behind the notify"
+        );
         let normal = stored(
             2,
             Class::Control,
@@ -802,7 +798,59 @@ mod tests {
         );
         normal.validate().unwrap();
         store.append_envelope(&normal).await.unwrap();
-        let head = store.head(B).await.unwrap();
-        assert_eq!(urgency_of_head(&store, B, head).await, Urgency::Normal);
+        assert_eq!(urgency_now(&store).await.0, Urgency::Urgent);
+        // B reads everything: nothing is pending.
+        store.next(B, None, false).await.unwrap();
+        assert_eq!(urgency_now(&store).await, (Urgency::Normal, false));
+        // New mail behind the read steer: unread, but not urgent.
+        let later = stored(
+            3,
+            Class::Notify,
+            "notify",
+            json!({"text": "priority: urgent"}),
+            false,
+        );
+        later.validate().unwrap();
+        store.append_envelope(&later).await.unwrap();
+        assert_eq!(
+            urgency_now(&store).await,
+            (Urgency::Normal, true),
+            "the read steer no longer counts; the unread notify is normal"
+        );
+    }
+
+    /// Nothing unread is no read at all; unread mail is one `pending_urgent`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_urgency_check_does_not_read_when_nothing_is_unread() {
+        let store = mem_store().await;
+        assert_eq!(urgency_now(&store).await, (Urgency::Normal, false));
+        let steer = stored(
+            0,
+            Class::Control,
+            "steer",
+            json!({"op": "pause", "priority": "urgent", "sup_epoch": 0}),
+            true,
+        );
+        store.append_envelope(&steer).await.unwrap();
+        assert_eq!(urgency_now(&store).await, (Urgency::Urgent, true));
+        // Another recipient's newer row does not change B's answer.
+        let mut other = steer.clone();
+        other.msg.seq = 1;
+        other.to = Recipient::Npub("cc".repeat(32));
+        store.append_envelope(&other).await.unwrap();
+        assert_eq!(urgency_now(&store).await, (Urgency::Urgent, true));
+        store.next(B, None, false).await.unwrap();
+        assert_eq!(urgency_now(&store).await, (Urgency::Normal, false));
+    }
+
+    /// The urgency comes from toron's API, not a query of its tables.
+    #[test]
+    fn the_urgency_reads_toron_pending_urgent_not_its_schema() {
+        let src = include_str!("inbox_ports.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests")];
+        assert!(prod.contains(".pending_urgent(npub, cursor)"));
+        for gone in ["inbox_log", "sqlx::", "read_stream("] {
+            assert!(!prod.contains(gone), "{gone} is toron's to read");
+        }
     }
 }
