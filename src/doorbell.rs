@@ -716,7 +716,11 @@ pub fn inject_wake_in(
     if denied {
         return Err(InjectDeny::Budget);
     }
-    let _ = crate::append_pending_fact(&crate::config::state_dir(), project, &summary);
+    // The pending wake goes under the SAME state dir as the journal and the
+    // budget. The CLI passes `config::state_dir()`, so production is
+    // unchanged; a test's temp dir now holds the whole inject instead of
+    // the operator's real `facts/<project>-pending.jsonl`.
+    let _ = crate::append_pending_fact(state_dir, project, &summary);
     Ok(summary)
 }
 
@@ -3820,20 +3824,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn inject_cleanup(proj: &str) {
-        let pend = crate::config::state_dir()
-            .join("facts")
-            .join(format!("{}-pending.jsonl", crate::state::state_key(proj)));
-        let _ = std::fs::remove_file(pend);
-    }
-
     #[test]
     fn inject_journals_row_and_queues_wake() {
         // D8/bd-woha: console inject lands a stage=inject Fact row in the
-        // named scope journal plus one pending wake. Real pending queue
-        // (fake project), temp journal — cleaned after.
-        let dir = std::env::temp_dir().join(format!("dbll-inj-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // named scope journal plus one pending wake. Journal, budget and
+        // pending queue all live in the temp state dir; the operator's real
+        // `facts/` is never touched (it used to be written, then removed).
+        let tmp = tempfile::tempdir().expect("state dir");
+        let dir = tmp.path().to_path_buf();
         let proj = "inject-probe";
         let out = inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_000).expect("inject");
         assert!(out.contains('P') && out.contains("hello"));
@@ -3843,20 +3841,21 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["executed"]["stage"], serde_json::json!("inject"));
         assert_eq!(rows[0]["executed"]["pin"], serde_json::json!("P"));
-        let pend = crate::config::state_dir()
+        let pend = dir
             .join("facts")
             .join(format!("{}-pending.jsonl", crate::state::state_key(proj)));
         let body = std::fs::read_to_string(&pend).unwrap_or_default();
-        assert!(body.contains("hello"), "one wake queued");
-        inject_cleanup(proj);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            body.contains("hello"),
+            "one wake queued in the given state dir"
+        );
     }
 
     #[test]
     fn inject_ratchet_refuses_same_second_dup() {
         // D8: identical pin+line within one unix second refuses.
-        let dir = std::env::temp_dir().join(format!("dbll-injr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().expect("state dir");
+        let dir = tmp.path().to_path_buf();
         let proj = "inject-probe-r";
         inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_000).expect("first");
         assert_eq!(
@@ -3865,15 +3864,13 @@ mod tests {
         );
         // Next second: admitted (budget still has room).
         inject_wake_in(&dir, proj, "manual", "P", "hello", 1_700_001).expect("next second");
-        inject_cleanup(proj);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn inject_budget_denies_fourth_in_window() {
         // D8: 3 per 1800s rolling; the 4th refuses, spend is persisted.
-        let dir = std::env::temp_dir().join(format!("dbll-injb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().expect("state dir");
+        let dir = tmp.path().to_path_buf();
         let proj = "inject-probe-b";
         for i in 0..3 {
             inject_wake_in(
@@ -3892,8 +3889,6 @@ mod tests {
         );
         // Window rolls: t+1801 admits again.
         inject_wake_in(&dir, proj, "manual", "P", "later", 1_700_000 + 1801).expect("rolled");
-        inject_cleanup(proj);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// governed-by: bd-z7w0 — resolve_host Embedded arms reachability.
