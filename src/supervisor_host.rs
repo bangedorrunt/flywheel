@@ -32,9 +32,7 @@
 //! crew npub and does not type a pane. A steer the log already appended is not sent again; a
 //! restart resolves one that is still pending.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -585,6 +583,108 @@ fn lead_facts_file(project: &str, context: Option<&str>) -> PathBuf {
     crate::config::state_dir().join("facts").join(name)
 }
 
+/// A facts file read from where this host left off (rv23 #4).
+///
+/// `next` is how far this host has read; `committed` is what the sidecar
+/// (`<file>.read-<reader>`) says. [`FactsCursor::commit`] runs at the start
+/// of the next `observe`, after the round that folded those facts, so a
+/// restart re-reads at most the last round's lines (and the fold's bounded
+/// [`crate::supervisor_program::RecentKeys`] still holds their keys). A file
+/// shorter than `next` was replaced, and is read from the start.
+#[derive(Debug)]
+pub(crate) struct FactsCursor {
+    path: PathBuf,
+    sidecar: PathBuf,
+    next: u64,
+    committed: u64,
+    /// Bytes read so far by this host (evidence and tests).
+    pub(crate) bytes_read: u64,
+}
+
+impl FactsCursor {
+    pub(crate) fn open(path: PathBuf, reader: &str) -> Self {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".read-{reader}"));
+        let sidecar = path.with_file_name(name);
+        let committed = std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        Self {
+            path,
+            sidecar,
+            next: committed,
+            committed,
+            bytes_read: 0,
+        }
+    }
+
+    /// Persist how far the last round read. A failed write only means a
+    /// restart re-reads more.
+    pub(crate) fn commit(&mut self) {
+        if self.next == self.committed {
+            return;
+        }
+        if crate::private_fs::write_private_atomic(&self.sidecar, self.next.to_string().as_bytes())
+            .is_ok()
+        {
+            self.committed = self.next;
+        }
+    }
+
+    /// The complete lines after `next`, and the offset just past them. The
+    /// caller moves `next` there with [`FactsCursor::consume`] once it has
+    /// used them; a partial last line is left for the next read.
+    pub(crate) fn read_new(&mut self) -> (String, u64) {
+        let Ok(mut f) = std::fs::File::open(&self.path) else {
+            return (String::new(), self.next);
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < self.next {
+            self.next = 0;
+        }
+        if len == self.next
+            || std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(self.next)).is_err()
+        {
+            return (String::new(), self.next);
+        }
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_err() {
+            return (String::new(), self.next);
+        }
+        self.bytes_read += buf.len() as u64;
+        let used = buf.rfind('\n').map_or(0, |i| i + 1);
+        buf.truncate(used);
+        (buf, self.next + used as u64)
+    }
+
+    pub(crate) fn consume(&mut self, end: u64) {
+        self.next = end;
+    }
+}
+
+/// [`child_upward`] over the lines `cur` has not spent yet (rv23 #4: the
+/// file is no longer re-read whole every round). A line is spent only while
+/// the lead runs, because `child_upward` skips it otherwise; a stopped
+/// lead's lines are read again once it runs.
+fn lead_upward(
+    cur: &mut FactsCursor,
+    model: &SupModel,
+    child: &str,
+    now_ms: u64,
+    host_dead: bool,
+) -> Vec<SupMsg> {
+    let (text, end) = cur.read_new();
+    if model
+        .children
+        .get(child)
+        .is_some_and(|c| c.state == ChildState::Running)
+    {
+        cur.consume(end);
+    }
+    child_upward(model, child, now_ms, &text, host_dead)
+}
+
 /// What a parent may learn from one lead's facts file. Pass, progress, and
 /// done lines stay in the lead. An escalate line is one `ChildEscalated`.
 /// A dead lease past `t_orphan_ms` is one `Adopt`.
@@ -1053,7 +1153,10 @@ pub struct LivePorts {
     inbox: crate::inbox_ports::FlywheelPorts,
     herdr_up: Option<bool>,
     facts_seen: BTreeSet<String>,
-    deaf_off: u64,
+    /// rv23 #4: the inbox host's facts file, read incrementally.
+    deaf: Option<FactsCursor>,
+    /// rv23 #4: each lead child's facts file, read incrementally.
+    lead_facts: BTreeMap<String, FactsCursor>,
     relaunch_bin: PathBuf,
     /// Set on a nested lead host so its facts file is not the root's.
     context: Option<String>,
@@ -1072,7 +1175,8 @@ impl LivePorts {
             inbox: crate::inbox_ports::FlywheelPorts::new(cfg, project, workspace),
             herdr_up: None,
             facts_seen: BTreeSet::new(),
-            deaf_off: 0,
+            deaf: None,
+            lead_facts: BTreeMap::new(),
             relaunch_bin,
             context: None,
         }
@@ -1143,6 +1247,12 @@ impl LivePorts {
 impl Ports for LivePorts {
     fn observe(&mut self, model: &SupModel, now_ms: u64) -> Vec<SupMsg> {
         let mut out = Vec::new();
+        // rv23 #4: the last round's facts are folded by now; record how far
+        // they were read.
+        let reader = self.context.clone().unwrap_or_else(|| "root".into());
+        for c in self.lead_facts.values_mut() {
+            c.commit();
+        }
         // Lead facts and a dead lease, before the herdr edge, so a lead
         // failure still restarts while herdr reads up.
         let leads: Vec<String> = model
@@ -1152,15 +1262,13 @@ impl Ports for LivePorts {
             .map(|(id, _)| id.clone())
             .collect();
         for id in leads {
-            let text = std::fs::read_to_string(lead_facts_file(&self.project, Some(&id)))
-                .unwrap_or_default();
-            out.extend(child_upward(
-                model,
-                &id,
-                now_ms,
-                &text,
-                self.lead_host_dead(&id),
-            ));
+            let dead = self.lead_host_dead(&id);
+            let project = self.project.clone();
+            let cur = self
+                .lead_facts
+                .entry(id.clone())
+                .or_insert_with(|| FactsCursor::open(lead_facts_file(&project, Some(&id)), &reader));
+            out.extend(lead_upward(cur, model, &id, now_ms, dead));
         }
         // herdr edges.
         let up = self.client().is_some();
@@ -1217,17 +1325,16 @@ impl Ports for LivePorts {
             }
         }
         // The inbox host's deaf facts, by the npub they name.
-        if let Ok(mut f) = std::fs::File::open(self.inbox_facts_path())
-            && std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(self.deaf_off)).is_ok()
+        let deaf_path = self.inbox_facts_path();
+        let deaf = self
+            .deaf
+            .get_or_insert_with(|| FactsCursor::open(deaf_path, &reader));
+        deaf.commit();
+        let (buf, end) = deaf.read_new();
+        deaf.consume(end);
         {
-            let mut buf = String::new();
-            if f.read_to_string(&mut buf).is_ok() {
-                let mut used = 0usize;
+            {
                 for l in buf.split_inclusive('\n') {
-                    if !l.ends_with('\n') {
-                        break;
-                    }
-                    used += l.len();
                     let Ok(v) = serde_json::from_str::<Value>(l.trim()) else {
                         continue;
                     };
@@ -1249,7 +1356,6 @@ impl Ports for LivePorts {
                         });
                     }
                 }
-                self.deaf_off += used as u64;
             }
         }
         out
@@ -2501,6 +2607,80 @@ mod tests {
 
     fn spawn(id: &str) -> SupMsg {
         spawn_as(id, ChildKind::Crew)
+    }
+
+    fn lead_model(state: ChildState) -> SupModel {
+        let (mut m, _) = crate::supervisor_program::replay(&[spawn_as("plane", ChildKind::Lead)]);
+        m.children.get_mut("plane").unwrap().state = state;
+        m
+    }
+
+    fn escalated_keys(out: &[SupMsg]) -> Vec<String> {
+        out.iter()
+            .filter_map(|m| match m {
+                SupMsg::ChildEscalated { fact_key, .. } => fact_key.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// rv23 #4: a lead's facts are read from where this host left off (not
+    /// the whole file every round). A partial line waits for its newline, a
+    /// stopped lead's lines are read again once it runs, a restart resumes at
+    /// the committed offset, and a replaced (shorter) file is read from the
+    /// start.
+    #[test]
+    fn lead_facts_are_read_incrementally() {
+        use std::io::Write as _;
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("proj--plane-supervisor.jsonl");
+        let line = |k: &str| format!("{}\n", json!({"kind": "escalate", "key": k, "reason": "r"}));
+        let add = |s: &str| {
+            let mut h = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+            h.write_all(s.as_bytes()).unwrap();
+        };
+        let run = lead_model(ChildState::Running);
+        std::fs::write(&f, line("k1")).unwrap();
+        let mut c = FactsCursor::open(f.clone(), "root");
+        assert_eq!(escalated_keys(&lead_upward(&mut c, &run, "plane", 1, false)), ["k1"]);
+        let after_first = c.bytes_read;
+        assert!(escalated_keys(&lead_upward(&mut c, &run, "plane", 2, false)).is_empty());
+        assert_eq!(c.bytes_read, after_first, "nothing new is no bytes read");
+        add(&format!("{}{{\"kind\":\"esc", line("k2")));
+        assert_eq!(escalated_keys(&lead_upward(&mut c, &run, "plane", 3, false)), ["k2"]);
+        add("alate\",\"key\":\"k3\",\"reason\":\"r\"}\n");
+        let stopped = lead_model(ChildState::Restarting);
+        assert!(escalated_keys(&lead_upward(&mut c, &stopped, "plane", 4, false)).is_empty());
+        assert_eq!(
+            escalated_keys(&lead_upward(&mut c, &run, "plane", 5, false)),
+            ["k3"],
+            "a line a stopped lead skipped is read once it runs"
+        );
+        c.commit();
+        let mut again = FactsCursor::open(f.clone(), "root");
+        assert!(
+            escalated_keys(&lead_upward(&mut again, &run, "plane", 6, false)).is_empty(),
+            "a restart resumes at the committed offset"
+        );
+        let mut other = FactsCursor::open(f.clone(), "plane");
+        assert_eq!(
+            escalated_keys(&lead_upward(&mut other, &run, "plane", 6, false)),
+            ["k1", "k2", "k3"],
+            "each reader keeps its own offset"
+        );
+        std::fs::write(&f, line("k9")).unwrap();
+        assert_eq!(escalated_keys(&lead_upward(&mut again, &run, "plane", 7, false)), ["k9"]);
+    }
+
+    /// rv23 #4: the live observe reads lead and deaf facts through cursors.
+    #[test]
+    fn live_observe_reads_facts_through_cursors() {
+        let src = include_str!("supervisor_host.rs");
+        let at = src.find("impl Ports for LivePorts {").expect("LivePorts");
+        let body = &src[at..at + 4000];
+        assert!(body.contains("out.extend(lead_upward(cur, model, &id, now_ms, dead));"));
+        assert!(body.contains("let (buf, end) = deaf.read_new();"));
+        assert!(!body.contains("std::fs::read_to_string(lead_facts_file"));
     }
 
     fn spawn_as(id: &str, kind: ChildKind) -> SupMsg {

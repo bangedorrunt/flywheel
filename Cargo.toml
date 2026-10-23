@@ -48,6 +48,9 @@ toron-mcp = { path = "../toron/crates/toron-mcp" }
 # ALL workflow execution through toron-workflow's WorkflowEngine. This is the
 # cargo edge the tier diagram always implied but no Cargo.toml wired.
 toron-workflow = { path = "../toron/crates/toron-workflow" }
+# rv23 #4: one point read of the inbox head row by its offset (the urgency
+# check), on the pool `InboxStore::pool` exposes. Same version as toron-core.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite"] }
 async-trait = "0.1"
 cron = "0.17.0"
 chrono = "0.4.45"
