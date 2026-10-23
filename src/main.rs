@@ -22,6 +22,7 @@
 mod adr0016_invariants;
 mod agent_ref;
 mod agentstate;
+mod approval;
 mod artifact;
 mod authority;
 mod backend;
