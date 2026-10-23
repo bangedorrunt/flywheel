@@ -553,30 +553,159 @@ fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     cond()
 }
 
-/// Unload the supervisor, reporting a REAL failure (bd-yvte): the old
-/// `let _ = .output()` swallowed it, SIGKILL then respawned through
-/// KeepAlive, and the endpoint bail blamed "another process" for our own
-/// job. Absence counts as success — bootout of a never-loaded job (manual
-/// start) must never block a stop.
-fn disable_supervisor(cfg: &Config) -> Result<(), String> {
-    // Never unload THE service on behalf of a scratch instance (tests and
-    // probes run `stop` against temp state dirs while the real unit is
-    // loaded — an unconditional bootout there killed the live daemon).
-    if let Some(body) = installed_unit_path().and_then(|p| std::fs::read_to_string(p).ok())
-        && !unit_body_serves(&body, &cfg.state_dir)
-    {
-        return Ok(());
+/// What `stop` may do to the platform supervisor, as one port so the stop
+/// tests never reach the real launchctl/systemctl: read the LOADED unit, and
+/// unload it.
+pub(crate) trait SupervisorPort {
+    /// The loaded unit as the supervisor itself reports it (`launchctl print
+    /// gui/<uid>/com.doorbell.serve`, `systemctl --user show doorbell.service`).
+    /// `None` = it could not be read: not loaded, no such tool, a failed call.
+    fn print_loaded(&mut self) -> Option<String>;
+    /// Boot out / stop the unit. Called only after the print matched.
+    fn unload(&mut self) -> Result<(), String>;
+}
+
+/// The outcome of a supervisor unload request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unload {
+    /// The loaded unit serves this state dir and was unloaded.
+    Unloaded,
+    /// Nothing was done; the reason says why.
+    Skipped(String),
+}
+
+/// Unload the supervisor only when the LOADED unit provably serves
+/// `state_dir`, and fail closed otherwise.
+///
+/// The old guard read the installed plist under `$HOME` and, when it could not
+/// read it, went on to `launchctl bootout gui/<uid>/com.doorbell.serve`. That
+/// domain is keyed by uid, not HOME, so any `stop` under a fake or empty HOME
+/// (a test, a probe) booted out the operator's live daemon. Now the loaded
+/// unit's own argv (from `print_loaded`) must name this exact state dir; an
+/// unreadable, missing, unparseable or non-matching print does nothing and
+/// says so. A real unload failure is still an `Err` (bd-yvte), and absence
+/// at unload time still counts as success (bd-yvte: a never-loaded job must
+/// never block a stop).
+pub(crate) fn disable_supervisor_with(
+    port: &mut dyn SupervisorPort,
+    state_dir: &std::path::Path,
+) -> Result<Unload, String> {
+    let Some(print) = port.print_loaded() else {
+        return Ok(Unload::Skipped(
+            "the loaded supervisor unit could not be read (not loaded, or no access)".into(),
+        ));
+    };
+    let Some(served) = loaded_unit_state_dir(&print) else {
+        return Ok(Unload::Skipped(
+            "the loaded supervisor unit names no --state-dir".into(),
+        ));
+    };
+    if !same_state_dir(&served, state_dir) {
+        return Ok(Unload::Skipped(format!(
+            "the loaded supervisor unit serves {}, not {}",
+            served.display(),
+            state_dir.display()
+        )));
     }
-    #[cfg(target_os = "macos")]
-    {
-        let uid = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
-        if let Some(uid) = uid {
+    port.unload().map(|()| Unload::Unloaded)
+}
+
+/// The `--state-dir` the loaded unit's argv names. macOS: the `arguments =
+/// { ... }` block of `launchctl print`, one argument per line. Linux: the
+/// `argv[]=` list of `systemctl show -p ExecStart`. `None` when there is no
+/// argv or no `--state-dir` in it.
+fn loaded_unit_state_dir(print: &str) -> Option<PathBuf> {
+    let argv: Vec<String> = if let Some(at) = print.find("argv[]=") {
+        print[at + "argv[]=".len()..]
+            .split(';')
+            .next()?
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    } else {
+        let mut lines = print.lines().map(str::trim);
+        lines.find(|l| *l == "arguments = {")?;
+        let argv: Vec<String> = lines
+            .take_while(|l| *l != "}")
+            .map(str::to_string)
+            .collect();
+        argv
+    };
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--state-dir" {
+            return it.next().filter(|v| !v.is_empty()).map(PathBuf::from);
+        }
+        if let Some(v) = arg.strip_prefix("--state-dir=") {
+            return (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+    }
+    None
+}
+
+/// Same directory: equal paths, or equal once both resolve.
+fn same_state_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// The real supervisor behind [`SupervisorPort`].
+struct PlatformSupervisor;
+
+impl SupervisorPort for PlatformSupervisor {
+    fn print_loaded(&mut self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            let uid = std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())?;
+            std::process::Command::new("launchctl")
+                .args(["print", &format!("gui/{uid}/com.doorbell.serve")])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "show",
+                    "doorbell.service",
+                    "--property=LoadState",
+                    "--property=ExecStart",
+                ])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .filter(|s| s.lines().any(|l| l.trim() == "LoadState=loaded"))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    fn unload(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            let uid = std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "launchctl bootout: no uid".to_string())?;
             let out = std::process::Command::new("launchctl")
                 .args(["bootout", &format!("gui/{uid}/com.doorbell.serve")])
                 .output()
@@ -596,29 +725,42 @@ fn disable_supervisor(cfg: &Config) -> Result<(), String> {
                 }
             }
         }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let out = std::process::Command::new("systemctl")
-            .args(["--user", "stop", "doorbell.service"])
-            .output()
-            .map_err(|e| format!("systemctl stop could not run: {e}"))?;
-        if !out.status.success() {
-            let text = format!(
-                "{} {}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            if !bootout_absent(&text) {
-                return Err(format!(
-                    "systemctl stop failed ({}): {}",
-                    out.status,
-                    text.trim()
-                ));
+        #[cfg(target_os = "linux")]
+        {
+            let out = std::process::Command::new("systemctl")
+                .args(["--user", "stop", "doorbell.service"])
+                .output()
+                .map_err(|e| format!("systemctl stop could not run: {e}"))?;
+            if !out.status.success() {
+                let text = format!(
+                    "{} {}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if !bootout_absent(&text) {
+                    return Err(format!(
+                        "systemctl stop failed ({}): {}",
+                        out.status,
+                        text.trim()
+                    ));
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
+}
+
+/// The real unload `stop` performs: through [`disable_supervisor_with`],
+/// reporting a skip on stderr (a skip is not a failure: there was nothing
+/// provably ours to unload).
+fn disable_supervisor(sup: &mut dyn SupervisorPort, cfg: &Config) -> Result<(), String> {
+    match disable_supervisor_with(sup, &cfg.state_dir)? {
+        Unload::Unloaded => Ok(()),
+        Unload::Skipped(why) => {
+            eprintln!("doorbell: supervisor not unloaded: {why}");
+            Ok(())
+        }
+    }
 }
 
 /// Absence signatures of `bootout`/`stop` on a job that is not loaded —
@@ -629,14 +771,6 @@ fn bootout_absent(output: &str) -> bool {
     ["no such process", "could not find service", "not loaded"]
         .iter()
         .any(|p| s.contains(p))
-}
-
-/// The installed unit serves this state dir (its argv names it). A unit
-/// we cannot READ is assumed to be THE service: a loaded job whose plist
-/// vanished still needs stopping, and silence there is how a respawn war
-/// starts.
-fn unit_body_serves(body: &str, state_dir: &std::path::Path) -> bool {
-    body.contains(&state_dir.display().to_string())
 }
 
 /// Where the installed autostart unit lives on this platform. Must stay in
@@ -1121,21 +1255,23 @@ pub fn start(cfg: &Config) -> Result<()> {
 /// assert the endpoints are dead. Refuses unmanaged
 /// socket holders without --force (never clobbers a stranger's bind).
 pub fn stop(cfg: &Config, force: bool) -> Result<()> {
-    let msg = stop_with_budgets(cfg, force, STOP_GRACE, KILL_GRACE)?;
+    let msg = stop_with_budgets(cfg, &mut PlatformSupervisor, force, STOP_GRACE, KILL_GRACE)?;
     println!("{msg}");
     Ok(())
 }
 
 /// Budget-injected wrapper: the policy numbers are data, and the world
-/// behind them is one seam (see [`StopWorld`]).
+/// behind them is one seam (see [`StopWorld`]). The supervisor is a port
+/// too, so the stop tests never reach the real launchctl/systemctl.
 fn stop_with_budgets(
     cfg: &Config,
+    sup: &mut dyn SupervisorPort,
     force: bool,
     grace: Duration,
     kill_grace: Duration,
 ) -> Result<String> {
     stop_core(
-        &mut RealStop { cfg },
+        &mut RealStop { cfg, sup },
         cfg.port,
         &cfg.socket_path(),
         force,
@@ -1174,6 +1310,7 @@ trait StopWorld {
 /// Real world behind [`StopWorld`], bound to this config.
 struct RealStop<'a> {
     cfg: &'a Config,
+    sup: &'a mut dyn SupervisorPort,
 }
 
 impl StopWorld for RealStop<'_> {
@@ -1196,7 +1333,7 @@ impl StopWorld for RealStop<'_> {
         wait_for(|| !pid_alive(pid), grace)
     }
     fn unload_supervisor(&mut self) -> Result<(), String> {
-        disable_supervisor(self.cfg)
+        disable_supervisor(self.sup, self.cfg)
     }
     fn health_answers(&mut self) -> bool {
         health_probe(self.cfg).is_some()
@@ -2454,8 +2591,19 @@ mod tests {
         sleep.arg("300");
         let pid = spawn_reaped(&mut sleep);
         std::fs::write(cfg.pid_file(), format!("{pid}\n")).unwrap();
-        let msg = stop_with_budgets(&cfg, false, Duration::from_secs(5), Duration::from_secs(2))
-            .expect("SIGTERM-honouring pid must stop cleanly");
+        let mut sup = FakeSupervisor::unreadable();
+        let msg = stop_with_budgets(
+            &cfg,
+            &mut sup,
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .expect("SIGTERM-honouring pid must stop cleanly");
+        // The clean-exit arm asks the injected port, never the real
+        // launchctl/systemctl.
+        assert_eq!(sup.prints, 1, "the stop consulted the injected supervisor");
+        assert_eq!(sup.unloads, 0, "an unreadable unit is never unloaded");
         assert!(msg.contains("stopped (pid"), "plain message: {msg}");
         assert!(!msg.contains("SIGKILL"), "no escalation expected: {msg}");
         assert!(!pid_alive(pid), "process must be gone");
@@ -2475,8 +2623,10 @@ mod tests {
         sh.args(["-c", "trap '' TERM; exec sleep 300"]);
         let pid = spawn_reaped(&mut sh);
         std::fs::write(cfg.pid_file(), format!("{pid}\n")).unwrap();
+        let mut sup = FakeSupervisor::unreadable();
         let msg = stop_with_budgets(
             &cfg,
+            &mut sup,
             false,
             Duration::from_millis(400),
             Duration::from_secs(3),
@@ -2505,8 +2655,15 @@ mod tests {
         sleep.arg("300");
         let pid = spawn_reaped(&mut sleep);
         std::fs::write(cfg.pid_file(), format!("{pid}\n")).unwrap();
-        let err = stop_with_budgets(&cfg, false, Duration::from_secs(5), Duration::from_secs(2))
-            .expect_err("a surviving endpoint must fail the stop");
+        let mut sup = FakeSupervisor::unreadable();
+        let err = stop_with_budgets(
+            &cfg,
+            &mut sup,
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .expect_err("a surviving endpoint must fail the stop");
         let text = err.to_string();
         assert!(text.contains("still held by another process"), "{text}");
         assert!(!pid_alive(pid), "our pid must still be terminated");
@@ -2613,19 +2770,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The supervisor port as data: what `print_loaded` returns, and how
+    /// many unloads were asked for. Never reaches launchctl/systemctl.
+    struct FakeSupervisor {
+        print: Option<String>,
+        prints: usize,
+        unloads: usize,
+    }
+
+    impl FakeSupervisor {
+        fn unreadable() -> Self {
+            Self {
+                print: None,
+                prints: 0,
+                unloads: 0,
+            }
+        }
+        fn printing(print: &str) -> Self {
+            Self {
+                print: Some(print.to_string()),
+                prints: 0,
+                unloads: 0,
+            }
+        }
+    }
+
+    impl SupervisorPort for FakeSupervisor {
+        fn print_loaded(&mut self) -> Option<String> {
+            self.prints += 1;
+            self.print.clone()
+        }
+        fn unload(&mut self) -> Result<(), String> {
+            self.unloads += 1;
+            Ok(())
+        }
+    }
+
+    /// A `launchctl print gui/<uid>/com.doorbell.serve` body, trimmed to
+    /// the fields the guard reads.
+    fn launchd_print(state_dir: &str) -> String {
+        format!(
+            "gui/501/com.doorbell.serve = {{\n\tactive count = 1\n\tpath = /Users/u/Library/LaunchAgents/com.doorbell.serve.plist\n\tstate = running\n\tprogram = /Users/u/.local/bin/doorbell\n\targuments = {{\n\t\t/Users/u/.local/bin/doorbell\n\t\tserve\n\t\t--state-dir\n\t\t{state_dir}\n\t\t--port\n\t\t18980\n\t}}\n\n\tpid = 4242\n}}\n"
+        )
+    }
+
     #[test]
     fn scratch_state_dirs_never_unload_the_real_unit() {
         // A temp-dir `stop` (probe, test) must not boot out the loaded
-        // service for a state dir the unit does not serve.
-        let body = "<string>--state-dir</string><string>/Users/u/.local/state/doorbell</string>";
-        assert!(unit_body_serves(
-            body,
-            std::path::Path::new("/Users/u/.local/state/doorbell")
+        // service for a state dir the unit does not serve, and a unit the
+        // guard cannot read or parse is never assumed to be ours.
+        let real = std::path::Path::new("/Users/u/.local/state/doorbell");
+        let scratch = std::path::Path::new("/tmp/dbcl-scratch");
+
+        let mut sup = FakeSupervisor::printing(&launchd_print("/Users/u/.local/state/doorbell"));
+        assert_eq!(
+            disable_supervisor_with(&mut sup, real),
+            Ok(Unload::Unloaded)
+        );
+        assert_eq!(sup.unloads, 1, "the matching unit is unloaded");
+
+        let mut sup = FakeSupervisor::printing(&launchd_print("/Users/u/.local/state/doorbell"));
+        let out = disable_supervisor_with(&mut sup, scratch);
+        assert!(
+            matches!(&out, Ok(Unload::Skipped(why)) if why.contains("serves /Users/u/.local/state/doorbell")),
+            "{out:?}"
+        );
+        assert_eq!(sup.unloads, 0, "a scratch dir never unloads the real unit");
+
+        let mut sup = FakeSupervisor::unreadable();
+        let out = disable_supervisor_with(&mut sup, real);
+        assert!(
+            matches!(&out, Ok(Unload::Skipped(why)) if why.contains("could not be read")),
+            "{out:?}"
+        );
+        assert_eq!(sup.unloads, 0, "an unreadable print fails closed");
+
+        for garbage in ["", "Bad request.\n", "arguments = {\n\tserve\n}\n"] {
+            let mut sup = FakeSupervisor::printing(garbage);
+            let out = disable_supervisor_with(&mut sup, real);
+            assert!(
+                matches!(&out, Ok(Unload::Skipped(why)) if why.contains("names no --state-dir")),
+                "{garbage:?}: {out:?}"
+            );
+            assert_eq!(
+                sup.unloads, 0,
+                "{garbage:?}: an unparseable print fails closed"
+            );
+        }
+
+        // A prefix is not a match: /Users/u/.local/state/doorbell-2 is not ours.
+        let mut sup = FakeSupervisor::printing(&launchd_print("/Users/u/.local/state/doorbell-2"));
+        assert!(matches!(
+            disable_supervisor_with(&mut sup, real),
+            Ok(Unload::Skipped(_))
         ));
-        assert!(!unit_body_serves(
-            body,
-            std::path::Path::new("/tmp/dbcl-scratch")
-        ));
+        assert_eq!(sup.unloads, 0);
+    }
+
+    #[test]
+    fn the_loaded_state_dir_comes_from_the_units_own_argv() {
+        assert_eq!(
+            loaded_unit_state_dir(&launchd_print("/s/doorbell")),
+            Some(PathBuf::from("/s/doorbell"))
+        );
+        let systemd = "LoadState=loaded\nExecStart={ path=/u/bin/doorbell ; argv[]=/u/bin/doorbell serve --state-dir /s/db --port 18980 ; ignore_errors=no ; start_time=[n/a] }\n";
+        assert_eq!(loaded_unit_state_dir(systemd), Some(PathBuf::from("/s/db")));
+        assert_eq!(
+            loaded_unit_state_dir("arguments = {\n\tserve\n\t--state-dir=/s/eq\n}\n"),
+            Some(PathBuf::from("/s/eq"))
+        );
+        assert_eq!(
+            loaded_unit_state_dir("arguments = {\n\t--state-dir\n}\n"),
+            None
+        );
     }
 
     #[cfg(unix)]
