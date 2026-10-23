@@ -75,6 +75,11 @@ pub struct RtHost {
     // detach. The thread is intentionally not shut down per-host.
     #[allow(dead_code)]
     state_log_writer: Option<std::thread::JoinHandle<()>>,
+    /// T3 (bd-ma3y): services for durable interpret, built once per process
+    /// (see durable_services). Borrowed, never owned: owning a
+    /// ManagedRuntime here would drop a tokio Runtime inside the async
+    /// Brain. One arm today (Audit); later arms share this runtime.
+    durable_services: &'static ManagedRuntime,
 }
 
 /// Map one wake-sock outcome onto `BrainMsg`. Single owner for the twin
@@ -234,11 +239,40 @@ impl RtHost {
             // also visible rather than a silent no-op.
             state_log,
             state_log_writer,
+            durable_services: durable_services(),
         })
     }
 
     pub fn set_generation(&mut self, generation: Option<doorbell::WatcherGen>) {
         self.generation = generation;
+    }
+
+    /// T3 arm 1 (bd-ma3y): run Audit cmds through the boot-built edge and
+    /// fold their outcomes. Returns the cmds the rt effect layer still owns.
+    /// Outcomes fold quiet (sentinel), so the model only gains ambient
+    /// per-message bookkeeping. FactMiss keeps today's path: the final match
+    /// in tick still renders it as Effect::Audit for the rt journal.
+    fn run_durable_audit(&mut self, cmds: Vec<workspace::Cmd>) -> Vec<workspace::Cmd> {
+        let mut rest = Vec::with_capacity(cmds.len());
+        for cmd in cmds {
+            if !matches!(cmd, workspace::Cmd::Audit { .. }) {
+                rest.push(cmd);
+                continue;
+            }
+            let exit = self.durable_services.run(DurableInterpret::interpret_in_env(
+                &cmd,
+                self.durable_services.context(),
+            ));
+            let (next, _) = match exit {
+                Exit::Success(msg) => workspace::tick(&self.model, &msg),
+                Exit::Failure(cause) => workspace::tick(
+                    &self.model,
+                    &workspace::WorkspaceProgram::failure(&Failure::of_cause(cause)),
+                ),
+            };
+            self.model = next;
+        }
+        rest
     }
 
     /// Share the brain's death bell. Call before the first wake arms.
@@ -545,6 +579,9 @@ impl Host for RtHost {
         if let Some(topo) = self.model.session_topology.as_deref() {
             let _ = crate::state::save_session_topology(&self.project, topo);
         }
+        // T3 arm 1 (bd-ma3y): Audit cmds run through the boot-built edge and
+        // fold quiet; the rt effect layer keeps the rest.
+        let cmds = self.run_durable_audit(cmds);
         crate::handle_workspace_cmds(
             &mut self.model,
             &cmds,
@@ -1768,5 +1805,202 @@ mod off_runtime_tests {
             "the embedded doorbell exited within 4s of starting: {:?}",
             h.join().map(|r| r.map_err(|e| e.to_string()))
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T3 durable interpret, arm 1: Audit (bd-ma3y).
+//
+// One executor arm moves from the host's Effect match into
+// DurableInterpret::interpret_in_env, backed by services the host builds
+// once per boot (RtHost::durable_services, built by durable_services_for).
+// Audit is first because it is observation-only: success and typed failure
+// both fold to the T2 sentinel, which emits nothing and touches no domain
+// state. Exact behavior is preserved: the edge writes the identical stderr
+// line handle_workspace_cmds writes today (src/main.rs, Cmd::Audit arm) —
+// twin noted here because the two cannot share code across the binary
+// boundary without moving the format. Next arms (Prompt with herdr
+// handles, ...) add edged services to the same runtime. interpret()
+// without services fails typed, never drops.
+// ---------------------------------------------------------------------------
+
+use toron_core::kernel::{
+    BuiltServices, Effect as FxEffect, Exit, Failure, Interpret, Layer, ManagedRuntime, Program,
+    ServiceTag, use_service,
+};
+
+/// The Audit arm's edge: what actually records the row. The fold never
+/// touches the world; this is the only place the arm does.
+pub trait AuditEdge: Send + Sync {
+    fn append(&self, kind: &str, pin: &str, detail: &str) -> Result<(), String>;
+}
+
+pub struct AuditEdgeTag;
+
+impl ServiceTag for AuditEdgeTag {
+    type Service = Arc<dyn AuditEdge>;
+    const ID: &'static str = "flywheel-durable-audit-edge";
+}
+
+/// Production edge: the identical stderr line handle_workspace_cmds writes
+/// today (twin: src/main.rs Cmd::Audit arm). Best-effort like the original.
+pub struct StderrAuditEdge;
+
+impl AuditEdge for StderrAuditEdge {
+    fn append(&self, kind: &str, pin: &str, detail: &str) -> Result<(), String> {
+        eprintln!("flywheel: [Audit {kind}] {pin}: {detail}");
+        Ok(())
+    }
+}
+
+/// Services for durable interpret (T3), built once per PROCESS, never
+/// dropped: the host lives inside the async Brain, and dropping a
+/// ManagedRuntime there panics (its TokioExecutor owns a tokio Runtime).
+/// A process-wide static is never dropped, so the async-owned host can
+/// safely borrow it. One arm today (Audit); later arms add edged services
+/// to this runtime.
+fn durable_services() -> &'static ManagedRuntime {
+    static SERVICES: std::sync::OnceLock<ManagedRuntime> = std::sync::OnceLock::new();
+    SERVICES.get_or_init(|| {
+        let layer = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(
+            Arc::new(StderrAuditEdge) as Arc<dyn AuditEdge>,
+        );
+        ManagedRuntime::make(&layer).expect("durable services build")
+    })
+}
+
+pub struct DurableInterpret;
+
+impl Interpret<crate::workspace::WorkspaceProgram> for DurableInterpret {
+    fn interpret(cmd: &crate::workspace::Cmd) -> FxEffect<crate::workspace::Msg, String> {
+        FxEffect::fail(format!(
+            "no edge in hand for {cmd:?}: boot the host with durable services"
+        ))
+    }
+
+    fn interpret_in_env(
+        cmd: &crate::workspace::Cmd,
+        services: Option<&BuiltServices>,
+    ) -> FxEffect<crate::workspace::Msg, String> {
+        let crate::workspace::Cmd::Audit { kind, pin, detail } = cmd else {
+            return Self::interpret(cmd);
+        };
+        let Some(services) = services else {
+            return Self::interpret(cmd);
+        };
+        let (kind, pin, detail) = (kind.clone(), pin.clone(), detail.clone());
+        let quiet = crate::workspace::Msg::DiagnoseFailed {
+            name: crate::workspace::SHADOW_FAILURE_NAME.into(),
+        };
+        use_service::<AuditEdgeTag>()
+            .map_err(|_: std::convert::Infallible| String::from("unreachable"))
+            .flat_map(move |edge| match edge.append(&kind, &pin, &detail) {
+                Ok(()) => FxEffect::succeed(quiet.clone()),
+                Err(detail) => FxEffect::fail(detail),
+            })
+            .provide_from(services)
+    }
+}
+
+#[cfg(test)]
+mod durable_tests {
+    use super::*;
+    use toron_core::kernel::{Exit, Runtime};
+    use workspace::{Msg, SHADOW_FAILURE_NAME};
+
+    struct Recorder {
+        ran: std::sync::Mutex<Vec<(String, String, String)>>,
+        refuse: bool,
+    }
+
+    impl AuditEdge for Recorder {
+        fn append(&self, kind: &str, pin: &str, detail: &str) -> Result<(), String> {
+            self.ran
+                .lock()
+                .unwrap()
+                .push((kind.into(), pin.into(), detail.into()));
+            if self.refuse {
+                Err("the edge refused".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn services_with(refuse: bool) -> (ManagedRuntime, Arc<Recorder>) {
+        let rec = Arc::new(Recorder { ran: std::sync::Mutex::new(vec![]), refuse });
+        let layer = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(
+            rec.clone() as Arc<dyn AuditEdge>,
+        );
+        let rt = ManagedRuntime::make(&layer).expect("value layer builds");
+        assert!(rt.context().is_some());
+        (rt, rec)
+    }
+
+    fn audit_cmd() -> workspace::Cmd {
+        workspace::Cmd::Audit { kind: "k".into(), pin: "p".into(), detail: "d".into() }
+    }
+
+    #[test]
+    fn audit_arm_runs_through_the_edge() {
+        let (rt, rec) = services_with(false);
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(
+            &audit_cmd(),
+            rt.context(),
+        ));
+        let Exit::Success(msg) = exit else {
+            panic!("edge success must complete quiet");
+        };
+        assert_eq!(
+            rec.ran.lock().unwrap().as_slice(),
+            &[("k".to_string(), "p".to_string(), "d".to_string())]
+        );
+        assert!(matches!(msg, Msg::DiagnoseFailed { .. }));
+        let (next, cmds) = workspace::tick(&workspace::WorkspaceModel::default(), &msg);
+        assert!(cmds.is_empty());
+        assert!(next.swarm.heal_states.is_empty());
+    }
+
+    #[test]
+    fn edge_refusal_surfaces_typed_failure_named_by_the_fold() {
+        let (rt, rec) = services_with(true);
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(
+            &audit_cmd(),
+            rt.context(),
+        ));
+        let Exit::Failure(cause) = exit else {
+            panic!("edge refusal must fail typed, never succeed");
+        };
+        assert_eq!(rec.ran.lock().unwrap().len(), 1);
+        let msg = workspace::WorkspaceProgram::failure(&Failure::of_cause(cause));
+        assert!(matches!(msg, Msg::DiagnoseFailed { ref name } if name == SHADOW_FAILURE_NAME));
+        let (next, cmds) = workspace::tick(&workspace::WorkspaceModel::default(), &msg);
+        assert!(cmds.is_empty());
+        assert!(next.swarm.heal_states.is_empty());
+    }
+
+    #[test]
+    fn no_edge_in_hand_fails_typed_never_drops() {
+        let exit = Runtime::run(DurableInterpret::interpret(&audit_cmd()));
+        assert!(!exit.is_success(), "no edge in hand must fail typed, never drop");
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(&audit_cmd(), None));
+        assert!(!exit.is_success());
+    }
+
+    #[test]
+    fn non_audit_commands_are_not_owned_by_this_arm() {
+        let (rt, rec) = services_with(false);
+        let other = workspace::Cmd::Send { name: "n".into(), text: "t".into() };
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(&other, rt.context()));
+        assert!(!exit.is_success(), "unowned arms fail typed, never run");
+        assert!(rec.ran.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn services_builder_builds_once_and_carries_the_edge() {
+        let a = durable_services();
+        let b = durable_services();
+        assert!(std::ptr::eq(a, b), "one runtime per process, never rebuilt");
+        assert!(a.context().is_some());
     }
 }
