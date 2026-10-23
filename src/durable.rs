@@ -1750,6 +1750,215 @@ async fn loop_run_verify(info: &Info, args: LoopRunVerifyArgs) -> Result<Value> 
     }
 }
 
+/// The close-path settle plan (bd-5ouq): what one `__loop-run-verify`
+/// outcome means, computed pure from the child value. Executing the plan
+/// is `settle_loop_verify_output` below. Splitting plan from execution
+/// keeps every shape — including the armed record path — pinned by tests
+/// without a loop-armed global or a beads workspace in the suite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoopVerifySettle {
+    /// Band is not loop-runnable: return the value unchanged, run nothing.
+    Passthrough,
+    /// Record the proof: receipt content, optional advisory annotation for
+    /// a vacuous-but-tolerated run, and the verify command for the verdict.
+    Record {
+        output: String,
+        warn_append: Option<String>,
+        verify_cmd: String,
+    },
+    /// Reopen the bead: failed/skipped head, or a strict vacuous refusal.
+    /// `vacuous` carries the warning, the filtered count, and the evidence
+    /// file content when the refusal wrote one.
+    Reopen {
+        vacuous: Option<(String, Option<u32>, String)>,
+        timed_out: bool,
+        exit: i64,
+    },
+}
+
+pub(crate) fn plan_loop_verify_settle(
+    v: &serde_json::Value,
+    strict: bool,
+) -> LoopVerifySettle {
+    if v.get("band").and_then(serde_json::Value::as_str) != Some("loop-runnable") {
+        return LoopVerifySettle::Passthrough;
+    }
+    let skipped = v.get("skipped").and_then(serde_json::Value::as_str).is_some();
+    let timed_out = v
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let exit = v.get("exit").and_then(serde_json::Value::as_i64).unwrap_or(-1);
+    if skipped || exit != 0 {
+        return LoopVerifySettle::Reopen { vacuous: None, timed_out, exit };
+    }
+    let output = v.get("output_tail").and_then(serde_json::Value::as_str).unwrap_or("");
+    let verify_cmd = v
+        .get("verify")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // bd-p4oc: vacuous VERIFY gate — reuse part-1 parse. Cargo-test-shaped
+    // filters that matched 0 tests are evidence of nothing.
+    let is_cargo = crate::is_cargo_test_verify(&verify_cmd);
+    let (passed, filtered) = if is_cargo {
+        crate::parse_cargo_test_counts(output)
+    } else {
+        (None, None)
+    };
+    let is_vacuous = is_cargo && passed == Some(0);
+    if is_vacuous {
+        let warning = format!(
+            "WARNING: vacuous VERIFY — filter `{verify_cmd}` matched 0 tests (evidence proves nothing)"
+        );
+        if strict {
+            let evidence = format!(
+                "{warning}\nfiltered out: {}\noutput tail:\n{}\n",
+                filtered
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                output
+            );
+            return LoopVerifySettle::Reopen {
+                vacuous: Some((warning, filtered, evidence)),
+                timed_out,
+                exit,
+            };
+        }
+        let warn_append = format!(
+            "\n{warning}\nfiltered out: {}\n",
+            filtered
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        return LoopVerifySettle::Record {
+            output: output.to_string(),
+            warn_append: Some(warn_append),
+            verify_cmd,
+        };
+    }
+    LoopVerifySettle::Record {
+        output: output.to_string(),
+        warn_append: None,
+        verify_cmd,
+    }
+}
+
+/// Settle one `__loop-run-verify` outcome (bd-5ouq): the post-subprocess
+/// half of `loop_run_verify`, with the child run journaled and the
+/// evaluation inline with caller authority. Takes the parsed child value
+/// plus caller-side facts (the verdict timestamp comes from the caller's
+/// injected authority, never sampled here; `reopen` performs the journaled
+/// reopen — production passes `reopen_bead_journaled`, tests pass scripted
+/// outcomes so the suite stays hermetic).
+///
+/// Shapes, receipt paths and the vacuous gate are byte-identical to the
+/// `#[function]` body. The one deliberate deviation lives at the call site,
+/// not here: reopen goes through `run_leaf_journaled` (same idempotency —
+/// one mail per (bead, sha) — plus a journal row, so a kill between verify
+/// and reopen resumes without duplicates) instead of a direct child wait.
+pub(crate) fn settle_loop_verify_output(
+    v: &serde_json::Value,
+    project: &str,
+    bead_id: &str,
+    sha: &str,
+    strict: bool,
+    at: chrono::DateTime<chrono::Utc>,
+    reopen: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<serde_json::Value> {
+    let dir = v.get("dir").and_then(serde_json::Value::as_str).unwrap_or(".");
+    let cwd = std::path::Path::new(dir);
+    match plan_loop_verify_settle(v, strict) {
+        LoopVerifySettle::Passthrough => Ok(v.clone()),
+        LoopVerifySettle::Record { output, warn_append, verify_cmd } => {
+            let receipt =
+                crate::verdict::write_command_verified_receipt(cwd, bead_id, sha, &output);
+            match receipt {
+                Ok(receipt_path) => {
+                    // advisory vacuous: annotate the receipt even though we still record
+                    if let Some(warning) = warn_append {
+                        let _ = crate::append_to_receipt(&receipt_path, &warning);
+                    }
+                    let verdict = crate::verdict::Verdict {
+                        kind: crate::verdict::VerdictKind::CommandVerified,
+                        bead_id: bead_id.to_string(),
+                        sha: sha.to_string(),
+                        at,
+                        actor: crate::verdict::AgentName::new("flywheel-toron-loop1"),
+                        receipt_path,
+                        verify_cmd,
+                    };
+                    match crate::verdict::report_pass(cwd, &verdict) {
+                        Ok(()) => Ok(serde_json::json!({
+                            "band": "loop-runnable",
+                            "recorded": true,
+                            "bead_id": bead_id,
+                            "sha": sha,
+                        })),
+                        Err(e) => Err(anyhow::anyhow!(
+                            "loop-run-verify record failed for {bead_id}: {e}"
+                        )),
+                    }
+                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "loop-run-verify receipt write failed for {bead_id}: {e}"
+                )),
+            }
+        }
+        LoopVerifySettle::Reopen { vacuous, timed_out, exit } => {
+            let warning = if let Some((warning, filtered, evidence)) = vacuous {
+                // Strict: refuse to write verdict, keep bead open with evidence.
+                // Best-effort evidence write (advisory — ignore errors).
+                let _ = (|| -> anyhow::Result<()> {
+                    let dir = cwd.join(".flywheel").join("receipts");
+                    std::fs::create_dir_all(&dir)?;
+                    let path = dir.join(format!("{bead_id}-{sha}.vacuous.txt"));
+                    std::fs::write(&path, &evidence)?;
+                    Ok(())
+                })();
+                eprintln!("{warning}");
+                Some((warning, filtered))
+            } else {
+                None
+            };
+            // Failed or skipped-head: reopen via the `__reopen-bead` leaf
+            // command (idempotent, one mail per (bead, sha); the reopened
+            // bead IS the fix unit — it re-dispatches with the failure in its
+            // thread). Never a re-verify of the same broken head.
+            let reopened = reopen()
+                .map_err(|e| anyhow::anyhow!("__reopen-bead failed: {e:#}"))?;
+            if let Some((warning, filtered)) = warning {
+                return Ok(serde_json::json!({
+                    "band": "loop-runnable",
+                    "reopened": reopened,
+                    "vacuous": true,
+                    "bead_id": bead_id,
+                    "warning": warning,
+                    "filtered": filtered,
+                }));
+            }
+            Ok(serde_json::json!({
+                "band": "loop-runnable",
+                "reopened": reopened,
+                "bead_id": bead_id,
+                "timed_out": timed_out,
+                "exit": exit,
+            }))
+        }
+    }
+}
+
+/// Reopen through the journaled leaf (bd-5ouq): same idempotency as the
+/// direct child wait (one mail per (bead, sha)) plus a journal row, so a
+/// kill between verify and reopen resumes without duplicating the mail.
+/// Returns the leaf's parsed value; the caller only checks success.
+fn reopen_bead_journaled(project: &str, bead_id: &str, sha: &str) -> anyhow::Result<bool> {
+    let key = format!("loop-run-verify-reopen:{bead_id}:{sha}");
+    crate::elm::leaf::run_leaf_journaled(project, "__reopen-bead", &[project, bead_id, sha], &key)
+        .map(|_| true)
+        .map_err(|e| anyhow::anyhow!("__reopen-bead failed: {e:#}"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyArgs {
     pub project: String,
@@ -2174,11 +2383,11 @@ fn self_exe() -> anyhow::Result<std::path::PathBuf> {
 /// leaf whose subprocess runs seconds-to-a-minute; leaves with a legit
 /// longer internal deadline (poll_events, send --confirm, loop-run-verify
 /// TIMEBOX) pass their own bound + grace via `run_leaf_cmd_bounded`.
-const DEFAULT_LEAF_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const DEFAULT_LEAF_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Grace added on top of a leaf's own internal deadline when the call site
 /// knows it (poll_events `--timeout-ms`, confirm timeout, VERIFY TIMEBOX).
-const LEAF_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const LEAF_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(crate) async fn run_leaf_cmd(
     cmd: std::process::Command,
@@ -2197,7 +2406,7 @@ pub(crate) async fn run_leaf_cmd(
 /// WHOLE GROUP via `kill -- -<pgid>` — a leaf's own children (br/git/cargo
 /// it spawned) die with it instead of orphaning to PPID 1 (prior incident:
 /// orphaned cargo test pid 9791).
-async fn run_leaf_cmd_bounded(
+pub(crate) async fn run_leaf_cmd_bounded(
     mut cmd: std::process::Command,
     label: &'static str,
     watchdog: std::time::Duration,
@@ -4188,6 +4397,53 @@ async fn poll_xproj_inbox(args: XprojInboxArgs) -> Result<Vec<crate::XprojInboxI
 /// then applies the pure [`eval_dispatch_guard`] verdict. Scan INFRA
 /// failures (collector crash, bad JSON, mail daemon down) fail OPEN with a
 /// loud log — a broken scanner must not freeze all dispatch; a SUCCESSFUL
+/// Settle one `__dispatch-guard` outcome (bd-5ouq): parse the fetched facts
+/// and evaluate them against caller time, returning the exact
+/// `{bead, dispatch, reason}` shape the `#[function]` body returns.
+/// Pure — fully pinned by unit tests. The call sites run the fetch through
+/// the journaled leaf and settle here; scan-infra failure stays fail-open
+/// at the call site (proceed), with the leaf error on stderr. Deviation
+/// from the old body, documented: the old code distinguished "scan failed"
+/// (non-zero exit) from "scan error" (transport) in the fail-open reason;
+/// the leaf folds both into one error, so both now proceed with the leaf
+/// error line. Dispatch behavior is identical (fail-open proceed either
+/// way); only the reason string merges.
+pub(crate) fn settle_dispatch_guard_output(
+    facts: &serde_json::Value,
+    bead: &str,
+    now_us: i64,
+    ttl_us: i64,
+) -> serde_json::Value {
+    let signals: Vec<(i64, GuardSignalKind)> = facts
+        .get("signals")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let ts = s.get("ts_us").and_then(serde_json::Value::as_i64)?;
+                    let kind = match s.get("kind").and_then(serde_json::Value::as_str)? {
+                        "claim" => GuardSignalKind::Claim,
+                        "announce" => GuardSignalKind::Announce,
+                        "done" => GuardSignalKind::Done,
+                        "stand_down" => GuardSignalKind::StandDown,
+                        "handoff" => GuardSignalKind::Handoff,
+                        _ => return None,
+                    };
+                    Some((ts, kind))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let facts = DispatchGuardFacts {
+        signals,
+        receipts_fresh_us: facts.get("receipts_fresh_us").and_then(serde_json::Value::as_i64),
+    };
+    match eval_dispatch_guard(&facts, now_us, ttl_us) {
+        Ok(()) => serde_json::json!({ "bead": bead, "dispatch": true, "reason": null }),
+        Err(reason) => serde_json::json!({ "bead": bead, "dispatch": false, "reason": reason }),
+    }
+}
+
 /// scan that says hold always wins.
 #[function]
 async fn dispatch_guard_scan(args: DispatchGuardArgs) -> Result<Value> {
@@ -7576,26 +7832,38 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     // bd-dispatch-dedupe-2zlz: GOAL gate — a live peer
                     // claim/announce/stand-down on the bead thread holds
                     // this dispatch (fail-open on scan infra failure).
-                    let g_args = DispatchGuardArgs {
-                        project: params.project.clone(),
-                        bead: bead.id.clone(),
-                        dispatch_ttl_us: params.dispatch_guard_ttl_us,
-                        now_us: authority.now_unix() as i64 * 1_000_000,
-                    };
-                    match ctx.run(dispatch_guard_scan, g_args).await {
-                        Ok(v) => {
-                            if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
-                                let reason =
-                                    v.get("reason").and_then(Value::as_str).unwrap_or("held");
-                                eprintln!("flywheel: dispatch-guard HOLD {}: {reason}", bead.id);
-                                continue;
-                            }
-                        }
+                    // bd-5ouq: facts via the journaled leaf (fresh per
+                    // poll — the key carries now_us so a crash re-fetches
+                    // instead of replaying a stale read), evaluated inline
+                    // with caller authority time.
+                    let g_now_us = authority.now_unix() as i64 * 1_000_000;
+                    let g_facts = match crate::elm::leaf::run_leaf_journaled(
+                        &params.project,
+                        "__dispatch-guard",
+                        &[&params.project, &bead.id],
+                        &format!("dispatch-guard:{}:{g_now_us}", bead.id),
+                    ) {
+                        Ok(v) => Some(v),
                         Err(e) => {
                             eprintln!(
                                 "flywheel: dispatch-guard leaf failed for {} (fail-open): {e}",
                                 bead.id
                             );
+                            None
+                        }
+                    };
+                    if let Some(g_facts) = g_facts {
+                        let g_v = settle_dispatch_guard_output(
+                            &g_facts,
+                            &bead.id,
+                            g_now_us,
+                            params.dispatch_guard_ttl_us,
+                        );
+                        if g_v.get("dispatch").and_then(Value::as_bool) == Some(false) {
+                            let reason =
+                                g_v.get("reason").and_then(Value::as_str).unwrap_or("held");
+                            eprintln!("flywheel: dispatch-guard HOLD {}: {reason}", bead.id);
+                            continue;
                         }
                     }
                     queue_brief(
@@ -7688,21 +7956,49 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // bd-dispatch-dedupe-2zlz: the claim-watch fired, but
                         // a LATE claim/announce may have landed since — scan
                         // before re-dispatching (W4 second-occurrence fix).
-                        let g_args = DispatchGuardArgs {
-                            project: params.project.clone(),
-                            bead: bead_id.clone(),
-                            dispatch_ttl_us: params.dispatch_guard_ttl_us,
-                            now_us: authority.now_unix() as i64 * 1_000_000,
-                        };
-                        match ctx.run(dispatch_guard_scan, g_args).await {
-                            Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
-                                let reason =
-                                    v.get("reason").and_then(Value::as_str).unwrap_or("held");
+                        // bd-5ouq: facts via the journaled leaf (fresh per
+                        // poll), evaluated inline with caller authority
+                        // time. Fail-open: a scan failure proceeds.
+                        let g_now_us = authority.now_unix() as i64 * 1_000_000;
+                        let g_hold: Option<String> =
+                            match crate::elm::leaf::run_leaf_journaled(
+                                &params.project,
+                                "__dispatch-guard",
+                                &[&params.project, &bead_id],
+                                &format!("dispatch-guard:{bead_id}:{g_now_us}"),
+                            ) {
+                                Ok(facts) => {
+                                    let v = settle_dispatch_guard_output(
+                                        &facts,
+                                        &bead_id,
+                                        g_now_us,
+                                        params.dispatch_guard_ttl_us,
+                                    );
+                                    if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
+                                        Some(
+                                            v.get("reason")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("held")
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "flywheel: dispatch-guard leaf failed for {bead_id} (fail-open): {e}"
+                                    );
+                                    None
+                                }
+                            };
+                        match g_hold {
+                            Some(reason) => {
                                 eprintln!(
                                     "flywheel: dispatch-guard HOLD re-dispatch {bead_id}: {reason}"
                                 );
                             }
-                            _ => {
+                            None => {
                                 queue_brief(
                                     &mut queue,
                                     &bead_id,
@@ -7728,21 +8024,49 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     ClaimWatchAction::RedispatchResume { bead_id, title } => {
                         // bd-dispatch-dedupe-2zlz: same gate for the resume
                         // re-dispatch — a posted stand-down holds it.
-                        let g_args = DispatchGuardArgs {
-                            project: params.project.clone(),
-                            bead: bead_id.clone(),
-                            dispatch_ttl_us: params.dispatch_guard_ttl_us,
-                            now_us: authority.now_unix() as i64 * 1_000_000,
-                        };
-                        match ctx.run(dispatch_guard_scan, g_args).await {
-                            Ok(v) if v.get("dispatch").and_then(Value::as_bool) == Some(false) => {
-                                let reason =
-                                    v.get("reason").and_then(Value::as_str).unwrap_or("held");
+                        // bd-5ouq: facts via the journaled leaf (fresh per
+                        // poll), evaluated inline with caller authority
+                        // time. Fail-open: a scan failure proceeds.
+                        let g_now_us = authority.now_unix() as i64 * 1_000_000;
+                        let g_hold: Option<String> =
+                            match crate::elm::leaf::run_leaf_journaled(
+                                &params.project,
+                                "__dispatch-guard",
+                                &[&params.project, &bead_id],
+                                &format!("dispatch-guard:{bead_id}:{g_now_us}"),
+                            ) {
+                                Ok(facts) => {
+                                    let v = settle_dispatch_guard_output(
+                                        &facts,
+                                        &bead_id,
+                                        g_now_us,
+                                        params.dispatch_guard_ttl_us,
+                                    );
+                                    if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
+                                        Some(
+                                            v.get("reason")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("held")
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "flywheel: dispatch-guard leaf failed for {bead_id} (fail-open): {e}"
+                                    );
+                                    None
+                                }
+                            };
+                        match g_hold {
+                            Some(reason) => {
                                 eprintln!(
                                     "flywheel: dispatch-guard HOLD resume {bead_id}: {reason}"
                                 );
                             }
-                            _ => {
+                            None => {
                                 queue_brief(
                                     &mut queue,
                                     &bead_id,
@@ -7858,17 +8182,58 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                             timeout_secs: None,
                                             strict: params.strict,
                                         };
-                                        match ctx.run(loop_run_verify, lr_args).await {
-                                            Ok(v) => {
-                                                lr_band = v
-                                                    .get("band")
-                                                    .and_then(Value::as_str)
-                                                    .unwrap_or("")
-                                                    .to_string();
+                                        // bd-5ouq: the child runs through the
+                                        // journaled leaf (same argv); settling
+                                        // stays inline with caller authority.
+                                        let mut lr_argv = vec![
+                                            params.project.clone(),
+                                            bead_id.clone(),
+                                            "--sha".to_string(),
+                                            sha.clone(),
+                                        ];
+                                        if let Some(t) = lr_args.timeout_secs {
+                                            lr_argv.push("--timeout-secs".to_string());
+                                            lr_argv.push(t.to_string());
+                                        }
+                                        let lr_refs: Vec<&str> =
+                                            lr_argv.iter().map(String::as_str).collect();
+                                        let lr_value = match crate::elm::leaf::run_leaf_journaled_timeout(
+                                            &params.project,
+                                            "__loop-run-verify",
+                                            &lr_refs,
+                                            &format!("loop-run-verify:{bead_id}:{sha}"),
+                                            lr_args.timeout_secs,
+                                        ) {
+                                            Ok(v) => Some(v),
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "flywheel: loop-run-verify for {bead_id} failed (continuing): {e}"
+                                                );
+                                                None
                                             }
-                                            Err(e) => eprintln!(
-                                                "flywheel: loop-run-verify for {bead_id} failed (continuing): {e}"
-                                            ),
+                                        };
+                                        if let Some(v) = lr_value {
+                                            let settled = settle_loop_verify_output(
+                                                &v,
+                                                &params.project,
+                                                &bead_id,
+                                                &sha,
+                                                params.strict,
+                                                authority.now_datetime(),
+                                                || {
+                                                    reopen_bead_journaled(
+                                                        &params.project,
+                                                        &bead_id,
+                                                        &sha,
+                                                    )
+                                                },
+                                            )
+                                            .map_err(map_err)?;
+                                            lr_band = settled
+                                                .get("band")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string();
                                         }
                                         if lr_band != "loop-runnable" {
                                             // Non-runnable band (or a leaf
@@ -13734,12 +14099,13 @@ mod tests {
     /// `swarm_loop` must not `ctx.run` a pure subprocess+parse leaf — those
     /// go through `run_leaf_journaled` with the same argv/parse as the leaf
     /// body. Complex leaves keep `ctx.run` (own Cmd fields needed):
-    /// `dispatch_guard_scan` (caller-time eval), `loop_run_verify` (custom
-    /// timeout + authority), `poll_events` (bounded + inside-leaf log),
-    /// `send_prompt` (inbox branch + bounded + send log), `respawn_agent`
-    /// (file writes), `spawn_xproj` (at-most-once mark), `notify_blocked`
-    /// (ack gate + persist), `diagnose_agent` (log), `reclaim_bead`
-    /// (release + comment), `renew_filtered_leases` (direct mail).
+    /// `poll_events` (bounded + inside-leaf log), `send_prompt` (inbox
+    /// branch + bounded + send log), `respawn_agent` (file writes),
+    /// `spawn_xproj` (at-most-once mark), `notify_blocked` (ack gate +
+    /// persist), `diagnose_agent` (log), `reclaim_bead` (release + comment),
+    /// `renew_filtered_leases` (direct mail). bd-5ouq: `loop_run_verify`
+    /// and `dispatch_guard_scan` left that list — their children run
+    /// journaled and their evaluations stay inline with caller authority.
     #[test]
     fn pure_leaves_run_journaled_not_ctx_run() {
         let src = std::fs::read_to_string(file!()).expect("durable.rs readable");
@@ -13763,6 +14129,8 @@ mod tests {
             ["reply", "_settled,"].concat(),
             ["remind", "_reply,"].concat(),
             ["read", "_output,"].concat(),
+            ["loop_run", "_verify,"].concat(),
+            ["dispatch_guard", "_scan,"].concat(),
         ];
         for leaf in &pure_leaves {
             assert!(
@@ -19101,5 +19469,212 @@ mod single_writer_tests {
                 "Option A: swarm_loop must not construct {needle} (doorbell slice)"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T4 close path (bd-5ouq): RED — the verify-settle step must exist as a
+// testable unit before the ctx.run(loop_run_verify) call site can move.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod t4_close_tests {
+    use super::*;
+
+    fn at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flywheel-settle-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn runnable(dir: &std::path::Path) -> serde_json::Value {
+        serde_json::json!({
+            "band": "loop-runnable",
+            "dir": dir.to_str().unwrap(),
+            "output_tail": "ok 3 passed",
+            "verify": "cargo test x",
+            "exit": 0,
+        })
+    }
+
+    #[test]
+    fn non_runnable_band_passes_through_untouched() {
+        let v = serde_json::json!({"band": "non-runnable", "raw": "x"});
+        assert_eq!(
+            plan_loop_verify_settle(&v, false),
+            LoopVerifySettle::Passthrough
+        );
+        let out = settle_loop_verify_output(&v, "proj", "bd-x", "abc", false, at(), || {
+            panic!("passthrough must never reopen")
+        })
+        .expect("passthrough settles");
+        assert_eq!(out, v);
+    }
+
+    #[test]
+    fn plan_names_record_for_runnable_proof() {
+        let dir = scratch("plan");
+        let plan = plan_loop_verify_settle(&runnable(&dir), false);
+        assert_eq!(
+            plan,
+            LoopVerifySettle::Record {
+                output: "ok 3 passed".to_string(),
+                warn_append: None,
+                verify_cmd: "cargo test x".to_string(),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_names_reopen_for_failed_head() {
+        let dir = scratch("fail");
+        let mut v = runnable(&dir);
+        v["exit"] = serde_json::json!(1);
+        let plan = plan_loop_verify_settle(&v, false);
+        assert_eq!(
+            plan,
+            LoopVerifySettle::Reopen { vacuous: None, timed_out: false, exit: 1 }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vacuous_strict_refuses_and_writes_evidence() {
+        let dir = scratch("vacuous");
+        let v = serde_json::json!({
+            "band": "loop-runnable",
+            "dir": dir.to_str().unwrap(),
+            "output_tail": "test result: ok. 0 passed",
+            "verify": "cargo test nothing-matches",
+            "exit": 0,
+        });
+        match plan_loop_verify_settle(&v, true) {
+            LoopVerifySettle::Reopen { vacuous: Some((w, _, e)), timed_out, exit } => {
+                assert!(w.contains("vacuous VERIFY"));
+                assert_eq!((timed_out, exit), (false, 0));
+                assert!(e.contains("output tail"));
+            }
+            other => panic!("strict vacuous must refuse with evidence, got {other:?}"),
+        }
+        let out = settle_loop_verify_output(&v, "proj", "bd-x", "abc", true, at(), || Ok(true))
+            .expect("strict vacuous settles via reopen");
+        assert_eq!(out["reopened"], true);
+        assert_eq!(out["vacuous"], true);
+        let ev = std::fs::read_to_string(dir.join(".flywheel/receipts/bd-x-abc.vacuous.txt"))
+            .expect("vacuous evidence written");
+        assert!(ev.contains("vacuous VERIFY"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vacuous_advisory_still_records_with_annotation() {
+        let dir = scratch("advisory");
+        let v = serde_json::json!({
+            "band": "loop-runnable",
+            "dir": dir.to_str().unwrap(),
+            "output_tail": "test result: ok. 0 passed",
+            "verify": "cargo test nothing-matches",
+            "exit": 0,
+        });
+        match plan_loop_verify_settle(&v, false) {
+            LoopVerifySettle::Record { warn_append: Some(w), .. } => {
+                assert!(w.contains("vacuous VERIFY"));
+            }
+            other => panic!("advisory vacuous must record annotated, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_failure_propagates_with_leaf_prefix() {
+        let dir = scratch("reopen-err");
+        let mut v = runnable(&dir);
+        v["exit"] = serde_json::json!(1);
+        let err = settle_loop_verify_output(&v, "proj", "bd-x", "abc", false, at(), || {
+            Err(anyhow::anyhow!("boom"))
+        })
+        .expect_err("reopen failure must propagate");
+        assert!(err.to_string().contains("__reopen-bead failed:"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_without_duplicates_settle_twice_identical() {
+        let dir = scratch("idempotent");
+        let mut v = runnable(&dir);
+        v["exit"] = serde_json::json!(1);
+        let once = settle_loop_verify_output(&v, "proj", "bd-x", "abc", false, at(), || Ok(true))
+            .expect("first settle");
+        let twice = settle_loop_verify_output(&v, "proj", "bd-x", "abc", false, at(), || Ok(true))
+            .expect("resume settles identically");
+        assert_eq!(once, twice, "kill mid-window resumes without duplicates");
+        assert_eq!(twice["reopened"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unarmed_record_refuses_forgery() {
+        let dir = scratch("unarmed");
+        let v = runnable(&dir);
+        let err = settle_loop_verify_output(&v, "proj", "bd-x", "abc", false, at(), || Ok(true))
+            .expect_err("un loop-armed record must refuse");
+        assert!(err.to_string().contains("LOOP only"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn guard_facts(signals: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "signals": signals, "receipts_fresh_us": null })
+    }
+
+    #[test]
+    fn dispatch_guard_hold_shape_is_exact() {
+        let now = 1_000_000_000i64;
+        let facts = guard_facts(serde_json::json!([
+            {"ts_us": now - 3_000_000, "kind": "stand_down"},
+        ]));
+        let v = settle_dispatch_guard_output(&facts, "bd-x", now, 600_000_000);
+        assert_eq!(v["bead"], "bd-x");
+        assert_eq!(v["dispatch"], false);
+        assert!(v["reason"].as_str().unwrap().contains("stood down"), "{v}");
+    }
+
+    #[test]
+    fn dispatch_guard_proceed_shape_is_exact() {
+        let now = 1_000_000_000i64;
+        let v = settle_dispatch_guard_output(&guard_facts(serde_json::json!([])), "bd-x", now, 600_000_000);
+        assert_eq!(v, serde_json::json!({"bead": "bd-x", "dispatch": true, "reason": null}));
+    }
+
+    #[test]
+    fn dispatch_guard_drops_malformed_signals() {
+        let now = 1_000_000_000i64;
+        let facts = guard_facts(serde_json::json!([
+            {"ts_us": now - 1_000, "kind": "bogus-kind"},
+            {"kind": "claim"},
+            {"ts_us": "not-a-number", "kind": "claim"},
+        ]));
+        let v = settle_dispatch_guard_output(&facts, "bd-x", now, 600_000_000);
+        assert_eq!(v["dispatch"], true, "malformed signals never hold: {v}");
+    }
+
+    #[test]
+    fn dispatch_guard_settle_is_deterministic() {
+        let now = 1_000_000_000i64;
+        let facts = guard_facts(serde_json::json!([
+            {"ts_us": now - 3_000_000, "kind": "stand_down"},
+        ]));
+        let a = settle_dispatch_guard_output(&facts, "bd-x", now, 600_000_000);
+        let b = settle_dispatch_guard_output(&facts, "bd-x", now, 600_000_000);
+        assert_eq!(a, b, "same inputs settle identically");
     }
 }
