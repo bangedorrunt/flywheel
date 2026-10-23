@@ -57,6 +57,9 @@ pub enum Begin {
     Skip,
     /// The journal could not be reached: do not run blind.
     Unavailable(String),
+    /// A live claim by another owner (not this host's predecessor) holds the
+    /// key. Nothing ran and nothing failed: the holder settles it (rv23 S2).
+    Held(String),
 }
 
 /// The effect journal a command runs under.
@@ -232,6 +235,10 @@ fn scrub_msg(m: SupMsg) -> SupMsg {
             key,
             why: flatten(&why),
         },
+        SupMsg::CmdHeld { key, holder } => SupMsg::CmdHeld {
+            key,
+            holder: flatten(&holder),
+        },
         other => other,
     }
 }
@@ -299,6 +306,8 @@ pub struct RoundReport {
     pub skipped: u64,
     /// Commands that failed.
     pub failed: u64,
+    /// Commands another live owner's claim held (not failures).
+    pub held: u64,
     /// Effects `FLYWHEEL_ALLOW_EXEC=0` refused. One line each.
     pub suppressed: Vec<String>,
 }
@@ -741,6 +750,11 @@ pub fn execute(
                 why: format!("journal unavailable: {why}"),
             }];
         }
+        // Not a failure of the child: a refused claim spends no restart.
+        Begin::Held(holder) => {
+            rep.held += 1;
+            return vec![SupMsg::CmdHeld { key, holder }];
+        }
         Begin::Run(g) => g,
     };
     let res: Result<Vec<SupMsg>, String> = match cmd {
@@ -908,6 +922,7 @@ pub fn recover(
                         why: format!("journal unavailable: {why}"),
                     });
                 }
+                Begin::Held(_) => rep.held += 1,
             }
             continue;
         }
@@ -942,6 +957,27 @@ pub fn recover(
 }
 
 // ---- production journal ---------------------------------------------------
+
+/// The journal owner for supervisor context `ctx` (its lease key, one live
+/// host each) at `sup_epoch`. No pid: a restarted host is recognised by its
+/// context and its higher epoch, not by a process id.
+pub(crate) fn journal_owner(ctx: &str, sup_epoch: u64) -> String {
+    format!("{ctx}@e{sup_epoch}")
+}
+
+/// Pure: may `mine` take over a claim owned by `theirs`? Only a claim of the
+/// SAME context at a LOWER sup_epoch (the dead predecessor). Another context,
+/// an equal or newer epoch, or an owner of another shape is never taken.
+pub(crate) fn takes_over(mine: &str, theirs: &str) -> bool {
+    let split = |o: &str| {
+        o.rsplit_once("@e")
+            .and_then(|(c, e)| e.parse::<u64>().ok().map(|e| (c.to_string(), e)))
+    };
+    match (split(mine), split(theirs)) {
+        (Some((mc, me)), Some((tc, te))) => mc == tc && te < me,
+        _ => false,
+    }
+}
 
 /// toron's `ToronJournal` as the effect journal.
 pub struct ToronEffectJournal {
@@ -987,15 +1023,30 @@ impl EffectJournal for ToronEffectJournal {
             return Begin::Skip;
         }
         let now = chrono::Utc::now().timestamp_millis();
-        let claimed =
-            match self
-                .j
-                .try_claim(key, &self.owner, now + self.lease_ms, now, row.generation)
-            {
-                Ok(Some(r)) => r,
-                Ok(None) => return Begin::Unavailable("claim refused".into()),
-                Err(e) => return Begin::Unavailable(e.to_string()),
-            };
+        let claim = |owner: &str| {
+            self.j
+                .try_claim(key, owner, now + self.lease_ms, now, row.generation)
+        };
+        let claimed = match claim(&self.owner) {
+            Ok(Some(r)) => r,
+            // Refused: another owner's lease is live. If that owner is this
+            // context's predecessor (a lower sup_epoch, so a host that is
+            // dead: the context lease admits one live host and the epoch
+            // claim fenced it), take its claim over and run the key under it.
+            // Waiting out its lease instead made the fold count the refusal
+            // as a child failure: an extra generation and a spent restart
+            // slot per host crash (rv23 S2).
+            Ok(None) => match row.owner.as_deref() {
+                Some(theirs) if takes_over(&self.owner, theirs) => match claim(theirs) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return Begin::Held(theirs.to_string()),
+                    Err(e) => return Begin::Unavailable(e.to_string()),
+                },
+                Some(theirs) => return Begin::Held(theirs.to_string()),
+                None => return Begin::Held(String::new()),
+            },
+            Err(e) => return Begin::Unavailable(e.to_string()),
+        };
         if claimed.state == EffectState::Prepared {
             let _ = self
                 .j
@@ -1642,7 +1693,7 @@ fn host_loop(
     let epoch = claim_for_host(&mut core, project, me)?;
     let mut journal = ToronEffectJournal::open(
         &format!("supervise:{}", crate::state::state_key(project)),
-        me,
+        &journal_owner(lease_ws, epoch),
     )?;
     let mut ports = LivePorts::new(cfg, project, project);
     if let Some(c) = context {
@@ -3672,6 +3723,104 @@ mod tests {
             ),
             rt,
         )
+    }
+
+    /// Two hosts' journals over ONE store (a kill -9 and a restart).
+    fn toron_journals(
+        owners: &[&str],
+    ) -> (Vec<ToronEffectJournal>, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = dir.join("index.sqlite");
+        let pool = rt.block_on(async {
+            let pool = toron_core::index::schema::connect(&db.to_string_lossy())
+                .await
+                .unwrap();
+            toron_core::index::schema::migrate(&pool).await.unwrap();
+            pool
+        });
+        let js = owners
+            .iter()
+            .map(|o| {
+                let jd = toron_core::journal::JournalDb::new(pool.clone(), "supervise:test", 64);
+                ToronEffectJournal::new(toron_core::journal::ToronJournal::spawn(jd, rt.handle()), o)
+            })
+            .collect();
+        (js, rt)
+    }
+
+    /// rv23 S2, the regression: the host dies (kill -9) holding a live claim
+    /// on `relaunch:b:2`. The restarted host (same context, next sup_epoch)
+    /// must take that claim over and run the relaunch, not be refused (a
+    /// refusal became `CmdFailed`, an extra generation and a spent slot).
+    #[test]
+    fn a_restarted_host_takes_over_its_dead_predecessors_relaunch_claim() {
+        let dead = journal_owner("supervise-p", 1);
+        let next = journal_owner("supervise-p", 2);
+        let other_ctx = journal_owner("supervise-p--lead", 1);
+        let newer = journal_owner("supervise-p", 3);
+        let (mut js, _rt) = toron_journals(&[&dead, &next, &other_ctx, &newer]);
+        let g1 = match js[0].begin("relaunch:b:2") {
+            Begin::Run(g) => g,
+            other => panic!("{other:?}"),
+        };
+        // The predecessor never settles: it was killed.
+        let g2 = match js[1].begin("relaunch:b:2") {
+            Begin::Run(g) => g,
+            other => panic!("the restarted host must take over: {other:?}"),
+        };
+        assert!(g2 > g1, "the takeover fences the dead claim");
+        js[1].finish("relaunch:b:2", g2, true);
+        assert_eq!(js[1].begin("relaunch:b:2"), Begin::Skip);
+        // Never taken: another context's live claim, or a NEWER epoch's.
+        assert!(matches!(js[2].begin("relaunch:x:2"), Begin::Run(_)));
+        assert_eq!(js[1].begin("relaunch:x:2"), Begin::Held(other_ctx.clone()));
+        assert!(matches!(js[3].begin("relaunch:y:2"), Begin::Run(_)));
+        assert_eq!(js[1].begin("relaunch:y:2"), Begin::Held(newer.clone()));
+    }
+
+    #[test]
+    fn takes_over_only_the_same_context_at_a_lower_epoch() {
+        assert!(takes_over("supervise-p@e2", "supervise-p@e1"));
+        assert!(!takes_over("supervise-p@e2", "supervise-p@e2"));
+        assert!(!takes_over("supervise-p@e2", "supervise-p@e3"));
+        assert!(!takes_over("supervise-p@e2", "supervise-p--lead@e1"));
+        assert!(!takes_over("supervise-p@e2", "supervise-p-123"));
+        assert!(!takes_over("supervise-p-123", "supervise-p@e1"));
+    }
+
+    /// A held claim reaches the fold as `CmdHeld`, never `CmdFailed`.
+    #[test]
+    fn a_held_claim_is_reported_as_held_not_failed() {
+        struct HeldJ;
+        impl EffectJournal for HeldJ {
+            fn begin(&mut self, _: &str) -> Begin {
+                Begin::Held("supervise-p@e1".into())
+            }
+            fn finish(&mut self, _: &str, _: u64, _: bool) {}
+        }
+        let f = Fake::default();
+        let mut p = f.clone();
+        let mut rep = RoundReport::default();
+        let back = execute(
+            &mut HeldJ,
+            &mut p,
+            &SupCmd::Relaunch {
+                child: "b".into(),
+                generation: 2,
+                kind: ChildKind::Crew,
+            },
+            &mut rep,
+        );
+        assert_eq!(
+            back,
+            vec![SupMsg::CmdHeld {
+                key: "relaunch:b:2".into(),
+                holder: "supervise-p@e1".into()
+            }]
+        );
+        assert_eq!((rep.failed, rep.held), (0, 1));
+        assert!(f.0.lock().unwrap().relaunched.is_empty(), "nothing ran");
     }
 
     #[test]
