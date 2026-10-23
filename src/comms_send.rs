@@ -699,8 +699,8 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
                 // budget and the deaf escalation. A sender ring on top of it
                 // would be a second, unbudgeted writer for the same mail.
                 Ok(target) => {
-                    let ws = crate::find_workspace(c, &project).ok();
-                    if doorbell_owner(&project, ws.as_deref()).is_some() {
+                    let ws = crate::find_workspace_info(c, &project).ok();
+                    if doorbell_owner(&project, ws.as_ref()).is_some() {
                         "left to the doorbell host (budgeted, level-triggered)".to_string()
                     } else {
                         let kind = crate::state::load_spawn_registry(&project)
@@ -731,11 +731,32 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
 /// A live doorbell owner for this project's workspace (embedded or daemon
 /// host), by its lease: the writer that rings with a budget. `None` = nobody
 /// is hosting, so the sender's own ring is the only wake there is.
-pub fn doorbell_owner(project: &str, workspace: Option<&str>) -> Option<u32> {
+pub fn doorbell_owner(
+    project: &str,
+    workspace: Option<&crate::herdr_shim::WorkspaceInfo>,
+) -> Option<u32> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    doorbell_owner_in(&crate::config::state_dir(), project, workspace, now)
+    owner_of_workspace(&crate::config::state_dir(), project, workspace, now)
+}
+
+/// The sender's lookup for a herdr workspace: by the key its doorbell host
+/// was spawned under ([`host_key`]), never by the herdr workspace id.
+fn owner_of_workspace(
+    state_dir: &std::path::Path,
+    project: &str,
+    workspace: Option<&crate::herdr_shim::WorkspaceInfo>,
+    now: u64,
+) -> Option<u32> {
+    doorbell_owner_in(state_dir, project, workspace.map(host_key), now)
+}
+
+/// A doorbell host runs as `__doorbell --workspace <label>`: its pid file,
+/// owner lease and inbox lease ([`crate::doorbell::inbox_owner_key`]) all
+/// carry the herdr workspace LABEL (prod: `owner-inbox-flywheel-flywheel.json`).
+fn host_key(ws: &crate::herdr_shim::WorkspaceInfo) -> &str {
+    &ws.label
 }
 
 fn doorbell_owner_in(
@@ -748,7 +769,7 @@ fn doorbell_owner_in(
     // flag holds the workspace lease but types nothing (kind `no-text`), so
     // deferring to it left the workspace silent. The inbox host's own lease
     // (`inbox-<ws>`) is the ringer there (follow-up a).
-    let inbox = workspace.map(doorbell_rt::lease::inbox_lease_key);
+    let inbox = workspace.map(crate::doorbell::inbox_owner_key);
     doorbell_rt::lease::live_leases(state_dir, now)
         .into_iter()
         .find(|(ws, l)| {
@@ -1136,6 +1157,43 @@ mod tests {
             doorbell_owner_in(dir.path(), "other", Some("other"), now),
             None
         );
+    }
+
+    fn herdr_ws(id: &str, label: &str) -> crate::herdr_shim::WorkspaceInfo {
+        serde_json::from_value(json!({
+            "workspace_id": id, "number": 1, "label": label, "focused": false,
+            "pane_count": 1, "tab_count": 1, "active_tab_id": "t1", "agent_status": "idle"
+        }))
+        .expect("a herdr workspace row")
+    }
+
+    /// rv23 S1/S2, the regression: the inbox host is spawned under the herdr
+    /// workspace LABEL and leases `inbox-<label>`; the sender resolved the
+    /// workspace ID (`w1`) and looked up `inbox-w1`, found nobody, and rang
+    /// the pane itself on every send (two wakes per send, plus one to an
+    /// agent with no pane). The label differs from the id AND the project
+    /// here, so no coincidence can make the lookup pass.
+    #[test]
+    fn the_sender_finds_the_inbox_host_by_the_workspace_label_not_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = doorbell_rt::lease::unix_now();
+        let ws = herdr_ws("w1", "flywheel-proj");
+        assert_eq!(owner_of_workspace(dir.path(), "proj", Some(&ws), now), None);
+        // Exactly what `run_inbox_only(cfg, "proj", "flywheel-proj")` leases.
+        doorbell_rt::lease::acquire_lease(
+            dir.path(),
+            &crate::doorbell::inbox_owner_key("flywheel-proj"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            owner_of_workspace(dir.path(), "proj", Some(&ws), now),
+            Some(std::process::id()),
+            "the sender must defer to the live inbox host: one wake per send"
+        );
+        // Another workspace's host is not this one's, even with the same id.
+        let other = herdr_ws("w1", "flywheel-other");
+        assert_eq!(owner_of_workspace(dir.path(), "other", Some(&other), now), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
