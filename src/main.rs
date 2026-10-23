@@ -122,6 +122,10 @@ mod workspace;
 mod workspace_policy;
 mod workspace_reporting;
 mod write_liveness;
+// bd-w7g8: the hermetic-test half. Test-only, and inside the bin because there
+// is no lib target for it to live in.
+#[cfg(test)]
+mod test_env_contract;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
