@@ -1,8 +1,13 @@
 //! Collaboration-pattern e2e soak harness (bd-test-collab-patterns-e2e).
 //!
-//! Always-on: CLI surface + pure parsers + recipe catalog presence.
-//! Live: when herdr + agent-mail respond, exercise debate/xproj/plan-review help
-//! paths and soft mail product ensure (no orphan workspaces).
+//! Always-on: CLI surface + pure parsers + recipe catalog presence. Every
+//! binary call there runs through [`run`]: a fresh temp HOME and temp XDG
+//! dirs, no herdr socket, and no inherited TORON_/FLYWHEEL_/DOORBELL_ env.
+//! Live (opt-in, `FLYWHEEL_LIVE_E2E=1`, off by default): the debate and
+//! plan-review soaks against the real herdr and mail, the mail probe, and the
+//! xproj inbox leaf. Each of those writes to the operator's live stores (the
+//! probe alone created `flywheel-mail-probe` in the real toron data dir on
+//! every plain `cargo test`), so none of them runs unless asked.
 //!
 //! governed-by: ADR-0001 §10, §9.1–9.5
 
@@ -11,6 +16,85 @@ use std::time::Duration;
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
+}
+
+/// Opt-in for the live soaks. Off unless exactly `1`.
+const LIVE_E2E: &str = "FLYWHEEL_LIVE_E2E";
+
+fn live_e2e_opted_in() -> bool {
+    std::env::var(LIVE_E2E).as_deref() == Ok("1")
+}
+
+/// Run the binary hermetically: a fresh temp HOME and XDG data/state/config/
+/// cache, a herdr socket path that does not exist, and none of the operator's
+/// TORON_/FLYWHEEL_/DOORBELL_ settings. The temp dir is removed on return.
+fn run(args: &[&str]) -> std::process::Output {
+    let tmp = tempfile::tempdir().expect("hermetic temp dir");
+    let mut cmd = Command::new(flywheel());
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("TORON_")
+            || key.starts_with("FLYWHEEL_")
+            || key.starts_with("DOORBELL_")
+            || key == "AGENT_NAME"
+        {
+            cmd.env_remove(key.as_ref());
+        }
+    }
+    for (var, sub) in [
+        ("HOME", "home"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+    ] {
+        let dir = tmp.path().join(sub);
+        std::fs::create_dir_all(&dir).expect("hermetic subdir");
+        cmd.env(var, dir);
+    }
+    cmd.env("HERDR_SOCKET_PATH", tmp.path().join("no-herdr.sock"));
+    cmd.args(args).output().expect("spawn flywheel")
+}
+
+/// Every test reaches the binary, herdr or mail only through [`run`] or after
+/// the opt-in gate, and the three live soaks carry that gate. A plain
+/// `cargo test` used to run the mail probe (creating `flywheel-mail-probe`
+/// in the operator's toron data dir), the xproj inbox leaf, and the soaks
+/// against the real herdr whenever they were up.
+#[test]
+fn live_soaks_are_opt_in_before_anything_live() {
+    let src = include_str!("collab_patterns_e2e.rs");
+    let me = "live_soaks_are_opt_in_before_anything_live";
+    let live_tests = [
+        "debate_soak_three_rounds_ack_gated_verdict",
+        "plan_review_implement_soak_three_paths",
+        "cross_project_xproj_and_product_surface",
+    ];
+    let mut seen = 0;
+    for body in src.split("#[test]\nfn ").skip(1) {
+        let name = body.split('(').next().unwrap_or_default();
+        if name == me {
+            continue;
+        }
+        seen += 1;
+        let gate = body.find("if !live_e2e_opted_in()");
+        assert_eq!(
+            gate.is_some(),
+            live_tests.contains(&name),
+            "{name}: exactly the live soaks carry the opt-in gate"
+        );
+        let hermetic = &body[..gate.unwrap_or(body.len())];
+        for live in ["Command::new(", "herdr_up()", "mail_up()", "__xproj-inbox"] {
+            assert!(
+                !hermetic.contains(live),
+                "{name}: {live} before the opt-in gate (use run())"
+            );
+        }
+    }
+    assert!(seen >= 7, "found {seen} tests");
+    if std::env::var(LIVE_E2E).ok().as_deref() != Some("1") {
+        assert!(!live_e2e_opted_in(), "off unless {LIVE_E2E}=1");
+    }
 }
 
 fn herdr_up() -> bool {
@@ -46,37 +130,23 @@ fn mail_up() -> bool {
 /// Default gate: the collaboration recipes are wired into the CLI surface.
 #[test]
 fn collab_recipes_are_wired_into_the_cli() {
-    let exe = flywheel();
-
-    let out = Command::new(exe)
-        .args(["debate", "--help"])
-        .output()
-        .expect("debate --help");
+    let out = run(&["debate", "--help"]);
     assert!(out.status.success(), "debate --help must exit 0");
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("proposition"), "debate takes a proposition");
     assert!(help.contains("--rounds"), "debate has --rounds");
 
-    let out = Command::new(exe)
-        .args(["plan-review", "--help"])
-        .output()
-        .expect("plan-review --help");
+    let out = run(&["plan-review", "--help"]);
     assert!(out.status.success(), "plan-review --help must exit 0");
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("--max-change-rounds") || help.contains("FEATURE"));
 
-    let out = Command::new(exe)
-        .args(["xproj", "--help"])
-        .output()
-        .expect("xproj --help");
+    let out = run(&["xproj", "--help"]);
     assert!(out.status.success(), "xproj --help must exit 0");
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("request") && help.contains("send") && help.contains("parse"));
 
-    let out = Command::new(exe)
-        .args(["spawn", "--help"])
-        .output()
-        .expect("spawn --help");
+    let out = run(&["spawn", "--help"]);
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("--peer-aware"), "spawn has --peer-aware");
@@ -92,28 +162,12 @@ fn collab_recipes_are_wired_into_the_cli() {
 /// unit-tested, flag never wired (cargo test + clippy both green regardless).
 #[test]
 fn cli_surface_exposes_gated_features() {
-    let exe = flywheel();
-
-    let spawn_help = String::from_utf8_lossy(
-        &Command::new(exe)
-            .args(["spawn", "--help"])
-            .output()
-            .expect("spawn --help")
-            .stdout,
-    )
-    .to_string();
+    let spawn_help = String::from_utf8_lossy(&run(&["spawn", "--help"]).stdout).to_string();
     for flag in ["--settle-secs", "--profile", "--count"] {
         assert!(spawn_help.contains(flag), "spawn --help must expose {flag}");
     }
 
-    let send_help = String::from_utf8_lossy(
-        &Command::new(exe)
-            .args(["send", "--help"])
-            .output()
-            .expect("send --help")
-            .stdout,
-    )
-    .to_string();
+    let send_help = String::from_utf8_lossy(&run(&["send", "--help"]).stdout).to_string();
     assert!(
         send_help.contains("--respawn-on-stall"),
         "send --help must expose --respawn-on-stall"
@@ -123,12 +177,8 @@ fn cli_surface_exposes_gated_features() {
 /// Pure xproj parse path (no infra) — dual-project e2e unit layer.
 #[test]
 fn xproj_parse_contract_for_receiver_loop() {
-    let exe = flywheel();
     let body = "[xproj] run\nrecipe=backtest-5m\nworkers=4\nproduct=trading-research\nstrategy=X\n";
-    let out = Command::new(exe)
-        .args(["xproj", "parse", body])
-        .output()
-        .expect("xproj parse");
+    let out = run(&["xproj", "parse", body]);
     assert!(
         out.status.success(),
         "stderr={}",
@@ -146,6 +196,10 @@ fn xproj_parse_contract_for_receiver_loop() {
 /// and fails fast without hanging when agents are missing.
 #[test]
 fn debate_soak_three_rounds_ack_gated_verdict() {
+    if !live_e2e_opted_in() {
+        eprintln!("{LIVE_E2E} unset — live debate soak skipped (CLI wiring covered above)");
+        return;
+    }
     let exe = flywheel();
     if !herdr_up() {
         eprintln!("herdr down — CLI wiring covered by collab_recipes_are_wired_into_the_cli");
@@ -229,11 +283,7 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
 /// full agent path optional when live.
 #[test]
 fn plan_review_implement_soak_three_paths() {
-    let exe = flywheel();
-    let out = Command::new(exe)
-        .args(["plan-review", "--help"])
-        .output()
-        .expect("help");
+    let out = run(&["plan-review", "--help"]);
     assert!(out.status.success());
 
     // unit-level paths already in plan_review_tests; assert binary embeds tokens
@@ -241,6 +291,11 @@ fn plan_review_implement_soak_three_paths() {
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("max-change-rounds") || help.contains("FEATURE"));
 
+    if !live_e2e_opted_in() {
+        eprintln!("{LIVE_E2E} unset — live plan-review soak skipped");
+        return;
+    }
+    let exe = flywheel();
     if !herdr_up() || !mail_up() {
         eprintln!("infra partial — pure plan_review unit tests cover APPROVE/CHANGES/REJECT");
         return;
@@ -280,11 +335,7 @@ fn plan_review_implement_soak_three_paths() {
 /// Peer-triggered: --peer-aware is wired; live spawn not required for gap close.
 #[test]
 fn peer_triggered_soak_a_wakes_b() {
-    let exe = flywheel();
-    let out = Command::new(exe)
-        .args(["spawn", "--help"])
-        .output()
-        .expect("spawn help");
+    let out = run(&["spawn", "--help"]);
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("--peer-aware"));
@@ -306,20 +357,24 @@ fn peer_triggered_soak_a_wakes_b() {
 /// Cross-project: parse + product CLI + soft product ensure when mail up.
 #[test]
 fn cross_project_xproj_and_product_surface() {
-    let exe = flywheel();
-    let out = Command::new(exe)
-        .args([
-            "xproj",
-            "parse",
-            "[xproj]\nrecipe=soak\nworkers=2\nproduct=trading-research\n",
-        ])
-        .output()
-        .expect("parse");
+    let out = run(&[
+        "xproj",
+        "parse",
+        "[xproj]\nrecipe=soak\nworkers=2\nproduct=trading-research\n",
+    ]);
     assert!(out.status.success());
     let v: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(v["recipe"], "soak");
 
+    // Opt-in: the mail probe and the inbox leaf below each open the
+    // configured mail store and register a project there
+    // (`flywheel-mail-probe`, `flywheel-xproj-e2e`).
+    if !live_e2e_opted_in() {
+        eprintln!("{LIVE_E2E} unset — live xproj inbox skipped (parse contract covered above)");
+        return;
+    }
+    let exe = flywheel();
     if !mail_up() {
         eprintln!("mail down — skip the product surface");
         return;
