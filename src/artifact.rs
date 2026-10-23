@@ -358,11 +358,20 @@ fn safe_component(value: &str) -> String {
     }
 }
 
-/// State path for one host evaluation: `artifacts/<run_id>/evaluations/`.
-pub fn evaluation_artifact_path(project: &str, run_id: &str, link: &str, phase: &str) -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("flywheel")
+/// State path for one host evaluation under the data root `root`:
+/// `flywheel/<project>/artifacts/<run_id>/evaluations/`. The evidence
+/// read/write/stitch path takes the root as a value, like
+/// [`stitch_artifacts_in`], so a test resolves everything under its own temp
+/// dir instead of the operator's `dirs::data_local_dir()` (on macOS
+/// `~/Library/Application Support`, which ignores `XDG_DATA_HOME`).
+fn evaluation_artifact_path_in(
+    root: &std::path::Path,
+    project: &str,
+    run_id: &str,
+    link: &str,
+    phase: &str,
+) -> PathBuf {
+    root.join("flywheel")
         .join(safe_component(project))
         .join("artifacts")
         .join(safe_component(run_id))
@@ -437,7 +446,7 @@ fn validate_evaluation_evidence(
 /// Persist one host evaluation, returning its durable path.
 ///
 /// The gate reads this file back (`artifacts stitch`,
-/// `read_evaluation_evidence`), so the write is atomic: a reader never sees a
+/// `read_evaluation_evidence_in`), so the write is atomic: a reader never sees a
 /// half-written record, and `fs_util::atomic_write` names the failing path in
 /// its error where a bare errno does not. A transient OS error gets ONE
 /// retry — the write is idempotent (same bytes, same destination) and a real
@@ -446,8 +455,23 @@ pub fn write_evaluation_evidence(
     project: &str,
     evidence: &EvaluationEvidence,
 ) -> anyhow::Result<PathBuf> {
+    write_evaluation_evidence_in(&default_data_root(), project, evidence)
+}
+
+/// [`write_evaluation_evidence`] under an explicit data root.
+fn write_evaluation_evidence_in(
+    root: &std::path::Path,
+    project: &str,
+    evidence: &EvaluationEvidence,
+) -> anyhow::Result<PathBuf> {
     validate_evaluation_evidence(evidence, None)?;
-    let path = evaluation_artifact_path(project, &evidence.run_id, &evidence.link, &evidence.phase);
+    let path = evaluation_artifact_path_in(
+        root,
+        project,
+        &evidence.run_id,
+        &evidence.link,
+        &evidence.phase,
+    );
     let json = serde_json::to_string_pretty(evidence)?;
     if let Err(first) = crate::fs_util::atomic_write(&path, json.as_bytes()) {
         crate::fs_util::atomic_write(&path, json.as_bytes()).map_err(|retry| {
@@ -458,11 +482,13 @@ pub fn write_evaluation_evidence(
 }
 
 /// Read and validate all host evaluations for one run.
-pub fn read_evaluation_evidence(
+/// The stitcher reads through this with its own root.
+fn read_evaluation_evidence_in(
+    root: &std::path::Path,
     project: &str,
     run_id: &str,
 ) -> anyhow::Result<Vec<EvaluationEvidence>> {
-    let base = evaluation_artifact_path(project, run_id, "", "");
+    let base = evaluation_artifact_path_in(root, project, run_id, "", "");
     let Some(dir) = base.parent() else {
         return Ok(Vec::new());
     };
@@ -608,7 +634,9 @@ fn stitch_artifacts_in(
     }
     records.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     non_artifacts.sort_by(|a, b| a.file.cmp(&b.file));
-    let evaluations = read_evaluation_evidence(project, run_id)?;
+    // The same root as the records above: reading evidence from the ambient
+    // root here would stitch a different tree than the one being stitched.
+    let evaluations = read_evaluation_evidence_in(root, project, run_id)?;
 
     let stitched_path = base.join("stitched.md");
     let mut md = String::new();
@@ -899,6 +927,13 @@ mod tests {
 
     #[test]
     fn evaluation_evidence_rejects_tampering_and_round_trips_through_state() {
+        // One injected data root for write, read and stitch. The TempDir is
+        // the cleanup: it is removed on drop, so a failing assertion leaves
+        // nothing behind, and nothing lands under the operator's
+        // `dirs::data_local_dir()` (this test used to write there and clean
+        // up only when it passed).
+        let xdg = xdg_root();
+        let root = xdg.path();
         let project = format!("evaluation-test-{}", uuid::Uuid::new_v4());
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
         let contract = crate::phase_contracts::PhaseContractReport {
@@ -914,26 +949,31 @@ mod tests {
             &serde_json::json!({ "target": null }),
             &contract,
         );
-        let path = write_evaluation_evidence(&project, &evidence).expect("write evidence");
+        let path = write_evaluation_evidence_in(root, &project, &evidence).expect("write evidence");
         assert!(path.exists());
-        let records = read_evaluation_evidence(&project, &run_id).expect("read evidence");
+        assert!(
+            path.starts_with(root),
+            "evidence must land under the injected root {}: {}",
+            root.display(),
+            path.display()
+        );
+        let records = read_evaluation_evidence_in(root, &project, &run_id).expect("read evidence");
         assert_eq!(records, vec![evidence.clone()]);
 
         let mut tampered = evidence.clone();
         tampered.verdict = EvaluationVerdict::Pass;
         assert!(!tampered.integrity_valid());
-        assert!(write_evaluation_evidence(&project, &tampered).is_err());
+        assert!(write_evaluation_evidence_in(root, &project, &tampered).is_err());
 
-        let stitched = stitch_artifacts(&project, &run_id).expect("stitch evidence");
+        let stitched = stitch_artifacts_in(root, &project, &run_id).expect("stitch evidence");
+        assert!(
+            stitched.starts_with(root),
+            "stitched under the root: {}",
+            stitched.display()
+        );
         let markdown = std::fs::read_to_string(stitched).expect("read stitched evidence");
         assert!(markdown.contains("## Host evaluation evidence"));
         assert!(markdown.contains(&evidence.evidence_hash));
-
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("flywheel")
-            .join(&project);
-        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
