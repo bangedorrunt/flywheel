@@ -533,7 +533,9 @@ pub fn cron_tick_wake_in(state_dir: &Path, project: &str, summary: &str) {
         serde_json::json!({ "stage": "cron_tick", "summary": summary, "workspace": project, "corr": None::<String> }),
         None,
     );
-    if let Err(e) = crate::append_pending_fact(&crate::config::state_dir(), project, summary) {
+    // Same state dir as the journal row (the caller passes
+    // `config::state_dir()`), so a test's temp dir holds the whole wake.
+    if let Err(e) = crate::append_pending_fact(state_dir, project, summary) {
         eprintln!("flywheel: cron doorbell sink: pending queue failed: {e:#}");
     }
 }
@@ -589,7 +591,10 @@ pub fn service_emit_wake_in(state_dir: &Path, project: &str, service: &str, to: 
         serde_json::json!({ "stage": "emit", "service": service, "to": to, "workspace": project, "corr": None::<String> }),
         None,
     );
-    if let Err(e) = crate::append_pending_fact(&crate::config::state_dir(), project, &summary) {
+    // Same state dir as the journal row (the emit route passes
+    // `config::state_dir()`). emit_wake_journals_service_row used to append
+    // `"emit ci -> captain"` to the operator's real `facts/proj-pending.jsonl`.
+    if let Err(e) = crate::append_pending_fact(state_dir, project, &summary) {
         eprintln!("flywheel: service emit: pending queue failed: {e:#}");
     }
 }
@@ -3759,8 +3764,8 @@ mod tests {
     #[test]
     fn emit_wake_journals_service_row() {
         // bd-asr2.17: admitted emit leaves a stage=emit Fact row.
-        let dir = std::env::temp_dir().join(format!("dbll-emit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().expect("state dir");
+        let dir = tmp.path().to_path_buf();
         service_emit_wake_in(&dir, "proj", "ci", "captain");
         let rows = doorbell_rt::FileStore::new(&dir)
             .fold_workspace("proj")
@@ -3768,7 +3773,14 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["executed"]["stage"], serde_json::json!("emit"));
         assert_eq!(rows[0]["executed"]["service"], serde_json::json!("ci"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let pend = dir
+            .join("facts")
+            .join(format!("{}-pending.jsonl", crate::state::state_key("proj")));
+        let body = std::fs::read_to_string(&pend).unwrap_or_default();
+        assert!(
+            body.contains("emit ci -> captain"),
+            "the wake is queued in the given state dir"
+        );
     }
 
     fn seed_home_sub(dir: &std::path::Path, ws: &str, pin: &str) {
