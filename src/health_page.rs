@@ -17,21 +17,8 @@ use std::path::Path;
 /// different signals and stay separate.
 pub const PRESENCE_TTL_SECS: u64 = 60;
 
-/// §6: a herdr pane binding may clear only when herdr is the backend, the
-/// harness is one herdr injects, a pane is bound, and herdr answered without
-/// that pane. Every other binding is kept: absence of a herdr pane is not
-/// death for a pin herdr cannot see.
-pub fn pane_binding_may_clear(
-    harness: &str,
-    backend: &str,
-    pane_id: &str,
-    live_panes: Option<&HashSet<String>>,
-) -> bool {
-    backend == "herdr"
-        && matches!(harness, "opencode" | "pi" | "grok" | "omp")
-        && !pane_id.is_empty()
-        && live_panes.is_some_and(|live| !live.contains(pane_id))
-}
+/// §6: the single clear rule lives in [`crate::pane_keep::pane_binding_may_clear`];
+/// this page calls it, never a copy.
 
 /// What one doorbell workspace's pid file says.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,7 +223,7 @@ pub fn heartbeat_signals(
         let age = now.saturating_sub(*ts);
         let signal = if age <= PRESENCE_TTL_SECS {
             HeartbeatSignal::Fresh
-        } else if pane_binding_may_clear(&row.harness, &row.backend, &row.pane_id, live_panes) {
+        } else if crate::pane_keep::pane_binding_may_clear(&row.harness, &row.backend, &row.pane_id, live_panes) {
             HeartbeatSignal::Stale {
                 age_secs: age,
                 line: format!(
@@ -412,7 +399,7 @@ mod tests {
         );
         // The §6 gate itself, not only the absence of a heartbeat row.
         assert!(
-            !pane_binding_may_clear("freebuff", "herdr", "w1:p9", Some(&live)),
+            !crate::pane_keep::pane_binding_may_clear("freebuff", "herdr", "w1:p9", Some(&live)),
             "freebuff is never a clearable herdr binding"
         );
 
