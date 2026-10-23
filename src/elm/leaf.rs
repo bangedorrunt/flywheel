@@ -52,10 +52,14 @@ pub enum LeafMsg {
 /// One durable intent: run this argv under this key. The key is the leaf's
 /// stable identity (e.g. `mail-done:{bead}`), so a retry or a redelivery
 /// after a crash joins the same journal row instead of minting a new one.
+/// `timeout_secs` is the leaf's own watchdog (plus the standard grace);
+/// `None` keeps the generic leaf bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeafCmd {
     pub key: String,
     pub argv: Vec<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 impl CmdTrait for LeafCmd {
@@ -83,6 +87,7 @@ impl Program for LeafProgram {
         let cmd = LeafCmd {
             key: model.key.clone(),
             argv: model.argv.clone(),
+            timeout_secs: boot.get("timeout_secs").and_then(|s| s.parse::<u64>().ok()),
         };
         Update {
             model,
@@ -180,6 +185,7 @@ fn leaf_label(argv: &[String]) -> &'static str {
         Some("__check-reply") => "__check-reply",
         Some("__reply-settled") => "__reply-settled",
         Some("__remind-reply") => "__remind-reply",
+        Some("__loop-run-verify") => "__loop-run-verify",
         Some("__kind") => "__kind",
         Some("__profile") => "__profile",
         _ => "leaf",
@@ -188,6 +194,16 @@ fn leaf_label(argv: &[String]) -> &'static str {
 
 fn parse_leaf_stdout(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw.trim()).unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() }))
+}
+
+/// Watchdog for one leaf intent (bd-5ouq): an explicit per-leaf timeout wins
+/// (plus the standard grace, mirroring the loop_run_verify call shape);
+/// otherwise the generic leaf bound.
+fn leaf_watchdog(cmd: &LeafCmd) -> std::time::Duration {
+    match cmd.timeout_secs {
+        Some(t) => std::time::Duration::from_secs(t) + crate::durable::LEAF_WATCHDOG_GRACE,
+        None => crate::durable::DEFAULT_LEAF_WATCHDOG,
+    }
 }
 
 fn run_leaf_once(cmd: &LeafCmd) -> LeafMsg {
@@ -202,7 +218,8 @@ fn run_leaf_once(cmd: &LeafCmd) -> LeafMsg {
     let mut child = std::process::Command::new(exe);
     child.args(&cmd.argv);
     let label = leaf_label(&cmd.argv);
-    let run = crate::durable::run_leaf_cmd(child, label);
+    let watchdog = leaf_watchdog(cmd);
+    let run = crate::durable::run_leaf_cmd_bounded(child, label, watchdog);
     let out = match crate::effect_journal::submit_journal_wait(async move {
         run.await.map_err(|e| anyhow::anyhow!("{e}"))
     }) {
@@ -252,11 +269,23 @@ pub fn run_leaf_journaled(
     args: &[&str],
     key: &str,
 ) -> anyhow::Result<serde_json::Value> {
+    run_leaf_journaled_timeout(project, subcommand, args, key, None)
+}
+
+/// Journaled run with a per-leaf watchdog (bd-5ouq): `Some(t)` bounds the
+/// child at `t` plus the standard grace; `None` keeps the generic bound.
+pub fn run_leaf_journaled_timeout(
+    project: &str,
+    subcommand: &str,
+    args: &[&str],
+    key: &str,
+    timeout_secs: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
     let journal_path = leaf_journal_path(project);
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    run_leaf_journaled_at(&journal_path, subcommand, args, key)
+    run_leaf_journaled_at_timeout(&journal_path, subcommand, args, key, timeout_secs)
 }
 
 /// The journaled run against an explicit journal file: the seam tests drive
@@ -270,6 +299,18 @@ pub fn run_leaf_journaled_at(
     args: &[&str],
     key: &str,
 ) -> anyhow::Result<serde_json::Value> {
+    run_leaf_journaled_at_timeout(journal_path, subcommand, args, key, None)
+}
+
+/// Explicit-journal variant of [`run_leaf_journaled_timeout`]: the seam
+/// tests drive (tempdir) instead of the production state dir.
+pub fn run_leaf_journaled_at_timeout(
+    journal_path: &std::path::Path,
+    subcommand: &str,
+    args: &[&str],
+    key: &str,
+    timeout_secs: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
     let path = journal_path.to_path_buf();
     let subcommand = subcommand.to_string();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -277,7 +318,7 @@ pub fn run_leaf_journaled_at(
     std::thread::spawn(move || {
         let log: Arc<dyn DurableLog> = Arc::new(FileLog::open(&path)?);
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = run_leaf_on(log, &subcommand, &args_ref, &key);
+        let out = run_leaf_on_timeout(log, &subcommand, &args_ref, &key, timeout_secs);
         if out.is_ok() {
             let _ = std::fs::remove_file(&path);
         }
@@ -295,12 +336,26 @@ pub fn run_leaf_on(
     args: &[&str],
     key: &str,
 ) -> anyhow::Result<serde_json::Value> {
+    run_leaf_on_timeout(log, subcommand, args, key, None)
+}
+
+/// The loop half with a per-leaf watchdog (bd-5ouq): `Some(t)` bounds the
+/// child at `t` plus the standard grace; `None` keeps the generic bound.
+pub fn run_leaf_on_timeout(
+    log: Arc<dyn DurableLog>,
+    subcommand: &str,
+    args: &[&str],
+    key: &str,
+    timeout_secs: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
     let mut argv = vec![subcommand.to_string()];
     argv.extend(args.iter().map(|s| s.to_string()));
-    let boot = Boot {
-        config: [("key".to_string(), key.to_string())].into_iter().collect(),
-        args: argv,
-    };
+    let mut config: std::collections::BTreeMap<String, String> =
+        [("key".to_string(), key.to_string())].into_iter().collect();
+    if let Some(t) = timeout_secs {
+        config.insert("timeout_secs".to_string(), t.to_string());
+    }
+    let boot = Boot { config, args: argv };
     let loop_ = Loop::<LeafProgram, LeafInterpret>::boot(
         &boot,
         ManagedRuntime::new(),
@@ -483,6 +538,7 @@ mod tests {
         let cmd = LeafCmd {
             key: "leaf-test:help".into(),
             argv: vec!["--help".into()],
+            timeout_secs: None,
         };
         let msg = run_leaf_once(&cmd);
         match msg {
@@ -577,5 +633,59 @@ mod tests {
             path.extension().and_then(|e| e.to_str()) == Some("journal"),
             "{path:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T4 close path (bd-5ouq): RED — LeafCmd must carry a per-leaf timeout
+// before loop_run_verify can leave ctx.run.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod t4_close_tests {
+    use super::*;
+    use toron_core::kernel::Boot;
+
+    fn boot_with(key: &str, argv: Vec<String>, timeout: Option<&str>) -> Boot {
+        let mut config: std::collections::BTreeMap<String, String> =
+        [("key".to_string(), key.to_string())].into_iter().collect();
+        if let Some(t) = timeout {
+            config.insert("timeout_secs".to_string(), t.to_string());
+        }
+        Boot { config, args: argv }
+    }
+
+    #[test]
+    fn leaf_cmd_carries_per_leaf_timeout() {
+        let custom = LeafCmd { key: "k".into(), argv: vec![], timeout_secs: Some(5) };
+        assert_eq!(leaf_watchdog(&custom), std::time::Duration::from_secs(65));
+        let generic = LeafCmd { key: "k".into(), argv: vec![], timeout_secs: None };
+        assert_eq!(leaf_watchdog(&generic), std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn init_reads_timeout_from_boot_config() {
+        let argv = vec!["__loop-run-verify".to_string()];
+        let with = LeafProgram::init(&boot_with("k", argv.clone(), Some("600")));
+        assert_eq!(with.commands[0].timeout_secs, Some(600));
+        let without = LeafProgram::init(&boot_with("k", argv, None));
+        assert_eq!(without.commands[0].timeout_secs, None);
+        let bogus = LeafProgram::init(&boot_with("k", vec![], Some("nope")));
+        assert_eq!(bogus.commands[0].timeout_secs, None);
+    }
+
+    #[test]
+    fn timeout_field_survives_journal_round_trip() {
+        // Old journal rows predate the field: they must still parse.
+        let old: LeafCmd = serde_json::from_str(r#"{"key":"k","argv":["a"]}"#).unwrap();
+        assert_eq!(old.timeout_secs, None);
+        let new = LeafCmd { key: "k".into(), argv: vec!["a".into()], timeout_secs: Some(9) };
+        let back: LeafCmd = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back, new);
+    }
+
+    #[test]
+    fn loop_run_verify_has_its_watchdog_label() {
+        assert_eq!(leaf_label(&["__loop-run-verify".to_string()]), "__loop-run-verify");
     }
 }
