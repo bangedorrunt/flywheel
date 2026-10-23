@@ -54,6 +54,7 @@ mod fs_util;
 mod harness_caps;
 mod harness_registry;
 mod headless;
+mod health_page;
 mod herdr_shim;
 mod inbox_host;
 mod inbox_ports;
@@ -16372,7 +16373,7 @@ fn whois_pane_id(project: &str, pin: &str) -> Option<String> {
 
 /// bd-8pis: live herdr pane ids (status != dead). None when the daemon is
 /// unreachable — the caller trusts whois bindings instead of warn-storming.
-fn live_herdr_panes(cfg: &Config) -> Option<HashSet<String>> {
+pub(crate) fn live_herdr_panes(cfg: &Config) -> Option<HashSet<String>> {
     let c = Client::connect(Some(&cfg.socket_path())).ok()?;
     let agents = c.agent_list().ok()?;
     Some(
@@ -23132,6 +23133,13 @@ fn cmd_loop_supervise(
 /// never swallows the escalation — the line on stderr stands on its own, and
 /// the failure names itself so the operator knows the page did not land.
 fn page_captain_dead_stop(cfg: &Config, project: &str, line: &str) {
+    page_captain_mail(cfg, project, "[loop-mode supervise] dead stop", line)
+}
+
+/// Page the captain on `subject`. Best-effort but LOUD: a failed page never
+/// swallows the escalation, and the failure names itself so the operator
+/// knows the page did not land.
+pub(crate) fn page_captain_mail(cfg: &Config, project: &str, subject: &str, line: &str) {
     let Ok(key) = crate::project_dir_str(cfg, project) else {
         eprintln!(
             "flywheel: captain page FAILED (resolve project dir) — escalation line above stands"
@@ -23152,7 +23160,7 @@ fn page_captain_dead_stop(cfg: &Config, project: &str, line: &str) {
     match mail.send(
         &key,
         &[target],
-        "[loop-mode supervise] dead stop",
+        subject,
         line,
         "urgent",
         true,
