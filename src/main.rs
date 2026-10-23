@@ -25,7 +25,6 @@ mod agentstate;
 mod artifact;
 mod authority;
 mod backend;
-mod breaker;
 mod briefing;
 mod builtin_workflows;
 mod captain_slot;

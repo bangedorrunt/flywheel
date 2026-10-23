@@ -22,6 +22,21 @@ use crate::decide::{Snapshot, decide};
 use serde::{Deserialize, Serialize};
 use toron_core::kernel::{Boot, Cmd as CmdTrait, Durability, Failure, Program, Update};
 
+/// The framework's remote-stack shapes, re-exported so this plane has ONE
+/// door to the framework (ADR-0018 §1: the port module is the only door).
+/// An upstream API move changes this list, not the plane's call sites.
+pub use toron_core::kernel::{
+    BreakerConfig, Cause, ClockImpl, Defect, Effect, Exit, Remote, RemoteError, RemotePolicy,
+    Runtime, SystemClock, TestClock,
+};
+
+/// A host duration as the framework's. The framework measures in whole
+/// milliseconds, so the conversion belongs here, beside the types it
+/// converts into.
+pub fn kernel_millis(d: std::time::Duration) -> toron_core::kernel::Duration {
+    toron_core::kernel::Duration::from_millis(d.as_millis().min(u64::MAX as u128) as u64)
+}
+
 // The shared journal executor owns the pool construction
 // (`effect_journal`, 4 workers and a 4096 bound pinned by its own test);
 // this module keeps no second constructor beside it.
@@ -300,6 +315,76 @@ mod tests {
                 argv: d.argv.clone(),
                 topology: d.topology.to_string(),
             }]
+        );
+    }
+
+    /// ADR-0018 §4: the fold is pure — no clock, no environment, no
+    /// randomness in `decide`, so the same input folds to the same commands.
+    ///
+    /// The scan lives HERE, not in `decide.rs`: the banned names are spelled
+    /// out below, and a scan inside the file it scans would match its own
+    /// list.
+    #[test]
+    fn decide_reads_no_clock_no_env_and_no_randomness() {
+        let src = include_str!("decide.rs");
+        for banned in ["SystemTime", "std::env", "thread_rng", "StdRng", "rand::"] {
+            assert!(
+                !src.contains(banned),
+                "decide.rs must stay pure for the elm fold, found {banned}"
+            );
+        }
+    }
+
+    /// ADR-0018 §4: one carrier. The plane declares no breaker of its own —
+    /// the framework's `policy::remote` owns the breaker and the bounds
+    /// travel as the stack's argument. A local breaker type beside it is the
+    /// second spelling the ADR forbids.
+    #[test]
+    fn the_plane_declares_no_breaker_of_its_own() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src_dir, &mut files);
+        assert!(!files.is_empty(), "the source tree is readable: {src_dir:?}");
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let Ok(src) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            for (n, line) in src.lines().enumerate() {
+                let line = line.trim_start();
+                let line = line.strip_prefix("pub ").unwrap_or(line);
+                for kw in ["struct ", "enum ", "trait "] {
+                    let Some(rest) = line.strip_prefix(kw) else {
+                        continue;
+                    };
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if name.contains("Breaker") {
+                        offenders.push(format!("{}:{}: {kw}{name}", file.display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the plane declares no breaker of its own: {offenders:?}"
         );
     }
 }

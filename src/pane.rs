@@ -34,7 +34,13 @@ use serde_json::{Value, json};
 
 use toron_workflow::schema::Action;
 
-use crate::authority::Clock;
+// ADR-0018 §1: the framework's shapes come from THIS plane's port module
+// (`src/elm`), never straight from toron's — one door per repo, so an
+// upstream API move lands in the port and not in the protocol code.
+use crate::elm::{
+    BreakerConfig, Cause, ClockImpl, Defect, Effect, Exit, Remote, RemoteError, RemotePolicy,
+    Runtime, SystemClock, TestClock, kernel_millis,
+};
 
 use crate::config::Config;
 use crate::crew::CrewPlan;
@@ -1385,16 +1391,15 @@ pub fn pane_dispatch(
     // the first step fires: `agent_not_ready` is transient — retry with
     // backoff (bounded; a persistent not-ready surfaces as a per-step error,
     // never a hang).
-    // P1+P2: transient dispatch retries ride the shared RetryPolicy (was:
-    // fixed 10s x6) behind a host-held consecutive-failure breaker (5/60s).
-    // Open breaker = fast escalate, never a hammered pane.
-    // Per-site coverage lives with `dispatch_retry_policy` below: the loop
-    // itself needs a live pane, so the fail-twice test pins this config
-    // through the shared driver with an injected no-op sleep.
-    let dispatch_policy = dispatch_retry_policy();
-    // bd-jvka: the breaker check moved INTO the chain below — consulted
-    // before every attempt, so an open breaker stops the chain instead of
-    // letting it hammer the pane for six more tries.
+    // P1+P2: transient dispatch retries ride the framework's remote stack
+    // (`policy::remote`) — 6 attempts, 5s base, 10s cap — with the
+    // consecutive-failure breaker (5/60s) as its ARGUMENT, not as a second
+    // breaker beside it. Open breaker = fast escalate, never a hammered pane.
+    // The envelope lives in `dispatch_policy` below; the loop itself needs a
+    // live pane, so the stack's ORDER is pinned by the unit tests there.
+    // bd-jvka: the breaker is consulted INSIDE the chain — before every
+    // attempt, so an open breaker stops the chain instead of letting it
+    // hammer the pane for six more tries.
     // bd-fen3: the busy-owner fence, adopted from toron-workflow. This replaces
     // the bd-5llv in-process idle gate, which is DELETED rather than kept
     // alongside — one concern, one mechanism. The fence owns the hold bound and
@@ -1444,53 +1449,60 @@ pub fn pane_dispatch(
     // the NEXT route and runs a NEW chain, so the fallback is OUTSIDE the
     // retry (effect-kernel law 10) and the new route gets its own budget.
     'route: loop {
+        // ADR-0018 §3 item 5: the chain IS the framework's remote stack, with
+        // the breaker as its argument (there is no second breaker beside it).
+        // The framework calls the attempt through a 'static closure, so the
+        // route's data is owned here - cloned once per chain, never borrowed.
+        // `send_*` are the closure's own copies: the route's live values stay
+        // owned by the loop, which reroutes and retries them.
+        let send_agent = attempt_entry.name.clone();
+        let send_profile = attempt_profile.clone();
+        let send_project = project.to_string();
+        let send_prompt = prompt.clone();
+        let send_spec = (*spec).clone();
+        let send_inputs = (*inputs).clone();
         let chain = dispatch_chain(
-            &dispatch_policy,
-            dispatch_chain_budget(),
-            BreakerGate {
-                open: &|| {
-                    let mut b = dispatch_breaker().lock().expect("dispatch breaker");
-                    if b.allows_at(crate::authority::SystemClock.now_unix()) {
-                        None
-                    } else {
-                        Some(format!("{:?}", b.state()))
+            dispatch_remote(),
+            dispatch_runtime(),
+            dispatch_clock(),
+            move || -> Effect<Value, String, ()> {
+                let exe = match std::env::current_exe() {
+                    Ok(exe) => exe,
+                    // A host error, not the child's typed failure: a defect,
+                    // so the framework does not retry it.
+                    Err(e) => {
+                        return Effect::die(Defect::new(format!(
+                            "pane dispatch: resolve the flywheel executable: {e}"
+                        )));
                     }
-                },
-                // bd-jvka: a strike PER FAILURE. The old code charged one
-                // strike per exhausted dispatch, so six transient retries
-                // cost one strike and the breaker never opened.
-                strike: &|| {
-                    dispatch_breaker()
-                        .lock()
-                        .expect("dispatch breaker")
-                        .record_failure_at(crate::authority::SystemClock.now_unix());
-                },
-            },
-            &mut |_attempt: u32| -> Result<Value, DispatchErr> {
-                let mut cmd = Command::new(
-                    std::env::current_exe().map_err(|e| DispatchErr::Fatal(e.to_string()))?,
-                );
+                };
+                let mut cmd = Command::new(exe);
                 cmd.arg("__send")
-                    .arg(project)
-                    .arg(&attempt_entry.name)
-                    .arg(&prompt)
+                    .arg(&send_project)
+                    .arg(&send_agent)
+                    .arg(&send_prompt)
                     .arg("--confirm")
                     .arg("--profile")
-                    .arg(&attempt_profile);
+                    .arg(&send_profile);
                 // bd-jvka: the attempt timeout ON the call — a `__send` child
                 // that never exits must not park the dispatch.
-                let output = crate::proc::run_bounded(&mut cmd, dispatch_attempt_timeout())
-                    .map_err(|e| match e {
-                        crate::proc::ProcError::Timeout { .. } => DispatchErr::Fatal(format!(
-                            "__send for @{attempt_profile} ({}) exceeded the attempt timeout ({:?}) — the child never exited",
-                            attempt_entry.name,
+                let output = match crate::proc::run_bounded(&mut cmd, dispatch_attempt_timeout()) {
+                    Ok(output) => output,
+                    // The child never came back: a host error, not the child's
+                    // typed failure - a defect, so the framework does not
+                    // retry it.
+                    Err(crate::proc::ProcError::Timeout { .. }) => {
+                        return Effect::die(Defect::new(format!(
+                            "__send for @{send_profile} ({send_agent}) exceeded the attempt timeout ({:?}) - the child never exited",
                             dispatch_attempt_timeout()
-                        )),
-                        crate::proc::ProcError::Io(e) => DispatchErr::Fatal(format!(
-                            "__send for @{attempt_profile} ({}) failed: {e}",
-                            attempt_entry.name
-                        )),
-                    })?;
+                        )));
+                    }
+                    Err(crate::proc::ProcError::Io(e)) => {
+                        return Effect::die(Defect::new(format!(
+                            "__send for @{send_profile} ({send_agent}) failed: {e}"
+                        )));
+                    }
+                };
                 let raw = String::from_utf8_lossy(&output.stdout).to_string();
                 let trimmed = raw.trim();
                 if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
@@ -1512,12 +1524,14 @@ pub fn pane_dispatch(
                             .and_then(Value::as_str)
                             .unwrap_or("transient")
                             .to_string();
-                        return Err(DispatchErr::Transient { reason });
+                        // The child's TYPED failure: the framework retries it
+                        // and charges the breaker once per attempt.
+                        return Effect::fail(reason);
                     }
                     // ADR-0022 §3.5 warn-first plan-artifact gate (bd-cvv9): same
                     // contract as the headless path — warn + tag, never block
                     // (the W5 flip owns blocking).
-                    if crate::phase_chain::plan_artifact_missing(spec, inputs) {
+                    if crate::phase_chain::plan_artifact_missing(&send_spec, &send_inputs) {
                         eprintln!(
                             "flywheel: phase implement dispatch has NO completed plan artifact — \
                      warn-first gate (ADR-0022 §3.5); step output tagged plan_artifact_missing"
@@ -1527,17 +1541,15 @@ pub fn pane_dispatch(
                     //
                     // It used to be set only on the failure path, which meant a
                     // SUCCESSFUL send produced a receipt with no top-level `ok` at
-                    // all. The breaker branch below reads `out["ok"] == Some(true)`, so
-                    // every success fell to the else and recorded a breaker FAILURE.
-                    // The breaker therefore charged once per dispatch regardless of
-                    // outcome and opened after 5 — so the dispatch COUNT predicted
-                    // failure, not the result. That is why wave-swarm (6 dispatches)
-                    // failed every single time while a 2-prompt compose always
-                    // succeeded, and why the error blamed an "unavailable pane" when
-                    // every prompt had in fact landed.
+                    // all. The breaker's charge read that field, so every success
+                    // fell to the else and recorded a FAILURE — the dispatch COUNT
+                    // predicted failure, not the result. That is why wave-swarm (6
+                    // dispatches) failed every single time while a 2-prompt compose
+                    // always succeeded, and why the error blamed an "unavailable
+                    // pane" when every prompt had in fact landed.
                     let mut out = json!({
-                        "profile": attempt_profile.clone(),
-                        "agent": attempt_entry.name,
+                        "profile": send_profile.clone(),
+                        "agent": send_agent.clone(),
                         "ok": dispatch_receipt_ok(&v),
                         "send": v.clone(),
                     });
@@ -1548,12 +1560,8 @@ pub fn pane_dispatch(
                         // error-less or kind-less ok:false misroutes as bare
                         // {error: step failed} downstream (bd-nyrn).
                         let leaf_err = v.get("error").and_then(Value::as_str).unwrap_or("");
-                        let err_str = dispatch_failure_error(
-                            &attempt_profile,
-                            &attempt_entry.name,
-                            &raw,
-                            leaf_err,
-                        );
+                        let err_str =
+                            dispatch_failure_error(&send_profile, &send_agent, &raw, leaf_err);
                         let cf = crate::failure::classify(&err_str, None, None);
                         out["stage"] = json!(cf.stage);
                         out["ok"] = json!(false);
@@ -1561,25 +1569,23 @@ pub fn pane_dispatch(
                         out["kind"] = json!(cf.kind.to_string());
                         out["retryable"] = json!(cf.retryable);
                     }
-                    return Ok(out);
+                    return Effect::succeed(out);
                 }
                 let err = String::from_utf8_lossy(&output.stderr).to_string();
                 // bd-5yzp: never error:'' — stderr, stdout, then scoped fallback.
-                let err_str =
-                    dispatch_failure_error(&attempt_profile, &attempt_entry.name, &raw, &err);
+                let err_str = dispatch_failure_error(&send_profile, &send_agent, &raw, &err);
                 let cf = crate::failure::classify(&err_str, None, None);
-                Ok(json!({
+                Effect::succeed(json!({
                     "ok": false,
                     "error": err_str,
-                    "profile": attempt_profile.clone(),
-                    "agent": attempt_entry.name,
+                    "profile": send_profile.clone(),
+                    "agent": send_agent.clone(),
                     // GS-049 P1-3: phase-bearing failure (ActionStage)
                     "stage": cf.stage,
                     "kind": cf.kind.to_string(),
                     "retryable": cf.retryable,
                 }))
             },
-            &mut |d| std::thread::sleep(d),
         );
         // bd-jvka: the FALLBACK is OUTSIDE the chain. The chain is done; only
         // now may a 429 reroute pick the next route and start a NEW chain (with
@@ -1592,20 +1598,14 @@ pub fn pane_dispatch(
                     attempt_entry.name
                 ));
             }
-            Err(DispatchErr::BreakerOpen { state, reason }) => {
-                let because = reason
-                    .map(|r| format!(" (last failure: {r})"))
-                    .unwrap_or_default();
+            Err(DispatchErr::BreakerOpen) => {
                 return Err(anyhow!(
-                    "pane dispatch: consecutive-failure breaker {state} — fast escalate, waiting out cooldown instead of hammering the pane{because}"
+                    "pane dispatch: the consecutive-failure breaker is open — fast escalate, waiting out the cooldown instead of hammering the pane"
                 ));
             }
-            Err(DispatchErr::BudgetExhausted { reason }) => {
-                let because = reason
-                    .map(|r| format!(" (last failure: {r})"))
-                    .unwrap_or_default();
+            Err(DispatchErr::BudgetExhausted) => {
                 return Err(anyhow!(
-                    "pane dispatch: the dispatch chain spent its {:?} budget{because} — the target pane never became available",
+                    "pane dispatch: the dispatch chain spent its {:?} budget — the target pane never became available",
                     dispatch_chain_budget()
                 ));
             }
@@ -1715,12 +1715,10 @@ pub fn pane_dispatch(
         if !reroute_trail.is_empty() {
             out["reroute_trail"] = json!(reroute_trail);
         }
-        let mut breaker = dispatch_breaker().lock().expect("dispatch breaker");
-        if out.get("ok").and_then(Value::as_bool) == Some(true) {
-            breaker.record_success_at();
-        } else {
-            breaker.record_failure_at(crate::authority::SystemClock.now_unix());
-        }
+        // ADR-0018 §3 item 5: the breaker's state lives in the framework's
+        // stack, which charged it once per FAILED ATTEMPT inside the chain
+        // and reset it on a success. Charging it here too would be the
+        // second carrier the ADR forbids.
         return Ok(crate::phase_chain::annotate_dispatch_output(
             spec, inputs, out,
         ));
@@ -1743,93 +1741,72 @@ fn dispatch_failure_error(profile: &str, agent: &str, raw_stdout: &str, err: &st
 /// — the same envelope as the old fixed 10s x6, now with a backoff ramp.
 const MAX_ATTEMPTS: u32 = 6;
 
+/// bd-8pjr: the backoff base and the cap it never passes. The framework's
+/// stack owns the schedule; these are the bounds it runs with.
+const DISPATCH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+const DISPATCH_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// bd-jvka: the typed outcome of one dispatch chain.
 #[derive(Debug)]
 pub enum DispatchErr {
     /// The attempt failed transiently; the chain may retry it.
     Transient { reason: String },
-    /// The consecutive-failure breaker was open before an attempt.
-    BreakerOpen {
-        state: String,
-        reason: Option<String>,
-    },
+    /// The framework's breaker rejected the attempt: no attempt ran.
+    BreakerOpen,
     /// The chain's wall-clock budget was spent.
-    BudgetExhausted { reason: Option<String> },
+    BudgetExhausted,
     /// The call itself failed (spawn, timeout, ...) — not retryable here.
     Fatal(String),
 }
 
-/// bd-jvka: the breaker's view for the chain: is it open, and one strike.
-pub struct BreakerGate<'a> {
-    /// `Some(state)` when the breaker is OPEN: the chain stops there.
-    pub open: &'a dyn Fn() -> Option<String>,
-    /// One strike for a failed attempt. A strike PER FAILURE — six transient
-    /// retries are six failures, not one.
-    pub strike: &'a dyn Fn(),
+/// bd-jvka + ADR-0018 §3 item 5: the dispatch chain IS the framework's remote
+/// stack (`policy::remote`), with the breaker as its argument. There is no
+/// second breaker beside it.
+///
+/// The order is the framework's, and it is the order bd-jvka proved: the
+/// breaker is consulted INSIDE the retry (before every attempt), the budget
+/// bounds the chain AROUND it, the attempt timeout is ON the call, and the
+/// fallback is OUTSIDE (the caller reroutes when the chain ends).
+///
+/// The attempt is a `'static` closure because the framework's stack calls it
+/// through one: the route's data is owned by the closure, never borrowed.
+pub fn dispatch_chain(
+    remote: &Remote<Value, String>,
+    rt: &Runtime,
+    clock: &std::sync::Arc<dyn ClockImpl>,
+    attempt: impl Fn() -> Effect<Value, String, ()> + Send + Sync + 'static,
+) -> Result<Value, DispatchErr> {
+    match remote.call(rt, clock, attempt) {
+        Exit::Success(v) => Ok(v),
+        Exit::Failure(cause) => Err(map_dispatch_cause(cause)),
+    }
 }
 
-/// bd-jvka: the dispatch chain — the ONE order for a remote command
-/// (effect-kernel law 10): the breaker is consulted INSIDE the retry (before
-/// every attempt), the budget bounds the chain AROUND it, the attempt timeout
-/// is ON the call (the caller's `attempt` owns it), and the fallback is
-/// OUTSIDE (the caller reroutes when the chain ends).
+/// The framework's stack decisions, as the chain's typed outcomes.
 ///
-/// The seams are injected so the ORDER is provable without a live pane: a
-/// test drives the chain with a fake attempt, a fake breaker and a no-op
-/// sleep.
-pub fn dispatch_chain(
-    policy: &crate::retry::RetryPolicy,
-    budget: std::time::Duration,
-    breaker: BreakerGate<'_>,
-    attempt: &mut dyn FnMut(u32) -> Result<Value, DispatchErr>,
-    sleep: &mut dyn FnMut(std::time::Duration),
-) -> Result<Value, DispatchErr> {
-    // bd-lf1u classification: this monotonic read is a HOST-side deadline on
-    // a real subprocess chain, not a decision input, so it is deliberately
-    // NOT migrated to an injected clock — the same class as the `timeout`
-    // wrapped around a live effect. Nothing it selects is recorded.
-    let deadline = std::time::Instant::now() + budget;
-    let mut last_reason: Option<String> = None;
-    let mut attempt_no = 0u32;
-    policy.retry_with_backoff(
-        || {
-            // budget AROUND the chain
-            if std::time::Instant::now() >= deadline {
-                return Err(DispatchErr::BudgetExhausted {
-                    reason: last_reason.clone(),
-                });
-            }
-            // breaker INSIDE the retry: consulted before EVERY attempt, so an
-            // open breaker stops the chain instead of letting it hammer the
-            // pane six more times.
-            if let Some(state) = (breaker.open)() {
-                return Err(DispatchErr::BreakerOpen {
-                    state,
-                    reason: last_reason.clone(),
-                });
-            }
-            let n = attempt_no;
-            attempt_no += 1;
-            match attempt(n) {
-                Ok(v) => Ok(v),
-                Err(DispatchErr::Transient { reason }) => {
-                    // a transient failure IS a failure: one strike per attempt
-                    (breaker.strike)();
-                    last_reason = Some(reason.clone());
-                    Err(DispatchErr::Transient { reason })
-                }
-                Err(e) => Err(e),
-            }
+/// A defect is NOT the child's typed failure: it is a host error, and the
+/// framework does not retry it. A typed failure IS the child's own answer
+/// ("not ready yet"): it is retried, and the breaker is charged once per
+/// attempt - six transient retries are six failures, not one.
+fn map_dispatch_cause(cause: Cause<RemoteError<String>>) -> DispatchErr {
+    if let Some(defect) = cause.defects().first() {
+        return DispatchErr::Fatal(defect.message.clone());
+    }
+    match cause.failure() {
+        Some(RemoteError::Inner(reason)) => DispatchErr::Transient {
+            reason: reason.clone(),
         },
-        |e| matches!(e, DispatchErr::Transient { .. }),
-        |n, e| {
-            if let DispatchErr::Transient { reason } = e {
-                eprintln!("flywheel: dispatch attempt {n} not ready ({reason}) — retrying");
-            }
-        },
-        crate::retry::host_draw,
-        sleep,
-    )
+        Some(RemoteError::BreakerOpen) => DispatchErr::BreakerOpen,
+        Some(RemoteError::BudgetTimeout) => DispatchErr::BudgetExhausted,
+        Some(RemoteError::AttemptTimeout) => {
+            DispatchErr::Fatal("the dispatch attempt exceeded its timeout".to_string())
+        }
+        Some(RemoteError::BulkheadFull) => {
+            DispatchErr::Fatal("the dispatch bulkhead is full".to_string())
+        }
+        Some(RemoteError::Filtered) => DispatchErr::Fatal("the dispatch was filtered".to_string()),
+        None => DispatchErr::Fatal("the dispatch failed with no cause".to_string()),
+    }
 }
 
 /// bd-jvka: the attempt timeout ON the call. The `__send` child waits 45s for
@@ -1847,23 +1824,48 @@ fn dispatch_chain_budget() -> std::time::Duration {
     std::time::Duration::from_secs(900)
 }
 
-/// Pane-dispatch retry budget (bd-8pjr): 6 attempts, 5s base, 10s cap —
-/// same envelope as the old fixed 10s x6, now with backoff ramp + headroom.
-/// Named so the per-site fail-twice test pins the config.
-fn dispatch_retry_policy() -> crate::retry::RetryPolicy {
-    crate::retry::RetryPolicy {
-        max_attempts: MAX_ATTEMPTS,
-        base: std::time::Duration::from_secs(5),
-        cap: std::time::Duration::from_secs(10),
+/// ADR-0018 §3 item 5: the ONE dispatch stack — the framework's remote
+/// policy with the breaker as its ARGUMENT. There is no second breaker
+/// beside it, and no second spelling of the retry envelope beside it either.
+///
+/// The stack is process-wide (the static it replaces was too), so the
+/// breaker's state is shared across dispatches: five consecutive failures
+/// open it for 60s (ADR-0015 §3 P2), and the framework resets the count on a
+/// success and lets one probe through after the cooldown, so a pane that
+/// failed can recover.
+fn dispatch_policy() -> RemotePolicy<Value, String> {
+    RemotePolicy {
+        // The framework counts RETRIES after the first attempt.
+        retries: MAX_ATTEMPTS.saturating_sub(1),
+        backoff: kernel_millis(DISPATCH_BACKOFF),
+        ceiling: kernel_millis(DISPATCH_BACKOFF_CAP),
+        attempt_timeout: kernel_millis(dispatch_attempt_timeout()),
+        budget: kernel_millis(dispatch_chain_budget()),
+        breaker: Some(BreakerConfig {
+            max_failures: 5,
+            reset: kernel_millis(std::time::Duration::from_secs(60)),
+        }),
+        // The fallback stays OUTSIDE the stack (bd-jvka): the chain hands the
+        // rate-limit verdict back, and only the caller picks the next route.
+        ..Default::default()
     }
 }
 
-/// Host-held dispatch breaker (P2): consecutive failures open it for 60s.
-/// ponytail: process-local static, threshold 5 per ADR-0015 §3 P2.
-fn dispatch_breaker() -> &'static std::sync::Mutex<crate::breaker::ConsecutiveBreaker> {
-    static BREAKER: std::sync::OnceLock<std::sync::Mutex<crate::breaker::ConsecutiveBreaker>> =
-        std::sync::OnceLock::new();
-    BREAKER.get_or_init(|| std::sync::Mutex::new(crate::breaker::ConsecutiveBreaker::default()))
+/// The built stack: one shared breaker, one shared bulkhead, process-wide.
+fn dispatch_remote() -> &'static Remote<Value, String> {
+    static REMOTE: std::sync::OnceLock<Remote<Value, String>> = std::sync::OnceLock::new();
+    REMOTE.get_or_init(|| Remote::new(dispatch_policy()))
+}
+
+/// The wall clock and the runtime the framework's stack runs on.
+fn dispatch_clock() -> &'static std::sync::Arc<dyn ClockImpl> {
+    static CLOCK: std::sync::OnceLock<std::sync::Arc<dyn ClockImpl>> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(|| std::sync::Arc::new(SystemClock))
+}
+
+fn dispatch_runtime() -> &'static Runtime {
+    static RT: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| Runtime::new())
 }
 
 /// bd-mukq: select a one-hop 429 reroute target for a pane dispatch — the
@@ -3042,60 +3044,15 @@ mod tests {
         assert_eq!(got.pane_id, "w1:p5");
     }
 
-    /// bd-gkwu + bd-retry-jitter-xlh6: the dispatch retry schedule is pure
-    /// policy data — deterministic per (attempt, draw), drawn from the upper
-    /// half of the attempt's ceiling, bounded by the cap, no sleep inside.
-    /// (The sleep lives at the single call site in the interpreter.)
+    /// bd-8pjr: the dispatch retry schedule is the framework's now, so the
+    /// envelope the stack runs with is pinned against the real policy type:
+    /// six attempts (five retries), 5s base, 10s cap.
     #[test]
-    fn authority_edge_dispatch_retry_is_policy_schedule() {
-        let policy = dispatch_retry_policy();
-        let d0 = policy.delay_for(0, 0.5);
-        assert_eq!(
-            d0,
-            policy.delay_for(0, 0.5),
-            "schedule must be deterministic"
-        );
-        assert!(d0 <= policy.cap, "attempt 0 within cap: {d0:?}");
-        assert!(
-            policy.delay_for(100, 1.0) <= policy.cap,
-            "far attempts bounded by the cap"
-        );
-        assert!(
-            policy.delay_for(1, 1.0) >= d0,
-            "backoff must not shrink: {:?} vs {d0:?}",
-            policy.delay_for(1, 1.0)
-        );
-        assert!(
-            policy.delay_for(1, 0.0) < policy.delay_for(1, 1.0),
-            "the draw moves the delay inside the attempt's window"
-        );
-    }
-
-    /// bd-8pjr: per-site fail-twice-then-succeed through the shared driver
-    /// with THIS site's policy (no-op sleep — the loop itself needs a live
-    /// pane, so the config rides the driver here, not the subprocess).
-    #[test]
-    fn dispatch_policy_fail_twice_then_succeeds() {
-        let policy = dispatch_retry_policy();
-        let mut calls = 0;
-        let mut sleeps = 0;
-        let out = policy.retry_with_backoff(
-            || {
-                calls += 1;
-                if calls < 3 {
-                    Err("agent_not_ready")
-                } else {
-                    Ok("sent")
-                }
-            },
-            |_| true,
-            |_, _| {},
-            || 0.0,
-            |_| sleeps += 1,
-        );
-        assert_eq!(out, Ok("sent"));
-        assert_eq!(calls, 3);
-        assert_eq!(sleeps, 2);
+    fn dispatch_chain_carries_the_retry_envelope_as_its_argument() {
+        let policy = dispatch_policy();
+        assert_eq!(policy.retries, MAX_ATTEMPTS - 1, "five retries after the first attempt");
+        assert_eq!(policy.backoff.as_millis(), 5_000, "5s backoff base");
+        assert_eq!(policy.ceiling.as_millis(), 10_000, "10s backoff cap");
     }
 
     /// bd-wave-swarm-graduation-fix-98io: both boot-race signatures are
@@ -3170,50 +3127,64 @@ mod tests {
         );
     }
 
-    /// bd-jvka: the ORDER, provable without a live pane. The breaker is
-    /// consulted INSIDE the retry — before EVERY attempt — so an open
-    /// breaker stops the chain instead of letting it hammer the pane six
-    /// more times. And a transient failure is a FAILURE: one strike per
-    /// attempt, so the breaker opens on the failures, not on the dispatches.
+    /// bd-jvka + ADR-0018 §3 item 5: the ORDER, provable without a live
+    /// pane. The breaker is consulted INSIDE the retry — before EVERY
+    /// attempt — so an open breaker stops the chain instead of letting it
+    /// hammer the pane six more times. And a transient failure is a FAILURE:
+    /// one strike per attempt, so the breaker opens on the failures, not on
+    /// the dispatches.
     #[test]
-    fn dispatch_watchdog_consults_the_breaker_inside_the_chain() {
-        let policy = dispatch_retry_policy();
-        let attempts = std::cell::Cell::new(0u32);
-        let strikes = std::cell::Cell::new(0u32);
-        let breaker_opened = std::cell::Cell::new(false);
-        let out = dispatch_chain(
-            &policy,
-            dispatch_chain_budget(),
-            BreakerGate {
-                open: &|| {
-                    if breaker_opened.get() {
-                        Some("open".to_string())
-                    } else {
-                        None
-                    }
-                },
-                strike: &|| {
-                    strikes.set(strikes.get() + 1);
-                    breaker_opened.set(true);
-                },
-            },
-            &mut |_n| {
-                attempts.set(attempts.get() + 1);
-                Err(DispatchErr::Transient {
-                    reason: "agent_not_ready".into(),
-                })
-            },
-            &mut |_| {},
-        );
+    fn dispatch_chain_consults_the_breaker_inside_the_chain() {
+        let remote = Remote::new(RemotePolicy {
+            retries: 5,
+            backoff: kernel_millis(Duration::ZERO),
+            ceiling: kernel_millis(Duration::ZERO),
+            attempt_timeout: kernel_millis(Duration::from_secs(30)),
+            budget: kernel_millis(Duration::from_secs(60)),
+            // ONE failure opens the breaker, so the chain stops right after it.
+            breaker: Some(BreakerConfig {
+                max_failures: 1,
+                reset: kernel_millis(Duration::from_secs(60)),
+            }),
+            ..Default::default()
+        });
+        let clock: std::sync::Arc<dyn ClockImpl> = std::sync::Arc::new(TestClock::new());
+        let rt = Runtime::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let out = dispatch_chain(&remote, &rt, &clock, {
+            let attempts = attempts.clone();
+            move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Effect::fail("agent_not_ready".to_string())
+            }
+        });
         assert!(
-            matches!(out, Err(DispatchErr::BreakerOpen { .. })),
+            matches!(out, Err(DispatchErr::BreakerOpen)),
             "the open breaker must stop the chain: {out:?}"
         );
-        assert_eq!(strikes.get(), 1, "one failure is one strike");
         assert_eq!(
-            attempts.get(),
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the breaker is consulted before every attempt, so the chain stopped after the first failure"
+        );
+    }
+
+    /// ADR-0018 §3 item 5: the breaker is the framework stack's ARGUMENT,
+    /// not a second breaker beside it. The production stack says so in the
+    /// policy it is built from: five consecutive failures open it for 60s
+    /// (ADR-0015 §3 P2), and the framework lets one probe through after the
+    /// cooldown so a pane that failed can recover.
+    #[test]
+    fn dispatch_chain_carries_the_breaker_as_its_argument() {
+        let policy = dispatch_policy();
+        let breaker = policy
+            .breaker
+            .expect("the stack carries the breaker as its argument");
+        assert_eq!(breaker.max_failures, 5, "five failures open it");
+        assert_eq!(
+            breaker.reset.as_millis(),
+            60_000,
+            "60s cooldown before one probe"
         );
     }
 
@@ -3221,29 +3192,51 @@ mod tests {
     /// not attempt at all, and it must not be spent by the breaker check
     /// either.
     #[test]
-    fn dispatch_watchdog_budget_bounds_the_chain() {
-        let policy = dispatch_retry_policy();
-        let mut attempts = 0u32;
-        let out = dispatch_chain(
-            &policy,
-            std::time::Duration::ZERO,
-            BreakerGate {
-                open: &|| None,
-                strike: &|| {},
-            },
-            &mut |_n| {
-                attempts += 1;
-                Err(DispatchErr::Transient {
-                    reason: "agent_not_ready".into(),
-                })
-            },
-            &mut |_| {},
-        );
+    fn dispatch_chain_budget_bounds_the_chain() {
+        // A clock that advances a millisecond per read: the budget compares
+        // the ELAPSED time, so a frozen clock can never show a spent budget.
+        struct TickingClock(std::sync::atomic::AtomicU64);
+        impl ClockImpl for TickingClock {
+            fn sleep(
+                &self,
+                _duration: toron_core::kernel::Duration,
+                _interrupted: &dyn Fn() -> bool,
+            ) -> toron_core::kernel::SleepOutcome {
+                toron_core::kernel::SleepOutcome::Elapsed
+            }
+            fn now_millis(&self) -> u64 {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+        let remote = Remote::new(RemotePolicy {
+            retries: 5,
+            backoff: kernel_millis(Duration::ZERO),
+            ceiling: kernel_millis(Duration::ZERO),
+            attempt_timeout: kernel_millis(Duration::from_secs(30)),
+            // zero budget: the first read of the clock already shows it spent
+            budget: kernel_millis(Duration::ZERO),
+            ..Default::default()
+        });
+        let clock: std::sync::Arc<dyn ClockImpl> =
+            std::sync::Arc::new(TickingClock(std::sync::atomic::AtomicU64::new(0)));
+        let rt = Runtime::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let out = dispatch_chain(&remote, &rt, &clock, {
+            let attempts = attempts.clone();
+            move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Effect::fail("agent_not_ready".to_string())
+            }
+        });
         assert!(
-            matches!(out, Err(DispatchErr::BudgetExhausted { .. })),
+            matches!(out, Err(DispatchErr::BudgetExhausted)),
             "a spent budget must end the chain: {out:?}"
         );
-        assert_eq!(attempts, 0, "a spent budget must not attempt at all");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a spent budget must not attempt at all"
+        );
     }
 
     /// bd-jvka: the FALLBACK is outside the chain — the chain hands the
@@ -3251,24 +3244,31 @@ mod tests {
     /// the next route. A chain that rerouted itself would hide the fallback
     /// inside the retry.
     #[test]
-    fn dispatch_watchdog_hands_the_fallback_verdict_back_to_the_caller() {
-        let policy = dispatch_retry_policy();
-        let mut attempts = 0u32;
-        let out = dispatch_chain(
-            &policy,
-            dispatch_chain_budget(),
-            BreakerGate {
-                open: &|| None,
-                strike: &|| {},
-            },
-            &mut |_n| {
-                attempts += 1;
-                Ok(json!({"ok": false, "kind": "rate_limit"}))
-            },
-            &mut |_| {},
-        )
+    fn dispatch_chain_hands_the_fallback_verdict_back_to_the_caller() {
+        let remote = Remote::new(RemotePolicy {
+            retries: 5,
+            backoff: kernel_millis(Duration::ZERO),
+            ceiling: kernel_millis(Duration::ZERO),
+            attempt_timeout: kernel_millis(Duration::from_secs(30)),
+            budget: kernel_millis(Duration::from_secs(60)),
+            ..Default::default()
+        });
+        let clock: std::sync::Arc<dyn ClockImpl> = std::sync::Arc::new(TestClock::new());
+        let rt = Runtime::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let out = dispatch_chain(&remote, &rt, &clock, {
+            let attempts = attempts.clone();
+            move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Effect::succeed(json!({"ok": false, "kind": "rate_limit"}))
+            }
+        })
         .expect("a final verdict");
-        assert_eq!(attempts, 1, "a final verdict ends the chain");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a final verdict ends the chain"
+        );
         assert_eq!(
             out["kind"],
             json!("rate_limit"),
