@@ -291,16 +291,18 @@ mod tests {
         assert!(s.contains("FLYWHEEL_BACKEND"), "points at the env var: {s}");
     }
 
-    /// Stub contract (runs only in `--all-features` builds where the stub
-    /// feature is on): the stub is name()-enumerable and every operation
-    /// returns an honest Unsupported naming it (no Ok, no panic).
+    /// Unsupported-honesty contract (runs only in `--all-features` builds):
+    /// the superlogical backend is name()-enumerable and the operations it
+    /// does not implement stay honest Unsupported naming the method. Probed
+    /// through `subscribe`, not `workspace_list`: the latter now shells out to
+    /// `rex` and would reach the operator's live server.
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn superlogical_stub_is_honest_unsupported() {
         let b = crate::backend::superlogical::SuperlogicalBackend;
         assert_eq!(b.name(), "superlogical");
         let m: Box<dyn MultiplexerBackend> = Box::new(b);
-        match m.workspace_list() {
+        match m.subscribe(&[]) {
             Err(toron_core::backend::BackendError {
                 code: toron_core::backend::BackendErrorCode::Unsupported,
                 message,
