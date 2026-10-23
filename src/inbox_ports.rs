@@ -196,6 +196,24 @@ impl FlywheelPorts {
         self.append_notify(pin, text, key, 0).map(|_| ())
     }
 
+    /// Append one `escalate@1` to `pin` as the system producer: `reason` is
+    /// the notice, `key` the evidence that names it.
+    fn escalate_pin(&mut self, pin: &str, reason: &str, key: &str) -> Result<(), String> {
+        let to = self
+            .npub_of(pin)
+            .ok_or_else(|| format!("no npub for {pin}"))?;
+        let (producer, epoch) = self.claim_producer_epoch()?;
+        let env = crate::supervisor_host::escalate_envelope(
+            &self.project,
+            &producer,
+            epoch,
+            &to,
+            reason,
+            &[key.to_string()],
+        )?;
+        self.append_env(env).map(|_| ())
+    }
+
     /// Append one `notify@1` to `pin`'s inbox as the system producer; returns
     /// the log offset. `generation` is the envelope's (a steer carries the
     /// child's incarnation).
@@ -255,16 +273,22 @@ impl FlywheelPorts {
     /// and that host runs only while the comms flag is on.
     pub(crate) fn claim_producer_epoch(&mut self) -> Result<(String, u64), String> {
         let producer = system_producer(&self.project);
+        let epoch = self.claim_epoch_as(&producer)?;
+        Ok((producer, epoch))
+    }
+
+    /// Claim the next epoch for `producer` (a nested lead steers as its own
+    /// lead context's key, rv23 #6).
+    pub(crate) fn claim_epoch_as(&mut self, producer: &str) -> Result<u64, String> {
         let store = self.store().ok_or("no comms store")?.clone();
-        let p2 = producer.clone();
-        let epoch = crate::mail_shim::block_on(async move {
+        let p2 = producer.to_string();
+        crate::mail_shim::block_on(async move {
             store
                 .claim_epoch(&p2, &format!("doorbell:{}", std::process::id()))
                 .await
                 .map(|c| c.epoch)
                 .map_err(|e| e.to_string())
-        })?;
-        Ok((producer, epoch))
+        })
     }
 
     /// Append one already-validated envelope. The caller built it.
@@ -601,7 +625,10 @@ impl Ports for FlywheelPorts {
                 json!({"kind": "notified", "to": null, "role": "captain"}),
             );
         };
-        self.notify_pin(&cap, text, &key)?;
+        // rv23 #6: a deaf recipient is a captain decision, so the notice is
+        // `escalate@1` (Control), not a `notify@1` the captain may never act
+        // on. The supervisor's deaf notice stays `notify@1`.
+        self.escalate_pin(&cap, &text, &key)?;
         self.fact(
             &key,
             json!({"kind": "notified", "to": cap, "role": "captain"}),
@@ -768,9 +795,40 @@ mod tests {
         e
     }
 
+    /// rv23 #6: the deaf CAPTAIN notice is escalate@1; the supervisor's stays
+    /// notify@1, and nothing else changed shape.
+    #[test]
+    fn the_deaf_captain_notice_is_an_escalate_and_the_supervisor_notice_a_notify() {
+        let src = include_str!("inbox_ports.rs");
+        let body = |name: &str| {
+            let at = src.find(name).expect(name);
+            &src[at..at + src[at..].find("\n    }\n").expect("end")]
+        };
+        let cap = body("fn notify_captain(");
+        assert!(cap.contains("self.escalate_pin(&cap, &text, &key)?"), "{cap}");
+        assert!(!cap.contains("notify_pin("), "{cap}");
+        let sup = body("fn notify_supervisor(");
+        assert!(sup.contains("self.notify_pin(&sup,"), "{sup}");
+        let esc = body("fn escalate_pin(");
+        assert!(esc.contains("escalate_envelope("), "{esc}");
+        let env = crate::supervisor_host::escalate_envelope(
+            "proj",
+            A,
+            0,
+            B,
+            &deaf_text("Pin", 0xab, DeafCause::NoAnswer),
+            &["deaf-captain:x:171".into()],
+        )
+        .unwrap();
+        assert_eq!(env.contract, ContractId::new("escalate", 1));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stored_steer_head_is_urgent_and_a_later_notify_head_is_not() {
-        let store = mem_store().await;
+        // rv23 #6 (toron F7): with no lead row only the operator may steer,
+        // so the steering key `A` is the store's operator. Pre-F7 toron has
+        // no such fence; this passes on both.
+        let store = mem_store().await.with_operator(A.to_string());
         let steer = stored(
             0,
             Class::Control,

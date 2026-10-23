@@ -89,13 +89,54 @@ pub fn plan_lead_epoch(stored: Option<u64>, fold_accepted: u64) -> u64 {
     }
 }
 
+/// The key that holds the lead: the same `system_producer(project)` the host
+/// signs every steer with (`from`). toron's steer fence (F7) accepts a steer
+/// only when `from` equals the holder on record, so the holder is this key
+/// and never a per-process name. The pid stays in the fold's own claim
+/// (`supervise-<project>-<pid>`) and in the epoch claim's owner string.
+///
+/// `context` is the lead context ([`lead_context`]): the root's is the
+/// project, so its holder is unchanged; a nested lead holds its own key.
+pub fn lead_holder(context: &str) -> String {
+    crate::inbox_ports::system_producer(context)
+}
+
+/// The toron context a supervisor host leads and steers in. The root leads
+/// `project`; a nested lead host (`--context <sub>`) leads `project/<sub>`,
+/// never the root's context, so the two leads do not fence each other's
+/// steers and each steers only under its own `lead@1` row.
+pub fn lead_context(project: &str, sub: Option<&str>) -> String {
+    match sub {
+        Some(s) => format!("{project}/{s}"),
+        None => project.to_string(),
+    }
+}
+
 /// Toron's fence, named as the fold's cause. Other refusals are not a fence.
+///
+/// `NoLead` and `NotLeadHolder` (toron F7) are matched on the wire tag, not
+/// the variant, so this builds against a toron from before the fence too
+/// (where those refusals cannot occur).
 pub fn store_reject_cause(err: &InboxError) -> Option<RejectCause> {
     match err {
         InboxError::Reject(Reject::StaleSupEpoch { .. }) => Some(RejectCause::StaleEpoch),
         InboxError::Reject(Reject::SteerPending { .. }) => Some(RejectCause::SteerPending),
+        InboxError::Reject(r) => match reject_tag(r).as_deref() {
+            Some("no_lead") => Some(RejectCause::NoLead),
+            Some("not_lead_holder") => Some(RejectCause::NotLeadHolder),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// The `reject` wire tag of a refusal (`#[serde(tag = "reject")]`).
+fn reject_tag(r: &Reject) -> Option<String> {
+    serde_json::to_value(r)
+        .ok()?
+        .get("reject")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn lead_error(err: InboxError) -> LeadError {
@@ -107,7 +148,7 @@ fn lead_error(err: InboxError) -> LeadError {
 }
 
 fn lead_envelope(
-    project: &str,
+    context: &str,
     producer: &str,
     epoch: u64,
     holder: &str,
@@ -125,7 +166,7 @@ fn lead_envelope(
         to: Recipient::Npub(producer.to_string()),
         class: Class::Control,
         contract: ContractId::new("lead", 1),
-        context: ContextId(project.to_string()),
+        context: ContextId(context.to_string()),
         task: None,
         generation: 0,
         causation: None,
@@ -146,6 +187,19 @@ pub async fn append_lead_at(
     holder: &str,
     sup_epoch: u64,
 ) -> Result<(), LeadError> {
+    append_lead_in(store, project, project, holder, sup_epoch).await
+}
+
+/// [`append_lead_at`] in `context` ([`lead_context`]). The fact is still
+/// signed by the project's system producer (the store's operator); the row
+/// it sets is `context`'s.
+pub async fn append_lead_in(
+    store: &InboxStore,
+    project: &str,
+    context: &str,
+    holder: &str,
+    sup_epoch: u64,
+) -> Result<(), LeadError> {
     if holder.trim().is_empty() {
         return Err(LeadError::Store("lead holder must be non-empty".into()));
     }
@@ -154,7 +208,7 @@ pub async fn append_lead_at(
         .claim_epoch(&producer, &format!("lead:{}", std::process::id()))
         .await
         .map_err(|e| LeadError::Store(e.to_string()))?;
-    let env = lead_envelope(project, &producer, claim.epoch, holder, sup_epoch)
+    let env = lead_envelope(context, &producer, claim.epoch, holder, sup_epoch)
         .map_err(LeadError::Store)?;
     match store.append_envelope(&env).await {
         Ok(_) => Ok(()),
@@ -170,10 +224,21 @@ pub async fn sync_lead(
     holder: &str,
     fold_accepted: u64,
 ) -> Result<LeadStep, LeadError> {
+    sync_lead_in(store, project, project, holder, fold_accepted).await
+}
+
+/// [`sync_lead`] for `context`'s row ([`lead_context`]).
+pub async fn sync_lead_in(
+    store: &InboxStore,
+    project: &str,
+    context: &str,
+    holder: &str,
+    fold_accepted: u64,
+) -> Result<LeadStep, LeadError> {
     let mut raced = false;
     for _ in 0..2 {
         let row = store
-            .lead_of(project)
+            .lead_of(context)
             .await
             .map_err(|e| LeadError::Store(e.to_string()))?;
         if let Some(row) = &row
@@ -183,7 +248,7 @@ pub async fn sync_lead(
             return Ok(LeadStep::CatchUp(row.sup_epoch));
         }
         let epoch = plan_lead_epoch(row.as_ref().map(|r| r.sup_epoch), fold_accepted);
-        match append_lead_at(store, project, holder, epoch).await {
+        match append_lead_in(store, project, context, holder, epoch).await {
             Ok(()) => return Ok(LeadStep::Appended(epoch)),
             Err(LeadError::Stale) => raced = true,
             Err(e) => return Err(e),
@@ -239,6 +304,34 @@ mod tests {
             Some(RejectCause::SteerPending)
         );
         assert_eq!(store_reject_cause(&other), None);
+    }
+
+    /// rv23 #6 (toron F7): the steer fence's two refusals are causes, not
+    /// `None`. Built from the wire so this compiles against a pre-F7 toron,
+    /// where the variants do not exist (and the test has nothing to map).
+    #[test]
+    fn the_steer_fence_refusals_map_onto_causes() {
+        let wire = [
+            (
+                serde_json::json!({"reject": "no_lead", "context": "proj"}),
+                RejectCause::NoLead,
+            ),
+            (
+                serde_json::json!({"reject": "not_lead_holder", "actor": "x", "holder": "y", "sup_epoch": 3}),
+                RejectCause::NotLeadHolder,
+            ),
+        ];
+        let mut mapped = 0;
+        for (v, cause) in wire {
+            // `Reject` borrows (`Deserialize<'static>` only): a leaked line.
+            let line: &'static str = Box::leak(v.to_string().into_boxed_str());
+            let Ok(r) = serde_json::from_str::<Reject>(line) else {
+                continue;
+            };
+            assert_eq!(store_reject_cause(&InboxError::Reject(r)), Some(cause));
+            mapped += 1;
+        }
+        assert!(mapped == 0 || mapped == 2, "F7 adds both refusals");
     }
 
     async fn mem() -> InboxStore {

@@ -474,6 +474,12 @@ pub enum RejectCause {
     /// A redirect without a delta, or a delta on another op, or one that is
     /// not a sha256 (4b.4).
     BadSteer,
+    /// toron F7: a steer in a context with no `lead@1` row from a key that
+    /// is not the operator.
+    NoLead,
+    /// toron F7: a steer at the current epoch from a key that is not the
+    /// lead holder on record.
+    NotLeadHolder,
 }
 
 impl RejectCause {
@@ -488,6 +494,8 @@ impl RejectCause {
             Self::CapExceeded => "cap_exceeded",
             Self::NotRunning => "not_running",
             Self::BadSteer => "bad_steer",
+            Self::NoLead => "no_lead",
+            Self::NotLeadHolder => "not_lead_holder",
         }
     }
 }

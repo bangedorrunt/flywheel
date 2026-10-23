@@ -1067,6 +1067,18 @@ pub fn recover(
 
 // ---- production journal ---------------------------------------------------
 
+/// The effect-journal scope of one host. The root's is unchanged. A nested
+/// lead's is its own: its fold numbers steers from 1 as well, so sharing the
+/// root's scope made the nested `steer:1` read as settled and it was never
+/// sent (rv23 #6, nested leads; found by the live fixture).
+pub(crate) fn journal_scope(project: &str, context: Option<&str>) -> String {
+    let root = format!("supervise:{}", crate::state::state_key(project));
+    match context {
+        Some(c) => format!("{root}:{c}"),
+        None => root,
+    }
+}
+
 /// The journal owner for supervisor context `ctx` (its lease key, one live
 /// host each) at `sup_epoch`. No pid: a restarted host is recognised by its
 /// context and its higher epoch, not by a process id.
@@ -1220,6 +1232,9 @@ pub struct LivePorts {
     relaunch_bin: PathBuf,
     /// Set on a nested lead host so its facts file is not the root's.
     context: Option<String>,
+    /// rv23 #6: the `sup_epoch` this host holds the lead at. `None` holds
+    /// every steer (see [`steer_gate`]).
+    lead: Option<u64>,
 }
 
 impl LivePorts {
@@ -1239,10 +1254,17 @@ impl LivePorts {
             lead_facts: BTreeMap::new(),
             relaunch_bin,
             context: None,
+            lead: None,
         }
     }
 
     /// This host is the lead for `context` (its own facts file and lease).
+    /// The lead this host claimed at startup (rv23 #6).
+    pub(crate) fn with_lead(mut self, lead: Option<u64>) -> Self {
+        self.lead = lead;
+        self
+    }
+
     pub fn in_context(mut self, context: &str) -> Self {
         if context_token(context) {
             self.context = Some(context.to_string());
@@ -1252,6 +1274,11 @@ impl LivePorts {
 
     fn facts_path(&self) -> PathBuf {
         lead_facts_file(&self.project, self.context.as_deref())
+    }
+
+    /// The toron context this host leads and steers in (rv23 #6).
+    pub(crate) fn lead_context(&self) -> String {
+        crate::lead_claim::lead_context(&self.project, self.context.as_deref())
     }
 
     /// The lead host's pid is dead. No lease file means the lead was never
@@ -1461,6 +1488,8 @@ impl Ports for LivePorts {
     }
 
     fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {
+        // rv23 #6: never steer without a lead claimed at this epoch.
+        steer_gate(self.lead, s.sup_epoch)?;
         // The delta comes from the side store by sha and is refused unless its
         // bytes hash to that sha. It rides the steer@1 body, never a pane.
         // The supervisor log keeps the sha (the fold's message), not these bytes.
@@ -1475,8 +1504,12 @@ impl Ports for LivePorts {
             .inbox
             .npub_of(&s.child)
             .ok_or_else(|| format!("no npub for {}", s.child))?;
-        let (producer, epoch) = self.inbox.claim_producer_epoch()?;
-        let env = steer_envelope(&self.project, &producer, epoch, &to, s, delta.as_ref())?;
+        // The steer's context and `from` are this host's lead context and
+        // holder: a nested lead steers in `project/<sub>`, not the root's.
+        let ctx = self.lead_context();
+        let producer = crate::lead_claim::lead_holder(&ctx);
+        let epoch = self.inbox.claim_epoch_as(&producer)?;
+        let env = steer_envelope(&ctx, &producer, epoch, &to, s, delta.as_ref())?;
         self.inbox.append_env(env)
     }
 
@@ -1726,23 +1759,39 @@ fn run_bounded(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<std::process::ExitStatus, Bounded> {
+    let mut started = None;
+    run_bounded_on(program, argv, cwd, timeout, &mut || {
+        started.get_or_insert_with(std::time::Instant::now).elapsed()
+    })
+}
+
+/// [`run_bounded`] on an injected clock: `elapsed` says how long the child
+/// has run (first asked right after the spawn). Tests drive the deadline
+/// with it instead of racing the machine's load.
+fn run_bounded_on(
+    program: &str,
+    argv: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    elapsed: &mut dyn FnMut() -> Duration,
+) -> Result<std::process::ExitStatus, Bounded> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(argv).stdin(std::process::Stdio::null());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
     let mut child = cmd.spawn().map_err(Bounded::Spawn)?;
-    let started = std::time::Instant::now();
+    elapsed();
     loop {
         match child.try_wait() {
             Ok(Some(st)) => return Ok(st),
-            Ok(None) if started.elapsed() < timeout => {
+            Ok(None) if elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(Bounded::TimedOut(started.elapsed()));
+                return Err(Bounded::TimedOut(elapsed()));
             }
             Err(e) => {
                 let _ = child.kill();
@@ -1768,30 +1817,104 @@ fn now_ms() -> u64 {
 /// Startup claim. The store is the authority when `inbox_lead` can be read,
 /// unless `FLYWHEEL_SUPERVISOR_EPOCH=fold`. The fold's counter runs only on
 /// the other side of that gate.
-fn claim_for_host(core: &mut Core, project: &str, me: &str) -> Result<u64> {
+fn claim_for_host(core: &mut Core, project: &str, lead_ctx: &str, me: &str) -> Result<HostClaim> {
     let forced = std::env::var("FLYWHEEL_SUPERVISOR_EPOCH").ok();
     let opened = crate::comms_send::store()
         .ok()
         .map(|store| store.with_operator(crate::inbox_ports::system_producer(project)));
+    claim_with(core, project, lead_ctx, me, forced.as_deref(), opened)
+}
+
+/// What the startup claim settled: the fold's epoch, and the `sup_epoch` a
+/// `lead@1` row on record names for this host's steering key, if one does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostClaim {
+    pub epoch: u64,
+    /// `Some(e)`: toron's lead row names [`crate::lead_claim::lead_holder`]
+    /// at `e`. `None`: no lead was claimed, so this host must not steer.
+    pub lead: Option<u64>,
+}
+
+/// [`claim_for_host`] with the store and the switch passed in.
+///
+/// rv23 #6 (toron F7): the lead holder is the key the host steers with
+/// ([`crate::lead_claim::lead_holder`]), never `me`; `me` (it carries the
+/// pid) stays the fold's claimant. Fold mode claims the lead too: the fold
+/// picks the epoch and the store records `lead@1` at it, so no mode steers
+/// without a lead.
+///
+/// `lead_ctx` is [`crate::lead_claim::lead_context`]: the root claims the
+/// project's lead, a nested lead claims `project/<sub>` and never the root's.
+pub(crate) fn claim_with(
+    core: &mut Core,
+    project: &str,
+    lead_ctx: &str,
+    me: &str,
+    forced: Option<&str>,
+    opened: Option<toron_core::inbox::InboxStore>,
+) -> Result<HostClaim> {
     let readable = match &opened {
-        Some(store) => crate::mail_shim::block_on(store.lead_of(project)).is_ok(),
+        Some(store) => crate::mail_shim::block_on(store.lead_of(lead_ctx)).is_ok(),
         None => false,
     };
-    if forced.as_deref() == Some("toron") && (opened.is_none() || !readable) {
+    if forced == Some("toron") && (opened.is_none() || !readable) {
         bail!("FLYWHEEL_SUPERVISOR_EPOCH=toron but inbox_lead cannot be read");
     }
-    match crate::lead_claim::epoch_authority(forced.as_deref(), readable) {
-        crate::lead_claim::EpochAuthority::Fold => core.claim(me),
+    let holder = crate::lead_claim::lead_holder(lead_ctx);
+    match crate::lead_claim::epoch_authority(forced, readable) {
+        crate::lead_claim::EpochAuthority::Fold => {
+            let epoch = core.claim(me)?;
+            let lead = match opened.as_ref().filter(|_| readable) {
+                Some(store) => match crate::mail_shim::block_on(
+                    crate::lead_claim::append_lead_in(store, project, lead_ctx, &holder, epoch),
+                ) {
+                    Ok(()) => Some(epoch),
+                    Err(e) => {
+                        eprintln!(
+                            "flywheel supervisor: fold epoch {epoch} has no lead@1 ({e}); steers are held"
+                        );
+                        None
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "flywheel supervisor: no readable lead table; steers are held (no lead claim)"
+                    );
+                    None
+                }
+            };
+            Ok(HostClaim { epoch, lead })
+        }
         crate::lead_claim::EpochAuthority::Toron => {
             let store = opened.context("comms store required for a lead claim")?;
-            let step = crate::mail_shim::block_on(crate::lead_claim::sync_lead(
+            let step = crate::mail_shim::block_on(crate::lead_claim::sync_lead_in(
                 &store,
                 project,
-                me,
+                lead_ctx,
+                &holder,
                 core.model.accepted_epoch,
             ));
-            apply_lead(core, me, step)
+            let epoch = apply_lead(core, me, step)?;
+            Ok(HostClaim {
+                epoch,
+                lead: Some(epoch),
+            })
         }
+    }
+}
+
+/// rv23 #6: a steer goes out only under a lead this host claimed at the
+/// steer's own `sup_epoch`. toron would refuse it anyway (NoLead,
+/// NotLeadHolder, StaleSupEpoch); refusing here names why before a send.
+pub(crate) fn steer_gate(lead: Option<u64>, sup_epoch: u64) -> Result<(), String> {
+    match lead {
+        Some(e) if e == sup_epoch => Ok(()),
+        Some(e) => Err(format!(
+            "steer at sup_epoch {sup_epoch} but this host holds the lead at {e}; not sent"
+        )),
+        None => Err(format!(
+            "no lead claim: this host holds no lead@1, so the steer at sup_epoch {sup_epoch} is not sent"
+        )),
     }
 }
 
@@ -1894,12 +2017,15 @@ fn host_loop(
     context: Option<&str>,
 ) -> Result<()> {
     let mut core = Core::open(paths.clone(), me, Tier::Lead, hc.policy())?;
-    let epoch = claim_for_host(&mut core, project, me)?;
+    // rv23 #6: a nested lead claims and steers in its own context.
+    let lead_ctx = crate::lead_claim::lead_context(project, context);
+    let claim = claim_for_host(&mut core, project, &lead_ctx, me)?;
+    let epoch = claim.epoch;
     let mut journal = ToronEffectJournal::open(
-        &format!("supervise:{}", crate::state::state_key(project)),
+        &journal_scope(project, context),
         &journal_owner(lease_ws, epoch),
     )?;
-    let mut ports = LivePorts::new(cfg, project, project);
+    let mut ports = LivePorts::new(cfg, project, project).with_lead(claim.lead);
     if let Some(c) = context {
         ports = ports.in_context(c);
     }
@@ -2138,6 +2264,10 @@ pub enum SupervisorCmd {
         project: String,
         #[arg(long)]
         child: String,
+        /// Nested lead (its own log and `project/<lead>` lead). Omit for the
+        /// root host.
+        #[arg(long)]
+        context: Option<String>,
         #[arg(long)]
         op: String,
         /// The sup_epoch the sender holds (default: the log's accepted one).
@@ -2237,11 +2367,21 @@ pub fn run_cli(cmd: &SupervisorCmd) -> Result<()> {
         SupervisorCmd::Steer {
             project,
             child,
+            context,
             op,
             sup_epoch,
             delta_file,
         } => {
-            let p = CtxPaths::new(&CtxPaths::default_dir(), project);
+            let dir = CtxPaths::default_dir();
+            let p = match context.as_deref() {
+                Some(c) if !c.is_empty() => {
+                    if !context_token(c) {
+                        bail!("--context must be letters, digits, '-' or '_'");
+                    }
+                    CtxPaths::with_context(&dir, project, c)
+                }
+                _ => CtxPaths::new(&dir, project),
+            };
             let op = parse_op(op)?;
             // Validate and stash the delta BEFORE queueing the steer: a bad
             // file queues nothing.
@@ -2685,6 +2825,175 @@ mod tests {
         assert_eq!(epoch, 8);
         assert_eq!(c.model.accepted_epoch, 8);
         assert_eq!(store.lead_of("proj").await.unwrap().unwrap().sup_epoch, 8);
+    }
+
+    /// rv23 #6: an operated in-memory comms store for `project`.
+    fn op_store(project: &str) -> toron_core::inbox::InboxStore {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = dir.join("index.sqlite");
+        crate::mail_shim::block_on(async move {
+            let pool = toron_core::index::schema::connect(&db.to_string_lossy())
+                .await
+                .unwrap();
+            toron_core::index::schema::migrate(&pool).await.unwrap();
+            toron_core::inbox::InboxStore::new(pool)
+        })
+        .with_operator(crate::inbox_ports::system_producer(project))
+    }
+
+    fn lead_row(store: &toron_core::inbox::InboxStore, project: &str) -> (String, u64) {
+        let s = store.clone();
+        let p = project.to_string();
+        let row = crate::mail_shim::block_on(async move { s.lead_of(&p).await })
+            .unwrap()
+            .expect("a lead@1 row");
+        (row.holder, row.sup_epoch)
+    }
+
+    /// rv23 #6 (toron F7): the lead holder on record is the key the host
+    /// steers with. toron accepts a steer only when `from` equals the holder,
+    /// and the old holder (`supervise-<project>-<pid>`) fenced every steer.
+    #[test]
+    fn the_lead_holder_is_the_key_the_host_steers_with() {
+        let store = op_store("proj");
+        let d = tempfile::tempdir().unwrap();
+        let me = "supervise-proj-4242";
+        let mut c = Core::open(CtxPaths::new(d.path(), "proj"), me, Tier::Lead, None).unwrap();
+        let claim = claim_with(&mut c, "proj", "proj", me, None, Some(store.clone())).unwrap();
+        assert_eq!(claim.lead, Some(claim.epoch), "toron mode holds the lead");
+        let (holder, epoch) = lead_row(&store, "proj");
+        assert_eq!(epoch, claim.epoch);
+        let s = SteerSend {
+            sup_epoch: claim.epoch,
+            ..send(SteerOp::Pause, None)
+        };
+        let producer = crate::inbox_ports::system_producer("proj");
+        let env = steer_envelope("proj", &producer, 0, NPUB, &s, None).unwrap();
+        assert_eq!(holder, env.from, "the holder is the steer's `from`");
+        assert_ne!(holder, me, "the pid-bearing name is not the holder");
+        // And the store keeps the steer (F7: from == holder at the epoch).
+        let st = store.clone();
+        let kept = crate::mail_shim::block_on(async move {
+            let claim = st.claim_epoch(&producer, "test").await.unwrap();
+            let mut env = env;
+            env.msg.epoch = claim.epoch;
+            st.append_envelope(&env).await
+        });
+        assert!(kept.is_ok(), "the holder's steer is accepted: {kept:?}");
+    }
+
+    /// rv23 #6: fold mode claims the lead too. The fold picks the epoch and
+    /// the store records `lead@1` at it, so no mode steers without a lead.
+    #[test]
+    fn fold_mode_claims_the_lead_at_the_fold_epoch() {
+        let store = op_store("proj");
+        let d = tempfile::tempdir().unwrap();
+        let me = "supervise-proj-4243";
+        let mut c = Core::open(CtxPaths::new(d.path(), "proj"), me, Tier::Lead, None).unwrap();
+        let claim = claim_with(&mut c, "proj", "proj", me, Some("fold"), Some(store.clone())).unwrap();
+        assert_eq!(claim.lead, Some(claim.epoch));
+        assert_eq!(
+            lead_row(&store, "proj"),
+            (crate::lead_claim::lead_holder("proj"), claim.epoch)
+        );
+    }
+
+    /// rv23 #6: no store, no lead, no steer. The gate names why.
+    #[test]
+    fn no_lead_claim_holds_every_steer() {
+        let d = tempfile::tempdir().unwrap();
+        let me = "supervise-proj-4244";
+        let mut c = Core::open(CtxPaths::new(d.path(), "proj"), me, Tier::Lead, None).unwrap();
+        let claim = claim_with(&mut c, "proj", "proj", me, None, None).unwrap();
+        assert_eq!(claim.lead, None);
+        let e = claim.epoch;
+        assert!(steer_gate(claim.lead, e).unwrap_err().contains("no lead claim"));
+        assert!(steer_gate(Some(e), e + 1).is_err(), "another epoch is not ours");
+        assert!(steer_gate(Some(e), e).is_ok());
+    }
+
+    /// rv23 #6: the live port checks the gate before it builds anything.
+    #[test]
+    fn live_append_steer_is_gated_on_the_lead() {
+        let src = include_str!("supervisor_host.rs");
+        let at = src
+            .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {\n        // rv23")
+            .expect("LivePorts::append_steer");
+        let body = &src[at..at + 400];
+        assert!(body.contains("steer_gate(self.lead, s.sup_epoch)?;"), "{body}");
+        let main = src.find("fn host_loop(").expect("host_loop");
+        assert!(src[main..].contains(".with_lead(claim.lead)"));
+    }
+
+    /// rv23 #6, nested leads: a nested lead host claims and steers in its
+    /// own context (`project/<sub>`), never the project's. Both leads hold at
+    /// once, each one's steer is kept, and a steer into the other's context is
+    /// `NotLeadHolder` both ways.
+    #[test]
+    fn a_nested_lead_claims_and_steers_in_its_own_context() {
+        use crate::lead_claim::{lead_context, lead_holder, store_reject_cause};
+        use crate::supervisor_program::RejectCause;
+        let store = op_store("proj");
+        let sub = lead_context("proj", Some("plane"));
+        assert_eq!(lead_context("proj", None), "proj");
+        assert_eq!(sub, "proj/plane");
+        let d = tempfile::tempdir().unwrap();
+        let (rme, lme) = ("supervise-proj-1", "supervise-proj-plane-2");
+        let mut root = Core::open(CtxPaths::new(d.path(), "proj"), rme, Tier::Lead, None).unwrap();
+        let nested = CtxPaths::with_context(d.path(), "proj", "plane");
+        let mut lead = Core::open(nested, lme, Tier::Lead, None).unwrap();
+        let rc = claim_with(&mut root, "proj", "proj", rme, None, Some(store.clone())).unwrap();
+        let lc = claim_with(&mut lead, "proj", &sub, lme, None, Some(store.clone())).unwrap();
+        assert_eq!(lc.lead, Some(lc.epoch));
+        assert_eq!(lead_row(&store, "proj"), (lead_holder("proj"), rc.epoch));
+        assert_eq!(lead_row(&store, &sub), (lead_holder(&sub), lc.epoch));
+        assert_ne!(lead_holder("proj"), lead_holder(&sub));
+        // `as_ctx` signs as that context's holder; `into` is the steer's context.
+        let steer = |as_ctx: &str, into: &str, child: &str, sup_epoch: u64| {
+            let s = SteerSend {
+                child: child.into(),
+                sup_epoch,
+                ..send(SteerOp::Pause, None)
+            };
+            let producer = lead_holder(as_ctx);
+            let mut env = steer_envelope(into, &producer, 0, NPUB, &s, None).unwrap();
+            let st = store.clone();
+            crate::mail_shim::block_on(async move {
+                env.msg.epoch = st.claim_epoch(&producer, "test").await.unwrap().epoch;
+                st.append_envelope(&env).await
+            })
+        };
+        assert!(steer("proj", "proj", "r", rc.epoch).is_ok(), "root steer");
+        assert!(steer(&sub, &sub, "l", lc.epoch).is_ok(), "nested steer");
+        let into_sub = steer("proj", &sub, "x", lc.epoch).unwrap_err();
+        assert_eq!(
+            store_reject_cause(&into_sub),
+            Some(RejectCause::NotLeadHolder),
+            "{into_sub}"
+        );
+        let into_root = steer(&sub, "proj", "y", rc.epoch).unwrap_err();
+        assert_eq!(
+            store_reject_cause(&into_root),
+            Some(RejectCause::NotLeadHolder),
+            "{into_root}"
+        );
+    }
+
+    /// rv23 #6, nested leads: the live port steers in its lead context and
+    /// the host claims in it.
+    #[test]
+    fn the_live_host_claims_and_steers_in_its_lead_context() {
+        let src = include_str!("supervisor_host.rs");
+        let main = src.find("fn host_loop(").expect("host_loop");
+        let body = &src[main..];
+        assert!(body.contains("lead_context(project, context);"), "host_loop");
+        assert!(body.contains("claim_for_host(&mut core, project, &lead_ctx, me)?"));
+        let at = src
+            .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {\n        // rv23")
+            .expect("LivePorts::append_steer");
+        let steer = &src[at..at + 1400];
+        assert!(steer.contains("let ctx = self.lead_context();"), "{steer}");
+        assert!(steer.contains("steer_envelope(&ctx, &producer,"), "{steer}");
     }
 
     #[test]
@@ -3372,13 +3681,56 @@ mod tests {
     }
 
     /// rv23 #5 (review S3): a hung `br` must not park the supervisor loop.
-    /// The hold is bounded; past the deadline the child is killed and the
-    /// command fails loud (pinned binary), instead of waiting it out.
+    /// Past the deadline the child is killed and reaped. The deadline is an
+    /// injected clock that passes only once `br` has written its pid, so the
+    /// test does not race the machine's load (it was flaky at a real 300 ms).
     #[test]
     fn a_hung_br_hold_is_killed_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidf = dir.path().join("pid");
+        let (script, logf) = br_script(
+            dir.path(),
+            &format!("echo $$ > {}\nexec sleep 20", pidf.display()),
+        );
+        let deadline = Duration::from_secs(10);
+        // Zero until br is up and has its pid written, then the deadline.
+        let mut clock = || match std::fs::read_to_string(&pidf) {
+            Ok(s) if s.ends_with('\n') => deadline,
+            _ => Duration::ZERO,
+        };
+        let started = std::time::Instant::now();
+        let got = run_bounded_on(
+            script.to_str().unwrap(),
+            &["hold".into()],
+            None,
+            deadline,
+            &mut clock,
+        );
+        let took = started.elapsed();
+        assert!(logf.exists(), "br did run");
+        assert!(matches!(got, Err(Bounded::TimedOut(_))), "past the deadline is a timeout");
+        assert!(
+            took < Duration::from_secs(15),
+            "killed at the deadline, not waited out (br hangs 20 s): {took:?}"
+        );
+        let pid = std::fs::read_to_string(&pidf).unwrap();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the hung br (pid {}) is gone", pid.trim());
+    }
+
+    /// The same deadline through `execute`, on the real clock: a pinned `br`
+    /// that hangs fails the escalate loud as "timed out", well before the hang
+    /// ends. Only the upper bound is timed, with a wide margin.
+    #[test]
+    fn a_hung_pinned_br_hold_fails_the_escalate_as_timed_out() {
         let _g = crate::config::lock_env();
         let dir = tempfile::tempdir().unwrap();
-        let (script, logf) = br_script(dir.path(), "exec sleep 20");
+        let (script, _) = br_script(dir.path(), "exec sleep 20");
         unsafe { std::env::set_var("FLYWHEEL_BR_BIN", &script) };
         unsafe { std::env::set_var("FLYWHEEL_BR_HOLD_TIMEOUT_MS", "300") };
         let mut j = MemJournal::default();
@@ -3389,10 +3741,9 @@ mod tests {
         let took = started.elapsed();
         unsafe { std::env::remove_var("FLYWHEEL_BR_BIN") };
         unsafe { std::env::remove_var("FLYWHEEL_BR_HOLD_TIMEOUT_MS") };
-        assert!(logf.exists(), "br did run");
         assert!(
-            took < std::time::Duration::from_secs(5),
-            "the hold waits for its deadline, not for br: {took:?}"
+            took < Duration::from_secs(15),
+            "the hold waits for its deadline, not for br (20 s): {took:?}"
         );
         assert!(
             matches!(back.first(), Some(SupMsg::CmdFailed { why, .. }) if why.contains("timed out")),
@@ -3659,6 +4010,7 @@ mod tests {
         SupervisorCmd::Steer {
             project: "proj".into(),
             child: "a".into(),
+            context: None,
             op: op.into(),
             sup_epoch: Some(2),
             delta_file,
@@ -4156,6 +4508,43 @@ mod tests {
             ),
             rt,
         )
+    }
+
+    /// rv23 #6, nested leads: the root's settled `steer:1` does not settle
+    /// the nested lead's own `steer:1` (the two journals share one database).
+    #[test]
+    fn a_nested_lead_has_its_own_effect_journal() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let pool = rt.block_on(async {
+            let pool = toron_core::index::schema::connect(&db.to_string_lossy())
+                .await
+                .unwrap();
+            toron_core::index::schema::migrate(&pool).await.unwrap();
+            pool
+        });
+        let open = |scope: &str, owner: &str| {
+            let jd = toron_core::journal::JournalDb::new(pool.clone(), scope, 64);
+            ToronEffectJournal::new(
+                toron_core::journal::ToronJournal::spawn(jd, rt.handle()),
+                owner,
+            )
+        };
+        let (rs, ls) = (journal_scope("proj", None), journal_scope("proj", Some("plane")));
+        assert_eq!(rs, format!("supervise:{}", crate::state::state_key("proj")));
+        let mut root = open(&rs, "root");
+        let mut lead = open(&ls, "lead");
+        let g = match root.begin("steer:1") {
+            Begin::Run(g) => g,
+            other => panic!("{other:?}"),
+        };
+        root.finish("steer:1", g, true);
+        assert_eq!(root.begin("steer:1"), Begin::Skip);
+        assert!(
+            matches!(lead.begin("steer:1"), Begin::Run(_)),
+            "the nested lead's steer:1 is not the root's"
+        );
     }
 
     /// Two hosts' journals over ONE store (a kill -9 and a restart).
