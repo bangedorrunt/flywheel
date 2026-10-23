@@ -1594,7 +1594,11 @@ owner = "housekeeper"
         // state_dir() honors XDG_STATE_HOME, so the live spawn registry
         // (state dir, not config dir) must be redirected too — otherwise
         // the test reads the operator's live panes and dispatches for real.
+        // bd-3dge: snapshot what we touch — an unrestored XDG leaves later
+        // tests resolving the ambient/relative store.
         let _g = crate::config::lock_env();
+        let prev_config = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
         let dir = tmp_path("pane-dispatch-xdg");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1620,8 +1624,14 @@ owner = "housekeeper"
             err.to_string().contains("pane dispatch"),
             "dispatch path failed fast, not recorded: {err}"
         );
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        match prev_config {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        match prev_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
