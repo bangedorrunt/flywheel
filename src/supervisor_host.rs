@@ -1582,7 +1582,23 @@ impl Ports for LivePorts {
             &format!("page:{kind}:{pin}:{}", chrono::Utc::now().timestamp()),
             json!({"kind": "page", "page": kind, "pin": pin}),
         )?;
-        self.page_captain(&shown);
+        match kind {
+            // The health pages are their own subject: the captain can tell a
+            // dead dispatcher from a dead stop without reading the body.
+            "dead_doorbell" => crate::page_captain_mail(
+                &self.cfg,
+                &self.project,
+                "[loop-mode supervise] dead doorbell",
+                &shown,
+            ),
+            "stale_heartbeat" => crate::page_captain_mail(
+                &self.cfg,
+                &self.project,
+                "[loop-mode supervise] stale heartbeat",
+                &shown,
+            ),
+            _ => self.page_captain(&shown),
+        }
         Ok(())
     }
 
@@ -2232,6 +2248,40 @@ fn probe_msgs(
                 pin,
             });
         }
+    }
+    // Hardening slice 2 (bd-c0ha): a dead doorbell dispatcher or a stale
+    // heartbeat on a binding herdr may clear pages once, then holds. The
+    // model is the hold, so a replayed pass folds the same set.
+    let mut hold = crate::health_page::HealthHold {
+        dead_doorbells: model.dead_doorbells.clone(),
+        stale_pins: model.stale_pins.clone(),
+    };
+    let presence = std::fs::read_to_string(crate::mail_shim::presence_path()).unwrap_or_default();
+    let rows = crate::health_page::registry_rows(cfg, project);
+    let live_panes = crate::live_herdr_panes(cfg);
+    for event in crate::health_page::probe_events(
+        &crate::config::state_dir(),
+        project,
+        now,
+        &presence,
+        &rows,
+        live_panes.as_ref(),
+        &mut hold,
+    ) {
+        out.push(match event {
+            crate::health_page::HealthEvent::DeadDoorbell { label, line } => {
+                SupMsg::DeadDoorbell { label, line }
+            }
+            crate::health_page::HealthEvent::DoorbellRecovered { label } => {
+                SupMsg::DoorbellRecovered { label }
+            }
+            crate::health_page::HealthEvent::StaleHeartbeat { pin, line } => {
+                SupMsg::StaleHeartbeat { pin, line }
+            }
+            crate::health_page::HealthEvent::HeartbeatRecovered { pin } => {
+                SupMsg::HeartbeatRecovered { pin }
+            }
+        });
     }
     out
 }
