@@ -351,6 +351,11 @@ pub fn resolve_pane_entry_nth<'a>(
 /// profile-match then steals fresh-crew dispatches (and a stale
 /// skills_injected=true mutes the readiness gate). Pure — the caller
 /// supplies the live pane set and decides failure policy.
+///
+/// This is the DISPATCH gate, not the persisted clear: whatever herdr does not
+/// list is not dispatchable, whatever its harness. The persisted reap
+/// ([`reap_closed_rows`]) asks the stricter bd-j0b5 question before it drops a
+/// row for good.
 pub fn prune_dead_pane_rows(
     entries: Vec<SpawnEntry>,
     live_pane_ids: &std::collections::HashSet<String>,
@@ -361,15 +366,29 @@ pub fn prune_dead_pane_rows(
         .collect()
 }
 
-/// bd-bfwj: split a registry into live rows plus a pruned count, given
-/// the live pane set. Pure — tests pin the decision, the IO helper below
-/// supplies the live set and persists.
+/// bd-bfwj: split a registry into the rows that survive the persisted clear
+/// plus a pruned count, given the live pane set. bd-j0b5: a gone pane is death
+/// only for a harness herdr injects — a mail-only pin keeps its row. Pure —
+/// tests pin the decision, the IO helper below supplies the live set and
+/// persists.
 pub fn reap_closed_rows(
     entries: Vec<SpawnEntry>,
     live_pane_ids: &std::collections::HashSet<String>,
+    backend: &str,
 ) -> (Vec<SpawnEntry>, usize) {
     let before = entries.len();
-    let kept = prune_dead_pane_rows(entries, live_pane_ids);
+    let kept: Vec<SpawnEntry> = entries
+        .into_iter()
+        .filter(|e| {
+            live_pane_ids.contains(&e.pane_id)
+                || !crate::pane_keep::pane_binding_may_clear(
+                    e.harness.as_deref().unwrap_or(""),
+                    backend,
+                    &e.pane_id,
+                    Some(live_pane_ids),
+                )
+        })
+        .collect();
     let pruned = before.saturating_sub(kept.len());
     (kept, pruned)
 }
@@ -387,7 +406,15 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
             return 0;
         }
     };
-    let (kept, pruned) = reap_closed_rows(state::load_spawn_registry(project), &live);
+    // bd-j0b5: resolve the process backend once so the pure clear can decide;
+    // config load is best-effort and mirrors the multiplexer precedence.
+    let backend = crate::config::Config::load()
+        .map(|cfg| crate::backend::factory::resolve_backend_name(&cfg))
+        .unwrap_or_else(|_| {
+            crate::backend::factory::resolve_backend_name(&crate::config::Config::default())
+        });
+    let (kept, pruned) =
+        reap_closed_rows(state::load_spawn_registry(project), &live, &backend);
     if pruned == 0 {
         return 0;
     }
@@ -3993,10 +4020,42 @@ mod tests {
         let live: HashSet<String> = ["wLive:p1".to_string(), "wOther:p1".to_string()]
             .into_iter()
             .collect();
-        let (kept, pruned) = reap_closed_rows(entries, &live);
+        let (kept, pruned) = reap_closed_rows(entries, &live, "herdr");
         assert_eq!(pruned, 1);
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|e| e.pane_id != "wDead:p1"));
+    }
+
+    /// bd-j0b5: the persisted clear keeps a row from a harness herdr cannot
+    /// inject (its pane is absent on purpose) and an unknown harness; only a
+    /// gone pane of a herdr-injectable harness is cleared.
+    #[test]
+    fn reap_close_keeps_pins_herdr_cannot_inject() {
+        use std::collections::HashSet;
+        let mk = |pane: &str, name: &str, harness: Option<&str>| SpawnEntry {
+            pane_id: pane.into(),
+            name: name.into(),
+            profile: None,
+            harness: harness.map(str::to_string),
+            model: None,
+            model_pin: None,
+            skills_digest: None,
+            mail_identity: Some(name.into()),
+            skills_injected: false,
+            incarnation: 0,
+        };
+        let entries = vec![
+            mk("wDead:p1", "freebuff-pin", Some("freebuff")),
+            mk("wGone:p2", "gone-opencode", Some("opencode")),
+            mk("wLegacy:p3", "legacy-pin", None),
+        ];
+        let live: HashSet<String> = HashSet::new();
+        let (kept, pruned) = reap_closed_rows(entries, &live, "herdr");
+        assert_eq!(pruned, 1);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|e| e.pane_id == "wDead:p1"));
+        assert!(kept.iter().any(|e| e.pane_id == "wLegacy:p3"));
+        assert!(!kept.iter().any(|e| e.pane_id == "wGone:p2"));
     }
 
     /// bd-nwnb (red first): the gauge — rows whose pane is gone,
