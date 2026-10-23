@@ -1153,10 +1153,14 @@ impl EffectJournal for ToronEffectJournal {
             // Refused: another owner's lease is live. If that owner is this
             // context's predecessor (a lower sup_epoch, so a host that is
             // dead: the context lease admits one live host and the epoch
-            // claim fenced it), take its claim over and run the key under it.
-            // Waiting out its lease instead made the fold count the refusal
-            // as a child failure: an extra generation and a spent restart
-            // slot per host crash (rv23 S2).
+            // claim fenced it), take its claim over and run the key once more.
+            // The claim keeps the predecessor's owner token until its lease
+            // expires (the kernel refuses a cross-owner claim while a lease is
+            // live); the fence is the generation the takeover bumps, so the
+            // dead host's late settle cannot land. Waiting out the lease
+            // instead made the fold count the refusal as a child failure: an
+            // extra generation and a spent restart slot per host crash
+            // (rv23 S2).
             Ok(None) => match row.owner.as_deref() {
                 Some(theirs) if takes_over(&self.owner, theirs) => match claim(theirs) {
                     Ok(Some(r)) => r,
@@ -4599,6 +4603,121 @@ mod tests {
         assert_eq!(js[1].begin("relaunch:x:2"), Begin::Held(other_ctx.clone()));
         assert!(matches!(js[3].begin("relaunch:y:2"), Begin::Run(_)));
         assert_eq!(js[1].begin("relaunch:y:2"), Begin::Held(newer.clone()));
+    }
+
+    /// rv23 S2, the nested-lead half: the lead host dies (kill -9) holding
+    /// its own `relaunch:b:2`. Its successor in the SAME lead context at the
+    /// next sup_epoch takes that claim over and runs it once. No extra
+    /// generation and no extra restart slot: the fold sees `Relaunched`, never
+    /// `CmdFailed`. The root never steals the lead's claim, and a newer epoch
+    /// of the lead fences the older one.
+    #[test]
+    fn a_restarted_nested_lead_takes_over_its_own_relaunch_claim() {
+        let key = crate::state::state_key("proj");
+        let lead_ws = supervise_lease_workspace("proj", Some("plane"));
+        assert_eq!(lead_ws, format!("supervise-{key}--plane"));
+        let lead1 = journal_owner(&lead_ws, 1);
+        let lead2 = journal_owner(&lead_ws, 2);
+        let lead3 = journal_owner(&lead_ws, 3);
+        let root = journal_owner(&supervise_lease_workspace("proj", None), 2);
+        assert_eq!(lead1, format!("supervise-{key}--plane@e1"));
+        let (mut js, _rt) = toron_journals(&[&lead1, &lead2, &lead3, &root]);
+        // The wiring, not just the rule: the owner is the context lease plus
+        // the epoch, so a successor recomputes the SAME context and only the
+        // epoch moves. A pid or the root's workspace here would never take over.
+        let src = include_str!("supervisor_host.rs");
+        let at = src
+            .find("let mut journal = ToronEffectJournal::open(")
+            .expect("host_loop journal");
+        assert!(
+            src[at..at + 240].contains("journal_owner(lease_ws, epoch)"),
+            "{}",
+            &src[at..at + 240]
+        );
+        // The dead lead claimed the relaunch and never settled.
+        let g1 = match js[0].begin("relaunch:x:2") {
+            Begin::Run(g) => g,
+            other => panic!("{other:?}"),
+        };
+        // Its successor, same lead context at the next epoch, takes it over.
+        let g2 = match js[1].begin("relaunch:x:2") {
+            Begin::Run(g) => g,
+            other => panic!("the restarted lead must take over: {other:?}"),
+        };
+        assert!(g2 > g1, "the takeover fences the dead claim");
+        // The fence is the generation: the dead host's late settle, at the
+        // generation it held, cannot land on the taken-over row.
+        js[0].finish("relaunch:x:2", g1, true);
+        let g3 = match js[1].begin("relaunch:x:2") {
+            Begin::Run(g) => g,
+            other => panic!("a stale settle must not close the claim: {other:?}"),
+        };
+        js[1].finish("relaunch:x:2", g3, true);
+        assert_eq!(js[1].begin("relaunch:x:2"), Begin::Skip);
+        // The root is another context: it never steals the lead's live claim.
+        let held = match js[1].begin("relaunch:y:2") {
+            Begin::Run(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(js[3].begin("relaunch:y:2"), Begin::Held(lead2.clone()));
+        // A newer epoch of the lead does take the older one's claim.
+        let g4 = match js[2].begin("relaunch:y:2") {
+            Begin::Run(g) => g,
+            other => panic!("the newer epoch of the lead must take over: {other:?}"),
+        };
+        assert!(g4 > held, "the newer epoch supersedes the older claim");
+        // The fold half: the dead host logged the exit, claimed the relaunch,
+        // and was killed before it settled. The successor must run that one
+        // command at its original generation, spending no second slot.
+        let d = tempfile::tempdir().unwrap();
+        let me = "supervise-proj-plane-1";
+        let mut dead =
+            Core::open(CtxPaths::with_context(d.path(), "proj", "plane"), me, Tier::Lead, None)
+                .unwrap();
+        dead.claim(me).unwrap();
+        assert_eq!(dead.model.accepted_epoch, 1);
+        let f = Fake::default();
+        go(&mut dead, &mut MemJournal::default(), &f, vec![spawn("b")], 1_000);
+        let cmds = dead
+            .append_fold(SupMsg::Exit {
+                child: "b".into(),
+                now_ms: 2_000,
+            })
+            .unwrap();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                SupCmd::Relaunch {
+                    child,
+                    generation: 2,
+                    ..
+                } if child == "b"
+            )),
+            "the exit asks for relaunch:b:2: {cmds:?}"
+        );
+        assert!(matches!(js[0].begin("relaunch:b:2"), Begin::Run(_)));
+        drop(dead); // kill -9: the lead's claim is never settled.
+        let me2 = "supervise-proj-plane-2";
+        let mut live =
+            Core::open(CtxPaths::with_context(d.path(), "proj", "plane"), me2, Tier::Lead, None)
+                .unwrap();
+        live.claim(me2).unwrap();
+        assert_eq!(live.model.accepted_epoch, 2);
+        let f2 = Fake::default();
+        let mut p2 = f2.clone();
+        let rep = recover(&mut live, &mut js[1], &mut p2).unwrap();
+        assert_eq!(rep.failed, 0, "a takeover is not a failure: {rep:?}");
+        assert_eq!(rep.held, 0, "the lead's successor is its heir, not a rival");
+        assert_eq!(
+            f2.0.lock().unwrap().relaunched,
+            vec![("b".to_string(), 2)],
+            "the lead's claim runs once"
+        );
+        let b = live.model.children.get("b").expect("b");
+        assert_eq!(b.state, ChildState::Running);
+        assert_eq!(b.generation, 2, "no extra generation");
+        assert_eq!(live.model.restarts.len(), 1, "no extra restart slot");
+        assert_eq!(live.model.failed_cmds, 0);
     }
 
     #[test]
