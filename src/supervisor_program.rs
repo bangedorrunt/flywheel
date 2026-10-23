@@ -506,6 +506,44 @@ pub enum Status {
     Halted,
 }
 
+/// How many fact keys a dedup list keeps (rv23 #4). The host reads facts
+/// incrementally from a persisted offset, so a key comes back only for the
+/// round before a crash; the newest keys are the ones that can repeat.
+pub const SEEN_KEYS_MAX: usize = 1024;
+
+/// Fact keys already acted on, newest last, at most [`SEEN_KEYS_MAX`]
+/// (rv23 #4: these grew by one per fact for the host's life). Serialized as
+/// a plain list, so an older snapshot's set reads back as one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RecentKeys(std::collections::VecDeque<String>);
+
+impl RecentKeys {
+    /// Whether `key` is held.
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.iter().any(|k| k == key)
+    }
+
+    /// Hold `key`; `false` if it was already held. Past the cap the oldest
+    /// key is dropped.
+    pub fn insert(&mut self, key: String) -> bool {
+        if self.contains(&key) {
+            return false;
+        }
+        self.0.push_back(key);
+        while self.0.len() > SEEN_KEYS_MAX {
+            self.0.pop_front();
+        }
+        true
+    }
+
+    /// How many keys are held.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// The model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupModel {
@@ -546,7 +584,7 @@ pub struct SupModel {
     /// Commands that failed.
     pub failed_cmds: u64,
     /// Deaf facts already acted on.
-    pub deaf_seen: BTreeSet<String>,
+    pub deaf_seen: RecentKeys,
     /// Latest time seen.
     pub now_ms: u64,
     /// Generation floor for crews a failure halted: a re-adopted crew starts
@@ -568,7 +606,7 @@ pub struct SupModel {
     pub adopted: BTreeSet<String>,
     /// Escalate fact keys already spent as one `ChildEscalated`.
     #[serde(default)]
-    pub escalated_facts: BTreeSet<String>,
+    pub escalated_facts: RecentKeys,
     /// Children that reported `Proved`. `Done` is not this set.
     #[serde(default)]
     pub proved: BTreeSet<String>,
@@ -620,14 +658,14 @@ impl SupModel {
             paged: BTreeSet::new(),
             stalled: false,
             failed_cmds: 0,
-            deaf_seen: BTreeSet::new(),
+            deaf_seen: RecentKeys::default(),
             now_ms: 0,
             retired_gen: BTreeMap::new(),
             assignments: BTreeMap::new(),
             task_abnormal: BTreeMap::new(),
             parked_tasks: BTreeSet::new(),
             adopted: BTreeSet::new(),
-            escalated_facts: BTreeSet::new(),
+            escalated_facts: RecentKeys::default(),
             proved: BTreeSet::new(),
             integration_proved: false,
             conflicts: BTreeSet::new(),
@@ -3834,6 +3872,35 @@ mod tests {
             m.children["a"].state == ChildState::Parked || esc == 1,
             "bounded: parked by poison or escalated by intensity"
         );
+    }
+
+    /// rv23 #4: the fact-key lists are bounded with the newest kept, and a
+    /// snapshot that stored them as sets reads back.
+    #[test]
+    fn the_seen_fact_lists_are_bounded() {
+        let mut m = base();
+        for i in 0..SEEN_KEYS_MAX + 10 {
+            let (n, _) = step(
+                &m,
+                &SupMsg::Deaf {
+                    child: "nobody".into(),
+                    key: format!("deaf:{i}"),
+                    now_ms: 1,
+                },
+            );
+            m = n;
+        }
+        assert_eq!(m.deaf_seen.len(), SEEN_KEYS_MAX);
+        assert!(m.deaf_seen.contains(&format!("deaf:{}", SEEN_KEYS_MAX + 9)));
+        assert!(!m.deaf_seen.contains("deaf:0"), "the oldest key is dropped");
+        let mut k = RecentKeys::default();
+        for i in 0..SEEN_KEYS_MAX + 3 {
+            assert!(k.insert(format!("e{i}")));
+        }
+        assert!(!k.insert(format!("e{}", SEEN_KEYS_MAX + 2)), "a held key is not new");
+        assert_eq!(k.len(), SEEN_KEYS_MAX);
+        let old: RecentKeys = serde_json::from_str(r#"["a","b"]"#).unwrap();
+        assert!(old.contains("a") && old.contains("b"));
     }
 
     #[test]
