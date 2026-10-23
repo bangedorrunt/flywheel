@@ -6558,17 +6558,21 @@ async fn respawn_and_requeue(
 ) {
     let kind = match respawn_kind(kinds, name) {
         Some(k) => k,
-        None => match ctx
-            .run(
-                poll_kind,
-                PollKindArgs {
-                    project: params.project.clone(),
-                    name: name.to_string(),
-                },
-            )
-            .await
-        {
-            Ok(k) => k,
+        None => match crate::elm::leaf::run_leaf_journaled(
+            &params.project,
+            "__kind",
+            &[&params.project, name],
+            &format!("kind:{}:{name}", params.project),
+        ) {
+            Ok(v) => v
+                .as_str()
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    v.get("raw")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default(),
             Err(e) => {
                 // cg6.2: skip the respawn this tick; queue unchanged.
                 eprintln!("flywheel: poll_kind leaf failed for {name} (skipping respawn): {e}");
@@ -6974,17 +6978,42 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         ) {
             since_snapshot = 0;
             let prior_states = states.clone();
-            states = match ctx
-                .run(
-                    poll_swarm,
-                    PollArgs {
-                        project: params.project.clone(),
-                        to: params.to.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(s) => carry_nudge_streaks(s, &prior_states),
+            states = match crate::elm::leaf::run_leaf_journaled(
+                &params.project,
+                "__poll",
+                &[&params.project, &params.to],
+                &format!("poll-swarm:{}:{}", params.project, params.to),
+            ) {
+                Ok(v) => {
+                    let parsed: anyhow::Result<Vec<AgentState>> = (|| {
+                        let pairs = v.get("agents").and_then(|a| a.as_array()).ok_or_else(
+                            || {
+                                anyhow::anyhow!(
+                                    "__poll missing agents: {}",
+                                    serde_json::to_string(&v)
+                                        .unwrap_or_default()
+                                )
+                            },
+                        )?;
+                        let mut out = Vec::with_capacity(pairs.len());
+                        for p in pairs {
+                            out.push(parse_poll_entry(p).map_err(|e| {
+                                anyhow::anyhow!("{e}")
+                            })?);
+                        }
+                        Ok(out)
+                    })();
+                    match parsed {
+                        Ok(s) => carry_nudge_streaks(s, &prior_states),
+                        Err(e) => {
+                            critical_leaf_failed_this_iter = true;
+                            eprintln!(
+                                "flywheel: poll_swarm leaf failed (continuing with empty snapshot): {e}"
+                            );
+                            vec![]
+                        }
+                    }
+                }
                 Err(e) => {
                     // cg6.2: the correctness floor must not be a crash point —
                     // a transient herdr failure yields an empty snapshot; the
@@ -7014,16 +7043,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // recipe, call `__xproj-spawn` which spawns the swarm in this project
         // and replies in-thread. If it doesn't parse to a recipe, fall back to
         // queueing a prompt for an idle agent to interpret. Soft-fail.
-        let xproj_items: Vec<crate::XprojInboxItem> = ctx
-            .run(
-                poll_xproj_inbox,
-                XprojInboxArgs {
-                    project: params.project.clone(),
-                    limit: 30,
-                },
-            )
-            .await
-            .unwrap_or_default();
+        let xproj_items: Vec<crate::XprojInboxItem> =
+            match crate::elm::leaf::run_leaf_journaled(
+                &params.project,
+                "__xproj-inbox",
+                &[&params.project, "--limit", "30"],
+                &format!("xproj-inbox:{}", params.project),
+            ) {
+                Ok(v) => {
+                    let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
+                    serde_json::from_value(items).unwrap_or_default()
+                }
+                Err(_) => vec![],
+            };
         for item in &xproj_items {
             if seen_xproj.contains(&item.id) {
                 continue;
@@ -7080,16 +7112,27 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // allowlist (deny NEVER dispatches) then decide's coverage report.
         // A catalog hit queues guidance; a miss queues the candidate FOR
         // APPROVAL — W7 never auto-runs a composed workflow from mail.
-        let (compose_rows, compose_allowlist) = ctx
-            .run(
-                poll_compose_requests,
-                ComposeInboxArgs {
-                    project: params.project.clone(),
-                    limit: 30,
-                },
-            )
-            .await
-            .unwrap_or_else(|_| (vec![], vec![]));
+        let (compose_rows, compose_allowlist): (
+            Vec<ComposeRequestRow>,
+            Vec<String>,
+        ) = match crate::elm::leaf::run_leaf_journaled(
+            &params.project,
+            "__compose-inbox",
+            &[&params.project, "--limit", "30"],
+            &format!("compose-inbox:{}", params.project),
+        ) {
+            Ok(v) => {
+                let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
+                let rows: Vec<ComposeRequestRow> =
+                    serde_json::from_value(items).unwrap_or_default();
+                let allowlist = v
+                    .get("allowlist")
+                    .and_then(|a| serde_json::from_value::<Vec<String>>(a.clone()).ok())
+                    .unwrap_or_default();
+                (rows, allowlist)
+            }
+            Err(_) => (vec![], vec![]),
+        };
         if !compose_rows.is_empty() {
             let catalog_owned: Vec<(String, Option<String>)> =
                 crate::workflow_catalog::WorkflowCatalog::load_layered(None)
@@ -7140,16 +7183,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // fresh (standing orders ride the boot prime; open thread refs ride
         // the digest prefix on later prompts) within this poll cycle; the
         // sender pin → pane mapping refuses strangers.
-        let ctx_items: Vec<crate::XprojInboxItem> = ctx
-            .run(
-                poll_context_inbox,
-                ContextInboxArgs {
-                    project: params.project.clone(),
-                    limit: 30,
-                },
-            )
-            .await
-            .unwrap_or_default();
+        let ctx_items: Vec<crate::XprojInboxItem> =
+            match crate::elm::leaf::run_leaf_journaled(
+                &params.project,
+                "__context-inbox",
+                &[&params.project, "--limit", "30"],
+                &format!("context-inbox:{}", params.project),
+            ) {
+                Ok(v) => {
+                    let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
+                    serde_json::from_value(items).unwrap_or_default()
+                }
+                Err(_) => vec![],
+            };
         for item in &ctx_items {
             if seen_ctx_limit.contains(&item.id) {
                 continue;
@@ -7232,16 +7278,19 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             // = the polled swarm; stranded beads (assignee NOT live) are
             // RECLAIMED (re-opened to ready + re-dispatched) instead of being
             // resumed or left to stall the batch.
-            let inprog: Vec<ReadyBead> = match ctx
-                .run(
-                    poll_inprogress,
-                    ReadyArgs {
-                        project: params.project.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(b) => b,
+            let inprog: Vec<ReadyBead> = match crate::elm::leaf::run_leaf_journaled(
+                &params.project,
+                "__inprogress",
+                &[&params.project],
+                &format!("inprogress:{}", params.project),
+            ) {
+                Ok(v) => match parse_bead_list(&v, "__inprogress") {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("flywheel: poll_inprogress leaf failed (continuing): {e}");
+                        vec![]
+                    }
+                },
                 Err(e) => {
                     // cg6.2: leaf errors never abort the loop — a tracker
                     // hiccup yields no interrupted-work refresh this tick.
@@ -8390,16 +8439,13 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // path (T0-T3). Everything here runs through checkpointed leaves —
         // replay reproduces identical verdicts and the reminder is deduped
         // by the last-sent registry (same invocation + text).
-        let expected_entries = match ctx
-            .run(
-                load_expected_replies,
-                ExpectedArgs {
-                    project: params.project.clone(),
-                },
-            )
-            .await
-        {
-            Ok(e) => e,
+        let expected_entries = match crate::elm::leaf::run_leaf_journaled(
+            &params.project,
+            "__expected-replies",
+            &[&params.project],
+            &format!("expected-replies:{}", params.project),
+        ) {
+            Ok(v) => parse_expected_reply_entries(&v),
             Err(e) => {
                 // bd-87hq: flag expected-replies failures for the gate too
                 // (part of the stale-checkpoint signature per the symptom).
@@ -8437,18 +8483,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             if !settled {
                 continue; // working/blocked/unknown — not settled yet
             }
-            let (newest_id, author) = match ctx
-                .run(
-                    check_reply,
-                    CheckReplyArgs {
-                        project: params.project.clone(),
-                        name: herdr_name.clone(),
-                        thread: exp.thread.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(v) => v,
+            let (newest_id, author) = match crate::elm::leaf::run_leaf_journaled(
+                &params.project,
+                "__check-reply",
+                &[&params.project, &herdr_name, &exp.thread],
+                &format!(
+                    "check-reply:{}:{}:{}",
+                    params.project, herdr_name, exp.thread
+                ),
+            ) {
+                Ok(v) => parse_reply_check(&v),
                 Err(e) => {
                     eprintln!("flywheel: check-reply leaf failed for {agent} (continuing): {e}");
                     (None, None)
@@ -8476,32 +8520,41 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     // expectation so it stops keeping the loop alive. The
                     // file keys by the MAIL identity (agent), not the herdr
                     // name — pass the file key.
-                    let _ = ctx
-                        .run(
-                            reply_settled,
-                            ReplySettledArgs {
-                                project: params.project.clone(),
-                                name: exp.agent.clone(),
-                                thread: exp.thread.clone(),
-                            },
-                        )
-                        .await; // leaf errors logged inside; local retain below
+                    let _ = crate::elm::leaf::run_leaf_journaled(
+                        &params.project,
+                        "__reply-settled",
+                        &[&params.project, &exp.agent, &exp.thread],
+                        &format!(
+                            "reply-settled:{}:{}:{}",
+                            params.project, exp.agent, exp.thread
+                        ),
+                    ); // leaf errors logged inside; local retain below
                     satisfied_names.push(key.clone());
                 }
                 ReplyVerdict::Reminded => {
-                    let _ = ctx
-                        .run(
-                            remind_reply,
-                            RemindArgs {
-                                project: params.project.clone(),
-                                name: herdr_name.clone(),
-                                thread: exp.thread.clone(),
-                                reminder_count: exp.reminder_count,
-                                invocation: params.invocation.clone(),
-                                iteration,
-                            },
-                        )
-                        .await; // leaf logs ReplyMissing + sends; errors logged inside
+                    let remind_args = RemindArgs {
+                        project: params.project.clone(),
+                        name: herdr_name.clone(),
+                        thread: exp.thread.clone(),
+                        reminder_count: exp.reminder_count,
+                        invocation: params.invocation.clone(),
+                        iteration,
+                    };
+                    let remind_argv = remind_reply_argv(&remind_args);
+                    let remind_refs: Vec<&str> =
+                        remind_argv.iter().map(|s| s.as_str()).collect();
+                    let _ = crate::elm::leaf::run_leaf_journaled(
+                        &params.project,
+                        "__remind-reply",
+                        &remind_refs[1..],
+                        &format!(
+                            "remind-reply:{}:{}:{}:{}",
+                            params.project,
+                            herdr_name,
+                            exp.thread,
+                            exp.reminder_count
+                        ),
+                    ); // leaf logs ReplyMissing + sends; errors logged inside
                     exp.reminder_count = 1;
                 }
                 ReplyVerdict::Escalate => {
@@ -8565,18 +8618,17 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 LoopAction::Send { name, text } | LoopAction::DispatchImmediate { name, text } => {
                     // context guard: if the idle agent is context-exhausted,
                     // respawn a fresh instance instead of delegating to it
-                    let verdict = match ctx
-                        .run(
-                            read_output,
-                            ReadArgs {
-                                project: params.project.clone(),
-                                name: name.clone(),
-                                now_unix: authority.now_unix(),
-                            },
-                        )
-                        .await
-                    {
-                        Ok(v) => v,
+                    let read_now = authority.now_unix();
+                    let verdict = match crate::elm::leaf::run_leaf_journaled(
+                        &params.project,
+                        "__read",
+                        &[&params.project, name],
+                        &format!("read:{}:{name}", params.project),
+                    ) {
+                        Ok(v) => {
+                            let ro = parse_read_output(&v);
+                            context_verdict(&ro.terminal, ro.state.as_ref(), read_now)
+                        }
                         Err(e) => {
                             // cg6.2: the agent may have exited between poll
                             // and read (a real race) — skip the context guard;
@@ -8614,16 +8666,28 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 confirm_timeout_ms: params.confirm_timeout_ms,
                                 invocation: params.invocation.clone(),
                                 iteration,
-                                profile: ctx
-                                    .run(
-                                        resolve_agent_profile,
-                                        ProfileArgs {
-                                            project: params.project.clone(),
-                                            name: name.clone(),
-                                        },
-                                    )
-                                    .await
-                                    .unwrap_or_default(),
+                                profile: match crate::elm::leaf::run_leaf_journaled(
+                                    &params.project,
+                                    "__profile",
+                                    &[&params.project, name],
+                                    &format!("profile:{}:{name}", params.project),
+                                ) {
+                                    Ok(v) => v
+                                        .as_str()
+                                        .map(|s| s.to_string())
+                                        .or_else(|| {
+                                            v.get("raw")
+                                                .and_then(|r| r.as_str())
+                                                .map(|s| s.to_string())
+                                        })
+                                        .unwrap_or_default(),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "flywheel: __profile failed for {name} (sending raw): {e}"
+                                        );
+                                        String::new()
+                                    }
+                                },
                             },
                         )
                         .await
@@ -8820,16 +8884,28 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                     confirm_timeout_ms: params.confirm_timeout_ms,
                                     invocation: params.invocation.clone(),
                                     iteration,
-                                    profile: ctx
-                                        .run(
-                                            resolve_agent_profile,
-                                            ProfileArgs {
-                                                project: params.project.clone(),
-                                                name: name.clone(),
-                                            },
-                                        )
-                                        .await
-                                        .unwrap_or_default(),
+                                    profile: match crate::elm::leaf::run_leaf_journaled(
+                                        &params.project,
+                                        "__profile",
+                                        &[&params.project, name],
+                                        &format!("profile:{}:{name}", params.project),
+                                    ) {
+                                        Ok(v) => v
+                                            .as_str()
+                                            .map(|s| s.to_string())
+                                            .or_else(|| {
+                                                v.get("raw")
+                                                    .and_then(|r| r.as_str())
+                                                    .map(|s| s.to_string())
+                                            })
+                                            .unwrap_or_default(),
+                                        Err(e) => {
+                                            eprintln!(
+                                                "flywheel: __profile failed for {name} (sending raw): {e}"
+                                            );
+                                            String::new()
+                                        }
+                                    },
                                 },
                             )
                             .await
@@ -9049,19 +9125,26 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // no longer in-progress — and a reclaim failure must not stall the
         // batch forever (the loop resolves; the tracker owns strays).
         let inprogress_blocking = if params.work {
-            match ctx
-                .run(
-                    poll_inprogress,
-                    ReadyArgs {
-                        project: params.project.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(bs) => {
-                    let live_names: Vec<String> = states.iter().map(|s| s.name.clone()).collect();
-                    !blocking_inprogress(&bs, &live_names).is_empty()
-                }
+            match crate::elm::leaf::run_leaf_journaled(
+                &params.project,
+                "__inprogress",
+                &[&params.project],
+                &format!("inprogress:{}", params.project),
+            ) {
+                Ok(v) => match parse_bead_list(&v, "__inprogress") {
+                    Ok(bs) => {
+                        let live_names: Vec<String> =
+                            states.iter().map(|s| s.name.clone()).collect();
+                        !blocking_inprogress(&bs, &live_names).is_empty()
+                    }
+                    Err(e) => {
+                        critical_leaf_failed_this_iter = true;
+                        eprintln!(
+                            "flywheel: poll_inprogress leaf failed (completion guard): {e}"
+                        );
+                        true
+                    }
+                },
                 Err(e) => {
                     // cg6.2: a leaf hiccup must not crash the completion
                     // check — treat as blocking so the loop keeps polling.
@@ -13645,6 +13728,48 @@ mod tests {
             src.contains("async fn reservation_board(args: ReservationBoardArgs)"),
             "checkpointed leaf retained for external/detached callers"
         );
+    }
+
+    /// bd-jjlg (T1): the pure leaves run journaled, not via `ctx.run`.
+    /// `swarm_loop` must not `ctx.run` a pure subprocess+parse leaf — those
+    /// go through `run_leaf_journaled` with the same argv/parse as the leaf
+    /// body. Complex leaves keep `ctx.run` (own Cmd fields needed):
+    /// `dispatch_guard_scan` (caller-time eval), `loop_run_verify` (custom
+    /// timeout + authority), `poll_events` (bounded + inside-leaf log),
+    /// `send_prompt` (inbox branch + bounded + send log), `respawn_agent`
+    /// (file writes), `spawn_xproj` (at-most-once mark), `notify_blocked`
+    /// (ack gate + persist), `diagnose_agent` (log), `reclaim_bead`
+    /// (release + comment), `renew_filtered_leases` (direct mail).
+    #[test]
+    fn pure_leaves_run_journaled_not_ctx_run() {
+        let src = std::fs::read_to_string(file!()).expect("durable.rs readable");
+        let loop_start = src.find("async fn swarm_loop(").expect("swarm_loop exists");
+        let loop_body = &src[loop_start..];
+        let loop_end = loop_body
+            .find("pub async fn run_durable_loop")
+            .expect("run_durable_loop after swarm_loop");
+        let body = &loop_body[..loop_end];
+        // Split needles so this test's own source cannot satisfy them.
+        let pure_leaves = [
+            ["poll", "_swarm,"].concat(),
+            ["poll", "_xproj_inbox,"].concat(),
+            ["poll", "_compose_requests,"].concat(),
+            ["poll", "_context_inbox,"].concat(),
+            ["poll", "_inprogress,"].concat(),
+            ["poll", "_kind,"].concat(),
+            ["resolve", "_agent_profile,"].concat(),
+            ["load", "_expected_replies,"].concat(),
+            ["check", "_reply,"].concat(),
+            ["reply", "_settled,"].concat(),
+            ["remind", "_reply,"].concat(),
+            ["read", "_output,"].concat(),
+        ];
+        for leaf in &pure_leaves {
+            assert!(
+                !body.contains(leaf.as_str()),
+                "bd-jjlg: swarm_loop must not ctx.run({leaf}) — wire it via run_leaf_journaled"
+            );
+        }
     }
 
     /// bd-0fvb: the durable function takes host authority from the invocation

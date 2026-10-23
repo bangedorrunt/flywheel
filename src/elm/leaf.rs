@@ -172,6 +172,16 @@ fn leaf_label(argv: &[String]) -> &'static str {
         Some("__ready") => "__ready",
         Some("__release-bead-locks") => "__release-bead-locks",
         Some("__pin-stamp") => "__pin-stamp",
+        Some("__poll") => "__poll",
+        Some("__xproj-inbox") => "__xproj-inbox",
+        Some("__compose-inbox") => "__compose-inbox",
+        Some("__context-inbox") => "__context-inbox",
+        Some("__expected-replies") => "__expected-replies",
+        Some("__check-reply") => "__check-reply",
+        Some("__reply-settled") => "__reply-settled",
+        Some("__remind-reply") => "__remind-reply",
+        Some("__kind") => "__kind",
+        Some("__profile") => "__profile",
         _ => "leaf",
     }
 }
