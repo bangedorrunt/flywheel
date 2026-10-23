@@ -273,16 +273,22 @@ impl FlywheelPorts {
     /// and that host runs only while the comms flag is on.
     pub(crate) fn claim_producer_epoch(&mut self) -> Result<(String, u64), String> {
         let producer = system_producer(&self.project);
+        let epoch = self.claim_epoch_as(&producer)?;
+        Ok((producer, epoch))
+    }
+
+    /// Claim the next epoch for `producer` (a nested lead steers as its own
+    /// lead context's key, rv23 #6).
+    pub(crate) fn claim_epoch_as(&mut self, producer: &str) -> Result<u64, String> {
         let store = self.store().ok_or("no comms store")?.clone();
-        let p2 = producer.clone();
-        let epoch = crate::mail_shim::block_on(async move {
+        let p2 = producer.to_string();
+        crate::mail_shim::block_on(async move {
             store
                 .claim_epoch(&p2, &format!("doorbell:{}", std::process::id()))
                 .await
                 .map(|c| c.epoch)
                 .map_err(|e| e.to_string())
-        })?;
-        Ok((producer, epoch))
+        })
     }
 
     /// Append one already-validated envelope. The caller built it.
