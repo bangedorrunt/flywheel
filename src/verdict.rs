@@ -406,6 +406,8 @@ fn run_br(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 /// Record a PASS verdict (ADR-0019 Spec 1): `br gate report <id> --gate
 /// <kind> --provider <actor> --status pass --note "sha=<sha> receipt=<path>"`.
+/// For the three command-verified kinds the note also carries `exit=0
+/// tail=<path> cmd=<verify command>` (bd-3unc).
 ///
 /// SPIKE VERDICT (bd-w1-policy-spike-nq1p, br 0.2.22, 2026-08-16): `br gate
 /// report --to closed` does NOT transition the issue — verdicts are append-only
@@ -433,11 +435,30 @@ pub fn report_pass(cwd: &Path, verdict: &Verdict) -> anyhow::Result<()> {
         );
     }
     let gate = verdict.kind.gate_name();
-    let note = format!(
-        "sha={} receipt={}",
-        verdict.sha,
-        verdict.receipt_path.display()
-    );
+    // bd-3unc: for the three command-verified kinds the note is
+    // command-shaped — `sha=<sha> receipt=<path> exit=0 tail=<path>
+    // cmd=<verify command>`. `cmd` rides last: the note parses as a leading
+    // run of `key=value` pairs and a verify command contains spaces, so
+    // anything after it would never parse. The legality rule
+    // (`ledger_check`) only needs it non-empty; the proof is `exit=0` plus
+    // a `tail=` file that exists and is non-empty. The other kinds keep the
+    // old shape and stay on the sha= rule alone.
+    let note = match verdict.kind {
+        VerdictKind::CommandVerified
+        | VerdictKind::UnitTestVerified
+        | VerdictKind::LiveVerified => format!(
+            "sha={} receipt={} exit=0 tail={} cmd={}",
+            verdict.sha,
+            verdict.receipt_path.display(),
+            verdict.receipt_path.display(),
+            verdict.verify_cmd,
+        ),
+        _ => format!(
+            "sha={} receipt={}",
+            verdict.sha,
+            verdict.receipt_path.display()
+        ),
+    };
     let stdout = run_br(
         cwd,
         &[
@@ -953,6 +974,34 @@ fn note_receipt_path(note: &str) -> Option<PathBuf> {
         .map(|(_, v)| PathBuf::from(v))
 }
 
+/// bd-3unc: the command-shaped half of a pass note. For the three
+/// command-verified kinds a `sha=` bind is not enough: the note must name a
+/// non-empty `cmd=`, record `exit=0`, and point `tail=` at a file that exists
+/// and is non-empty. A prose `/tmp` path with no `tail=` token — or a token
+/// pointing at a missing or empty file — does not count. The other kinds
+/// stay on the sha= rule alone, so this is consulted only for them.
+fn note_has_command_proof(note: &str) -> bool {
+    let tokens = note_tokens(note);
+    let value = |key: &str| {
+        tokens
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
+    };
+    match (value("cmd"), value("exit"), value("tail")) {
+        (Some(cmd), Some("0"), Some(tail)) => {
+            !cmd.is_empty() && is_non_empty_file(Path::new(tail))
+        }
+        _ => false,
+    }
+}
+
+/// A result the check may lean on: present on disk, a plain file, holding at
+/// least one byte.
+fn is_non_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
 /// Why `note` does not bind `sha`, naming every `sha=` token the note carries
 /// so the author sees the competing candidates instead of a bare "no legal
 /// verdict" (bd-0z00). `None` when the note does bind `sha`.
@@ -1146,6 +1195,19 @@ pub fn ledger_check(cwd: &Path, bead: &BeadUnit, ac: AcShape, sha: &str) -> anyh
         // `sha=<sha>`. A Phase 5 `task=` `verdict=` pair is a separate hit
         // (`ledger_proved`); it does not satisfy the SHA rule.
         if !row.note.as_deref().is_some_and(|n| note_has_sha(n, sha)) {
+            continue;
+        }
+        // bd-3unc: a command-shaped pass note carries the test tail. For the
+        // three command-verified kinds `sha=` alone is not legal: the note
+        // must also carry a non-empty `cmd=`, `exit=0`, and a `tail=` file
+        // that exists and is non-empty. The other kinds skip this.
+        if matches!(
+            kind,
+            VerdictKind::CommandVerified
+                | VerdictKind::UnitTestVerified
+                | VerdictKind::LiveVerified
+        ) && !row.note.as_deref().is_some_and(note_has_command_proof)
+        {
             continue;
         }
         let Some(at) = parse_recorded_at(&row.recorded_at) else {
@@ -1911,6 +1973,10 @@ mod tests {
         );
         // loop path: armed -> recorded as a PASS gate row.
         arm_loop_reporter();
+        // bd-3unc: the command-shaped note needs a real tail file — the
+        // receipt the proof check reads.
+        std::fs::create_dir_all(dir.join(".flywheel/receipts")).unwrap();
+        std::fs::write(dir.join(".flywheel/receipts/x.txt"), "cargo test ... ok\n").unwrap();
         report_pass(&dir, &v).unwrap();
         let list = list_gates(&dir, &bead_id).unwrap();
         assert_eq!(list.history.len(), 1);
@@ -1921,6 +1987,14 @@ mod tests {
                 .note
                 .as_deref()
                 .is_some_and(|n| note_has_sha(n, &sha))
+        );
+        assert!(
+            list.history[0]
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("exit=0") && n.contains("tail=")),
+            "command-verified rows are command-shaped: {}",
+            list.history[0].note.as_deref().unwrap_or("")
         );
         // ledger check: legal for the current SHA, not for a wrong SHA.
         assert!(ledger_check(&dir, &bead, AcShape::Checkable, &sha).unwrap());
@@ -1944,6 +2018,128 @@ mod tests {
             ))
         );
         assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-3unc: a command-verified note without a tail is not legal. The
+    /// same note plus cmd + exit=0 + a real non-empty tail file is legal; a
+    /// reviewer-signed note with only sha= stays legal; exit=1 is not legal.
+    #[test]
+    fn a_command_verified_note_without_a_tail_is_not_legal() {
+        // `report_pass` always writes the full command-shaped note, so the
+        // negative cases below go through `br` directly with crafted notes.
+        fn report_note(dir: &Path, bead_id: &str, gate: &str, note: &str) {
+            let out = StdCommand::new("br")
+                .args([
+                    "gate",
+                    "report",
+                    bead_id,
+                    "--gate",
+                    gate,
+                    "--provider",
+                    "test",
+                    "--status",
+                    "pass",
+                    "--note",
+                    note,
+                ])
+                .current_dir(dir)
+                .output()
+                .expect("br gate report");
+            assert!(
+                out.status.success(),
+                "br gate report {gate}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // One scratch workspace per case: ledger_check is true when ANY row
+        // is legal, so the illegal cases need a bead of their own.
+        let pid = std::process::id();
+
+        // Case 1: command-verified with a sha= bind but no command proof.
+        // A prose file in /tmp with no tail= token does not count, so one
+        // is planted on purpose.
+        let (dir, bead_id) = scratch_workspace("cmd-note-no-tail");
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
+        let bead = bead_from_br_show(&dir, &bead_id).unwrap();
+        let prose = std::env::temp_dir().join(format!("bd-3unc-prose-{pid}.txt"));
+        std::fs::write(&prose, "the tests passed, trust me\n").unwrap();
+        report_note(
+            &dir,
+            &bead_id,
+            "command-verified",
+            &format!("sha={sha} receipt={}", prose.display()),
+        );
+        assert!(
+            !ledger_check(&dir, &bead, AcShape::Checkable, &sha).unwrap(),
+            "a command-verified note without cmd/exit/tail must not be legal"
+        );
+        let _ = std::fs::remove_file(&prose);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Case 2: the same shape plus cmd, exit=0, and a real non-empty
+        // tail file — legal.
+        let (dir, bead_id) = scratch_workspace("cmd-note-full");
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
+        let bead = bead_from_br_show(&dir, &bead_id).unwrap();
+        let tail = dir.join("tail.txt");
+        std::fs::write(&tail, "test result: ok. 1 passed\n").unwrap();
+        report_note(
+            &dir,
+            &bead_id,
+            "command-verified",
+            &format!(
+                "sha={sha} receipt={} exit=0 tail={} cmd={}",
+                tail.display(),
+                tail.display(),
+                bead.verify,
+            ),
+        );
+        assert!(
+            ledger_check(&dir, &bead, AcShape::Checkable, &sha).unwrap(),
+            "a command-shaped note with a real tail must be legal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Case 3: reviewer-signed stays on the sha= rule alone. The
+        // scratch policy requires command-verified, so this bead gets a
+        // reviewer-shaped one (`br` validates the gate against it).
+        let (dir, bead_id) = scratch_workspace("cmd-note-reviewer");
+        std::fs::write(
+            dir.join(".beads/policy.yaml"),
+            "workflow:\n  transitions:\n    open:\n      - closed\n  gates:\n    open -> closed:\n      require_all:\n        - reviewer-signed\n",
+        )
+        .unwrap();
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
+        let bead = bead_from_br_show(&dir, &bead_id).unwrap();
+        report_note(&dir, &bead_id, "reviewer-signed", &format!("sha={sha}"));
+        assert!(
+            ledger_check(&dir, &bead, AcShape::Judgment, &sha).unwrap(),
+            "a reviewer-signed note with only sha= must stay legal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Case 4: exit=1 is not legal, tail file or not.
+        let (dir, bead_id) = scratch_workspace("cmd-note-exit1");
+        let sha = derive_head_sha(&dir, &bead_id).unwrap();
+        let bead = bead_from_br_show(&dir, &bead_id).unwrap();
+        let tail = dir.join("tail.txt");
+        std::fs::write(&tail, "test result: FAILED. 0 passed; 1 failed\n").unwrap();
+        report_note(
+            &dir,
+            &bead_id,
+            "command-verified",
+            &format!(
+                "sha={sha} receipt={} exit=1 tail={} cmd={}",
+                tail.display(),
+                tail.display(),
+                bead.verify,
+            ),
+        );
+        assert!(
+            !ledger_check(&dir, &bead, AcShape::Checkable, &sha).unwrap(),
+            "a command-verified note with exit=1 must not be legal"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2589,6 +2785,10 @@ mod tests {
     fn close_check_legal_when_gate_row_binds_sha() {
         let (dir, bead_id) = scratch_workspace("reopen-legal");
         let sha = derive_head_sha(&dir, &bead_id).unwrap();
+        let bead = bead_from_br_show(&dir, &bead_id).unwrap();
+        // bd-3unc: the gate row binds the sha AND carries the command proof.
+        let tail = dir.join("tail.txt");
+        std::fs::write(&tail, "test result: ok\n").unwrap();
         let gate = StdCommand::new("br")
             .args([
                 "gate",
@@ -2601,7 +2801,12 @@ mod tests {
                 "--status",
                 "pass",
                 "--note",
-                &format!("sha={sha} receipt={}/x.txt", dir.display()),
+                &format!(
+                    "sha={sha} receipt={} exit=0 tail={} cmd={}",
+                    tail.display(),
+                    tail.display(),
+                    bead.verify,
+                ),
             ])
             .current_dir(&dir)
             .output()
