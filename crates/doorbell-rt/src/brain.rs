@@ -834,12 +834,18 @@ impl<H: Host> Brain<H> {
                 self.on_inbox_fetched(pin, rows).await;
             }
         }
-        self.journal(
-            &serde_json::json!({"rt_kind": "Sweep"}),
-            &effects,
-            serde_json::json!({"stage": "sweep"}),
-            &[],
-        );
+        // rv23 #3: a sweep whose only effect is the inbox fetch decided
+        // nothing, so it writes no journal row (it was ~1 row/s idle, and the
+        // journal is what `/health` folds). The beat itself is the stamp.
+        if is_decision(&effects) {
+            self.journal(
+                &serde_json::json!({"rt_kind": "Sweep"}),
+                &effects,
+                serde_json::json!({"stage": "sweep"}),
+                &[],
+            );
+        }
+        let _ = self.store.touch_sweep(&self.cfg.workspace, now);
         self.deliver(effects, "sweep").await;
         for pin in self.hear.expire(now, doorbell_core::UNANSWERED_SECS) {
             *self.deaf_attempts.entry(pin).or_insert(0) += 1;
@@ -857,16 +863,20 @@ impl<H: Host> Brain<H> {
             self.wake.since_by_pin.insert(pin.clone(), hw);
             self.flush_wake("inbox-cursor");
         }
+        let fetched = !rows.is_empty();
         let effects = self.host.tick(&BrainMsg::InboxFetched {
             pin: pin.clone(),
             rows,
         });
-        self.journal(
-            &serde_json::json!({"rt_kind": "InboxFetched", "pin": pin}),
-            &effects,
-            serde_json::json!({"stage": "executed"}),
-            &[pin],
-        );
+        // rv23 #3: an empty fetch that decides nothing is not a row.
+        if fetched || is_decision(&effects) {
+            self.journal(
+                &serde_json::json!({"rt_kind": "InboxFetched", "pin": pin}),
+                &effects,
+                serde_json::json!({"stage": "executed"}),
+                &[pin],
+            );
+        }
         self.deliver(effects, "inbox").await;
     }
 
@@ -1350,6 +1360,13 @@ impl<H: Host> Brain<H> {
     }
 }
 
+/// rv23 #3: does this tick decide anything worth a journal row? The inbox
+/// fetch request alone is the sweep's clock, not a decision: it re-enters as
+/// `InboxFetched`, which journals when rows came back.
+fn is_decision(effects: &[Effect]) -> bool {
+    effects.iter().any(|e| !matches!(e, Effect::FetchInbox))
+}
+
 /// Journaled Prompt intents awaiting confirmation (crash-resume redelivery
 /// set). Counts `{"Prompt": …}` actions across the loud fold.
 fn count_journaled_prompts(store: &FileStore, workspace: &str) -> usize {
@@ -1724,6 +1741,70 @@ mod tests {
         let sinks = SinkManager::new(tx.clone());
         let brain = Brain::new(BrainConfig::new("w"), host, FileStore::new(dir), sinks);
         (brain, rx, tx)
+    }
+
+    fn journal_kinds(name: &str) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!("dbrt-brain-{}-{}", std::process::id(), name));
+        let raw = std::fs::read_to_string(FileStore::new(&dir).journal_file("w")).unwrap_or_default();
+        raw.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["msg"]["rt_kind"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// rv23 #3: an idle sweep decides nothing, so it writes no journal row
+    /// (it was ~1 row/s, and the journal is what `/health` folds). The beat
+    /// still lands, in the sweep stamp. A sweep that DOES decide journals.
+    #[tokio::test]
+    async fn an_idle_sweep_writes_no_journal_row_but_stamps_the_beat() {
+        let name = "rv23-idle-sweep";
+        let audit = Effect::Audit {
+            kind: "k".into(),
+            pin: "p".into(),
+            detail: serde_json::json!({}),
+        };
+        let (mut brain, _rx, _tx) = test_brain(
+            name,
+            vec![vec![Effect::FetchInbox], vec![], vec![Effect::FetchInbox, audit]],
+        );
+        brain.dispatch(BrainMsg::Sweep { now: 1_000_001 }).await;
+        brain.dispatch(BrainMsg::Sweep { now: 1_000_002 }).await;
+        assert!(
+            journal_kinds(name).is_empty(),
+            "two no-op sweeps, no rows: {:?}",
+            journal_kinds(name)
+        );
+        let dir = std::env::temp_dir().join(format!("dbrt-brain-{}-{}", std::process::id(), name));
+        let stamp = FileStore::new(&dir).sweep_stamp_file("w");
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap().trim(),
+            "1000002",
+            "the beat is stamped every sweep"
+        );
+        brain.dispatch(BrainMsg::Sweep { now: 1_000_003 }).await;
+        assert_eq!(journal_kinds(name), vec!["Sweep".to_string()]);
+    }
+
+    /// rv23 #3: an empty inbox fetch that decides nothing is not a row; a
+    /// fetch that brought rows back is.
+    #[tokio::test]
+    async fn an_empty_inbox_fetch_writes_no_journal_row() {
+        let name = "rv23-empty-fetch";
+        let (mut brain, _rx, _tx) = test_brain(name, vec![]);
+        brain
+            .dispatch(BrainMsg::InboxFetched {
+                pin: "p".into(),
+                rows: vec![],
+            })
+            .await;
+        assert!(journal_kinds(name).is_empty(), "{:?}", journal_kinds(name));
+        brain
+            .dispatch(BrainMsg::InboxFetched {
+                pin: "p".into(),
+                rows: vec![serde_json::json!({"id": 1, "created_ts": "2026-10-23T00:00:00Z"})],
+            })
+            .await;
+        assert_eq!(journal_kinds(name), vec!["InboxFetched".to_string()]);
     }
 
     /// bd-nuf2: Brain::run exits inside the drain budget with a hung
@@ -2550,7 +2631,14 @@ mod tests {
     /// stays monotonic and the sweep cadence re-stabilizes.
     #[tokio::test]
     async fn clock_jump_keeps_order_and_restabilizes() {
-        let (mut brain, _rx, _tx) = test_brain("clock", vec![vec![], vec![], vec![]]);
+        // rv23 #3: the mid-jump sweep must DECIDE something to be a row (an
+        // idle sweep no longer journals), so it carries one audit effect.
+        let decided = vec![Effect::Audit {
+            kind: "k".into(),
+            pin: "p".into(),
+            detail: serde_json::json!({}),
+        }];
+        let (mut brain, _rx, _tx) = test_brain("clock", vec![vec![], decided, vec![]]);
         brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
         brain.host.now = 1_000_000 + 86_400; // +1 day mid-run
         brain
