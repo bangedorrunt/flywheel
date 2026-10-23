@@ -298,6 +298,11 @@ pub fn mailbox_roots() -> (PathBuf, PathBuf) {
         toron_data_dir,
         xdg_data_home: env_non_empty_os("XDG_DATA_HOME"),
         home: env_non_empty_os("HOME"),
+        // bd-fize: the toron side grew this field so a cargo TEST binary
+        // resolves a temp root instead of the operator's live store. The
+        // flywheel's caller must say the same thing, or a test writes into
+        // the operator's index.
+        test_process: toron_core::config::is_test_process(),
     };
     let root = toron_core::config::resolve_data_root(&env);
     (mailbox_data_dir(&root), db_at(&root))
@@ -2872,18 +2877,60 @@ mod tests {
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
         unsafe { std::env::set_var("HOME", "/tmp/flywheel-se2.1-home") };
         let (data_dir, _) = mailbox_roots();
-        assert_eq!(
-            data_dir,
-            PathBuf::from("/tmp/flywheel-se2.1-home/.local/share/toron/projects")
+        // bd-fize: HOME is not an explicit pin — in a TEST process it must
+        // not resolve to a live-looking root. The temp root wins instead, so
+        // a test never writes identities into a real-looking store.
+        assert!(
+            !data_dir.starts_with("/tmp/flywheel-se2.1-home"),
+            "bare HOME in a test process must not resolve under HOME: {data_dir:?}"
+        );
+        assert!(
+            data_dir.starts_with(std::env::temp_dir()),
+            "test process without an explicit pin resolves to temp: {data_dir:?}"
         );
         unsafe { std::env::remove_var("HOME") };
         let (data_dir, db) = mailbox_roots();
-        assert_eq!(
-            data_dir,
-            PathBuf::from("toron-data/projects"),
-            "no env at all → D3 relative fallback, never temp (canonical projects segment)"
+        // Same with nothing set at all: the relative `toron-data` fallback
+        // is production-only; a test process gets temp, never relative.
+        assert!(
+            data_dir.starts_with(std::env::temp_dir()),
+            "no env in a test process resolves to temp, never the relative fallback: {data_dir:?}"
         );
-        assert_eq!(db, PathBuf::from("toron-data/index.sqlite"));
+        assert!(
+            !db.to_string_lossy().contains("toron-data"),
+            "no relative index in a test process: {db:?}"
+        );
+    }
+
+    /// bd-fize: the production half of the contract, pinned without env
+    /// mutation — an explicit struct, not the ambient process. Explicit pins
+    /// win in any process; HOME and the relative fallback only apply
+    /// outside a test binary.
+    #[test]
+    fn data_root_production_contract_is_pure() {
+        use toron_core::config::{DataRootEnv, resolve_data_root};
+        // An explicit pin wins even in a test process.
+        let env = DataRootEnv {
+            toron_data_dir: Some(PathBuf::from("/env/root")),
+            xdg_data_home: None,
+            home: Some(PathBuf::from("/home/alice")),
+            test_process: true,
+        };
+        assert_eq!(resolve_data_root(&env), PathBuf::from("/env/root"));
+        // Production HOME fallback, unchanged.
+        let env = DataRootEnv {
+            toron_data_dir: None,
+            xdg_data_home: None,
+            home: Some(PathBuf::from("/home/alice")),
+            test_process: false,
+        };
+        assert_eq!(
+            resolve_data_root(&env),
+            PathBuf::from("/home/alice/.local/share/toron")
+        );
+        // Production no-env fallback, unchanged.
+        let env = DataRootEnv::default();
+        assert_eq!(resolve_data_root(&env), PathBuf::from("toron-data"));
     }
 
     /// bd-enov: the embedded mailbox's index is byte-identical to toron's
