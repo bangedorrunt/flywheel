@@ -16,8 +16,9 @@
 //! - Scenario B (Spec 3.3): `flywheel loop run <scratch>` in a workspace
 //!   carrying an extra `git worktree add` sibling exits non-zero WITHOUT
 //!   `--allow-worktree` (preflight worktree check FAIL) and succeeds WITH it
-//!   (operator-only, logged). Live-gated: runs when herdr + resonate are up,
-//!   skips (like collab_patterns_e2e) when they are not.
+//!   (operator-only, logged). Opt-in (`FLYWHEEL_LIVE_E2E=1`, off by
+//!   default): it drives the real herdr and the live preflight. Opted in,
+//!   it still skips when herdr or resonate is down.
 //! - Assert the loop dispatch surface contains ZERO worktree-create calls
 //!   (source grep) — the brief bans worktrees, the action enum has no
 //!   worktree variant, and the preflight gate is the structural ban.
@@ -30,6 +31,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
+}
+
+/// Opt-in for the live Scenario B. Off unless exactly `1`.
+const LIVE_E2E: &str = "FLYWHEEL_LIVE_E2E";
+
+fn live_e2e_opted_in() -> bool {
+    std::env::var(LIVE_E2E).as_deref() == Ok("1")
+}
+
+/// The live Scenario B checks the opt-in before it touches herdr, the
+/// preflight, or the toron data dir: a plain `cargo test` reaches none of
+/// them (it used to open the operator's `~/.local/share/toron` store and
+/// create a workspace on the real herdr on every full run).
+#[test]
+fn live_scenario_b_is_opt_in_before_anything_live() {
+    let src = include_str!("e2e_serialize_worktree.rs");
+    let at = src
+        .find("#[test]\nfn linked_worktree_gates_loop_run_until_operator_optout() {")
+        .expect("Scenario B");
+    let body = &src[at..];
+    let gate = body.find("if !live_e2e_opted_in()").expect("opt-in gate");
+    for live in ["herdr_up()", "resonate_up()", "Command::new(", "herdr_workspace_create("] {
+        let first = body.find(live).unwrap_or(usize::MAX);
+        assert!(gate < first, "the opt-in gate must come before {live}");
+    }
+    let opted_in = std::env::var(LIVE_E2E).ok();
+    if opted_in.as_deref() != Some("1") {
+        assert!(!live_e2e_opted_in(), "off unless {LIVE_E2E}=1");
+    }
 }
 
 fn herdr_up() -> bool {
@@ -429,8 +459,19 @@ fn allow_worktree_flag_is_exposed_on_run_surfaces() {
 /// naming the linked tree) and SUCCEEDS with it (operator opt-out LOGGED).
 /// Live-gated: needs herdr (workspace + worktree list) and resonate (all
 /// preflight checks must pass for the success half). Skips when down.
+///
+/// Opt-in only (`FLYWHEEL_LIVE_E2E=1`): it creates a workspace on the REAL
+/// herdr and runs `loop run` against the operator's live preflight (doorbell,
+/// toron mail store under the real data dir, operator key). Isolating it
+/// would mean faking all of those, so a plain `cargo test` must not reach
+/// any of them; the pure halves are unit-tested in `src/preflight.rs`
+/// (`linked_worktrees_filters_primary_tree`, `worktree_optout_legal`).
 #[test]
 fn linked_worktree_gates_loop_run_until_operator_optout() {
+    if !live_e2e_opted_in() {
+        eprintln!("{LIVE_E2E} unset — Scenario B skipped (live herdr/preflight; CLI surface covered above)");
+        return;
+    }
     if !herdr_up() {
         eprintln!("herdr down — Scenario B skipped (CLI surface covered above)");
         return;
