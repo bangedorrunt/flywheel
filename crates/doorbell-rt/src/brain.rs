@@ -11,8 +11,8 @@ use crate::host::{Effect, Host};
 use crate::msg::{AskKind, AskReply, BrainMsg};
 use crate::sinks::{SendOutcome, SinkManager, Undelivered};
 use crate::store::FileStore;
+use bbtree::unsync::{BBTreeMap as BTreeMap, BBTreeSet as BTreeSet};
 use doorbell_core::{PinBudget, take_allowed_like};
-use std::collections::BTreeMap;
 
 /// bd-5qyt: a journal append that failed. The row carries the seq the write
 /// could not take and the running count, so a lost row NAMES itself instead of
@@ -199,7 +199,9 @@ pub struct Brain<H: Host> {
     host: H,
     store: FileStore,
     sinks: SinkManager,
-    budgets: BTreeMap<String, PinBudget>,
+    /// Budgets cross into `doorbell_core::take_allowed_like`, which takes
+    /// std's map, and are keyed by pin (tens of rows), so this stays std.
+    budgets: std::collections::BTreeMap<String, PinBudget>,
     hear: HearTracker,
     wake: doorbell_core::WakeState,
     digest: Vec<(String, String)>,
@@ -246,7 +248,7 @@ pub struct Brain<H: Host> {
     /// past SLA is re-reported on EVERY scan (live: the same 89 ids every
     /// 60s, forever), so only a CHANGE is news — a steady backlog is one
     /// fact, not one row per minute.
-    sla_seen: std::collections::BTreeSet<String>,
+    sla_seen: BTreeSet<String>,
     /// bd-y40k: the shared probe the drain reads at its deadline — the
     /// brain touches it on every select wake, the drain classifies
     /// starve/churn/lost-wake from age + wake growth.
@@ -267,7 +269,7 @@ impl<H: Host> Brain<H> {
         let next_seq = store.last_seq(&cfg.workspace) + 1;
         // Durable budgets (D4.5): refold grant rows so a restart resumes
         // exact window state — a crash buys no extra prompts.
-        let mut budgets = BTreeMap::new();
+        let mut budgets = std::collections::BTreeMap::new();
         for row in &store.fold_workspace(&cfg.workspace).rows {
             let is_budget = row
                 .get("executed")
@@ -328,7 +330,7 @@ impl<H: Host> Brain<H> {
             dedup_high_us: None,
             watch_seen: std::collections::VecDeque::new(),
             watch_seen_set: BTreeSet::new(),
-            sla_seen: std::collections::BTreeSet::new(),
+            sla_seen: BTreeSet::new(),
             liveness: std::sync::Arc::new(BrainLiveness::new()),
             died_bell: None,
         };
@@ -948,7 +950,7 @@ impl<H: Host> Brain<H> {
         //
         // bd-1i8c: the dedupe lives HERE because the scan now answers
         // DETACHED (off the dispatch) and lands as this message.
-        let current: std::collections::BTreeSet<String> = posts.iter().cloned().collect();
+        let current: BTreeSet<String> = posts.iter().cloned().collect();
         if current == self.sla_seen {
             return;
         }
@@ -3208,8 +3210,6 @@ mod tests {
 //
 // Heard-or-deaf tracking — verbatim port of `src/doorbell.rs:574-666`.
 // A ring not heard within 120s goes unanswered (digest names it, S3).
-
-use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
 struct PendingRing {

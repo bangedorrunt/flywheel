@@ -21,7 +21,7 @@
 use crate::host::{CoreReducer, Effect, Host};
 use crate::msg::BrainMsg;
 use crate::store::FileStore;
-use std::collections::BTreeMap;
+use bbtree::unsync::{BBTreeMap as BTreeMap, BBTreeSet as BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Toron watch kinds — MUST match the embedded in-process filter and the
@@ -753,13 +753,13 @@ fn captain_pane_targets(
 /// can exist with no agent in it. An empty set means herdr did not answer
 /// (unknown binary, non-zero exit), and callers must treat that as "cannot
 /// tell" rather than "no panes exist".
-fn herdr_pane_ids(herdr_bin: &str) -> std::collections::BTreeSet<String> {
+fn herdr_pane_ids(herdr_bin: &str) -> BTreeSet<String> {
     let out = run_cli(herdr_bin, &["pane", "list"], CLI_TIMEOUT_SECS);
     let Some(out) = out else {
-        return std::collections::BTreeSet::new();
+        return BTreeSet::new();
     };
     if !out.status.success() {
-        return std::collections::BTreeSet::new();
+        return BTreeSet::new();
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     let empty = Vec::new();
@@ -883,7 +883,9 @@ pub struct FileHost {
     /// top exactly like the embedded workspace model. The Fact arm reads
     /// `captain`/`wheelhouse` here (bd-ztek: without it every daemon-side
     /// fact, including inject, degraded to fact_miss).
-    roles: BTreeMap<String, String>,
+    /// Role binds are a JSON boundary (`load_binds`) and feed
+    /// `doorbell_core::fact_captain_pin`, so this one stays std's map.
+    roles: std::collections::BTreeMap<String, String>,
     /// pane_id -> pin for the herdr list join.
     panes: BTreeMap<String, String>,
     /// pin -> herdr agent name for prompt delivery. Shared with the
@@ -1038,7 +1040,7 @@ impl FileHost {
             presence: BTreeMap::new(),
             presence_ts: BTreeMap::new(),
             herdr: BTreeMap::new(),
-            roles: BTreeMap::new(),
+            roles: std::collections::BTreeMap::new(),
             panes: BTreeMap::new(),
             targets: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             npubs: BTreeMap::new(),
@@ -1529,14 +1531,16 @@ impl FileHost {
 
     /// Seed role binds: `{state}/role_binds/{key}.json` map (missing →
     /// empty; corrupt → loud error, never silent default).
-    pub fn load_binds(&self) -> Result<BTreeMap<String, String>, String> {
+    pub fn load_binds(&self) -> Result<std::collections::BTreeMap<String, String>, String> {
         let path = self
             .cfg
             .flywheel_state
             .join("role_binds")
             .join(format!("{}.json", registry_key(&self.cfg.project)));
         match std::fs::read_to_string(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(std::collections::BTreeMap::new())
+            }
             Err(e) => Err(format!("role_binds read failed at {}: {e}", path.display())),
             Ok(raw) => serde_json::from_str(&raw)
                 .map_err(|e| format!("corrupt role_binds at {}: {e}", path.display())),

@@ -56,6 +56,8 @@
 //! delete makes the registry's history unreconstructable, which is how you end up
 //! debugging a routing table with no memory of what it used to contain.
 
+use bbtree::unsync::{BBTreeMap as BTreeMap, BBTreeSet as BTreeSet};
+
 /// How many consecutive observations of a vanished pane are required before a row
 /// is pruned. Three is enough to ride out a herdr restart without being slow to
 /// notice a pane that is genuinely gone.
@@ -120,8 +122,8 @@ impl Decision {
 /// the entire 65% hazard in one branch.
 pub fn decide(
     rows: &[Row],
-    known_panes: &std::collections::BTreeSet<String>,
-    confirmations: &mut std::collections::BTreeMap<String, u32>,
+    known_panes: &BTreeSet<String>,
+    confirmations: &mut BTreeMap<String, u32>,
     required: u32,
 ) -> Decision {
     let mut fates = Vec::with_capacity(rows.len());
@@ -173,7 +175,6 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn rows() -> Vec<Row> {
         vec![
@@ -192,7 +193,7 @@ mod tests {
         ]
     }
 
-    fn herdr(panes: &[&str]) -> std::collections::BTreeSet<String> {
+    fn herdr(panes: &[&str]) -> BTreeSet<String> {
         panes.iter().map(|s| (*s).to_string()).collect()
     }
 
