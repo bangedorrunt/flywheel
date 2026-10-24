@@ -111,6 +111,15 @@ pub enum InboxFailure {
         /// The refusal.
         detail: String,
     },
+    /// The journal's append outcome is unknown: the command may have run.
+    /// Kept apart from `NotAppended` so a reader never hears "it did not
+    /// run" about work that may have landed.
+    JournalUnknown {
+        /// What may have run.
+        label: String,
+        /// Why the outcome is unknown.
+        detail: String,
+    },
 }
 
 impl InboxFailure {
@@ -120,7 +129,8 @@ impl InboxFailure {
             Self::Typed { label, .. }
             | Self::Defect { label, .. }
             | Self::Interrupted { label }
-            | Self::NotAppended { label, .. } => label,
+            | Self::NotAppended { label, .. }
+            | Self::JournalUnknown { label, .. } => label,
         }
     }
 }
@@ -348,6 +358,11 @@ impl Program for InboxProgram {
             Failure::Interrupted => InboxMsg::Failed(InboxFailure::Interrupted { label }),
             // The journal refused the append, so the command never ran.
             Failure::NotAppended(error) => InboxMsg::Failed(InboxFailure::NotAppended {
+                label,
+                detail: format!("{error:?}"),
+            }),
+            // The append may have landed. Never report this as "did not run".
+            Failure::Unknown(error) => InboxMsg::Failed(InboxFailure::JournalUnknown {
                 label,
                 detail: format!("{error:?}"),
             }),

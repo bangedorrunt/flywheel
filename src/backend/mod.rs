@@ -24,6 +24,9 @@
 //! Real impls override what they support (ADR-0002 §6 — open-to-extension).
 
 pub mod factory;
+// The primary/fallback pair is constructed only by the superlogical "auto"
+// arm, so the module is compiled with that backend.
+#[cfg(feature = "backend-superlogical")]
 pub mod fallback;
 pub mod herdr;
 #[cfg(test)]

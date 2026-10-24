@@ -1804,9 +1804,9 @@ mod tests {
                 .state,
             EffectState::Unknown
         );
-        // Pool knobs are still 4 workers and a 4096 bound.
+        // Pool knobs are still 4 workers and a 4096 blocking bound.
         assert_eq!(super::EXECUTOR_QUEUE_BOUND, 4096);
         let rt = super::journal_runtime();
-        assert_eq!(rt.queue_bound(), 4096);
+        assert_eq!(rt.max_blocking_threads(), 4096);
     }
 }

@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
+#[cfg(any(test, feature = "backend-superlogical"))]
 use toron_core::backend::herdr::AgentInfo;
 use toron_core::contracts::task_v1::TaskV1;
 use toron_core::delivery::Reject;
@@ -799,6 +800,9 @@ fn doorbell_owner_in(
 /// Pure: the wake target pane for a pin from a backend listing. Mirrors
 /// `wake_target`'s exactly-one-or-typed-error contract: a pin names its
 /// block label (set by spawn/rename) or its agent name, never a substring.
+// Sender-side wake is compiled with the rex backend; the tests exercise the
+// resolver on its own.
+#[cfg(any(test, feature = "backend-superlogical"))]
 fn backend_wake_target(agents: &[AgentInfo], pin: &str) -> Result<String, String> {
     let mut hits = agents
         .iter()

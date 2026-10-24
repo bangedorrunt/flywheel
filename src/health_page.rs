@@ -17,8 +17,8 @@ use std::path::Path;
 /// different signals and stay separate.
 pub const PRESENCE_TTL_SECS: u64 = 60;
 
-/// §6: the single clear rule lives in [`crate::pane_keep::pane_binding_may_clear`];
-/// this page calls it, never a copy.
+// §6: the single clear rule lives in `crate::pane_keep::pane_binding_may_clear`;
+// this page calls it, never a copy.
 
 /// What one doorbell workspace's pid file says.
 #[derive(Clone, Debug, PartialEq, Eq)]

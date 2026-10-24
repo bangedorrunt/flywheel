@@ -618,16 +618,6 @@ fn inject_budget_path(state_dir: &Path, project: &str) -> PathBuf {
     ))
 }
 
-fn inject_budget_load(
-    state_dir: &Path,
-    project: &str,
-) -> std::collections::BTreeMap<String, Vec<u64>> {
-    std::fs::read_to_string(inject_budget_path(state_dir, project))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
 pub fn inject_wake_in(
     state_dir: &Path,
     project: &str,

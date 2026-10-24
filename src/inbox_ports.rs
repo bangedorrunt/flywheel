@@ -693,7 +693,7 @@ impl Ports for FlywheelPorts {
         }
         #[cfg(not(feature = "backend-superlogical"))]
         {
-            return Err("rex backend is not compiled in".to_string());
+            Err("rex backend is not compiled in".to_string())
         }
     }
 

@@ -39,7 +39,7 @@ use toron_workflow::schema::Action;
 // upstream API move lands in the port and not in the protocol code.
 use crate::elm::{
     BreakerConfig, Cause, ClockImpl, Defect, Effect, Exit, Remote, RemoteError, RemotePolicy,
-    Runtime, SystemClock, TestClock, kernel_millis,
+    Runtime, SystemClock, kernel_millis,
 };
 
 use crate::config::Config;
@@ -1942,7 +1942,7 @@ fn dispatch_clock() -> &'static std::sync::Arc<dyn ClockImpl> {
 
 fn dispatch_runtime() -> &'static Runtime {
     static RT: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
-    RT.get_or_init(|| Runtime::new())
+    RT.get_or_init(Runtime::new)
 }
 
 /// bd-mukq: select a one-hop 429 reroute target for a pane dispatch — the
@@ -2594,6 +2594,9 @@ pub fn engine_journal_mode(
     Ok(toron_workflow::engine::EffectJournalMode::Enforced)
 }
 
+// One parameter per engine seam part; this is the local constructor, not a
+// public API.
+#[allow(clippy::too_many_arguments)]
 fn local_engine_with_journal(
     rt: &tokio::runtime::Runtime,
     server_url: Option<String>,
@@ -2972,6 +2975,7 @@ pub fn start_spawn_drainer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elm::TestClock;
 
     /// bd-ietv: a role whose registry row exists but whose pane is missing
     /// from herdr's listing at dispatch time is the spawn/list race, not a

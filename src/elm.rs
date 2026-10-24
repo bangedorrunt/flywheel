@@ -27,8 +27,10 @@ use toron_core::kernel::{Boot, Cmd as CmdTrait, Durability, Failure, Program, Up
 /// An upstream API move changes this list, not the plane's call sites.
 pub use toron_core::kernel::{
     BreakerConfig, Cause, ClockImpl, Defect, Effect, Exit, Remote, RemoteError, RemotePolicy,
-    Runtime, SystemClock, TestClock,
+    Runtime, SystemClock,
 };
+#[cfg(test)]
+pub use toron_core::kernel::TestClock;
 
 /// A host duration as the framework's. The framework measures in whole
 /// milliseconds, so the conversion belongs here, beside the types it

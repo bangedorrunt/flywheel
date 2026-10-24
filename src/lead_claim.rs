@@ -181,6 +181,7 @@ fn lead_envelope(
 /// Append one `lead@1` at `sup_epoch`. `store` must be `with_operator` of
 /// the system producer: the first lead fact is operator-signed. The
 /// envelope epoch comes from `claim_epoch` and is not `sup_epoch`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn append_lead_at(
     store: &InboxStore,
     project: &str,
@@ -218,6 +219,7 @@ pub async fn append_lead_in(
 
 /// Read the row and append the next epoch, or catch up when this holder
 /// already stored one the fold missed. A lost race re-reads once.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn sync_lead(
     store: &InboxStore,
     project: &str,

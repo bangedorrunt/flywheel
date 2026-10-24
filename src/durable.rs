@@ -1269,6 +1269,8 @@ async fn mail_not_ready(args: NotReadyMailArgs) -> Result<Value> {
 /// remembering; the close reason is the durable copy, this mail is the
 /// captain's copy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Constructed by serde at the `#[function]` entry point, not by a literal.
+#[allow(dead_code)]
 pub struct MailDoneArgs {
     pub project: String,
     pub bead_id: String,
@@ -1859,7 +1861,7 @@ pub(crate) fn plan_loop_verify_settle(
 /// and reopen resumes without duplicates) instead of a direct child wait.
 pub(crate) fn settle_loop_verify_output(
     v: &serde_json::Value,
-    project: &str,
+    _project: &str,
     bead_id: &str,
     sha: &str,
     strict: bool,
@@ -4337,6 +4339,8 @@ pub struct ComposeRequestRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Constructed by serde at the `#[function]` entry point, not by a literal.
+#[allow(dead_code)]
 pub struct ComposeInboxArgs {
     pub project: String,
     pub limit: u32,
@@ -5158,6 +5162,8 @@ pub enum LoopAction {
 
 /// Args for the context-limit inbox leaf (bd-context-limit-honor-luqg).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Constructed by serde at the `#[function]` entry point, not by a literal.
+#[allow(dead_code)]
 pub struct ContextInboxArgs {
     pub project: String,
     pub limit: u32,

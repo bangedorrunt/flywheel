@@ -6667,8 +6667,12 @@ impl Program for WorkspaceProgram {
 
 /// Shadow interpreter: completes every command as the quiet sentinel.
 /// Outcomes are replayed, never performed — no services, no I/O.
+// T2 shadow surface: the loop half is test-proven; the production hook is
+// the residual named above.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ShadowInterpret;
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Interpret<WorkspaceProgram> for ShadowInterpret {
     fn interpret(_cmd: &Cmd) -> Effect<Msg, String> {
         Effect::succeed(Msg::DiagnoseFailed {
@@ -6680,10 +6684,12 @@ impl Interpret<WorkspaceProgram> for ShadowInterpret {
 /// Production shadow: pure fold + compare. No I/O, no clock, no Loop —
 /// the caller logs what drain_divergences returns. The Loop-boot half of
 /// T2 is proven in tests; this is the zero-observable-cost half.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ShadowDriver {
     divergences: Vec<String>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ShadowDriver {
     pub fn new() -> Self {
         Self {
@@ -6718,6 +6724,7 @@ impl ShadowDriver {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Default for ShadowDriver {
     fn default() -> Self {
         Self::new()

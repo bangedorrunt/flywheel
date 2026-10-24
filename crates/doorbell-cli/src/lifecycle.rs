@@ -2216,7 +2216,6 @@ mod tests {
         assert!(plist_program_args("<key>Label</key><string>x</string>").is_empty());
     }
 
-    #[test]
     /// bd-24mm: launchd runs the job with no HOME and a PATH that does not
     /// include ~/.local/bin, so the daemon cannot resolve herdr and its
     /// fail-closed boot gate (bd-fuql) refuses to host anything. The unit
@@ -2270,6 +2269,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn render_substitutes_live_paths() {
         let hosts = vec![("proj".to_string(), "ws".to_string())];
         let body = render_autostart(

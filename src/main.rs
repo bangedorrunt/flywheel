@@ -22,6 +22,9 @@
 mod adr0016_invariants;
 mod agent_ref;
 mod agentstate;
+// bd-bd5j: the approvals reader lands with its caller; the module is the
+// tested contract until then.
+#[cfg_attr(not(test), allow(dead_code))]
 mod approval;
 mod artifact;
 mod authority;
@@ -18868,7 +18871,6 @@ mod bd_4pxy_tests {
         assert!(w.short.is_none(), "pane id carries no kind short");
     }
 
-    #[test]
     /// bd-k8jn (the token half): a spawned crew's herdr name is its mail PIN
     /// (herdr lowercases it) while the spawn registry keeps the canonical
     /// name. The two can never meet, so the registry's PANE has to be the
@@ -18906,6 +18908,7 @@ mod bd_4pxy_tests {
         );
     }
 
+    #[test]
     fn match_indices_kind_fallback_resolves_omp1() {
         // the bd-4pxy witness shape: an omp agent NAMED flywheel-<base>-coder
         let omp1 = agent(

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 /// Where the approvals file lives when the caller does not pass a path.
 /// Tests never touch this path; they use a temp file.
+#[allow(dead_code)] // The default path lands with the first caller.
 pub fn default_approvals_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)

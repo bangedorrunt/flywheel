@@ -1648,7 +1648,7 @@ mod events_lost_tests {
                 match calls {
                     1 => Err(BackendError::new(
                         BackendErrorCode::EventsLost,
-                        "subscriber fell behind".to_string(),
+                        "subscriber fell behind",
                     )),
                     2 => Ok(Some((
                         "pane.agent_status_changed".to_string(),

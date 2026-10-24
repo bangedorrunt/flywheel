@@ -138,6 +138,14 @@ impl Program for LeafProgram {
             Failure::NotAppended(e) => LeafMsg::Defected {
                 detail: format!("the journal refused the append: {e:?}"),
             },
+            // The append may have landed, so this is neither success nor a
+            // clean failure. `LeafMsg` has no "may have run" state; a defect
+            // keeps it out of the success and failed-attempt counts.
+            Failure::Unknown(e) => LeafMsg::Defected {
+                detail: format!(
+                    "the journal's append outcome is unknown (the child may have run; reconcile before retrying): {e:?}"
+                ),
+            },
         }
     }
 }
@@ -293,6 +301,7 @@ pub fn run_leaf_journaled_timeout(
 /// on a plain OS thread, never the caller's: dropping a tokio runtime
 /// inside an async context panics, and the production caller is an async
 /// Resonate worker.
+#[cfg(test)]
 pub fn run_leaf_journaled_at(
     journal_path: &std::path::Path,
     subcommand: &str,
@@ -330,6 +339,7 @@ pub fn run_leaf_journaled_at_timeout(
 
 /// The loop half, over an explicit log: the unit tests drive this with a
 /// memory log or a temp-dir file instead of the production journal path.
+#[cfg(test)]
 pub fn run_leaf_on(
     log: Arc<dyn DurableLog>,
     subcommand: &str,
@@ -481,7 +491,7 @@ mod tests {
         let path = dir.join("leaf.journal");
 
         let log: Arc<dyn DurableLog> = Arc::new(FileLog::open(&path).expect("open log"));
-        let mut loop_ = Loop::<LeafProgram, ScriptedLeaf>::boot(
+        let loop_ = Loop::<LeafProgram, ScriptedLeaf>::boot(
             &test_boot(),
             test_runtime(),
             log,
