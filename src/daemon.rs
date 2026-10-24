@@ -699,7 +699,7 @@ fn resonate_healthy(url: &str) -> bool {
 /// Pure: autostart is allowed ONLY against loopback (127.0.0.1 / localhost
 /// / ::1) — a remote url must fail loudly instead of silently hosting a
 /// second store elsewhere.
-fn is_loopback_host(url: &str) -> bool {
+pub(crate) fn is_loopback_host(url: &str) -> bool {
     let authority = url_authority(url);
     let host = if let Some(rest) = authority.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")

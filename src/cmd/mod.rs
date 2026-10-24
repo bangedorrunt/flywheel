@@ -14,6 +14,7 @@ pub(crate) mod cron;
 #[cfg(feature = "serve")]
 pub(crate) mod daemon;
 pub(crate) mod doorbell;
+pub(crate) mod engine;
 pub(crate) mod history;
 pub(crate) mod judgment;
 pub(crate) mod ledger;
@@ -51,6 +52,7 @@ pub(crate) use doorbell::{
     cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
     cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_internal_doorbell,
 };
+pub(crate) use engine::{EngineCmd, cmd_engine};
 pub(crate) use history::{
     cmd_analytics, cmd_audit, cmd_changes, cmd_history, cmd_resume, cmd_timeline,
 };
