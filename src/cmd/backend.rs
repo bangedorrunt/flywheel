@@ -46,6 +46,13 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             for (name, stub) in [
                 ("herdr", false),
                 ("superlogical", cfg!(not(feature = "backend-superlogical"))),
+                // auto is a selection mode, not a compiled backend: ready
+                // when both sides are compiled in.
+                (
+                    "auto",
+                    !(cfg!(feature = "backend-herdr")
+                        && cfg!(feature = "backend-superlogical")),
+                ),
             ] {
                 rows.push(json!({
                     "name": name,

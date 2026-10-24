@@ -24,6 +24,7 @@
 //! Real impls override what they support (ADR-0002 §6 — open-to-extension).
 
 pub mod factory;
+pub mod fallback;
 pub mod herdr;
 #[cfg(test)]
 mod parity;

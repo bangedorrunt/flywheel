@@ -4,7 +4,8 @@
 //! governed-by: ADR-0002, ADR-0003
 //!
 //! Selection precedence (flag > env > `.env` > config.toml > default):
-//! - `FLYWHEEL_BACKEND` (`herdr` default; `superlogical` future/stub)
+//! - `FLYWHEEL_BACKEND` (`auto` when the rex backend is compiled in, else
+//!   `herdr`; `superlogical` pins rex without fallback)
 //! - `FLYWHEEL_MAIL`    (`toron`; the agentmail backend is deleted, bd-euav)
 //!
 //! Mail backend routing (ADR-0003 V2/V3 — fixes the BUG1 shared-url misroute):
@@ -23,7 +24,12 @@ use crate::config::Config;
 #[cfg(feature = "mail-toron")]
 use crate::mail::Mail;
 
-/// Default multiplexer backend name.
+/// Default multiplexer backend name: rex-first with herdr fallback when the
+/// rex backend is compiled in, else herdr.
+#[cfg(feature = "backend-superlogical")]
+pub const DEFAULT_BACKEND: &str = "auto";
+/// Default multiplexer backend name (the rex backend is not compiled in).
+#[cfg(not(feature = "backend-superlogical"))]
 pub const DEFAULT_BACKEND: &str = "herdr";
 /// Default mail backend name.
 pub const DEFAULT_MAIL: &str = "toron";
@@ -70,6 +76,30 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
         // agent_send_keys stay Unsupported and name the method.
         #[cfg(feature = "backend-superlogical")]
         "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
+        // auto: rex first, herdr on transport failure (Connect/Io/Timeout).
+        // A herdr daemon that is down at startup leaves a primary-only
+        // backend behind a loud warning instead of refusing the whole
+        // construction: rex-first still works, and a later rex transport
+        // failure surfaces as its own error.
+        #[cfg(feature = "backend-superlogical")]
+        "auto" => {
+            let primary: Box<dyn MultiplexerBackend> =
+                Box::new(crate::backend::superlogical::SuperlogicalBackend);
+            #[cfg(feature = "backend-herdr")]
+            let fallback: Option<Box<dyn MultiplexerBackend>> =
+                match toron_core::backend::herdr::HerdrBackend::connect(Some(&cfg.socket_path())) {
+                    Ok(backend) => Some(Box::new(backend)),
+                    Err(e) => {
+                        eprintln!("auto backend: herdr unavailable ({e}); rex-only");
+                        None
+                    }
+                };
+            #[cfg(not(feature = "backend-herdr"))]
+            let fallback: Option<Box<dyn MultiplexerBackend>> = None;
+            Ok(Box::new(crate::backend::fallback::FallbackBackend::new(
+                primary, fallback,
+            )))
+        }
         other => Err(backend_not_compiled_or_unknown(
             other,
             "multiplexer",
@@ -161,7 +191,9 @@ mod tests {
     // env lock (config::lock_env, 193.2) — a per-module lock would still
     // race sibling modules' env-mutating tests.
 
-    /// Defaults resolve to herdr + toron when nothing is set.
+    /// Defaults resolve to herdr + toron when nothing is set (the build
+    /// without the rex backend; with it, the default is auto).
+    #[cfg(not(feature = "backend-superlogical"))]
     #[test]
     fn defaults_resolve_to_herdr_and_toron() {
         let _g = lock_env();
@@ -172,6 +204,24 @@ mod tests {
         assert_eq!(resolve_mail_name(&cfg), "toron");
     }
 
+    /// With the rex backend compiled in, the default is rex-first with
+    /// herdr fallback. Construction never needs a live daemon: rex
+    /// resolves lazily per call, and a down herdr daemon leaves a
+    /// primary-only backend behind a warning.
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn defaults_resolve_to_auto_and_toron() {
+        let _g = lock_env();
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
+        let cfg = Config::default();
+        assert_eq!(resolve_backend_name(&cfg), "auto");
+        assert_eq!(resolve_mail_name(&cfg), "toron");
+        let backend = multiplexer_backend(&cfg).expect("auto constructs");
+        assert_eq!(backend.name(), "auto");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
+    }
     /// Env overrides config (the precedence contract — flag wiring is R0.6).
     #[test]
     fn env_overrides_config() {
