@@ -25,7 +25,7 @@
 #[cfg(test)]
 mod tests {
     use crate::backend::{BackendError, InboxQuery, MailSurface, MultiplexerBackend, run_mail};
-    use crate::herdr_shim::HerdrError;
+    use crate::herdr::HerdrError;
 
     // ---- error coercion: the path real transport errors take ----
 
@@ -100,7 +100,7 @@ mod tests {
     /// contract under test (no socket needed).
     #[test]
     fn prompt_landing_maps_landed_status_and_coded_error() {
-        use crate::herdr_shim::{AgentInfo, AgentStatus};
+        use crate::herdr::{AgentInfo, AgentStatus};
         // landed: Ok(AgentInfo) → status Some, code None
         let ok = crate::backend::herdr::map_prompt_result(Ok(AgentInfo {
             agent: Some("pi".into()),
@@ -315,7 +315,7 @@ mod tests {
     fn live_backend(kind: ParityKind) -> Box<dyn MailSurface> {
         match kind {
             ParityKind::Toron => {
-                let mail = crate::mail_shim::Mail::from_config(Some(&crate::config::MailConfig {
+                let mail = crate::mail::Mail::from_config(Some(&crate::config::MailConfig {
                     url: Some(kind.base_url().to_string()),
                     token: None,
                     name: Some("CoralFinch".to_string()),

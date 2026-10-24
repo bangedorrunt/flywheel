@@ -20,7 +20,7 @@
 //!   The supervisor does not type that wake; appending is its job.
 
 use crate::config::{self, Config};
-use crate::herdr_shim::{AgentStatus, Client};
+use crate::herdr::{AgentStatus, Client};
 use crate::inbox_host::{Bind, Observation, Ports, Seen};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -230,7 +230,7 @@ impl FlywheelPorts {
         let producer = system_producer(&self.project);
         let store = self.store().ok_or("no comms store")?.clone();
         let (project, key) = (self.project.clone(), key.to_string());
-        crate::mail_shim::block_on(async move {
+        crate::mail::block_on(async move {
             use toron_core::contracts::notify_v1::NotifyV1;
             use toron_core::envelope::{
                 Class, ContextId, ContractId, ENVELOPE_V, Envelope, MsgId, Recipient,
@@ -282,7 +282,7 @@ impl FlywheelPorts {
     pub(crate) fn claim_epoch_as(&mut self, producer: &str) -> Result<u64, String> {
         let store = self.store().ok_or("no comms store")?.clone();
         let p2 = producer.to_string();
-        crate::mail_shim::block_on(async move {
+        crate::mail::block_on(async move {
             store
                 .claim_epoch(&p2, &format!("doorbell:{}", std::process::id()))
                 .await
@@ -297,7 +297,7 @@ impl FlywheelPorts {
         env: toron_core::envelope::Envelope,
     ) -> Result<u64, String> {
         let store = self.store().ok_or("no comms store")?.clone();
-        crate::mail_shim::block_on(async move {
+        crate::mail::block_on(async move {
             env.validate().map_err(|e| format!("{e:?}"))?;
             store
                 .append_envelope(&env)
@@ -447,7 +447,7 @@ impl Ports for FlywheelPorts {
             };
             let store = store.clone();
             let n2 = npub.clone();
-            let (head, cursor, urgency) = crate::mail_shim::block_on(async move {
+            let (head, cursor, urgency) = crate::mail::block_on(async move {
                 let (head, cursor) = head_and_cursor(&store, &n2).await;
                 let (urgency, _) = urgency_of_unread(&store, &n2, head, cursor).await;
                 (head, cursor, urgency)

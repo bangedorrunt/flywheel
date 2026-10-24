@@ -6,7 +6,7 @@
 
 use std::io::IsTerminal;
 
-use crate::herdr_shim::AgentStatus;
+use crate::herdr::AgentStatus;
 
 // ---------------------------------------------------------------------------
 // color capability detection

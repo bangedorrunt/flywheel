@@ -11,7 +11,7 @@
 //! Test names: adr0010_d13_* — filtered by `mbx +nightly-aarch64-apple-darwin test adr0010_d13`.
 
 const MAIN: &str = include_str!("../src/main.rs");
-const SHIM: &str = include_str!("../src/herdr_shim.rs");
+const SHIM: &str = include_str!("../src/herdr.rs");
 const SWARM: &str = include_str!("../integrations/prompts/swarm.md.tpl");
 const LOOP: &str = include_str!("../integrations/prompts/loop.md.tpl");
 const OPEN: &str = include_str!("../integrations/prompts/open.md.tpl");

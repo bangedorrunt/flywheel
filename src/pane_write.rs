@@ -123,7 +123,7 @@ pub trait PaneTyper {
 }
 
 /// herdr as the pane boundary.
-pub struct HerdrPanes<'a>(pub &'a crate::herdr_shim::Client);
+pub struct HerdrPanes<'a>(pub &'a crate::herdr::Client);
 
 impl PaneTyper for HerdrPanes<'_> {
     fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
@@ -151,7 +151,7 @@ impl PaneTyper for HerdrPanes<'_> {
 /// `pane.send_text` + settle + Enter (retried; Enter alone is retried once the
 /// text has landed, the text is never re-typed). Same boot semantics as the
 /// legacy prime, but reachable only with a closed [`PaneWrite`].
-pub struct BootPanes<'a>(pub &'a crate::herdr_shim::Client);
+pub struct BootPanes<'a>(pub &'a crate::herdr::Client);
 
 impl PaneTyper for BootPanes<'_> {
     fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
@@ -196,7 +196,7 @@ impl PaneTyper for BootPanes<'_> {
 /// constant into a fresh pane. Best-effort like the legacy prime (a failed
 /// bootstrap warns, never fails the spawn); returns whether it landed.
 pub fn launch_bootstrap_into(
-    c: &crate::herdr_shim::Client,
+    c: &crate::herdr::Client,
     pane_id: &str,
     harness: Harness,
 ) -> bool {
@@ -246,7 +246,7 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 #[cfg(test)]
 pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
     ("src/cmd/doorbell.rs", 1),
-    ("src/herdr_shim.rs", 1),
+    ("src/herdr.rs", 1),
     ("src/main.rs", 9),
 ];
 

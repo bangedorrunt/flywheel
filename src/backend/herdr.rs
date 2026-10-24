@@ -2,7 +2,7 @@
 //!
 //! The herdr backend is now toron-core's `HerdrBackend` implementing the
 //! unified `toron_core::backend::Backend` trait — the client was already
-//! unified (herdr_shim re-exports toron-core's `Client`), and P1 unified the
+//! unified (herdr re-exports toron-core's `Client`), and P1 unified the
 //! trait surface. Callers use `toron_core::backend::herdr::HerdrBackend`
 //! directly; this module keeps the flywheel-side prompt-landing helper.
 //!

@@ -169,7 +169,7 @@ where
 ///
 /// Preferred source is the mailbox flywheel already built (no second SQLite
 /// connection, no second schema — migrations including `0010_workflow_effects`
-/// ran in `mail_shim::build_mailbox`).
+/// ran in `mail::build_mailbox`).
 ///
 /// Most CLI paths never build a mailbox, though, and those are exactly the ones
 /// that run workflows. Opening the SAME index file the mailbox would use
@@ -180,11 +180,11 @@ where
 /// same thread-isolated runtime the dispatch path uses.
 pub fn journal_store() -> Option<WorkflowEffectStore> {
     if let Some(pool) =
-        crate::mail_shim::try_mailbox().and_then(toron_core::mailbox::Mailbox::index_pool)
+        crate::mail::try_mailbox().and_then(toron_core::mailbox::Mailbox::index_pool)
     {
         return Some(WorkflowEffectStore::new(pool.clone()));
     }
-    let (data_dir, db) = crate::mail_shim::mailbox_roots();
+    let (data_dir, db) = crate::mail::mailbox_roots();
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         eprintln!(
             "flywheel: cannot create the toron data dir {}: {e} — effectful workflow leaves \
@@ -628,7 +628,7 @@ pub fn run_journal(store: WorkflowEffectStore) -> RunJournal {
 ///
 /// A remote `[mail.toron] url` is refused deliberately: the daemon's wire
 /// surface cannot carry the `corr` tag the journal needs (Spec 5.4, and
-/// `mail_shim` refuses that same send), and the journal's index is the LOCAL
+/// `mail` refuses that same send), and the journal's index is the LOCAL
 /// one — sending here would land a message the daemon's mailbox never reads.
 /// Mailbox leaves with no plane fail closed in the runner (bd-v9em) instead.
 fn mail_plane(cfg: &crate::config::Config) -> Option<MailPlane> {
@@ -642,8 +642,8 @@ fn mail_plane(cfg: &crate::config::Config) -> Option<MailPlane> {
     }
     // In-process plane: make sure the shared mailbox exists (runtime-safe) and
     // deliver through it.
-    let _ = crate::mail_shim::Mail::from_config(None);
-    let mailbox = crate::mail_shim::try_mailbox()?.clone();
+    let _ = crate::mail::Mail::from_config(None);
+    let mailbox = crate::mail::try_mailbox()?.clone();
     let send: MailSender = {
         let mailbox = mailbox.clone();
         Arc::new(move |message: SendMessage| {
@@ -894,7 +894,7 @@ mod tests {
     }
 
     /// A migrated, throwaway journal — the same `connect` + `migrate` pair
-    /// `mail_shim::build_mailbox` runs against the real index.
+    /// `mail::build_mailbox` runs against the real index.
     async fn test_store() -> (tempfile::TempDir, WorkflowEffectStore) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("index.sqlite");
@@ -1425,10 +1425,10 @@ mod tests {
     #[tokio::test]
     async fn in_process_mailbox_sender_delivers_a_workflow_message() {
         let (_dir, store) = test_store().await;
-        crate::mail_shim::Mail::from_config(None)
+        crate::mail::Mail::from_config(None)
             .expect("mail config")
             .expect("in-process facade");
-        let mailbox = crate::mail_shim::mailbox().clone();
+        let mailbox = crate::mail::mailbox().clone();
         // The recipient must exist in the project before the mailbox will route
         // to it — the same precondition any workflow send has in production.
         submit_journal_wait({
@@ -1447,7 +1447,7 @@ mod tests {
                 // register it here by reusing that key (proof of possession)
                 // so the runner finds it on the roster instead of minting.
                 let actor = toron_core::nostr::identity::AgentProfile::new("flywheel");
-                crate::mail_shim::fixture_register_async(&mailbox, "demo", &actor).await
+                crate::mail::fixture_register_async(&mailbox, "demo", &actor).await
             }
         })
         .expect("register the recipient");

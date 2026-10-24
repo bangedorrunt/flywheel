@@ -3948,7 +3948,7 @@ mod tests {
         // RFC3339 parsers can diverge at the boundary.
         // (needle split so this self-scan does not match its own source)
         let needle = ["created_ts_us >", " s"].concat();
-        let src = include_str!("mail_shim.rs");
+        let src = include_str!("mail.rs");
         assert!(
             !src.contains(&needle),
             "RED (55nx.12): duplicate since_ts retain still in inbox_filtered"

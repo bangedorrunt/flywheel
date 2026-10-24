@@ -13,8 +13,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::herdr_shim::{Client, WorktreeInfo};
-use crate::mail_shim::Mail;
+use crate::herdr::{Client, WorktreeInfo};
+use crate::mail::Mail;
 use crate::{command_exists, resonate_health};
 
 // ─── types ───────────────────────────────────────────────────────────────────
@@ -557,7 +557,7 @@ fn check_worktree(cfg: &Config, project: &str) -> Check {
         Ok(id) => id,
         Err(e) => return Check::fail("worktree", format!("workspace lookup failed: {e}")),
     };
-    let all = match crate::herdr_shim::worktree_list(&mut c, Some(&ws_id)) {
+    let all = match crate::herdr::worktree_list(&mut c, Some(&ws_id)) {
         Ok(v) => v,
         Err(e) => return Check::fail("worktree", format!("worktree.list failed: {e}")),
     };

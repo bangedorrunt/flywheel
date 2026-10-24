@@ -202,12 +202,12 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
     // Pins: herdr agent list for this workspace (best effort).
     let mut pins = Vec::new();
     let mut launch_pending: u32 = 0;
-    match crate::herdr_shim::Client::connect(Some(&cfg.socket_path())) {
+    match crate::herdr::Client::connect(Some(&cfg.socket_path())) {
         Ok(mut c) => match crate::find_workspace(&mut c, project) {
             Ok(ws_id) => match c.agent_list() {
                 Ok(agents) => {
                     for a in agents.iter().filter(|a| a.workspace_id == ws_id) {
-                        if crate::herdr_shim::agent_still_booting(a) {
+                        if crate::herdr::agent_still_booting(a) {
                             launch_pending = launch_pending.saturating_add(1);
                         }
                         let herdr_status = a.agent_status.as_str();
@@ -424,7 +424,7 @@ fn read_reservation_board(
 ) -> (Option<serde_json::Value>, bool) {
     // Mail facade covers remote daemon AND in-process. try_mailbox() is
     // in-process only — a configured URL never fills it, so helm degraded.
-    match crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
+    match crate::mail::Mail::from_config(Some(&cfg.toron_mail_config())) {
         Ok(Some(mail)) => match mail.list_active(project, None, None) {
             Ok(v) => (Some(v), false),
             Err(_) => (None, true),

@@ -434,14 +434,14 @@ impl ProfileCatalog {
     }
 
     /// bd-enov (F6): is `kind` a harness flywheel can actually spawn? True for
-    /// a herdr integration kind (`crate::herdr_shim::INTEGRATION_KINDS`) or a
+    /// a herdr integration kind (`crate::herdr::INTEGRATION_KINDS`) or a
     /// `[harness.<name>]` spawn recipe (compiled-in `pa`/`jcode` or a user
     /// entry). Short aliases (`oc`, `gk`) are normalized FIRST so the caller
     /// can persist the canonical kind. `None` = unknown (reject loudly at
     /// profile-create time instead of failing later at spawn).
     pub fn canonical_harness(&self, kind: &str) -> Option<String> {
         let k = normalize_harness_alias(kind);
-        if crate::herdr_shim::INTEGRATION_KINDS.contains(&k.as_str())
+        if crate::herdr::INTEGRATION_KINDS.contains(&k.as_str())
             || self.harnesses.contains_key(&k)
         {
             return Some(k);
@@ -452,7 +452,7 @@ impl ProfileCatalog {
     /// Every spawnable harness name, sorted — the payload of the
     /// profile-create rejection message.
     pub fn known_harnesses(&self) -> Vec<String> {
-        let mut out: Vec<String> = crate::herdr_shim::INTEGRATION_KINDS
+        let mut out: Vec<String> = crate::herdr::INTEGRATION_KINDS
             .iter()
             .map(|k| (*k).to_string())
             .chain(self.harnesses.keys().cloned())

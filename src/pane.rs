@@ -44,7 +44,7 @@ use crate::elm::{
 
 use crate::config::Config;
 use crate::crew::CrewPlan;
-use crate::herdr_shim::{AgentStatus, Client};
+use crate::herdr::{AgentStatus, Client};
 use crate::models::{FallbackRoute, ModelRegistry};
 use crate::profile::ProfileCatalog;
 use crate::state::SpawnEntry;
@@ -862,7 +862,7 @@ fn spawn_crew_into(
                                 let root = pane_ids.first().cloned().ok_or_else(|| {
                                     anyhow!("pane crew: no root pane in workspace {ws_id}")
                                 })?;
-                                let split = crate::herdr_shim::pane_split(
+                                let split = crate::herdr::pane_split(
                                     c,
                                     &root,
                                     "down",
@@ -874,7 +874,7 @@ fn spawn_crew_into(
                         }
                     }
                     Some(p) => {
-                        let split = crate::herdr_shim::pane_split(
+                        let split = crate::herdr::pane_split(
                             c,
                             p,
                             "down",
@@ -891,7 +891,7 @@ fn spawn_crew_into(
                 // CANONICAL mode). The peer-aware template renders to a ~2.6KB
                 // single-quoted arg; typed into a booting shell it splits
                 // mid-quote and zsh parks at the PS2 continuation prompt with
-                // the agent never starting — herdr_shim.rs documents this as
+                // the agent never starting — herdr.rs documents this as
                 // the 2026-08-18 "coder2/coder3 dead-on-spawn" incident.
                 //
                 // `cmd_crew_control` (the relaunch path) has always gated on
@@ -910,7 +910,7 @@ fn spawn_crew_into(
                 // `fail-closed`); refuse with the real reason instead. A
                 // measured fresh pane needs ~770ms, so a 15s budget that
                 // expires is a genuinely broken shell, not a slow one.
-                if !crate::herdr_shim::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
+                if !crate::herdr::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
                     return Err(shell_gate_refusal(&name, &pane_id));
                 }
                 // AGENT_ARG / the pane-env pin were resolved BEFORE the pane
@@ -2033,9 +2033,9 @@ pub(crate) fn pane_env_for_launch(
     mail_identity: Option<&str>,
     env_model_pin: Option<&str>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut env = crate::herdr_shim::herdr_integration_env(cfg, mail_identity);
+    let mut env = crate::herdr::herdr_integration_env(cfg, mail_identity);
     if let Some(model) = env_model_pin {
-        crate::herdr_shim::apply_opencode_model_pin(&mut env, model)?;
+        crate::herdr::apply_opencode_model_pin(&mut env, model)?;
     }
     Ok(env)
 }
@@ -2247,7 +2247,7 @@ pub fn launch_spawn_job(
         // the life of the process it launches.
         let pane_env =
             pane_env_for_launch(cfg, mail_identity.as_deref(), plan.env_model_pin.as_deref())?;
-        let split = crate::herdr_shim::pane_split(
+        let split = crate::herdr::pane_split(
             &mut c,
             &prev,
             "down",
@@ -2687,7 +2687,7 @@ pub(crate) struct DrainerReads {
 /// Production reads. Built on the drainer thread BEFORE its runtime exists,
 /// so `Mail::from_config` never has to take the in-runtime guard path.
 fn production_drainer_reads(cfg: Config, project: String) -> DrainerReads {
-    let mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+    let mail = crate::mail::Mail::from_config(Some(&cfg.toron_mail_config()))
         .ok()
         .flatten();
     let signoff_project = project.clone();
@@ -5446,8 +5446,8 @@ steps:
 
     /// The in-process facade (no `[mail.toron] url`) with both fixture pins
     /// registered. Built OUTSIDE any runtime, as a CLI caller would.
-    fn in_process_mail(project: &str, pins: [&str; 2]) -> crate::mail_shim::Mail {
-        let mail = crate::mail_shim::Mail::from_config(None)
+    fn in_process_mail(project: &str, pins: [&str; 2]) -> crate::mail::Mail {
+        let mail = crate::mail::Mail::from_config(None)
             .expect("mail config")
             .expect("in-process facade");
         mail.ensure_project(project).expect("fixture project");

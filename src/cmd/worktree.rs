@@ -5,7 +5,7 @@ use clap::Subcommand;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::herdr_shim::Client;
+use crate::herdr::Client;
 use crate::output::{dim, kind_paint};
 
 #[derive(Subcommand)]
@@ -39,7 +39,7 @@ pub(crate) fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {
     match cmd {
         WorktreeCmd::List { project } => {
             let ws_id = crate::find_workspace(&mut c, project)?;
-            let v = crate::herdr_shim::worktree_list(&mut c, Some(&ws_id))?;
+            let v = crate::herdr::worktree_list(&mut c, Some(&ws_id))?;
             for w in &v {
                 println!(
                     "{}  {}  {}",

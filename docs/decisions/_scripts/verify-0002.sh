@@ -34,7 +34,7 @@ fi
 grep -q 'pub use toron_core::mailbox::surface' src/backend/mod.rs 2>/dev/null \
   && ok "MailSurface re-exported from toron-core (src/backend/mod.rs)" \
   || bad "MailSurface re-export missing from src/backend/mod.rs"
-grep -q 'toron_core::mailbox::Mailbox' src/mail_shim.rs 2>/dev/null \
+grep -q 'toron_core::mailbox::Mailbox' src/mail.rs 2>/dev/null \
   && ok "mail_shim.rs consumes toron-core Mailbox" \
   || bad "mail_shim.rs no longer consumes toron-core Mailbox"
 grep -rq 'FLYWHEEL_BACKEND' src/ 2>/dev/null && ok "FLYWHEEL_BACKEND env wired" || warn "FLYWHEEL_BACKEND not yet wired"

@@ -142,7 +142,7 @@ fn operator_home_probe_child() {
     // instead of stopping at the first env mismatch.
     let config = crate::config::config_dir();
     let state = crate::config::state_dir();
-    let (data, db) = crate::mail_shim::mailbox_roots();
+    let (data, db) = crate::mail::mailbox_roots();
     std::fs::create_dir_all(&config).expect("write config dir");
     std::fs::create_dir_all(&state).expect("write state dir");
     std::fs::create_dir_all(&data).expect("write mail data dir");

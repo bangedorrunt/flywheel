@@ -98,7 +98,7 @@ fn invariant_5_effects_are_bounded() {
         has_test(&src, "leaf_is_bounded") || src.contains("run_leaf_cmd_bounded"),
         "invariant 5: the bounded leaf-command wrapper is gone"
     );
-    let shim = file("src/herdr_shim.rs");
+    let shim = file("src/herdr.rs");
     assert!(
         shim.contains("timeout") || shim.contains("deadline"),
         "invariant 5: the remote-command stack lost its bound"

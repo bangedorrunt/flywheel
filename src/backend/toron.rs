@@ -32,7 +32,7 @@ use crate::backend::{
     ProductHit, ProductInfo, ReceiptOp, ReceiptOutcome, RegisteredAgent, ReleaseResult,
     RenewResult, ReplyMail, SearchQuery, SendMail, SendReceipt, ThreadSummary, WhoIs,
 };
-use crate::mail_shim::{Mail, MailInboxFilter, MailSearchFilter};
+use crate::mail::{Mail, MailInboxFilter, MailSearchFilter};
 use toron_core::mailbox::unwrap::ContactPolicy;
 
 /// Toron mail backend: delegates to the toron `Mail` facade (`Mail::from_config`
@@ -398,7 +398,7 @@ impl MailSurface for ToronMailBackend {
 
     async fn health(&self) -> Result<toron_core::mailbox::infra::HealthReport, MailError> {
         let mail = self.mail.clone();
-        let v = run_facade(mail, super::super::mail_shim::Mail::health).await?;
+        let v = run_facade(mail, super::super::mail::Mail::health).await?;
         into_typed(v, "health")
     }
 

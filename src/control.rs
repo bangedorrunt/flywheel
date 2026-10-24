@@ -53,8 +53,8 @@ pub struct InterruptPlan {
 
 /// Composer-empty provable only at idle; every other status means the
 /// cancel is unconfirmed (capability-gated).
-pub fn interrupt_plan(status: crate::herdr_shim::AgentStatus) -> InterruptPlan {
-    use crate::herdr_shim::AgentStatus;
+pub fn interrupt_plan(status: crate::herdr::AgentStatus) -> InterruptPlan {
+    use crate::herdr::AgentStatus;
     InterruptPlan {
         keys: &["Escape"],
         confirmed: status == AgentStatus::Idle,
@@ -224,7 +224,7 @@ mod tests {
     // AC: interrupt postconditions — Escape only, confirmation capability-gated.
     #[test]
     fn adr0010_d7_interrupt_is_escape_and_confirms_only_at_idle() {
-        use crate::herdr_shim::AgentStatus;
+        use crate::herdr::AgentStatus;
         let idle = interrupt_plan(AgentStatus::Idle);
         assert_eq!(idle.keys, &["Escape"]);
         assert!(idle.confirmed);

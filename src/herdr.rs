@@ -3133,7 +3133,7 @@ mod shell_prompt_tests {
     /// workspace: "no agents in workspace w37").
     #[test]
     fn resolve_workspace_id_prefers_owned_label_over_foreign() {
-        use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
+        use crate::herdr::{AgentInfo, WorkspaceInfo};
         let mk = |id: &str, label: &str| WorkspaceInfo {
             workspace_id: id.into(),
             number: 0,
@@ -3142,7 +3142,7 @@ mod shell_prompt_tests {
             pane_count: 0,
             tab_count: 0,
             active_tab_id: String::new(),
-            agent_status: crate::herdr_shim::AgentStatus::Unknown,
+            agent_status: crate::herdr::AgentStatus::Unknown,
             cwd: None,
         };
         let foreign = mk("w37", "toron");
@@ -3184,7 +3184,7 @@ mod shell_prompt_tests {
     /// label. The registry's panes are the truth.
     #[test]
     fn a_crew_named_by_its_pin_resolves_to_its_registered_workspace() {
-        use crate::herdr_shim::{AgentInfo, AgentStatus, WorkspaceInfo};
+        use crate::herdr::{AgentInfo, AgentStatus, WorkspaceInfo};
         let mk = |id: &str, label: &str| WorkspaceInfo {
             workspace_id: id.into(),
             number: 0,

@@ -16,7 +16,7 @@ echo "== review-fix regression gate (bd-review-fix-epic-m0b) =="
 # consume) — the filter struct now lives in mail_shim.rs (MailSearchFilter)
 # and the wire args in backend/wire.rs (search_args). Both must carry
 # include_body_md; main.rs must request it (lines below).
-grep -q 'include_body_md: bool' src/mail_shim.rs \
+grep -q 'include_body_md: bool' src/mail.rs \
   && ok "F1: MailSearchFilter (mail_shim.rs) carries include_body_md" \
   || bad "F1: MailSearchFilter lost include_body_md"
 grep -q 'include_body_md: bool' src/backend/wire.rs \

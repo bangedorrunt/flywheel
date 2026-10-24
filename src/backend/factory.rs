@@ -9,7 +9,7 @@
 //!
 //! Mail backend routing (ADR-0003 V2/V3 — fixes the BUG1 shared-url misroute):
 //! `FLYWHEEL_MAIL=toron` (the default and only backend) → the toron facade
-//! (`src/backend/toron.rs` over `mail_shim::Mail`), reading `[mail.toron]`
+//! (`src/backend/toron.rs` over `mail::Mail`), reading `[mail.toron]`
 //! (absent → embedded in-process). The old `[agent_mail]` url is never a
 //! routing source.
 //!
@@ -21,7 +21,7 @@
 use crate::backend::{BackendError, MailSurface, MultiplexerBackend, Result};
 use crate::config::Config;
 #[cfg(feature = "mail-toron")]
-use crate::mail_shim::Mail;
+use crate::mail::Mail;
 
 /// Default multiplexer backend name.
 pub const DEFAULT_BACKEND: &str = "herdr";

@@ -18,7 +18,7 @@ use clap::Subcommand;
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::mail_shim::MailInboxFilter;
+use crate::mail::MailInboxFilter;
 use crate::output::print_json;
 use crate::preflight;
 
@@ -357,7 +357,7 @@ pub(crate) fn last_commit_age_secs(project_dir: &std::path::Path, now: u64) -> O
 /// One inbox read for the watch. `since` scopes the read server-side so the
 /// store's limit (which keeps the OLDEST rows of an ascending page) cannot hide
 /// a brand-new message — the same trap `mail watch` guards against.
-fn inbox_rows(mail: &crate::mail_shim::Mail, key: &str, since: Option<&str>) -> Result<Vec<Value>> {
+fn inbox_rows(mail: &crate::mail::Mail, key: &str, since: Option<&str>) -> Result<Vec<Value>> {
     let filter = MailInboxFilter {
         unread_only: false,
         include_bodies: true,

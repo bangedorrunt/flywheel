@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::config::Config;
-use crate::herdr_shim::Client;
+use crate::herdr::Client;
 use crate::output::{dim, kind_paint, print_json, status_paint};
 
 #[derive(Subcommand)]

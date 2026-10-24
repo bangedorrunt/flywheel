@@ -10,7 +10,7 @@
 //! local `MultiplexerBackend` trait — it re-exports the unified one:
 //! `pub use toron_core::backend::Backend as MultiplexerBackend;`. Call sites
 //! keep the name; the trait is sync, `&self`, object-safe, Unsupported-open.
-//! The herdr *client* was already unified (herdr_shim re-exports toron-core).
+//! The herdr *client* was already unified (herdr re-exports toron-core).
 //!
 //! ADR-0007 D2 (se2.3): the flywheel-local `MailBackend` trait is DELETED
 //! (not dual-lived). The coordination-fabric trait is
@@ -94,7 +94,7 @@ pub use factory::{
 /// leaf body runs on the loop's tokio worker) must use
 /// [`run_mail_off_runtime`] instead.
 pub fn run_mail<F: std::future::Future>(f: F) -> F::Output {
-    crate::mail_shim::block_on(f)
+    crate::mail::block_on(f)
 }
 
 /// The async-safe twin of [`run_mail`]: run one synchronous mail block (which
@@ -177,11 +177,11 @@ impl From<anyhow::Error> for BackendError {
     }
 }
 
-impl From<crate::herdr_shim::HerdrError> for BackendError {
+impl From<crate::herdr::HerdrError> for BackendError {
     /// Preserve herdr's typed error code as an `Other` with a lossless
     /// anyhow context. (Backend callers handle `BackendError::Unsupported`;
     /// transport errors stay opaque in `Other`.)
-    fn from(e: crate::herdr_shim::HerdrError) -> Self {
+    fn from(e: crate::herdr::HerdrError) -> Self {
         Self::Other(anyhow::anyhow!("herdr error {}: {}", e.code, e.message))
     }
 }
@@ -225,7 +225,7 @@ mod off_runtime_tests {
         let rt = tokio::runtime::Runtime::new().expect("test runtime");
         let v = rt
             .block_on(async {
-                run_mail_off_runtime(|| Ok(crate::mail_shim::block_on(async { 7i32 }))).await
+                run_mail_off_runtime(|| Ok(crate::mail::block_on(async { 7i32 }))).await
             })
             .expect("the bridge must not nest block_on on the caller's runtime");
         assert_eq!(v, 7);
@@ -236,13 +236,13 @@ mod off_runtime_tests {
     #[test]
     fn run_mail_off_runtime_sync_bridges_inside_a_runtime_and_passes_through_outside() {
         let outside =
-            super::run_mail_off_runtime_sync(|| crate::mail_shim::block_on(async { 3i32 }));
+            super::run_mail_off_runtime_sync(|| crate::mail::block_on(async { 3i32 }));
         assert_eq!(outside, 3);
         let rt = tokio::runtime::Runtime::new().expect("test runtime");
         let borrowed = String::from("x");
         let inside = rt.block_on(async {
             super::run_mail_off_runtime_sync(|| {
-                (borrowed.len(), crate::mail_shim::block_on(async { 4i32 }))
+                (borrowed.len(), crate::mail::block_on(async { 4i32 }))
             })
         });
         assert_eq!(inside, (1, 4));
@@ -256,7 +256,7 @@ mod off_runtime_tests {
     fn inline_shared_runtime_block_on_panics_inside_a_runtime() {
         let rt = tokio::runtime::Runtime::new().expect("test runtime");
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rt.block_on(async { crate::mail_shim::block_on(async { 1i32 }) })
+            rt.block_on(async { crate::mail::block_on(async { 1i32 }) })
         }));
         assert!(
             res.is_err(),

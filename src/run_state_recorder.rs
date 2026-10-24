@@ -224,7 +224,7 @@ impl RunStateRecorder {
     /// Open a recorder over the existing toron index, or `None` when no index
     /// is available. `None` is a visible "no recorder", never a silent no-op.
     pub fn attach(thread: &str) -> Option<Self> {
-        let pool = crate::mail_shim::try_mailbox().and_then(|mb| mb.index_pool().cloned())?;
+        let pool = crate::mail::try_mailbox().and_then(|mb| mb.index_pool().cloned())?;
         let thread = ThreadId::new(thread).ok()?;
         Some(Self {
             store: RunStateStore::new(pool),

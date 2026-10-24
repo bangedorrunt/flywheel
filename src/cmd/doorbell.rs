@@ -327,7 +327,7 @@ pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Re
 }
 
 fn nearby_herdr_agents(cfg: &Config) -> Vec<(String, String, String)> {
-    let Ok(c) = crate::herdr_shim::Client::connect(Some(&cfg.socket_path())) else {
+    let Ok(c) = crate::herdr::Client::connect(Some(&cfg.socket_path())) else {
         return Vec::new();
     };
     let Ok(agents) = c.agent_list() else {
@@ -804,7 +804,7 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
     crate::ensure_doorbell_supervisor();
     let registry = crate::state::load_spawn_registry(project);
     let peer_tpl = include_str!("../../integrations/peer-aware.md.tpl");
-    let c = crate::herdr_shim::Client::connect(Some(&cfg.socket_path()))?;
+    let c = crate::herdr::Client::connect(Some(&cfg.socket_path()))?;
     let mut injected = 0;
     for e in &registry {
         if e.pane_id.is_empty() {

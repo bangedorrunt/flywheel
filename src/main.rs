@@ -56,7 +56,7 @@ mod harness_caps;
 mod harness_registry;
 mod headless;
 mod health_page;
-mod herdr_shim;
+mod herdr;
 mod inbox_host;
 mod inbox_ports;
 mod ingress;
@@ -89,7 +89,7 @@ mod stage;
 // intentionally available for the next interpreter migrations.
 #[allow(dead_code)]
 mod kernel;
-mod mail_shim;
+mod mail;
 mod mcp_http;
 mod models;
 mod output;
@@ -159,7 +159,7 @@ use cmd::{
     cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
-use herdr_shim::{
+use herdr::{
     AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, alt_screen_read_ladder,
     classify_send_result, sanitize_pane_text,
 };
@@ -677,9 +677,9 @@ fn inbox_cli_filter(
     since: Option<&str>,
     thread_id: Option<&str>,
     limit: u32,
-) -> Option<mail_shim::MailInboxFilter> {
+) -> Option<mail::MailInboxFilter> {
     match (since, unread, thread_id) {
-        (Some(ts), _, _) => Some(mail_shim::MailInboxFilter {
+        (Some(ts), _, _) => Some(mail::MailInboxFilter {
             urgent_only: urgent,
             unread_only: unread,
             include_bodies: true,
@@ -688,7 +688,7 @@ fn inbox_cli_filter(
             thread_id: thread_id.map(str::to_string),
             ..Default::default()
         }),
-        (None, true, _) => Some(mail_shim::MailInboxFilter {
+        (None, true, _) => Some(mail::MailInboxFilter {
             unread_only: true,
             include_bodies: true,
             limit,
@@ -697,7 +697,7 @@ fn inbox_cli_filter(
         }),
         // bd-44hw: a bare --thread-id rides the filtered surface too —
         // thread filtering is post-unwrap, so bodies come along.
-        (None, false, Some(t)) => Some(mail_shim::MailInboxFilter {
+        (None, false, Some(t)) => Some(mail::MailInboxFilter {
             include_bodies: true,
             limit,
             thread_id: Some(t.to_string()),
@@ -2324,9 +2324,9 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
 pub(crate) fn find_workspace_info(
     c: &mut Client,
     project: &str,
-) -> Result<herdr_shim::WorkspaceInfo> {
+) -> Result<herdr::WorkspaceInfo> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
-    let mut matches: Vec<herdr_shim::WorkspaceInfo> = c
+    let mut matches: Vec<herdr::WorkspaceInfo> = c
         .workspace_list()?
         .into_iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
@@ -2345,11 +2345,11 @@ pub(crate) fn find_workspace_info(
         // room carrying the bare project label. The spawn registry is the
         // project→pane map, so its panes name the live swarm.
         if let Some(ws) =
-            herdr_shim::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
+            herdr::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
         {
             return Ok(pick_workspace(matches, &ws));
         }
-        let id = herdr_shim::resolve_workspace_id(&matches, &agents, &prefix);
+        let id = herdr::resolve_workspace_id(&matches, &agents, &prefix);
         return Ok(pick_workspace(matches, &id));
     }
     Ok(matches.swap_remove(0))
@@ -2357,9 +2357,9 @@ pub(crate) fn find_workspace_info(
 
 /// The entry with workspace id `id` (one of `matches` by construction).
 fn pick_workspace(
-    mut matches: Vec<herdr_shim::WorkspaceInfo>,
+    mut matches: Vec<herdr::WorkspaceInfo>,
     id: &str,
-) -> herdr_shim::WorkspaceInfo {
+) -> herdr::WorkspaceInfo {
     let i = matches
         .iter()
         .position(|w| w.workspace_id == id)
@@ -2455,7 +2455,7 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
 /// share the helper bodies via macros-free duplication (small, narrow).
 fn find_workspace_dyn(backend: &dyn backend::MultiplexerBackend, project: &str) -> Result<String> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
-    let matches: Vec<herdr_shim::WorkspaceInfo> = backend
+    let matches: Vec<herdr::WorkspaceInfo> = backend
         .workspace_list()?
         .into_iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
@@ -2827,9 +2827,9 @@ fn registry_entry_for_token<'a>(
 /// bd-a2bw: herdr `launch_pending` is stale when the pane is already
 /// input-ready (omp at `π >` with a session, status idle/working/blocked/
 /// done). Spawn/send must not treat that as still-booting.
-/// GS-049: shared with `snapshot::assemble` via `herdr_shim::agent_still_booting`.
+/// GS-049: shared with `snapshot::assemble` via `herdr::agent_still_booting`.
 fn is_still_booting(a: &AgentInfo) -> bool {
-    herdr_shim::agent_still_booting(a)
+    herdr::agent_still_booting(a)
 }
 
 /// Log an event with a compact payload.
@@ -2851,7 +2851,7 @@ fn main() {
         print_json(&json!({
             "tool": "flywheel",
             "version": VERSION,
-            "backend": format!("herdr (socket protocol v{})", herdr_shim::HDR_PROTOCOL),
+            "backend": format!("herdr (socket protocol v{})", herdr::HDR_PROTOCOL),
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
@@ -4285,7 +4285,7 @@ pub(crate) struct ProfileLaunchPlan {
     pub model: String,
     /// `Some(model)` when the harness's interactive entrypoint has no model
     /// flag, so the pin must ALSO travel via pane env
-    /// (`herdr_shim::apply_opencode_model_pin`).
+    /// (`herdr::apply_opencode_model_pin`).
     pub env_model_pin: Option<String>,
 }
 
@@ -4358,7 +4358,7 @@ pub(crate) fn profile_launch_args(
         anyhow::bail!(
             "harness {harness:?} takes no model flag on its interactive entrypoint, so the \
              model {m:?} cannot be delivered as argv — resolve the plan and pin it via pane \
-             env (herdr_shim::apply_opencode_model_pin) instead of using the argv-only view"
+             env (herdr::apply_opencode_model_pin) instead of using the argv-only view"
         );
     }
     Ok(plan.args)
@@ -4457,8 +4457,8 @@ enum WorkspaceOrigin {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkspaceSplit {
-    pub owned: Vec<herdr_shim::WorkspaceInfo>,
-    pub foreign: Vec<herdr_shim::WorkspaceInfo>,
+    pub owned: Vec<herdr::WorkspaceInfo>,
+    pub foreign: Vec<herdr::WorkspaceInfo>,
 }
 
 /// bd-627z.3: classify one workspace by origin. `None` = unrelated (skip).
@@ -4466,8 +4466,8 @@ pub(crate) struct WorkspaceSplit {
 /// base-labeled workspace is still a flywheel workspace).
 fn classify_workspace_origin(
     project: &str,
-    ws: &herdr_shim::WorkspaceInfo,
-    agents: &[herdr_shim::AgentInfo],
+    ws: &herdr::WorkspaceInfo,
+    agents: &[herdr::AgentInfo],
     spawn_label: Option<&str>,
 ) -> Option<WorkspaceOrigin> {
     let base = project_base(project);
@@ -4492,8 +4492,8 @@ fn classify_workspace_origin(
 /// bd-627z.3: pure partition of the workspace list into owned/foreign.
 fn partition_workspaces(
     project: &str,
-    ws_list: Vec<herdr_shim::WorkspaceInfo>,
-    agents: &[herdr_shim::AgentInfo],
+    ws_list: Vec<herdr::WorkspaceInfo>,
+    agents: &[herdr::AgentInfo],
     spawn_label: Option<&str>,
 ) -> WorkspaceSplit {
     let mut split = WorkspaceSplit::default();
@@ -4526,7 +4526,7 @@ pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<Worksp
 /// flywheel-toron). Refuses when no owned workspace exists (spawn first).
 fn add_target_from_split(
     split: &WorkspaceSplit,
-    agents: &[herdr_shim::AgentInfo],
+    agents: &[herdr::AgentInfo],
     project: &str,
 ) -> Result<String> {
     if split.owned.is_empty() {
@@ -4535,7 +4535,7 @@ fn add_target_from_split(
     // prefer the owned workspace hosting managed agents; first owned otherwise
     // (resolve_workspace_id picks the agent-hosting workspace among many).
     let prefix = format!("flywheel-{}-", project_base(project));
-    Ok(herdr_shim::resolve_workspace_id(
+    Ok(herdr::resolve_workspace_id(
         &split.owned,
         agents,
         &prefix,
@@ -5183,7 +5183,7 @@ mod profile_run_spawn_tests {
     #[test]
     fn resolved_spec_workspace_returns_pane_id() {
         use crate::backend::MultiplexerBackend;
-        use crate::herdr_shim::{PaneInfo, WorkspaceInfo};
+        use crate::herdr::{PaneInfo, WorkspaceInfo};
         use toron_core::backend::types::AgentStatus;
 
         struct MockMux {
@@ -5350,7 +5350,7 @@ mod internal_respawn_tests {
     use super::*;
     use crate::backend::MultiplexerBackend;
     use crate::config::lock_env;
-    use crate::herdr_shim::{PaneInfo, WorkspaceInfo};
+    use crate::herdr::{PaneInfo, WorkspaceInfo};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5675,7 +5675,7 @@ mod steer_safety_tests {
 
     #[test]
     fn working_agent_names_only_working() {
-        use crate::herdr_shim::{AgentInfo, AgentStatus};
+        use crate::herdr::{AgentInfo, AgentStatus};
         fn agent(name: &str, status: AgentStatus) -> AgentInfo {
             AgentInfo {
                 agent: None,
@@ -6040,7 +6040,7 @@ mod steer_engine_tests {
 #[cfg(test)]
 mod workspace_origin_tests {
     use super::*;
-    use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
+    use crate::herdr::{AgentInfo, WorkspaceInfo};
 
     fn ws(id: &str, label: &str, panes: u64) -> WorkspaceInfo {
         WorkspaceInfo {
@@ -6734,7 +6734,7 @@ mod adr0013_spawn_effect_tests {
             .find("AgentEffectGuard::begin")
             .expect("cmd_add must journal the add intent");
         let dispatch = add
-            .find("herdr_shim::pane_split(")
+            .find("herdr::pane_split(")
             .expect("cmd_add must split panes");
         assert!(
             gate < guard,
@@ -8351,15 +8351,15 @@ const LIFECYCLE_AUTHORITY_KINDS: &[&str] = &[
 fn preflight_kind_integration(
     c: &mut Client,
     kind: &str,
-    statuses: &HashMap<String, herdr_shim::IntegrationStatus>,
+    statuses: &HashMap<String, herdr::IntegrationStatus>,
 ) {
-    if herdr_shim::integration_target(kind).is_none() {
+    if herdr::integration_target(kind).is_none() {
         return; // custom kind with no herdr integration — nothing to preflight
     }
     let st = statuses
         .get(kind)
         .cloned()
-        .unwrap_or_else(herdr_shim::IntegrationStatus::not_installed);
+        .unwrap_or_else(herdr::IntegrationStatus::not_installed);
     if st.installed && st.current {
         return; // already good
     }
@@ -8371,7 +8371,7 @@ fn preflight_kind_integration(
         };
         eprintln!("flywheel: warn: {kind} herdr integration {detail} — refreshing");
     }
-    match herdr_shim::integration_install_socket(c, kind) {
+    match herdr::integration_install_socket(c, kind) {
         Ok(messages) => {
             eprintln!(
                 "flywheel: herdr integration {kind} installed via socket{}",
@@ -8413,8 +8413,8 @@ fn warn_integration_install_failed(kind: &str, hook_authority: bool, e: &anyhow:
 /// One `herdr integration status` read per spawn/add — the preflight map all
 /// kinds share. A failed read degrades to an empty map (every kind looks
 /// not-installed → best-effort install attempt, the self-healing path).
-fn read_integration_statuses() -> HashMap<String, herdr_shim::IntegrationStatus> {
-    match herdr_shim::integration_status_all() {
+fn read_integration_statuses() -> HashMap<String, herdr::IntegrationStatus> {
+    match herdr::integration_status_all() {
         Ok(v) => v.into_iter().collect(),
         Err(e) => {
             eprintln!(
@@ -8428,7 +8428,7 @@ fn read_integration_statuses() -> HashMap<String, herdr_shim::IntegrationStatus>
 
 /// H3: one `kind: <state>` line for the status/deps surfaces
 /// (kind -> installed/current/version), painted by state.
-fn integration_status_line(kind: &str, st: &herdr_shim::IntegrationStatus) -> String {
+fn integration_status_line(kind: &str, st: &herdr::IntegrationStatus) -> String {
     let label = if st.installed && st.current {
         format!("current ({})", st.version.as_deref().unwrap_or("?"))
     } else if st.installed {
@@ -8545,7 +8545,7 @@ fn stale_rename_label(name: &str, attempts: u32) -> String {
 /// ADR-0003 discipline: classify on the machine code, never the message text.
 /// `agent_name_taken` is herdr's wire code passed through as
 /// `BackendErrorCode::Other` — the one check every start door shares.
-fn is_taken_name_error(e: &herdr_shim::BackendError) -> bool {
+fn is_taken_name_error(e: &herdr::BackendError) -> bool {
     e.code().as_str() == "agent_name_taken"
 }
 
@@ -8587,7 +8587,7 @@ enum StartAttempt {
     Started,
     /// Refused for a reason that is NOT `agent_name_taken` — the caller's own
     /// error policy (logging, classification, retry) still applies.
-    NotTaken(herdr_shim::BackendError),
+    NotTaken(herdr::BackendError),
     /// The name is taken and the recovery may not (or could not) free it —
     /// fail loud NOW; keeping the name costs the retry budget and clears
     /// nothing.
@@ -8604,7 +8604,7 @@ trait TakenNameOps {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, herdr_shim::BackendError>;
+    ) -> std::result::Result<AgentInfo, herdr::BackendError>;
     /// Name the pane's OWN binding currently holds. An unreadable list reads
     /// as `None` — the safe side, because `None` never authorizes a rename.
     fn pane_binding(&mut self, pane_id: &str) -> Option<String>;
@@ -8615,13 +8615,13 @@ trait TakenNameOps {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), herdr_shim::BackendError>;
+    ) -> std::result::Result<(), herdr::BackendError>;
 }
 
 /// The concrete-client implementation (spawn's dead-shell re-launch, both
 /// retry loops, the crew / rate-limit hops).
 struct ConcreteTakenOps<'a> {
-    c: &'a herdr_shim::Client,
+    c: &'a herdr::Client,
 }
 
 impl TakenNameOps for ConcreteTakenOps<'_> {
@@ -8631,7 +8631,7 @@ impl TakenNameOps for ConcreteTakenOps<'_> {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, herdr_shim::BackendError> {
+    ) -> std::result::Result<AgentInfo, herdr::BackendError> {
         self.c.agent_start(name, kind, pane_id, 45_000, args)
     }
     fn pane_binding(&mut self, pane_id: &str) -> Option<String> {
@@ -8654,7 +8654,7 @@ impl TakenNameOps for ConcreteTakenOps<'_> {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), herdr_shim::BackendError> {
+    ) -> std::result::Result<(), herdr::BackendError> {
         self.c.agent_rename(pane_id, label).map(|_| ())
     }
 }
@@ -8672,7 +8672,7 @@ impl TakenNameOps for DynTakenOps<'_> {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, herdr_shim::BackendError> {
+    ) -> std::result::Result<AgentInfo, herdr::BackendError> {
         self.backend.agent_start(name, kind, pane_id, args)
     }
     fn pane_binding(&mut self, pane_id: &str) -> Option<String> {
@@ -8695,7 +8695,7 @@ impl TakenNameOps for DynTakenOps<'_> {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), herdr_shim::BackendError> {
+    ) -> std::result::Result<(), herdr::BackendError> {
         self.backend.agent_rename(pane_id, Some(label))
     }
 }
@@ -9249,8 +9249,8 @@ fn verify_or_respawn_pane(
         let grace = std::time::Instant::now() + Duration::from_secs(20);
         let mut live = false;
         while std::time::Instant::now() < grace && std::time::Instant::now() < deadline {
-            let verdict = herdr_shim::pane_process_info(c, pane_id)
-                .map(|pi| herdr_shim::pane_agent_alive(&pi, kind))
+            let verdict = herdr::pane_process_info(c, pane_id)
+                .map(|pi| herdr::pane_agent_alive(&pi, kind))
                 .unwrap_or(None);
             if verdict == Some(true) {
                 live = true;
@@ -9282,8 +9282,8 @@ fn verify_or_respawn_pane(
         // when the SHELL owns the foreground (pane_agent_alive == Some(false)
         // requires the shell to own the fg group): no agent is running, so
         // Ctrl+C cannot interrupt a TUI.
-        if let Some(pi) = herdr_shim::pane_process_info(c, pane_id).ok()
-            && herdr_shim::pane_agent_alive(&pi, kind) == Some(false)
+        if let Some(pi) = herdr::pane_process_info(c, pane_id).ok()
+            && herdr::pane_agent_alive(&pi, kind) == Some(false)
         {
             let _ = c.pane_send_input(pane_id, &["CTRL_C"]);
             std::thread::sleep(Duration::from_millis(500));
@@ -9305,7 +9305,7 @@ fn verify_or_respawn_pane(
         }
         // bd-eign.6 L1: readiness gate again (the TUI owns the foreground
         // exactly when it is input-ready).
-        let _ = herdr_shim::wait_agent_foreground(c, pane_id, kind, name, Duration::from_secs(15));
+        let _ = herdr::wait_agent_foreground(c, pane_id, kind, name, Duration::from_secs(15));
         // H2 / bd-umb3: re-prime (peer templates are their own prime; never
         // stack).
         if prime {
@@ -9622,8 +9622,8 @@ projects available: {}",
     // working — probe failures never prove death, bd-1np principle).
     let all_agents = c.agent_list()?;
     let mut probe = Client::connect(Some(&cfg.socket_path())).ok();
-    let mut dead_owned: Vec<herdr_shim::WorkspaceInfo> = Vec::new();
-    let mut live_owned: Vec<herdr_shim::WorkspaceInfo> = Vec::new();
+    let mut dead_owned: Vec<herdr::WorkspaceInfo> = Vec::new();
+    let mut live_owned: Vec<herdr::WorkspaceInfo> = Vec::new();
     for ws in &split.owned {
         let ws_agents: Vec<_> = all_agents
             .iter()
@@ -9783,13 +9783,13 @@ projects available: {}",
         }
         None => None,
     };
-    let mut herdr_env = herdr_shim::herdr_integration_env(cfg, first_pin.as_deref());
+    let mut herdr_env = herdr::herdr_integration_env(cfg, first_pin.as_deref());
     if let Some(m) = first_plan
         .as_ref()
         .and_then(|p| p.env_model_pin.clone())
         .or_else(|| first_bare.as_ref().and_then(|(_, pin)| pin.clone()))
     {
-        herdr_shim::apply_opencode_model_pin(&mut herdr_env, &m)?;
+        herdr::apply_opencode_model_pin(&mut herdr_env, &m)?;
     }
     // D9 (ADR-0013 Wave B): the spawn is an EFFECTFUL dispatch — the intent is
     // journaled before the workspace exists, so a crash or a dead pane can
@@ -9937,15 +9937,15 @@ projects available: {}",
                     (args, None, env_pin)
                 }
             };
-            let mut pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
+            let mut pane_env = herdr::herdr_integration_env(cfg, mail_identity.as_deref());
             if let Some(m) = &env_model_pin {
-                herdr_shim::apply_opencode_model_pin(&mut pane_env, m)?;
+                herdr::apply_opencode_model_pin(&mut pane_env, m)?;
             }
             let pane_id = if first {
                 first = false;
                 prev.clone()
             } else {
-                let p = herdr_shim::pane_split(
+                let p = herdr::pane_split(
                     &mut c,
                     &prev,
                     "down",
@@ -10002,7 +10002,7 @@ projects available: {}",
             // mid-quote and zsh parks at `>....` — agent never starts
             // (2026-08-18 coder2/coder3). Wait for the rendered prompt.
             let shell_ready =
-                herdr_shim::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
+                herdr::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -10021,7 +10021,7 @@ projects available: {}",
             // launch command is dispatched, not when the TUI is input-ready;
             // a prompt in the boot window is lost to the shell. Poll until
             // the agent binary owns the foreground (max 15s).
-            let ready = herdr_shim::wait_agent_foreground(
+            let ready = herdr::wait_agent_foreground(
                 &mut c,
                 &pane_id,
                 &kind,
@@ -10339,9 +10339,9 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         // died after its per-pane verification (during later panes' spawn) is
         // a dead shell, never a ready agent.
         let dead = dead_panes(&booted, |pane_id, kind| {
-            herdr_shim::pane_process_info(&mut c, pane_id)
+            herdr::pane_process_info(&mut c, pane_id)
                 .ok()
-                .and_then(|pi| herdr_shim::pane_agent_alive(&pi, kind))
+                .and_then(|pi| herdr::pane_agent_alive(&pi, kind))
         });
         if !dead.is_empty() {
             let list = dead
@@ -10686,7 +10686,7 @@ fn cmd_doorbell_why(
     }
     // presence/assignment into a single proof (tenant contamination).
     // Each workspace folds its own entries from an identically-seeded Default.
-    let presence_rows = std::fs::read_to_string(crate::mail_shim::presence_path())
+    let presence_rows = std::fs::read_to_string(crate::mail::presence_path())
         .ok()
         .map(|body| timeout_presence_rows(&body, doorbell_now_unix()))
         .unwrap_or_default();
@@ -11134,7 +11134,7 @@ fn digest_roster_lines(cfg: &Config, project: &str, now: u64) -> Vec<String> {
         .collect();
     // Presence with recency (latest row per pin wins).
     let mut presence: Vec<(String, String, u64)> = Vec::new();
-    if let Ok(body) = std::fs::read_to_string(crate::mail_shim::presence_path()) {
+    if let Ok(body) = std::fs::read_to_string(crate::mail::presence_path()) {
         let mut latest: std::collections::HashMap<String, (u64, String)> =
             std::collections::HashMap::new();
         for line in body.lines() {
@@ -11779,8 +11779,8 @@ fn upsert_workspace_receipt(corr: &str, receipt: &workspace::Receipt) {
         result_path: receipt.result_path.clone(),
         updated_at: chrono::Utc::now().timestamp_millis(),
     };
-    let _ = crate::mail_shim::block_on(async {
-        if let Some(mb) = crate::mail_shim::try_mailbox()
+    let _ = crate::mail::block_on(async {
+        if let Some(mb) = crate::mail::try_mailbox()
             && let Ok(store) = mb.receipt_store()
         {
             let _ = store.upsert(&r).await;
@@ -12009,13 +12009,13 @@ fn drain_pending_wait_corrs(workspace_model: &mut workspace::WorkspaceModel) {
 }
 
 fn try_tick_receipt(workspace_model: &mut workspace::WorkspaceModel, corr: &str) -> bool {
-    let Some(mb) = crate::mail_shim::try_mailbox() else {
+    let Some(mb) = crate::mail::try_mailbox() else {
         return false;
     };
     let Ok(store) = mb.receipt_store() else {
         return false;
     };
-    let Ok(Some(r)) = crate::mail_shim::block_on(store.get(corr)) else {
+    let Ok(Some(r)) = crate::mail::block_on(store.get(corr)) else {
         return false;
     };
     let rec = workspace::Receipt {
@@ -12260,7 +12260,7 @@ fn publish_human_question(
     if kind != 14 || corr.is_empty() {
         return;
     }
-    let Some(mb) = crate::mail_shim::try_mailbox() else {
+    let Some(mb) = crate::mail::try_mailbox() else {
         return;
     };
     let mut extra_tags = Vec::new();
@@ -12285,7 +12285,7 @@ fn publish_human_question(
         extra_tags,
         ..Default::default()
     };
-    if let Err(e) = crate::mail_shim::block_on(mb.send_message(&args)) {
+    if let Err(e) = crate::mail::block_on(mb.send_message(&args)) {
         eprintln!("flywheel: [Publish kind=14] send failed: {e:#}");
     }
 }
@@ -12306,9 +12306,9 @@ fn seed_why_presence(
 }
 
 fn rebuild_assignment_from_receipts(workspace_model: &mut crate::workspace::WorkspaceModel) {
-    if let Some(mb) = crate::mail_shim::try_mailbox()
+    if let Some(mb) = crate::mail::try_mailbox()
         && let Ok(store) = mb.receipt_store()
-        && let Ok(receipts) = crate::mail_shim::block_on(store.list(None))
+        && let Ok(receipts) = crate::mail::block_on(store.list(None))
     {
         for r in receipts {
             let w = r
@@ -13035,7 +13035,7 @@ mod peer_encoding_tests {
             _kind: &str,
             _pane_id: &str,
             _args: &[String],
-        ) -> Result<crate::herdr_shim::AgentInfo, crate::herdr_shim::BackendError> {
+        ) -> Result<crate::herdr::AgentInfo, crate::herdr::BackendError> {
             panic!("agent.start must never be reached with a poisoned arg")
         }
     }
@@ -13263,7 +13263,7 @@ pub(crate) fn pinned_mail_identity(
             let seed = state::fnv1a64(name);
             let mut pin = unique_adjnoun_pin(&taken, seed);
             for _ in 0..256 {
-                if daemon_mode || !mail_shim::pin_bound_elsewhere(&key, &pin) {
+                if daemon_mode || !mail::pin_bound_elsewhere(&key, &pin) {
                     break;
                 }
                 taken.insert(pin.clone());
@@ -13289,7 +13289,7 @@ pub(crate) fn pinned_mail_identity(
     // second identity. The fold is a Mailbox-only op (not on the shared
     // MailSurface trait), so the concrete facade writes it. Best-effort,
     // loud on fail; never fails the spawn.
-    if let Ok(Some(facade)) = mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+    if let Ok(Some(facade)) = mail::Mail::from_config(Some(&cfg.toron_mail_config()))
         && let Err(e) = facade.fold_agent_name_alias(&key, name, &mail_name)
     {
         eprintln!("flywheel: mail fold_agent_name_alias failed for {name} -> {mail_name}: {e:#}");
@@ -13409,7 +13409,7 @@ fn record_spawn_comms_facts(project: &str, pin: &str, npub: &str) {
             return;
         }
     };
-    match mail_shim::block_on(spawn_facts::append_spawn_facts(
+    match mail::block_on(spawn_facts::append_spawn_facts(
         &store, project, topology, npub, role,
     )) {
         Ok(Some(what)) => eprintln!("flywheel: comms recorded {what} for {pin}"),
@@ -14752,8 +14752,8 @@ fn cmd_add(
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
             }
-            let pane_env = herdr_shim::herdr_integration_env(cfg, mail_identity.as_deref());
-            let p = herdr_shim::pane_split(
+            let pane_env = herdr::herdr_integration_env(cfg, mail_identity.as_deref());
+            let p = herdr::pane_split(
                 &mut c,
                 &prev,
                 "down",
@@ -14779,7 +14779,7 @@ fn cmd_add(
             }
             // bd-pattern-peer-triggered: same shell-readiness gate as spawn —
             // typing into a booting shell mangles long single-quoted args.
-            let shell_ready = herdr_shim::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15));
+            let shell_ready = herdr::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({prev}) did not render a prompt \
@@ -14800,7 +14800,7 @@ fn cmd_add(
             // = fail loud with the corpse + exact close command; unknown kind
             // (inconclusive probe) or probe error = loud warn with the check
             // command, never a confident healthy.
-            let foreground = herdr_shim::wait_agent_foreground(
+            let foreground = herdr::wait_agent_foreground(
                 &mut c,
                 &prev,
                 &kind,
@@ -14808,8 +14808,8 @@ fn cmd_add(
                 Duration::from_secs(15),
             );
             if !foreground {
-                match herdr_shim::pane_process_info(&mut c, &prev)
-                    .map(|pi| herdr_shim::pane_agent_alive(&pi, &kind))
+                match herdr::pane_process_info(&mut c, &prev)
+                    .map(|pi| herdr::pane_agent_alive(&pi, &kind))
                 {
                     Ok(Some(false)) => bail!(
                         "add {name}: agent process gone on {prev} — undriven shell left behind; close it with `herdr pane close {prev}`"
@@ -14927,7 +14927,7 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
             if let Some(ags) = r["agents"].as_array() {
                 for a in ags {
                     let st = a["status"].as_str().unwrap_or("unknown");
-                    let st = herdr_shim::parse_agent_status(st)
+                    let st = herdr::parse_agent_status(st)
                         .map(status_paint)
                         .unwrap_or_else(|_| dim(st));
                     println!(
@@ -16591,17 +16591,17 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     // H3 (bd-harness-integration-preflight): surface each distinct kind's
     // herdr integration state (kind -> installed/current/version).
     let integration_statuses = read_integration_statuses();
-    let integrations: BTreeMap<String, herdr_shim::IntegrationStatus> = agents
+    let integrations: BTreeMap<String, herdr::IntegrationStatus> = agents
         .iter()
         .filter_map(|a| a.agent.as_deref())
-        .filter(|k| herdr_shim::integration_target(k).is_some())
+        .filter(|k| herdr::integration_target(k).is_some())
         .collect::<HashSet<_>>()
         .into_iter()
         .map(|k| {
             let st = integration_statuses
                 .get(k)
                 .cloned()
-                .unwrap_or_else(herdr_shim::IntegrationStatus::not_installed);
+                .unwrap_or_else(herdr::IntegrationStatus::not_installed);
             (k.to_string(), st)
         })
         .collect();
@@ -16637,7 +16637,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
-            let st = herdr_shim::parse_agent_status(st)
+            let st = herdr::parse_agent_status(st)
                 .map(status_paint)
                 .unwrap_or_else(|_| dim(st));
             println!(
@@ -17120,14 +17120,14 @@ const RESPONSIVENESS_WINDOW: Duration = Duration::from_secs(3);
 /// inconclusive (the caller falls back to legacy pane-existence
 /// classification — never a confident "healthy").
 fn probe_agent_liveness(
-    probe: &mut Option<herdr_shim::Client>,
+    probe: &mut Option<herdr::Client>,
     pane_id: &str,
     kind: &str,
     name: &str,
 ) -> Option<bool> {
     let c = probe.as_mut()?;
-    match herdr_shim::pane_process_info(c, pane_id) {
-        Ok(pi) => herdr_shim::pane_agent_alive(&pi, kind),
+    match herdr::pane_process_info(c, pane_id) {
+        Ok(pi) => herdr::pane_agent_alive(&pi, kind),
         Err(e) => {
             eprintln!("flywheel: recover liveness probe for {name} failed: {e:#}");
             None
@@ -17211,7 +17211,7 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                     // advance state_change_seq while idle.
                     Some(true) => {
                         let verdict = probe.as_mut().map(|c| {
-                            herdr_shim::probe_agent_responsiveness(
+                            herdr::probe_agent_responsiveness(
                                 c,
                                 pane_id,
                                 RESPONSIVENESS_WINDOW,
@@ -17220,7 +17220,7 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                         match verdict {
                             // alive as a PID, dead to input → respawn,
                             // not healthy (the bd-a8i shape).
-                            Some(herdr_shim::Responsiveness::Unresponsive) => {
+                            Some(herdr::Responsiveness::Unresponsive) => {
                                 RecoverDecision::Respawn {
                                     reason: "unresponsive",
                                 }
@@ -17933,7 +17933,7 @@ fn cmd_send(
                 "{} {}",
                 dim(agent_target(a)),
                 status_paint(
-                    herdr_shim::parse_agent_status(status).unwrap_or(AgentStatus::Unknown)
+                    herdr::parse_agent_status(status).unwrap_or(AgentStatus::Unknown)
                 )
             );
         }
@@ -19411,7 +19411,7 @@ fn cmd_interrupt(
     // because a send JSON showed prior idle (false-fail root cause).
     for a in &targets {
         let prior =
-            herdr_shim::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
+            herdr::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
         interrupt_guard_working(prior, force)?;
     }
     let is_kill = kill_key(&keys).is_some();
@@ -19448,7 +19448,7 @@ fn client_read_with_fallback(
     source: &str,
     lines: Option<u32>,
 ) -> Result<String> {
-    let mut ops = herdr_shim::ClientAltScreenRead::new(c, target, lines);
+    let mut ops = herdr::ClientAltScreenRead::new(c, target, lines);
     let raw = alt_screen_read_ladder(&mut ops, source)
         .map_err(|e| anyhow!("{target}: alt-screen read failed: {e:#}"))?;
     Ok(sanitize_pane_text(&raw))
@@ -19493,7 +19493,7 @@ fn watch_name_for_pane<'a>(targets: &'a [(String, String)], pane_id: &str) -> Op
 }
 
 /// `flywheel output`: read an agent's session from the opencode structured
-/// store (bd-eign.5). Logic lives in herdr_shim::read_session_log; this is a
+/// store (bd-eign.5). Logic lives in herdr::read_session_log; this is a
 /// thin runtime + render stub.
 fn cmd_output(
     cfg: &Config,
@@ -19505,7 +19505,7 @@ fn cmd_output(
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "output")?;
     let dir = project_dir_str(cfg, project)?;
-    let log = herdr_shim::read_session_log(&dir, role, session, limit)?;
+    let log = herdr::read_session_log(&dir, role, session, limit)?;
     print_json(&log);
     Ok(())
 }
@@ -19520,7 +19520,7 @@ fn cmd_watch(
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "watch")?;
     let until_status: Option<AgentStatus> =
-        until.map(herdr_shim::parse_agent_status).transpose()?;
+        until.map(herdr::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings line.
     if std::io::stdout().is_terminal() {
@@ -19560,7 +19560,7 @@ fn cmd_watch(
         .iter()
         .map(|p| Subscription::agent_status_changed(p.pane_id.clone()))
         .collect();
-    let mut stream = match herdr_shim::subscribe(&mut c, &subs) {
+    let mut stream = match herdr::subscribe(&mut c, &subs) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("flywheel: WARNING subscription failed ({e:#}); polling fallback");
@@ -19596,8 +19596,8 @@ fn cmd_watch(
                     // The payload's `agent` field is the agent KIND, not the
                     // name — match via pane id (watch_targets).
                     match ev.data {
-                        herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
-                        | herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(change) => {
+                        herdr::HerdrEventData::PaneAgentStatusChanged(change)
+                        | herdr::HerdrEventData::PaneAgentStatusChangedSub(change) => {
                             let Some(name) = watch_name_for_pane(&watch_targets, &change.pane_id)
                             else {
                                 continue;
@@ -19676,7 +19676,7 @@ fn cmd_zoom(cfg: &Config, project: &str, to: &str, off: bool) -> Result<()> {
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     let mode = if off { "off" } else { "on" };
     for a in &targets {
-        herdr_shim::pane_zoom(&mut c, &a.pane_id, mode)?;
+        herdr::pane_zoom(&mut c, &a.pane_id, mode)?;
     }
     println!("zoom {mode} for {to}");
     Ok(())
@@ -19700,7 +19700,7 @@ fn cmd_attach(cfg: &Config, project: &str, to: &str) -> Result<()> {
 fn working_agent_names(agents: &[AgentInfo]) -> Vec<String> {
     agents
         .iter()
-        .filter(|a| a.agent_status == herdr_shim::AgentStatus::Working)
+        .filter(|a| a.agent_status == herdr::AgentStatus::Working)
         .map(|a| a.name.clone().unwrap_or_else(|| a.pane_id.clone()))
         .collect()
 }
@@ -20135,7 +20135,7 @@ mod verify_gate_tests {
 }
 
 fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&str>) -> Result<()> {
-    let mail = mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
+    let mail = mail::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
         anyhow!(
             "agent-mail (toron) not configured — set [mail.toron] url in {}",
             config::config_file().display()
@@ -20217,8 +20217,8 @@ fn cmd_assign(cfg: &Config, project: &str, to: &str, beads: &str, msg: Option<&s
 
 // ---- mail ----
 
-fn mail_or_die(cfg: &Config) -> Result<mail_shim::Mail> {
-    mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
+fn mail_or_die(cfg: &Config) -> Result<mail::Mail> {
+    mail::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
         anyhow!(
             "toron mail not configured — set [mail.toron] url in {}",
             config::config_file().display()
@@ -20253,7 +20253,7 @@ fn resolve_mail_actor_roster(
 }
 
 /// Mail facade acting as resolved actor (registers identity best-effort).
-fn mail_as(cfg: &Config, project_key: &str, as_agent: Option<&str>) -> Result<mail_shim::Mail> {
+fn mail_as(cfg: &Config, project_key: &str, as_agent: Option<&str>) -> Result<mail::Mail> {
     let mail = mail_or_die(cfg)?;
     // bd-aseq: the registry is keyed by project NAME (state_key hashes path
     // forms separately) — derive it from the project dir so the actor lookup
@@ -20663,7 +20663,7 @@ fn mail_project<'a>(
 /// read rows — assign or not — do not wake). The wake trigger uses
 /// `urgent > 0`, which IS meaningful (importance is a real message
 /// attribute).
-fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
+fn digest_for(mail: &mail::Mail, key: &str, name: &str) -> Result<Value> {
     // bd-dbre: poll the inbox the agent actually READS. Herdr name and pin
     // are separate recipients (message_reads is per-recipient, bd-5icg);
     // waking on the name inbox means pin-side mark-read can never clear
@@ -20677,7 +20677,7 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
     let v = mail.inbox_filtered(
         key,
         &identity,
-        &mail_shim::MailInboxFilter {
+        &mail::MailInboxFilter {
             unread_only: false,
             include_bodies: true,
             limit: 10,
@@ -20729,7 +20729,7 @@ fn digest_for(mail: &mail_shim::Mail, key: &str, name: &str) -> Result<Value> {
 /// `member_dirs`: (slug, registry dir-key) pairs; the CLI resolves dirs
 /// via `project_dir_str`, tests pass slugs (no registry → name fallback).
 fn product_digest_for(
-    mail: &mail_shim::Mail,
+    mail: &mail::Mail,
     product_key: &str,
     name: &str,
     member_dirs: &[(String, String)],
@@ -20765,8 +20765,8 @@ fn product_digest_for(
         .map(|(s, d)| (s.as_str(), d.as_str()))
         .collect();
     // The LIVE mailbox's roots, not a fresh env resolution: the fold probes
-    // where the keys actually are (see mail_shim::BUILT_ROOTS).
-    let (data_dir, _) = mail_shim::built_mailbox_roots();
+    // where the keys actually are (see mail::BUILT_ROOTS).
+    let (data_dir, _) = mail::built_mailbox_roots();
     for slug in &slugs {
         let Some(dir) = dirs.get(slug.as_str()) else {
             gaps_out.push(gap(slug, "no project dir supplied for member".to_string()));
@@ -21041,7 +21041,7 @@ fn bind_spawn_role(
     let Some(role) = spawn_role_noun(profile, short) else {
         return Ok(());
     };
-    let facade = mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+    let facade = mail::Mail::from_config(Some(&cfg.toron_mail_config()))
         .map_err(|e| {
             anyhow::anyhow!("mail role pin failed for role {role} -> {pin}: {e:#}")
         })?
@@ -21537,7 +21537,7 @@ mod wake_identity_tests {
             src.contains("Some(profile_name)"),
             "NEW-L8: squad spawn must bind"
         );
-        let shim = include_str!("mail_shim.rs");
+        let shim = include_str!("mail.rs");
         assert!(
             shim.contains("refusing a silent skip"),
             "NEW-L7: remote role-pin must fail-loud"
@@ -21935,7 +21935,7 @@ mod wake_identity_tests {
             .expect("registry entry");
         assert_eq!(entry.pane_id, "w9:p1");
         assert_eq!(entry.mail_identity.as_deref(), Some(pin.as_str()));
-        crate::mail_shim::cleanup_test_data_dir(&data);
+        crate::mail::cleanup_test_data_dir(&data);
     }
 
     /// bd-gpj0: arrive with HERDR_PANE_ID records the open-mode pane so
@@ -21961,7 +21961,7 @@ mod wake_identity_tests {
             Some(v) => unsafe { std::env::set_var("HERDR_PANE_ID", v) },
             None => unsafe { std::env::remove_var("HERDR_PANE_ID") },
         }
-        crate::mail_shim::cleanup_test_data_dir(&data);
+        crate::mail::cleanup_test_data_dir(&data);
     }
 
     #[test]
@@ -22007,7 +22007,7 @@ mod wake_identity_tests {
             .expect("colliding spawn draws a fresh pin");
         assert_ne!(pin2, pin, "collision with the agents table redraws");
         assert!(valid_pair(&pin2, &ADJECTIVES, &NOUNS).is_some(), "{pin2}");
-        crate::mail_shim::cleanup_test_data_dir(&data);
+        crate::mail::cleanup_test_data_dir(&data);
     }
 
     /// bd-add-missing-mail-identity-16le: the ADD path's identity step mints
@@ -22074,7 +22074,7 @@ mod wake_identity_tests {
                 "registered pin {p} resolves via the agents table (whois)"
             );
         }
-        crate::mail_shim::cleanup_test_data_dir(&data);
+        crate::mail::cleanup_test_data_dir(&data);
     }
 
     /// bd-pin-public-plane-s-easy.2: register_spawned_agent writes the
@@ -22102,7 +22102,7 @@ mod wake_identity_tests {
         // mode passes the name through and the slug alone is not registered).
         let mail = backend::mail_backend(&cfg).expect("mail backend");
         backend::run_mail(mail.ensure_project(&key)).expect("ensure project");
-        if let Ok(Some(facade)) = mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
+        if let Ok(Some(facade)) = mail::Mail::from_config(Some(&cfg.toron_mail_config())) {
             facade.set_identity_mode(&key, "swarm").expect("swarm mode");
         }
         let who_slug = backend::run_mail(mail.whois(&key, slug)).expect("whois slug via fold");
@@ -22111,7 +22111,7 @@ mod wake_identity_tests {
             who_slug.npub, who_pin.npub,
             "whois(slug) resolves to the pin's npub after the fold"
         );
-        crate::mail_shim::cleanup_test_data_dir(&data);
+        crate::mail::cleanup_test_data_dir(&data);
     }
 
     /// S9 (ADR-0018 D1a): the peer-aware spawn template injects the mail
@@ -22160,10 +22160,10 @@ mod wake_identity_tests {
 
     /// bd-7hdb: the thread-scoping is only worth anything if the watch actually
     /// scopes its read, so the call site is pinned, not just the helper.
-    /// `mail_shim::a_thread_scoped_read_survives_a_limit_smaller_than_the_inbox`
+    /// `mail::a_thread_scoped_read_survives_a_limit_smaller_than_the_inbox`
     /// proves the mechanism against the real store; this proves the watch uses
     /// it. Without this the fix could be reverted to a hand-built filter and
-    /// the mail_shim test would stay green over a watch that no longer scopes.
+    /// the mail test would stay green over a watch that no longer scopes.
     #[test]
     fn cmd_mail_watch_scopes_its_read_to_the_watched_thread() {
         // Every needle is split so this test cannot match its own source: a
@@ -22236,7 +22236,7 @@ fn cmd_mail_watch(
     //    and letter/digit boundaries, so hyphenated thread ids are not
     //    reliably phrase-searchable (e2e-verified) — hence exact `thread_id`
     //    equality on the row rather than a phrase search.
-    let rows = |m: &mail_shim::Mail| -> Result<Vec<Value>> {
+    let rows = |m: &mail::Mail| -> Result<Vec<Value>> {
         let v = m.inbox_filtered(&key, &m.name, &watch_filter(thread_id))?;
         Ok(v.as_array().cloned().unwrap_or_default())
     };
@@ -22274,8 +22274,8 @@ fn cmd_mail_watch(
 /// The inbox read a thread watch performs. Scoped to the thread so the store's
 /// `limit` (which keeps the OLDEST rows of an ascending list) cannot hide the
 /// very reply the watch exists to detect. Pure: one thread in, one filter out.
-fn watch_filter(thread_id: &str) -> mail_shim::MailInboxFilter {
-    mail_shim::MailInboxFilter {
+fn watch_filter(thread_id: &str) -> mail::MailInboxFilter {
+    mail::MailInboxFilter {
         unread_only: false,
         include_bodies: true,
         limit: 200,
@@ -22560,7 +22560,7 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
                 }
             }
             WorkflowStep::Wait { until, timeout_ms } => {
-                let st = herdr_shim::parse_agent_status(until)?;
+                let st = herdr::parse_agent_status(until)?;
                 let targets = resolve_agents(&mut c, &ws_id, project, "all")?;
                 for a in &targets {
                     c.agent_wait(
@@ -23073,10 +23073,10 @@ fn probe_pane_wedges(
         // launched), so the process probe needs no profile lookup. A pane herdr
         // reports with no kind probes as inconclusive (`None`), never alive.
         let kind = a.agent.as_deref().unwrap_or("");
-        let alive = herdr_shim::pane_process_info(&mut c, &e.pane_id)
+        let alive = herdr::pane_process_info(&mut c, &e.pane_id)
             .ok()
-            .and_then(|info| herdr_shim::pane_agent_alive(&info, kind));
-        let tail = herdr_shim::pane_recent_text(&mut c, &e.pane_id).ok();
+            .and_then(|info| herdr::pane_agent_alive(&info, kind));
+        let tail = herdr::pane_recent_text(&mut c, &e.pane_id).ok();
         let action = durable::pane_wedge_action(
             &durable::PaneWedgeInputs {
                 pin,
@@ -24960,7 +24960,7 @@ mod loop_tests {
     #[test]
     fn verify_fence_not_ready_bead_mails_planner_on_bead_thread() {
         use crate::backend::MailSurface as _;
-        let mail = crate::mail_shim::Mail::from_config(None)
+        let mail = crate::mail::Mail::from_config(None)
             .expect("mail ok")
             .expect("mail Some");
         let backend = crate::backend::toron::ToronMailBackend::new(mail);
@@ -24969,9 +24969,9 @@ mod loop_tests {
         // the surface sends AS its own identity — it needs a key in-project
         let sender = backend.agent_name().to_string();
         let sender_profile = spawn_agent_profile(&sender, "opencode", project);
-        crate::mail_shim::fixture_register(project, &sender_profile).expect("register sender");
+        crate::mail::fixture_register(project, &sender_profile).expect("register sender");
         let profile = spawn_agent_profile("PlannerOne", "opencode", project);
-        crate::mail_shim::fixture_register(project, &profile).expect("register");
+        crate::mail::fixture_register(project, &profile).expect("register");
         let receipt = send_not_ready_mail(
             &backend,
             project,
@@ -25013,20 +25013,20 @@ mod loop_tests {
     #[test]
     fn done_mail_carries_close_report_on_bead_thread() {
         use crate::backend::MailSurface as _;
-        let mail = crate::mail_shim::Mail::from_config(None)
+        let mail = crate::mail::Mail::from_config(None)
             .expect("mail ok")
             .expect("mail Some");
         let backend = crate::backend::toron::ToronMailBackend::new(mail);
         let project = "done-mail-test";
         backend::run_mail(backend.ensure_project(project)).expect("ensure");
         let sender = backend.agent_name().to_string();
-        crate::mail_shim::fixture_register(
+        crate::mail::fixture_register(
             project,
             &spawn_agent_profile(&sender, "opencode", project),
         )
         .expect("register sender");
         let captain = "CaptainPine";
-        crate::mail_shim::fixture_register(
+        crate::mail::fixture_register(
             project,
             &spawn_agent_profile(captain, "flywheel", project),
         )
@@ -25082,7 +25082,7 @@ mod loop_tests {
     #[test]
     fn sha_rule_missing_commit_mail_names_the_missing_commit() {
         use crate::backend::MailSurface as _;
-        let mail = crate::mail_shim::Mail::from_config(None)
+        let mail = crate::mail::Mail::from_config(None)
             .expect("mail ok")
             .expect("mail Some");
         let backend = crate::backend::toron::ToronMailBackend::new(mail);
@@ -25090,9 +25090,9 @@ mod loop_tests {
         backend::run_mail(backend.ensure_project(project)).expect("ensure");
         let sender = backend.agent_name().to_string();
         let sender_profile = spawn_agent_profile(&sender, "opencode", project);
-        crate::mail_shim::fixture_register(project, &sender_profile).expect("register sender");
+        crate::mail::fixture_register(project, &sender_profile).expect("register sender");
         let profile = spawn_agent_profile("PlannerOne", "opencode", project);
-        crate::mail_shim::fixture_register(project, &profile).expect("register");
+        crate::mail::fixture_register(project, &profile).expect("register");
         send_unverified_close_mail(&backend, project, "bd-sha-missing", "", "PlannerOne")
             .expect("unverified-close mail sends");
         let items = backend::run_mail(backend.inbox(&backend::InboxQuery {
@@ -25239,7 +25239,7 @@ mod loop_tests {
                 receipt_eligible,
             } => {
                 assert!(!receipt_eligible, "loop-runnable -> no receipt grace");
-                let mail = crate::mail_shim::Mail::from_config(None)
+                let mail = crate::mail::Mail::from_config(None)
                     .expect("mail ok")
                     .expect("mail Some");
                 let backend = crate::backend::toron::ToronMailBackend::new(mail);
@@ -25249,7 +25249,7 @@ mod loop_tests {
                 backend::run_mail(backend.ensure_project(&project)).expect("ensure");
                 let sender = backend.agent_name().to_string();
                 let sender_profile = spawn_agent_profile(&sender, "opencode", &project);
-                crate::mail_shim::fixture_register(&project, &sender_profile)
+                crate::mail::fixture_register(&project, &sender_profile)
                     .expect("register sender");
                 // the planner = the bead's creator (registered identity)
                 let planner = planner_recipient_chain(&dir_str, &bead_id, "FallbackIdentity")
@@ -25257,7 +25257,7 @@ mod loop_tests {
                     .next()
                     .unwrap_or_default();
                 let planner_profile = spawn_agent_profile(&planner, "opencode", &project);
-                crate::mail_shim::fixture_register(&project, &planner_profile)
+                crate::mail::fixture_register(&project, &planner_profile)
                     .expect("register planner");
                 // tick 1: reopen + mail
                 let v = reopen_unverified_close(&dir_str, &bead_id, &sha, &backend, &planner)
@@ -26772,23 +26772,23 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| herdr_shim::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
+        .and_then(|o| herdr::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
     {
-        match protocol_check(p, herdr_shim::HDR_PROTOCOL) {
+        match protocol_check(p, herdr::HDR_PROTOCOL) {
             ProtocolCheck::Match => println!(
                 "herdr protocol: {} (verified {})",
                 paint_ok(&p.to_string()),
-                herdr_shim::HDR_PROTOCOL
+                herdr::HDR_PROTOCOL
             ),
             ProtocolCheck::Newer => {
                 println!(
                     "herdr protocol: {} (verified {})",
                     crate::output::warn(&p.to_string()),
-                    herdr_shim::HDR_PROTOCOL
+                    herdr::HDR_PROTOCOL
                 );
                 eprintln!(
                     "flywheel: INFO herdr protocol {p} > verified {} — forward-compatible (client ignores what it doesn't know), but flywheel may not use new features; rebuild against the newer schema when ready",
-                    herdr_shim::HDR_PROTOCOL
+                    herdr::HDR_PROTOCOL
                 );
             }
             ProtocolCheck::Older => {
@@ -26796,11 +26796,11 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
                 println!(
                     "herdr protocol: {} (verified {})",
                     crate::output::error(&p.to_string()),
-                    herdr_shim::HDR_PROTOCOL
+                    herdr::HDR_PROTOCOL
                 );
                 eprintln!(
                     "flywheel: ERROR herdr protocol {p} < verified {} — server too old, our requests may be rejected; upgrade herdr or rebuild flywheel against the pinned schema",
-                    herdr_shim::HDR_PROTOCOL
+                    herdr::HDR_PROTOCOL
                 );
             }
         }
@@ -26808,7 +26808,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         println!(
             "herdr protocol: {} (verified {})",
             crate::output::warn("unknown"),
-            herdr_shim::HDR_PROTOCOL
+            herdr::HDR_PROTOCOL
         );
         eprintln!("flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)");
     }
@@ -26817,7 +26817,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     // (kind -> installed/current/version). Informational — a failed status
     // read warns but does not fail the deps check (the socket surface works
     // regardless of the CLI status read).
-    match herdr_shim::integration_status_all() {
+    match herdr::integration_status_all() {
         Ok(list) => {
             println!("herdr integrations:");
             for (kind, st) in list {
@@ -26875,7 +26875,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         }
     }
 
-    match mail_shim::Mail::from_config(Some(&cfg.toron_mail_config())) {
+    match mail::Mail::from_config(Some(&cfg.toron_mail_config())) {
         Ok(Some(m)) => match m.health() {
             Ok(_) => println!("mail (toron): {}", status_paint(AgentStatus::Idle)),
             Err(e) => {
@@ -32459,9 +32459,9 @@ fn settle_agent(mux: &dyn backend::MultiplexerBackend, agent: &str) -> Result<()
     mux.agent_wait(
         agent,
         &[
-            crate::herdr_shim::AgentStatus::Done,
-            crate::herdr_shim::AgentStatus::Idle,
-            crate::herdr_shim::AgentStatus::Blocked,
+            crate::herdr::AgentStatus::Done,
+            crate::herdr::AgentStatus::Idle,
+            crate::herdr::AgentStatus::Blocked,
         ],
         Some(1_800_000),
     )
@@ -32956,7 +32956,7 @@ fn is_first_dispatch(skills_injected: bool) -> bool {
 /// missing (fresh pane still binding) or still booting. Anything else
 /// proceeds straight to the normal send path.
 fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
-    first && agent.is_none_or(crate::herdr_shim::agent_still_booting)
+    first && agent.is_none_or(crate::herdr::agent_still_booting)
 }
 
 /// bd-83as: have this agent's skills been injected yet (spawn registry)?
@@ -33002,7 +33002,7 @@ where
         if let Some(a) = agents
             .iter()
             .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
-            && !crate::herdr_shim::agent_still_booting(a)
+            && !crate::herdr::agent_still_booting(a)
         {
             return Ok(a.clone());
         }
@@ -33396,7 +33396,7 @@ fn log_engine_dispatch(
 /// the caller-provided, workspace-filtered agent list) maps to its pane; a
 /// target containing `:` is treated as a raw pane id; anything else is
 /// unknown. Pure — no lookup logic duplicated from `__send`.
-fn resolve_pane_id(agents: &[herdr_shim::AgentInfo], target: &str) -> Option<String> {
+fn resolve_pane_id(agents: &[herdr::AgentInfo], target: &str) -> Option<String> {
     if let Some(a) = agents.iter().find(|a| a.name.as_deref() == Some(target)) {
         return Some(a.pane_id.clone());
     }
@@ -33449,7 +33449,7 @@ fn cmd_internal_wait_output(
         eprintln!("flywheel: target {target} not found in {project}");
         std::process::exit(1);
     };
-    match herdr_shim::pane_wait_output(
+    match herdr::pane_wait_output(
         &mut c,
         &pane_id,
         wait_output_mode(regex),
@@ -33675,8 +33675,8 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
     // for idle + retry on agent_not_idle, visible fallback, then the docs'
     // file-path fallback — so the loop's context guard still sees
     // CONTEXT_LIMIT markers mid-task.
-    let mut ops = herdr_shim::BackendAltScreenRead::new(&*backend, &target, 60);
-    let text = match alt_screen_read_ladder(&mut ops, herdr_shim::RECENT_UNWRAPPED_SOURCE) {
+    let mut ops = herdr::BackendAltScreenRead::new(&*backend, &target, 60);
+    let text = match alt_screen_read_ladder(&mut ops, herdr::RECENT_UNWRAPPED_SOURCE) {
         Ok(t) => t,
         Err(e) => return Err(anyhow!("{target}: alt-screen read failed: {e:#}")),
     };
@@ -35717,11 +35717,11 @@ fn cmd_internal_ack_overdue(
     // Same identity resolution the pings used (bd-aseq): the health mail goes
     // to the REGISTERED identity, so the ack read must be keyed by it too.
     let agent = resolve_mail_target_registry(project, name);
-    let filter = crate::mail_shim::AckOverdueFilter {
+    let filter = crate::mail::AckOverdueFilter {
         sla_secs,
         thread_id: thread.map(String::from),
     };
-    let found = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+    let found = crate::mail::Mail::from_config(Some(&cfg.toron_mail_config()))
         .and_then(|m| {
             m.ok_or_else(|| anyhow!("no mail backend configured (embedded toron unavailable)"))
         })
@@ -35732,7 +35732,7 @@ fn cmd_internal_ack_overdue(
             "project": project,
             "agent": agent,
             "thread_id": thread,
-            "sla_secs": sla_secs.unwrap_or(crate::mail_shim::ACK_SLA_DEFAULT_SECS),
+            "sla_secs": sla_secs.unwrap_or(crate::mail::ACK_SLA_DEFAULT_SECS),
             "count": rows.len(),
             "messages": rows,
         })),
@@ -37235,8 +37235,8 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
     // bd-harness-alt-screen-reads (H4): route through the alt-screen ladder
     // (recent-unwrapped → wait+retry on agent_not_idle → visible → file
     // fallback); still soft on failure — the health mail goes out regardless.
-    let mut ops = herdr_shim::BackendAltScreenRead::new(&*backend, name, 80);
-    match alt_screen_read_ladder(&mut ops, herdr_shim::RECENT_UNWRAPPED_SOURCE) {
+    let mut ops = herdr::BackendAltScreenRead::new(&*backend, name, 80);
+    match alt_screen_read_ladder(&mut ops, herdr::RECENT_UNWRAPPED_SOURCE) {
         Ok(v) => {
             tail = v;
             if tail.len() > 4000 {
@@ -37375,7 +37375,7 @@ fn cmd_internal_renew_leases(cfg: &Config, project: &str, extend_seconds: u64) -
             "new_expires_ts": r.expires_ts_us.map(|u| u.to_string()).unwrap_or_default(),
         })).collect::<Vec<_>>(),
     });
-    let reservations = crate::mail_shim::list_own_reservations(&envelope);
+    let reservations = crate::mail::list_own_reservations(&envelope);
     print_json(&json!({
         "ok": true,
         "renewed": v.renewed,
@@ -38112,7 +38112,7 @@ fn cmd_serve(_cfg: &Config, _port: u16) -> Result<()> {
 #[cfg(test)]
 mod wait_output_tests {
     use super::*;
-    use crate::herdr_shim::{AgentInfo, PaneWaitResult};
+    use crate::herdr::{AgentInfo, PaneWaitResult};
 
     fn agent(name: Option<&str>, pane: &str) -> AgentInfo {
         AgentInfo {
@@ -39805,7 +39805,7 @@ steps:
 #[cfg(test)]
 mod bd_bvwf1_orphan_workspaces {
     use super::{WorkspaceOrigin, classify_workspace_origin, partition_workspaces};
-    use crate::herdr_shim::{AgentInfo, WorkspaceInfo};
+    use crate::herdr::{AgentInfo, WorkspaceInfo};
 
     fn ws(id: &str, label: &str) -> WorkspaceInfo {
         serde_json::from_value(serde_json::json!({
@@ -41665,8 +41665,8 @@ mod adr0010_d1_tests {
 mod product_digest_tests {
     use super::*;
 
-    fn pd_mail() -> mail_shim::Mail {
-        mail_shim::Mail::from_config(None)
+    fn pd_mail() -> mail::Mail {
+        mail::Mail::from_config(None)
             .expect("mail ok")
             .expect("mail Some")
     }
@@ -41675,13 +41675,13 @@ mod product_digest_tests {
         format!("pd-{tag}-{}", std::process::id())
     }
 
-    fn pd_register(mail: &mail_shim::Mail, project: &str, pin: &str) {
+    fn pd_register(mail: &mail::Mail, project: &str, pin: &str) {
         mail.ensure_project(project).expect("ensure member");
         mail.register_fixture(project, pin, "flywheel", "m", "t")
             .expect("register pin");
     }
 
-    fn pd_seed(mail: &mail_shim::Mail, project: &str, pin: &str, subject: &str) {
+    fn pd_seed(mail: &mail::Mail, project: &str, pin: &str, subject: &str) {
         let sender = mail.clone().with_name(pin.to_string());
         sender
             .send(
@@ -41696,7 +41696,7 @@ mod product_digest_tests {
             .expect("seed mail");
     }
 
-    fn pd_product(mail: &mail_shim::Mail, key: &str, members: &[String]) {
+    fn pd_product(mail: &mail::Mail, key: &str, members: &[String]) {
         mail.ensure_product(key, None).expect("ensure product");
         for m in members {
             mail.products_link(key, m).expect("link member");
@@ -41798,7 +41798,7 @@ mod product_digest_tests {
         // One key across members, never a second: the fold copies the
         // EXISTING key file (whois profiles stay the member's own
         // onboarding — a read verb never publishes those).
-        let (data_dir, _) = mail_shim::built_mailbox_roots();
+        let (data_dir, _) = mail::built_mailbox_roots();
         let key_of = |p: &str| {
             std::fs::read(
                 data_dir

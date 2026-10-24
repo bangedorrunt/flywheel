@@ -9,7 +9,7 @@
 //! (removed); behavioral deltas are marked DELTA with their reason.
 
 use crate::config::Config;
-use crate::herdr_shim::{Client, StreamOutcome, Subscription};
+use crate::herdr::{Client, StreamOutcome, Subscription};
 use crate::{config, doorbell, state, workspace};
 use doorbell_rt::{BrainMsg, Effect, FileStore, Host};
 use std::collections::{HashMap, HashSet};
@@ -319,7 +319,7 @@ impl RtHost {
                 return;
             };
             let subs = Subscription::agent_status_changed_many(attempt_ids.iter().cloned());
-            match crate::herdr_shim::subscribe(&mut sub_client, &subs) {
+            match crate::herdr::subscribe(&mut sub_client, &subs) {
                 Ok(s) => {
                     stream = Some(s);
                     break;
@@ -358,8 +358,8 @@ impl RtHost {
                 match stream.read_outcome() {
                     Ok(StreamOutcome::Event(ev)) => {
                         let ev = *ev;
-                        if let crate::herdr_shim::HerdrEventData::PaneAgentStatusChanged(change)
-                        | crate::herdr_shim::HerdrEventData::PaneAgentStatusChangedSub(
+                        if let crate::herdr::HerdrEventData::PaneAgentStatusChanged(change)
+                        | crate::herdr::HerdrEventData::PaneAgentStatusChangedSub(
                             change,
                         ) = ev.data
                         {
@@ -456,7 +456,7 @@ fn reconcile_status_after_events_lost(
 /// Pull AgentInfo rows out of a session.snapshot payload when present.
 fn agents_from_session_snapshot(
     snap: &serde_json::Value,
-) -> Option<Vec<crate::herdr_shim::AgentInfo>> {
+) -> Option<Vec<crate::herdr::AgentInfo>> {
     // Common shapes: { agents: [...] } or { panes: [...] } with agent fields,
     // or nested under tabs. Prefer an agents array; else try panes.
     if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {
@@ -654,11 +654,11 @@ impl Host for RtHost {
     }
 
     fn scan_ack_sla(&mut self) -> Vec<String> {
-        let Some(mb) = crate::mail_shim::try_mailbox() else {
+        let Some(mb) = crate::mail::try_mailbox() else {
             return Vec::new();
         };
         match crate::backend::run_mail_off_runtime_sync(|| {
-            crate::mail_shim::block_on(mb.check_ack_sla_expired(&self.project, None))
+            crate::mail::block_on(mb.check_ack_sla_expired(&self.project, None))
         }) {
             Ok(emitted) if emitted.is_empty() => Vec::new(),
             Ok(emitted) => {
@@ -725,7 +725,7 @@ impl Host for RtHost {
         // ticks Presence per row; hear derives after). The path is toron's
         // canonical root-level projection (`mailbox_root` lift, bd-m5ym) —
         // the projects-level file is never written and starves the map.
-        let path = crate::mail_shim::presence_path();
+        let path = crate::mail::presence_path();
         let Ok(body) = std::fs::read_to_string(&path) else {
             return Vec::new();
         };
@@ -831,10 +831,10 @@ impl RtHost {
         // In-process mail `block_on`s the shared mail runtime inside
         // `inbox_filtered`; this is called from the brain's runtime thread.
         crate::backend::run_mail_off_runtime_sync(|| {
-            let mail = crate::mail_shim::Mail::from_config(Some(&self.cfg.toron_mail_config()))
+            let mail = crate::mail::Mail::from_config(Some(&self.cfg.toron_mail_config()))
                 .ok()
                 .flatten()?;
-            let filter = crate::mail_shim::MailInboxFilter {
+            let filter = crate::mail::MailInboxFilter {
                 since_ts: Some(since.to_string()),
                 limit: 50,
                 include_bodies: true,
@@ -1193,13 +1193,13 @@ fn spawn_bus_watch(
     died_bell: std::sync::Arc<doorbell_rt::DiedBell>,
 ) -> bool {
     (|| -> Option<()> {
-        let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()))
+        let _mail = crate::mail::Mail::from_config(Some(&cfg.toron_mail_config()))
             .ok()
             .flatten()?;
         // Remote-daemon mail has no in-process mailbox (`mailbox()` panics
         // there): no bus to watch, so the caller falls back to the wake socket.
-        let mb = crate::mail_shim::try_mailbox()?;
-        let bus = crate::mail_shim::block_on(async {
+        let mb = crate::mail::try_mailbox()?;
+        let bus = crate::mail::block_on(async {
             Ok::<std::sync::Arc<dyn toron_core::bus::Bus>, anyhow::Error>(mb.bus().clone())
         })
         .ok()?;
@@ -1218,7 +1218,7 @@ fn spawn_bus_watch(
                 ])
                 .hashtag(project)
         };
-        let mut sub = crate::mail_shim::block_on(bus.subscribe_trusted(filter)).ok()?;
+        let mut sub = crate::mail::block_on(bus.subscribe_trusted(filter)).ok()?;
         // GS062-ADV-4: stamp on hosting thread before nesting the reader.
         let mut stamps =
             doorbell_rt::watchbeat::spawn_stamp_threads(config::state_dir(), workspace.to_string());
@@ -1226,7 +1226,7 @@ fn spawn_bus_watch(
             // GS-062: mirror child watch — touch_event on each Event; stoppable
             // 1s touch_heartbeat while the subscription lives (never conflate).
             loop {
-                let ev_opt = crate::mail_shim::block_on(sub.next());
+                let ev_opt = crate::mail::block_on(sub.next());
                 match ev_opt {
                     Some(toron_core::bus::SubscriptionEvent::Event(e)) => {
                         let tags: Vec<Vec<String>> =
@@ -1340,7 +1340,7 @@ mod parity_tests {
     #[test]
     fn embedded_vs_daemon_journal_parity() {
         // Plain sync test: hosts construct on the main thread, OUTSIDE
-        // any runtime — mail_shim::block_on panics nested inside one.
+        // any runtime — mail::block_on panics nested inside one.
         // Each side runs SEQUENTIALLY under its own XDG state tree with
         // identical fixture files: sweep drains are destructive
         // (files deleted after read), so concurrent sides race.
@@ -1739,7 +1739,7 @@ mod off_runtime_tests {
     fn host_mail_methods_do_not_nest_block_on_inside_a_runtime() {
         let _home = crate::config::test_state_home();
         // In-process mail (no [mail.toron] url); built OUTSIDE any runtime.
-        let _mail = crate::mail_shim::Mail::from_config(None)
+        let _mail = crate::mail::Mail::from_config(None)
             .expect("in-process mail")
             .expect("some");
         let (tx, _rx) = mpsc::channel(8);
@@ -1786,7 +1786,7 @@ mod off_runtime_tests {
             }),
             ..Default::default()
         };
-        let _mail = crate::mail_shim::Mail::from_config(Some(&cfg.toron_mail_config()));
+        let _mail = crate::mail::Mail::from_config(Some(&cfg.toron_mail_config()));
         let rt = tokio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
             let _ = build_index(&cfg, &project);
@@ -1799,7 +1799,7 @@ mod off_runtime_tests {
     #[test]
     fn the_embedded_doorbell_starts_and_stays_up_with_in_process_mail() {
         let _home = crate::config::test_state_home();
-        let _mail = crate::mail_shim::Mail::from_config(None)
+        let _mail = crate::mail::Mail::from_config(None)
             .expect("in-process mail")
             .expect("some");
         let ws = "offrt-embedded";

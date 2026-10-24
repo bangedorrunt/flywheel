@@ -49,7 +49,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::state_dir;
-use crate::herdr_shim::AgentStatus;
+use crate::herdr::AgentStatus;
 
 /// Current `loops.json` schema version (bd-loop-state-schema-v3 — MailHealth).
 pub const LOOPS_SCHEMA_VERSION: u32 = 3;

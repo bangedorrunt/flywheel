@@ -401,7 +401,7 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             // contract (stable keys + types); the default dump stays
             // byte-identical to before.
             print_json(&if *json {
-                crate::mail_shim::inbox_json_rows(&v)
+                crate::mail::inbox_json_rows(&v)
             } else {
                 v
             });
@@ -467,7 +467,7 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
                 &key,
                 query,
                 *limit,
-                &crate::mail_shim::MailSearchFilter {
+                &crate::mail::MailSearchFilter {
                     sender: sender.clone(),
                     importance: importance.clone(),
                     thread_id: thread_id.clone(),
@@ -520,7 +520,7 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             // bd-register-portability-3c2b: never mint an unnamed identity.
             let mut decided = crate::resolve_register_name(name.clone(), from_project.as_deref())?;
             if let Some(adopt) = adopt_unnamed.as_deref() {
-                let (data_dir, _) = crate::mail_shim::mailbox_roots();
+                let (data_dir, _) = crate::mail::mailbox_roots();
                 crate::adopt_unnamed_key(&data_dir, project, adopt)?;
                 if decided.is_empty() {
                     decided = adopt.to_string();
@@ -540,7 +540,7 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             if let Some(from) = from_project.as_deref()
                 && from != project
             {
-                let (data_dir, _) = crate::mail_shim::mailbox_roots();
+                let (data_dir, _) = crate::mail::mailbox_roots();
                 crate::bind_source_key(&data_dir, from, project, &decided)?;
             }
             let v = mail.register_agent(
@@ -849,8 +849,8 @@ pub(crate) fn cmd_mail(cfg: &Config, cmd: &MailCmd) -> Result<()> {
             mail.ensure_project(&key)?;
             // ADR-0010 D8 (bd-d8e4): look the receipt up FIRST — the resend is
             // only safe while the corr is genuinely outstanding.
-            let receipt = crate::mail_shim::block_on(async {
-                let mb = crate::mail_shim::try_mailbox()
+            let receipt = crate::mail::block_on(async {
+                let mb = crate::mail::try_mailbox()
                     .ok_or_else(|| anyhow::anyhow!("no in-process toron mailbox"))?;
                 let store = mb
                     .receipt_store()
@@ -1129,7 +1129,7 @@ pub(crate) fn project_agent_keys_dir(project: &str) -> std::path::PathBuf {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(project);
-    crate::mail_shim::mailbox_roots()
+    crate::mail::mailbox_roots()
         .0
         .join(slug)
         .join("agents")

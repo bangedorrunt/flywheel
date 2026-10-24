@@ -10,7 +10,7 @@ use clap::Subcommand;
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::herdr_shim::Client;
+use crate::herdr::Client;
 use crate::output::print_json;
 
 #[derive(Subcommand)]
@@ -47,10 +47,10 @@ pub(crate) fn cmd_agent(cfg: &Config, cmd: &AgentCmd) -> Result<()> {
 /// name-vs-identity ladder `status` uses, so a numbered herdr name (oc2/pi2)
 /// still resolves to its pin. Pure over its inputs.
 fn pin_pane<'a>(
-    panes: &'a [crate::herdr_shim::PaneInfo],
+    panes: &'a [crate::herdr::PaneInfo],
     registry: &[crate::state::SpawnEntry],
     pin: &str,
-) -> Option<&'a crate::herdr_shim::PaneInfo> {
+) -> Option<&'a crate::herdr::PaneInfo> {
     if let Some(pane) = panes.iter().find(|p| {
         p.tokens.get("toron_pin").and_then(Value::as_str) == Some(pin)
             || p.display_agent.as_deref() == Some(pin)
@@ -118,7 +118,7 @@ fn cmd_agent_tail(
             pane.pane_id
         );
     };
-    let tail = crate::herdr_shim::read_agent_session_tail(session, n)?;
+    let tail = crate::herdr::read_agent_session_tail(session, n)?;
     if json_out || !std::io::stdout().is_terminal() {
         print_json(&json!({
             "pin": pin,

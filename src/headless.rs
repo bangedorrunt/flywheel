@@ -1312,7 +1312,7 @@ mod tests {
 /// in-session `/models` (https://opencode.ai/v2/docs/models/). opencode
 /// merges config sources rather than replacing them, so the pin travels as a
 /// per-pane `OPENCODE_CONFIG_CONTENT` document — see
-/// [`crate::herdr_shim::apply_opencode_model_pin`].
+/// [`crate::herdr::apply_opencode_model_pin`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractiveModelPlan {
     /// The harness takes the model as argv. `args` are appended to the launch.

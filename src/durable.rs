@@ -16124,19 +16124,19 @@ mod tests {
     }
 
     /// Grep acceptance: the loop path (durable.rs + the __poll_events
-    /// collector) contains no direct herdr_shim event construction — the
+    /// collector) contains no direct herdr event construction — the
     /// event stream comes via the backend trait. The scan covers the
     /// non-test source (the loop path), not this test's own strings.
     #[test]
-    fn events_primary_grep_no_herdr_shim_in_loop_path() {
+    fn events_primary_grep_no_herdr_in_loop_path() {
         let durable = include_str!("durable.rs");
         let loop_path = durable
             .split("#[cfg(test)]")
             .next()
             .expect("non-test source");
         assert!(
-            !loop_path.contains("herdr_shim"),
-            "durable.rs (the loop core) must not touch herdr_shim directly"
+            !loop_path.contains("herdr"),
+            "durable.rs (the loop core) must not touch herdr directly"
         );
         let main_src = include_str!("main.rs");
         let collect = main_src
@@ -16149,8 +16149,8 @@ mod tests {
             "collect_poll_events must obtain the stream via the backend trait"
         );
         assert!(
-            !collect.contains("herdr_shim"),
-            "collect_poll_events must not construct herdr_shim events"
+            !collect.contains("herdr"),
+            "collect_poll_events must not construct herdr events"
         );
     }
 

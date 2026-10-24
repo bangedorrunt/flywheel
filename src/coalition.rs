@@ -218,7 +218,7 @@ fn runtime() -> Result<&'static Runtime> {
 
 /// Durable mailbox roots: same XDG/D3 resolution as the mail shim.
 fn mailbox_roots() -> (PathBuf, PathBuf) {
-    crate::mail_shim::mailbox_roots()
+    crate::mail::mailbox_roots()
 }
 
 /// The coalition store: durable mailbox + bus + manifest registry.
@@ -257,7 +257,7 @@ impl CoalitionStore {
                 let pool = toron_core::index::schema::connect(&db_path).await?;
                 toron_core::index::schema::migrate(&pool)
                     .await
-                    .with_context(|| crate::mail_shim::migrate_skew_hint("coalition", &db_path))?;
+                    .with_context(|| crate::mail::migrate_skew_hint("coalition", &db_path))?;
                 let bus = InProcessBus::open(
                     pool.clone(),
                     toron_core::bus::in_process::InProcessBusConfig::default(),

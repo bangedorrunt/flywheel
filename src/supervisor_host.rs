@@ -1119,12 +1119,12 @@ impl ToronEffectJournal {
 
     /// Open `scope` on the shared comms index database.
     pub fn open(scope: &str, owner: &str) -> Result<Self> {
-        let mb = crate::mail_shim::comms_mailbox()?;
+        let mb = crate::mail::comms_mailbox()?;
         let pool = mb
             .index_pool()
             .cloned()
             .ok_or_else(|| anyhow!("supervisor journal needs the index pool"))?;
-        let rt = crate::mail_shim::runtime()?;
+        let rt = crate::mail::runtime()?;
         let db = toron_core::journal::JournalDb::new(pool, scope, 4096);
         Ok(Self::new(
             toron_core::journal::ToronJournal::spawn(db, rt.handle()),
@@ -1326,8 +1326,8 @@ impl LivePorts {
             .map(|e| e.pane_id)
     }
 
-    fn client(&self) -> Option<crate::herdr_shim::Client> {
-        crate::herdr_shim::Client::connect(Some(&self.cfg.socket_path())).ok()
+    fn client(&self) -> Option<crate::herdr::Client> {
+        crate::herdr::Client::connect(Some(&self.cfg.socket_path())).ok()
     }
 
     fn page_captain(&self, line: &str) {
@@ -1410,7 +1410,7 @@ impl Ports for LivePorts {
                 continue;
             };
             if let Some(store) = self.inbox.store().cloned() {
-                let (_, cursor) = crate::mail_shim::block_on(async move {
+                let (_, cursor) = crate::mail::block_on(async move {
                     crate::inbox_ports::head_and_cursor(&store, &npub).await
                 });
                 out.push(SupMsg::Cursor {
@@ -1874,7 +1874,7 @@ pub(crate) fn claim_with(
     opened: Option<toron_core::inbox::InboxStore>,
 ) -> Result<HostClaim> {
     let readable = match &opened {
-        Some(store) => crate::mail_shim::block_on(store.lead_of(lead_ctx)).is_ok(),
+        Some(store) => crate::mail::block_on(store.lead_of(lead_ctx)).is_ok(),
         None => false,
     };
     if forced == Some("toron") && (opened.is_none() || !readable) {
@@ -1885,7 +1885,7 @@ pub(crate) fn claim_with(
         crate::lead_claim::EpochAuthority::Fold => {
             let epoch = core.claim(me)?;
             let lead = match opened.as_ref().filter(|_| readable) {
-                Some(store) => match crate::mail_shim::block_on(
+                Some(store) => match crate::mail::block_on(
                     crate::lead_claim::append_lead_in(store, project, lead_ctx, &holder, epoch),
                 ) {
                     Ok(()) => Some(epoch),
@@ -1907,7 +1907,7 @@ pub(crate) fn claim_with(
         }
         crate::lead_claim::EpochAuthority::Toron => {
             let store = opened.context("comms store required for a lead claim")?;
-            let step = crate::mail_shim::block_on(crate::lead_claim::sync_lead_in(
+            let step = crate::mail::block_on(crate::lead_claim::sync_lead_in(
                 &store,
                 project,
                 lead_ctx,
@@ -2082,7 +2082,7 @@ fn host_loop(
     // the next round early. Dropping the channel (hints off) is the plain tick.
     let (hint_tx, hint_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let _watcher = if hc.hints {
-        let (_, index_db) = crate::mail_shim::mailbox_roots();
+        let (_, index_db) = crate::mail::mailbox_roots();
         Some(crate::supervisor_hints::Watcher::spawn(
             crate::supervisor_hints::watched_paths(&index_db, &paths.inbox),
             hint_tx,
@@ -2256,7 +2256,7 @@ fn probe_msgs(
         dead_doorbells: model.dead_doorbells.clone(),
         stale_pins: model.stale_pins.clone(),
     };
-    let presence = std::fs::read_to_string(crate::mail_shim::presence_path()).unwrap_or_default();
+    let presence = std::fs::read_to_string(crate::mail::presence_path()).unwrap_or_default();
     let rows = crate::health_page::registry_rows(cfg, project);
     let live_panes = crate::live_herdr_panes(cfg);
     for event in crate::health_page::probe_events(
@@ -2885,7 +2885,7 @@ mod tests {
     fn op_store(project: &str) -> toron_core::inbox::InboxStore {
         let dir = tempfile::tempdir().unwrap().keep();
         let db = dir.join("index.sqlite");
-        crate::mail_shim::block_on(async move {
+        crate::mail::block_on(async move {
             let pool = toron_core::index::schema::connect(&db.to_string_lossy())
                 .await
                 .unwrap();
@@ -2898,7 +2898,7 @@ mod tests {
     fn lead_row(store: &toron_core::inbox::InboxStore, project: &str) -> (String, u64) {
         let s = store.clone();
         let p = project.to_string();
-        let row = crate::mail_shim::block_on(async move { s.lead_of(&p).await })
+        let row = crate::mail::block_on(async move { s.lead_of(&p).await })
             .unwrap()
             .expect("a lead@1 row");
         (row.holder, row.sup_epoch)
@@ -2927,7 +2927,7 @@ mod tests {
         assert_ne!(holder, me, "the pid-bearing name is not the holder");
         // And the store keeps the steer (F7: from == holder at the epoch).
         let st = store.clone();
-        let kept = crate::mail_shim::block_on(async move {
+        let kept = crate::mail::block_on(async move {
             let claim = st.claim_epoch(&producer, "test").await.unwrap();
             let mut env = env;
             env.msg.epoch = claim.epoch;
@@ -3012,7 +3012,7 @@ mod tests {
             let producer = lead_holder(as_ctx);
             let mut env = steer_envelope(into, &producer, 0, NPUB, &s, None).unwrap();
             let st = store.clone();
-            crate::mail_shim::block_on(async move {
+            crate::mail::block_on(async move {
                 env.msg.epoch = st.claim_epoch(&producer, "test").await.unwrap().epoch;
                 st.append_envelope(&env).await
             })
