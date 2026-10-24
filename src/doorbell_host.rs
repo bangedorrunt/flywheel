@@ -290,12 +290,20 @@ impl RtHost {
     /// Spawn push forwarders for registry panes without coverage (bd-8hv0):
     /// late crew panes get push coverage instead of the polling fallback.
     ///
+    /// Herdr only: when another backend is selected there is no herdr pane
+    /// to subscribe, and the level-triggered ticks decide without hints
+    /// (bd-g5zs). A backend-native subscribe is a follow-up, not a silent
+    /// herdr attempt that fails every sweep.
+    ///
     /// Multiplex: one `events.subscribe` covering all uncovered crew panes
     /// (herdr/tuios per-caller stream cap). On stream death, clear covered
     /// so the next sweep re-arms. If subscribe rejects because a listed pane
     /// died, refresh the pane list and retry. `events_lost` stays TODO until
     /// toron-core surfaces it as a typed signal (see hook below).
     fn cover_new_panes(&mut self) {
+        if crate::backend::resolve_backend_name(&self.cfg) != "herdr" {
+            return;
+        }
         let registry = state::load_spawn_registry(&self.project);
         let covered = self.covered_panes.lock().unwrap_or_else(|e| e.into_inner());
         let pane_ids: Vec<(String, String)> = registry
