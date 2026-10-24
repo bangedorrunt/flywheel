@@ -16,9 +16,11 @@
 //! gated by: cargo feature `backend-superlogical` (off by default).
 //! The host box is the sync `Backend` `Result`. No elm-effect program.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
-use toron_core::backend::AgentStatus;
-use toron_core::backend::herdr::{AgentInfo, PaneInfo, WaitOptions, WorkspaceInfo};
+use toron_core::backend::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
+use toron_core::backend::{AgentStatus, BackendError, EventStream, PromptLanding};
 
 #[path = "rex_cli.rs"]
 mod rex_cli;
@@ -26,9 +28,10 @@ mod rex_cli;
 use crate::backend::MultiplexerBackend;
 use rex_cli::rex_map::{capture_format, split_direction, status_from_program_status, tail_lines};
 use rex_cli::{
-    Rex, RexBlock, RexFail, RexSession, block_close_args, capture_args, list_blocks_args, ls_args,
-    new_args, parse_blocks, parse_created_block_id, parse_created_session, parse_sessions,
-    program_status_args, run_args, split_args, write_args,
+    Rex, RexBlock, RexEventStream, RexFail, RexSession, block_close_args, capture_args,
+    events_args, list_blocks_args, ls_args, new_args, parse_blocks, parse_created_block_id,
+    parse_created_session, parse_sessions, program_status_args, rename_args, run_args,
+    send_key_args, session_kill_args, split_args, write_args,
 };
 
 /// Superlogical backend over the `rex` CLI.
@@ -252,6 +255,192 @@ impl MultiplexerBackend for SuperlogicalBackend {
             .map_err(RexFail::into_backend)?;
         Ok(json!({ "text": tail_lines(&text, lines) }))
     }
+
+    fn workspace_close(
+        &self,
+        workspace_id: &str,
+        _close_group: bool,
+    ) -> Result<(), toron_core::backend::BackendError> {
+        // A rex session is the workspace. Both close flags destroy it.
+        // `session kill` does not fall through to herdr.
+        let rex = Self::rex()?;
+        rex.text(&session_kill_args(workspace_id))
+            .map_err(RexFail::into_backend)?;
+        Ok(())
+    }
+
+    fn agent_rename(
+        &self,
+        target: &str,
+        new_name: Option<&str>,
+    ) -> Result<(), toron_core::backend::BackendError> {
+        let Some(label) = new_name.filter(|name| !name.is_empty()) else {
+            return Err(RexFail::Rejected {
+                message: "rex rename needs a label".into(),
+            }
+            .into_backend());
+        };
+        let rex = Self::rex()?;
+        let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
+        rex.text(&rename_args(
+            &session.session_id,
+            &block.block_id,
+            label,
+        ))
+        .map_err(RexFail::into_backend)?;
+        Ok(())
+    }
+
+    fn agent_send_keys(
+        &self,
+        target: &str,
+        keys: &[&str],
+    ) -> Result<(), toron_core::backend::BackendError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let rex = Self::rex()?;
+        let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
+        rex.text(&send_key_args(
+            &session.session_id,
+            &block.block_id,
+            keys,
+        ))
+        .map_err(RexFail::into_backend)?;
+        Ok(())
+    }
+
+    fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        args: &[String],
+    ) -> Result<AgentInfo, toron_core::backend::BackendError> {
+        let mut command = kind.to_string();
+        for arg in args {
+            command.push(' ');
+            command.push_str(arg);
+        }
+        self.pane_run(pane_id, &command)?;
+        if !name.is_empty() {
+            self.agent_rename(pane_id, Some(name))?;
+        }
+        let rex = Self::rex()?;
+        let (session, block) = Self::locate(&rex, pane_id).map_err(RexFail::into_backend)?;
+        let status = Self::block_status(&rex, &session.session_id, &block.block_id)
+            .unwrap_or(AgentStatus::Unknown);
+        let mut agent = agent_from(&block, &session.session_id, status);
+        if !name.is_empty() {
+            agent.name = Some(name.to_string());
+        }
+        Ok(agent)
+    }
+
+    fn agent_wait(
+        &self,
+        target: &str,
+        until: &[AgentStatus],
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentInfo, toron_core::backend::BackendError> {
+        // No timeout means one read. An open wait would never return.
+        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        loop {
+            let rex = Self::rex()?;
+            let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
+            let status = Self::block_status(&rex, &session.session_id, &block.block_id)
+                .map_err(RexFail::into_backend)?;
+            if until.is_empty() || until.contains(&status) {
+                return Ok(agent_from(&block, &session.session_id, status));
+            }
+            match deadline {
+                None => {
+                    return Err(BackendError::timeout(
+                        "rex status did not match and no timeout was set",
+                    ));
+                }
+                Some(deadline) if Instant::now() >= deadline => {
+                    return Err(BackendError::timeout(format!(
+                        "rex status {status:?} did not become {until:?}"
+                    )));
+                }
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(Duration::from_millis(20).min(left));
+                }
+            }
+        }
+    }
+
+    fn prompt_coded(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<&WaitOptions>,
+    ) -> Result<PromptLanding, toron_core::backend::BackendError> {
+        let rex = Self::rex()?;
+        let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
+        let status = Self::block_status(&rex, &session.session_id, &block.block_id)
+            .map_err(RexFail::into_backend)?;
+        if status == AgentStatus::Blocked {
+            return Ok(PromptLanding {
+                status: None,
+                code: Some("agent_blocked".into()),
+            });
+        }
+        self.prompt(target, text, wait)?;
+        if let Some(wait) = wait {
+            let agent = self.agent_wait(target, &wait.until, wait.timeout_ms)?;
+            return Ok(PromptLanding {
+                status: Some(agent.agent_status),
+                code: None,
+            });
+        }
+        Ok(PromptLanding {
+            status: Some(status),
+            code: None,
+        })
+    }
+
+    fn pane_wait_output(
+        &self,
+        pane_id: &str,
+        needle: &str,
+        timeout_ms: u64,
+    ) -> Result<Value, toron_core::backend::BackendError> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let value = self.agent_read(pane_id, "text", 0)?;
+            let text = value.get("text").and_then(Value::as_str).unwrap_or("");
+            if text.contains(needle) {
+                return Ok(value);
+            }
+            if Instant::now() >= deadline {
+                return Err(BackendError::timeout(format!(
+                    "rex output did not contain {needle:?}"
+                )));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(Duration::from_millis(20).min(left));
+        }
+    }
+
+    fn subscribe(
+        &self,
+        filters: &[Subscription],
+    ) -> Result<Box<dyn EventStream>, toron_core::backend::BackendError> {
+        let rex = Self::rex()?;
+        let panes: Vec<String> = filters
+            .iter()
+            .map(|filter| filter.pane_id.clone())
+            .filter(|id| !id.is_empty())
+            .collect();
+        let child = rex
+            .spawn(&events_args(None))
+            .map_err(RexFail::into_backend)?;
+        let stream = RexEventStream::start(child, panes).map_err(RexFail::into_backend)?;
+        Ok(Box::new(stream))
+    }
 }
 
 fn workspace_from(session: RexSession, index: usize) -> WorkspaceInfo {
@@ -416,5 +605,147 @@ esac
             !err.to_string().contains("not yet released"),
             "never a release excuse: {err}"
         );
+    }
+
+    const PARITY_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|session|block|events|capture|api|run) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    kill|rename|send-key|program_status|write) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+  esac
+done
+case "$cmd:$sub" in
+  session:kill) echo killed; exit 0 ;;
+  block:send-key) echo keyed; exit 0 ;;
+  block:rename) echo renamed; exit 0 ;;
+  events:)
+    printf '%s\n' '{"type":"session_event","payload":{"event":{"type":"terminal.program_status_changed","payload":{"block_id":"block:fake-1","record":{"state":"idle"}}}}}'
+    exit 0
+    ;;
+  block:program_status)
+    printf '%s\n' '{"records":[{"state":"idle"}]}'
+    exit 0
+    ;;
+  capture:)
+    printf '%s\n' 'ready now'
+    exit 0
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"build","creator_name":"com.superlogical.terminal"}]}'
+    exit 0
+    ;;
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-1","label":"work","pane_count":1,"tab_count":1}]}'
+    exit 0
+    ;;
+  *)
+    echo ok
+    exit 0
+    ;;
+esac
+"#;
+
+    #[test]
+    fn superlogical_matches_herdr_lifecycle_on_a_fake_rex() {
+        let guard = RexBinGuard::install(PARITY_REX);
+        let backend = SuperlogicalBackend;
+        backend
+            .workspace_close("session:fake-1", false)
+            .expect("session kill");
+        backend
+            .agent_rename("block:fake-1", Some("dusty"))
+            .expect("rename");
+        backend
+            .agent_send_keys("block:fake-1", &["enter"])
+            .expect("send-key");
+        let started = backend
+            .agent_start("dusty", "opencode", "block:fake-1", &["run".into()])
+            .expect("start");
+        assert_eq!(started.name.as_deref(), Some("dusty"));
+        let waited = backend
+            .agent_wait("block:fake-1", &[AgentStatus::Idle], Some(1_000))
+            .expect("already idle");
+        assert_eq!(waited.agent_status, AgentStatus::Idle);
+        let screen = backend
+            .pane_wait_output("block:fake-1", "ready", 1_000)
+            .expect("needle");
+        assert!(screen["text"].as_str().unwrap_or("").contains("ready"));
+        let mut stream = backend.subscribe(&[]).expect("events");
+        let event = stream.read_event().expect("line").expect("one event");
+        match event {
+            toron_core::backend::BackendEvent::AgentStatusChanged { pane, status, .. } => {
+                assert_eq!(pane.as_str(), "block:fake-1");
+                assert_eq!(status, AgentStatus::Idle);
+            }
+            other => panic!("status event, got {other:?}"),
+        }
+        let log = guard.log_text();
+        assert!(log.contains("session kill"), "{log}");
+        assert!(log.contains("send-key"), "{log}");
+        assert!(log.contains("rename"), "{log}");
+        assert!(!log.contains("herdr"), "{log}");
+    }
+
+    #[test]
+    fn superlogical_does_not_type_into_a_blocked_program() {
+        let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|api|block) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    program_status|write) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+  esac
+done
+case "$cmd:$sub" in
+  block:program_status)
+    printf '%s\n' '{"records":[{"state":"blocked","kind":"permission"}]}'
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"build"}]}'
+    ;;
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-1","label":"work"}]}'
+    ;;
+  block:write)
+    echo wrote-blocked >> @@LOG@@
+    echo '{}'
+    ;;
+  *) echo ok ;;
+esac
+"#;
+        let guard = RexBinGuard::install(script);
+        let landing = SuperlogicalBackend
+            .prompt_coded("block:fake-1", "go", None)
+            .expect("coded prompt");
+        assert_eq!(landing.status, None);
+        assert_eq!(landing.code.as_deref(), Some("agent_blocked"));
+        let log = guard.log_text();
+        assert!(!log.contains("wrote-blocked"), "{log}");
+        assert!(!log.contains(" write"), "{log}");
+    }
+
+    #[test]
+    fn superlogical_wait_times_out_without_sleeping_when_the_budget_is_zero() {
+        let guard = RexBinGuard::install(FAKE_REX);
+        let err = SuperlogicalBackend
+            .agent_wait("block:fake-1", &[AgentStatus::Idle], Some(0))
+            .expect_err("working is not idle");
+        assert_eq!(err.code(), &BackendErrorCode::Timeout, "{err}");
+        let _ = guard;
     }
 }
