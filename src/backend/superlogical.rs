@@ -748,4 +748,110 @@ esac
         assert_eq!(err.code(), &BackendErrorCode::Timeout, "{err}");
         let _ = guard;
     }
+
+    const PARITY_REMAINING_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|session|block|capture|api|run|split|new) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    kill|rename|send-key|program_status|write) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+  esac
+done
+case "$cmd:$sub" in
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-1","label":"work","pane_count":1,"tab_count":1}]}'
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"build","creator_name":"com.superlogical.terminal"}]}'
+    ;;
+  block:program_status)
+    printf '%s\n' '{"records":[{"state":"working"}]}'
+    ;;
+  block:write)
+    printf '%s\n' '{}'
+    ;;
+  capture:)
+    printf '%s\n' 'one' 'two' 'three'
+    ;;
+  split:)
+    printf '%s\n' '{"block_id":"block:fake-2","window_id":"window:fake-1"}'
+    ;;
+  run:)
+    printf '%s\n' '{}'
+    ;;
+  new:)
+    printf '%s\n' '{"session_id":"session:fake-2"}'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// The remaining trait methods go through rex with no herdr contact:
+    /// create, split, run, read, prompt, and the landed prompt_coded path.
+    #[test]
+    fn superlogical_covers_create_split_run_read_and_prompt() {
+        // Two lock domains touch process-global `REX_BIN_DIR`: `RexBinGuard`
+        // (`REX_LOCK`) and `config::lock_env` (the factory stub test sets the
+        // same var). Hold both so an interleaved empty-dir set cannot fail a
+        // mid-test locate with "not installed".
+        let _env = crate::config::lock_env();
+        let guard = RexBinGuard::install(PARITY_REMAINING_REX);
+        let backend = SuperlogicalBackend;
+
+        let workspace = backend
+            .workspace_create(Some("work2"))
+            .expect("session new");
+        assert_eq!(workspace.workspace_id, "session:fake-2");
+        assert_eq!(workspace.label, "work2");
+
+        let pane = backend
+            .pane_split("block:fake-1", "right", None)
+            .expect("split");
+        assert_eq!(pane.pane_id, "block:fake-2");
+        assert_eq!(pane.tab_id, "window:fake-1");
+        assert_eq!(pane.workspace_id, "session:fake-1");
+
+        backend.pane_run("block:fake-1", "echo hi").expect("run");
+        let err = backend
+            .pane_run("block:fake-1", "")
+            .expect_err("empty command is refused before spawn");
+        assert!(err.to_string().contains("empty"), "{err}");
+
+        let screen = backend
+            .agent_read("block:fake-1", "text", 2)
+            .expect("capture");
+        assert_eq!(screen["text"].as_str().unwrap_or(""), "two\nthree\n");
+
+        backend.prompt("block:fake-1", "hello", None).expect("write");
+        let landed = backend
+            .prompt_coded("block:fake-1", "go", None)
+            .expect("coded prompt");
+        assert_eq!(landed.status, Some(AgentStatus::Working));
+        assert_eq!(landed.code, None);
+
+        let err = backend
+            .agent_rename("block:fake-1", Some(""))
+            .expect_err("rename needs a label");
+        assert!(err.to_string().contains("label"), "{err}");
+        let err = backend
+            .pane_split("block:fake-1", "diagonal", None)
+            .expect_err("unknown direction is refused before spawn");
+        assert!(err.to_string().contains("left, right, above"), "{err}");
+
+        let log = guard.log_text();
+        for verb in ["new", "split", "run", "capture", "write", "program_status"] {
+            assert!(log.contains(verb), "{log}");
+        }
+        assert!(!log.contains("herdr"), "{log}");
+    }
 }
