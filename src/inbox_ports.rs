@@ -199,6 +199,47 @@ impl FlywheelPorts {
         Client::connect(Some(&self.cfg.socket_path())).ok()
     }
 
+    /// Pure: project a backend agent row onto the pane shape the wake rule
+    /// folds. `agent_list` (unlike `pane_list`) classifies status through
+    /// block records plus the process fallback; rex rows carry no stamped
+    /// tokens, so verification downstream takes the label path by
+    /// construction. Label prefers the agent name, falling back to display.
+    fn agent_to_pane(a: &crate::herdr::AgentInfo) -> crate::herdr::PaneInfo {
+        crate::herdr::PaneInfo {
+            pane_id: a.pane_id.clone(),
+            terminal_id: a.terminal_id.clone(),
+            workspace_id: a.workspace_id.clone(),
+            tab_id: a.tab_id.clone(),
+            focused: a.focused,
+            agent_status: a.agent_status,
+            revision: a.revision,
+            title: a.terminal_title.clone(),
+            cwd: a.cwd.clone(),
+            agent: a.agent.clone(),
+            agent_session: None,
+            display_agent: a.display_agent.clone(),
+            foreground_cwd: a.foreground_cwd.clone(),
+            label: a.name.clone().or_else(|| a.display_agent.clone()),
+            scroll: None,
+            state_labels: a.state_labels.clone(),
+            terminal_title: a.terminal_title.clone(),
+            terminal_title_stripped: None,
+            tokens: serde_json::Map::new(),
+        }
+    }
+
+    /// The host's session id on a non-herdr backend (label→id; empty when
+    /// unresolvable, which verifies nothing). Labels collide across
+    /// sessions, ids do not.
+    fn host_session_for(backend: &dyn MultiplexerBackend, workspace: &str) -> String {
+        backend
+            .workspace_list()
+            .ok()
+            .and_then(|ws| ws.into_iter().find(|w| w.label == workspace))
+            .map(|w| w.workspace_id)
+            .unwrap_or_default()
+    }
+
     /// Pure: pane state + binding for one registry entry given a listing.
     /// Found → the pane's status with its token binding; missing with the
     /// backend up → Gone; missing with it down → Unknown (never a false
@@ -499,21 +540,21 @@ impl Ports for FlywheelPorts {
             // Token verification needs no session id.
             (panes, up, String::new())
         } else {
-            // Non-herdr backends: list panes plus the host's own session id
+            // Non-herdr backends: agent rows (classified status included),
+            // projected onto the pane shape, plus the host's own session id
             // (resolved label→id; labels collide across sessions, ids do
-            // not). A backend that answers neither reads as down.
+            // not). `pane_list` leaves status Unknown by construction, which
+            // would silence every ring. A backend that answers neither reads
+            // as down.
             match crate::backend::multiplexer_backend(&self.cfg).ok() {
                 Some(b) => {
-                    let host_session = b
-                        .workspace_list()
-                        .ok()
-                        .and_then(|ws| {
-                            ws.into_iter().find(|w| w.label == self.workspace)
-                        })
-                        .map(|w| w.workspace_id)
-                        .unwrap_or_default();
-                    match b.pane_list(None).ok() {
-                        Some(panes) => (panes, true, host_session),
+                    let host_session = Self::host_session_for(&*b, &self.workspace);
+                    match b.agent_list().ok() {
+                        Some(agents) => (
+                            agents.iter().map(Self::agent_to_pane).collect(),
+                            true,
+                            host_session,
+                        ),
                         None => (Vec::new(), false, host_session),
                     }
                 }
@@ -575,27 +616,20 @@ impl Ports for FlywheelPorts {
             .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))?;
         if crate::backend::resolve_backend_name(&self.cfg) != "herdr" {
             let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;
-            let host_session = backend
-                .workspace_list()
-                .ok()
-                .and_then(|ws| ws.into_iter().find(|w| w.label == self.workspace))
-                .map(|w| w.workspace_id)
-                .unwrap_or_default();
             let p = backend
-                .pane_list(None)
+                .agent_list()
                 .ok()?
                 .into_iter()
                 .find(|p| p.pane_id == e.pane_id)?;
-            if p.tokens.contains_key(TOKEN_PIN) {
-                return Some(verify_tokens(
-                    &p.tokens,
-                    &pin,
-                    npub,
-                    &p.pane_id,
-                    &p.workspace_id,
-                ));
-            }
-            return Some(verify_rex_binding(&p, &host_session, &pin, npub));
+            // Agent rows carry no stamped tokens; rex bindings verify
+            // through the label path.
+            let pane = Self::agent_to_pane(&p);
+            return Some(verify_rex_binding(
+                &pane,
+                &Self::host_session_for(&*backend, &self.workspace),
+                &pin,
+                npub,
+            ));
         }
         let client = self.client()?;
         let p = client
@@ -1088,8 +1122,15 @@ mod tests {
         assert_eq!(state, PaneState::Working);
         assert!(bind.is_some_and(|b| b.verified));
 
-        let (state, bind) =
-            FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, "npub1other", "herdr", "w1");
+        let (state, bind) = FlywheelPorts::pane_observation(
+            &panes,
+            "w1:p1",
+            true,
+            pin,
+            "npub1other",
+            "herdr",
+            "w1",
+        );
         assert_eq!(state, PaneState::Working);
         assert!(bind.is_some_and(|b| !b.verified));
 
@@ -1182,5 +1223,49 @@ mod tests {
             "",
         );
         assert!(bind.is_some_and(|b| !b.verified));
+    }
+
+    /// The agent-to-pane projection carries the classified status, the
+    /// label for binding, and the session id — and no stamped tokens, so
+    /// projected panes always take the label path downstream.
+    #[test]
+    fn agent_projection_carries_status_label_and_session() {
+        let agent = crate::herdr::AgentInfo {
+            agent: Some("com.superlogical.terminal".to_string()),
+            agent_status: AgentStatus::Idle,
+            cwd: None,
+            display_agent: Some("TealOtter".to_string()),
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: true,
+            launch_pending: false,
+            name: Some("TealOtter".to_string()),
+            pane_id: "block:fake-1".to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: "window:fake-1".to_string(),
+            terminal_id: String::new(),
+            terminal_title: None,
+            workspace_id: "session:fake-1".to_string(),
+        };
+        let pane = FlywheelPorts::agent_to_pane(&agent);
+        assert_eq!(pane.pane_id, "block:fake-1");
+        assert_eq!(pane.agent_status, AgentStatus::Idle);
+        assert_eq!(pane.label.as_deref(), Some("TealOtter"));
+        assert_eq!(pane.workspace_id, "session:fake-1");
+        assert!(pane.tokens.is_empty());
+        let (state, bind) = FlywheelPorts::pane_observation(
+            std::slice::from_ref(&pane),
+            "block:fake-1",
+            true,
+            "TealOtter",
+            "npub1test",
+            "superlogical",
+            "session:fake-1",
+        );
+        assert_eq!(state, PaneState::Idle);
+        assert!(bind.is_some_and(|b| b.verified));
     }
 }

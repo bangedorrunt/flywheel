@@ -453,7 +453,28 @@ pub fn round(
     // The periodic full re-evaluation: level-triggered, so a lost hint or a
     // dead channel costs nothing.
     msgs.push(InboxMsg::Tick { now_ms });
+    // TEMPORARY bd-fd09 diagnostic (revert before close).
+    let _debug_round = std::env::var("FLYWHEEL_INBOX_DEBUG_ROUND").is_ok();
     let cmds = core.fold(&msgs);
+    if _debug_round {
+        for s in &obs.seen {
+            eprintln!(
+                "DBG seen pin={} head={} cursor={} pane={:?} bind={:?} urg={:?}",
+                s.pin,
+                s.head,
+                s.cursor,
+                s.pane,
+                s.bind.as_ref().map(|b| (b.verified, b.verified_by.as_str())),
+                s.urgency,
+            );
+        }
+        eprintln!(
+            "DBG model gen={} recipients={:?} cmds={:?}",
+            core.model.generation,
+            core.model.recipients.keys().collect::<Vec<_>>(),
+            cmds,
+        );
+    }
     write_binds(core, &before, ports, &mut rep);
     // Follow-up b: the budget a ring spends is persisted BEFORE the ring goes
     // out, so a crash between the two can only under-ring, never exceed it.
@@ -1329,5 +1350,111 @@ mod tests {
         assert!(!ports.contains(a) && !ports.contains(b));
         let pw = include_str!("pane_write.rs");
         assert!(pw.contains("toron_core::wake::wake_line(wm.0)"));
+    }
+
+    /// Scripted ports: canned observation, recorded rings/notices. No
+    /// filesystem, no clock, no network.
+    struct ScriptedPorts {
+        seen: Vec<Seen>,
+        rung: std::sync::Mutex<Vec<(String, u64)>>,
+        notices: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedPorts {
+        fn viewing(head: u64, cursor: u64, pane: PaneState, verified: bool) -> Self {
+            Self {
+                seen: vec![Seen {
+                    npub: "npub1test".to_string(),
+                    pin: "DustySparrow".to_string(),
+                    head,
+                    cursor,
+                    urgency: Urgency::Normal,
+                    pane,
+                    bind: Some(Bind {
+                        pane_id: "block:fake-1".to_string(),
+                        herdr_session: "session:fake-1".to_string(),
+                        verified,
+                        verified_by: "rex-label".to_string(),
+                    }),
+                }],
+                rung: std::sync::Mutex::new(Vec::new()),
+                notices: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Ports for ScriptedPorts {
+        fn observe(&mut self) -> Observation {
+            Observation {
+                seen: self.seen.clone(),
+                herdr_restarted: false,
+            }
+        }
+
+        fn reverify(&mut self, _npub: &str) -> Option<Bind> {
+            None
+        }
+
+        fn ring(
+            &mut self,
+            _npub: &str,
+            pane_id: &str,
+            wm: u64,
+            _line: &str,
+        ) -> Result<(), String> {
+            self.rung.lock().unwrap().push((pane_id.to_string(), wm));
+            Ok(())
+        }
+
+        fn fact(&mut self, _key: &str, _fact: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn notify_supervisor(&mut self, npub: &str, wm: u64, _cause: DeafCause) -> Result<(), String> {
+            self.notices
+                .lock()
+                .unwrap()
+                .push(format!("supervisor {npub} {wm}"));
+            Ok(())
+        }
+
+        fn notify_captain(&mut self, npub: &str, wm: u64, _cause: DeafCause) -> Result<(), String> {
+            self.notices
+                .lock()
+                .unwrap()
+                .push(format!("captain {npub} {wm}"));
+            Ok(())
+        }
+    }
+
+    /// AshBadger mirror: unread (41>0), verified rex-label binding, idle
+    /// pane, fresh budget. The first evaluated round must ring; then the
+    /// backoff ladder, then deaf escalation with both notices.
+    #[test]
+    fn unread_verified_idle_recipient_rings_then_goes_deaf() {
+        let mut ports = ScriptedPorts::viewing(41, 0, PaneState::Idle, true);
+        let mut core = Core::default();
+        // Round one: fresh mail, no prior ring — immediate ring at head.
+        let rep = round(&mut core, &mut ports, vec![], 1_000_000);
+        assert_eq!(rep.rings, 1, "first round rings");
+        assert_eq!(
+            *ports.rung.lock().unwrap(),
+            vec![("block:fake-1".to_string(), 41)]
+        );
+        // Backoff holds until 30s after the first ring.
+        let rep = round(&mut core, &mut ports, vec![], 1_000_000 + 29_999);
+        assert_eq!(rep.rings, 0, "backoff holds");
+        // Four more rings across the ladder, then deaf with both notices.
+        let mut at = 1_000_000 + 30_000;
+        for _ in 0..4 {
+            at += 600_000;
+            round(&mut core, &mut ports, vec![], at);
+        }
+        assert_eq!(ports.rung.lock().unwrap().len(), 5, "budget is five rings");
+        let rep = round(&mut core, &mut ports, vec![], at + 600_000);
+        let notices = ports.notices.lock().unwrap().clone();
+        assert!(notices.iter().any(|n| n.starts_with("supervisor ")), "{notices:?}");
+        assert!(notices.iter().any(|n| n.starts_with("captain ")), "{notices:?}");
+        assert_eq!(rep.deaf, 1, "deaf escalates after the budget");
     }
 }

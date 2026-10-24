@@ -949,8 +949,7 @@ pub mod rex_map {
                 r#"[{"id":"us-east","state":"working"}]"#,
                 r#"[{"id":"eu-west","state":"blocked"},{"state":"clear","id":"eu-west"}]"#,
             ] {
-                let value: Value =
-                    serde_json::from_str(records).expect("fixture is JSON");
+                let value: Value = serde_json::from_str(records).expect("fixture is JSON");
                 let live = status_from_program_status(&json!({ "records": value }));
                 assert_eq!(status_from_records(records), live, "{records}");
             }

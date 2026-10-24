@@ -886,7 +886,14 @@ esac
         assert!(err.to_string().contains("left, right, above"), "{err}");
 
         let log = guard.log_text();
-        for verb in ["new", "split", "capture", "write", "send-key", "program_status"] {
+        for verb in [
+            "new",
+            "split",
+            "capture",
+            "write",
+            "send-key",
+            "program_status",
+        ] {
             assert!(log.contains(verb), "{log}");
         }
         assert!(!log.contains("herdr"), "{log}");
@@ -1041,7 +1048,7 @@ esac
     /// Keys and close ride the matching block verbs. No herdr contact.
     #[test]
     fn rex_panes_typer_writes_then_submits() {
-        use crate::pane_write::{PaneWrite, Urgency, Wm, RexPanes, write};
+        use crate::pane_write::{PaneWrite, RexPanes, Urgency, Wm, write};
         let guard = RexBinGuard::install(TYPER_REX);
         let backend = SuperlogicalBackend;
         let typer = RexPanes(&backend);
