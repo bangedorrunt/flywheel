@@ -96,6 +96,42 @@ abandonment path.
 
 Orphan crews follow `on_captain_death` in config: `stop` (default) kills attributed children; `continue` keeps crews and the doorbell and clears the `captain` alias (mail to `captain` fails until `recover` or `adopt` rebinds); `--reap-crews` overrides unconditionally.
 
+## Disk maintenance
+
+The durable engine keeps every settled promise: `resonate serve` has no retention knob. `flywheel engine gc` bounds that store without touching pending work.
+
+```bash
+flywheel engine gc                       # count only; writes nothing
+flywheel engine gc --older-than-days 30  # same report, different horizon
+flywheel engine gc --yes                 # delete + VACUUM (the write gate)
+flywheel engine gc --db /path/resonate.db --yes --force
+```
+
+```text
+{
+  "applied": false,
+  "backup": null,
+  "cutoff_ms": 1790288011383,
+  "db": "/Users/you/.local/state/flywheel/resonate.db",
+  "hint": "pass --yes to delete",
+  "older_than_days": 30,
+  "prunable_promises": 218682,
+  "size_after": 251793408,
+  "size_before": 251793408
+}
+```
+
+What it deletes: promises with `settled_at` set before the cutoff, then their task and timeout rows through the foreign-key cascades. Pending promises are never touched. A settled promise stays when a callback row still names it as `awaited_id`, because an awaiter may not have loaded the value yet.
+
+Safety contract:
+
+- **`--yes` is the only write gate.** Without it the command reports only; `--dry-run` is the same report as an explicit flag.
+- **Backup first.** Every apply copies the store to `<db>.bak-<unix-ms>` before the transaction. The command never deletes that copy; remove it once `sqlite3 <db> "pragma integrity_check"` prints `ok`.
+- **Live-server refusal.** It refuses when the configured url is loopback and answers `/health`, or when the store was written in the last five minutes (a local engine on another port). `--force` bypasses both. That is the abandonment path, not the fix: a live engine can re-serve rows the command just deleted.
+- **VACUUM needs headroom** roughly equal to the store size while it rewrites.
+
+If it fails: a `no such table` or `no promises(settled_at, state)` error means the file is not a Resonate store this command knows, and it refuses rather than guessing. A remote `RESONATE_URL` that answers `/health` is not a refusal, because that server does not own the local file. `sqlite3` must be on PATH; the error names the install when it is missing.
+
 ## Forensics
 
 `flywheel timeline` and `flywheel audit` answer "what happened"; `flywheel checkpoint`/`resume`/`changes` answer "what moved since"; `flywheel analytics` aggregates counters. `flywheel ledger check` exits 0 only on a legal verdict for the **current** sha, and a verdict counts only when the gate row's `--note` carries `sha=<that sha>` **in full, 40 hex** (bd-u5yr) — a note-less or abbreviated row is unbound, not wrong, so it reports clean-false. Two consequences: the check is green exactly at the revision it verified (the next commit flips it back, by design), and historic unbound rows cannot be repaired in place, because br refuses a gate write on a closed bead. `flywheel ledger receipt` writes the receipt file (workers never write verdicts).

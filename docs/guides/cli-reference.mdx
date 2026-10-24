@@ -43,6 +43,7 @@ Conventions: `<p>` is the project slug. The full clap surface is `flywheel --hel
 | `artifacts` | Typed per-run records: `<run_id> [--json]`, `stitch <run_id>` |
 | `snapshot`, `checkpoint`, `resume`, `changes`, `timeline`, `audit`, `analytics`, `history` | Fleet state forensics |
 | `runs` | Runs dashboard: state, owner, per-run cost |
+| `engine` | Local Resonate store: `gc` counts or prunes settled promises older than a horizon, then VACUUMs; writes only with `--yes`, backs up first, refuses a live loopback engine without `--force` |
 | `profile`, `squad`, `model`, `slot`, `catalog`, `backend` | Identity and routing: profiles, squads (recipes/template aliases), model registry, routing slots, TUI catalog hub, backend selection (`profile show` projects `fallback`/`model_fallback`; `subscribe --project` names the auto-host pair) |
 | `worktree` | git worktree swarms (never on loop-owned beads) |
 | `guards`, `policy`, `safety` | Active policy guards, destructive-command policy, posture |
