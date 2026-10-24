@@ -4,8 +4,10 @@
 //! place the wake path touches the store, herdr and the filesystem.
 //!
 //! - observe: the spawn registry names the recipients; the in-process comms
-//!   store answers `head` and `cursor`; herdr's `pane.list` gives the pane
-//!   state and the `report_metadata` tokens the binding is verified against.
+//!   store answers `head` and `cursor`; the selected backend's `pane.list`
+//!   gives the pane state and the `report_metadata` tokens the binding is
+//!   verified against (herdr today; other backends list but cannot stamp
+//!   tokens yet, so their bindings stay unverified).
 //! - ring: the closed [`crate::pane_write::PaneWrite::WakeLine`], by pane id.
 //!   Nothing else can reach a pane from here.
 //! - facts: `bind` and `deaf` facts append to
@@ -19,6 +21,7 @@
 //!   else, including a `notify@1` whose text says "urgent", is normal.
 //!   The supervisor does not type that wake; appending is its job.
 
+use crate::backend::MultiplexerBackend;
 use crate::config::{self, Config};
 use crate::herdr::{AgentStatus, Client};
 use crate::inbox_host::{Bind, Observation, Ports, Seen};
@@ -171,6 +174,33 @@ impl FlywheelPorts {
 
     fn client(&self) -> Option<Client> {
         Client::connect(Some(&self.cfg.socket_path())).ok()
+    }
+
+    /// Pure: pane state + binding for one registry entry given a listing.
+    /// Found → the pane's status with its token binding; missing with the
+    /// backend up → Gone; missing with it down → Unknown (never a false
+    /// Gone when the backend itself is unreachable).
+    fn pane_observation(
+        panes: &[crate::herdr::PaneInfo],
+        pane_id: &str,
+        up: bool,
+        pin: &str,
+        npub: &str,
+    ) -> (PaneState, Option<Bind>) {
+        match panes.iter().find(|p| p.pane_id == pane_id) {
+            Some(p) => (
+                pane_state(p.agent_status),
+                Some(verify_tokens(
+                    &p.tokens,
+                    pin,
+                    npub,
+                    &p.pane_id,
+                    &p.workspace_id,
+                )),
+            ),
+            None if up => (PaneState::Gone, None),
+            None => (PaneState::Unknown, None),
+        }
     }
 
     fn pin_of_npub(&self, npub: &str) -> String {
@@ -426,13 +456,29 @@ impl Ports for FlywheelPorts {
     fn observe(&mut self) -> Observation {
         self.urgencies.clear();
         let registry = crate::state::load_spawn_registry(&self.project);
-        let client = self.client();
-        let herdr_restarted = client.is_some() && self.herdr_was_down;
-        self.herdr_was_down = client.is_none();
-        let panes = client
-            .as_ref()
-            .and_then(|c| c.pane_list(None).ok())
-            .unwrap_or_default();
+        // The selected backend lists panes; herdr keeps the direct client
+        // path. `up` tracks the selected backend's reachability (the field
+        // keeps its name; the fold bumps the generation fence on any flap).
+        let selected = crate::backend::resolve_backend_name(&self.cfg);
+        let (panes, up) = if selected == "herdr" {
+            let client = self.client();
+            let up = client.is_some();
+            let panes = client
+                .as_ref()
+                .and_then(|c| c.pane_list(None).ok())
+                .unwrap_or_default();
+            (panes, up)
+        } else {
+            match crate::backend::multiplexer_backend(&self.cfg)
+                .ok()
+                .and_then(|b| b.pane_list(None).ok())
+            {
+                Some(panes) => (panes, true),
+                None => (Vec::new(), false),
+            }
+        };
+        let herdr_restarted = up && self.herdr_was_down;
+        self.herdr_was_down = !up;
         let mut seen = Vec::new();
         for e in &registry {
             let Some(pin) = e.mail_identity.clone() else {
@@ -453,21 +499,7 @@ impl Ports for FlywheelPorts {
                 (head, cursor, urgency)
             });
             self.urgencies.insert(npub.clone(), urgency);
-            let pane = panes.iter().find(|p| p.pane_id == e.pane_id);
-            let (state, bind) = match pane {
-                Some(p) => (
-                    pane_state(p.agent_status),
-                    Some(verify_tokens(
-                        &p.tokens,
-                        &pin,
-                        &npub,
-                        &p.pane_id,
-                        &p.workspace_id,
-                    )),
-                ),
-                None if client.is_some() => (PaneState::Gone, None),
-                None => (PaneState::Unknown, None),
-            };
+            let (state, bind) = Self::pane_observation(&panes, &e.pane_id, up, &pin, &npub);
             seen.push(Seen {
                 npub,
                 pin,
@@ -490,6 +522,21 @@ impl Ports for FlywheelPorts {
         let e = registry
             .iter()
             .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))?;
+        if crate::backend::resolve_backend_name(&self.cfg) != "herdr" {
+            let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;
+            let p = backend
+                .pane_list(None)
+                .ok()?
+                .into_iter()
+                .find(|p| p.pane_id == e.pane_id)?;
+            return Some(verify_tokens(
+                &p.tokens,
+                &pin,
+                npub,
+                &p.pane_id,
+                &p.workspace_id,
+            ));
+        }
         let client = self.client()?;
         let p = client
             .pane_list(None)
@@ -506,7 +553,6 @@ impl Ports for FlywheelPorts {
     }
 
     fn ring(&mut self, npub: &str, pane_id: &str, wm: u64, line: &str) -> Result<(), String> {
-        let client = self.client().ok_or("herdr unreachable")?;
         let urgency = self.urgencies.get(npub).copied().unwrap_or(Urgency::Normal);
         let kind = crate::state::load_spawn_registry(&self.project)
             .into_iter()
@@ -518,16 +564,42 @@ impl Ports for FlywheelPorts {
         // than typing at a pane that cannot be poked.
         let route =
             crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
-        match ring_wake(
-            &crate::pane_write::HerdrPanes(&client),
-            pane_id,
-            wm,
-            line,
-            urgency,
-            route,
-        )? {
-            RingDone::Typed => Ok(()),
-            RingDone::NoDoor(no_door) => Err(crate::harness_caps::no_door_line(&no_door)),
+        // The typer follows the selected backend: herdr keeps the direct
+        // client typer; rex types through the backend trait (write plus
+        // Enter inside `prompt`).
+        if crate::backend::resolve_backend_name(&self.cfg) == "herdr" {
+            let client = self.client().ok_or("herdr unreachable")?;
+            return match ring_wake(
+                &crate::pane_write::HerdrPanes(&client),
+                pane_id,
+                wm,
+                line,
+                urgency,
+                route,
+            )? {
+                RingDone::Typed => Ok(()),
+                RingDone::NoDoor(no_door) => Err(crate::harness_caps::no_door_line(&no_door)),
+            };
+        }
+        #[cfg(feature = "backend-superlogical")]
+        {
+            let backend =
+                crate::backend::multiplexer_backend(&self.cfg).map_err(|e| e.to_string())?;
+            return match ring_wake(
+                &crate::pane_write::RexPanes(&*backend),
+                pane_id,
+                wm,
+                line,
+                urgency,
+                route,
+            )? {
+                RingDone::Typed => Ok(()),
+                RingDone::NoDoor(no_door) => Err(crate::harness_caps::no_door_line(&no_door)),
+            };
+        }
+        #[cfg(not(feature = "backend-superlogical"))]
+        {
+            return Err("rex backend is not compiled in".to_string());
         }
     }
 
@@ -910,5 +982,60 @@ mod tests {
         for gone in ["inbox_log", "sqlx::", "read_stream("] {
             assert!(!prod.contains(gone), "{gone} is toron's to read");
         }
+    }
+
+    fn listed_pane(id: &str, status: AgentStatus, pin: &str, npub: &str) -> crate::herdr::PaneInfo {
+        crate::herdr::PaneInfo {
+            pane_id: id.to_string(),
+            terminal_id: String::new(),
+            workspace_id: "w1".to_string(),
+            tab_id: "t1".to_string(),
+            focused: false,
+            agent_status: status,
+            revision: 0,
+            title: None,
+            cwd: None,
+            agent: None,
+            agent_session: None,
+            display_agent: None,
+            foreground_cwd: None,
+            label: None,
+            scroll: None,
+            state_labels: serde_json::Map::new(),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens: [
+                (TOKEN_PIN.to_string(), Value::String(pin.to_string())),
+                (TOKEN_NPUB.to_string(), Value::String(npub.to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    /// The wake rule's pane reading, backend-agnostic: found panes fold
+    /// status plus token binding; a missing pane is Gone only when the
+    /// backend is up, never a false Gone on an unreachable backend.
+    #[test]
+    fn pane_observation_folds_found_gone_and_unknown() {
+        let pin = "DustySparrow";
+        let npub = "npub1test";
+        let panes = vec![listed_pane("w1:p1", AgentStatus::Working, pin, npub)];
+        let (state, bind) = FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, npub);
+        assert_eq!(state, PaneState::Working);
+        assert!(bind.is_some_and(|b| b.verified));
+
+        let (state, bind) =
+            FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, "npub1other");
+        assert_eq!(state, PaneState::Working);
+        assert!(bind.is_some_and(|b| !b.verified));
+
+        let (state, bind) = FlywheelPorts::pane_observation(&panes, "w1:p9", true, pin, npub);
+        assert_eq!(state, PaneState::Gone);
+        assert_eq!(bind, None);
+
+        let (state, bind) = FlywheelPorts::pane_observation(&panes, "w1:p9", false, pin, npub);
+        assert_eq!(state, PaneState::Unknown);
+        assert_eq!(bind, None);
     }
 }

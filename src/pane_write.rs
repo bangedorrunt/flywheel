@@ -156,7 +156,7 @@ impl PaneTyper for HerdrPanes<'_> {
 // ponytail: allow(dead_code) until bd-bio8/bd-9201 select this typer.
 #[cfg(feature = "backend-superlogical")]
 #[allow(dead_code)]
-pub struct RexPanes<'a>(pub &'a crate::backend::superlogical::SuperlogicalBackend);
+pub struct RexPanes<'a>(pub &'a dyn crate::backend::MultiplexerBackend);
 
 #[cfg(feature = "backend-superlogical")]
 impl PaneTyper for RexPanes<'_> {
@@ -492,5 +492,75 @@ mod tests {
             "// c.agent_prompt(t, l, None)".to_string(),
         )];
         assert!(fence_violations(&commented).is_empty());
+    }
+
+    /// A scripted backend behind the trait object. Records prompt/keys/close
+    /// landings; every call succeeds.
+    #[cfg(feature = "backend-superlogical")]
+    struct ScriptedTyper(std::sync::Mutex<Vec<String>>);
+
+    #[cfg(feature = "backend-superlogical")]
+    impl crate::backend::MultiplexerBackend for ScriptedTyper {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn prompt(
+            &self,
+            target: &str,
+            text: &str,
+            _wait: Option<&toron_core::backend::herdr::WaitOptions>,
+        ) -> Result<serde_json::Value, toron_core::backend::BackendError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("prompt {target} {text}"));
+            Ok(serde_json::Value::Null)
+        }
+
+        fn agent_send_keys(
+            &self,
+            target: &str,
+            keys: &[&str],
+        ) -> Result<(), toron_core::backend::BackendError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("keys {target} {}", keys.join("+")));
+            Ok(())
+        }
+
+        fn pane_close(&self, pane_id: &str) -> Result<(), toron_core::backend::BackendError> {
+            self.0.lock().unwrap().push(format!("close {pane_id}"));
+            Ok(())
+        }
+    }
+
+    /// The rex typer drives any backend through the trait: prompt, keys and
+    /// close each land exactly once, in order.
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn rex_panes_drives_the_backend_trait() {
+        let backend = ScriptedTyper(std::sync::Mutex::new(Vec::new()));
+        let typer = RexPanes(&backend);
+        write(
+            &typer,
+            "block:fake-1",
+            &PaneWrite::WakeLine {
+                wm: Wm(0x7f3a),
+                urgency: Urgency::Normal,
+            },
+        )
+        .unwrap();
+        write(&typer, "block:fake-1", &PaneWrite::Interrupt).unwrap();
+        write(&typer, "block:fake-1", &PaneWrite::Exit).unwrap();
+        assert_eq!(
+            *backend.0.lock().unwrap(),
+            vec![
+                "prompt block:fake-1 ⟦toron⟧ new work (wm 7f3a) — run: toron next".to_string(),
+                "keys block:fake-1 Escape".to_string(),
+                "close block:fake-1".to_string(),
+            ]
+        );
     }
 }
