@@ -18,9 +18,11 @@
 //! `only_the_sink_types_into_panes` (below) fences the source tree: a new
 //! `agent_prompt` / `pane_send_text` call outside this file fails the build.
 
+#[cfg(feature = "backend-superlogical")]
+use crate::backend::MultiplexerBackend;
+
 /// The marker every wake line starts with (redesign §4.1).
 pub const WAKE_MARK: &str = "⟦toron⟧";
-
 /// Wake urgency (redesign §6A.4): urgent steers ring with the URGENT line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Urgency {
@@ -143,6 +145,43 @@ impl PaneTyper for HerdrPanes<'_> {
             .call_coded("pane.close", serde_json::json!({ "pane_id": pane_id }))
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("herdr pane.close {pane_id}: {e}"))
+    }
+}
+
+/// rex as the pane boundary (feature `backend-superlogical`).
+///
+/// Matches herdr submission semantics: `write` only queues bytes (proven
+/// live: text sits in the prompt buffer), so every prompt is followed by
+/// Enter. Selected by the spawn/observe lanes; until then fake-rex tests
+/// are the only callers.
+// ponytail: allow(dead_code) until bd-bio8/bd-9201 select this typer.
+#[cfg(feature = "backend-superlogical")]
+#[allow(dead_code)]
+pub struct RexPanes<'a>(pub &'a crate::backend::superlogical::SuperlogicalBackend);
+
+#[cfg(feature = "backend-superlogical")]
+impl PaneTyper for RexPanes<'_> {
+    fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
+        self.0
+            .prompt(target, line, None)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("rex block write {target}: {e}"))?;
+        // Lowercase: verified against the live server (`enter` submits).
+        self.0
+            .agent_send_keys(target, &["enter"])
+            .map_err(|e| anyhow::anyhow!("rex block send-key {target}: {e}"))
+    }
+    fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
+        self.0
+            .agent_send_keys(target, keys)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("rex block send-key {target}: {e}"))
+    }
+    fn close(&self, pane_id: &str) -> anyhow::Result<()> {
+        self.0
+            .pane_close(pane_id)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("rex block close {pane_id}: {e}"))
     }
 }
 

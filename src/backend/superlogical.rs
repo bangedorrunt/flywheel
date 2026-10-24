@@ -855,4 +855,76 @@ esac
         }
         assert!(!log.contains("herdr"), "{log}");
     }
+
+    const TYPER_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|session|block|capture|api|run|split|new|do) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    kill|rename|send-key|program_status|write|close) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+    *block.close*) sub=close ;;
+  esac
+done
+case "$cmd:$sub" in
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-1","label":"work","pane_count":1,"tab_count":1}]}'
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"build"}]}'
+    ;;
+  block:write)
+    printf '%s\n' '{"bytes_written":9}'
+    ;;
+  block:send-key)
+    printf '%s\n' 'keyed'
+    ;;
+  api:close)
+    printf '%s\n' '{"revision":1}'
+    ;;
+  block:close)
+    printf '%s\n' '{"revision":1}'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// The rex typer writes the constant line and submits it: write first,
+    /// then Enter (write-only leaves text pending in the prompt buffer).
+    /// Keys and close ride the matching block verbs. No herdr contact.
+    #[test]
+    fn rex_panes_typer_writes_then_submits() {
+        use crate::pane_write::{PaneWrite, Urgency, Wm, RexPanes, write};
+        let _env = crate::config::lock_env();
+        let guard = RexBinGuard::install(TYPER_REX);
+        let backend = SuperlogicalBackend;
+        let typer = RexPanes(&backend);
+        write(
+            &typer,
+            "block:fake-1",
+            &PaneWrite::WakeLine {
+                wm: Wm(0x7f3a),
+                urgency: Urgency::Normal,
+            },
+        )
+        .expect("wake line typed and submitted");
+        write(&typer, "block:fake-1", &PaneWrite::Interrupt).expect("escape keyed");
+        write(&typer, "block:fake-1", &PaneWrite::Exit).expect("block closed");
+        let log = guard.log_text();
+        assert!(log.contains("toron next"), "{log}");
+        let write_at = log.find("write").expect("write call");
+        let key_at = log.find("send-key").expect("enter call");
+        assert!(write_at < key_at, "write lands before Enter:\n{log}");
+        assert!(log.contains("block.close"), "{log}");
+        assert!(!log.contains("herdr"), "{log}");
+    }
 }
