@@ -156,7 +156,7 @@ use cmd::{
     PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd,
     ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
     cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
-    cmd_crew, cmd_doorbell_digest, cmd_doorbell_inject, cmd_doorbell_introduce,
+    cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
     cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
     cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_engine, cmd_history, cmd_internal_doorbell,
     cmd_judgment,
@@ -3287,6 +3287,10 @@ fn main() {
             ),
             DoorbellCmd::Subscriptions {} => cmd_doorbell_subscriptions(&cfg),
             DoorbellCmd::Unsubscribe { id } => cmd_doorbell_unsubscribe(&cfg, id),
+            DoorbellCmd::Gc {
+                older_than_days,
+                yes,
+            } => cmd_doorbell_gc(*older_than_days, *yes),
         },
         Some(Commands::LoopMode { cmd }) => match cmd {
             LoopCmd::Run {

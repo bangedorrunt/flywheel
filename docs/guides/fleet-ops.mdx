@@ -132,6 +132,18 @@ Safety contract:
 
 If it fails: a `no such table` or `no promises(settled_at, state)` error means the file is not a Resonate store this command knows, and it refuses rather than guessing. A remote `RESONATE_URL` that answers `/health` is not a refusal, because that server does not own the local file. `sqlite3` must be on PATH; the error names the install when it is missing.
 
+The doorbell audit trail is the other per-workspace growth: one `<workspace>.audit.jsonl` per workspace that ever ran a dispatcher, including the throwaway temp roots of gate runs. Rotation caps a live file at 5 MB; `doorbell gc` removes the files of workspaces nothing will serve again.
+
+```bash
+flywheel doorbell gc                     # report only; writes nothing
+flywheel doorbell gc --older-than-days 7 # same report, shorter idle horizon
+flywheel doorbell gc --yes               # delete the candidates
+```
+
+A file is a candidate only when **both** hold: no live dispatcher holds its `.pid`, and one of two death signals fires. Either the `.project` sidecar records an absolute project path that no longer exists (a finished gate run's temp root, dead immediately however recently it wrote), or the file has not been touched for `--older-than-days` (default 30). A bare project name like `flywheel` cannot be tested for existence, so it only ever expires on age. The small sibling files (`.pid`, `.gen`, `.unanswered`, `.audit.loudmiss`) are never candidates, so `doorbell status` still reports the workspace.
+
+If it fails: an empty `files` list means nothing is dead under that horizon, not that the command did nothing. `--yes` deletes the audit rows for good; `doorbell why` for that workspace then has no history, which is why the write is gated and the reason per file (`project-gone` or `idle`) is printed before you pass it.
+
 ## Forensics
 
 `flywheel timeline` and `flywheel audit` answer "what happened"; `flywheel checkpoint`/`resume`/`changes` answer "what moved since"; `flywheel analytics` aggregates counters. `flywheel ledger check` exits 0 only on a legal verdict for the **current** sha, and a verdict counts only when the gate row's `--note` carries `sha=<that sha>` **in full, 40 hex** (bd-u5yr) — a note-less or abbreviated row is unbound, not wrong, so it reports clean-false. Two consequences: the check is green exactly at the revision it verified (the next commit flips it back, by design), and historic unbound rows cannot be repaired in place, because br refuses a gate write on a closed bead. `flywheel ledger receipt` writes the receipt file (workers never write verdicts).

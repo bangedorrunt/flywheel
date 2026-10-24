@@ -23,7 +23,7 @@ Conventions: `<p>` is the project slug. The full clap surface is `flywheel --hel
 | `crew` | `preview` + lifecycle `control` (interrupt, exit, relaunch) |
 | `rebind`, `recover` | Restore name bindings; restore or respawn agents |
 | `kill` | Close the swarm: `--force`, `--force-working`, `--drain` |
-| `doorbell` | Wake plane: status, start, stop, why, digest, events, inject, subscribe, unsubscribe, afk, re-inject |
+| `doorbell` | Wake plane: status, start, stop, why, digest, events, inject, subscribe, unsubscribe, afk, re-inject; `gc` prunes dead workspaces' audit logs (writes only with `--yes`) |
 | `loop-mode` | `run\|status\|list\|prune\|doctor\|replay\|why`; `run --work` is the durable dispatcher |
 | `steer` | One compose call to done; `--direct` skips the tracker |
 | `workflow` | `list\|lint\|run\|compose\|new\|crew\|history`; `--parts` grammar lives in [workflows](./workflows) |

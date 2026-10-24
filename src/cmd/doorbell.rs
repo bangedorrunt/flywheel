@@ -155,6 +155,18 @@ pub(crate) enum DoorbellCmd {
         /// subscription id (see `subscriptions`)
         id: String,
     },
+    /// prune audit logs of workspaces no dispatcher will serve again.
+    ///
+    /// Rotation caps a live file; nothing removes one. Without `--yes` this
+    /// only reports what it would delete.
+    Gc {
+        /// also prune a quiet workspace's audit file after this many days
+        #[arg(long, default_value_t = crate::doorbell::AUDIT_PRUNE_DAYS)]
+        older_than_days: u64,
+        /// Required to delete
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// The `--as` actor of a doorbell: the ONE identity ladder (bd-05ar).
@@ -889,6 +901,52 @@ pub(crate) fn cmd_internal_doorbell(
             crate::doorbell_host::run_embedded(cfg, project, workspace)
         }
     }
+}
+
+/// `flywheel doorbell gc`: delete the audit trail of dead workspaces.
+///
+/// The candidate rule (live pid wins, vanished project path dead now, bare
+/// project name dead on age) lives in [`crate::doorbell::dead_audit_files`],
+/// so the decision is testable without deleting anything.
+pub(crate) fn cmd_doorbell_gc(older_than_days: u64, yes: bool) -> Result<()> {
+    let state_dir = crate::config::state_dir();
+    let candidates = crate::doorbell::dead_audit_files(
+        &state_dir,
+        older_than_days,
+        std::time::SystemTime::now(),
+        crate::doorbell::pid_alive,
+    );
+    let prunable_bytes: u64 = candidates.iter().map(|c| c.bytes).sum();
+    let mut freed = 0u64;
+    let mut rows = Vec::with_capacity(candidates.len());
+    for c in &candidates {
+        if yes {
+            std::fs::remove_file(&c.path)
+                .with_context(|| format!("remove {}", c.path.display()))?;
+            freed += c.bytes;
+        }
+        rows.push(serde_json::json!({
+            "workspace": c.workspace,
+            "path": c.path.display().to_string(),
+            "bytes": c.bytes,
+            "reason": c.reason,
+        }));
+    }
+    crate::output::print_json(&serde_json::json!({
+        "state_dir": state_dir.join("doorbell").display().to_string(),
+        "older_than_days": older_than_days,
+        "applied": yes,
+        "prunable_files": candidates.len(),
+        "prunable_bytes": prunable_bytes,
+        "freed_bytes": freed,
+        "files": rows,
+        "hint": if yes {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!("pass --yes to delete")
+        },
+    }));
+    Ok(())
 }
 
 #[cfg(test)]

@@ -152,8 +152,13 @@ pub fn pid_alive(pid: u32) -> bool {
     if pid <= 1 {
         return false;
     }
+    // Silence both streams: a dead pid is the common answer, and a reporting
+    // command that probes a hundred of them must not spew `kill: no such
+    // process` per row (doorbell-rt and doorbell-cli already do this).
     Command::new("kill")
         .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -1253,6 +1258,82 @@ pub fn audit_append(state_dir: &Path, workspace: &str, entry: serde_json::Value)
     // rotation (5 MB / 4k lines) instead of trusting the append path to be
     // bounded; before this, a single workspace audit file reached 17 MB.
     doorbell_rt::file_host::rotate_audit_if_oversized(&path);
+}
+
+/// Idle horizon for [`dead_audit_files`] when no explicit one is given.
+pub const AUDIT_PRUNE_DAYS: u64 = 30;
+
+/// One audit file `doorbell gc` would delete, and why it counts as dead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadAuditFile {
+    pub workspace: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// `project-gone` or `idle`; never a guess.
+    pub reason: &'static str,
+}
+
+/// Audit logs owned by workspaces no dispatcher will serve again.
+///
+/// Rotation bounds a LIVE file, but nothing here is ever removed: one
+/// `.audit.jsonl` per workspace that ever ran a dispatcher, including the
+/// throwaway temp roots of finished gate runs. This finds those, and only
+/// those. A workspace is dead when no live dispatcher holds its pid AND
+///
+/// - its `.project` sidecar is an absolute path that no longer exists (a
+///   temp root from a finished gate run), or
+/// - the file has not been written for `horizon_days`.
+///
+/// A bare project name (`flywheel`), which is how `doorbell start` records a
+/// human project, cannot be tested for existence, so it only ever prunes on
+/// age. Deleting a live diagnostic is worse than keeping a few MB.
+pub fn dead_audit_files(
+    state_dir: &Path,
+    horizon_days: u64,
+    now: std::time::SystemTime,
+    alive: impl Fn(u32) -> bool,
+) -> Vec<DeadAuditFile> {
+    let dir = state_dir.join("doorbell");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let horizon = std::time::Duration::from_secs(horizon_days.saturating_mul(86_400));
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(workspace) = name.strip_suffix(".audit.jsonl") else {
+            continue;
+        };
+        let path = entry.path();
+        // A dispatcher that still holds its pid owns the file, however old it
+        // looks; only a dead or absent pid makes the workspace a candidate.
+        if read_pid(&pid_file(state_dir, workspace)).is_some_and(&alive) {
+            continue;
+        }
+        let Ok(md) = entry.metadata() else {
+            continue;
+        };
+        let idle = md
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > horizon);
+        let reason = match read_project_sidecar(state_dir, workspace) {
+            Some(project) if Path::new(&project).is_absolute() && !Path::new(&project).exists() => {
+                "project-gone"
+            }
+            _ if idle => "idle",
+            _ => continue,
+        };
+        out.push(DeadAuditFile {
+            workspace: workspace.to_string(),
+            path,
+            bytes: md.len(),
+            reason,
+        });
+    }
+    out.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+    out
 }
 
 // Pins addressed by this watch line: `p`/`assignee` (pin or npub) plus
@@ -4041,6 +4122,93 @@ mod bd_2zqk_health_probe_tests {
             daemon_health_probe("not-a-url").expect_err("must fail"),
             HealthProbeFailure::UnparseableUrl
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_gc_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn write_audit(dir: &Path, workspace: &str) -> PathBuf {
+        let path = audit_file(dir, workspace);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"i\":1}\n").unwrap();
+        path
+    }
+
+    /// A dispatcher that is still up owns its file, however old it looks. The
+    /// pid is the only signal that says "this workspace will be served again".
+    #[test]
+    fn a_live_dispatcher_keeps_its_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        write_audit(dir.path(), "live");
+        write_pid(&pid_file(dir.path(), "live"), 4242).unwrap();
+        let found = dead_audit_files(dir.path(), 0, SystemTime::now(), |pid| pid == 4242);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A sidecar that records an absolute project path which no longer exists
+    /// is a finished gate run's temp root. It is dead now, not in 30 days: the
+    /// workspace can never be started again.
+    #[test]
+    fn a_vanished_project_path_is_dead_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        write_audit(dir.path(), "flywheel-fw-gate-1");
+        std::fs::write(
+            project_sidecar(dir.path(), "flywheel-fw-gate-1"),
+            "/tmp/gone-forever-fw-gate-1",
+        )
+        .unwrap();
+        let found = dead_audit_files(dir.path(), 30, SystemTime::now(), |_| false);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].reason, "project-gone");
+        assert_eq!(found[0].workspace, "flywheel-fw-gate-1");
+    }
+
+    /// A bare project name (how `doorbell start` records a human project)
+    /// cannot be tested for existence, so it prunes on age only. Fresh and
+    /// quiet is kept; past the horizon it goes.
+    #[test]
+    fn a_bare_project_name_only_prunes_on_age() {
+        let dir = tempfile::tempdir().unwrap();
+        write_audit(dir.path(), "flywheel");
+        std::fs::write(project_sidecar(dir.path(), "flywheel"), "flywheel").unwrap();
+        let mtime = std::fs::metadata(audit_file(dir.path(), "flywheel"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let fresh = dead_audit_files(dir.path(), 30, mtime + Duration::from_secs(86_400), |_| {
+            false
+        });
+        assert!(
+            fresh.is_empty(),
+            "a quiet week must not delete a project log"
+        );
+
+        let idle = dead_audit_files(
+            dir.path(),
+            30,
+            mtime + Duration::from_secs(31 * 86_400),
+            |_| false,
+        );
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle[0].reason, "idle");
+    }
+
+    /// Only `.audit.jsonl` is a candidate: the small per-workspace status
+    /// files stay, so `doorbell status` still knows the workspace existed.
+    #[test]
+    fn siblings_and_other_suffixes_are_never_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        write_audit(dir.path(), "ws");
+        std::fs::write(dir.path().join("doorbell").join("ws.audit.loudmiss"), "x").unwrap();
+        std::fs::write(dir.path().join("doorbell").join("ws.gen"), "x").unwrap();
+        std::fs::write(project_sidecar(dir.path(), "ws"), "/tmp/gone-forever-ws").unwrap();
+        let found = dead_audit_files(dir.path(), 30, SystemTime::now(), |_| false);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("ws.audit.jsonl"));
     }
 }
 
