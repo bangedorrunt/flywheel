@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-24
+
+### Added
+- **Rex-first `auto` multiplexer backend with herdr transport fallback (bd-k69m).** `FLYWHEEL_BACKEND` gains `auto` (rex first, herdr on `Connect`/`Io`/`Timeout` only; semantic rejects surface loud) and `superlogical` (rex pinned, no fallback). Default is `auto` with the `backend-superlogical` feature compiled in, else `herdr`. `flywheel backend list` shows the `auto` row.
+- **Superlogical backend over the rex CLI: full trait surface (bd-z4t5, bd-ntrr, bd-i328).** All sixteen `Backend` methods (workspace/pane/agent lifecycle, prompt, wait, read, send-keys, subscribe) go through `rex`, with fake-rex tests per method and an honest `rex CLI not installed` error instead of a release excuse.
+- **RexPanes pane typer (bd-3phi).** Wake lines and prompts type through `block write` plus Enter (write alone queues without submitting, proven live), matching herdr `agent.prompt` submission semantics behind the same closed `PaneWrite` enum.
+- **One-shot Lua via `rex do` (bd-pxyq).** Handler-free scripts run with JSON results (`integrations/rex/session-snapshot.lua`); scripts with handlers would outlive the call bound and must not ride this path.
+- **Inbox observe, reverify, and ring follow the selected backend (bd-9201, bd-dbkd).** Pane liveness, binding re-verification, and the wake typer route through the factory backend with the herdr path byte-identical. Bindings verify through stamped tokens everywhere, or through the rex label plus session id (`rex-label` provenance) for unstamped blocks.
+- **OSC 7501 process fallback for silent harnesses (bd-u7rq).** Explicit records always win; an empty board folds the foreground process (agent binary is Working, a shell is at a prompt). Interactive opencode pane sessions emit working/blocked/done records; headless `opencode run` one-shots leave none.
+- **Sender wake leg follows the selected backend (bd-na7p).** Target resolution plus the RexPanes ring ride the factory backend with exactly-one-or-typed-error semantics; session ids and labels are never intermixed.
+
+### Fixed
+- **Spawn refuses non-herdr backends loudly instead of silently building herdr panes (bd-bio8).** Rex crews assemble via the rex CLI plus the project-local agent-names mirror until spawn itself is backend-aware.
+- **Rex prompt submits (bd-bio8).** `prompt`/`prompt_coded` do write plus Enter so loop sends land as turns; the typer no longer double-submits.
+- **`block rename` takes the block positionally (live-shape fix).** The builder passed a `-b` flag the CLI rejects; fakes accept anything, so only the live server guards arg shapes.
+- **Mechanical rename `herdr_shim` to `herdr` and `mail_shim` to `mail` (bd-lzmp).** No logic change.
+
 ### Added
 - **Request keys make a retried mutation converge on its slot (bd-command-receipts-zile, bd-4fgc).** `spawn`, `add`, `steer`, and `halt` accept `--request-key`. A retry with the same key reads the intent-before-dispatch row its first attempt wrote instead of dispatching again: a settled slot REPLAYS with no second effect (no second crew, no second steer run, no second halt queued), an unresolved slot refuses loudly rather than racing a fork, and the same key with another plan or payload is a typed conflict instead of handing back another request's slot. Spawn and add key the workspace label (`<label>-rk-<key>`, add namespaced with `-add` so an add row can never overwrite the swarm's spawn row); steer and halt key `<project>-steer` / `<project>-halt`, so one key never names two doors. `send` keeps its existing `--param task_id` reconcile — one spelling per door.
 

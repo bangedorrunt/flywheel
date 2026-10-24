@@ -1,8 +1,8 @@
 [package]
 name = "flywheel"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
-description = "Multi-agent swarm orchestrator on the herdr backend — NTM-parity daily loop for opencode/pi/grok"
+description = "Multi-agent swarm orchestrator on herdr and rex (Superlogical) backends — NTM-parity daily loop for opencode/pi/grok"
 license = "MIT"
 
 [workspace]
