@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
+use toron_core::backend::herdr::AgentInfo;
 use toron_core::contracts::task_v1::TaskV1;
 use toron_core::delivery::Reject;
 use toron_core::envelope::{
@@ -44,6 +45,8 @@ use toron_core::envelope::{
 use toron_core::inbox::{InboxError, InboxStore};
 use toron_core::outbox::{self, SendState};
 
+#[cfg(feature = "backend-superlogical")]
+use crate::backend::MultiplexerBackend;
 use crate::config::Config;
 use crate::pane_write::{PaneTyper, PaneWrite, Urgency, Wm};
 
@@ -687,7 +690,21 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         req.task_id,
         &req.task,
     ))?;
-    // Wake: the constant line only, to the recipient's pane.
+    // Wake: the constant line only, to the recipient's pane. Off herdr the
+    // typer and the target resolution follow the selected backend (same
+    // constant line, same no-host-rings rule); herdr keeps the path below.
+    // (Feature-gated: without the rex backend this selection cannot ring
+    // anywhere else, so the herdr path below stays the behavior.)
+    #[cfg(feature = "backend-superlogical")]
+    if crate::backend::resolve_backend_name(cfg) != "herdr" {
+        for (row, addr) in rows.iter_mut().zip(parsed.iter()) {
+            row.wake = match addr.pin() {
+                None => "no-pane (npub address; Phase 3 rings by binding)".into(),
+                Some(pin) => wake_via_backend(cfg, &store, &project, pin, &row.npub),
+            };
+        }
+        return Ok(rows);
+    }
     let mut herdr = crate::herdr::Client::connect(Some(&cfg.socket_path()));
     for (row, addr) in rows.iter_mut().zip(parsed.iter()) {
         row.wake = match (&mut herdr, addr.pin()) {
@@ -777,6 +794,61 @@ fn doorbell_owner_in(
                 || Some(ws) == inbox.as_ref()
         })
         .map(|(_, l)| l.pid)
+}
+
+/// Pure: the wake target pane for a pin from a backend listing. Mirrors
+/// `wake_target`'s exactly-one-or-typed-error contract: a pin names its
+/// block label (set by spawn/rename) or its agent name, never a substring.
+fn backend_wake_target(agents: &[AgentInfo], pin: &str) -> Result<String, String> {
+    let mut hits = agents
+        .iter()
+        .filter(|a| a.name.as_deref() == Some(pin) || a.display_agent.as_deref() == Some(pin));
+    match (hits.next(), hits.next()) {
+        (Some(a), None) => Ok(a.pane_id.clone()),
+        (None, _) => Err(format!("{pin} has no pane")),
+        (Some(_), Some(_)) => Err(format!("{pin} matches multiple panes; not ringing")),
+    }
+}
+
+/// Sender-side wake through the selected backend: resolve the pin to its
+/// block, gate on the harness door, and ring the constant line through the
+/// rex typer. String in, string out, matching the herdr arm's report
+/// shapes (`rung wm …`, skip notes, `no-pane …`, `failed: …`).
+#[cfg(feature = "backend-superlogical")]
+fn wake_via_backend(
+    cfg: &Config,
+    store: &InboxStore,
+    project: &str,
+    pin: &str,
+    npub: &str,
+) -> String {
+    let backend = match crate::backend::multiplexer_backend(cfg) {
+        Ok(b) => b,
+        Err(e) => return format!("skipped: backend unavailable ({e})"),
+    };
+    let target = match backend
+        .agent_list()
+        .map_err(|e| format!("no-pane ({e:#})"))
+        .and_then(|agents| backend_wake_target(&agents, pin))
+    {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let kind = crate::state::load_spawn_registry(project)
+        .into_iter()
+        .find(|e| e.mail_identity.as_deref() == Some(pin))
+        .and_then(|e| e.harness)
+        .unwrap_or_default();
+    match send_wake(&kind, crate::harness_caps::installed_from_env()) {
+        SendWake::Skip(note) => note,
+        SendWake::Ring => {
+            let panes = crate::pane_write::RexPanes(&*backend);
+            match crate::mail::block_on(ring(&store, &panes, &target, npub)) {
+                Ok(wm) => format!("rung wm {:x}", wm.0),
+                Err(e) => format!("failed: {e:#}"),
+            }
+        }
+    }
 }
 
 fn wake_target(c: &mut crate::herdr::Client, project: &str, pin: &str) -> Result<String> {
@@ -1470,5 +1542,53 @@ mod tests {
             .unwrap_err();
         assert!(is_payload_conflict(&kernel.to_string()), "{kernel}");
         assert!(!is_payload_conflict("stale epoch 0 < 3"));
+    }
+
+    fn listed_agent(pane: &str, name: Option<&str>, display: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            agent: None,
+            agent_status: toron_core::backend::AgentStatus::Working,
+            cwd: None,
+            display_agent: display.map(str::to_string),
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: name.map(str::to_string),
+            pane_id: pane.to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: String::new(),
+            terminal_id: String::new(),
+            terminal_title: None,
+            workspace_id: String::new(),
+        }
+    }
+
+    /// The sender wake resolves a pin to exactly one block by name or
+    /// display label: missing, case-drifted, substring, and ambiguous
+    /// addresses all refuse instead of ringing the wrong pane.
+    #[test]
+    fn backend_wake_target_matches_name_or_display_exactly_once() {
+        let one = vec![listed_agent("block:a", Some("TealOtter"), None)];
+        assert_eq!(
+            backend_wake_target(&one, "TealOtter").as_deref(),
+            Ok("block:a")
+        );
+        let via_display = vec![listed_agent("block:b", None, Some("TealOtter"))];
+        assert_eq!(
+            backend_wake_target(&via_display, "TealOtter").as_deref(),
+            Ok("block:b")
+        );
+        assert!(backend_wake_target(&[], "TealOtter").is_err());
+        assert!(backend_wake_target(&one, "tealotter").is_err());
+        assert!(backend_wake_target(&one, "Teal").is_err());
+        let two = vec![
+            listed_agent("block:a", Some("TealOtter"), None),
+            listed_agent("block:c", None, Some("TealOtter")),
+        ];
+        assert!(backend_wake_target(&two, "TealOtter").is_err());
     }
 }

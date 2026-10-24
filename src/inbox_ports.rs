@@ -81,11 +81,13 @@ pub fn verify_tokens(
 /// Pure: the binding for `pin`/`npub` from a rex block. A rex block carries
 /// no stamped tokens, so the binding is three visible facts: the block
 /// label is the pin (set by spawn/rename, the only trusted writer), the
-/// block lives in the observed session, and toron's directory maps the pin
-/// to this npub. Provenance reads `rex-label`, never `report_metadata`.
+/// block lives in the host's session, and the npub is the directory's
+/// answer for the pin. `session_id` is the rex session id, never a label:
+/// labels collide across sessions, ids do not. Provenance reads
+/// `rex-label`, never `report_metadata`.
 pub fn verify_rex_binding(
     pane: &crate::herdr::PaneInfo,
-    workspace: &str,
+    session_id: &str,
     pin: &str,
     npub: &str,
 ) -> Bind {
@@ -93,7 +95,7 @@ pub fn verify_rex_binding(
         pane_id: pane.pane_id.clone(),
         herdr_session: pane.workspace_id.clone(),
         verified: pane.label.as_deref() == Some(pin)
-            && pane.workspace_id == workspace
+            && pane.workspace_id == session_id
             && !npub.is_empty(),
         verified_by: "rex-label".to_string(),
     }
@@ -208,15 +210,18 @@ impl FlywheelPorts {
         pin: &str,
         npub: &str,
         backend_name: &str,
-        workspace: &str,
+        host_session: &str,
     ) -> (PaneState, Option<Bind>) {
         match panes.iter().find(|p| p.pane_id == pane_id) {
             Some(p) => {
                 // Stamped panes verify through tokens on every backend; an
                 // unstamped pane verifies through the rex label binding off
                 // herdr, and stays unverified on herdr exactly as before.
+                // `host_session` is the session id the host serves (resolved
+                // from its label); empty resolves against nothing, so an
+                // unresolvable host verifies nothing.
                 let bind = if backend_name != "herdr" && !p.tokens.contains_key(TOKEN_PIN) {
-                    verify_rex_binding(p, workspace, pin, npub)
+                    verify_rex_binding(p, host_session, pin, npub)
                 } else {
                     verify_tokens(&p.tokens, pin, npub, &p.pane_id, &p.workspace_id)
                 };
@@ -484,21 +489,35 @@ impl Ports for FlywheelPorts {
         // path. `up` tracks the selected backend's reachability (the field
         // keeps its name; the fold bumps the generation fence on any flap).
         let selected = crate::backend::resolve_backend_name(&self.cfg);
-        let (panes, up) = if selected == "herdr" {
+        let (panes, up, host_session) = if selected == "herdr" {
             let client = self.client();
             let up = client.is_some();
             let panes = client
                 .as_ref()
                 .and_then(|c| c.pane_list(None).ok())
                 .unwrap_or_default();
-            (panes, up)
+            // Token verification needs no session id.
+            (panes, up, String::new())
         } else {
-            match crate::backend::multiplexer_backend(&self.cfg)
-                .ok()
-                .and_then(|b| b.pane_list(None).ok())
-            {
-                Some(panes) => (panes, true),
-                None => (Vec::new(), false),
+            // Non-herdr backends: list panes plus the host's own session id
+            // (resolved label→id; labels collide across sessions, ids do
+            // not). A backend that answers neither reads as down.
+            match crate::backend::multiplexer_backend(&self.cfg).ok() {
+                Some(b) => {
+                    let host_session = b
+                        .workspace_list()
+                        .ok()
+                        .and_then(|ws| {
+                            ws.into_iter().find(|w| w.label == self.workspace)
+                        })
+                        .map(|w| w.workspace_id)
+                        .unwrap_or_default();
+                    match b.pane_list(None).ok() {
+                        Some(panes) => (panes, true, host_session),
+                        None => (Vec::new(), false, host_session),
+                    }
+                }
+                None => (Vec::new(), false, String::new()),
             }
         };
         let herdr_restarted = up && self.herdr_was_down;
@@ -530,7 +549,7 @@ impl Ports for FlywheelPorts {
                 &pin,
                 &npub,
                 &selected,
-                &self.workspace,
+                &host_session,
             );
             seen.push(Seen {
                 npub,
@@ -556,6 +575,12 @@ impl Ports for FlywheelPorts {
             .find(|e| e.mail_identity.as_deref() == Some(pin.as_str()))?;
         if crate::backend::resolve_backend_name(&self.cfg) != "herdr" {
             let backend = crate::backend::multiplexer_backend(&self.cfg).ok()?;
+            let host_session = backend
+                .workspace_list()
+                .ok()
+                .and_then(|ws| ws.into_iter().find(|w| w.label == self.workspace))
+                .map(|w| w.workspace_id)
+                .unwrap_or_default();
             let p = backend
                 .pane_list(None)
                 .ok()?
@@ -570,7 +595,7 @@ impl Ports for FlywheelPorts {
                     &p.workspace_id,
                 ));
             }
-            return Some(verify_rex_binding(&p, &self.workspace, &pin, npub));
+            return Some(verify_rex_binding(&p, &host_session, &pin, npub));
         }
         let client = self.client()?;
         let p = client
@@ -1144,5 +1169,18 @@ mod tests {
             "session:fake-1",
         );
         assert!(bind.is_some_and(|b| b.verified && b.verified_by == "report_metadata"));
+
+        // Unresolvable host session: ids never match across backends, so an
+        // empty session id verifies nothing (fail closed, never a label).
+        let (_, bind) = FlywheelPorts::pane_observation(
+            &panes,
+            "block:fake-1",
+            true,
+            pin,
+            npub,
+            "superlogical",
+            "",
+        );
+        assert!(bind.is_some_and(|b| !b.verified));
     }
 }

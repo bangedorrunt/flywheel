@@ -396,12 +396,15 @@ pub fn session_kill_args(session: &str) -> Vec<String> {
 }
 
 pub fn rename_args(session: &str, block: &str, label: &str) -> Vec<String> {
+    // `rename` takes the block positionally: no `-b` flag exists here
+    // (unlike `send`/`capture`). Verified against `rex block rename --help`
+    // and the live server — the fake accepts anything, so only the live
+    // shape guards this.
     vec![
         "block".into(),
         "rename".into(),
         "-s".into(),
         session.into(),
-        "-b".into(),
         block.into(),
         label.into(),
     ]

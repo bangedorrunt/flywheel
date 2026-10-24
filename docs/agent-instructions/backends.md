@@ -11,6 +11,16 @@ Pluggable multiplexer + mail. Spine targets traits, not concretes.
 
 Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
+## Identity vocabulary (ids never match across backends)
+
+| Term | herdr | rex | Notes |
+|------|-------|-----|-------|
+| Session id | workspace id (`w22`) | session id (`session:…`) | Opaque; compare only within one backend |
+| Session label | workspace label | session label | Human-readable; collides across sessions — never an identity |
+| Pane id | `wX:pY` | block id (`block:…`) | Opaque; compare only within one backend |
+| Agent name | herdr agent name | block label | Set by spawn/rename (the trusted writer); the wake binding checks it |
+| Binding stamp | `report_metadata` tokens | none — label plus session id | Provenance `report_metadata` vs `rex-label`; never mix the checks |
+
 ## Selection
 
 **flag > env > `.env` > `config.toml` `[backend]` > default**
