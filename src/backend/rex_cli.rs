@@ -616,45 +616,23 @@ fn bound_label(waited: Duration) -> String {
 pub mod rex_map {
     use serde_json::Value;
     use toron_core::backend::{AgentStatus, BackendEvent, PaneId};
-    use toron_core::osc7501::{ProgramState, parse_report};
+    use toron_core::osc7501::{Board, ProgramState, parse_report};
+
+    use crate::backend::rex_map::fold_status;
 
     /// Map one `program_status` payload to the trait status.
     ///
     /// OSC `idle` is at a prompt. OSC `error` is Unknown, never Done.
     /// The root record wins. With no root, any blocked child is Blocked.
     ///
-    /// ponytail: no-root, non-blocked children stay Unknown.
+    /// ponytail: no-root, non-blocked children fold newest-first.
     pub fn status_from_program_status(value: &Value) -> AgentStatus {
-        let mut root = None;
-        let mut child_blocked = false;
-        let mut any = false;
+        let mut board = Board::default();
+        let mut order: Vec<String> = Vec::new();
         for record in record_slice(value) {
-            let Some((is_root, state)) = classify(record) else {
-                continue;
-            };
-            if state == ProgramState::Clear {
-                continue;
-            }
-            any = true;
-            if is_root {
-                if root.is_none() {
-                    root = Some(map_state(state));
-                }
-            } else if state == ProgramState::Blocked {
-                child_blocked = true;
-            }
+            apply_record(&mut board, &mut order, record);
         }
-        if !any {
-            return AgentStatus::Unknown;
-        }
-        if let Some(status) = root {
-            return status;
-        }
-        if child_blocked {
-            AgentStatus::Blocked
-        } else {
-            AgentStatus::Unknown
-        }
+        fold_status(&board, &order)
     }
 
     /// Rex `--split` directions, plus the herdr words the trait already passes.
@@ -705,34 +683,49 @@ pub mod rex_map {
         }
     }
 
-    fn classify(value: &Value) -> Option<(bool, ProgramState)> {
+    /// Apply one `program_status` record to the board. Raw strings go to
+    /// the parser as-is; objects naming a raw report key (`osc`, `raw`,
+    /// `report`, `sequence`) apply the first report the parser accepts;
+    /// otherwise a `state` word renders through the same grammar, so an id
+    /// outside the OSC id grammar drops the record. Anything `parse_report`
+    /// refuses is not a record.
+    fn apply_record(board: &mut Board, order: &mut Vec<String>, value: &Value) {
         match value {
-            Value::String(raw) => from_osc(raw),
+            Value::String(raw) => {
+                if let Some(report) = parse_report(raw) {
+                    order.push(report.id.clone().unwrap_or_default());
+                    board.apply(raw);
+                }
+            }
             Value::Object(map) => {
                 for key in ["osc", "raw", "report", "sequence"] {
                     if let Some(Value::String(raw)) = map.get(key) {
-                        if let Some(parsed) = from_osc(raw) {
-                            return Some(parsed);
+                        if let Some(report) = parse_report(raw) {
+                            order.push(report.id.clone().unwrap_or_default());
+                            board.apply(raw);
+                            return;
                         }
                     }
                 }
-                let state = map.get("state")?.as_str()?;
-                if let Some(parsed) = from_osc(state) {
-                    return Some(parsed);
+                let Some(state) = map.get("state").and_then(Value::as_str) else {
+                    return;
+                };
+                if word_state(state).is_none() {
+                    return;
                 }
-                let program = word_state(state)?;
                 let id = map.get("id").and_then(Value::as_str).unwrap_or("");
-                Some((id.is_empty(), program))
+                let raw = if id.is_empty() {
+                    format!("\u{1b}]7501;state={state}\u{1b}\\")
+                } else {
+                    format!("\u{1b}]7501;state={state}:id={id}\u{1b}\\")
+                };
+                if let Some(report) = parse_report(&raw) {
+                    order.push(report.id.clone().unwrap_or_default());
+                    board.apply(&raw);
+                }
             }
-            _ => None,
+            _ => {}
         }
-    }
-
-    /// A raw OSC 7501 string. Anything `parse_report` refuses is not a record.
-    fn from_osc(raw: &str) -> Option<(bool, ProgramState)> {
-        let report = parse_report(raw)?;
-        let root = report.id.as_deref().unwrap_or("").is_empty();
-        Some((root, report.state))
     }
 
     fn word_state(raw: &str) -> Option<ProgramState> {
@@ -787,17 +780,6 @@ pub mod rex_map {
             return record.clone();
         }
         serde_json::json!({ "records": [record] })
-    }
-
-    fn map_state(state: ProgramState) -> AgentStatus {
-        match state {
-            ProgramState::Idle => AgentStatus::Idle,
-            ProgramState::Working => AgentStatus::Working,
-            ProgramState::Done => AgentStatus::Done,
-            ProgramState::Blocked => AgentStatus::Blocked,
-            // error is a failure. Mapping it to Done would prove completion.
-            ProgramState::Error | ProgramState::Clear => AgentStatus::Unknown,
-        }
     }
 
     #[cfg(test)]
@@ -864,6 +846,29 @@ pub mod rex_map {
                 "records": [osc("state=idle:app=claude-code")]
             }));
             assert_eq!(idle, AgentStatus::Idle, "OSC idle is at a prompt");
+        }
+
+        /// Both folds read one policy: the live `program_status` entry and
+        /// the projector agree on every shared fixture, so herdr and rex
+        /// panes classify identically.
+        #[test]
+        fn both_folds_agree_on_shared_fixtures() {
+            use crate::backend::rex_map::status_from_records;
+            for records in [
+                r#"[]"#,
+                r#"[{"state":"error","app":"freebuff"}]"#,
+                r#"[{"state":"idle"}]"#,
+                r#"[{"state":"blocked"}]"#,
+                r#"[{"state":"working"},{"id":"eu-west","state":"blocked"}]"#,
+                r#"[{"id":"us-east","state":"working"},{"id":"eu-west","state":"blocked"}]"#,
+                r#"[{"id":"us-east","state":"working"}]"#,
+                r#"[{"id":"eu-west","state":"blocked"},{"state":"clear","id":"eu-west"}]"#,
+            ] {
+                let value: Value =
+                    serde_json::from_str(records).expect("fixture is JSON");
+                let live = status_from_program_status(&json!({ "records": value }));
+                assert_eq!(status_from_records(records), live, "{records}");
+            }
         }
     }
 }

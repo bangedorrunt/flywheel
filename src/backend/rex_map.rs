@@ -10,12 +10,10 @@
 // yet, and this is a bin crate where `pub` does not exempt dead code.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
-
 use serde_json::Value;
-use toron_core::backend::AgentStatus;
 use toron_core::backend::herdr::{PaneInfo, WorkspaceInfo};
-use toron_core::osc7501::{self, ProgramState};
+use toron_core::backend::AgentStatus;
+use toron_core::osc7501::{parse_report, Board, ProgramState};
 
 /// A Rex session is a herdr workspace; the session id is the workspace id.
 /// Its agent status is `Unknown`: a session with no records proves nothing.
@@ -78,65 +76,67 @@ pub fn status_from_records(records_json: &str) -> AgentStatus {
         Value::Array(items) => items,
         other => vec![other],
     };
-    let mut records: BTreeMap<String, ProgramState> = BTreeMap::new();
+    let mut board = Board::default();
     let mut order: Vec<String> = Vec::new();
-    for item in items {
-        let Some((id, state)) = record_state(&item) else {
-            continue;
-        };
-        // Mirrors `osc7501::Board::apply`: clear drops the record and its children.
-        if state == ProgramState::Clear {
-            if id.is_empty() {
-                records.clear();
+    for item in &items {
+        apply_record(&mut board, &mut order, item);
+    }
+    fold_status(&board, &order)
+}
+
+/// Apply one JSON record to the board. Strings are raw OSC 7501 reports;
+/// objects carrying `state` (and optionally `id`) render through the same
+/// grammar, so an id outside the OSC id grammar drops the record, same as
+/// a malformed raw string. A discarded report changes nothing.
+fn apply_record(board: &mut Board, order: &mut Vec<String>, item: &Value) {
+    // ponytail: an object record is rendered as an OSC report so `osc7501`
+    // stays the only parser. The empty id is omitted: `id=` with no value
+    // is rejected by the parser and would lose the record.
+    let raw;
+    let text = match item {
+        Value::String(text) => text.as_str(),
+        Value::Object(map) => {
+            let Some(state) = map.get("state").and_then(Value::as_str) else {
+                return;
+            };
+            let id = map.get("id").and_then(Value::as_str).unwrap_or_default();
+            raw = if id.is_empty() {
+                format!("\u{1b}]7501;state={state}\u{1b}\\")
             } else {
-                let prefix = format!("{id}/");
-                records.retain(|key, _| key != &id && !key.starts_with(&prefix));
-            }
-            continue;
+                format!("\u{1b}]7501;state={state}:id={id}\u{1b}\\")
+            };
+            raw.as_str()
         }
-        records.insert(id.clone(), state);
-        order.push(id);
+        _ => return,
+    };
+    let Some(report) = parse_report(text) else {
+        return;
+    };
+    order.push(report.id.clone().unwrap_or_default());
+    board.apply(text);
+}
+
+/// Fold one terminal's board into a single status. Pure: no I/O, no clock.
+///
+/// A root record speaks for the whole terminal, so a blocked child never
+/// hides a working root. With no root, one blocked child blocks; otherwise
+/// the newest surviving record speaks, and a cleared one is gone.
+pub(crate) fn fold_status(board: &Board, order: &[String]) -> AgentStatus {
+    if let Some(root) = board.get("") {
+        return status_of(root.state);
     }
-    // A root record speaks for the whole terminal, so a blocked child never
-    // hides a working root. With no root, one blocked child blocks; otherwise
-    // the newest surviving record speaks, and a cleared one is gone.
-    if let Some(state) = records.get("") {
-        return status_of(*state);
-    }
-    if records
-        .values()
-        .any(|state| *state == ProgramState::Blocked)
-    {
+    if order.iter().any(|id| {
+        board
+            .get(id)
+            .is_some_and(|r| r.state == ProgramState::Blocked)
+    }) {
         return AgentStatus::Blocked;
     }
     order
         .iter()
         .rev()
-        .find_map(|id| records.get(id))
-        .map_or(AgentStatus::Unknown, |state| status_of(*state))
-}
-
-/// Parse one record into `(id, state)`. The empty id is the root.
-fn record_state(item: &Value) -> Option<(String, ProgramState)> {
-    // ponytail: an object record is rendered as an OSC report so `osc7501`
-    // stays the only parser; an id outside the OSC id grammar drops the
-    // record, same as a malformed raw string. The empty id is omitted: `id=`
-    // with no value is rejected by the parser and would lose the record.
-    let raw = match item {
-        Value::String(raw) => raw.clone(),
-        Value::Object(map) => {
-            let state = map.get("state").and_then(Value::as_str)?;
-            let id = map.get("id").and_then(Value::as_str).unwrap_or_default();
-            if id.is_empty() {
-                format!("\u{1b}]7501;state={state}\u{1b}\\")
-            } else {
-                format!("\u{1b}]7501;state={state}:id={id}\u{1b}\\")
-            }
-        }
-        _ => return None,
-    };
-    let report = osc7501::parse_report(&raw)?;
-    Some((report.id.unwrap_or_default(), report.state))
+        .find_map(|id| board.get(id))
+        .map_or(AgentStatus::Unknown, |r| status_of(r.state))
 }
 
 fn status_of(state: ProgramState) -> AgentStatus {
@@ -231,5 +231,25 @@ mod tests {
         assert_eq!(pane.workspace_id, "sess-1");
         assert_eq!(pane.label.as_deref(), Some("cargo test"));
         assert_eq!(pane.tab_id, "win-2");
+    }
+
+    /// The toron-core contract this fold relies on: `herdr_status` carries
+    /// working/blocked/done and refuses idle/error/clear, so OSC idle never
+    /// reads as finished-and-seen and OSC error never reads as done.
+    #[test]
+    fn toron_osc_herdr_status_contract() {
+        use toron_core::osc7501::parse_report;
+        for (body, expected) in [
+            ("state=working:app=rex", Some(AgentStatus::Working)),
+            ("state=blocked:kind=permission", Some(AgentStatus::Blocked)),
+            ("state=done:app=rex", Some(AgentStatus::Done)),
+            ("state=idle:app=rex", None),
+            ("state=error:app=freebuff", None),
+            ("state=clear:id=eu-west", None),
+        ] {
+            let report = parse_report(&osc(body)).expect("spec-shaped report parses");
+            assert_eq!(report.herdr_status(), expected, "{body}");
+        }
+        assert!(parse_report("not a report").is_none());
     }
 }
