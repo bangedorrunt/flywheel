@@ -498,6 +498,24 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_journal_outcome_is_not_read_as_a_refusal() {
+        let msg = InboxProgram::failure(&toron_core::kernel::Failure::Unknown(
+            toron_core::kernel::AppendError::Unavailable("lost acknowledgement".into()),
+        ));
+        assert!(matches!(
+            msg,
+            InboxMsg::Failed(InboxFailure::JournalUnknown { .. })
+        ));
+        let update = InboxProgram::update(&InboxModel::default(), &msg);
+        assert!(matches!(
+            update.model.failure,
+            Some(InboxFailure::JournalUnknown { .. })
+        ));
+        // Parked: no command asks the edge to run anything again.
+        assert!(update.commands.is_empty());
+    }
+
+    #[test]
     fn the_fold_agrees_with_the_core_it_delegates_to() {
         // The program owns the SHAPE, not a second decision: the same edge
         // message folds to the same model and the same commands the core

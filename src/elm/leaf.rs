@@ -666,6 +666,17 @@ mod t4_close_tests {
     }
 
     #[test]
+    fn an_unknown_journal_outcome_is_a_defect_not_a_failure() {
+        let msg = LeafProgram::failure(&toron_core::kernel::Failure::Unknown(
+            toron_core::kernel::AppendError::Unavailable("lost acknowledgement".into()),
+        ));
+        let LeafMsg::Defected { detail } = msg else {
+            panic!("unknown outcome must not settle as a failure: {msg:?}");
+        };
+        assert!(detail.contains("unknown"), "{detail}");
+    }
+
+    #[test]
     fn leaf_cmd_carries_per_leaf_timeout() {
         let custom = LeafCmd { key: "k".into(), argv: vec![], timeout_secs: Some(5) };
         assert_eq!(leaf_watchdog(&custom), std::time::Duration::from_secs(65));
