@@ -432,6 +432,29 @@ pub fn run_args(session: &str, block: &str, command: &str) -> Vec<String> {
     ]
 }
 
+/// `rex do -e <lua> [--args <json>]`: one-shot Lua, result as JSON.
+///
+/// The script must be handler- and timer-free (see
+/// `integrations/rex/session-snapshot.lua`): `rex.on`/`rex.every` keep
+/// `rex do` running past the call bound, which the edge reports as
+/// `Interrupted`, never as a result. `--json` makes the return value
+/// machine-readable; an empty stdout is `BadOutput`, never `Null`.
+pub fn do_args(session: Option<&str>, script: &str, args_json: Option<&str>) -> Vec<String> {
+    let mut args = vec!["do".into()];
+    if let Some(session) = session.filter(|s| !s.is_empty()) {
+        args.push("-s".into());
+        args.push(session.into());
+    }
+    args.push("-e".into());
+    args.push(script.into());
+    if let Some(payload) = args_json.filter(|s| !s.is_empty()) {
+        args.push("--args".into());
+        args.push(payload.into());
+    }
+    args.push("--json".into());
+    args
+}
+
 /// `rex ls --json` is either `{"sessions":[...]}` or a bare array.
 pub fn parse_sessions(value: &Value) -> Result<Vec<RexSession>, RexFail> {
     let rows = match value {
@@ -997,6 +1020,51 @@ exit 2
         assert!(!joined.contains("session.close"), "{joined}");
         assert!(!joined.contains("session.destroy"), "{joined}");
         assert!(!joined.contains("kill"), "{joined}");
+    }
+
+    const DO_FAKE: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+for arg in "$@"; do
+  case "$arg" in
+    *herdr*) echo "refusing herdr" >&2; exit 3 ;;
+  esac
+done
+for arg in "$@"; do
+  if [ "$arg" = "do" ]; then
+    printf '%s\n' '{"label":"work","windows":1}'
+    exit 0
+  fi
+done
+echo "unexpected $*" >&2
+exit 2
+"#;
+
+    /// `rex do -e` runs one-shot Lua and answers JSON. A script with
+    /// handlers would outlive the call bound and surface as Interrupted,
+    /// so only handler-free scripts (like `session-snapshot.lua`) ride
+    /// this path.
+    #[test]
+    fn rex_do_runs_one_shot_lua_as_json() {
+        let _env = crate::config::lock_env();
+        let guard = RexBinGuard::install(DO_FAKE);
+        let rex = Rex::resolve().expect("REX_BIN_DIR/rex");
+        let value = rex
+            .json(&do_args(
+                Some("session:fake-1"),
+                "return { ok = true }",
+                Some(r#"{"limit":2}"#),
+            ))
+            .expect("do --json");
+        assert_eq!(value.get("label").and_then(Value::as_str), Some("work"));
+        let bare = rex
+            .json(&do_args(None, "return { ok = true }", None))
+            .expect("do without session or args");
+        assert_eq!(bare.get("windows").and_then(Value::as_u64), Some(1));
+        let log = guard.log_text();
+        for flag in ["do", "-e", "--args", "--json", "-s"] {
+            assert!(log.contains(flag), "{log}");
+        }
+        assert!(!log.contains("herdr"), "{log}");
     }
 
     /// A child that ignores `--timeout` is killed. That is an interruption,
