@@ -1020,12 +1020,20 @@ pub mod rex_map {
 
 /// Holds `REX_BIN_DIR` for one fake binary. Never prepends PATH, so the
 /// real rex stays off the lookup.
+///
+/// One lock domain for the process-global var: the guard holds `REX_LOCK`
+/// and then the crate-wide env lock (`lock_env`, which also pins a hermetic
+/// `XDG_STATE_HOME`), in that order everywhere. The factory feature-off
+/// test mutates the same var under `lock_env` alone, so either side waits
+/// for the other — no interleaved empty-dir reads, no deadlock (nothing
+/// takes the locks in the reverse order).
 #[cfg(test)]
 pub(crate) struct RexBinGuard {
     _dir: tempfile::TempDir,
     log: PathBuf,
     prev: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
+    _env: crate::config::TestStateHome,
 }
 
 #[cfg(test)]
@@ -1035,6 +1043,7 @@ static REX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl RexBinGuard {
     pub(crate) fn install(script: &str) -> Self {
         let _lock = REX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::config::lock_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("log");
         let script = script.replace("@@LOG@@", &shell_quote(&log));
@@ -1047,12 +1056,14 @@ impl RexBinGuard {
             log,
             prev,
             _lock,
+            _env,
         }
     }
 
     /// A directory with no `rex` file. Resolve must not search PATH.
     pub(crate) fn empty() -> Self {
         let _lock = REX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::config::lock_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var_os("REX_BIN_DIR");
         unsafe { std::env::set_var("REX_BIN_DIR", dir.path()) };
@@ -1061,6 +1072,7 @@ impl RexBinGuard {
             log: PathBuf::new(),
             prev,
             _lock,
+            _env,
         }
     }
 
@@ -1167,7 +1179,6 @@ exit 2
     /// this path.
     #[test]
     fn rex_do_runs_one_shot_lua_as_json() {
-        let _env = crate::config::lock_env();
         let guard = RexBinGuard::install(DO_FAKE);
         let rex = Rex::resolve().expect("REX_BIN_DIR/rex");
         let value = rex

@@ -837,12 +837,9 @@ esac
     /// create, split, run, read, prompt, and the landed prompt_coded path.
     #[test]
     fn superlogical_covers_create_split_run_read_and_prompt() {
-        // Two lock domains touch process-global `REX_BIN_DIR`: `RexBinGuard`
-        // (`REX_LOCK`) and `config::lock_env` (the factory feature-off test
-        // sets the
-        // same var). Hold both so an interleaved empty-dir set cannot fail a
-        // mid-test locate with "not installed".
-        let _env = crate::config::lock_env();
+        // The guard serializes `REX_BIN_DIR` globally (REX lock plus the
+        // crate-wide env lock), so no manual hold is needed or allowed
+        // here — nesting another env acquisition would self-deadlock.
         let guard = RexBinGuard::install(PARITY_REMAINING_REX);
         let backend = SuperlogicalBackend;
 
@@ -870,7 +867,9 @@ esac
             .expect("capture");
         assert_eq!(screen["text"].as_str().unwrap_or(""), "two\nthree\n");
 
-        backend.prompt("block:fake-1", "hello", None).expect("write");
+        backend
+            .prompt("block:fake-1", "hello", None)
+            .expect("write");
         let landed = backend
             .prompt_coded("block:fake-1", "go", None)
             .expect("coded prompt");
@@ -933,7 +932,6 @@ esac
     /// run verb is invoked.
     #[test]
     fn pane_run_types_and_submits_in_place() {
-        let _env = crate::config::lock_env();
         let guard = RexBinGuard::install(RUN_IN_PANE_REX);
         SuperlogicalBackend
             .pane_run("block:fake-1", "echo hi")
@@ -985,7 +983,6 @@ esac
     /// through the foreground process: an agent binary in front is Working.
     #[test]
     fn agent_list_falls_back_to_the_foreground_process() {
-        let _env = crate::config::lock_env();
         let guard = RexBinGuard::install(PROCESS_REX);
         let agents = SuperlogicalBackend.agent_list().expect("agent_list");
         assert_eq!(agents.len(), 1, "{agents:#?}");
@@ -1045,7 +1042,6 @@ esac
     #[test]
     fn rex_panes_typer_writes_then_submits() {
         use crate::pane_write::{PaneWrite, Urgency, Wm, RexPanes, write};
-        let _env = crate::config::lock_env();
         let guard = RexBinGuard::install(TYPER_REX);
         let backend = SuperlogicalBackend;
         let typer = RexPanes(&backend);
