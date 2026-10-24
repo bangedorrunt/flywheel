@@ -234,8 +234,19 @@ impl MultiplexerBackend for SuperlogicalBackend {
     ) -> Result<Value, toron_core::backend::BackendError> {
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
-        rex.json(&write_args(&session.session_id, &block.block_id, text))
-            .map_err(RexFail::into_backend)
+        let receipt = rex
+            .json(&write_args(&session.session_id, &block.block_id, text))
+            .map_err(RexFail::into_backend)?;
+        // Submission is part of prompt semantics (herdr `agent.prompt`
+        // submits): `write` only queues bytes, so a prompt without Enter
+        // would sit in the prompt buffer unread.
+        rex.text(&send_key_args(
+            &session.session_id,
+            &block.block_id,
+            &["enter"],
+        ))
+        .map_err(RexFail::into_backend)?;
+        Ok(receipt)
     }
 
     fn agent_read(
@@ -777,6 +788,9 @@ case "$cmd:$sub" in
   block:write)
     printf '%s\n' '{}'
     ;;
+  block:send-key)
+    printf '%s\n' 'keyed'
+    ;;
   capture:)
     printf '%s\n' 'one' 'two' 'three'
     ;;
@@ -850,7 +864,7 @@ esac
         assert!(err.to_string().contains("left, right, above"), "{err}");
 
         let log = guard.log_text();
-        for verb in ["new", "split", "run", "capture", "write", "program_status"] {
+        for verb in ["new", "split", "run", "capture", "write", "send-key", "program_status"] {
             assert!(log.contains(verb), "{log}");
         }
         assert!(!log.contains("herdr"), "{log}");

@@ -134,6 +134,21 @@ pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailSurface>> {
     }
 }
 
+/// bd-bio8: spawn is herdr-led (workspace.create, pane.split, agent env,
+/// doorbell subscribe all speak herdr). A non-herdr selection fails loud
+/// before any side effect instead of silently building herdr panes while
+/// the operator believes they are on rex.
+pub fn require_herdr_for_spawn(name: &str) -> Result<()> {
+    if name == "herdr" {
+        return Ok(());
+    }
+    Err(BackendError::Unsupported {
+        backend: name.to_string(),
+        method: "spawn",
+        reason: "flywheel spawn is herdr-led; set FLYWHEEL_BACKEND=herdr for spawn (rex crews assemble via the rex CLI)".to_string(),
+    })
+}
+
 /// Feature-aware error for a backend name that isn't compiled in or is unknown.
 /// The single message covers both cases: a known backend whose cargo feature is
 /// off (user must enable it) and a genuinely unknown name — both resolve the
@@ -424,5 +439,31 @@ mod tests {
             assert!(h.join().expect("thread joins"), "health() via shared Arc");
         }
         unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
+    }
+}
+
+#[cfg(test)]
+mod spawn_gate_tests {
+    use super::require_herdr_for_spawn;
+    use crate::backend::BackendError;
+
+    /// bd-bio8: herdr spawns; every other selection refuses loud before any
+    /// side effect, naming the method and the fix. No live socket needed:
+    /// the gate decides on the name alone.
+    #[test]
+    fn spawn_gate_passes_herdr_and_refuses_rex_modes() {
+        assert!(require_herdr_for_spawn("herdr").is_ok());
+        for name in ["auto", "superlogical", "nonsense"] {
+            match require_herdr_for_spawn(name) {
+                Err(BackendError::Unsupported {
+                    backend, method, ..
+                }) => {
+                    assert_eq!(backend, name);
+                    assert_eq!(method, "spawn");
+                }
+                Err(e) => panic!("expected Unsupported for {name}, got error: {e}"),
+                Ok(()) => panic!("expected Unsupported for {name}, got Ok"),
+            }
+        }
     }
 }

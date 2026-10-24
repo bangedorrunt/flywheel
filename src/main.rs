@@ -9455,6 +9455,9 @@ projects available: {}",
         }
         bail!("{msg}");
     }
+    // bd-bio8: spawn is herdr-led. Refuse a non-herdr selection before any
+    // side effect instead of silently building herdr panes.
+    crate::backend::factory::require_herdr_for_spawn(&crate::backend::resolve_backend_name(cfg))?;
     let kind_count_escape =
         opts.counts.oc.unwrap_or(0) + opts.counts.pi.unwrap_or(0) + opts.counts.gk.unwrap_or(0) > 0
             || !opts.kinds.is_empty()

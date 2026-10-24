@@ -150,10 +150,9 @@ impl PaneTyper for HerdrPanes<'_> {
 
 /// rex as the pane boundary (feature `backend-superlogical`).
 ///
-/// Matches herdr submission semantics: `write` only queues bytes (proven
-/// live: text sits in the prompt buffer), so every prompt is followed by
-/// Enter. Selected by the spawn/observe lanes; until then fake-rex tests
-/// are the only callers.
+/// `prompt` submits (the backend appends Enter: `write` only queues bytes,
+/// proven live). Selected by the spawn/observe lanes; until then fake-rex
+/// tests are the only callers.
 // ponytail: allow(dead_code) until bd-bio8/bd-9201 select this typer.
 #[cfg(feature = "backend-superlogical")]
 #[allow(dead_code)]
@@ -165,11 +164,7 @@ impl PaneTyper for RexPanes<'_> {
         self.0
             .prompt(target, line, None)
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("rex block write {target}: {e}"))?;
-        // Lowercase: verified against the live server (`enter` submits).
-        self.0
-            .agent_send_keys(target, &["enter"])
-            .map_err(|e| anyhow::anyhow!("rex block send-key {target}: {e}"))
+            .map_err(|e| anyhow::anyhow!("rex block prompt {target}: {e}"))
     }
     fn keys(&self, target: &str, keys: &[&str]) -> anyhow::Result<()> {
         self.0
