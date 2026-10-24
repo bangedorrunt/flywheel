@@ -3963,7 +3963,7 @@ pub fn audit_tail_keep(body: &str, keep: usize) -> String {
 /// first line the seek landed inside, keep the newest rows, and swap via a temp
 /// file + rename so a crash mid-rotation leaves the original intact rather than
 /// a truncated one.
-fn rotate_audit_if_oversized(path: &Path) {
+pub fn rotate_audit_if_oversized(path: &Path) {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(md) = std::fs::metadata(path) else {
         return;

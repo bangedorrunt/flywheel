@@ -1248,6 +1248,11 @@ pub fn audit_append(state_dir: &Path, workspace: &str, entry: serde_json::Value)
         line.push('\n');
         let _ = f.write_all(line.as_bytes());
     }
+    // This writer is the one that stays live for hours inside a dispatcher, so
+    // the file is the one that grows without end. Reuse the doorbell-rt tail
+    // rotation (5 MB / 4k lines) instead of trusting the append path to be
+    // bounded; before this, a single workspace audit file reached 17 MB.
+    doorbell_rt::file_host::rotate_audit_if_oversized(&path);
 }
 
 // Pins addressed by this watch line: `p`/`assignee` (pin or npub) plus
@@ -4036,5 +4041,35 @@ mod bd_2zqk_health_probe_tests {
             daemon_health_probe("not-a-url").expect_err("must fail"),
             HealthProbeFailure::UnparseableUrl
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_rotation_tests {
+    use super::*;
+
+    /// The live dispatcher appends audit rows for hours, so the file must be
+    /// byte-bounded even though `audit_append` is not the doorbell-rt store.
+    /// Before the rotation call, one workspace file reached 17 MB.
+    #[test]
+    fn audit_append_stays_under_the_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let filler = "x".repeat(900);
+        for i in 0..8_000 {
+            audit_append(
+                dir.path(),
+                "ws",
+                serde_json::json!({"i": i, "f": filler}),
+            );
+        }
+        let path = audit_file(dir.path(), "ws");
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            len <= doorbell_rt::file_host::AUDIT_MAX_BYTES + 4096,
+            "audit file is {len} bytes, over the {} byte cap",
+            doorbell_rt::file_host::AUDIT_MAX_BYTES
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"i\":7999"), "the newest row was rotated away");
     }
 }
