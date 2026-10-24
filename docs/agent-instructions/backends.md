@@ -46,7 +46,7 @@ headless `opencode run` one-shots leave no records), then the foreground
 process (`process` block method: agent binary in front is Working, a shell
 is at a prompt), then `child_exited`/`process_changed` events. `pane_run` executes in the pane on both backends (text plus Enter); a headless one-shot belongs in Lua `rex.exec`, not in `pane_run`.
 
-Manual rex crews (spawn is herdr-led and refuses): `rex new` a session, `split` blocks, `block rename` each to its pin, start the harness via the block itself, and record `pane_id`/`name`/`harness` rows in the project's `.flywheel/agent-names.json` mirror (recover/rebind read it when the registry is empty). Bindings verify through the rex label (label plus session) with provenance `rex-label`; stamped-token panes keep the token path on every backend.
+Manual rex crews (spawn is herdr-led and refuses): `rex new` a session, `split` blocks, `block rename` each to its pin, start the harness via the block itself, and record `pane_id`/`name`/`harness` rows in the project's `.flywheel/agent-names.json` mirror (recover/rebind read it when the registry is empty). Bindings verify through the rex label (label plus session) with provenance `rex-label`; stamped-token panes keep the token path on every backend. Inbox observe on rex reads classified `agent_list` rows projected onto the pane shape; `pane_list` leaves status Unknown by construction and would silence every ring.
 
 ```bash
 flywheel backend list --json
