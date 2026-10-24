@@ -23,7 +23,8 @@
 # [kinds]
 # claude = "claude"
 
-# backend selection (defaults: multiplexer=herdr, mail=toron).
+# backend selection (defaults: multiplexer=auto with the rex backend compiled
+# in, else herdr; mail=toron). Values: herdr | superlogical | auto.
 # Env overrides: FLYWHEEL_BACKEND / FLYWHEEL_MAIL.
 # [backend]
 # multiplexer = "herdr"

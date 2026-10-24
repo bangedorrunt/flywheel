@@ -6,7 +6,7 @@ Pluggable multiplexer + mail. Spine targets traits, not concretes.
 
 | Role | Trait | Default | Stubs |
 |------|-------|---------|-------|
-| Multiplexer | `toron_core::backend::Backend` (re-export `MultiplexerBackend`) | herdr (`backend-herdr`) | superlogical (`Unsupported`) |
+| Multiplexer | `toron_core::backend::Backend` (re-export `MultiplexerBackend`) | auto = rex-first + herdr fallback (`backend-superlogical`); herdr when that feature is off | none (single selected backend) |
 | Mail | `toron_core::mailbox::surface::MailSurface` | toron (`mail-toron`) | none (single backend) |
 
 Factory: `src/backend/factory.rs`. Code: `src/backend/`.
@@ -17,7 +17,7 @@ Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
 | Var / key | Values | Default |
 |-----------|--------|---------|
-| `FLYWHEEL_BACKEND` / `[backend] multiplexer` | herdr \| superlogical | herdr |
+| `FLYWHEEL_BACKEND` / `[backend] multiplexer` | herdr \| superlogical \| auto | auto (feature on) / herdr (feature off) |
 | `FLYWHEEL_MAIL` / `[backend] mail` | toron | toron |
 | `FLYWHEEL_TORON_URL` / `TOKEN` | `[mail.toron]` only | config.toml |
 | `FLYWHEEL_MAIL_NAME` | `[agent_mail] name` | `flywheel` |
@@ -26,7 +26,9 @@ Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
 Ack-overdue reads (`flywheel __ack-overdue`, `Mail::ack_overdue`) are **in-process only**: they read per-recipient `message_reads` state through the mailbox projection, and the remote daemon exposes no ack-overdue tool, so the call fails loudly instead of answering an empty set. The blocked escalation's ack gate (see [loop.md](loop.md)) treats that as "not acked" and keeps its time ladder.
 
-Mailbox root: `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Never per-pid temp. `src/mail_shim.rs` + `src/coalition.rs` share this.
+Mailbox root: `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Never per-pid temp. `src/mail.rs` + `src/coalition.rs` share this.
+
+`auto` retries a call on herdr only for transport codes (`Connect`/`Io`/`Timeout`); semantic rejects surface loud, never masked. Pane ids are backend-namespaced (herdr `wX:pY`, rex `block:`/`session:`), and `pane_keep` matches `"herdr"` exactly, so auto skips herdr-only janitor work in the safe direction. Agent status on both backends folds one OSC 7501 grammar (`toron_core::osc7501::Board`; `src/backend/rex_map.rs`). One-shot Lua rides `rex do -e` (`integrations/rex/session-snapshot.lua`); handler scripts would outlive the call bound and must not ride it.
 
 ```bash
 flywheel backend list --json

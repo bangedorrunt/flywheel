@@ -801,7 +801,8 @@ esac
     #[test]
     fn superlogical_covers_create_split_run_read_and_prompt() {
         // Two lock domains touch process-global `REX_BIN_DIR`: `RexBinGuard`
-        // (`REX_LOCK`) and `config::lock_env` (the factory stub test sets the
+        // (`REX_LOCK`) and `config::lock_env` (the factory feature-off test
+        // sets the
         // same var). Hold both so an interleaved empty-dir set cannot fail a
         // mid-test locate with "not installed".
         let _env = crate::config::lock_env();

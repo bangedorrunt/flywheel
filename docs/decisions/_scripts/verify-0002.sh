@@ -40,7 +40,7 @@ grep -q 'toron_core::mailbox::Mailbox' src/mail.rs 2>/dev/null \
 grep -rq 'FLYWHEEL_BACKEND' src/ 2>/dev/null && ok "FLYWHEEL_BACKEND env wired" || warn "FLYWHEEL_BACKEND not yet wired"
 grep -rq 'FLYWHEEL_MAIL' src/ 2>/dev/null && ok "FLYWHEEL_MAIL env wired" || warn "FLYWHEEL_MAIL not yet wired"
 grep -q 'backend-herdr' Cargo.toml 2>/dev/null && ok "cargo feature backend-herdr present" || warn "backend-herdr feature missing"
-grep -q 'backend-superlogical' Cargo.toml 2>/dev/null && ok "cargo feature backend-superlogical present (stub)" || warn "backend-superlogical feature missing"
+grep -q 'backend-superlogical' Cargo.toml 2>/dev/null && ok "cargo feature backend-superlogical present (rex backend)" || warn "backend-superlogical feature missing"
 
 # (a) factory exists and returns trait objects (the REAL contract)
 grep -rq -e '-> Result<Box<dyn MultiplexerBackend>>' src/backend/factory.rs 2>/dev/null \

@@ -14,10 +14,9 @@
 //! (absent → embedded in-process). The old `[agent_mail]` url is never a
 //! routing source.
 //!
-//! Stub backend (`superlogical`) lands in `bd-toron-superlogical-
-//! stubs` (R0.7); until then an unrecognized name returns a clear
-//! `BackendError::Unsupported` so a user who typos the env var gets an
-//! actionable error, not a silent fallback.
+//! An unrecognized name returns a clear `BackendError::Unsupported` so a
+//! user who typos the env var gets an actionable error, not a silent
+//! fallback.
 
 use crate::backend::{BackendError, MailSurface, MultiplexerBackend, Result};
 use crate::config::Config;
@@ -273,8 +272,8 @@ mod tests {
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
-    /// A stubbed-but-unwired backend (superlogical) returns an actionable
-    /// Unsupported pointing at the stub bead (no silent fallback).
+    /// A backend compiled out (superlogical without its feature) returns an
+    /// actionable Unsupported (no silent fallback).
     /// With `backend-superlogical` OFF, selecting superlogical yields the
     /// feature-aware "not compiled in" error (no silent fallback). Gated to
     /// the feature-off build (the stub itself is covered by --all-features).

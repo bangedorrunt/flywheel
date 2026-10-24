@@ -198,10 +198,12 @@ pub struct MailSections {
 
 /// Backend selection (ADR-0002). `[backend] multiplexer` / `[backend] mail` in
 /// config.toml; overridden by `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL` env (which
-/// may themselves be set by `.env`). Defaults: herdr / toron.
+/// may themselves be set by `.env`). Defaults: auto (rex-first + herdr
+/// fallback) with the rex backend compiled in, else herdr / toron.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendConfig {
-    /// multiplexer backend name (`herdr` default; `superlogical` future)
+    /// multiplexer backend name (`auto` default with the rex backend
+    /// compiled in, else `herdr`; `superlogical` pins rex without fallback)
     pub multiplexer: String,
     /// mail backend name (`toron`; the agentmail backend is deleted, bd-euav)
     pub mail: String,
