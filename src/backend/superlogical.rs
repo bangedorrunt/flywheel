@@ -26,11 +26,14 @@ use toron_core::backend::{AgentStatus, BackendError, EventStream, PromptLanding}
 mod rex_cli;
 
 use crate::backend::MultiplexerBackend;
-use rex_cli::rex_map::{capture_format, split_direction, status_from_program_status, tail_lines};
+use rex_cli::rex_map::{
+    board_of, capture_format, parse_process_view, split_direction, status_for_block,
+    status_from_program_status, tail_lines,
+};
 use rex_cli::{
     Rex, RexBlock, RexEventStream, RexFail, RexSession, block_close_args, capture_args,
     events_args, list_blocks_args, ls_args, new_args, parse_blocks, parse_created_block_id,
-    parse_created_session, parse_sessions, program_status_args, rename_args, run_args,
+    parse_created_session, parse_sessions, process_args, program_status_args, rename_args,
     send_key_args, session_kill_args, split_args, write_args,
 };
 
@@ -87,8 +90,21 @@ impl SuperlogicalBackend {
     }
 
     fn block_status(rex: &Rex, session: &str, block: &str) -> Result<AgentStatus, RexFail> {
-        let value = rex.json(&program_status_args(session, block))?;
-        Ok(status_from_program_status(&value))
+        let records = rex.json(&program_status_args(session, block))?;
+        let (board, order) = board_of(&records);
+        // Records win when any exist; the process fallback only covers the
+        // empty board (a harness that never reports, e.g. opencode today).
+        // One extra call per silent block, skipped for reporting harnesses.
+        if board.is_empty() {
+            let process = rex.json(&process_args(session, block))?;
+            Ok(status_for_block(
+                &board,
+                &order,
+                &parse_process_view(&process),
+            ))
+        } else {
+            Ok(status_from_program_status(&records))
+        }
     }
 }
 
@@ -203,10 +219,19 @@ impl MultiplexerBackend for SuperlogicalBackend {
             }
             .into_backend());
         }
+        // In-pane execution like herdr `pane.run` (send text, then Enter):
+        // the command runs where the caller points, never in a fresh split.
+        // A headless one-shot belongs in `do_args` Lua (`rex.exec`), not here.
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, pane_id).map_err(RexFail::into_backend)?;
-        rex.text(&run_args(&session.session_id, &block.block_id, command))
+        rex.json(&write_args(&session.session_id, &block.block_id, command))
             .map_err(RexFail::into_backend)?;
+        rex.text(&send_key_args(
+            &session.session_id,
+            &block.block_id,
+            &["enter"],
+        ))
+        .map_err(RexFail::into_backend)?;
         Ok(())
     }
 
@@ -637,6 +662,7 @@ case "$cmd:$sub" in
   session:kill) echo killed; exit 0 ;;
   block:send-key) echo keyed; exit 0 ;;
   block:rename) echo renamed; exit 0 ;;
+  block:write) echo '{"bytes_written":9}'; exit 0 ;;
   events:)
     printf '%s\n' '{"type":"session_event","payload":{"event":{"type":"terminal.program_status_changed","payload":{"block_id":"block:fake-1","record":{"state":"idle"}}}}}'
     exit 0
@@ -797,9 +823,6 @@ case "$cmd:$sub" in
   split:)
     printf '%s\n' '{"block_id":"block:fake-2","window_id":"window:fake-1"}'
     ;;
-  run:)
-    printf '%s\n' '{}'
-    ;;
   new:)
     printf '%s\n' '{"session_id":"session:fake-2"}'
     ;;
@@ -864,9 +887,113 @@ esac
         assert!(err.to_string().contains("left, right, above"), "{err}");
 
         let log = guard.log_text();
-        for verb in ["new", "split", "run", "capture", "write", "send-key", "program_status"] {
+        for verb in ["new", "split", "capture", "write", "send-key", "program_status"] {
             assert!(log.contains(verb), "{log}");
         }
+        assert!(!log.contains("herdr"), "{log}");
+    }
+
+    const RUN_IN_PANE_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|session|block|capture|api|run|split|new|do) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    program_status|process|send-key|write) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+  esac
+done
+case "$cmd:$sub" in
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-1","label":"work","pane_count":1,"tab_count":1}]}'
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"shell"}]}'
+    ;;
+  block:write)
+    printf '%s\n' '{"bytes_written":7}'
+    ;;
+  block:send-key)
+    printf '%s\n' 'keyed'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// `pane_run` executes in the pane like herdr (text, then Enter), never
+    /// in a fresh split: the write lands before the submit, and no split or
+    /// run verb is invoked.
+    #[test]
+    fn pane_run_types_and_submits_in_place() {
+        let _env = crate::config::lock_env();
+        let guard = RexBinGuard::install(RUN_IN_PANE_REX);
+        SuperlogicalBackend
+            .pane_run("block:fake-1", "echo hi")
+            .expect("run in pane");
+        let log = guard.log_text();
+        let write_at = log.find("write").expect("write call");
+        let key_at = log.find("send-key").expect("enter call");
+        assert!(write_at < key_at, "write lands before Enter:\n{log}");
+        assert!(!log.contains("split"), "{log}");
+        assert!(log.contains("echo hi"), "{log}");
+    }
+
+    const PROCESS_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|session|block|capture|api|run|split|new|do) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    program_status|process) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+  esac
+done
+case "$cmd:$sub" in
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-1","label":"work","pane_count":1,"tab_count":1}]}'
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"crew","creator_name":"com.superlogical.terminal"}]}'
+    ;;
+  block:program_status)
+    printf '%s\n' '{"records":[]}'
+    ;;
+  block:process)
+    printf '%s\n' '{"foreground":{"name":"opencode","cwd":"/tmp/work"},"last_exit":null}'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// A silent harness (no 7501 records, like opencode today) still reads
+    /// through the foreground process: an agent binary in front is Working.
+    #[test]
+    fn agent_list_falls_back_to_the_foreground_process() {
+        let _env = crate::config::lock_env();
+        let guard = RexBinGuard::install(PROCESS_REX);
+        let agents = SuperlogicalBackend.agent_list().expect("agent_list");
+        assert_eq!(agents.len(), 1, "{agents:#?}");
+        assert_eq!(agents[0].pane_id, "block:fake-1");
+        assert_eq!(agents[0].agent_status, AgentStatus::Working);
+        let log = guard.log_text();
+        assert!(log.contains("program_status"), "{log}");
+        assert!(log.contains("process"), "{log}");
         assert!(!log.contains("herdr"), "{log}");
     }
 

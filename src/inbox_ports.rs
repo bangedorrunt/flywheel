@@ -78,6 +78,27 @@ pub fn verify_tokens(
     }
 }
 
+/// Pure: the binding for `pin`/`npub` from a rex block. A rex block carries
+/// no stamped tokens, so the binding is three visible facts: the block
+/// label is the pin (set by spawn/rename, the only trusted writer), the
+/// block lives in the observed session, and toron's directory maps the pin
+/// to this npub. Provenance reads `rex-label`, never `report_metadata`.
+pub fn verify_rex_binding(
+    pane: &crate::herdr::PaneInfo,
+    workspace: &str,
+    pin: &str,
+    npub: &str,
+) -> Bind {
+    Bind {
+        pane_id: pane.pane_id.clone(),
+        herdr_session: pane.workspace_id.clone(),
+        verified: pane.label.as_deref() == Some(pin)
+            && pane.workspace_id == workspace
+            && !npub.is_empty(),
+        verified_by: "rex-label".to_string(),
+    }
+}
+
 /// Pure: the system producer the doorbell's notifications are sent as (a
 /// stable 64-hex id per project; no key, `from` only has to equal it).
 pub fn system_producer(project: &str) -> String {
@@ -186,18 +207,21 @@ impl FlywheelPorts {
         up: bool,
         pin: &str,
         npub: &str,
+        backend_name: &str,
+        workspace: &str,
     ) -> (PaneState, Option<Bind>) {
         match panes.iter().find(|p| p.pane_id == pane_id) {
-            Some(p) => (
-                pane_state(p.agent_status),
-                Some(verify_tokens(
-                    &p.tokens,
-                    pin,
-                    npub,
-                    &p.pane_id,
-                    &p.workspace_id,
-                )),
-            ),
+            Some(p) => {
+                // Stamped panes verify through tokens on every backend; an
+                // unstamped pane verifies through the rex label binding off
+                // herdr, and stays unverified on herdr exactly as before.
+                let bind = if backend_name != "herdr" && !p.tokens.contains_key(TOKEN_PIN) {
+                    verify_rex_binding(p, workspace, pin, npub)
+                } else {
+                    verify_tokens(&p.tokens, pin, npub, &p.pane_id, &p.workspace_id)
+                };
+                (pane_state(p.agent_status), Some(bind))
+            }
             None if up => (PaneState::Gone, None),
             None => (PaneState::Unknown, None),
         }
@@ -499,7 +523,15 @@ impl Ports for FlywheelPorts {
                 (head, cursor, urgency)
             });
             self.urgencies.insert(npub.clone(), urgency);
-            let (state, bind) = Self::pane_observation(&panes, &e.pane_id, up, &pin, &npub);
+            let (state, bind) = Self::pane_observation(
+                &panes,
+                &e.pane_id,
+                up,
+                &pin,
+                &npub,
+                &selected,
+                &self.workspace,
+            );
             seen.push(Seen {
                 npub,
                 pin,
@@ -529,13 +561,16 @@ impl Ports for FlywheelPorts {
                 .ok()?
                 .into_iter()
                 .find(|p| p.pane_id == e.pane_id)?;
-            return Some(verify_tokens(
-                &p.tokens,
-                &pin,
-                npub,
-                &p.pane_id,
-                &p.workspace_id,
-            ));
+            if p.tokens.contains_key(TOKEN_PIN) {
+                return Some(verify_tokens(
+                    &p.tokens,
+                    &pin,
+                    npub,
+                    &p.pane_id,
+                    &p.workspace_id,
+                ));
+            }
+            return Some(verify_rex_binding(&p, &self.workspace, &pin, npub));
         }
         let client = self.client()?;
         let p = client
@@ -1016,26 +1051,98 @@ mod tests {
     /// The wake rule's pane reading, backend-agnostic: found panes fold
     /// status plus token binding; a missing pane is Gone only when the
     /// backend is up, never a false Gone on an unreachable backend.
+    /// Off herdr, an unstamped pane verifies through the rex label binding
+    /// (label plus session); a label or session mismatch stays unverified.
     #[test]
     fn pane_observation_folds_found_gone_and_unknown() {
         let pin = "DustySparrow";
         let npub = "npub1test";
         let panes = vec![listed_pane("w1:p1", AgentStatus::Working, pin, npub)];
-        let (state, bind) = FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, npub);
+        let (state, bind) =
+            FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, npub, "herdr", "w1");
         assert_eq!(state, PaneState::Working);
         assert!(bind.is_some_and(|b| b.verified));
 
         let (state, bind) =
-            FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, "npub1other");
+            FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, "npub1other", "herdr", "w1");
         assert_eq!(state, PaneState::Working);
         assert!(bind.is_some_and(|b| !b.verified));
 
-        let (state, bind) = FlywheelPorts::pane_observation(&panes, "w1:p9", true, pin, npub);
+        let (state, bind) =
+            FlywheelPorts::pane_observation(&panes, "w1:p9", true, pin, npub, "herdr", "w1");
         assert_eq!(state, PaneState::Gone);
         assert_eq!(bind, None);
 
-        let (state, bind) = FlywheelPorts::pane_observation(&panes, "w1:p9", false, pin, npub);
+        let (state, bind) =
+            FlywheelPorts::pane_observation(&panes, "w1:p9", false, pin, npub, "herdr", "w1");
         assert_eq!(state, PaneState::Unknown);
         assert_eq!(bind, None);
+    }
+
+    fn listed_block(id: &str, session: &str, label: &str) -> crate::herdr::PaneInfo {
+        // A rex block: creator-set label, no stamped tokens.
+        let mut pane = listed_pane(id, AgentStatus::Idle, label, "npub1x");
+        pane.workspace_id = session.to_string();
+        pane.label = Some(label.to_string());
+        pane.tokens = serde_json::Map::new();
+        pane
+    }
+
+    #[test]
+    fn pane_observation_verifies_rex_blocks_by_label_and_session() {
+        let pin = "DustySparrow";
+        let npub = "npub1test";
+        let panes = vec![listed_block("block:fake-1", "session:fake-1", pin)];
+        let (state, bind) = FlywheelPorts::pane_observation(
+            &panes,
+            "block:fake-1",
+            true,
+            pin,
+            npub,
+            "superlogical",
+            "session:fake-1",
+        );
+        assert_eq!(state, PaneState::Idle);
+        assert!(bind.is_some_and(|b| b.verified && b.verified_by == "rex-label"));
+
+        // Wrong session: same label, different session, not verified.
+        let (state, bind) = FlywheelPorts::pane_observation(
+            &panes,
+            "block:fake-1",
+            true,
+            pin,
+            npub,
+            "superlogical",
+            "session:other",
+        );
+        assert_eq!(state, PaneState::Idle);
+        assert!(bind.is_some_and(|b| !b.verified));
+
+        // Wrong label: the block answers to another pin.
+        let other = vec![listed_block("block:fake-1", "session:fake-1", "SomeOther")];
+        let (_, bind) = FlywheelPorts::pane_observation(
+            &other,
+            "block:fake-1",
+            true,
+            pin,
+            npub,
+            "superlogical",
+            "session:fake-1",
+        );
+        assert!(bind.is_some_and(|b| !b.verified));
+
+        // A stamped block verifies through tokens on every backend,
+        // including rex.
+        let stamped = vec![listed_pane("block:fake-1", AgentStatus::Working, pin, npub)];
+        let (_, bind) = FlywheelPorts::pane_observation(
+            &stamped,
+            "block:fake-1",
+            true,
+            pin,
+            npub,
+            "superlogical",
+            "session:fake-1",
+        );
+        assert!(bind.is_some_and(|b| b.verified && b.verified_by == "report_metadata"));
     }
 }

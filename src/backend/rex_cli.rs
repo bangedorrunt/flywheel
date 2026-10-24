@@ -322,6 +322,20 @@ pub fn program_status_args(session: &str, block: &str) -> Vec<String> {
     ]
 }
 
+/// `process` block method: the processes running in the terminal and how
+/// its program exited. Same call shape as `program_status`.
+pub fn process_args(session: &str, block: &str) -> Vec<String> {
+    vec![
+        "block".into(),
+        "call".into(),
+        "-s".into(),
+        session.into(),
+        "-b".into(),
+        block.into(),
+        "process".into(),
+    ]
+}
+
 pub fn write_args(session: &str, block: &str, text: &str) -> Vec<String> {
     vec![
         "block".into(),
@@ -413,23 +427,6 @@ pub fn events_args(session: Option<&str>) -> Vec<String> {
         args.push(session.into());
     }
     args
-}
-
-pub fn run_args(session: &str, block: &str, command: &str) -> Vec<String> {
-    vec![
-        "run".into(),
-        "-s".into(),
-        session.into(),
-        "-b".into(),
-        block.into(),
-        "--split=below".into(),
-        "--focus=false".into(),
-        "--json".into(),
-        "--".into(),
-        "sh".into(),
-        "-c".into(),
-        command.into(),
-    ]
 }
 
 /// `rex do -e <lua> [--args <json>]`: one-shot Lua, result as JSON.
@@ -650,12 +647,74 @@ pub mod rex_map {
     ///
     /// ponytail: no-root, non-blocked children fold newest-first.
     pub fn status_from_program_status(value: &Value) -> AgentStatus {
+        let (board, order) = board_of(value);
+        fold_status(&board, &order)
+    }
+
+    /// The board behind one payload, shared by the records fold and the
+    /// process fallback so both read one parse.
+    pub fn board_of(value: &Value) -> (Board, Vec<String>) {
         let mut board = Board::default();
         let mut order: Vec<String> = Vec::new();
         for record in record_slice(value) {
             apply_record(&mut board, &mut order, record);
         }
-        fold_status(&board, &order)
+        (board, order)
+    }
+
+    /// What the terminal's foreground process looks like. Empty when the
+    /// shape is missing or odd — the fold reads that as Unknown.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ProcessView {
+        pub foreground: String,
+        pub cwd: Option<String>,
+    }
+
+    /// Shells: a foreground shell is at a prompt (Idle). Anything else that
+    /// is not a known agent is Unknown, never inferred.
+    const SHELLS: [&str; 5] = ["sh", "bash", "zsh", "fish", "dash"];
+
+    /// Parse one `process` block-method payload into the foreground view.
+    pub fn parse_process_view(value: &Value) -> ProcessView {
+        let foreground = value.get("foreground");
+        ProcessView {
+            foreground: foreground
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            cwd: foreground
+                .and_then(|f| f.get("cwd"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    }
+
+    /// Liveness without cooperation: a known agent binary in front is
+    /// Working, a shell is at a prompt. Explicit records always win over
+    /// this — callers only reach it on an empty board.
+    pub fn process_status(view: &ProcessView) -> AgentStatus {
+        match crate::pane_write::Harness::from_kind(&view.foreground) {
+            crate::pane_write::Harness::Other => {
+                if SHELLS.contains(&view.foreground.as_str()) {
+                    AgentStatus::Idle
+                } else {
+                    AgentStatus::Unknown
+                }
+            }
+            _ => AgentStatus::Working,
+        }
+    }
+
+    /// Records first, process fallback: an empty board (no program ever
+    /// reported — the opencode steady state) folds the foreground process;
+    /// any record at all keeps the records fold, including explicit Unknown.
+    pub fn status_for_block(board: &Board, order: &[String], view: &ProcessView) -> AgentStatus {
+        if board.is_empty() {
+            process_status(view)
+        } else {
+            fold_status(board, order)
+        }
     }
 
     /// Rex `--split` directions, plus the herdr words the trait already passes.
@@ -892,6 +951,69 @@ pub mod rex_map {
                 let live = status_from_program_status(&json!({ "records": value }));
                 assert_eq!(status_from_records(records), live, "{records}");
             }
+        }
+
+        fn process_view(name: &str) -> ProcessView {
+            ProcessView {
+                foreground: name.to_string(),
+                cwd: None,
+            }
+        }
+
+        /// The process fallback reads the foreground program: a known agent
+        /// is Working, a shell is at a prompt, anything else is Unknown.
+        #[test]
+        fn process_view_folds_foreground_program() {
+            assert_eq!(
+                process_status(&process_view("opencode")),
+                AgentStatus::Working
+            );
+            assert_eq!(process_status(&process_view("pi")), AgentStatus::Working);
+            assert_eq!(process_status(&process_view("zsh")), AgentStatus::Idle);
+            assert_eq!(process_status(&process_view("bash")), AgentStatus::Idle);
+            assert_eq!(process_status(&process_view("")), AgentStatus::Unknown);
+            assert_eq!(
+                process_status(&process_view("postgres")),
+                AgentStatus::Unknown
+            );
+            let parsed = parse_process_view(&json!({
+                "foreground": {"name": "opencode", "cwd": "/tmp"},
+                "last_exit": null,
+            }));
+            assert_eq!(parsed.foreground, "opencode");
+            assert_eq!(parsed.cwd.as_deref(), Some("/tmp"));
+            assert_eq!(parse_process_view(&json!({})), ProcessView::default());
+            assert_eq!(
+                parse_process_view(&json!({"foreground": null})),
+                ProcessView::default()
+            );
+        }
+
+        /// Records win over the process view: an explicit error stays
+        /// Unknown even with an agent in front; an empty board folds the
+        /// foreground instead.
+        #[test]
+        fn records_win_over_the_process_view() {
+            let (board, order) = board_of(&json!({
+                "records": [{"state": "error", "app": "freebuff"}]
+            }));
+            assert_eq!(
+                status_for_block(&board, &order, &process_view("opencode")),
+                AgentStatus::Unknown
+            );
+            let (empty, empty_order) = board_of(&json!({ "records": [] }));
+            assert_eq!(
+                status_for_block(&empty, &empty_order, &process_view("opencode")),
+                AgentStatus::Working
+            );
+            assert_eq!(
+                status_for_block(&empty, &empty_order, &process_view("zsh")),
+                AgentStatus::Idle
+            );
+            assert_eq!(
+                status_for_block(&empty, &empty_order, &process_view("")),
+                AgentStatus::Unknown
+            );
         }
     }
 }
