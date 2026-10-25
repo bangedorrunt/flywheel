@@ -2514,9 +2514,16 @@ mod tests {
                 },
             );
             assert!(c.is_empty(), "{strategy:?}: a held claim emits nothing");
-            assert_eq!(n.children["b"].generation, 2, "{strategy:?}: no extra generation");
+            assert_eq!(
+                n.children["b"].generation, 2,
+                "{strategy:?}: no extra generation"
+            );
             assert_eq!(n.children["b"].abnormal, m.children["b"].abnormal);
-            assert_eq!(n.restarts.len(), slots, "{strategy:?}: no restart slot spent");
+            assert_eq!(
+                n.restarts.len(),
+                slots,
+                "{strategy:?}: no restart slot spent"
+            );
             assert_eq!(n.children["b"].state, ChildState::Restarting);
             // The same key failing for real is still a failed incarnation.
             let (f, _) = step(
@@ -3965,7 +3972,10 @@ mod tests {
         for i in 0..SEEN_KEYS_MAX + 3 {
             assert!(k.insert(format!("e{i}")));
         }
-        assert!(!k.insert(format!("e{}", SEEN_KEYS_MAX + 2)), "a held key is not new");
+        assert!(
+            !k.insert(format!("e{}", SEEN_KEYS_MAX + 2)),
+            "a held key is not new"
+        );
         assert_eq!(k.len(), SEEN_KEYS_MAX);
         let old: RecentKeys = serde_json::from_str(r#"["a","b"]"#).unwrap();
         assert!(old.contains("a") && old.contains("b"));
@@ -4945,7 +4955,10 @@ mod tests {
         assert_eq!(v[4], "bd-x0", "the first id is still --corr");
         let ok = format!("bd-{}", "a".repeat(BEAD_ID_MAX - 3));
         assert_eq!(ok.len(), BEAD_ID_MAX);
-        assert!(bead_hold_argv(&ok, "").is_some(), "BEAD_ID_MAX itself is fine");
+        assert!(
+            bead_hold_argv(&ok, "").is_some(),
+            "BEAD_ID_MAX itself is fine"
+        );
     }
 
     #[test]

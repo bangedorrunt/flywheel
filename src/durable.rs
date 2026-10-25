@@ -1778,23 +1778,33 @@ pub(crate) enum LoopVerifySettle {
     },
 }
 
-pub(crate) fn plan_loop_verify_settle(
-    v: &serde_json::Value,
-    strict: bool,
-) -> LoopVerifySettle {
+pub(crate) fn plan_loop_verify_settle(v: &serde_json::Value, strict: bool) -> LoopVerifySettle {
     if v.get("band").and_then(serde_json::Value::as_str) != Some("loop-runnable") {
         return LoopVerifySettle::Passthrough;
     }
-    let skipped = v.get("skipped").and_then(serde_json::Value::as_str).is_some();
+    let skipped = v
+        .get("skipped")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
     let timed_out = v
         .get("timed_out")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let exit = v.get("exit").and_then(serde_json::Value::as_i64).unwrap_or(-1);
+    let exit = v
+        .get("exit")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
     if skipped || exit != 0 {
-        return LoopVerifySettle::Reopen { vacuous: None, timed_out, exit };
+        return LoopVerifySettle::Reopen {
+            vacuous: None,
+            timed_out,
+            exit,
+        };
     }
-    let output = v.get("output_tail").and_then(serde_json::Value::as_str).unwrap_or("");
+    let output = v
+        .get("output_tail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let verify_cmd = v
         .get("verify")
         .and_then(serde_json::Value::as_str)
@@ -1868,11 +1878,18 @@ pub(crate) fn settle_loop_verify_output(
     at: chrono::DateTime<chrono::Utc>,
     reopen: impl FnOnce() -> anyhow::Result<bool>,
 ) -> anyhow::Result<serde_json::Value> {
-    let dir = v.get("dir").and_then(serde_json::Value::as_str).unwrap_or(".");
+    let dir = v
+        .get("dir")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(".");
     let cwd = std::path::Path::new(dir);
     match plan_loop_verify_settle(v, strict) {
         LoopVerifySettle::Passthrough => Ok(v.clone()),
-        LoopVerifySettle::Record { output, warn_append, verify_cmd } => {
+        LoopVerifySettle::Record {
+            output,
+            warn_append,
+            verify_cmd,
+        } => {
             let receipt =
                 crate::verdict::write_command_verified_receipt(cwd, bead_id, sha, &output);
             match receipt {
@@ -1907,7 +1924,11 @@ pub(crate) fn settle_loop_verify_output(
                 )),
             }
         }
-        LoopVerifySettle::Reopen { vacuous, timed_out, exit } => {
+        LoopVerifySettle::Reopen {
+            vacuous,
+            timed_out,
+            exit,
+        } => {
             let warning = if let Some((warning, filtered, evidence)) = vacuous {
                 // Strict: refuse to write verdict, keep bead open with evidence.
                 // Best-effort evidence write (advisory — ignore errors).
@@ -1927,8 +1948,7 @@ pub(crate) fn settle_loop_verify_output(
             // command (idempotent, one mail per (bead, sha); the reopened
             // bead IS the fix unit — it re-dispatches with the failure in its
             // thread). Never a re-verify of the same broken head.
-            let reopened = reopen()
-                .map_err(|e| anyhow::anyhow!("__reopen-bead failed: {e:#}"))?;
+            let reopened = reopen().map_err(|e| anyhow::anyhow!("__reopen-bead failed: {e:#}"))?;
             if let Some((warning, filtered)) = warning {
                 return Ok(serde_json::json!({
                     "band": "loop-runnable",
@@ -3441,7 +3461,9 @@ pub fn peer_held(bead_id: &str, reservations: &[(String, String)], self_pane: &s
 }
 
 /// Another pin holds a reservation whose path overlaps this file. `claims`
-/// are `(path pattern, holder pin)`. An empty holder is not a peer.
+/// are `(path pattern, holder pin)`. An empty holder is not a peer. The
+/// holder of this file keeps it. The other agent stops.
+///
 pub fn other_file_holder<'a>(
     path: &str,
     claims: &'a [(String, String)],
@@ -3456,26 +3478,46 @@ pub fn other_file_holder<'a>(
     })
 }
 
-/// This bead already holds a path that overlaps another pin's reservation.
-/// `rows` are `(path, reason, holder)`. A bead with no path of its own is
-/// not blocked here.
+/// Path-like words in bead text (`src/main.rs`, `src/**`). The loop uses
+/// these when the bead has not reserved yet, so a named file still stops
+/// the bead before the first lease.
+pub fn path_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '`' | ',' | '(' | ')' | '"' | '\'' | ';' | '[' | ']')
+    }) {
+        let tok = raw.trim_matches(|c: char| matches!(c, ',' | ';' | ':'));
+        if (tok.contains('/') || tok.contains('*')) && !out.iter().any(|seen: &String| seen == tok)
+        {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// This bead stops when another pin holds an overlapping path.
+/// `rows` are `(path, reason, holder)`. `intended` is the paths the bead
+/// named and has not reserved yet. An empty holder is not a peer. A bead
+/// that names nothing and holds nothing is not blocked.
 pub fn file_blocks_bead(
     bead_id: &str,
     rows: &[(String, String, String)],
     self_holder: &str,
+    intended: &[String],
 ) -> bool {
-    if self_holder.is_empty() {
-        return false;
-    }
     let claims: Vec<(String, String)> = rows
         .iter()
         .map(|(path, _, holder)| (path.clone(), holder.clone()))
         .collect();
-    rows.iter().any(|(path, reason, holder)| {
-        reason == bead_id
-            && holder == self_holder
-            && other_file_holder(path, &claims, self_holder).is_some()
-    })
+    let own = !self_holder.is_empty()
+        && rows.iter().any(|(path, reason, holder)| {
+            reason == bead_id
+                && holder == self_holder
+                && other_file_holder(path, &claims, self_holder).is_some()
+        });
+    own || intended
+        .iter()
+        .any(|path| other_file_holder(path, &claims, self_holder).is_some())
 }
 
 /// Should the loop resume this (bead, pane) now? Suppressed inside the window
@@ -4478,7 +4520,9 @@ pub(crate) fn settle_dispatch_guard_output(
         .unwrap_or_default();
     let facts = DispatchGuardFacts {
         signals,
-        receipts_fresh_us: facts.get("receipts_fresh_us").and_then(serde_json::Value::as_i64),
+        receipts_fresh_us: facts
+            .get("receipts_fresh_us")
+            .and_then(serde_json::Value::as_i64),
     };
     match eval_dispatch_guard(&facts, now_us, ttl_us) {
         Ok(()) => serde_json::json!({ "bead": bead, "dispatch": true, "reason": null }),
@@ -6867,11 +6911,7 @@ async fn respawn_and_requeue(
             Ok(v) => v
                 .as_str()
                 .map(|s| s.to_string())
-                .or_else(|| {
-                    v.get("raw")
-                        .and_then(|r| r.as_str())
-                        .map(|s| s.to_string())
-                })
+                .or_else(|| v.get("raw").and_then(|r| r.as_str()).map(|s| s.to_string()))
                 .unwrap_or_default(),
             Err(e) => {
                 // cg6.2: skip the respawn this tick; queue unchanged.
@@ -7286,20 +7326,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             ) {
                 Ok(v) => {
                     let parsed: anyhow::Result<Vec<AgentState>> = (|| {
-                        let pairs = v.get("agents").and_then(|a| a.as_array()).ok_or_else(
-                            || {
+                        let pairs =
+                            v.get("agents").and_then(|a| a.as_array()).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "__poll missing agents: {}",
-                                    serde_json::to_string(&v)
-                                        .unwrap_or_default()
+                                    serde_json::to_string(&v).unwrap_or_default()
                                 )
-                            },
-                        )?;
+                            })?;
                         let mut out = Vec::with_capacity(pairs.len());
                         for p in pairs {
-                            out.push(parse_poll_entry(p).map_err(|e| {
-                                anyhow::anyhow!("{e}")
-                            })?);
+                            out.push(parse_poll_entry(p).map_err(|e| anyhow::anyhow!("{e}"))?);
                         }
                         Ok(out)
                     })();
@@ -7343,19 +7379,18 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // recipe, call `__xproj-spawn` which spawns the swarm in this project
         // and replies in-thread. If it doesn't parse to a recipe, fall back to
         // queueing a prompt for an idle agent to interpret. Soft-fail.
-        let xproj_items: Vec<crate::XprojInboxItem> =
-            match crate::elm::leaf::run_leaf_journaled(
-                &params.project,
-                "__xproj-inbox",
-                &[&params.project, "--limit", "30"],
-                &format!("xproj-inbox:{}", params.project),
-            ) {
-                Ok(v) => {
-                    let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
-                    serde_json::from_value(items).unwrap_or_default()
-                }
-                Err(_) => vec![],
-            };
+        let xproj_items: Vec<crate::XprojInboxItem> = match crate::elm::leaf::run_leaf_journaled(
+            &params.project,
+            "__xproj-inbox",
+            &[&params.project, "--limit", "30"],
+            &format!("xproj-inbox:{}", params.project),
+        ) {
+            Ok(v) => {
+                let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
+                serde_json::from_value(items).unwrap_or_default()
+            }
+            Err(_) => vec![],
+        };
         for item in &xproj_items {
             if seen_xproj.contains(&item.id) {
                 continue;
@@ -7412,27 +7447,25 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // allowlist (deny NEVER dispatches) then decide's coverage report.
         // A catalog hit queues guidance; a miss queues the candidate FOR
         // APPROVAL — W7 never auto-runs a composed workflow from mail.
-        let (compose_rows, compose_allowlist): (
-            Vec<ComposeRequestRow>,
-            Vec<String>,
-        ) = match crate::elm::leaf::run_leaf_journaled(
-            &params.project,
-            "__compose-inbox",
-            &[&params.project, "--limit", "30"],
-            &format!("compose-inbox:{}", params.project),
-        ) {
-            Ok(v) => {
-                let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
-                let rows: Vec<ComposeRequestRow> =
-                    serde_json::from_value(items).unwrap_or_default();
-                let allowlist = v
-                    .get("allowlist")
-                    .and_then(|a| serde_json::from_value::<Vec<String>>(a.clone()).ok())
-                    .unwrap_or_default();
-                (rows, allowlist)
-            }
-            Err(_) => (vec![], vec![]),
-        };
+        let (compose_rows, compose_allowlist): (Vec<ComposeRequestRow>, Vec<String>) =
+            match crate::elm::leaf::run_leaf_journaled(
+                &params.project,
+                "__compose-inbox",
+                &[&params.project, "--limit", "30"],
+                &format!("compose-inbox:{}", params.project),
+            ) {
+                Ok(v) => {
+                    let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
+                    let rows: Vec<ComposeRequestRow> =
+                        serde_json::from_value(items).unwrap_or_default();
+                    let allowlist = v
+                        .get("allowlist")
+                        .and_then(|a| serde_json::from_value::<Vec<String>>(a.clone()).ok())
+                        .unwrap_or_default();
+                    (rows, allowlist)
+                }
+                Err(_) => (vec![], vec![]),
+            };
         if !compose_rows.is_empty() {
             let catalog_owned: Vec<(String, Option<String>)> =
                 crate::workflow_catalog::WorkflowCatalog::load_layered(None)
@@ -7483,19 +7516,18 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // fresh (standing orders ride the boot prime; open thread refs ride
         // the digest prefix on later prompts) within this poll cycle; the
         // sender pin → pane mapping refuses strangers.
-        let ctx_items: Vec<crate::XprojInboxItem> =
-            match crate::elm::leaf::run_leaf_journaled(
-                &params.project,
-                "__context-inbox",
-                &[&params.project, "--limit", "30"],
-                &format!("context-inbox:{}", params.project),
-            ) {
-                Ok(v) => {
-                    let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
-                    serde_json::from_value(items).unwrap_or_default()
-                }
-                Err(_) => vec![],
-            };
+        let ctx_items: Vec<crate::XprojInboxItem> = match crate::elm::leaf::run_leaf_journaled(
+            &params.project,
+            "__context-inbox",
+            &[&params.project, "--limit", "30"],
+            &format!("context-inbox:{}", params.project),
+        ) {
+            Ok(v) => {
+                let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
+                serde_json::from_value(items).unwrap_or_default()
+            }
+            Err(_) => vec![],
+        };
         for item in &ctx_items {
             if seen_ctx_limit.contains(&item.id) {
                 continue;
@@ -8004,38 +8036,37 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // poll), evaluated inline with caller authority
                         // time. Fail-open: a scan failure proceeds.
                         let g_now_us = authority.now_unix() as i64 * 1_000_000;
-                        let g_hold: Option<String> =
-                            match crate::elm::leaf::run_leaf_journaled(
-                                &params.project,
-                                "__dispatch-guard",
-                                &[&params.project, &bead_id],
-                                &format!("dispatch-guard:{bead_id}:{g_now_us}"),
-                            ) {
-                                Ok(facts) => {
-                                    let v = settle_dispatch_guard_output(
-                                        &facts,
-                                        &bead_id,
-                                        g_now_us,
-                                        params.dispatch_guard_ttl_us,
-                                    );
-                                    if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
-                                        Some(
-                                            v.get("reason")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("held")
-                                                .to_string(),
-                                        )
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "flywheel: dispatch-guard leaf failed for {bead_id} (fail-open): {e}"
-                                    );
+                        let g_hold: Option<String> = match crate::elm::leaf::run_leaf_journaled(
+                            &params.project,
+                            "__dispatch-guard",
+                            &[&params.project, &bead_id],
+                            &format!("dispatch-guard:{bead_id}:{g_now_us}"),
+                        ) {
+                            Ok(facts) => {
+                                let v = settle_dispatch_guard_output(
+                                    &facts,
+                                    &bead_id,
+                                    g_now_us,
+                                    params.dispatch_guard_ttl_us,
+                                );
+                                if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
+                                    Some(
+                                        v.get("reason")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("held")
+                                            .to_string(),
+                                    )
+                                } else {
                                     None
                                 }
-                            };
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "flywheel: dispatch-guard leaf failed for {bead_id} (fail-open): {e}"
+                                );
+                                None
+                            }
+                        };
                         match g_hold {
                             Some(reason) => {
                                 eprintln!(
@@ -8072,38 +8103,37 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // poll), evaluated inline with caller authority
                         // time. Fail-open: a scan failure proceeds.
                         let g_now_us = authority.now_unix() as i64 * 1_000_000;
-                        let g_hold: Option<String> =
-                            match crate::elm::leaf::run_leaf_journaled(
-                                &params.project,
-                                "__dispatch-guard",
-                                &[&params.project, &bead_id],
-                                &format!("dispatch-guard:{bead_id}:{g_now_us}"),
-                            ) {
-                                Ok(facts) => {
-                                    let v = settle_dispatch_guard_output(
-                                        &facts,
-                                        &bead_id,
-                                        g_now_us,
-                                        params.dispatch_guard_ttl_us,
-                                    );
-                                    if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
-                                        Some(
-                                            v.get("reason")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("held")
-                                                .to_string(),
-                                        )
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "flywheel: dispatch-guard leaf failed for {bead_id} (fail-open): {e}"
-                                    );
+                        let g_hold: Option<String> = match crate::elm::leaf::run_leaf_journaled(
+                            &params.project,
+                            "__dispatch-guard",
+                            &[&params.project, &bead_id],
+                            &format!("dispatch-guard:{bead_id}:{g_now_us}"),
+                        ) {
+                            Ok(facts) => {
+                                let v = settle_dispatch_guard_output(
+                                    &facts,
+                                    &bead_id,
+                                    g_now_us,
+                                    params.dispatch_guard_ttl_us,
+                                );
+                                if v.get("dispatch").and_then(Value::as_bool) == Some(false) {
+                                    Some(
+                                        v.get("reason")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("held")
+                                            .to_string(),
+                                    )
+                                } else {
                                     None
                                 }
-                            };
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "flywheel: dispatch-guard leaf failed for {bead_id} (fail-open): {e}"
+                                );
+                                None
+                            }
+                        };
                         match g_hold {
                             Some(reason) => {
                                 eprintln!(
@@ -8241,21 +8271,22 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                         }
                                         let lr_refs: Vec<&str> =
                                             lr_argv.iter().map(String::as_str).collect();
-                                        let lr_value = match crate::elm::leaf::run_leaf_journaled_timeout(
-                                            &params.project,
-                                            "__loop-run-verify",
-                                            &lr_refs,
-                                            &format!("loop-run-verify:{bead_id}:{sha}"),
-                                            lr_args.timeout_secs,
-                                        ) {
-                                            Ok(v) => Some(v),
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "flywheel: loop-run-verify for {bead_id} failed (continuing): {e}"
-                                                );
-                                                None
-                                            }
-                                        };
+                                        let lr_value =
+                                            match crate::elm::leaf::run_leaf_journaled_timeout(
+                                                &params.project,
+                                                "__loop-run-verify",
+                                                &lr_refs,
+                                                &format!("loop-run-verify:{bead_id}:{sha}"),
+                                                lr_args.timeout_secs,
+                                            ) {
+                                                Ok(v) => Some(v),
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "flywheel: loop-run-verify for {bead_id} failed (continuing): {e}"
+                                                    );
+                                                    None
+                                                }
+                                            };
                                         if let Some(v) = lr_value {
                                             let settled = settle_loop_verify_output(
                                                 &v,
@@ -8950,18 +8981,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         iteration,
                     };
                     let remind_argv = remind_reply_argv(&remind_args);
-                    let remind_refs: Vec<&str> =
-                        remind_argv.iter().map(|s| s.as_str()).collect();
+                    let remind_refs: Vec<&str> = remind_argv.iter().map(|s| s.as_str()).collect();
                     let _ = crate::elm::leaf::run_leaf_journaled(
                         &params.project,
                         "__remind-reply",
                         &remind_refs[1..],
                         &format!(
                             "remind-reply:{}:{}:{}:{}",
-                            params.project,
-                            herdr_name,
-                            exp.thread,
-                            exp.reminder_count
+                            params.project, herdr_name, exp.thread, exp.reminder_count
                         ),
                     ); // leaf logs ReplyMissing + sends; errors logged inside
                     exp.reminder_count = 1;
@@ -9548,9 +9575,7 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     }
                     Err(e) => {
                         critical_leaf_failed_this_iter = true;
-                        eprintln!(
-                            "flywheel: poll_inprogress leaf failed (completion guard): {e}"
-                        );
+                        eprintln!("flywheel: poll_inprogress leaf failed (completion guard): {e}");
                         true
                     }
                 },
@@ -15184,11 +15209,7 @@ mod tests {
             ("bd-unstamped".to_string(), String::new()),
         ];
         assert_eq!(
-            other_file_holder(
-                "src/main.rs",
-                &[("src/**".into(), "OtherPin".into())],
-                "Me"
-            ),
+            other_file_holder("src/main.rs", &[("src/**".into(), "OtherPin".into())], "Me"),
             Some("OtherPin")
         );
         assert_eq!(
@@ -15203,10 +15224,26 @@ mod tests {
             ("src/**".into(), "bd-1".into(), "Me".into()),
             ("src/main.rs".into(), "bd-2".into(), "Other".into()),
         ];
-        assert!(file_blocks_bead("bd-1", &files, "Me"));
-        assert!(file_blocks_bead("bd-2", &files, "Other"));
-        assert!(!file_blocks_bead("bd-9", &files, "Me"));
-        assert!(!file_blocks_bead("bd-1", &files, ""));
+        assert!(file_blocks_bead("bd-1", &files, "Me", &[]));
+        assert!(file_blocks_bead("bd-2", &files, "Other", &[]));
+        assert!(!file_blocks_bead("bd-9", &files, "Me", &[]));
+        assert!(file_blocks_bead(
+            "bd-9",
+            &files,
+            "Me",
+            &["src/main.rs".to_string()]
+        ));
+        assert!(file_blocks_bead(
+            "bd-9",
+            &files,
+            "",
+            &["src/main.rs".to_string()]
+        ));
+        assert_eq!(
+            path_tokens("edit `src/main.rs` and leave Cargo.toml"),
+            vec!["src/main.rs".to_string()]
+        );
+        assert!(!file_blocks_bead("bd-1", &files, "", &[]));
         assert!(peer_held("bd-peer", &reservations, "MyPane"));
         assert!(
             !peer_held("bd-peer", &reservations, "PeerPane"),
@@ -19556,10 +19593,8 @@ mod t4_close_tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "flywheel-settle-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("flywheel-settle-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
     }
@@ -19611,7 +19646,11 @@ mod t4_close_tests {
         let plan = plan_loop_verify_settle(&v, false);
         assert_eq!(
             plan,
-            LoopVerifySettle::Reopen { vacuous: None, timed_out: false, exit: 1 }
+            LoopVerifySettle::Reopen {
+                vacuous: None,
+                timed_out: false,
+                exit: 1
+            }
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -19627,7 +19666,11 @@ mod t4_close_tests {
             "exit": 0,
         });
         match plan_loop_verify_settle(&v, true) {
-            LoopVerifySettle::Reopen { vacuous: Some((w, _, e)), timed_out, exit } => {
+            LoopVerifySettle::Reopen {
+                vacuous: Some((w, _, e)),
+                timed_out,
+                exit,
+            } => {
                 assert!(w.contains("vacuous VERIFY"));
                 assert_eq!((timed_out, exit), (false, 0));
                 assert!(e.contains("output tail"));
@@ -19655,7 +19698,10 @@ mod t4_close_tests {
             "exit": 0,
         });
         match plan_loop_verify_settle(&v, false) {
-            LoopVerifySettle::Record { warn_append: Some(w), .. } => {
+            LoopVerifySettle::Record {
+                warn_append: Some(w),
+                ..
+            } => {
                 assert!(w.contains("vacuous VERIFY"));
             }
             other => panic!("advisory vacuous must record annotated, got {other:?}"),
@@ -19719,8 +19765,16 @@ mod t4_close_tests {
     #[test]
     fn dispatch_guard_proceed_shape_is_exact() {
         let now = 1_000_000_000i64;
-        let v = settle_dispatch_guard_output(&guard_facts(serde_json::json!([])), "bd-x", now, 600_000_000);
-        assert_eq!(v, serde_json::json!({"bead": "bd-x", "dispatch": true, "reason": null}));
+        let v = settle_dispatch_guard_output(
+            &guard_facts(serde_json::json!([])),
+            "bd-x",
+            now,
+            600_000_000,
+        );
+        assert_eq!(
+            v,
+            serde_json::json!({"bead": "bd-x", "dispatch": true, "reason": null})
+        );
     }
 
     #[test]

@@ -195,43 +195,111 @@ pub fn read_lanes(project_dir: &std::path::Path, now: u64) -> (Vec<LaneRow>, boo
     (lanes, false)
 }
 
+/// Workspace pick for the snapshot pins read: first alias match wins;
+/// duplicates resolve to the flywheel-owned label — the same rule as
+/// `find_workspace_dyn` in main.rs. Pure so the contract is testable.
+fn pick_snapshot_workspace(
+    workspaces: &[crate::herdr::WorkspaceInfo],
+    aliases: &[String],
+    owned_label: &str,
+) -> Option<String> {
+    let matches: Vec<&crate::herdr::WorkspaceInfo> = workspaces
+        .iter()
+        .filter(|ws| aliases.iter().any(|a| a == &ws.label))
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    if matches.len() > 1 {
+        let prefix = format!("{owned_label}-");
+        if let Some(ws) = matches
+            .iter()
+            .find(|ws| ws.label == owned_label || ws.label.starts_with(&prefix))
+        {
+            return Some(ws.workspace_id.clone());
+        }
+    }
+    Some(matches[0].workspace_id.clone())
+}
+
+/// Fold one workspace's agents into snapshot pin rows. Shared by the herdr
+/// and rex doors so both report the same shape.
+fn collect_pin_rows(
+    agents: &[crate::herdr::AgentInfo],
+    ws_id: &str,
+    source: &str,
+    pins: &mut Vec<PinRow>,
+    launch_pending: &mut u32,
+) {
+    for a in agents.iter().filter(|a| a.workspace_id == ws_id) {
+        if crate::herdr::agent_still_booting(a) {
+            *launch_pending = launch_pending.saturating_add(1);
+        }
+        let herdr_status = a.agent_status.as_str();
+        let verdict = crate::workspace::verdict_for(None, herdr_status, herdr_status != "dead")
+            .status_token();
+        pins.push(PinRow {
+            pin: a.name.clone().unwrap_or_else(|| a.pane_id.clone()),
+            verdict,
+            source: source.to_string(),
+            since: String::new(),
+            bead: None,
+            reservations: Vec::new(),
+        });
+    }
+}
+
 /// Assemble the snapshot. `now` is the freshness epoch (caller clock).
 pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now: u64) -> Snapshot {
     let mut degraded = Vec::new();
 
-    // Pins: herdr agent list for this workspace (best effort).
+    // Pins: agent list for this workspace (best effort). Rex door: inside
+    // rex (`REX_SESSION` set) list through the multiplexer backend;
+    // otherwise keep the herdr client. Both paths are read-only — neither
+    // creates a session.
     let mut pins = Vec::new();
     let mut launch_pending: u32 = 0;
-    match crate::herdr::Client::connect(Some(&cfg.socket_path())) {
-        Ok(mut c) => match crate::find_workspace(&mut c, project) {
-            Ok(ws_id) => match c.agent_list() {
-                Ok(agents) => {
-                    for a in agents.iter().filter(|a| a.workspace_id == ws_id) {
-                        if crate::herdr::agent_still_booting(a) {
-                            launch_pending = launch_pending.saturating_add(1);
+    if crate::pane::rex_door_selected() {
+        let aliases = crate::workspace_label_aliases(
+            project,
+            crate::state::load_spawn_meta(project).as_deref(),
+        );
+        let owned_label = format!("flywheel-{}", crate::project_base(project));
+        match crate::backend::factory::multiplexer_backend(cfg) {
+            Ok(backend) => match backend.workspace_list() {
+                Ok(list) => match pick_snapshot_workspace(&list, &aliases, &owned_label) {
+                    Some(ws_id) => match backend.agent_list() {
+                        Ok(agents) => {
+                            let source = backend.name().to_string();
+                            collect_pin_rows(
+                                &agents,
+                                &ws_id,
+                                &source,
+                                &mut pins,
+                                &mut launch_pending,
+                            );
                         }
-                        let herdr_status = a.agent_status.as_str();
-                        let verdict = crate::workspace::verdict_for(
-                            None,
-                            herdr_status,
-                            herdr_status != "dead",
-                        )
-                        .status_token();
-                        pins.push(PinRow {
-                            pin: a.name.clone().unwrap_or_else(|| a.pane_id.clone()),
-                            verdict,
-                            source: "herdr".to_string(),
-                            since: String::new(),
-                            bead: None,
-                            reservations: Vec::new(),
-                        });
-                    }
-                }
+                        Err(_) => degraded.push("pins".to_string()),
+                    },
+                    None => degraded.push("pins".to_string()),
+                },
                 Err(_) => degraded.push("pins".to_string()),
             },
             Err(_) => degraded.push("pins".to_string()),
-        },
-        Err(_) => degraded.push("pins".to_string()),
+        }
+    } else {
+        match crate::herdr::Client::connect(Some(&cfg.socket_path())) {
+            Ok(mut c) => match crate::find_workspace(&mut c, project) {
+                Ok(ws_id) => match c.agent_list() {
+                    Ok(agents) => {
+                        collect_pin_rows(&agents, &ws_id, "herdr", &mut pins, &mut launch_pending);
+                    }
+                    Err(_) => degraded.push("pins".to_string()),
+                },
+                Err(_) => degraded.push("pins".to_string()),
+            },
+            Err(_) => degraded.push("pins".to_string()),
+        }
     }
 
     // Lanes: beads JSON.
@@ -860,5 +928,43 @@ mod adr0010_d10_tests {
         );
         bind_pins_to_board(&mut pins, &serde_json::json!({}), &identities);
         assert_eq!(pins[0].bead.as_deref(), Some("bd-zgi9"));
+    }
+
+    fn ws(id: &str, label: &str) -> crate::herdr::WorkspaceInfo {
+        crate::herdr::WorkspaceInfo {
+            workspace_id: id.to_string(),
+            number: 0,
+            label: label.to_string(),
+            focused: false,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: String::new(),
+            agent_status: crate::herdr::AgentStatus::Unknown,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_workspace_pick_prefers_owned_label() {
+        // Rex door: duplicate labels resolve to the flywheel-owned one,
+        // the same rule as `find_workspace_dyn`.
+        let list = vec![ws("w-stale", "proj"), ws("w-live", "flywheel-proj")];
+        let aliases = vec!["flywheel-proj".to_string(), "proj".to_string()];
+        assert_eq!(
+            pick_snapshot_workspace(&list, &aliases, "flywheel-proj").as_deref(),
+            Some("w-live")
+        );
+    }
+
+    #[test]
+    fn snapshot_workspace_pick_single_match_and_miss() {
+        let list = vec![ws("w1", "proj")];
+        let aliases = vec!["proj".to_string()];
+        assert_eq!(
+            pick_snapshot_workspace(&list, &aliases, "flywheel-proj").as_deref(),
+            Some("w1")
+        );
+        let none: Vec<String> = vec![];
+        assert_eq!(pick_snapshot_workspace(&list, &none, "flywheel-proj"), None);
     }
 }

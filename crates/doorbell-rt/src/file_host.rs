@@ -846,23 +846,50 @@ pub fn injection_picture(
     // (same guard as the reaper): no evidence, keep all rows.
     let panes = herdr_pane_ids(herdr_bin);
     let mut picture = InjectionPicture::default();
+    let herdr_answered = !panes.is_empty();
     for (_, pane, _) in &rows {
-        if !panes.is_empty() && (pane.is_empty() || !panes.contains(pane)) {
-            picture.panes_missing += 1;
-            continue;
-        }
-        picture.pins += 1;
-        match statuses.get(pane) {
-            Some(status) => {
-                picture.panes_seen += 1;
-                if doorbell_core::should_inject(status) {
-                    picture.injectable += 1;
-                }
-            }
-            None => picture.panes_missing += 1,
-        }
+        let status = statuses.get(pane).map(String::as_str);
+        account_listed_pane(
+            &mut picture,
+            pane,
+            herdr_answered,
+            panes.contains(pane),
+            status,
+        );
     }
     picture
+}
+
+/// One registry pane's contribution to the injection picture. A `block:`
+/// id is a Rex terminal herdr will never list. It counts as seen so
+/// `/health` does not say `no_pane_in_herdr` while the rex ring can still
+/// type. Injectable stays 0 until a status says idle, done, or blocked.
+pub fn account_listed_pane(
+    picture: &mut InjectionPicture,
+    pane: &str,
+    herdr_answered: bool,
+    herdr_has_pane: bool,
+    status: Option<&str>,
+) {
+    if pane.starts_with("block:") {
+        picture.pins += 1;
+        picture.panes_seen += 1;
+        return;
+    }
+    if herdr_answered && (pane.is_empty() || !herdr_has_pane) {
+        picture.panes_missing += 1;
+        return;
+    }
+    picture.pins += 1;
+    match status {
+        Some(status) => {
+            picture.panes_seen += 1;
+            if doorbell_core::should_inject(status) {
+                picture.injectable += 1;
+            }
+        }
+        None => picture.panes_missing += 1,
+    }
 }
 
 /// Wake-socket subscription kinds live in [`WATCH_KINDS`]; the consumer in
@@ -2517,6 +2544,20 @@ mod tests {
         // digest-bound, never queued into a table that cannot drain it.
         let empty: std::collections::HashSet<String> = Default::default();
         assert!(captain_pane_targets(&roster, &["Gone".to_string()], &empty).is_empty());
+    }
+
+    #[test]
+    fn a_rex_block_counts_as_seen_when_herdr_lists_nothing() {
+        let mut pic = InjectionPicture::default();
+        account_listed_pane(&mut pic, "block:01a170b3", false, false, None);
+        assert_eq!(
+            (pic.pins, pic.panes_seen, pic.injectable, pic.panes_missing),
+            (1, 1, 0, 0)
+        );
+        let mut missing = InjectionPicture::default();
+        account_listed_pane(&mut missing, "w6:p1", true, false, None);
+        assert_eq!(missing.panes_missing, 1);
+        assert_eq!(missing.panes_seen, 0);
     }
 
     /// bd-523f: the LAST hop dies on the TARGET SPELLING, not on the route.

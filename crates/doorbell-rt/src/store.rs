@@ -883,9 +883,7 @@ impl FileStore {
     /// dead path. A tear on a workspace we HOST is degraded; a tear on one we
     /// abandoned is history.
     pub fn any_torn_tail_among(&self, hosted: &[&str]) -> bool {
-        hosted
-            .iter()
-            .any(|ws| self.torn_probe(ws).torn.is_some())
+        hosted.iter().any(|ws| self.torn_probe(ws).torn.is_some())
     }
 
     /// The SAME rule as [`Self::any_torn_tail_among`] (a tear on a workspace we
@@ -1589,8 +1587,14 @@ mod tests {
         for name in ["pub fn torn_tails_among", "pub fn any_torn_tail_among"] {
             let at = src.find(name).expect(name);
             let body = &src[at..at + src[at..].find("\n    }\n").expect("body end")];
-            assert!(body.contains("torn_probe("), "{name} must use torn_probe: {body}");
-            assert!(!body.contains("fold_workspace("), "{name} folds the rows: {body}");
+            assert!(
+                body.contains("torn_probe("),
+                "{name} must use torn_probe: {body}"
+            );
+            assert!(
+                !body.contains("fold_workspace("),
+                "{name} folds the rows: {body}"
+            );
         }
     }
 

@@ -1496,7 +1496,11 @@ mod tests {
 
         let out = fx(&inv).expect("runner returns a value");
 
-        assert_eq!(out["ok"], json!(true), "the observed result passes through: {out}");
+        assert_eq!(
+            out["ok"],
+            json!(true),
+            "the observed result passes through: {out}"
+        );
         assert!(
             store
                 .get_effect(&effect_key_for(&inv))

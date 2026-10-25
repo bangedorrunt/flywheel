@@ -53,6 +53,24 @@ pub fn resolve_mail_name(cfg: &Config) -> String {
         .unwrap_or_else(|| DEFAULT_MAIL.to_string())
 }
 
+/// Construct the herdr backend (connects the client itself, ADR-0005 P1).
+#[cfg(feature = "backend-herdr")]
+fn herdr_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> {
+    let backend = toron_core::backend::herdr::HerdrBackend::connect(Some(&cfg.socket_path()))
+        .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
+    Ok(Box::new(backend))
+}
+
+/// Auto selection: rex sets `REX_SESSION` (plus `REX_BLOCK`/`REX_SERVER`)
+/// in every terminal, so a set non-empty value means this process runs
+/// inside rex and rex is the primary (herdr stays as transport fallback).
+/// An empty or unset value means outside rex: herdr serves directly.
+fn rex_selected_via_env() -> bool {
+    std::env::var("REX_SESSION")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Construct the active multiplexer backend. Default = herdr; unrecognized →
 /// actionable error (no silent fallback to the default — ADR-0002 §6). The
 /// `backend-herdr` cargo feature gates the herdr impl; when it's off, the
@@ -61,27 +79,25 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
     let name = resolve_backend_name(cfg);
     match name.as_str() {
         #[cfg(feature = "backend-herdr")]
-        "herdr" => {
-            // ADR-0005 P1: the unified HerdrBackend (toron-core) connects the
-            // client itself and implements the unified Backend trait.
-            let backend =
-                toron_core::backend::herdr::HerdrBackend::connect(Some(&cfg.socket_path()))
-                    .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
-            Ok(Box::new(backend))
-        }
+        "herdr" => herdr_backend(cfg),
         // superlogical: rex CLI (feature `backend-superlogical`). With the
         // feature off, the arm is compiled out and the name falls through
         // to `other` -> "not compiled in". subscribe, agent_wait, and
         // agent_send_keys stay Unsupported and name the method.
         #[cfg(feature = "backend-superlogical")]
         "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
-        // auto: rex first, herdr on transport failure (Connect/Io/Timeout).
-        // A herdr daemon that is down at startup leaves a primary-only
-        // backend behind a loud warning instead of refusing the whole
-        // construction: rex-first still works, and a later rex transport
-        // failure surfaces as its own error.
+        // auto: `REX_SESSION` set (inside a rex terminal) → rex primary,
+        // herdr on transport failure only (Connect/Io/Timeout — a
+        // successful rex call never falls through). `REX_SESSION`
+        // empty/unset (outside rex) → herdr directly. A herdr daemon
+        // that is down at startup leaves a primary-only backend behind
+        // a loud warning instead of refusing the whole construction.
         #[cfg(feature = "backend-superlogical")]
         "auto" => {
+            #[cfg(feature = "backend-herdr")]
+            if !rex_selected_via_env() {
+                return herdr_backend(cfg);
+            }
             let primary: Box<dyn MultiplexerBackend> =
                 Box::new(crate::backend::superlogical::SuperlogicalBackend);
             #[cfg(feature = "backend-herdr")]
@@ -134,18 +150,18 @@ pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailSurface>> {
     }
 }
 
-/// bd-bio8: spawn is herdr-led (workspace.create, pane.split, agent env,
-/// doorbell subscribe all speak herdr). A non-herdr selection fails loud
-/// before any side effect instead of silently building herdr panes while
-/// the operator believes they are on rex.
+/// Rex native door: `herdr`, `auto`, and `superlogical` all spawn. Any other
+/// selection fails loud before any side effect instead of silently building
+/// panes on the wrong backend.
 pub fn require_herdr_for_spawn(name: &str) -> Result<()> {
-    if name == "herdr" {
+    if matches!(name, "herdr" | "auto" | "superlogical") {
         return Ok(());
     }
     Err(BackendError::Unsupported {
         backend: name.to_string(),
         method: "spawn",
-        reason: "flywheel spawn is herdr-led; set FLYWHEEL_BACKEND=herdr for spawn (rex crews assemble via the rex CLI)".to_string(),
+        reason: "unknown multiplexer backend for spawn (want herdr, auto, or superlogical)"
+            .to_string(),
     })
 }
 
@@ -218,16 +234,17 @@ mod tests {
         assert_eq!(resolve_mail_name(&cfg), "toron");
     }
 
-    /// With the rex backend compiled in, the default is rex-first with
-    /// herdr fallback. Construction never needs a live daemon: rex
-    /// resolves lazily per call, and a down herdr daemon leaves a
-    /// primary-only backend behind a warning.
+    /// With the rex backend compiled in, the default name is auto. Inside a
+    /// rex terminal (`REX_SESSION` set) auto constructs rex-first with
+    /// herdr transport fallback: rex resolves lazily per call, and a down
+    /// herdr daemon leaves a primary-only backend behind a warning.
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn defaults_resolve_to_auto_and_toron() {
         let _g = lock_env();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
+        unsafe { std::env::set_var("REX_SESSION", "session:test") };
         let cfg = Config::default();
         assert_eq!(resolve_backend_name(&cfg), "auto");
         assert_eq!(resolve_mail_name(&cfg), "toron");
@@ -235,6 +252,23 @@ mod tests {
         assert_eq!(backend.name(), "auto");
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
+        unsafe { std::env::remove_var("REX_SESSION") };
+    }
+
+    /// Auto selection follows `REX_SESSION` (set by the rex server in every
+    /// terminal): set means inside rex, empty or unset means outside.
+    #[test]
+    fn auto_selection_follows_rex_session_env() {
+        let _g = lock_env();
+        unsafe { std::env::remove_var("REX_SESSION") };
+        assert!(!super::rex_selected_via_env(), "unset means outside rex");
+        unsafe { std::env::set_var("REX_SESSION", "") };
+        assert!(!super::rex_selected_via_env(), "empty means outside rex");
+        unsafe { std::env::set_var("REX_SESSION", "   ") };
+        assert!(!super::rex_selected_via_env(), "blank means outside rex");
+        unsafe { std::env::set_var("REX_SESSION", "session:fake-1") };
+        assert!(super::rex_selected_via_env(), "set means inside rex");
+        unsafe { std::env::remove_var("REX_SESSION") };
     }
     /// Env overrides config (the precedence contract — flag wiring is R0.6).
     #[test]
@@ -447,23 +481,27 @@ mod spawn_gate_tests {
     use super::require_herdr_for_spawn;
     use crate::backend::BackendError;
 
-    /// bd-bio8: herdr spawns; every other selection refuses loud before any
-    /// side effect, naming the method and the fix. No live socket needed:
-    /// the gate decides on the name alone.
+    /// Rex native door: herdr, auto, and superlogical all pass the gate.
+    /// Unknown names still refuse loud before any side effect, naming the
+    /// method and the fix. No live socket needed: the gate decides on the
+    /// name alone.
     #[test]
-    fn spawn_gate_passes_herdr_and_refuses_rex_modes() {
-        assert!(require_herdr_for_spawn("herdr").is_ok());
-        for name in ["auto", "superlogical", "nonsense"] {
-            match require_herdr_for_spawn(name) {
-                Err(BackendError::Unsupported {
-                    backend, method, ..
-                }) => {
-                    assert_eq!(backend, name);
-                    assert_eq!(method, "spawn");
-                }
-                Err(e) => panic!("expected Unsupported for {name}, got error: {e}"),
-                Ok(()) => panic!("expected Unsupported for {name}, got Ok"),
+    fn spawn_gate_passes_herdr_and_rex_modes() {
+        for name in ["herdr", "auto", "superlogical"] {
+            assert!(
+                require_herdr_for_spawn(name).is_ok(),
+                "{name} must pass the spawn gate"
+            );
+        }
+        match require_herdr_for_spawn("nonsense") {
+            Err(BackendError::Unsupported {
+                backend, method, ..
+            }) => {
+                assert_eq!(backend, "nonsense");
+                assert_eq!(method, "spawn");
             }
+            Err(e) => panic!("expected Unsupported for nonsense, got error: {e}"),
+            Ok(()) => panic!("expected Unsupported for nonsense, got Ok"),
         }
     }
 }

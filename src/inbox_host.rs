@@ -464,7 +464,9 @@ pub fn round(
                 s.head,
                 s.cursor,
                 s.pane,
-                s.bind.as_ref().map(|b| (b.verified, b.verified_by.as_str())),
+                s.bind
+                    .as_ref()
+                    .map(|b| (b.verified, b.verified_by.as_str())),
                 s.urgency,
             );
         }
@@ -1395,13 +1397,7 @@ mod tests {
             None
         }
 
-        fn ring(
-            &mut self,
-            _npub: &str,
-            pane_id: &str,
-            wm: u64,
-            _line: &str,
-        ) -> Result<(), String> {
+        fn ring(&mut self, _npub: &str, pane_id: &str, wm: u64, _line: &str) -> Result<(), String> {
             self.rung.lock().unwrap().push((pane_id.to_string(), wm));
             Ok(())
         }
@@ -1410,7 +1406,12 @@ mod tests {
             Ok(())
         }
 
-        fn notify_supervisor(&mut self, npub: &str, wm: u64, _cause: DeafCause) -> Result<(), String> {
+        fn notify_supervisor(
+            &mut self,
+            npub: &str,
+            wm: u64,
+            _cause: DeafCause,
+        ) -> Result<(), String> {
             self.notices
                 .lock()
                 .unwrap()
@@ -1453,8 +1454,14 @@ mod tests {
         assert_eq!(ports.rung.lock().unwrap().len(), 5, "budget is five rings");
         let rep = round(&mut core, &mut ports, vec![], at + 600_000);
         let notices = ports.notices.lock().unwrap().clone();
-        assert!(notices.iter().any(|n| n.starts_with("supervisor ")), "{notices:?}");
-        assert!(notices.iter().any(|n| n.starts_with("captain ")), "{notices:?}");
+        assert!(
+            notices.iter().any(|n| n.starts_with("supervisor ")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.starts_with("captain ")),
+            "{notices:?}"
+        );
         assert_eq!(rep.deaf, 1, "deaf escalates after the budget");
     }
 }

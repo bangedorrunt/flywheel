@@ -22,6 +22,8 @@ use crate::decide::{Snapshot, decide};
 use serde::{Deserialize, Serialize};
 use toron_core::kernel::{Boot, Cmd as CmdTrait, Durability, Failure, Program, Update};
 
+#[cfg(test)]
+pub use toron_core::kernel::TestClock;
 /// The framework's remote-stack shapes, re-exported so this plane has ONE
 /// door to the framework (ADR-0018 §1: the port module is the only door).
 /// An upstream API move changes this list, not the plane's call sites.
@@ -29,8 +31,6 @@ pub use toron_core::kernel::{
     BreakerConfig, Cause, ClockImpl, Defect, Effect, Exit, Remote, RemoteError, RemotePolicy,
     Runtime, SystemClock,
 };
-#[cfg(test)]
-pub use toron_core::kernel::TestClock;
 
 /// A host duration as the framework's. The framework measures in whole
 /// milliseconds, so the conversion belongs here, beside the types it
@@ -360,7 +360,10 @@ mod tests {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         rs_files(&src_dir, &mut files);
-        assert!(!files.is_empty(), "the source tree is readable: {src_dir:?}");
+        assert!(
+            !files.is_empty(),
+            "the source tree is readable: {src_dir:?}"
+        );
 
         let mut offenders = Vec::new();
         for file in &files {

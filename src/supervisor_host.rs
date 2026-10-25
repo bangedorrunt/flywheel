@@ -1359,10 +1359,9 @@ impl Ports for LivePorts {
         for id in leads {
             let dead = self.lead_host_dead(&id);
             let project = self.project.clone();
-            let cur = self
-                .lead_facts
-                .entry(id.clone())
-                .or_insert_with(|| FactsCursor::open(lead_facts_file(&project, Some(&id)), &reader));
+            let cur = self.lead_facts.entry(id.clone()).or_insert_with(|| {
+                FactsCursor::open(lead_facts_file(&project, Some(&id)), &reader)
+            });
             out.extend(lead_upward(cur, model, &id, now_ms, dead));
         }
         // herdr edges.
@@ -1781,7 +1780,9 @@ fn run_bounded(
 ) -> Result<std::process::ExitStatus, Bounded> {
     let mut started = None;
     run_bounded_on(program, argv, cwd, timeout, &mut || {
-        started.get_or_insert_with(std::time::Instant::now).elapsed()
+        started
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
     })
 }
 
@@ -1885,9 +1886,9 @@ pub(crate) fn claim_with(
         crate::lead_claim::EpochAuthority::Fold => {
             let epoch = core.claim(me)?;
             let lead = match opened.as_ref().filter(|_| readable) {
-                Some(store) => match crate::mail::block_on(
-                    crate::lead_claim::append_lead_in(store, project, lead_ctx, &holder, epoch),
-                ) {
+                Some(store) => match crate::mail::block_on(crate::lead_claim::append_lead_in(
+                    store, project, lead_ctx, &holder, epoch,
+                )) {
                     Ok(()) => Some(epoch),
                     Err(e) => {
                         eprintln!(
@@ -2944,7 +2945,15 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let me = "supervise-proj-4243";
         let mut c = Core::open(CtxPaths::new(d.path(), "proj"), me, Tier::Lead, None).unwrap();
-        let claim = claim_with(&mut c, "proj", "proj", me, Some("fold"), Some(store.clone())).unwrap();
+        let claim = claim_with(
+            &mut c,
+            "proj",
+            "proj",
+            me,
+            Some("fold"),
+            Some(store.clone()),
+        )
+        .unwrap();
         assert_eq!(claim.lead, Some(claim.epoch));
         assert_eq!(
             lead_row(&store, "proj"),
@@ -2961,8 +2970,15 @@ mod tests {
         let claim = claim_with(&mut c, "proj", "proj", me, None, None).unwrap();
         assert_eq!(claim.lead, None);
         let e = claim.epoch;
-        assert!(steer_gate(claim.lead, e).unwrap_err().contains("no lead claim"));
-        assert!(steer_gate(Some(e), e + 1).is_err(), "another epoch is not ours");
+        assert!(
+            steer_gate(claim.lead, e)
+                .unwrap_err()
+                .contains("no lead claim")
+        );
+        assert!(
+            steer_gate(Some(e), e + 1).is_err(),
+            "another epoch is not ours"
+        );
         assert!(steer_gate(Some(e), e).is_ok());
     }
 
@@ -2974,7 +2990,10 @@ mod tests {
             .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {\n        // rv23")
             .expect("LivePorts::append_steer");
         let body = &src[at..at + 400];
-        assert!(body.contains("steer_gate(self.lead, s.sup_epoch)?;"), "{body}");
+        assert!(
+            body.contains("steer_gate(self.lead, s.sup_epoch)?;"),
+            "{body}"
+        );
         let main = src.find("fn host_loop(").expect("host_loop");
         assert!(src[main..].contains(".with_lead(claim.lead)"));
     }
@@ -3040,7 +3059,10 @@ mod tests {
         let src = include_str!("supervisor_host.rs");
         let main = src.find("fn host_loop(").expect("host_loop");
         let body = &src[main..];
-        assert!(body.contains("lead_context(project, context);"), "host_loop");
+        assert!(
+            body.contains("lead_context(project, context);"),
+            "host_loop"
+        );
         assert!(body.contains("claim_for_host(&mut core, project, &lead_ctx, me)?"));
         let at = src
             .find("    fn append_steer(&mut self, s: &SteerSend) -> Result<u64, String> {\n        // rv23")
@@ -3154,12 +3176,18 @@ mod tests {
         let run = lead_model(ChildState::Running);
         std::fs::write(&f, line("k1")).unwrap();
         let mut c = FactsCursor::open(f.clone(), "root");
-        assert_eq!(escalated_keys(&lead_upward(&mut c, &run, "plane", 1, false)), ["k1"]);
+        assert_eq!(
+            escalated_keys(&lead_upward(&mut c, &run, "plane", 1, false)),
+            ["k1"]
+        );
         let after_first = c.bytes_read;
         assert!(escalated_keys(&lead_upward(&mut c, &run, "plane", 2, false)).is_empty());
         assert_eq!(c.bytes_read, after_first, "nothing new is no bytes read");
         add(&format!("{}{{\"kind\":\"esc", line("k2")));
-        assert_eq!(escalated_keys(&lead_upward(&mut c, &run, "plane", 3, false)), ["k2"]);
+        assert_eq!(
+            escalated_keys(&lead_upward(&mut c, &run, "plane", 3, false)),
+            ["k2"]
+        );
         add("alate\",\"key\":\"k3\",\"reason\":\"r\"}\n");
         let stopped = lead_model(ChildState::Restarting);
         assert!(escalated_keys(&lead_upward(&mut c, &stopped, "plane", 4, false)).is_empty());
@@ -3181,7 +3209,10 @@ mod tests {
             "each reader keeps its own offset"
         );
         std::fs::write(&f, line("k9")).unwrap();
-        assert_eq!(escalated_keys(&lead_upward(&mut again, &run, "plane", 7, false)), ["k9"]);
+        assert_eq!(
+            escalated_keys(&lead_upward(&mut again, &run, "plane", 7, false)),
+            ["k9"]
+        );
     }
 
     /// rv23 #4: the live observe reads lead and deaf facts through cursors.
@@ -3762,7 +3793,10 @@ mod tests {
         );
         let took = started.elapsed();
         assert!(logf.exists(), "br did run");
-        assert!(matches!(got, Err(Bounded::TimedOut(_))), "past the deadline is a timeout");
+        assert!(
+            matches!(got, Err(Bounded::TimedOut(_))),
+            "past the deadline is a timeout"
+        );
         assert!(
             took < Duration::from_secs(15),
             "killed at the deadline, not waited out (br hangs 20 s): {took:?}"
@@ -4585,7 +4619,10 @@ mod tests {
                 owner,
             )
         };
-        let (rs, ls) = (journal_scope("proj", None), journal_scope("proj", Some("plane")));
+        let (rs, ls) = (
+            journal_scope("proj", None),
+            journal_scope("proj", Some("plane")),
+        );
         assert_eq!(rs, format!("supervise:{}", crate::state::state_key("proj")));
         let mut root = open(&rs, "root");
         let mut lead = open(&ls, "lead");
@@ -4602,9 +4639,7 @@ mod tests {
     }
 
     /// Two hosts' journals over ONE store (a kill -9 and a restart).
-    fn toron_journals(
-        owners: &[&str],
-    ) -> (Vec<ToronEffectJournal>, tokio::runtime::Runtime) {
+    fn toron_journals(owners: &[&str]) -> (Vec<ToronEffectJournal>, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap().keep();
         let db = dir.join("index.sqlite");
@@ -4619,7 +4654,10 @@ mod tests {
             .iter()
             .map(|o| {
                 let jd = toron_core::journal::JournalDb::new(pool.clone(), "supervise:test", 64);
-                ToronEffectJournal::new(toron_core::journal::ToronJournal::spawn(jd, rt.handle()), o)
+                ToronEffectJournal::new(
+                    toron_core::journal::ToronJournal::spawn(jd, rt.handle()),
+                    o,
+                )
             })
             .collect();
         (js, rt)
@@ -4721,13 +4759,23 @@ mod tests {
         // command at its original generation, spending no second slot.
         let d = tempfile::tempdir().unwrap();
         let me = "supervise-proj-plane-1";
-        let mut dead =
-            Core::open(CtxPaths::with_context(d.path(), "proj", "plane"), me, Tier::Lead, None)
-                .unwrap();
+        let mut dead = Core::open(
+            CtxPaths::with_context(d.path(), "proj", "plane"),
+            me,
+            Tier::Lead,
+            None,
+        )
+        .unwrap();
         dead.claim(me).unwrap();
         assert_eq!(dead.model.accepted_epoch, 1);
         let f = Fake::default();
-        go(&mut dead, &mut MemJournal::default(), &f, vec![spawn("b")], 1_000);
+        go(
+            &mut dead,
+            &mut MemJournal::default(),
+            &f,
+            vec![spawn("b")],
+            1_000,
+        );
         let cmds = dead
             .append_fold(SupMsg::Exit {
                 child: "b".into(),
@@ -4748,9 +4796,13 @@ mod tests {
         assert!(matches!(js[0].begin("relaunch:b:2"), Begin::Run(_)));
         drop(dead); // kill -9: the lead's claim is never settled.
         let me2 = "supervise-proj-plane-2";
-        let mut live =
-            Core::open(CtxPaths::with_context(d.path(), "proj", "plane"), me2, Tier::Lead, None)
-                .unwrap();
+        let mut live = Core::open(
+            CtxPaths::with_context(d.path(), "proj", "plane"),
+            me2,
+            Tier::Lead,
+            None,
+        )
+        .unwrap();
         live.claim(me2).unwrap();
         assert_eq!(live.model.accepted_epoch, 2);
         let f2 = Fake::default();

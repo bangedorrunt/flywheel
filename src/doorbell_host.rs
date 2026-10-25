@@ -259,10 +259,12 @@ impl RtHost {
                 rest.push(cmd);
                 continue;
             }
-            let exit = self.durable_services.run(DurableInterpret::interpret_in_env(
-                &cmd,
-                self.durable_services.context(),
-            ));
+            let exit = self
+                .durable_services
+                .run(DurableInterpret::interpret_in_env(
+                    &cmd,
+                    self.durable_services.context(),
+                ));
             let (next, _) = match exit {
                 Exit::Success(msg) => workspace::tick(&self.model, &msg),
                 Exit::Failure(cause) => workspace::tick(
@@ -367,9 +369,8 @@ impl RtHost {
                     Ok(StreamOutcome::Event(ev)) => {
                         let ev = *ev;
                         if let crate::herdr::HerdrEventData::PaneAgentStatusChanged(change)
-                        | crate::herdr::HerdrEventData::PaneAgentStatusChangedSub(
-                            change,
-                        ) = ev.data
+                        | crate::herdr::HerdrEventData::PaneAgentStatusChangedSub(change) =
+                            ev.data
                         {
                             let pin = pin_by_pane
                                 .get(&change.pane_id)
@@ -462,9 +463,7 @@ fn reconcile_status_after_events_lost(
 }
 
 /// Pull AgentInfo rows out of a session.snapshot payload when present.
-fn agents_from_session_snapshot(
-    snap: &serde_json::Value,
-) -> Option<Vec<crate::herdr::AgentInfo>> {
+fn agents_from_session_snapshot(snap: &serde_json::Value) -> Option<Vec<crate::herdr::AgentInfo>> {
     // Common shapes: { agents: [...] } or { panes: [...] } with agent fields,
     // or nested under tabs. Prefer an agents array; else try panes.
     if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {
@@ -1883,9 +1882,10 @@ impl AuditEdge for StderrAuditEdge {
 fn durable_services() -> &'static ManagedRuntime {
     static SERVICES: std::sync::OnceLock<ManagedRuntime> = std::sync::OnceLock::new();
     SERVICES.get_or_init(|| {
-        let layer = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(
-            Arc::new(StderrAuditEdge) as Arc<dyn AuditEdge>,
-        );
+        let layer = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(Arc::new(
+            StderrAuditEdge,
+        )
+            as Arc<dyn AuditEdge>);
         ManagedRuntime::make(&layer).expect("durable services build")
     })
 }
@@ -1949,9 +1949,12 @@ mod durable_tests {
     }
 
     fn services_with(refuse: bool) -> (ManagedRuntime, Arc<Recorder>) {
-        let rec = Arc::new(Recorder { ran: std::sync::Mutex::new(vec![]), refuse });
+        let rec = Arc::new(Recorder {
+            ran: std::sync::Mutex::new(vec![]),
+            refuse,
+        });
         let layer = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(
-            rec.clone() as Arc<dyn AuditEdge>,
+            rec.clone() as Arc<dyn AuditEdge>
         );
         let rt = ManagedRuntime::make(&layer).expect("value layer builds");
         assert!(rt.context().is_some());
@@ -1959,7 +1962,11 @@ mod durable_tests {
     }
 
     fn audit_cmd() -> workspace::Cmd {
-        workspace::Cmd::Audit { kind: "k".into(), pin: "p".into(), detail: "d".into() }
+        workspace::Cmd::Audit {
+            kind: "k".into(),
+            pin: "p".into(),
+            detail: "d".into(),
+        }
     }
 
     #[test]
@@ -1993,7 +2000,11 @@ mod durable_tests {
         let (next, cmds) = workspace::tick(&model, &msg);
         assert!(cmds.is_empty());
         assert!(
-            next.swarm.heal_states.get("probe").expect("kept").awaiting_clear,
+            next.swarm
+                .heal_states
+                .get("probe")
+                .expect("kept")
+                .awaiting_clear,
             "a quiet fold preserves the model"
         );
     }
@@ -2024,7 +2035,11 @@ mod durable_tests {
         let (next, cmds) = workspace::tick(&model, &msg);
         assert!(cmds.is_empty());
         assert!(
-            next.swarm.heal_states.get("probe").expect("kept").awaiting_clear,
+            next.swarm
+                .heal_states
+                .get("probe")
+                .expect("kept")
+                .awaiting_clear,
             "a quiet fold preserves the model"
         );
     }
@@ -2032,7 +2047,10 @@ mod durable_tests {
     #[test]
     fn no_edge_in_hand_fails_typed_never_drops() {
         let exit = Runtime::run(DurableInterpret::interpret(&audit_cmd()));
-        assert!(!exit.is_success(), "no edge in hand must fail typed, never drop");
+        assert!(
+            !exit.is_success(),
+            "no edge in hand must fail typed, never drop"
+        );
         let exit = Runtime::run(DurableInterpret::interpret_in_env(&audit_cmd(), None));
         assert!(!exit.is_success());
     }
@@ -2040,7 +2058,10 @@ mod durable_tests {
     #[test]
     fn non_audit_commands_are_not_owned_by_this_arm() {
         let (rt, rec) = services_with(false);
-        let other = workspace::Cmd::Send { name: "n".into(), text: "t".into() };
+        let other = workspace::Cmd::Send {
+            name: "n".into(),
+            text: "t".into(),
+        };
         let exit = Runtime::run(DurableInterpret::interpret_in_env(&other, rt.context()));
         assert!(!exit.is_success(), "unowned arms fail typed, never run");
         assert!(rec.ran.lock().unwrap().is_empty());

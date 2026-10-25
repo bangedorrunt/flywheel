@@ -223,7 +223,12 @@ pub fn heartbeat_signals(
         let age = now.saturating_sub(*ts);
         let signal = if age <= PRESENCE_TTL_SECS {
             HeartbeatSignal::Fresh
-        } else if crate::pane_keep::pane_binding_may_clear(&row.harness, &row.backend, &row.pane_id, live_panes) {
+        } else if crate::pane_keep::pane_binding_may_clear(
+            &row.harness,
+            &row.backend,
+            &row.pane_id,
+            live_panes,
+        ) {
             HeartbeatSignal::Stale {
                 age_secs: age,
                 line: format!(

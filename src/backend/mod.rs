@@ -34,6 +34,8 @@ mod parity;
 #[cfg(feature = "backend-superlogical")]
 pub mod rex_map;
 #[cfg(feature = "backend-superlogical")]
+pub mod rex_spawn;
+#[cfg(feature = "backend-superlogical")]
 pub mod superlogical;
 #[cfg(feature = "mail-toron")]
 pub mod toron;
@@ -239,8 +241,7 @@ mod off_runtime_tests {
     /// runtime, and a plain pass-through outside one.
     #[test]
     fn run_mail_off_runtime_sync_bridges_inside_a_runtime_and_passes_through_outside() {
-        let outside =
-            super::run_mail_off_runtime_sync(|| crate::mail::block_on(async { 3i32 }));
+        let outside = super::run_mail_off_runtime_sync(|| crate::mail::block_on(async { 3i32 }));
         assert_eq!(outside, 3);
         let rt = tokio::runtime::Runtime::new().expect("test runtime");
         let borrowed = String::from("x");

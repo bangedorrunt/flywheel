@@ -159,12 +159,9 @@ fn prune(db: &Path, cutoff_ms: i64, apply: bool) -> Result<GcReport> {
     let where_clause = format!(
         "WHERE settled_at IS NOT NULL AND settled_at < {cutoff_ms} AND id NOT IN (SELECT awaited_id FROM callbacks)"
     );
-    let promises: u64 = sqlite(
-        db,
-        &format!("select count(*) from promises {where_clause}"),
-    )?
-    .parse()
-    .context("count(*) did not parse")?;
+    let promises: u64 = sqlite(db, &format!("select count(*) from promises {where_clause}"))?
+        .parse()
+        .context("count(*) did not parse")?;
     let size_before = db_size(db)?;
 
     if !apply {
@@ -294,13 +291,19 @@ mod tests {
             "new,old2,pending",
             "task rows cascade with their promise; old2 is protected"
         );
-        assert_eq!(sqlite(&db, "select count(*) from task_timeouts;").unwrap(), "1");
+        assert_eq!(
+            sqlite(&db, "select count(*) from task_timeouts;").unwrap(),
+            "1"
+        );
 
         // Dry run counts the same rows but writes nothing. Clearing the
         // callback releases old2 for the next prune.
         sqlite(&db, "DELETE FROM callbacks;").unwrap();
         let report = prune(&db, 5000, false).unwrap();
-        assert_eq!(report.promises, 1, "old2 is prunable once nothing awaits it");
+        assert_eq!(
+            report.promises, 1,
+            "old2 is prunable once nothing awaits it"
+        );
         assert_eq!(sqlite(&db, "select count(*) from promises;").unwrap(), "3");
     }
 

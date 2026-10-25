@@ -318,12 +318,8 @@ impl MultiplexerBackend for SuperlogicalBackend {
         };
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
-        rex.text(&rename_args(
-            &session.session_id,
-            &block.block_id,
-            label,
-        ))
-        .map_err(RexFail::into_backend)?;
+        rex.text(&rename_args(&session.session_id, &block.block_id, label))
+            .map_err(RexFail::into_backend)?;
         Ok(())
     }
 
@@ -337,12 +333,8 @@ impl MultiplexerBackend for SuperlogicalBackend {
         }
         let rex = Self::rex()?;
         let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
-        rex.text(&send_key_args(
-            &session.session_id,
-            &block.block_id,
-            keys,
-        ))
-        .map_err(RexFail::into_backend)?;
+        rex.text(&send_key_args(&session.session_id, &block.block_id, keys))
+            .map_err(RexFail::into_backend)?;
         Ok(())
     }
 

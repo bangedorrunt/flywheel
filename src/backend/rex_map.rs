@@ -11,9 +11,9 @@
 #![allow(dead_code)]
 
 use serde_json::Value;
-use toron_core::backend::herdr::{PaneInfo, WorkspaceInfo};
 use toron_core::backend::AgentStatus;
-use toron_core::osc7501::{parse_report, Board, ProgramState};
+use toron_core::backend::herdr::{PaneInfo, WorkspaceInfo};
+use toron_core::osc7501::{Board, ProgramState, parse_report};
 
 /// A Rex session is a herdr workspace; the session id is the workspace id.
 /// Its agent status is `Unknown`: a session with no records proves nothing.

@@ -78,6 +78,58 @@ pub fn verify_tokens(
     }
 }
 
+/// Which pane id arrive binds. Rex first: a set `REX_BLOCK` is the block
+/// this process is typing in. An empty or whitespace value is the same as
+/// unset, and only then does `HERDR_PANE_ID` apply. Both empty means there
+/// is no pane to push into.
+pub fn arrive_pane_from_env<'a>(
+    rex_block: Option<&'a str>,
+    herdr_pane: Option<&'a str>,
+) -> Option<&'a str> {
+    let rex = rex_block.map(str::trim).filter(|s| !s.is_empty());
+    if rex.is_some() {
+        return rex;
+    }
+    herdr_pane.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// A rex block id. The doorbell child often has no `REX_SESSION` of its
+/// own (launchd, a respawn). The pane id is the fact that says which
+/// typer to use, not the child's environment.
+pub fn is_rex_block(pane_id: &str) -> bool {
+    pane_id.starts_with("block:")
+}
+
+/// Two capitalised words, letters only. A block label with that shape is
+/// another pin, so it must not be rung for this one. `shell` and a
+/// kebab-case label are not pins.
+fn looks_like_pin(label: &str) -> bool {
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    let mut caps = 1u32;
+    let mut prev_cap = true;
+    for c in chars {
+        if !c.is_ascii_alphabetic() {
+            return false;
+        }
+        if c.is_ascii_uppercase() {
+            if prev_cap {
+                return false;
+            }
+            caps += 1;
+            prev_cap = true;
+        } else {
+            prev_cap = false;
+        }
+    }
+    caps == 2 && !prev_cap
+}
+
 /// Pure: the binding for `pin`/`npub` from a rex block. A rex block carries
 /// no stamped tokens, so the binding is three visible facts: the block
 /// label is the pin (set by spawn/rename, the only trusted writer), the
@@ -98,6 +150,24 @@ pub fn verify_rex_binding(
             && pane.workspace_id == session_id
             && !npub.is_empty(),
         verified_by: "rex-label".to_string(),
+    }
+}
+
+/// Registry-bound operator block. Arrive wrote this pane id from
+/// `REX_BLOCK`. The block label is whatever Rex named the terminal
+/// (`shell`), not the pin, and the session is the operator's session, not
+/// the project workspace label. A label that is a *different* pin stays
+/// unverified: that block belongs to someone else.
+pub fn verify_rex_block(pane: &crate::herdr::PaneInfo, pin: &str, npub: &str) -> Bind {
+    let other_pin = pane
+        .label
+        .as_deref()
+        .is_some_and(|label| label != pin && looks_like_pin(label));
+    Bind {
+        pane_id: pane.pane_id.clone(),
+        herdr_session: pane.workspace_id.clone(),
+        verified: is_rex_block(&pane.pane_id) && !npub.is_empty() && !pin.is_empty() && !other_pin,
+        verified_by: "rex-block".to_string(),
     }
 }
 
@@ -262,7 +332,22 @@ impl FlywheelPorts {
                 // from its label); empty resolves against nothing, so an
                 // unresolvable host verifies nothing.
                 let bind = if backend_name != "herdr" && !p.tokens.contains_key(TOKEN_PIN) {
-                    verify_rex_binding(p, host_session, pin, npub)
+                    let by_label = verify_rex_binding(p, host_session, pin, npub);
+                    if by_label.verified {
+                        by_label
+                    } else if p.label.as_deref() == Some(pin)
+                        || p.label
+                            .as_deref()
+                            .is_some_and(|label| label != pin && looks_like_pin(label))
+                    {
+                        // Same pin, wrong session, or a label that names a
+                        // different pin: do not promote it to a block binding.
+                        by_label
+                    } else if is_rex_block(&p.pane_id) {
+                        verify_rex_block(p, pin, npub)
+                    } else {
+                        by_label
+                    }
                 } else {
                     verify_tokens(&p.tokens, pin, npub, &p.pane_id, &p.workspace_id)
                 };
@@ -274,11 +359,13 @@ impl FlywheelPorts {
     }
 
     fn pin_of_npub(&self, npub: &str) -> String {
+        // A roster miss is not a pin: empty finds no registry row, so
+        // reverify returns None instead of comparing an invented name.
         self.npubs
             .iter()
             .find(|(_, n)| n.as_str() == npub)
             .map(|(p, _)| p.clone())
-            .unwrap_or_else(|| npub.chars().take(8).collect())
+            .unwrap_or_default()
     }
 
     /// The pin to notify for a role: a bound role, else the captain alias.
@@ -624,12 +711,17 @@ impl Ports for FlywheelPorts {
             // Agent rows carry no stamped tokens; rex bindings verify
             // through the label path.
             let pane = Self::agent_to_pane(&p);
-            return Some(verify_rex_binding(
-                &pane,
-                &Self::host_session_for(&*backend, &self.workspace),
+            let host_session = Self::host_session_for(&*backend, &self.workspace);
+            let (_, bind) = Self::pane_observation(
+                std::slice::from_ref(&pane),
+                &pane.pane_id,
+                true,
                 &pin,
                 npub,
-            ));
+                "superlogical",
+                &host_session,
+            );
+            return bind;
         }
         let client = self.client()?;
         let p = client
@@ -658,10 +750,11 @@ impl Ports for FlywheelPorts {
         // than typing at a pane that cannot be poked.
         let route =
             crate::harness_caps::wake_route(&kind, crate::harness_caps::installed_from_env());
-        // The typer follows the selected backend: herdr keeps the direct
-        // client typer; rex types through the backend trait (write plus
-        // Enter inside `prompt`).
-        if crate::backend::resolve_backend_name(&self.cfg) == "herdr" {
+        // The pane id picks the typer. A `block:` id is Rex even when this
+        // process has no `REX_SESSION` (the doorbell child often does not).
+        // A herdr pane id stays on herdr. An empty `REX_BLOCK` at arrive is
+        // what left a herdr id here.
+        if !is_rex_block(pane_id) {
             let client = self.client().ok_or("herdr unreachable")?;
             return match ring_wake(
                 &crate::pane_write::HerdrPanes(&client),
@@ -795,6 +888,20 @@ mod tests {
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn pin_of_npub_miss_returns_empty_not_hex() {
+        // A missing roster entry is not a pin: reverify finds no
+        // registry row for "" and returns None instead of comparing
+        // an invented 8-hex name against real pins.
+        let cfg = crate::config::Config::default();
+        let mut ports = FlywheelPorts::new(&cfg, "proj", "ws");
+        ports
+            .npubs
+            .insert("CalmFalcon".to_string(), "npub1abc".to_string());
+        assert_eq!(ports.pin_of_npub("npub1abc"), "CalmFalcon");
+        assert_eq!(ports.pin_of_npub("npub1missing"), "");
+    }
 
     #[test]
     fn a_deaf_notice_quotes_the_pin_and_hides_a_token() {
@@ -956,7 +1063,10 @@ mod tests {
             &src[at..at + src[at..].find("\n    }\n").expect("end")]
         };
         let cap = body("fn notify_captain(");
-        assert!(cap.contains("self.escalate_pin(&cap, &text, &key)?"), "{cap}");
+        assert!(
+            cap.contains("self.escalate_pin(&cap, &text, &key)?"),
+            "{cap}"
+        );
         assert!(!cap.contains("notify_pin("), "{cap}");
         let sup = body("fn notify_supervisor(");
         assert!(sup.contains("self.notify_pin(&sup,"), "{sup}");
@@ -1223,6 +1333,41 @@ mod tests {
             "",
         );
         assert!(bind.is_some_and(|b| !b.verified));
+
+        // Operator terminal: label is Rex's own name, session is not the
+        // project workspace. The registry pane id is the binding arrive
+        // wrote from REX_BLOCK.
+        let shell = vec![listed_block(
+            "block:01a170b3",
+            "session:fading-summit",
+            "shell",
+        )];
+        let (_, bind) = FlywheelPorts::pane_observation(
+            &shell,
+            "block:01a170b3",
+            true,
+            pin,
+            npub,
+            "superlogical",
+            "session:project",
+        );
+        assert!(bind.is_some_and(|b| b.verified && b.verified_by == "rex-block"));
+    }
+
+    #[test]
+    fn arrive_pane_prefers_rex_block_and_falls_back_when_it_is_empty() {
+        assert_eq!(
+            arrive_pane_from_env(Some("block:abc"), Some("w6:p1")),
+            Some("block:abc")
+        );
+        assert_eq!(
+            arrive_pane_from_env(Some("  "), Some("w6:p1")),
+            Some("w6:p1")
+        );
+        assert_eq!(arrive_pane_from_env(None, Some("w6:p1")), Some("w6:p1"));
+        assert_eq!(arrive_pane_from_env(Some(""), None), None);
+        assert!(is_rex_block("block:abc"));
+        assert!(!is_rex_block("w6:p1"));
     }
 
     /// The agent-to-pane projection carries the classified status, the

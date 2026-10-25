@@ -57,11 +57,10 @@ crossterm = "0.28"
 dialoguer = "0.11"
 
 [features]
-# Default build: the `serve` HTTP surface + herdr multiplexer + toron mail
-# (the only mail backend since bd-euav; selected via FLYWHEEL_MAIL=toron).
-# Optional multiplexer (superlogical) is
-# opt-in; its stub impl lands in bd-toron-superlogical-stubs (R0.7).
-default = ["serve", "backend-herdr", "mail-toron"]
+# Default build: the `serve` HTTP surface + herdr + superlogical (rex)
+# multiplexers + toron mail (the only mail backend since bd-euav; selected
+# via FLYWHEEL_MAIL=toron).
+default = ["serve", "backend-herdr", "backend-superlogical", "mail-toron"]
 serve = ["dep:axum", "dep:tokio-stream", "dep:futures-core"]
 # Multiplexer backends (ADR-0002)
 backend-herdr = []

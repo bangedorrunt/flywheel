@@ -42,6 +42,7 @@ use crate::elm::{
     Runtime, SystemClock, kernel_millis,
 };
 
+use crate::backend::MultiplexerBackend;
 use crate::config::Config;
 use crate::crew::CrewPlan;
 use crate::herdr::{AgentStatus, Client};
@@ -413,8 +414,7 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
         .unwrap_or_else(|_| {
             crate::backend::factory::resolve_backend_name(&crate::config::Config::default())
         });
-    let (kept, pruned) =
-        reap_closed_rows(state::load_spawn_registry(project), &live, &backend);
+    let (kept, pruned) = reap_closed_rows(state::load_spawn_registry(project), &live, &backend);
     if pruned == 0 {
         return 0;
     }
@@ -532,6 +532,21 @@ pub fn pre_spawn_crew(
     retire_orphans: bool,
 ) -> Result<PaneRunCtx> {
     ensure_crew(plan, wf_name)?;
+    // Rex door: a set REX_SESSION selects the rex multiplexer arm below —
+    // the herdr `Client` path after it stays exactly as it was. No
+    // `Client::connect` on the rex arm.
+    if rex_door_selected() {
+        return pre_spawn_crew_rex(
+            cfg,
+            project,
+            wf_name,
+            plan,
+            catalog,
+            reuse,
+            retain,
+            retire_orphans,
+        );
+    }
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let dir = crate::project_dir(cfg, project);
     if !dir.exists() {
@@ -725,6 +740,402 @@ fn shell_gate_refusal(name: &str, pane_id: &str) -> anyhow::Error {
          single-quoted arg would split mid-quote and leave the agent dead on spawn). Re-run once \
          the host is less loaded, or raise the budget."
     )
+}
+
+/// Rex-native spawn door (LinenQuill: `REX_SESSION` selects the multiplexer).
+/// A set, non-empty `REX_SESSION` means this process runs inside rex, so the
+/// doors target rex; empty/missing keeps today's herdr `Client` path.
+pub(crate) fn rex_door_selected() -> bool {
+    std::env::var("REX_SESSION")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+/// `program_status` readiness: `idle` (at prompt) and `working` (program
+/// running) both mean the shell is alive. `error` is not Done — a failed
+/// shell never passes the gate. Pure so the contract is testable.
+pub(crate) fn rex_shell_ready(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::Idle | AgentStatus::Working)
+}
+
+/// Quote one env value for the `env K=V` command prefix. Values without
+/// shell metacharacters pass through unchanged.
+fn rex_quote_env_value(v: &str) -> String {
+    if v.is_empty()
+        || v.bytes().any(|b| {
+            matches!(
+                b,
+                b' ' | b'\t' | b'\n' | b'\'' | b'"' | b'\\' | b'$' | b'`' | b'!'
+            )
+        })
+    {
+        format!("'{}'", v.replace('\'', "'\\''"))
+    } else {
+        v.to_string()
+    }
+}
+
+/// Build the one-string rex launch command. `session.new_split` has no env
+/// map, so the pane env rides as an `env K=V` prefix (LinenQuill). `HERDR_*`
+/// integration env belongs to the herdr plane and is dropped — a rex pane
+/// must not chase a herdr socket. Pure so the contract is testable.
+pub(crate) fn rex_env_command(
+    env: &BTreeMap<String, String>,
+    kind: &str,
+    args: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    // BTreeMap iterates sorted, so the prefix order is deterministic.
+    for (k, v) in env {
+        if k == "HERDR_ENV" || k.starts_with("HERDR_") {
+            continue;
+        }
+        parts.push(format!("{k}={}", rex_quote_env_value(v)));
+    }
+    if parts.is_empty() {
+        let mut cmd = vec![kind.to_string()];
+        cmd.extend(args.iter().cloned());
+        return cmd.join(" ");
+    }
+    let mut cmd = vec!["env".to_string()];
+    cmd.append(&mut parts);
+    cmd.push(kind.to_string());
+    cmd.extend(args.iter().cloned());
+    cmd.join(" ")
+}
+
+///Wait for a rex pane's shell: `program_status` (read through the backend's
+/// agent list, which derives statuses from it) must read `idle` or `working`
+/// within `timeout`. Fail-closed with the same refusal as the herdr gate —
+/// typing into a booting shell mangles the launch. Never calls
+/// `herdr::wait_shell_prompt` (that prober speaks herdr, not rex). A backend
+/// that never answers is the real reason and is reported as such instead of
+/// blaming the shell.
+pub(crate) fn wait_rex_shell_ready(
+    backend: &dyn MultiplexerBackend,
+    target: &str,
+    name: &str,
+    pane_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut list_err: Option<anyhow::Error> = None;
+    let mut saw_ok = false;
+    loop {
+        match backend.agent_list() {
+            Ok(agents) => {
+                saw_ok = true;
+                if let Some(a) = agents
+                    .iter()
+                    .find(|a| a.pane_id == target || a.name.as_deref() == Some(target))
+                    && rex_shell_ready(&a.agent_status)
+                {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                // Fail-open inside the budget (transport blip at startup),
+                // fail-closed at the deadline below.
+                list_err = Some(anyhow!("{e:#}"));
+            }
+        }
+        if start.elapsed() >= timeout {
+            // A backend we could never read is the real reason — say so
+            // instead of blaming the shell.
+            if !saw_ok && let Some(e) = list_err {
+                return Err(e.context(format!("rex: cannot read status for {name} ({pane_id})")));
+            }
+            return Err(shell_gate_refusal(name, pane_id));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Rex arm of [`spawn_crew_into`]: same registry/mail/launch contract over
+/// `&dyn MultiplexerBackend`, never `Client::connect`. Kept as a separate
+/// function so the herdr path below stays byte-identical and this arm lifts
+/// off cleanly. Known delta: a failed `pane_run` fails loudly (the
+/// rate-limit registry fallback below is `Client`-coupled).
+#[allow(clippy::too_many_arguments)]
+fn spawn_crew_into_rex(
+    cfg: &Config,
+    project: &str,
+    wf_name: &str,
+    plan: &CrewPlan,
+    catalog: &ProfileCatalog,
+    backend: &dyn MultiplexerBackend,
+    ws_id: &str,
+    label: &str,
+) -> Result<LiveRegistry> {
+    let mut registry: Vec<SpawnEntry> = state::load_spawn_registry(project);
+    let mut live_known: Option<std::collections::HashSet<String>> = backend
+        .pane_list(None)
+        .ok()
+        .map(|panes| panes.into_iter().map(|p| p.pane_id).collect());
+    if let Some(live) = &live_known {
+        let before = registry.len();
+        registry = prune_dead_pane_rows(registry, live);
+        let pruned = before - registry.len();
+        if pruned > 0 {
+            eprintln!("flywheel: pruned {pruned} dead-pane registry row(s) for {project}");
+        }
+    }
+    let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
+    let mut prev: Option<String> = None;
+    let dir = crate::project_dir(cfg, project);
+    for (role, count) in &plan.members {
+        let profile = catalog
+            .get(role)
+            .ok_or_else(|| anyhow!("pane crew: unknown profile @{role} (flywheel profile list)"))?;
+        let model_reg =
+            ModelRegistry::load_routing().map_err(|e| anyhow!("pane crew: model registry: {e}"))?;
+        let (harness_resolved, _slot_model) =
+            model_reg.resolve_profile_route(&profile.harness, &profile.model)?;
+        let harness = &harness_resolved;
+        for _i in 0..*count {
+            let ordinal = {
+                let n = ordinals.entry(role.clone()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            let name = crew_agent_name(wf_name, role, ordinal);
+            // --reuse idempotency: same rule as the herdr path, read through
+            // the backend instead of the herdr client.
+            let live_agents = backend.agent_list()?;
+            let existing = registry
+                .iter()
+                .find(|e| e.name == name)
+                .filter(|e| {
+                    live_agents
+                        .iter()
+                        .any(|a| a.pane_id == e.pane_id && a.workspace_id == ws_id)
+                })
+                .cloned();
+            let mail_identity = crate::pinned_mail_identity(cfg, project, &name, harness);
+            let (agent_pane_id, name, model_pin) = if let Some(e) = existing {
+                eprintln!(
+                    "  crew {}: reusing {} ({}) @{}",
+                    label, name, e.pane_id, role
+                );
+                (e.pane_id.clone(), name.clone(), e.model_pin.clone())
+            } else {
+                let (agent_args, model_pin, env_model_pin): (
+                    Vec<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = if profile.model.is_empty() && profile.provider.is_empty() {
+                    (vec![], None, None)
+                } else {
+                    let plan = crate::profile_launch_plan(harness, profile, None)
+                        .map_err(|e| anyhow!("pane crew @{role} model routing: {e}"))?;
+                    (plan.args, Some(plan.model), plan.env_model_pin)
+                };
+                let pane_env =
+                    pane_env_for_launch(cfg, mail_identity.as_deref(), env_model_pin.as_deref())?;
+                let panes = backend.pane_list(Some(ws_id))?;
+                let agents = backend.agent_list()?;
+                let occupied: std::collections::HashSet<String> =
+                    agents.iter().map(|a| a.pane_id.clone()).collect();
+                let pane_ids: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
+                // A seat whose model travels by env can never reuse a
+                // pre-existing pane (same reason as the herdr path: the env
+                // is fixed at split, and rex has no env map to patch later).
+                let reusable = if env_model_pin.is_some() {
+                    None
+                } else {
+                    select_empty_pane(&pane_ids, &occupied)
+                };
+                let pane_id = match (&prev, reusable) {
+                    (None, Some(pid)) => pid,
+                    (None, None) => {
+                        let root = pane_ids.first().cloned().ok_or_else(|| {
+                            anyhow!("pane crew: no root pane in workspace {ws_id}")
+                        })?;
+                        let split = backend.pane_split(
+                            &root,
+                            "down",
+                            Some(&crate::utf8_path(&dir, "workspace dir")?),
+                        )?;
+                        split.pane_id
+                    }
+                    (Some(p), _) => {
+                        let split = backend.pane_split(
+                            p,
+                            "down",
+                            Some(&crate::utf8_path(&dir, "workspace dir")?),
+                        )?;
+                        split.pane_id
+                    }
+                };
+                // Shell gate BEFORE typing the launch: program_status must be
+                // idle or working within 15s. Fail CLOSED like the herdr
+                // path — never dispatch into a booting shell.
+                wait_rex_shell_ready(backend, &pane_id, &name, &pane_id, Duration::from_secs(15))?;
+                // No env map on split: the pin + model pin ride as an
+                // `env K=V` command prefix, then rename binds the name.
+                let command = rex_env_command(&pane_env, harness, &agent_args);
+                backend
+                    .pane_run(&pane_id, &command)
+                    .map_err(|e| anyhow!("pane crew: rex run for {name} ({pane_id}): {e:#}"))?;
+                if let Err(e) = backend.agent_rename(&pane_id, Some(name.as_str())) {
+                    // Warn like the herdr path's post-hoc rebind: the pane
+                    // runs; the readiness wait + registry below still hold
+                    // the name contract.
+                    eprintln!("flywheel: warn: rex rename {pane_id} → {name} failed: {e:#}");
+                }
+                crate::bind_pane_mail_identity(
+                    cfg,
+                    project,
+                    &name,
+                    &pane_id,
+                    mail_identity.as_deref(),
+                );
+                // Readiness: the agent reports instead of the shell prompt.
+                // Best-effort like the herdr path — a wait failure degrades
+                // to __send semantics, never a panic.
+                if let Err(e) = backend.agent_wait(
+                    &name,
+                    &[AgentStatus::Idle, AgentStatus::Working],
+                    Some(90_000),
+                ) {
+                    eprintln!(
+                        "flywheel: crew {name} readiness wait failed (dispatching anyway): {e}"
+                    );
+                }
+                (pane_id, name.clone(), model_pin)
+            };
+            prev = Some(agent_pane_id.clone());
+            let incarnation = next_incarnation(&registry, &name);
+            registry.retain(|e| e.name != name);
+            registry.push(SpawnEntry {
+                pane_id: agent_pane_id.clone(),
+                name: name.clone(),
+                profile: Some(role.clone()),
+                harness: Some(harness.clone()),
+                model: None,
+                model_pin,
+                skills_digest: crate::profile::skills_digest(&profile.skills),
+                mail_identity,
+                skills_injected: false,
+                incarnation,
+            });
+            eprintln!("  crew {}: {} ({}) @{}", label, name, agent_pane_id, role);
+            if let Some(live) = live_known.as_mut() {
+                live.insert(agent_pane_id.clone());
+            }
+        }
+    }
+    state::save_spawn_registry(project, &registry)?;
+    Ok(match live_known {
+        Some(live) => LiveRegistry::prune(registry, &live),
+        None => {
+            let all: std::collections::HashSet<String> =
+                registry.iter().map(|e| e.pane_id.clone()).collect();
+            LiveRegistry::prune(registry, &all)
+        }
+    })
+}
+
+/// Rex arm of [`pre_spawn_crew`]: same reuse/orphan contract over
+/// `&dyn MultiplexerBackend`, never `Client::connect`.
+#[allow(clippy::too_many_arguments)] // same flag set as pre_spawn_crew
+fn pre_spawn_crew_rex(
+    cfg: &Config,
+    project: &str,
+    wf_name: &str,
+    plan: &CrewPlan,
+    catalog: &ProfileCatalog,
+    reuse: Option<&str>,
+    retain: bool,
+    retire_orphans: bool,
+) -> Result<PaneRunCtx> {
+    let dir = crate::project_dir(cfg, project);
+    if !dir.exists() {
+        bail!(
+            "project dir missing for pane crew: {} (run: flywheel init {project})",
+            dir.display()
+        );
+    }
+    let backend = crate::backend::factory::multiplexer_backend(cfg)?;
+    let label = crate::swarm_label(project);
+    let ws_list = backend.workspace_list()?;
+    // Owned = the swarm label (or the recorded spawn-meta label); rex has no
+    // captain/omp sessions to classify as foreign, so anything else is
+    // unrelated and left alone.
+    let spawn_meta = state::load_spawn_meta(project);
+    let owned: Vec<_> = ws_list
+        .iter()
+        .filter(|ws| ws.label == label || spawn_meta.as_deref() == Some(ws.label.as_str()))
+        .cloned()
+        .collect();
+    if let Some(ws_id) = reuse {
+        if !ws_list.iter().any(|ws| ws.workspace_id == ws_id) {
+            bail!("--reuse workspace {ws_id} not found for {project}");
+        }
+        let entries = spawn_crew_into_rex(
+            cfg, project, wf_name, plan, catalog, &*backend, ws_id, &label,
+        )?;
+        return Ok(PaneRunCtx {
+            workspace_id: ws_id.to_string(),
+            entries,
+            retained: true,
+        });
+    }
+    if !owned.is_empty() {
+        let detail: Vec<String> = owned
+            .iter()
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
+            .collect();
+        if retire_orphans {
+            eprintln!(
+                "flywheel: closing {} pre-existing workspace(s) for {project}: {}",
+                owned.len(),
+                detail.join(", ")
+            );
+            for ws in &owned {
+                if let Err(e) = backend.workspace_close(&ws.workspace_id, true) {
+                    eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
+                }
+            }
+            let live: std::collections::HashSet<String> = backend
+                .pane_list(None)
+                .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
+                .unwrap_or_default();
+            let (kept, pruned) =
+                reap_closed_rows(state::load_spawn_registry(project), &live, backend.name());
+            if pruned > 0 {
+                eprintln!("flywheel: reaped {pruned} dead-pane registry row(s) for {project}");
+                let _ = state::save_spawn_registry(project, &kept);
+            }
+        } else {
+            bail!(
+                "found {} pre-existing workspace(s) for {project} — stale panes would race the crew: {}. Close them first (flywheel kill {project}) or pass --retire-orphans / --reuse.",
+                owned.len(),
+                detail.join(", ")
+            );
+        }
+    }
+    let ws = backend.workspace_create(Some(&label))?;
+    let entries = spawn_crew_into_rex(
+        cfg,
+        project,
+        wf_name,
+        plan,
+        catalog,
+        &*backend,
+        &ws.workspace_id,
+        &label,
+    )?;
+    Ok(PaneRunCtx {
+        workspace_id: ws.workspace_id,
+        entries,
+        retained: retain,
+    })
 }
 #[allow(clippy::too_many_arguments)] // one param per caller mirror, mirrors cmd_spawn
 fn spawn_crew_into(
@@ -1852,7 +2263,8 @@ fn map_dispatch_cause(cause: Cause<RemoteError<String>>) -> DispatchErr {
             // Dispatches are sequential, so reaching this means the shared
             // stack itself is saturated, not the pane.
             DispatchErr::Fatal(
-                "the dispatch bulkhead admitted no permit in time — the shared stack is saturated".to_string(),
+                "the dispatch bulkhead admitted no permit in time — the shared stack is saturated"
+                    .to_string(),
             )
         }
         Some(RemoteError::Filtered) => DispatchErr::Fatal("the dispatch was filtered".to_string()),
@@ -3133,7 +3545,11 @@ mod tests {
     #[test]
     fn dispatch_chain_carries_the_retry_envelope_as_its_argument() {
         let policy = dispatch_policy();
-        assert_eq!(policy.retries, MAX_ATTEMPTS - 1, "five retries after the first attempt");
+        assert_eq!(
+            policy.retries,
+            MAX_ATTEMPTS - 1,
+            "five retries after the first attempt"
+        );
         assert_eq!(policy.backoff.as_millis(), 5_000, "5s backoff base");
         assert_eq!(policy.ceiling.as_millis(), 10_000, "10s backoff cap");
     }
@@ -3147,7 +3563,8 @@ mod tests {
     fn dispatch_chain_seeds_its_jitter_from_process_entropy() {
         let def = RemotePolicy::<Value, String>::default();
         assert_ne!(
-            dispatch_policy().seed, def.seed,
+            dispatch_policy().seed,
+            def.seed,
             "the dispatch stack must not run the framework default seed"
         );
     }
@@ -5094,6 +5511,140 @@ mod bd_d7zu_shell_gate_tests {
             msg.contains("less loaded") || msg.contains("raise the budget"),
             "offers a remedy: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rex_door_tests {
+    use super::{rex_door_selected, rex_env_command, rex_shell_ready, wait_rex_shell_ready};
+    use crate::backend::MultiplexerBackend;
+    use crate::herdr::{AgentInfo, AgentStatus, BackendError};
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    fn test_agent(pane_id: &str, name: &str, status: AgentStatus) -> AgentInfo {
+        AgentInfo {
+            agent: None,
+            agent_status: status,
+            cwd: None,
+            display_agent: None,
+            focused: false,
+            foreground_cwd: None,
+            interactive_ready: false,
+            launch_pending: false,
+            name: Some(name.to_string()),
+            pane_id: pane_id.to_string(),
+            revision: 0,
+            state_change_seq: 0,
+            completion_seq: None,
+            state_labels: serde_json::Map::new(),
+            tab_id: String::new(),
+            terminal_id: String::new(),
+            terminal_title: None,
+            workspace_id: "w0".to_string(),
+        }
+    }
+
+    struct ScriptedBackend {
+        agents: Vec<AgentInfo>,
+        err: Option<String>,
+    }
+
+    impl MultiplexerBackend for ScriptedBackend {
+        fn name(&self) -> &'static str {
+            "rex-test"
+        }
+
+        fn agent_list(&self) -> Result<Vec<AgentInfo>, BackendError> {
+            match &self.err {
+                Some(message) => Err(BackendError::timeout(message.clone())),
+                None => Ok(self.agents.clone()),
+            }
+        }
+    }
+
+    /// Selection contract (LinenQuill): empty/missing `REX_SESSION` keeps
+    /// herdr; a set value selects rex.
+    #[test]
+    fn empty_rex_session_selects_herdr_and_set_selects_rex() {
+        let _guard = crate::config::lock_env();
+        unsafe { std::env::remove_var("REX_SESSION") };
+        assert!(!rex_door_selected());
+        unsafe { std::env::set_var("REX_SESSION", "") };
+        assert!(!rex_door_selected());
+        unsafe { std::env::set_var("REX_SESSION", "sess-1") };
+        assert!(rex_door_selected());
+        unsafe { std::env::remove_var("REX_SESSION") };
+    }
+
+    /// program_status readiness: idle/working pass, anything else does not.
+    #[test]
+    fn shell_ready_is_idle_or_working() {
+        assert!(rex_shell_ready(&AgentStatus::Idle));
+        assert!(rex_shell_ready(&AgentStatus::Working));
+        assert!(!rex_shell_ready(&AgentStatus::Blocked));
+        assert!(!rex_shell_ready(&AgentStatus::Unknown));
+    }
+
+    /// No env map on split: the pin rides as `env K=V`, herdr-only keys
+    /// stay behind, and values with spaces are quoted.
+    #[test]
+    fn env_command_filters_herdr_and_quotes() {
+        let env: BTreeMap<String, String> = [
+            ("HERDR_ENV".to_string(), "1".to_string()),
+            ("HERDR_SOCKET_PATH".to_string(), "/tmp/x".to_string()),
+            ("AGENT_NAME".to_string(), "Pin".to_string()),
+            ("NOTE".to_string(), "a b".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            rex_env_command(&env, "opencode", &["--model".to_string(), "x".to_string()]),
+            "env AGENT_NAME=Pin NOTE='a b' opencode --model x"
+        );
+    }
+
+    #[test]
+    fn env_command_without_env_runs_kind_directly() {
+        assert_eq!(rex_env_command(&BTreeMap::new(), "pi", &[]), "pi");
+    }
+
+    #[test]
+    fn waiter_returns_when_program_status_is_working() {
+        let backend = ScriptedBackend {
+            agents: vec![test_agent("b1", "n1", AgentStatus::Working)],
+            err: None,
+        };
+        assert!(wait_rex_shell_ready(&backend, "b1", "n1", "b1", Duration::from_secs(5)).is_ok());
+    }
+
+    /// Fail-closed with the shell refusal (not a mailbox fault) when the
+    /// status never becomes idle/working.
+    #[test]
+    fn waiter_refuses_a_shell_that_never_reports_ready() {
+        let backend = ScriptedBackend {
+            agents: vec![test_agent("b1", "n1", AgentStatus::Blocked)],
+            err: None,
+        };
+        let err =
+            wait_rex_shell_ready(&backend, "b1", "n1", "b1", Duration::from_millis(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("never rendered a prompt"),
+            "{err:?}"
+        );
+    }
+
+    /// An unreadable backend is the real reason — report it instead of
+    /// blaming the shell.
+    #[test]
+    fn waiter_reports_an_unreadable_backend() {
+        let backend = ScriptedBackend {
+            agents: vec![],
+            err: Some("nope".to_string()),
+        };
+        let err =
+            wait_rex_shell_ready(&backend, "b1", "n1", "b1", Duration::from_millis(1)).unwrap_err();
+        assert!(err.to_string().contains("cannot read status"), "{err:?}");
     }
 }
 

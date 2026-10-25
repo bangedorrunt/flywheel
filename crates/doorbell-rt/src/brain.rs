@@ -1747,7 +1747,8 @@ mod tests {
 
     fn journal_kinds(name: &str) -> Vec<String> {
         let dir = std::env::temp_dir().join(format!("dbrt-brain-{}-{}", std::process::id(), name));
-        let raw = std::fs::read_to_string(FileStore::new(&dir).journal_file("w")).unwrap_or_default();
+        let raw =
+            std::fs::read_to_string(FileStore::new(&dir).journal_file("w")).unwrap_or_default();
         raw.lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter_map(|v| v["msg"]["rt_kind"].as_str().map(str::to_string))
@@ -1767,7 +1768,11 @@ mod tests {
         };
         let (mut brain, _rx, _tx) = test_brain(
             name,
-            vec![vec![Effect::FetchInbox], vec![], vec![Effect::FetchInbox, audit]],
+            vec![
+                vec![Effect::FetchInbox],
+                vec![],
+                vec![Effect::FetchInbox, audit],
+            ],
         );
         brain.dispatch(BrainMsg::Sweep { now: 1_000_001 }).await;
         brain.dispatch(BrainMsg::Sweep { now: 1_000_002 }).await;

@@ -6557,7 +6557,9 @@ mod gs048_reclassify_tests {
 // (doorbell.rs is held by a sibling lane) — residual on bd-gwdh.
 // ---------------------------------------------------------------------------
 
-use toron_core::kernel::{Boot, Cmd as CmdTrait, Durability, Effect, Failure, Interpret, Program, Update};
+use toron_core::kernel::{
+    Boot, Cmd as CmdTrait, Durability, Effect, Failure, Interpret, Program, Update,
+};
 
 /// Failure re-entry no real pane ever carries: heal_states is keyed by
 /// pane name, so this emits no commands and touches no domain state on any
@@ -6579,10 +6581,14 @@ impl CmdTrait for Cmd {
     fn durability(&self) -> Durability {
         match self {
             // Reads, signals, registrations, observations: journal nothing.
-            Cmd::FetchInbox | Cmd::CheckAckSla | Cmd::RestartWatch | Cmd::FactMiss { .. }
-            | Cmd::Audit { .. } | Cmd::WaitCorr { .. } | Cmd::Wait | Cmd::LoudMiss { .. } => {
-                Durability::Ephemeral
-            }
+            Cmd::FetchInbox
+            | Cmd::CheckAckSla
+            | Cmd::RestartWatch
+            | Cmd::FactMiss { .. }
+            | Cmd::Audit { .. }
+            | Cmd::WaitCorr { .. }
+            | Cmd::Wait
+            | Cmd::LoudMiss { .. } => Durability::Ephemeral,
             // Delivered batch: durable under its content identity. T3 assigns
             // executor-owned keys per arm; shadow only needs stability.
             Cmd::Digest { entries } => Durability::Durable {
@@ -6760,13 +6766,30 @@ mod shadow_tests {
             Msg::Sweep { now: 7 },
             Msg::AckSlaTick { now: 9 },
             Msg::WatchDied,
-            Msg::DiagnoseFailed { name: "pane".into() },
-            Msg::WatchNdjson { line: "not json".into() },
-            Msg::InboxItems { raw: "blob".into(), pin: "Pin".into() },
-            Msg::InboxRows { rows: vec![], pin: "Pin".into() },
-            Msg::HerdrStatus { pin: "P".into(), status: "idle".into() },
-            Msg::Fact { summary: "s".into() },
-            Msg::SlaFired { posts: vec!["c1".into()] },
+            Msg::DiagnoseFailed {
+                name: "pane".into(),
+            },
+            Msg::WatchNdjson {
+                line: "not json".into(),
+            },
+            Msg::InboxItems {
+                raw: "blob".into(),
+                pin: "Pin".into(),
+            },
+            Msg::InboxRows {
+                rows: vec![],
+                pin: "Pin".into(),
+            },
+            Msg::HerdrStatus {
+                pin: "P".into(),
+                status: "idle".into(),
+            },
+            Msg::Fact {
+                summary: "s".into(),
+            },
+            Msg::SlaFired {
+                posts: vec!["c1".into()],
+            },
             Msg::Reclaim {
                 bead_id: "bd-x".into(),
                 holder_pin: "H".into(),
@@ -6774,13 +6797,36 @@ mod shadow_tests {
                 is_live: false,
                 reason: "test".into(),
             },
-            Msg::Heal { name: "N".into(), status: "dead".into(), exited: true },
-            Msg::ClaimNudge { name: "N".into(), bead_id: "bd-x".into() },
-            Msg::CloseNudge { name: "N".into(), bead_id: "bd-x".into(), title: "t".into() },
-            Msg::Receipt { corr: "k".into(), receipt: Receipt::default() },
-            Msg::RoleBound { role: "captain".into(), pin: "P".into() },
-            Msg::Presence { pin: "P".into(), state: "bogus".into() },
-            Msg::HumanDecision { corr: "nope".into(), verdict: "approve".into() },
+            Msg::Heal {
+                name: "N".into(),
+                status: "dead".into(),
+                exited: true,
+            },
+            Msg::ClaimNudge {
+                name: "N".into(),
+                bead_id: "bd-x".into(),
+            },
+            Msg::CloseNudge {
+                name: "N".into(),
+                bead_id: "bd-x".into(),
+                title: "t".into(),
+            },
+            Msg::Receipt {
+                corr: "k".into(),
+                receipt: Receipt::default(),
+            },
+            Msg::RoleBound {
+                role: "captain".into(),
+                pin: "P".into(),
+            },
+            Msg::Presence {
+                pin: "P".into(),
+                state: "bogus".into(),
+            },
+            Msg::HumanDecision {
+                corr: "nope".into(),
+                verdict: "approve".into(),
+            },
             Msg::MaterialContext {
                 goal: "g".into(),
                 explicit_topology: None,
@@ -6813,7 +6859,11 @@ mod shadow_tests {
             for msg in msg_battery() {
                 let live = tick(&model, &msg);
                 let shadow = WorkspaceProgram::update(&model, &msg);
-                assert_eq!((shadow.model, shadow.commands), live, "divergence on {msg:?}");
+                assert_eq!(
+                    (shadow.model, shadow.commands),
+                    live,
+                    "divergence on {msg:?}"
+                );
             }
         }
     }
@@ -6846,7 +6896,10 @@ mod shadow_tests {
         let mut model = WorkspaceModel::default();
         model.swarm.heal_states.insert(
             "live-pane".into(),
-            crate::durable::HealState { awaiting_clear: true, ..Default::default() },
+            crate::durable::HealState {
+                awaiting_clear: true,
+                ..Default::default()
+            },
         );
         for f in &failures {
             let msg = WorkspaceProgram::failure(f);
@@ -6862,17 +6915,37 @@ mod shadow_tests {
 
     #[test]
     fn durability_keys_are_stable_and_variant_scoped() {
-        let a = Cmd::Send { name: "n".into(), text: "t".into() };
-        let b = Cmd::Send { name: "n".into(), text: "t".into() };
-        let c = Cmd::Send { name: "n".into(), text: "other".into() };
+        let a = Cmd::Send {
+            name: "n".into(),
+            text: "t".into(),
+        };
+        let b = Cmd::Send {
+            name: "n".into(),
+            text: "t".into(),
+        };
+        let c = Cmd::Send {
+            name: "n".into(),
+            text: "other".into(),
+        };
         let key = |c: &Cmd| match c.durability() {
             Durability::Durable { key } => key,
             Durability::Ephemeral => "ephemeral".into(),
         };
         assert_eq!(key(&a), key(&b));
         assert_ne!(key(&a), key(&c));
-        assert_ne!(key(&a), key(&Cmd::DispatchImmediate { name: "n".into(), text: "t".into() }));
-        for ephemeral in [Cmd::FetchInbox, Cmd::CheckAckSla, Cmd::RestartWatch, Cmd::Wait] {
+        assert_ne!(
+            key(&a),
+            key(&Cmd::DispatchImmediate {
+                name: "n".into(),
+                text: "t".into()
+            })
+        );
+        for ephemeral in [
+            Cmd::FetchInbox,
+            Cmd::CheckAckSla,
+            Cmd::RestartWatch,
+            Cmd::Wait,
+        ] {
             assert_eq!(ephemeral.durability(), Durability::Ephemeral);
         }
         let reclassify = Cmd::Reclassify {
@@ -6890,14 +6963,20 @@ mod shadow_tests {
 
     #[test]
     fn interpret_completes_commands_as_quiet_followup() {
-        let cmd = Cmd::Send { name: "n".into(), text: "t".into() };
+        let cmd = Cmd::Send {
+            name: "n".into(),
+            text: "t".into(),
+        };
         let exit = Runtime::run(ShadowInterpret::interpret(&cmd));
         assert!(exit.is_success());
         let Exit::Success(msg) = exit else {
             panic!("shadow interpret succeeds");
         };
         let (next, cmds) = tick(&WorkspaceModel::default(), &msg);
-        assert_eq!(without_ambient(&next), without_ambient(&WorkspaceModel::default()));
+        assert_eq!(
+            without_ambient(&next),
+            without_ambient(&WorkspaceModel::default())
+        );
         assert!(cmds.is_empty());
     }
 
@@ -6906,7 +6985,11 @@ mod shadow_tests {
         let dir = std::env::temp_dir().join(format!("flywheel-ws-shadow-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("shadow.jsonl");
-        let msgs = vec![Msg::Tick { now: 1 }, Msg::Tick { now: 2 }, Msg::Sweep { now: 3 }];
+        let msgs = vec![
+            Msg::Tick { now: 1 },
+            Msg::Tick { now: 2 },
+            Msg::Sweep { now: 3 },
+        ];
 
         let rt = test_runtime();
         let log: Arc<dyn DurableLog> = Arc::new(FileLog::open(&path).expect("open log"));
@@ -6932,7 +7015,9 @@ mod shadow_tests {
             Producer::new("ws-shadow-file"),
         )
         .expect("recover replays the journal");
-        let sentinel = Msg::DiagnoseFailed { name: SHADOW_FAILURE_NAME.into() };
+        let sentinel = Msg::DiagnoseFailed {
+            name: SHADOW_FAILURE_NAME.into(),
+        };
         let mut live = WorkspaceModel::default();
         for msg in &msgs {
             let (m, cmds) = tick(&live, msg);
@@ -6945,7 +7030,11 @@ mod shadow_tests {
                 live = m2;
             }
         }
-        assert_eq!(recovered.model(), &live, "recover converges to the live model");
+        assert_eq!(
+            recovered.model(),
+            &live,
+            "recover converges to the live model"
+        );
         assert!(recovered.in_flight().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6956,14 +7045,20 @@ mod shadow_tests {
         let mut model = WorkspaceModel::default();
         for (i, msg) in msg_battery().into_iter().enumerate() {
             let (next, cmds) = tick(&model, &msg);
-            assert!(driver.observe(&model, &msg, &next, &cmds), "divergence on {msg:?}");
+            assert!(
+                driver.observe(&model, &msg, &next, &cmds),
+                "divergence on {msg:?}"
+            );
             model = next;
             let _ = i;
         }
         // Second pass over the evolved model: divergence must stay zero.
         for msg in msg_battery() {
             let (next, cmds) = tick(&model, &msg);
-            assert!(driver.observe(&model, &msg, &next, &cmds), "divergence on {msg:?}");
+            assert!(
+                driver.observe(&model, &msg, &next, &cmds),
+                "divergence on {msg:?}"
+            );
             model = next;
         }
         assert!(driver.drain_divergences().is_empty());

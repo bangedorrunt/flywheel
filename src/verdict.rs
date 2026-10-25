@@ -982,16 +982,9 @@ fn note_receipt_path(note: &str) -> Option<PathBuf> {
 /// stay on the sha= rule alone, so this is consulted only for them.
 fn note_has_command_proof(note: &str) -> bool {
     let tokens = note_tokens(note);
-    let value = |key: &str| {
-        tokens
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| *v)
-    };
+    let value = |key: &str| tokens.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
     match (value("cmd"), value("exit"), value("tail")) {
-        (Some(cmd), Some("0"), Some(tail)) => {
-            !cmd.is_empty() && is_non_empty_file(Path::new(tail))
-        }
+        (Some(cmd), Some("0"), Some(tail)) => !cmd.is_empty() && is_non_empty_file(Path::new(tail)),
         _ => false,
     }
 }

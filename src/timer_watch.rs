@@ -460,7 +460,10 @@ fn config_stamp() -> Option<(std::time::SystemTime, u64)> {
 /// sweeps, and rebuilt only when the config file changes.
 pub struct LivePort {
     project: String,
-    inner: Option<(Option<(std::time::SystemTime, u64)>, crate::inbox_ports::FlywheelPorts)>,
+    inner: Option<(
+        Option<(std::time::SystemTime, u64)>,
+        crate::inbox_ports::FlywheelPorts,
+    )>,
     /// How many times the config and facts were loaded (tests, evidence).
     pub loads: u64,
 }
@@ -852,7 +855,10 @@ mod tests {
         let mut rec = rec();
         let err = sweep_at(d.path(), "p", 10, true, &mut rec).unwrap_err();
         assert_eq!(rec.appended.len(), 1, "the good watch was sent: {err}");
-        assert!(err.contains("a-bad.json") && err.contains("z-bad.json"), "{err}");
+        assert!(
+            err.contains("a-bad.json") && err.contains("z-bad.json"),
+            "{err}"
+        );
         assert!(dir.join("bad").join("a-bad.json").exists());
         assert!(dir.join("bad").join("z-bad.json").exists());
         assert!(!dir.join("a-bad.json").exists());
@@ -872,12 +878,16 @@ mod tests {
         assert_eq!(sweep_at(d.path(), "p", 10, true, &mut rec).unwrap(), 1);
         assert!(!dir.join("w1.json").exists(), "pruned from the swept dir");
         assert!(dir.join("done").join("w1.json").exists());
-        assert!(arm(d.path(), "p", "w1", "Buffy", 99, false)
-            .unwrap_err()
-            .contains("already settled"));
-        assert!(signal(d.path(), "p", "w1", Signal::Met)
-            .unwrap_err()
-            .contains("already settled"));
+        assert!(
+            arm(d.path(), "p", "w1", "Buffy", 99, false)
+                .unwrap_err()
+                .contains("already settled")
+        );
+        assert!(
+            signal(d.path(), "p", "w1", Signal::Met)
+                .unwrap_err()
+                .contains("already settled")
+        );
         // A settled file from before pruning: moved, nothing sent.
         let old = Watch {
             id: "old".into(),

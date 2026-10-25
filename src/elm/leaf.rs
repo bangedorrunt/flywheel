@@ -39,11 +39,17 @@ pub struct LeafModel {
 /// reads the clock, the environment, or the store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LeafMsg {
-    Completed { value: serde_json::Value },
+    Completed {
+        value: serde_json::Value,
+    },
     /// The child's own typed failure (a non-zero exit it reports).
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
     /// A defect: a bug in the leaf or the host, not the child's answer.
-    Defected { detail: String },
+    Defected {
+        detail: String,
+    },
     /// Cancellation. NOT a failure: the run was interrupted, so it must not
     /// settle as one.
     Interrupted,
@@ -658,7 +664,7 @@ mod t4_close_tests {
 
     fn boot_with(key: &str, argv: Vec<String>, timeout: Option<&str>) -> Boot {
         let mut config: std::collections::BTreeMap<String, String> =
-        [("key".to_string(), key.to_string())].into_iter().collect();
+            [("key".to_string(), key.to_string())].into_iter().collect();
         if let Some(t) = timeout {
             config.insert("timeout_secs".to_string(), t.to_string());
         }
@@ -678,9 +684,17 @@ mod t4_close_tests {
 
     #[test]
     fn leaf_cmd_carries_per_leaf_timeout() {
-        let custom = LeafCmd { key: "k".into(), argv: vec![], timeout_secs: Some(5) };
+        let custom = LeafCmd {
+            key: "k".into(),
+            argv: vec![],
+            timeout_secs: Some(5),
+        };
         assert_eq!(leaf_watchdog(&custom), std::time::Duration::from_secs(65));
-        let generic = LeafCmd { key: "k".into(), argv: vec![], timeout_secs: None };
+        let generic = LeafCmd {
+            key: "k".into(),
+            argv: vec![],
+            timeout_secs: None,
+        };
         assert_eq!(leaf_watchdog(&generic), std::time::Duration::from_secs(120));
     }
 
@@ -700,13 +714,20 @@ mod t4_close_tests {
         // Old journal rows predate the field: they must still parse.
         let old: LeafCmd = serde_json::from_str(r#"{"key":"k","argv":["a"]}"#).unwrap();
         assert_eq!(old.timeout_secs, None);
-        let new = LeafCmd { key: "k".into(), argv: vec!["a".into()], timeout_secs: Some(9) };
+        let new = LeafCmd {
+            key: "k".into(),
+            argv: vec!["a".into()],
+            timeout_secs: Some(9),
+        };
         let back: LeafCmd = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
         assert_eq!(back, new);
     }
 
     #[test]
     fn loop_run_verify_has_its_watchdog_label() {
-        assert_eq!(leaf_label(&["__loop-run-verify".to_string()]), "__loop-run-verify");
+        assert_eq!(
+            leaf_label(&["__loop-run-verify".to_string()]),
+            "__loop-run-verify"
+        );
     }
 }

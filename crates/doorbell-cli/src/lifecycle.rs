@@ -1692,14 +1692,8 @@ pub fn render_autostart(
                 "DOORBELL_HERDR_BIN_KEY",
                 doorbell_rt::binpath::HERDR_BIN_ENV,
             )
-            .replace(
-                "DOORBELL_TORON_BIN_VALUE",
-                &resolved_bin_value("toron"),
-            )
-            .replace(
-                "DOORBELL_HERDR_BIN_VALUE",
-                &resolved_bin_value("herdr"),
-            )
+            .replace("DOORBELL_TORON_BIN_VALUE", &resolved_bin_value("toron"))
+            .replace("DOORBELL_HERDR_BIN_VALUE", &resolved_bin_value("herdr"))
     }
     #[cfg(not(target_os = "macos"))]
     {

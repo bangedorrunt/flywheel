@@ -152,16 +152,15 @@ use cmd::DaemonCmd;
 use cmd::{
     AgentCmd, ArtifactsCmd, AssetCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd,
     ConfigCmd, CrewCmd, CronCmd, DoorbellCmd, EngineCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd,
-    ModelCmd,
-    PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd, StandingOrdersCmd,
-    ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent, cmd_analytics,
-    cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_config,
-    cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject, cmd_doorbell_introduce,
-    cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start, cmd_doorbell_status,
-    cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_engine, cmd_history, cmd_internal_doorbell,
-    cmd_judgment,
-    cmd_ledger, cmd_mail, cmd_models, cmd_policy, cmd_principles, cmd_resume, cmd_runs, cmd_slot,
-    cmd_stage, cmd_standing_orders, cmd_timeline, cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
+    ModelCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, SlotCmd, SquadCmd, StageCmd,
+    StandingOrdersCmd, ToronCmd, ToronMailCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd,
+    cmd_agent, cmd_analytics, cmd_asset, cmd_audit, cmd_backend, cmd_captain, cmd_changes,
+    cmd_checkpoint, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc,
+    cmd_doorbell_inject, cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster,
+    cmd_doorbell_start, cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_engine,
+    cmd_history, cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_models, cmd_policy,
+    cmd_principles, cmd_resume, cmd_runs, cmd_slot, cmd_stage, cmd_standing_orders, cmd_timeline,
+    cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
 use herdr::{
@@ -2308,7 +2307,7 @@ pub(crate) fn free_spawn_ordinal(
 /// label, spawn-meta custom label, the raw token, and its slug.
 /// Captains pass `--label flywheel-omp-repro` then `status flywheel-omp-repro`
 /// — that must hit, not only `flywheel-<dir>`.
-fn workspace_label_aliases(project: &str, spawn_meta: Option<&str>) -> Vec<String> {
+pub(crate) fn workspace_label_aliases(project: &str, spawn_meta: Option<&str>) -> Vec<String> {
     let mut out = vec![swarm_label(project)];
     if let Some(meta) = spawn_meta
         && !out.iter().any(|l| l == meta)
@@ -2331,10 +2330,7 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
 
 /// [`find_workspace`]'s pick, whole: the sender needs its LABEL, which is
 /// what a doorbell host is keyed by (`crate::doorbell::inbox_owner_key`).
-pub(crate) fn find_workspace_info(
-    c: &mut Client,
-    project: &str,
-) -> Result<herdr::WorkspaceInfo> {
+pub(crate) fn find_workspace_info(c: &mut Client, project: &str) -> Result<herdr::WorkspaceInfo> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
     let mut matches: Vec<herdr::WorkspaceInfo> = c
         .workspace_list()?
@@ -2366,10 +2362,7 @@ pub(crate) fn find_workspace_info(
 }
 
 /// The entry with workspace id `id` (one of `matches` by construction).
-fn pick_workspace(
-    mut matches: Vec<herdr::WorkspaceInfo>,
-    id: &str,
-) -> herdr::WorkspaceInfo {
+fn pick_workspace(mut matches: Vec<herdr::WorkspaceInfo>, id: &str) -> herdr::WorkspaceInfo {
     let i = matches
         .iter()
         .position(|w| w.workspace_id == id)
@@ -4549,11 +4542,7 @@ fn add_target_from_split(
     // prefer the owned workspace hosting managed agents; first owned otherwise
     // (resolve_workspace_id picks the agent-hosting workspace among many).
     let prefix = format!("flywheel-{}-", project_base(project));
-    Ok(herdr::resolve_workspace_id(
-        &split.owned,
-        agents,
-        &prefix,
-    ))
+    Ok(herdr::resolve_workspace_id(&split.owned, agents, &prefix))
 }
 
 fn add_target_workspace(c: &mut Client, project: &str) -> Result<String> {
@@ -9472,6 +9461,13 @@ projects available: {}",
     // bd-bio8: spawn is herdr-led. Refuse a non-herdr selection before any
     // side effect instead of silently building herdr panes.
     crate::backend::factory::require_herdr_for_spawn(&crate::backend::resolve_backend_name(cfg))?;
+    // Rex door: a set REX_SESSION selects the rex multiplexer arm below —
+    // the herdr `Client` path after it stays exactly as it was. No
+    // `Client::connect` on the rex arm (auto/superlogical resolve through
+    // `backend::multiplexer_backend`, rex-first with transport-only fallback).
+    if crate::pane::rex_door_selected() {
+        return cmd_spawn_rex(cfg, project, opts);
+    }
     let kind_count_escape =
         opts.counts.oc.unwrap_or(0) + opts.counts.pi.unwrap_or(0) + opts.counts.gk.unwrap_or(0) > 0
             || !opts.kinds.is_empty()
@@ -10015,8 +10011,7 @@ projects available: {}",
             // 1024-byte MAX_CANON line limit) splits the single-quoted arg
             // mid-quote and zsh parks at `>....` — agent never starts
             // (2026-08-18 coder2/coder3). Wait for the rendered prompt.
-            let shell_ready =
-                herdr::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
+            let shell_ready = herdr::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -10482,6 +10477,669 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
 
     // ADR-0005 D1: detached doorbell dispatcher. Spawn fails if it cannot
     // start or attach. --no-peer-aware skips registration (no child).
+    if peer_aware {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
+        doorbell::ensure_running(&exe, &config::state_dir(), &label, project)
+            .context("doorbell dispatcher")?;
+    }
+
+    println!(
+        "swarm ready: flywheel {} {} {}",
+        kind_paint("send"),
+        dim(project),
+        dim("--to all --stage ce-execute")
+    );
+    Ok(())
+}
+
+/// Rex arm of [`cmd_spawn`]: same plan/receipt/registry/presence contract over
+/// `&dyn MultiplexerBackend`, never `Client::connect`. Kept as a separate
+/// function so the herdr path above stays byte-identical and this arm lifts
+/// off cleanly. Selection is `REX_SESSION` (set = rex, empty = herdr);
+/// transport fallback inside `auto` stays Connect/Io/Timeout only.
+///
+/// Known deltas vs the herdr path (all fail-closed or loud, never silent):
+/// shell gate bails instead of warning (no verify-or-respawn net on rex),
+/// per-kind herdr preflight and the process-liveness probe are skipped
+/// (herdr-client-coupled), and the harness launch-hook bootstrap is not
+/// installed (prime goes through `pane_run`).
+fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
+    let dir = project_dir(cfg, project);
+    let kind_count_escape =
+        opts.counts.oc.unwrap_or(0) + opts.counts.pi.unwrap_or(0) + opts.counts.gk.unwrap_or(0) > 0
+            || !opts.kinds.is_empty()
+            || !opts.bare_model.is_empty();
+    if kind_count_escape && !opts.escape {
+        eprintln!(
+            "flywheel: spawn with --oc/--model/--provider is the escape hatch; default multi-lane is `workflow compose --parts wave-swarm --run`. Pass --escape to silence."
+        );
+    }
+    let plan = match recipe_counts(opts.recipe.as_deref(), &opts.counts, &opts.kinds) {
+        Ok(p) => p,
+        Err(_e) if opts.profile_name.is_some() => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let catalog = profile::ProfileCatalog::load()?;
+    let model_reg = models::ModelRegistry::load_routing()?;
+    let profile_plan = match opts.profile_name.as_deref() {
+        Some(p) => {
+            let profile = catalog
+                .get(p)
+                .ok_or_else(|| anyhow!("unknown profile '@{p}' (flywheel profile list)"))?;
+            Some((p, profile, opts.profile_count))
+        }
+        None => None,
+    };
+    let items = spawn_items_from_plan(plan, profile_plan);
+    if items.is_empty() {
+        bail!("nothing to spawn: pass --oc/--pi/--gk counts, --recipe NAME, or --profile NAME");
+    }
+    let base_label = opts
+        .label_override
+        .as_deref()
+        .map(String::from)
+        .unwrap_or_else(|| swarm_label(project));
+    let request_key = opts
+        .request_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let plan = request_receipts::plan_digest(
+        &items
+            .iter()
+            .map(|i| (i.short.clone(), i.count, i.kind.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let raw_label = match request_key {
+        Some(key) => request_receipts::label_for_request_key(&base_label, key),
+        None => base_label,
+    };
+    let (label, changed) = slugify_label(&raw_label);
+    if changed && opts.label_override.is_some() {
+        eprintln!(
+            "flywheel: label {:?} normalized to {label:?} (slugs: lowercase + hyphens)",
+            opts.label_override.as_deref()
+        );
+    }
+    if label.is_empty() {
+        bail!("workspace label must contain at least one alphanumeric character");
+    }
+    if let Some(key) = request_key {
+        match request_receipts::spawn_gate(
+            request_receipts::load_spawn_row(project, &label).as_ref(),
+            &plan,
+        ) {
+            request_receipts::Gate::Proceed => {}
+            request_receipts::Gate::Replay => {
+                print_json(&json!({
+                    "request_key": key,
+                    "label": label,
+                    "already_exists": true,
+                    "replay": true,
+                }));
+                eprintln!(
+                    "flywheel: request key {key:?} already settled this slot ({label}) — replaying, \
+                     no second dispatch. Its panes: flywheel list --json."
+                );
+                return Ok(());
+            }
+            request_receipts::Gate::InFlight => bail!(
+                "spawn request key {key:?} is IN FLIGHT (workspace label {label}) — a second \
+                 dispatch could fork a crew into one workspace. Inspect it with `flywheel status \
+                 {project}`, or retry with a fresh --request-key once the first attempt settles."
+            ),
+            request_receipts::Gate::Conflict => bail!(
+                "spawn request key {key:?} was already used for a DIFFERENT plan (the recorded plan \
+                 digest differs) — refusing to hand back another crew's slot under this key. Use a \
+                 fresh --request-key for the new plan."
+            ),
+        }
+    }
+    if !opts.yes && std::io::stdin().is_terminal() {
+        let rows = spawn_model_rows(&items, &catalog, &model_reg, cfg, &opts.bare_model)?;
+        let defaults_on = model_reg.defaults.as_ref().is_some_and(|d| d.active());
+        eprintln!("flywheel: spawn {project} — resolved models:");
+        for (lane, h, m) in &rows {
+            eprintln!("  {lane:24} {h:10} {m}");
+        }
+        if defaults_on {
+            eprintln!(
+                "  (operator default active: all slot aliases resolve through it — flywheel model clear-default to lift)"
+            );
+        }
+        let go: bool = dialoguer::Confirm::new()
+            .with_prompt("dispatch this crew?")
+            .default(true)
+            .interact()?;
+        if !go {
+            bail!("spawn: aborted by the operator at the model reconfirm gate");
+        }
+    }
+    if opts.label_override.is_some()
+        && let Err(e) = state::save_spawn_meta(project, &label)
+    {
+        eprintln!("flywheel: cannot save spawn label metadata: {e:#}");
+    }
+
+    // No Client::connect on this arm: the multiplexer backend (rex-first
+    // under `auto`, pinned rex under `superlogical`) owns every pane op.
+    let backend = backend::multiplexer_backend(cfg)?;
+    let split = {
+        let ws_list = backend.workspace_list()?;
+        let agents = backend.agent_list().unwrap_or_default();
+        partition_workspaces(
+            project,
+            ws_list,
+            &agents,
+            state::load_spawn_meta(project).as_deref(),
+        )
+    };
+    if !split.foreign.is_empty() {
+        let detail: Vec<String> = split
+            .foreign
+            .iter()
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
+            .collect();
+        eprintln!(
+            "flywheel: warn: {} foreign workspace(s) share the {project} label but are not flywheel-owned — leaving them alone: {}",
+            split.foreign.len(),
+            detail.join(", ")
+        );
+    }
+    // No herdr liveness probe on this arm (client-coupled): any owned
+    // workspace counts as live — refuse or retire, never auto-close.
+    let orphans = split.owned;
+    if !orphans.is_empty() {
+        let detail: Vec<String> = orphans
+            .iter()
+            .map(|ws| {
+                format!(
+                    "{} (label {:?}, {} panes)",
+                    ws.workspace_id, ws.label, ws.pane_count
+                )
+            })
+            .collect();
+        if opts.retire_orphans {
+            eprintln!(
+                "flywheel: closing {} pre-existing workspace(s) for {project}: {}",
+                orphans.len(),
+                detail.join(", ")
+            );
+            for ws in &orphans {
+                if let Err(e) = backend.workspace_close(&ws.workspace_id, true) {
+                    eprintln!("flywheel: close {} failed: {e:#}", ws.workspace_id);
+                }
+            }
+            let live: std::collections::HashSet<String> = backend
+                .pane_list(None)
+                .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
+                .unwrap_or_default();
+            let (kept, pruned) = crate::pane::reap_closed_rows(
+                state::load_spawn_registry(project),
+                &live,
+                backend.name(),
+            );
+            if pruned > 0 {
+                eprintln!("flywheel: reaped {pruned} dead-pane registry row(s) for {project}");
+                if let Err(e) = state::save_spawn_registry(project, &kept) {
+                    eprintln!("flywheel: cannot save reaped registry: {e:#}");
+                }
+            }
+        } else if opts.join {
+            eprintln!("{}", spawn_join_notice(project, &detail.join(", ")));
+            let pin = crate::authority::select_agent_identity(None, &|k| std::env::var(k).ok());
+            return cmd_arrive(cfg, project, pin.as_deref(), None, None, None);
+        } else {
+            bail!(
+                "found {} pre-existing workspace(s) for {project} — stale panes from a killed swarm would race the new one: {}. Close them first (flywheel kill {project}), pass --join to attach, or --retire-orphans to close them automatically.",
+                orphans.len(),
+                detail.join(", ")
+            );
+        }
+    }
+    let spawn_effect = match request_key {
+        Some(_) => agent_ref::AgentEffectGuard::begin_with(
+            agent_ref::AgentEffect::prepare(project, &label, agent_ref::AgentPhase::Spawn)
+                .with_plan_digest(plan.clone()),
+        )?,
+        None => agent_ref::AgentEffectGuard::begin(project, &label, agent_ref::AgentPhase::Spawn)?,
+    };
+    let ws = backend.workspace_create(Some(&label))?;
+    println!(
+        "{}",
+        if opts.no_focus {
+            format!("workspace {} created (background)", ws.workspace_id)
+        } else {
+            format!("workspace {} created", ws.workspace_id)
+        }
+    );
+
+    let mut spawned: Vec<Value> = Vec::new();
+    let mut booted: Vec<(String, String, String)> = Vec::new();
+    let mut registry: Vec<state::SpawnEntry> = Vec::new();
+    let panes = backend.pane_list(Some(&ws.workspace_id))?;
+    let mut prev = panes
+        .first()
+        .map(|p| p.pane_id.clone())
+        .ok_or_else(|| anyhow!("rex: workspace {} has no panes", ws.workspace_id))?;
+    let mut first = true;
+    let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
+    let peer_aware = opts.peer_aware && !opts.no_peer_aware;
+    let peer_template: Option<String> = if peer_aware {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/peer-aware.md.tpl");
+        match std::fs::read_to_string(&p) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!(
+                    "flywheel: cannot read peer-aware template {}: {e:#}",
+                    p.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut taken_names: std::collections::HashSet<String> = backend
+        .agent_list()
+        .map(|agents| agents.into_iter().filter_map(|a| a.name).collect())
+        .unwrap_or_default();
+    for item in &items {
+        let kind = spawn_item_kind(cfg, item, &catalog, &model_reg)?;
+        for _ in 0..item.count {
+            let ordinal = ordinals.entry(item.short.clone()).or_insert(0);
+            *ordinal += 1;
+            *ordinal = free_spawn_ordinal(project, &item.short, *ordinal, &taken_names);
+            let name = agent_name_n(project, &item.short, *ordinal);
+            taken_names.insert(name.clone());
+            let mail_identity = pinned_mail_identity(cfg, project, &name, &kind);
+            if mail_identity.is_none() {
+                refuse_unpinned_spawn(
+                    &name,
+                    item.profile.as_deref(),
+                    backend::mail_backend(cfg).is_ok(),
+                )?;
+            }
+            let identity = mail_identity.as_deref().unwrap_or(&name);
+            let (mut agent_args, model_pin, env_model_pin): (
+                Vec<String>,
+                Option<String>,
+                Option<String>,
+            ) = match &item.profile {
+                Some(pname) => {
+                    let p = catalog
+                        .get(pname)
+                        .expect("profile resolved at plan build (bd-eign.13)");
+                    let plan = profile_launch_plan(&kind, p, None)?;
+                    (plan.args, Some(plan.model), plan.env_model_pin)
+                }
+                None => {
+                    let (args, env_pin) =
+                        bare_model_launch(&kind, &opts.bare_model, &opts.bare_provider)?;
+                    (args, None, env_pin)
+                }
+            };
+            let pane_env = crate::pane::pane_env_for_launch(
+                cfg,
+                mail_identity.as_deref(),
+                env_model_pin.as_deref(),
+            )?;
+            let pane_id = if first {
+                first = false;
+                prev.clone()
+            } else {
+                let p =
+                    backend.pane_split(&prev, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
+                prev = p.pane_id.clone();
+                prev.clone()
+            };
+            let peer_args: Vec<String> = peer_template
+                .as_ref()
+                .map(|t| {
+                    vec![peer_prompt_template(
+                        t,
+                        &name,
+                        identity,
+                        opts.peer_poll_interval_minutes,
+                        opts.peer_poll_budget_minutes,
+                        opts.peer_max_prompts,
+                    )]
+                })
+                .unwrap_or_else(|| vec![doorbell::identity_prime(&name, identity)]);
+            let has_peer_prime = !peer_args.is_empty();
+            if needs_in_arg_prime(&kind) && !has_peer_prime {
+                agent_args.push(boot_prime_line().to_string());
+            }
+            // Shell gate: program_status idle/working within 15s, fail
+            // CLOSED (no verify-or-respawn net on this arm).
+            crate::pane::wait_rex_shell_ready(
+                &*backend,
+                &pane_id,
+                &name,
+                &pane_id,
+                Duration::from_secs(15),
+            )?;
+            // No env map on split: the pin + model pin ride as an
+            // `env K=V` command prefix, then rename binds the name.
+            let command = crate::pane::rex_env_command(&pane_env, &kind, &agent_args);
+            backend
+                .pane_run(&pane_id, &command)
+                .map_err(|e| anyhow!("spawn: rex run for {name} ({pane_id}): {e:#}"))?;
+            if let Err(e) = backend.agent_rename(&pane_id, Some(name.as_str())) {
+                eprintln!("flywheel: warn: rex rename {pane_id} → {name} failed: {e:#}");
+            }
+            // Readiness: the agent reports instead of the shell prompt.
+            // Best-effort — a wait failure degrades to dispatch-side
+            // errors, never a panic.
+            let launched_status: String = match backend.agent_wait(
+                &name,
+                &[herdr::AgentStatus::Idle, herdr::AgentStatus::Working],
+                Some(90_000),
+            ) {
+                Ok(a) => a.agent_status.as_str().to_string(),
+                Err(e) => {
+                    eprintln!(
+                        "flywheel: warn: {name} not ready within 90s of spawn (dispatching anyway): {e}"
+                    );
+                    "unknown".to_string()
+                }
+            };
+            if opts.settle_secs > 0 {
+                std::thread::sleep(Duration::from_secs(opts.settle_secs));
+            }
+            // Prime through pane_run (write + enter): the peer template is
+            // its own prime, else the identity line. The harness
+            // launch-hook bootstrap is herdr-client-coupled and is not
+            // installed on this arm.
+            if let Err(e) = backend.pane_run(&pane_id, &peer_args[0]) {
+                eprintln!("flywheel: warn: rex prime for {name} ({pane_id}) failed: {e:#}");
+            }
+            bind_pane_mail_identity(cfg, project, &name, &pane_id, mail_identity.as_deref());
+            note_role_bind_result(
+                bind_spawn_role(
+                    cfg,
+                    project,
+                    item.profile.as_deref(),
+                    &item.short,
+                    mail_identity.as_deref(),
+                ),
+                project,
+            );
+            let mut entry = match (&item.profile, &mail_identity) {
+                (Some(p), Some(mid)) => state::SpawnEntry::profiled(
+                    pane_id.clone(),
+                    name.clone(),
+                    p.clone(),
+                    kind.clone(),
+                    Some(mid.clone()),
+                ),
+                (Some(p), None) => {
+                    eprintln!(
+                        "flywheel: warn: spawned {name} ({}) profile {p} with no mail identity (mail not configured); doorbell sweep skips unpinned panes",
+                        pane_id
+                    );
+                    state::SpawnEntry::profiled(
+                        pane_id.clone(),
+                        name.clone(),
+                        p.clone(),
+                        kind.clone(),
+                        None,
+                    )
+                }
+                (None, Some(mid)) => state::SpawnEntry::with_mail_identity(
+                    pane_id.clone(),
+                    name.clone(),
+                    mid.clone(),
+                ),
+                (None, None) => {
+                    eprintln!(
+                        "flywheel: warn: spawned {name} ({}) with no mail identity (unpinned legacy entry); doorbell sweep skips unpinned panes — re-register with a mail identity to restore inbox checks",
+                        pane_id
+                    );
+                    state::SpawnEntry::legacy(pane_id.clone(), name.clone())
+                }
+            };
+            entry.model_pin = model_pin;
+            entry.skills_digest = item
+                .profile
+                .as_deref()
+                .and_then(|pname| catalog.get(pname))
+                .and_then(|p| profile::skills_digest(&p.skills));
+            registry.push(entry);
+            println!("  {} {}", kind_paint(&kind), dim(&format!("({})", pane_id)));
+            spawned.push(json!({
+                "name": name, "kind": kind, "pane_id": pane_id, "status": launched_status
+            }));
+            booted.push((pane_id.clone(), name.clone(), kind.clone()));
+        }
+    }
+
+    log(
+        project,
+        EventKind::Spawn,
+        json!({
+            "workspace_id": ws.workspace_id, "label": label, "agents": spawned
+        }),
+    );
+
+    if let Err(e) = state::save_spawn_registry(project, &registry) {
+        eprintln!("flywheel: cannot save spawn registry: {e:#}");
+    }
+    if let Err(e) = state::save_agent_names(&dir, &registry) {
+        eprintln!("flywheel: cannot save .flywheel/agent-names.json: {e:#}");
+    }
+    doorbell::register_workspace_subscriptions(
+        &config::state_dir(),
+        project,
+        &label,
+        &registry
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect::<Vec<_>>(),
+    );
+    {
+        use doorbell_rt::subscribe::SubscriptionStore;
+        let prefix = format!("spawn-{label}-");
+        let landed = SubscriptionStore::open(&config::state_dir())
+            .list()
+            .iter()
+            .filter(|s| s.id.starts_with(&prefix))
+            .count();
+        let wake = agent_ref::AgentEffect {
+            state: if landed == 0 {
+                agent_ref::EffectState::Unknown
+            } else {
+                agent_ref::EffectState::Settled
+            },
+            evidence: Some(format!("subscribers={landed}")),
+            ..agent_ref::AgentEffect::prepare(project, &label, agent_ref::AgentPhase::Wake)
+        };
+        if let Err(e) = agent_ref::journal_effect(project, &wake) {
+            eprintln!("flywheel: warn: cannot journal wake observation for {label}: {e:#}");
+        }
+        if landed == 0 {
+            eprintln!(
+                "flywheel: WARNING — no doorbell wake subscription landed for workspace {label} \
+                 (subscribers=0): rings / inbox-digest wakes / ack-SLA nudges will NOT be delivered \
+                 to this swarm. Check the plane with `flywheel doorbell status`; re-arm with \
+                 `doorbell start --host {project}/{label}` (bd-enov/F17)."
+            );
+        }
+    }
+
+    if !opts.no_verify {
+        let listed = backend.workspace_list()?;
+        if !listed.iter().any(|lws| lws.workspace_id == ws.workspace_id) {
+            bail!(
+                "spawn created workspace {} but the backend cannot list it — the session registry failed to persist. Re-run: flywheel spawn {project} \
+                 (the panes may still be live; --no-verify skips this check in scripts)",
+                ws.workspace_id
+            );
+        }
+    }
+
+    if !opts.no_verify && !registry.is_empty() {
+        let agents_now = backend.agent_list()?;
+        for e in &registry {
+            if e.pane_id.is_empty() {
+                continue;
+            }
+            let unbound = agents_now.iter().any(|a| {
+                a.pane_id == e.pane_id
+                    && (a.name.as_deref().is_none_or(|n| n.is_empty())
+                        || a.name.as_deref() != Some(e.name.as_str()))
+            });
+            if unbound && let Err(err) = backend.agent_rename(&e.pane_id, Some(e.name.as_str())) {
+                eprintln!(
+                    "flywheel: GS-039 P0-4 name-bind rename {} → {} failed: {err:#}",
+                    e.pane_id, e.name
+                );
+            }
+        }
+        let agents_after = backend.agent_list()?;
+        let still_unbound: Vec<String> = registry
+            .iter()
+            .filter(|e| !e.pane_id.is_empty())
+            .filter(
+                |e| match agents_after.iter().find(|a| a.pane_id == e.pane_id) {
+                    None => true,
+                    Some(a) => {
+                        a.name.as_deref().is_none_or(|n| n.is_empty())
+                            || a.name.as_deref() != Some(e.name.as_str())
+                    }
+                },
+            )
+            .map(|e| {
+                let seen = agents_after
+                    .iter()
+                    .find(|a| a.pane_id == e.pane_id)
+                    .and_then(|a| a.name.clone())
+                    .unwrap_or_else(|| "<missing>".into());
+                format!("{} ({}) saw={seen}", e.name, e.pane_id)
+            })
+            .collect();
+        if !still_unbound.is_empty() {
+            bail!(
+                "spawn name-binding failed after settle (GS-039 P0-4 / GS-043 AgentRef): panes still unbound/wrong-name: {}. Refusing swarm ready — rebind manually (flywheel rebind {project}) or re-spawn.",
+                still_unbound.join(", ")
+            );
+        }
+    }
+
+    // Readiness: "swarm ready" never prints while an agent is still
+    // launch_pending — same fail-closed shape as the herdr path (the
+    // process-liveness probe is herdr-client-coupled and skipped here).
+    if !opts.no_verify {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let agents = backend.agent_list()?;
+            let pending: Vec<AgentInfo> = agents
+                .iter()
+                .filter(|a| a.workspace_id == ws.workspace_id && is_still_booting(a))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "{}",
+                    launch_pending_error(&pending).expect("pending non-empty here")
+                );
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    if opts.no_verify {
+        spawn_effect.mark_unknown(Some("--no-verify: workspace + readiness gates skipped"));
+    } else {
+        spawn_effect.settle(Some(&format!(
+            "workspace={} panes={}",
+            ws.workspace_id,
+            booted.len()
+        )));
+    }
+
+    let presence_project = project_dir(cfg, project)
+        .to_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| project.to_string());
+    for e in &registry {
+        if let Some(pin) = &e.mail_identity {
+            let mut presence_effect = match agent_ref::AgentEffectGuard::begin(
+                project,
+                pin,
+                agent_ref::AgentPhase::Presence,
+            ) {
+                Ok(g) => Some(g),
+                Err(err) => {
+                    eprintln!("flywheel: warn: cannot journal presence intent for {pin}: {err:#}");
+                    None
+                }
+            };
+            let mut failure: Option<String> = None;
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let status = Command::new("toron")
+                    .args([
+                        "presence",
+                        "publish",
+                        "--as",
+                        pin,
+                        "--state",
+                        "working",
+                        "--project",
+                        &presence_project,
+                    ])
+                    .output();
+                match status {
+                    Ok(o) if o.status.success() => break,
+                    Ok(o) => {
+                        let err = String::from_utf8_lossy(&o.stderr);
+                        let unknown = err.to_ascii_lowercase().contains("unknown agent");
+                        if unknown && attempt < 3 {
+                            std::thread::sleep(Duration::from_millis(200 * attempt as u64));
+                            continue;
+                        }
+                        eprintln!(
+                            "flywheel: presence publish failed for {pin}: {}",
+                            err.trim()
+                        );
+                        failure =
+                            Some(format!("presence publish failed for {pin}: {}", err.trim()));
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("flywheel: presence publish failed for {pin}: {e}");
+                        failure = Some(format!("presence publish failed for {pin}: {e}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(g) = presence_effect.take() {
+                match failure {
+                    Some(ev) => g.mark_unknown(Some(&ev)),
+                    None => g.settle(Some("presence=working published")),
+                }
+            }
+        }
+    }
+
+    if !opts.join_channels.is_empty() {
+        let pins: Vec<String> = registry
+            .iter()
+            .filter_map(|e| e.mail_identity.clone())
+            .collect();
+        ensure_and_join_channels(project, &opts.join_channels, &pins);
+    }
+
     if peer_aware {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
         doorbell::ensure_running(&exe, &config::state_dir(), &label, project)
@@ -12376,7 +13034,7 @@ pub(crate) fn unpinned_spawn_fate(mail_configured: bool) -> UnpinnedFate {
     }
 }
 
-fn project_base(project: &str) -> String {
+pub(crate) fn project_base(project: &str) -> String {
     project.rsplit('/').next().unwrap_or(project).to_string()
 }
 
@@ -13335,6 +13993,13 @@ pub(crate) fn pinned_mail_identity(
 /// identity that exists) and record the pane_id in the spawn registry. Runs
 /// AFTER the pane exists; the pin itself was drawn pre-split so the pane env
 /// could carry it.
+/// Stamp gate for `bind_pane_mail_identity` below: a rex `block:` id is
+/// not a herdr pane, so stamping it makes herdr say `pane_not_found`.
+/// Pure so the contract is testable.
+fn pane_takes_herdr_stamp(pane_id: &str) -> bool {
+    !crate::inbox_ports::is_rex_block(pane_id)
+}
+
 pub(crate) fn bind_pane_mail_identity(
     cfg: &Config,
     project: &str,
@@ -13359,29 +14024,35 @@ pub(crate) fn bind_pane_mail_identity(
         // (display-only metadata; toron resolves tokens-first). Best-effort
         // like the file bridge above — a down herdr or missing pane is a
         // stderr note, never a spawn failure. Connect first (fast fail when
-        // herdr is down) so the whois replay below never runs then.
-        match toron_core::backend::herdr::HerdrBackend::connect(None) {
-            Ok(backend) => {
-                let npub = backend::run_mail(mail.whois(&key, pin))
-                    .map(|w| w.npub)
-                    .unwrap_or_default();
-                if !npub.is_empty()
-                    && let Err(e) = backend
-                        .client()
-                        .pane_report_metadata(pane_id, pin, &key, &npub)
-                {
+        // herdr is down) so the whois replay below never runs then. Rex
+        // blocks skip this entirely: herdr has no such pane and would only
+        // print pane_not_found.
+        if pane_takes_herdr_stamp(pane_id) {
+            match toron_core::backend::herdr::HerdrBackend::connect(None) {
+                Ok(backend) => {
+                    let npub = backend::run_mail(mail.whois(&key, pin))
+                        .map(|w| w.npub)
+                        .unwrap_or_default();
+                    if !npub.is_empty()
+                        && let Err(e) = backend
+                            .client()
+                            .pane_report_metadata(pane_id, pin, &key, &npub)
+                    {
+                        eprintln!(
+                            "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
+                        );
+                    }
+                    // Flag on only, after the toron_pin / toron_npub stamp. Records
+                    // the two facts; nothing is appended and nothing is shelled.
+                    if comms_inbox_on() && !npub.is_empty() {
+                        record_spawn_comms_facts(project, pin, &npub);
+                    }
+                }
+                Err(e) => {
                     eprintln!(
                         "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
-                    );
+                    )
                 }
-                // Flag on only, after the toron_pin / toron_npub stamp. Records
-                // the two facts; nothing is appended and nothing is shelled.
-                if comms_inbox_on() && !npub.is_empty() {
-                    record_spawn_comms_facts(project, pin, &npub);
-                }
-            }
-            Err(e) => {
-                eprintln!("flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}")
             }
         }
     }
@@ -14814,13 +15485,8 @@ fn cmd_add(
             // = fail loud with the corpse + exact close command; unknown kind
             // (inconclusive probe) or probe error = loud warn with the check
             // command, never a confident healthy.
-            let foreground = herdr::wait_agent_foreground(
-                &mut c,
-                &prev,
-                &kind,
-                &name,
-                Duration::from_secs(15),
-            );
+            let foreground =
+                herdr::wait_agent_foreground(&mut c, &prev, &kind, &name, Duration::from_secs(15));
             if !foreground {
                 match herdr::pane_process_info(&mut c, &prev)
                     .map(|pi| herdr::pane_agent_alive(&pi, &kind))
@@ -15984,14 +16650,15 @@ fn arrival_triple(project: &str, pin: &str) {
 /// spawn registry. `HERDR_PANE_ID` is the current herdr pane; bind it to
 /// the arriver pin. Without it, wakes stay digest-bound — say so loudly.
 fn arrive_maybe_bind_pane(cfg: &Config, project: &str, pin: &str) {
-    match std::env::var("HERDR_PANE_ID") {
-        Ok(pane) if !pane.trim().is_empty() => {
-            let pane = pane.trim();
+    let rex = std::env::var("REX_BLOCK").ok();
+    let herdr = std::env::var("HERDR_PANE_ID").ok();
+    match crate::inbox_ports::arrive_pane_from_env(rex.as_deref(), herdr.as_deref()) {
+        Some(pane) => {
             bind_pane_mail_identity(cfg, project, pin, pane, Some(pin));
             eprintln!("arrive bound pane {pane} to {pin} (doorbell can push)");
         }
-        _ => eprintln!(
-            "flywheel: no HERDR_PANE_ID — this session is pull-only; doorbell \
+        None => eprintln!(
+            "flywheel: no REX_BLOCK and no HERDR_PANE_ID — this session is pull-only; doorbell \
              pushes stay digest-bound. Pull with `toron mail inbox --since last`."
         ),
     }
@@ -16496,16 +17163,36 @@ fn cmd_helm(cfg: &Config, project: &str) -> Result<()> {
 fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     ensure_project_opt(project, "status")?;
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let Some(project) = project else {
         return cmd_list(cfg, false);
     };
-    let ws_id = find_workspace(&mut c, project)?;
-    let agents = c
-        .agent_list()?
-        .into_iter()
-        .filter(|a| a.workspace_id == ws_id)
-        .collect::<Vec<_>>();
+    // Rex door: inside rex list panes through the multiplexer backend;
+    // otherwise keep the herdr client. Read-only either way — status
+    // never creates a session.
+    let (ws_id, agents, dead): (String, Vec<herdr::AgentInfo>, Vec<(String, String)>) =
+        if crate::pane::rex_door_selected() {
+            let backend = crate::backend::factory::multiplexer_backend(cfg)?;
+            let ws_id = find_workspace_dyn(&*backend, project)?;
+            let agents = backend
+                .agent_list()?
+                .into_iter()
+                .filter(|a| a.workspace_id == ws_id)
+                .collect::<Vec<_>>();
+            // The dead-rows gauge is herdr-client-coupled (fail-open there);
+            // in rex mode it reports none — the reap still runs on
+            // spawn/close.
+            (ws_id, agents, Vec::new())
+        } else {
+            let mut c = Client::connect(Some(&cfg.socket_path()))?;
+            let ws_id = find_workspace(&mut c, project)?;
+            let agents = c
+                .agent_list()?
+                .into_iter()
+                .filter(|a| a.workspace_id == ws_id)
+                .collect::<Vec<_>>();
+            let dead = pane::dead_registry_rows(project, &mut c);
+            (ws_id, agents, dead)
+        };
     if agents.is_empty() {
         bail!("no agents in {project} — is the swarm spawned?");
     }
@@ -16666,7 +17353,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
         }
         // bd-nwnb: dead registry rows are visible here before dispatch
         // trips on them — reaped automatically on next spawn/close.
-        let dead = pane::dead_registry_rows(project, &mut c);
+        // (Computed with the status preamble; empty on the rex arm.)
         if dead.is_empty() {
             println!("  {}", dim("registry: no dead rows"));
         } else {
@@ -17223,20 +17910,14 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                     // advance state_change_seq while idle.
                     Some(true) => {
                         let verdict = probe.as_mut().map(|c| {
-                            herdr::probe_agent_responsiveness(
-                                c,
-                                pane_id,
-                                RESPONSIVENESS_WINDOW,
-                            )
+                            herdr::probe_agent_responsiveness(c, pane_id, RESPONSIVENESS_WINDOW)
                         });
                         match verdict {
                             // alive as a PID, dead to input → respawn,
                             // not healthy (the bd-a8i shape).
-                            Some(herdr::Responsiveness::Unresponsive) => {
-                                RecoverDecision::Respawn {
-                                    reason: "unresponsive",
-                                }
-                            }
+                            Some(herdr::Responsiveness::Unresponsive) => RecoverDecision::Respawn {
+                                reason: "unresponsive",
+                            },
                             // responsive or inconclusive → healthy (a failed
                             // probe never respawns an agent — bd-1np
                             // principle).
@@ -17944,9 +18625,7 @@ fn cmd_send(
             println!(
                 "{} {}",
                 dim(agent_target(a)),
-                status_paint(
-                    herdr::parse_agent_status(status).unwrap_or(AgentStatus::Unknown)
-                )
+                status_paint(herdr::parse_agent_status(status).unwrap_or(AgentStatus::Unknown))
             );
         }
         // bd-pin-public-plane-s-easy.9: dispatched + prior_status — the
@@ -19531,8 +20210,7 @@ fn cmd_watch(
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "watch")?;
-    let until_status: Option<AgentStatus> =
-        until.map(herdr::parse_agent_status).transpose()?;
+    let until_status: Option<AgentStatus> = until.map(herdr::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings line.
     if std::io::stdout().is_terminal() {
@@ -21925,6 +22603,17 @@ mod wake_identity_tests {
         );
     }
 
+    /// Rex block stamp gate: a `block:` id is a rex block, not a herdr
+    /// pane — stamping it makes herdr say `pane_not_found`. `w6:p1`
+    /// still takes the herdr stamp.
+    #[test]
+    fn rex_block_skips_the_herdr_stamp() {
+        assert!(!pane_takes_herdr_stamp(
+            "block:01a17136-a780-714f-9211-b78766ffd515"
+        ));
+        assert!(pane_takes_herdr_stamp("w6:p1"));
+    }
+
     /// S9 (ADR-0018 D1a) integration (embedded mailbox): spawn registers a
     /// UNIQUE adj+noun pin — never the slug — keeps it on re-spawn
     /// (idempotent), and redraws when the agents table already holds the
@@ -22977,8 +23666,8 @@ fn live_reservation_holders(cfg: &Config, project: &str) -> Vec<(String, String)
         .unwrap_or_default()
 }
 
-/// Live `(path, reason, holder)` rows for `file_blocks_bead`. A mail hiccup
-/// is an empty board, never a false block.
+/// Live `(path, reason, holder)` rows. The resume fold uses these for
+/// `file_blocks_bead`. A mail hiccup is an empty board, never a false block.
 fn live_file_rows(cfg: &Config, project: &str) -> Vec<(String, String, String)> {
     let Ok(key) = project_dir_str(cfg, project) else {
         return Vec::new();
@@ -23782,12 +24471,16 @@ fn cmd_loop(
                         .filter(|b| {
                             let pane = b.assignee.as_deref().unwrap_or("");
                             let last = window.get(&state::resume_key(&b.id, pane)).copied();
+                            let intended =
+                                durable::path_tokens(&format!("{} {}", b.title, b.description));
                             durable::should_resume_bead(
                                 last,
                                 now_us,
                                 durable::RESUME_WINDOW_DEFAULT_SECS,
                                 durable::peer_held(&b.id, &peers, pane)
-                                    || durable::file_blocks_bead(&b.id, &file_rows, pane),
+                                    || durable::file_blocks_bead(
+                                        &b.id, &file_rows, pane, &intended,
+                                    ),
                             )
                         })
                         .cloned()
@@ -23858,6 +24551,16 @@ fn cmd_loop(
                     let to_assign: Vec<durable::ReadyBead> = dispatchable
                         .into_iter()
                         .filter(|&b| !wave_held.contains(&b.id))
+                        .filter(|&b| {
+                            let intended =
+                                durable::path_tokens(&format!("{} {}", b.title, b.description));
+                            !durable::file_blocks_bead(
+                                &b.id,
+                                &file_rows,
+                                b.assignee.as_deref().unwrap_or(""),
+                                &intended,
+                            )
+                        })
                         .filter(|&b| match (&scope_ids, &scope_block) {
                             (Some(ids), _) => ids.contains(&b.id),
                             (None, Some(_)) => false,
@@ -25069,17 +25772,11 @@ mod loop_tests {
         let project = "done-mail-test";
         backend::run_mail(backend.ensure_project(project)).expect("ensure");
         let sender = backend.agent_name().to_string();
-        crate::mail::fixture_register(
-            project,
-            &spawn_agent_profile(&sender, "opencode", project),
-        )
-        .expect("register sender");
+        crate::mail::fixture_register(project, &spawn_agent_profile(&sender, "opencode", project))
+            .expect("register sender");
         let captain = "CaptainPine";
-        crate::mail::fixture_register(
-            project,
-            &spawn_agent_profile(captain, "flywheel", project),
-        )
-        .expect("register captain");
+        crate::mail::fixture_register(project, &spawn_agent_profile(captain, "flywheel", project))
+            .expect("register captain");
         // the orchestrator resolution prefers the program=="flywheel" agent
         assert_eq!(
             registered_orchestrator(&backend, project).as_deref(),
@@ -25298,8 +25995,7 @@ mod loop_tests {
                 backend::run_mail(backend.ensure_project(&project)).expect("ensure");
                 let sender = backend.agent_name().to_string();
                 let sender_profile = spawn_agent_profile(&sender, "opencode", &project);
-                crate::mail::fixture_register(&project, &sender_profile)
-                    .expect("register sender");
+                crate::mail::fixture_register(&project, &sender_profile).expect("register sender");
                 // the planner = the bead's creator (registered identity)
                 let planner = planner_recipient_chain(&dir_str, &bead_id, "FallbackIdentity")
                     .into_iter()
@@ -37843,8 +38539,10 @@ mod hosted_workspaces_from_registry_tests {
                 })
             })
             .collect();
-        let dirs: Vec<std::path::PathBuf> =
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let dirs: Vec<std::path::PathBuf> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         let unique: std::collections::BTreeSet<_> = dirs.iter().collect();
         for d in &dirs {
             let _ = std::fs::remove_dir_all(d);

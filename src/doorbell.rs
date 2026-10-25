@@ -4224,11 +4224,7 @@ mod audit_rotation_tests {
         let dir = tempfile::tempdir().unwrap();
         let filler = "x".repeat(900);
         for i in 0..8_000 {
-            audit_append(
-                dir.path(),
-                "ws",
-                serde_json::json!({"i": i, "f": filler}),
-            );
+            audit_append(dir.path(), "ws", serde_json::json!({"i": i, "f": filler}));
         }
         let path = audit_file(dir.path(), "ws");
         let len = std::fs::metadata(&path).unwrap().len();
@@ -4238,6 +4234,9 @@ mod audit_rotation_tests {
             doorbell_rt::file_host::AUDIT_MAX_BYTES
         );
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"i\":7999"), "the newest row was rotated away");
+        assert!(
+            text.contains("\"i\":7999"),
+            "the newest row was rotated away"
+        );
     }
 }

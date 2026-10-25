@@ -235,13 +235,13 @@ mod tests {
     async fn crew_first_stores_the_context_and_no_role() {
         let store = operated(mem().await, "proj");
         let crew = "bb".repeat(32);
-        let landed = append_spawn_facts(&store, "proj", Topology::Loop, &crew, Role::Crew)
+        let landed = append_spawn_facts(&store, "proj", Topology::Open, &crew, Role::Crew)
             .await
             .unwrap();
         assert_eq!(landed, Some("context@1"));
         assert_eq!(
             store.context_of("proj").await.unwrap().unwrap().topology,
-            Topology::Loop
+            Topology::Open
         );
         assert!(store.role_of("proj", &crew).await.unwrap().is_none());
         assert!(store.roles("proj").await.unwrap().is_empty());

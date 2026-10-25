@@ -919,7 +919,7 @@ mod tests {
     fn topology_enum_parses_swarm_loop_open_and_supervisor_but_not_join() {
         use toron_core::topology::Topology;
         assert_eq!(topology_enum("swarm"), Some(Topology::Swarm));
-        assert_eq!(topology_enum("loop"), Some(Topology::Loop));
+        assert_eq!(topology_enum("loop"), Some(Topology::Open));
         assert_eq!(topology_enum("open"), Some(Topology::Open));
         assert_eq!(topology_enum("supervisor"), Some(Topology::Supervisor));
         assert_eq!(topology_enum("join"), None);

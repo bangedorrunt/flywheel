@@ -50,8 +50,7 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                 // when both sides are compiled in.
                 (
                     "auto",
-                    !(cfg!(feature = "backend-herdr")
-                        && cfg!(feature = "backend-superlogical")),
+                    !(cfg!(feature = "backend-herdr") && cfg!(feature = "backend-superlogical")),
                 ),
             ] {
                 rows.push(json!({

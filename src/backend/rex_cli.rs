@@ -9,9 +9,9 @@
 //! and a spawn or JSON failure. A hang is not a rex failure.
 
 use std::io::BufRead;
-use std::path::PathBuf;
 #[cfg(test)]
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 
@@ -236,11 +236,9 @@ impl RexEventStream {
             Ok(Err(e)) => Err(RexFail::Spawn {
                 message: format!("rex events read: {e}"),
             }),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                Err(RexFail::Interrupted {
-                    waited: self.timeout.unwrap_or(Duration::ZERO),
-                })
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(RexFail::Interrupted {
+                waited: self.timeout.unwrap_or(Duration::ZERO),
+            }),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(None),
         }
     }

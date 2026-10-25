@@ -52,7 +52,12 @@ fn live_scenario_b_is_opt_in_before_anything_live() {
         .expect("Scenario B");
     let body = &src[at..];
     let gate = body.find("if !live_e2e_opted_in()").expect("opt-in gate");
-    for live in ["herdr_up()", "resonate_up()", "Command::new(", "herdr_workspace_create("] {
+    for live in [
+        "herdr_up()",
+        "resonate_up()",
+        "Command::new(",
+        "herdr_workspace_create(",
+    ] {
         let first = body.find(live).unwrap_or(usize::MAX);
         assert!(gate < first, "the opt-in gate must come before {live}");
     }
@@ -469,7 +474,9 @@ fn allow_worktree_flag_is_exposed_on_run_surfaces() {
 #[test]
 fn linked_worktree_gates_loop_run_until_operator_optout() {
     if !live_e2e_opted_in() {
-        eprintln!("{LIVE_E2E} unset — Scenario B skipped (live herdr/preflight; CLI surface covered above)");
+        eprintln!(
+            "{LIVE_E2E} unset — Scenario B skipped (live herdr/preflight; CLI surface covered above)"
+        );
         return;
     }
     if !herdr_up() {

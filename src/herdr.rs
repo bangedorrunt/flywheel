@@ -3233,11 +3233,7 @@ mod shell_prompt_tests {
         // INVERTED: without the registry the tie falls to list order and the
         // stale room wins — which is exactly the bug.
         assert_eq!(
-            super::resolve_workspace_id(
-                &[stale.clone(), live.clone()],
-                &agents,
-                "flywheel-toron-"
-            ),
+            super::resolve_workspace_id(&[stale.clone(), live.clone()], &agents, "flywheel-toron-"),
             "w23",
             "the prefix scan cannot see a pin-named crew, so list order wins"
         );

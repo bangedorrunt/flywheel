@@ -734,6 +734,7 @@ pub fn take_allowed_like(
 /// the daemon FileHost presence filter and the embedded path share it.
 pub fn is_urgent_line(line: &str) -> bool {
     line.contains("plane-P urgent")
+        || line.contains("URGENT steer")
         || line.contains("request-release")
         || line.contains("kind 30031")
         || line.contains("ack-sla-expired")
@@ -882,6 +883,20 @@ fn route_or_queue(
             why: "no_route".into(),
         });
     } else {
+        // should_ring parity (Busy × urgency): a working pane breaks
+        // through for urgent lines instead of queueing behind its own
+        // turn; routine lines still queue for the drain. Blocked never
+        // reaches here (injectable above), so its shape is untouched.
+        if matches!(
+            inject_gate_for_herdr(status, is_urgent_line(&line)),
+            InjectGate::Inject
+        ) {
+            actions.push(DoorbellAction::Prompt {
+                pin: pin.to_string(),
+                line,
+            });
+            return;
+        }
         // bd-ztek: a queued ring leaves one journal-visible Audit on the
         // empty→non-empty transition per pin. Without it the queue was
         // silent (no action row), so `why` showed nothing for dead-pane
@@ -1081,6 +1096,86 @@ mod tests {
         let (next2, second) = tick(&next, &msg);
         assert!(second.is_empty(), "no audit storm while queued");
         assert_eq!(next2.queues.get("BlueRidge").map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn working_urgent_steer_rings_now() {
+        // should_ring parity: working + urgent breaks through instead of
+        // queueing; the inbox wake text carries `URGENT steer`.
+        assert!(
+            is_urgent_line("⟦toron⟧ URGENT steer (wm 7) — run: toron next"),
+            "inbox wake text must read urgent"
+        );
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let mut actions = Vec::new();
+        route_or_queue(
+            &mut model,
+            &mut actions,
+            "BlueRidge",
+            "⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
+        );
+        assert!(
+            matches!(&actions[..], [DoorbellAction::Prompt { pin, .. }] if pin == "BlueRidge"),
+            "working + urgent must Prompt, got {actions:?}"
+        );
+        assert!(
+            model
+                .queues
+                .get("BlueRidge")
+                .is_none_or(std::vec::Vec::is_empty),
+            "an urgent ring must not park in the queue"
+        );
+    }
+
+    #[test]
+    fn working_normal_line_still_queues() {
+        // should_ring parity the other way: working + routine waits.
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let mut actions = Vec::new();
+        route_or_queue(
+            &mut model,
+            &mut actions,
+            "BlueRidge",
+            "[doorbell] kind 9. Pull: toron channel read".to_string(),
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, DoorbellAction::Prompt { .. })),
+            "working + normal must not Prompt, got {actions:?}"
+        );
+        assert_eq!(model.queues.get("BlueRidge").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn blocked_routing_unchanged() {
+        // Blocked stays as it is: urgent prompts, routine digests.
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "blocked".into());
+        let mut urgent = Vec::new();
+        route_or_queue(
+            &mut model,
+            &mut urgent,
+            "BlueRidge",
+            "⟦toron⟧ URGENT steer (wm 7) — run: toron next".to_string(),
+        );
+        assert!(
+            matches!(&urgent[..], [DoorbellAction::Prompt { .. }]),
+            "blocked + urgent must Prompt, got {urgent:?}"
+        );
+        let mut routine = Vec::new();
+        route_or_queue(
+            &mut model,
+            &mut routine,
+            "BlueRidge",
+            "[doorbell] kind 9. Pull: toron channel read".to_string(),
+        );
+        assert!(
+            matches!(&routine[..], [DoorbellAction::Digest { .. }]),
+            "blocked + routine must Digest, got {routine:?}"
+        );
     }
 
     #[test]

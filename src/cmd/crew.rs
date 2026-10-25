@@ -185,8 +185,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 .first()
                 .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?;
             let mail_identity = old.mail_identity.clone();
-            let mut pane_env =
-                crate::herdr::herdr_integration_env(cfg, mail_identity.as_deref());
+            let mut pane_env = crate::herdr::herdr_integration_env(cfg, mail_identity.as_deref());
             if let Some(m) = &plan.env_model_pin {
                 crate::herdr::apply_opencode_model_pin(&mut pane_env, m)?;
             }

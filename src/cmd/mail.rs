@@ -1129,10 +1129,7 @@ pub(crate) fn project_agent_keys_dir(project: &str) -> std::path::PathBuf {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(project);
-    crate::mail::mailbox_roots()
-        .0
-        .join(slug)
-        .join("agents")
+    crate::mail::mailbox_roots().0.join(slug).join("agents")
 }
 
 /// Agent dirs that hold `key.ncryptsec` but are not in the registered roster.
