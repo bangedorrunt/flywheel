@@ -1,7 +1,8 @@
 {{TOOL_FRONTMATTER}}
 # Orchestration: loop-mode
 
-/loop-mode: solo mode in the current harness.
+/loop-mode runs `loop-mode run` in open mode. It is not a third mode.
+Read `flywheel-open`. Do not read `flywheel-captain`.
 
 The supplied text is the objective, scope, and flags. ONE pane drives
 ONE objective end-to-end, not a reusable definition. Beads optional:

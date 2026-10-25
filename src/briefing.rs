@@ -84,8 +84,34 @@ pub fn spawns_crew(p: &Proposal) -> bool {
 pub fn split_topology(t: &str) -> (&str, bool) {
     if t == "join" {
         ("swarm", true)
+    } else if t == "loop" {
+        // Loop is the work unit, not a mode. A stored "loop" session stays
+        // in this pane and does not spawn a crew.
+        ("open", false)
     } else {
         (t, false)
+    }
+}
+
+/// Who works. `loop` is not a mode. `join` is swarm with the join flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Open,
+    Swarm,
+}
+
+pub fn mode_of(topology: &str) -> Mode {
+    match topology {
+        "swarm" | "supervisor" | "join" => Mode::Swarm,
+        _ => Mode::Open,
+    }
+}
+
+/// The one mode text. The prompt names one skill.
+pub fn mode_text(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Swarm => "MODE captain\nRead skill://flywheel-captain before starting.",
+        Mode::Open => "MODE open\nRead skill://flywheel-open before starting.",
     }
 }
 
@@ -143,6 +169,9 @@ pub struct Briefing {
     /// pass that was made and declined, and the line says which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_ranking: Option<String>,
+    /// One mode line plus the one skill to read. Open or captain, never both.
+    #[serde(default)]
+    pub mode_text: String,
 }
 
 fn held_summary(paths: &[String]) -> String {
@@ -445,7 +474,7 @@ pub fn assemble(
     // steer, joinable) falls off the briefing surface silently.
     let mut alternatives = vec![
         Alternative {
-            topology: "loop".into(),
+            topology: "open".into(),
             workflow: Some("loop-work".into()),
             when: "ready beads exist and you want solo durable dispatch".into(),
         },
@@ -517,10 +546,11 @@ pub fn assemble(
         // The Jev pass runs in the CALLER (cmd_briefing) and writes this line, so
         // the ranking cannot leak into the pure core that derives the menu.
         harness_ranking: None,
+        mode_text: mode_text(mode_of(&topology)).to_string(),
         questions: vec![
             Question {
                 id: "topology".into(),
-                options: vec!["swarm".into(), "loop".into(), "open".into()],
+                options: vec!["swarm".into(), "open".into()],
                 default: topology,
             },
             Question {
@@ -593,6 +623,7 @@ pub fn align_with_session_topology(b: &mut Briefing, session: &str, sticky_held:
     };
     b.proposal.topology = session_topology.to_string();
     b.proposal.join = session_join;
+    b.mode_text = mode_text(mode_of(session_topology)).to_string();
     if let Some(q) = b.questions.iter_mut().find(|q| q.id == "topology") {
         q.default = session_topology.to_string();
     }
@@ -758,6 +789,7 @@ fn rebuild_argv_for_topology(b: &mut Briefing, topology: &str) {
     let (topo, join) = split_topology(topology);
     b.proposal.topology = topo.to_string();
     b.proposal.join = join;
+    b.mode_text = mode_text(mode_of(topo)).to_string();
     match topology {
         "open" => {
             b.proposal.workflow = "none".into();
@@ -892,6 +924,17 @@ mod tests {
         assert_eq!(topology_enum("supervisor"), Some(Topology::Supervisor));
         assert_eq!(topology_enum("join"), None);
         assert_eq!(topology_enum("none"), None);
+    }
+
+    #[test]
+    fn stored_loop_is_open_and_mode_text_names_one_skill() {
+        assert_eq!(split_topology("loop"), ("open", false));
+        assert_eq!(split_topology("swarm"), ("swarm", false));
+        assert_eq!(mode_of("loop"), Mode::Open);
+        assert_eq!(mode_of("swarm"), Mode::Swarm);
+        assert!(mode_text(Mode::Open).contains("skill://flywheel-open"));
+        assert!(mode_text(Mode::Swarm).contains("skill://flywheel-captain"));
+        assert!(!mode_text(Mode::Open).contains("flywheel-captain"));
     }
 
     /// bd-compose-plumbing-zdzi: an empty FLEET, not an anonymous caller —
@@ -1073,7 +1116,7 @@ mod tests {
         assert!(!b.proposal.join && b.proposal.topology == "open");
         apply_answers(&mut b, Some("join"), None, None).unwrap();
         apply_answers(&mut b, Some("loop"), None, None).unwrap();
-        assert!(!b.proposal.join && b.proposal.topology == "loop");
+        assert!(!b.proposal.join && b.proposal.topology == "open");
         // Re-asking for what is already there changes nothing.
         let mut j = assemble(
             "wave-swarm 3 crews",
@@ -1189,7 +1232,8 @@ mod tests {
         };
         let b = assemble("work the ready beads", &world, &["coder".into()], 5, None);
         assert_eq!(b.proposal.workflow, "loop-work");
-        assert_eq!(b.proposal.topology, "loop");
+        assert_eq!(b.proposal.topology, "open");
+        assert!(b.mode_text.contains("flywheel-open"));
     }
 
     #[test]
@@ -1323,7 +1367,7 @@ mod tests {
             ..World::default()
         };
         let mut b = assemble("work the ready beads", &world, &["coder".into()], 5, None);
-        assert_eq!(b.proposal.topology, "loop", "precondition: loop classify");
+        assert_eq!(b.proposal.topology, "open", "precondition: open classify");
         assert!(
             b.proposal
                 .argv
@@ -1511,7 +1555,7 @@ mod tests {
         assert_eq!(b.proposal.topology, "swarm");
         assert_eq!(b.proposal.workflow, "wave-swarm");
         align_with_session_topology(&mut b, "loop", true);
-        assert_eq!(b.proposal.topology, "loop");
+        assert_eq!(b.proposal.topology, "open");
         assert_eq!(b.proposal.workflow, "loop-work");
         assert!(b.proposal.token.is_none());
         assert!(

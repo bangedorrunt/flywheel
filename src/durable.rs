@@ -3440,6 +3440,44 @@ pub fn peer_held(bead_id: &str, reservations: &[(String, String)], self_pane: &s
         .any(|(reason, holder)| reason == bead_id && !holder.is_empty() && holder != self_pane)
 }
 
+/// Another pin holds a reservation whose path overlaps this file. `claims`
+/// are `(path pattern, holder pin)`. An empty holder is not a peer.
+pub fn other_file_holder<'a>(
+    path: &str,
+    claims: &'a [(String, String)],
+    self_holder: &str,
+) -> Option<&'a str> {
+    claims.iter().find_map(|(pattern, holder)| {
+        let holder = holder.trim();
+        if holder.is_empty() || holder == self_holder {
+            return None;
+        }
+        toron_core::mailbox::reservations::overlaps(pattern, path).then_some(holder)
+    })
+}
+
+/// This bead already holds a path that overlaps another pin's reservation.
+/// `rows` are `(path, reason, holder)`. A bead with no path of its own is
+/// not blocked here.
+pub fn file_blocks_bead(
+    bead_id: &str,
+    rows: &[(String, String, String)],
+    self_holder: &str,
+) -> bool {
+    if self_holder.is_empty() {
+        return false;
+    }
+    let claims: Vec<(String, String)> = rows
+        .iter()
+        .map(|(path, _, holder)| (path.clone(), holder.clone()))
+        .collect();
+    rows.iter().any(|(path, reason, holder)| {
+        reason == bead_id
+            && holder == self_holder
+            && other_file_holder(path, &claims, self_holder).is_some()
+    })
+}
+
 /// Should the loop resume this (bead, pane) now? Suppressed inside the window
 /// and whenever a peer holds the bead's paths.
 pub fn should_resume_bead(
@@ -15145,6 +15183,30 @@ mod tests {
             ("bd-mine".to_string(), "MyPane".to_string()),
             ("bd-unstamped".to_string(), String::new()),
         ];
+        assert_eq!(
+            other_file_holder(
+                "src/main.rs",
+                &[("src/**".into(), "OtherPin".into())],
+                "Me"
+            ),
+            Some("OtherPin")
+        );
+        assert_eq!(
+            other_file_holder("src/main.rs", &[("src/**".into(), "Me".into())], "Me"),
+            None
+        );
+        assert_eq!(
+            other_file_holder("src/main.rs", &[("src/**".into(), "  ".into())], "Me"),
+            None
+        );
+        let files = vec![
+            ("src/**".into(), "bd-1".into(), "Me".into()),
+            ("src/main.rs".into(), "bd-2".into(), "Other".into()),
+        ];
+        assert!(file_blocks_bead("bd-1", &files, "Me"));
+        assert!(file_blocks_bead("bd-2", &files, "Other"));
+        assert!(!file_blocks_bead("bd-9", &files, "Me"));
+        assert!(!file_blocks_bead("bd-1", &files, ""));
         assert!(peer_held("bd-peer", &reservations, "MyPane"));
         assert!(
             !peer_held("bd-peer", &reservations, "PeerPane"),

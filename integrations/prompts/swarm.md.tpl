@@ -1,9 +1,10 @@
 {{TOOL_FRONTMATTER}}
 # Orchestration: swarm-mode
 
-/swarm-mode: captain-led multi-crew execution. One captain, up to 5
-crews; parallel lanes on disjoint files. Objective authoritative, every
-lane verifiable.
+/swarm-mode is a crew. The captain reads `flywheel-captain`. Each crew
+agent reads `flywheel-crew`. One captain, up to 5 crew members. The
+person's answer is the crew shape when a person is here. A named squad
+is the shape when no person is here.
 
 ## Playbook
 

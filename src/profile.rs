@@ -780,6 +780,11 @@ pub fn compiled_in_defaults() -> BTreeMap<String, Profile> {
     ] {
         m.insert(name.to_string(), profile);
     }
+    for profile in m.values_mut() {
+        if !profile.skills.iter().any(|s| s == "flywheel-crew") {
+            profile.skills.insert(0, "flywheel-crew".into());
+        }
+    }
     m
 }
 
@@ -837,6 +842,27 @@ pub fn compiled_in_harnesses() -> BTreeMap<String, HarnessConfig> {
         },
     );
     m
+}
+
+/// One reader for a squad name. A user recipe overrides the compiled-in squad
+/// of the same name. A profile name with no squad is a squad of one.
+pub fn resolve_squad(
+    name: &str,
+    recipes: &BTreeMap<String, crate::config::Recipe>,
+    profile_exists: bool,
+) -> Option<Squad> {
+    if let Some(recipe) = recipes.get(name) {
+        return Some(Squad::from_recipe(recipe));
+    }
+    if let Some(squad) = compiled_in_squads().get(name) {
+        return Some(squad.clone());
+    }
+    if profile_exists {
+        let mut counts = BTreeMap::new();
+        counts.insert(name.to_string(), 1);
+        return Some(Squad { counts });
+    }
+    None
 }
 
 /// Compiled-in squads (ADR-0007 D3). User `recipes.toml` overrides per name.
@@ -1872,6 +1898,29 @@ model = "big-pickle"
         assert_eq!(s["plan"].counts.get("planner"), Some(&1));
         assert_eq!(s["review"].counts.get("oracle"), Some(&1));
         assert_eq!(s["recon"].counts.get("scout"), Some(&2));
+    }
+
+    #[test]
+    fn resolve_squad_user_file_beats_compiled_in_then_a_profile_of_one() {
+        let mut recipes = BTreeMap::new();
+        recipes.insert(
+            "default".into(),
+            crate::config::Recipe {
+                pi: Some(9),
+                ..crate::config::Recipe::default()
+            },
+        );
+        let user = resolve_squad("default", &recipes, false).expect("user file");
+        assert_eq!(user.counts.get("pi"), Some(&9));
+        assert!(
+            !user.counts.contains_key("coder"),
+            "user file replaces the compiled-in counts"
+        );
+        let compiled = resolve_squad("plan", &recipes, false).expect("compiled-in");
+        assert_eq!(compiled.counts.get("planner"), Some(&1));
+        let one = resolve_squad("coder", &BTreeMap::new(), true).expect("profile");
+        assert_eq!(one.counts.get("coder"), Some(&1));
+        assert!(resolve_squad("nope", &BTreeMap::new(), false).is_none());
     }
 
     #[test]

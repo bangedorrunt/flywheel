@@ -1,7 +1,8 @@
 {{TOOL_FRONTMATTER}}
 # Orchestration: open-mode
 
-Run the /open-mode slash command: direct, uncoordinated agent mode.
+Open mode is one agent in this pane. Read `flywheel-open`.
+`mode_text` from `flywheel briefing --json` names that skill.
 
 ## AUTHORITATIVE OBJECTIVE (GS-039 P0-2)
 

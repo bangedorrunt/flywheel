@@ -25,7 +25,7 @@ Five nouns, not interchangeable:
 | **stage** | one named prompt (`send --stage ce-execute`). Catalog: `stage list`. | a runner. |
 | **workflow** | engine procedure (YAML steps or graph). A step *may* dispatch a stage to a `@role`. SIGNOFF is `request_approval`, not a stage. | a topology. |
 | **profile** | role → harness + model + skills. `crew: auto` counts `@roles`. | what makes a compose token. |
-| **topology** | how work is supervised: loop / swarm / open. | Workflow YAML. "Loop workflow" is forbidden speech. |
+| **mode** | who works: `open` or `swarm`. A loop is the work plus one verify check. | A third mode. "Loop workflow" is forbidden speech. |
 | **compose** (verb) | assembling a Workflow from parts (`--parts`, `--from-yaml`, `--agent`). | starting anything. |
 | **compose token** | bare name legal as `--parts`: `wave-swarm`, `repair-until-verified`, or `beads-lifecycle`. Preferred door: `workflow compose … --parts <token> --run`. Legacy alias: `workflow run <token> --execute`. | a recipe / squad. |
 | **ordinary builtin** | the same Workflow type, not a `--parts` token (e.g. captain-audit). | a compose token. |
@@ -40,7 +40,7 @@ Door map (one door per intent):
 | Legacy alias for compose token | `workflow run <token> --execute` (**legacy alias**, not preferred) | teaching it as the door |
 | Run a named ordinary builtin | `workflow run <name> --execute` | bare `--parts captain-audit` |
 | Inline a compose token inside parts | `--parts wave-swarm` / `repair-until-verified` / `beads-lifecycle` | calling it a "recipe" / squad |
-| Supervise a solo durable lane | topology `loop-mode` | "run the loop workflow" |
+| Walk ready beads in this pane | `loop-mode run <project> --work` (mode stays `open`) | calling that command a mode, or "run the loop workflow" |
 | Human gate on outer wave | SIGNOFF = `request_approval` on **outer** run only | nested crew inventing signoff |
 
 Invariants (each stated once): **preview ≠ started** — compose without `--run` only lints + previews the crew. **SIGNOFF outer-only** — nested captain+crew via `call_workflow` / `dispatch_job` never open a second `request_approval`, and a parked SIGNOFF is announced by the run's approval drainer (`flywheel workflow approve` resolves it; a resumed run re-issues it). **wave-swarm sequences on completion artifacts** — each gated pair (gate→dispatch→execute→review→verify) is separated by an await step that retries a `verify` of `.flywheel/wave/<label>-<stage>.done`, the marker the predecessor writes; per-step budget 240 x 30s, and exhaustion fails at that step with `wave in flight … extend with --timeout` (`--timeout` / `FLYWHEEL_COMPOSE_MAX_SECONDS` stays the run's outer bound). **join-before-post** — `compose --run` ensures the token's declared `steer_channel` (refusing up front when the channel cannot be resolved) and joins every spawned pin before any stage posts; briefing binds `captain_pin` to the arriving pin in the emitted `--inputs`, and names it in `questions` when it cannot derive it. Ordinary builtins enter via `workflow run <name> --execute` — never bare `--parts`. Open mode may run a bounded ordinary workflow or stage in the current pane; that procedure does not change topology or grant delegation permission. On every follow-up/material context change, re-check `workflow list --brief --json` and `stage list`, choose the smallest vehicle, or announce `none: raw` rather than replaying a stale first-prompt choice.

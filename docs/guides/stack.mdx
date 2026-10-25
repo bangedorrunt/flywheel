@@ -104,13 +104,13 @@ crews end up contending for the same files. `topology: none` with an empty
 `argv` is also a legitimate result rather than an error: it means no catalog
 route matched, so declare a trigger or author one with `compose --agent`.
 
-The door is not ceremony. `arrive` publishes presence, drains the session-start report (open decisions, unread status, divergence), and claims the captain alias first-come-first-served. The briefing classifier picks the vehicle: open, loop, swarm, or coalition. You run what it returns. The rulebook and its bypass ledger are in [integration](./integration).
+The door is not ceremony. `arrive` publishes presence, drains the session-start report (open decisions, unread status, divergence), and claims the captain alias first-come-first-served. The briefing classifier picks `open` or `swarm`. A loop is the work plus one verify check. The command `loop-mode run` stays. You run the argv briefing returns, and you read the one skill in `mode_text`. The rulebook and its bypass ledger are in [integration](./integration).
 
 ## Vocabulary
 
 | Term | Meaning |
 |---|---|
-| **pin** | Your public name, adjective + noun (`ToronScribe`). Mail `--as`/`--to` take pins. br `--assignee` takes the herdr slug (`flywheel-toron-coder`). |
+| **pin** | Your public name, AdjectiveNoun (`IvoryRidge`). The env is `AGENT_NAME`. Mail `--as`/`--to` and `br --assignee` take that pin. |
 | **bead** | One unit of ledgered work. `bd-###`. |
 | **corr** | Correlation id minted by the sender. `toron wait --corr` parks until the receipt lands. Never reuse the thread id. |
 | **plane** | One toron wire surface: P private gift-wrap, S shared rooms, J jobs, N presence, W live watch. |

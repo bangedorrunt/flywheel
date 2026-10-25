@@ -9,7 +9,9 @@
 //! and a spawn or JSON failure. A hang is not a rex failure.
 
 use std::io::BufRead;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(test)]
+use std::path::Path;
 use std::process::Output;
 use std::time::Duration;
 
@@ -439,6 +441,7 @@ pub fn events_args(session: Option<&str>) -> Vec<String> {
 /// `rex do` running past the call bound, which the edge reports as
 /// `Interrupted`, never as a result. `--json` makes the return value
 /// machine-readable; an empty stdout is `BadOutput`, never `Null`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn do_args(session: Option<&str>, script: &str, args_json: Option<&str>) -> Vec<String> {
     let mut args = vec!["do".into()];
     if let Some(session) = session.filter(|s| !s.is_empty()) {
@@ -490,10 +493,10 @@ pub fn parse_created_session(
         });
     }
     let mut session = session_row(row)?;
-    if session.label == session.session_id {
-        if let Some(label) = label_arg.filter(|s| !s.is_empty()) {
-            session.label = label.to_string();
-        }
+    if session.label == session.session_id
+        && let Some(label) = label_arg.filter(|s| !s.is_empty())
+    {
+        session.label = label.to_string();
     }
     let windows = value
         .get("initial_windows")
@@ -548,10 +551,10 @@ pub fn parse_created_block_id(value: &Value) -> Result<String, RexFail> {
     if let Some(id) = field(value, &["block_id"]) {
         return Ok(id);
     }
-    if let Some(block) = value.get("block") {
-        if let Some(id) = field(block, &["block_id", "id"]) {
-            return Ok(id);
-        }
+    if let Some(block) = value.get("block")
+        && let Some(id) = field(block, &["block_id", "id"])
+    {
+        return Ok(id);
     }
     if let Some(id) = value
         .get("block_ids")
@@ -619,7 +622,7 @@ fn parse_stdout_json(bytes: &[u8]) -> Result<Value, RexFail> {
 fn clip(text: &str) -> String {
     let mut clipped: String = text.chars().take(400).collect();
     if text.chars().count() > 400 {
-        clipped.push_str("…");
+        clipped.push('…');
     }
     clipped
 }
@@ -784,12 +787,12 @@ pub mod rex_map {
             }
             Value::Object(map) => {
                 for key in ["osc", "raw", "report", "sequence"] {
-                    if let Some(Value::String(raw)) = map.get(key) {
-                        if let Some(report) = parse_report(raw) {
-                            order.push(report.id.clone().unwrap_or_default());
-                            board.apply(raw);
-                            return;
-                        }
+                    if let Some(Value::String(raw)) = map.get(key)
+                        && let Some(report) = parse_report(raw)
+                    {
+                        order.push(report.id.clone().unwrap_or_default());
+                        board.apply(raw);
+                        return;
                     }
                 }
                 let Some(state) = map.get("state").and_then(Value::as_str) else {

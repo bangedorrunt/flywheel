@@ -280,7 +280,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     RouteEntry {
         primitive: "pickup",
         matchers: &["pickup", "resume session"],
-        topology: "loop",
+        topology: "open",
         gate: RouteGate::Always,
         argv: RouteArgv::WorkflowRun { mode: "pane" },
         reason: "pickup / resume session — pickup workflow",
@@ -288,7 +288,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     RouteEntry {
         primitive: "pause",
         matchers: &["pause", "going offline"],
-        topology: "loop",
+        topology: "open",
         gate: RouteGate::Always,
         argv: RouteArgv::WorkflowRunNoMode,
         reason: "pause / going offline — checkpoint + standing handoff",
@@ -544,7 +544,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         // Phrase needles only. Bare "work" matches "workflow"; bare "beads"
         // matches "beads-lifecycle" and any diagnosis that names the tracker.
         matchers: &["work the ready beads", "ready beads", "loop-mode", "loop"],
-        topology: "loop",
+        topology: "open",
         gate: RouteGate::ReadyBeadsWork,
         argv: RouteArgv::LoopWork,
         reason: "ready beads — loop-mode run <project> --work",

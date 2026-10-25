@@ -46,8 +46,6 @@ use toron_core::envelope::{
 use toron_core::inbox::{InboxError, InboxStore};
 use toron_core::outbox::{self, SendState};
 
-#[cfg(feature = "backend-superlogical")]
-use crate::backend::MultiplexerBackend;
 use crate::config::Config;
 use crate::pane_write::{PaneTyper, PaneWrite, Urgency, Wm};
 
@@ -620,17 +618,12 @@ pub fn store() -> Result<InboxStore> {
     Ok(InboxStore::new(pool))
 }
 
-/// The sender pin/npub: the ONE identity ladder (bd-05ar) — explicit, then
-/// `TORON_AGENT` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME`, then the configured
-/// `[agent_mail].name`. The env rungs are toron's `guard_agent` order, so the
-/// pin that sends mail is the pin that holds the lease and attributes the
-/// commit.
+/// The sender pin: `--as`, else `AGENT_NAME`. The same two rungs as the guard.
 pub fn sender_token(
     from: Option<&str>,
-    config_name: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, SendError> {
-    crate::authority::select_agent_identity(from, env, config_name).ok_or(SendError::NoSender)
+    crate::authority::select_agent_identity(from, env).ok_or(SendError::NoSender)
 }
 
 /// One full send from sync code (CLI and the `__send` leaf).
@@ -665,11 +658,7 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         .iter()
         .map(|t| parse_address(t))
         .collect::<Result<_, _>>()?;
-    let sender_tok = sender_token(
-        req.from,
-        cfg.agent_mail.as_ref().and_then(|m| m.name.as_deref()),
-        &|k| std::env::var(k).ok(),
-    )?;
+    let sender_tok = sender_token(req.from, &|k| std::env::var(k).ok())?;
     let store = store()?;
     let mb = crate::mail::mailbox();
     let project = req.project.to_string();
@@ -847,7 +836,7 @@ fn wake_via_backend(
         SendWake::Skip(note) => note,
         SendWake::Ring => {
             let panes = crate::pane_write::RexPanes(&*backend);
-            match crate::mail::block_on(ring(&store, &panes, &target, npub)) {
+            match crate::mail::block_on(ring(store, &panes, &target, npub)) {
                 Ok(wm) => format!("rung wm {:x}", wm.0),
                 Err(e) => format!("failed: {e:#}"),
             }
@@ -1269,7 +1258,10 @@ mod tests {
         );
         // Another workspace's host is not this one's, even with the same id.
         let other = herdr_ws("w1", "flywheel-other");
-        assert_eq!(owner_of_workspace(dir.path(), "other", Some(&other), now), None);
+        assert_eq!(
+            owner_of_workspace(dir.path(), "other", Some(&other), now),
+            None
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

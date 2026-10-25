@@ -148,7 +148,7 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 | `TORON_DATA_DIR` / `TORON_MCP_DATA_DIR` / `TORON_KEY_PASSPHRASE` | toron roots + operator key (never `TORON_OPERATOR_PASSPHRASE`) |
 | `RESONATE_URL` | durable-loop server (default `http://localhost:8001`) |
 | `HERDR_SOCKET_PATH` | multiplexer socket |
-| `AGENT_NAME` / `TORON_AGENT` / `FLYWHEEL_MAIL_AS` | your pin (attributed commits; unattributed fail closed) |
+| `AGENT_NAME` | the only pin env. `--as` wins. `TORON_AGENT` and `FLYWHEEL_MAIL_AS` do not supply a pin. Unset means the guard blocks the commit |
 | `FLYWHEEL_JEV` | judgment gate (bd-0glq P7: on by default). Unset = auto (enrich iff `TYPESAFE_API_KEY` is set, else loud `jev: unconfigured` passthrough, never escalate); `1/true/yes` = force on (deny escalates even keyless); `0/false/no` = force off (byte-identical) |
 | `TYPESAFE_API_KEY` | System One key, mikasa-only custody. Absent = unconfigured lane (marker, no escalate); present + failure = I4 hard escalate. Never commit a real key |
 | `FLYWHEEL_JEV_THRESHOLDS` | provisional `topology,honesty,announce` floats (default `0.85,0.80,0.60`, captain-tunable, re-validation duty) |
@@ -157,9 +157,9 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 
 | Daemon | Binary | Port | Unit | Owns |
 |---|---|---|---|---|
-| toron | `toron serve` | 18080 | `com.toron.serve` | mailbox/bus/Nostr archive |
-| flywheel | `flywheel serve` | 8787 | `dev.flywheel.daemon` | dispatch snapshots, loop |
-| doorbell | `doorbell serve` | 18980 | `com.doorbell.serve` | wake loops, journals |
+| toron | `toron serve` | 18080 | `com.toron.serve` | mail, reservations, pins. One writer |
+| flywheel | `flywheel serve` | 8787 | `dev.flywheel.daemon` | HTTP window: health, snapshot, send, events. Not a second mail store |
+| doorbell | `doorbell serve` | 18980 | `com.doorbell.serve` | the only wake while this port answers |
 | resonate | `resonate` | 8001 | (dev process) | durable promises |
 
 All three units are launchd-persisted (macOS) / systemd user (Linux).

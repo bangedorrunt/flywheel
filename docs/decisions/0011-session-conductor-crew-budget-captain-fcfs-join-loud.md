@@ -11,7 +11,7 @@ informed: flywheel × toron × beads maintainers; harness agents (grok/pi/omp/op
 
 | Field | Value |
 |-------|-------|
-| **Status** | **Accepted** (2026-09-08; captain word on four cuts) |
+| **Status** | **Accepted** (2026-09-08; captain word on four cuts). **Amended 2026-10-25:** the mode question is `open` or `swarm`. Ready beads stay the `loop-mode run` command and classify as `open`. A stored session word `loop` aligns to `open`. Crew budget N, captain FCFS, and join-loud are unchanged. |
 | **Date** | 2026-09-08 |
 | **Decision-makers** | Captain (bangedorrunt) |
 | **Extends** | [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md) (topologies open/loop/swarm; doorbell Layer 0), [ADR-0008](0008-workflow-compose-topology-agent-optimal-mental-model.md) (topology ≠ workflow), [ADR-0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md) (helm/snapshot/doorbell reflexes), [toron ADR-0011](../../toron/docs/decisions/0011-coalition-orchestration.md) (intent/reserve/join store), [toron ADR-0018](../../toron/docs/decisions/0018-agent-identity-naming-grammar.md) (captain alias), [toron ADR-0027](../../toron/docs/decisions/0027-one-workspace-tick-control-plane.md) (one tick), [toron ADR-0029](../../toron/docs/decisions/0029-rot-supervision-handoff-pacing-and-config-trust-boundary.md) (repo config may only narrow — `crew.max` is operator-only) |
@@ -64,7 +64,7 @@ Quality gates (playbook lint, VERIFY, ce-review, fail-closed close) stay. The le
 
 ### D1 — Topology ⊥ workflow (speech already Accepted; now a briefing axis)
 
-`/open` `/loop` `/swarm` remain ADR-0005 topologies. `decide` / `briefing` MUST emit a `topology` field. They MUST NOT collapse topology into a workflow primitive. A one-file typo is open. Ready beads with no new graph is loop. Multi-lane is swarm. Unmatched still steers, but the JSON names the topology guess.
+`/open` and `/swarm` are the modes. `/loop` is the bead command inside open mode (amended 2026-10-25). `decide` / `briefing` MUST emit a `topology` field. They MUST NOT collapse topology into a workflow primitive. A one-file typo is open. Ready beads with no new graph run `loop-mode run` and the mode is open. Multi-lane is swarm. Unmatched still names its topology in the JSON.
 
 Wave B lands the JSON. Wave A does not change decide needles except where needed to honor `--crew` on compose argv.
 

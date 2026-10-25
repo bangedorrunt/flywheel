@@ -1,7 +1,8 @@
 # Durable loop
 
-Session door is `flywheel arrive` then `flywheel briefing --json`. Briefing
-topology `loop` is what runs this command. Do not start a second loop on a
+Session door is `flywheel arrive` then `flywheel briefing --json`. This
+command is not a mode. Ready-bead work classifies as mode `open` and argv
+`loop-mode run <project> --work`. Do not start a second loop on a
 joinable fleet.
 
 `flywheel loop-mode run <project> [--work]` is the durable **solo execution
@@ -24,17 +25,17 @@ kill the supervisor), never passes `--force` (a live loop must refuse loudly,
 not be taken over), and stops after 3 consecutive failed passes naming the
 manual pass to run.
 
-Solo is the topology; the work source is separate:
+Open mode is the room for this command. The work source is separate:
 
 - without `--work`: drive the current objective, queue, or named workflow with
   one current harness/pane;
 - with `--work`: use `br ready` as the work source, claim beads, enforce wave
   gates, run VERIFY, and close/reopen legally.
 
-`--work` therefore requires beads; loop mode itself does not. Loop mode does
-not spawn a parallel crew. A reviewer may be summoned explicitly, but that is
-not swarm execution. `--force` takes over a live/corrupted invocation (it
-rejects the prior explicitly and starts fresh).
+`--work` therefore requires beads. The command does not. It does not spawn
+a crew. A reviewer may be summoned explicitly, and that is swarm mode.
+`--force` takes over a live or corrupted invocation (it rejects the prior
+and starts fresh).
 
 State: `~/.local/state/flywheel/loops.json` (schema 2) + `last_sent/<project>.json`.
 

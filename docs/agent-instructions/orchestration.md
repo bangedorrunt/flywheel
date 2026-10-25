@@ -13,9 +13,8 @@ Authoring: [docs/workflow-authoring.md](../workflow-authoring.md).
 | runs | `flywheel runs {list,show,pending,digest}` |
 | coalition | `flywheel coalition {form,status,disband}` — pane-crew-only |
 | steer | `flywheel steer "<target>" [--direct] [--project p]` |
-| open mode | `/open-mode`: direct work in the current pane; no crew, durable loop, or swarm lifecycle |
-| loop mode | `/loop-mode` / `flywheel loop-mode run`: durable solo execution in one current harness; `--work` opts into tracked work |
-| swarm mode | `/swarm-mode`: captain-led multi-crew execution with parallel lanes; loop supervision is optional |
+| open mode | one agent in this pane. Skill `flywheel-open`. `loop-mode run` may walk beads here. It does not spawn a crew |
+| swarm mode | a crew. Skill `flywheel-captain` for the captain, `flywheel-crew` for each crew agent. The captain asks for the squad when a person is here |
 | doorbell | workspace `__doorbell`. Spawn starts it. `flywheel kill` stops it. `/peer-aware-mode` attaches. Shared by loop-mode and swarm-mode when enabled. |
 
 ## Functional effect-kernel discipline

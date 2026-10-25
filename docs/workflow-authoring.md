@@ -8,9 +8,9 @@
 >
 > **One-line mental model:** a **profile** is a role template (behavior + model + harness); a
 > **recipe/squad** is a group of profiles; a **workflow** is a reusable multi-step procedure;
-> **loop mode** is durable solo execution of one objective; **swarm mode** is captain-led
-> multi-crew execution; **open mode** is direct current-pane work; a **cron** runs a workflow on
-> a schedule. You compose procedures with an execution topology; flywheel executes.
+> **open mode** is one agent in this pane; **swarm mode** is a crew; a **loop** is the work
+> plus one verify check (`loop-mode run` is the bead command, not a mode); a **cron** runs a
+> workflow on a schedule. You compose procedures; flywheel executes.
 
 ---
 

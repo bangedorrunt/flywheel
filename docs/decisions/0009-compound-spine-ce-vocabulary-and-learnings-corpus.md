@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Accepted (2026-09-06; captain, after the EveryInc/compound-engineering-plugin study session) |
+| **Status** | Accepted (2026-09-06; captain, after the EveryInc/compound-engineering-plugin study session). **Amended 2026-10-25:** D6 "loop-mode" is the bead command under open mode, not a third mode. Swarm stays the crew mode. |
 | **Date** | 2026-09-06 |
 | **Decision Maker** | Captain (bangedorrunt) |
 | **Relates to** | [ADR-0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) (stage payloads + wave swarm), [ADR-0008](0008-workflow-compose-topology-agent-optimal-mental-model.md) (compose tokens), toron [ADR-0022](../../toron/docs/decisions/0022-phase-native-orchestration.md) §3.1/§4 (phase vocabulary — amended by this ADR's addendum there), toron ADR-0027 (one-workspace tick), beads ADR-0001 (typed fields), [EveryInc/compound-engineering-plugin](https://github.com/EveryInc/compound-engineering-plugin) (MIT — concepts adopted, no code) |

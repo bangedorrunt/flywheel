@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Accepted (2026-08-20; G + §4.6 addenda + detached lifetime) |
+| **Status** | Accepted (2026-08-20; G + §4.6 addenda + detached lifetime). **Amended 2026-10-25:** `/loop-mode` is the bead command inside open mode, not a third mode. Modes are `open` and `swarm`. |
 | **Date** | 2026-08-19 |
 | **Decision Maker** | Captain (bangedorrunt) |
 | **Relates to** | ADR-0001 (S.9.3 peer-triggered), ADR-0003 (mail backend), toron ADR-0015 (flywheel drives, toron carries), toron ADR-0018 (identity), toron ADR-0020 (two-plane CLI; plane W = bus push), bd-pattern-peer-triggered |

@@ -3276,7 +3276,6 @@ fn main() {
                 dry_run,
                 json,
             } => cmd_doorbell_introduce(
-                &cfg,
                 project,
                 pin,
                 as_pin.as_deref(),
@@ -9729,10 +9728,7 @@ projects available: {}",
             pane::reap_dead_registry_rows(project, &mut c);
         } else if opts.join {
             eprintln!("{}", spawn_join_notice(project, &detail.join(", ")));
-            let pin = std::env::var("AGENT_NAME")
-                .ok()
-                .or_else(|| std::env::var("TORON_AGENT").ok())
-                .or_else(|| std::env::var("FLYWHEEL_MAIL_AS").ok());
+            let pin = crate::authority::select_agent_identity(None, &|k| std::env::var(k).ok());
             return cmd_arrive(cfg, project, pin.as_deref(), None, None, None);
         } else {
             bail!(
@@ -15707,11 +15703,7 @@ fn cmd_briefing(
         // bd-compose-plumbing-zdzi: the arriving pin — the ONE identity
         // ladder (env over config name), so the emitted wave-swarm argv can
         // bind `captain_pin` to the agent actually briefing.
-        agent_pin: crate::authority::select_agent_identity(
-            None,
-            &|k| std::env::var(k).ok(),
-            cfg.agent_mail.as_ref().and_then(|m| m.name.as_deref()),
-        ),
+        agent_pin: crate::authority::select_agent_identity(None, &|k| std::env::var(k).ok()),
     };
     if world.joinable {
         eprintln!("{}", briefing::join_banner(&world));
@@ -16108,7 +16100,9 @@ fn cmd_arrive(
                 .find(|e| &e.pane_id == pane)
                 .and_then(|e| e.mail_identity.clone())
         });
-        let env_pin = std::env::var("FLYWHEEL_MAIL_AS").ok();
+        let env_pin = std::env::var("AGENT_NAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let (captain_pin, _) = lookup_captain_holder(project);
         if let ArriveIdentityVerdict::Refused { injected, reason } = arrive_identity_verdict(
             requested,
@@ -20263,7 +20257,7 @@ fn resolve_mail_actor_roster(
     env: &dyn Fn(&str) -> Option<String>,
     roster: &[String],
 ) -> Option<String> {
-    let token = crate::authority::select_agent_identity(explicit, env, None)?;
+    let token = crate::authority::select_agent_identity(explicit, env)?;
     if roster.iter().any(|n| n == &token) {
         return Some(token);
     }
@@ -22983,6 +22977,41 @@ fn live_reservation_holders(cfg: &Config, project: &str) -> Vec<(String, String)
         .unwrap_or_default()
 }
 
+/// Live `(path, reason, holder)` rows for `file_blocks_bead`. A mail hiccup
+/// is an empty board, never a false block.
+fn live_file_rows(cfg: &Config, project: &str) -> Vec<(String, String, String)> {
+    let Ok(key) = project_dir_str(cfg, project) else {
+        return Vec::new();
+    };
+    let Ok(mail) = mail_or_die(cfg) else {
+        return Vec::new();
+    };
+    let Ok(v) = mail.list_active(&key, None, None) else {
+        return Vec::new();
+    };
+    v.get("reservations")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let path = r.get("path").and_then(Value::as_str)?.to_string();
+                    let reason = r
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let holder = r
+                        .get("holder")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Some((path, reason, holder))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// bd-reserve-yield-taqf: live `(bead, holder)` yield pairs — toron's
 /// structured stand-down (`reserve yield`), read through the same join as the
 /// lease board. Same soft-fail contract as the reservation board: a hiccup
@@ -23737,6 +23766,7 @@ fn cmd_loop(
             // here.
             let mut peers = live_reservation_holders(cfg, project);
             peers.extend(live_yielded_pairs(cfg, project));
+            let file_rows = live_file_rows(cfg, project);
             let now_us = chrono::Utc::now().timestamp_micros();
             // Prompts queued by the ordinary paths. The rotation's picks go
             // AHEAD of them (see the rotation block at the end of this scope).
@@ -23756,7 +23786,8 @@ fn cmd_loop(
                                 last,
                                 now_us,
                                 durable::RESUME_WINDOW_DEFAULT_SECS,
-                                durable::peer_held(&b.id, &peers, pane),
+                                durable::peer_held(&b.id, &peers, pane)
+                                    || durable::file_blocks_bead(&b.id, &file_rows, pane),
                             )
                         })
                         .cloned()
@@ -27344,15 +27375,9 @@ fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
         for crew in crews.split(',').map(str::trim).filter(|c| !c.is_empty()) {
             let cat = profile::ProfileCatalog::load()?;
             let recipes = config::Recipes::load()?.recipes;
-            let counts = match recipes.get(crew) {
-                Some(r) => profile::Squad::from_recipe(r).counts,
-                None if cat.get(crew).is_some() => {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(crew.to_string(), 1u32);
-                    m
-                }
-                None => bail!("unknown squad {crew:?} (flywheel squad list)"),
-            };
+            let counts = profile::resolve_squad(crew, &recipes, cat.get(crew).is_some())
+                .ok_or_else(|| anyhow!("unknown squad {crew:?} (flywheel squad list)"))?
+                .counts;
             for m in counts.keys() {
                 if !out.contains(m) {
                     out.push(m.clone());
@@ -27992,17 +28017,8 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
         SquadCmd::Show { name } => {
             let cat = ProfileCatalog::load()?;
             let recipes = config::Recipes::load()?.recipes;
-            let compiled = profile::compiled_in_squads();
-            let squad = match recipes.get(name) {
-                Some(r) => Squad::from_recipe(r),
-                None if compiled.contains_key(name) => compiled[name].clone(),
-                None if cat.get(name).is_some() => {
-                    let mut counts = std::collections::BTreeMap::new();
-                    counts.insert(name.clone(), 1u32);
-                    Squad { counts }
-                }
-                None => bail!("unknown squad '@{name}' (flywheel squad list)"),
-            };
+            let squad = profile::resolve_squad(name, &recipes, cat.get(name).is_some())
+                .ok_or_else(|| anyhow!("unknown squad '@{name}' (flywheel squad list)"))?;
             let members: Vec<Value> = squad
                 .members()
                 .into_iter()
@@ -28021,15 +28037,8 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
         } => {
             let cat = ProfileCatalog::load()?;
             let recipes = config::Recipes::load()?.recipes;
-            let squad = match recipes.get(name) {
-                Some(r) => Squad::from_recipe(r),
-                None if cat.get(name).is_some() => {
-                    let mut counts = std::collections::BTreeMap::new();
-                    counts.insert(name.clone(), 1u32);
-                    Squad { counts }
-                }
-                None => bail!("unknown squad '@{name}' (flywheel squad list)"),
-            };
+            let squad = profile::resolve_squad(name, &recipes, cat.get(name).is_some())
+                .ok_or_else(|| anyhow!("unknown squad '@{name}' (flywheel squad list)"))?;
             if squad.counts.is_empty() {
                 bail!("squad {name} has no members");
             }
@@ -28918,15 +28927,9 @@ fn packed_from_flag(
         crew::CrewFlag::Named(name) => {
             let cat = profile::ProfileCatalog::load()?;
             let recipes = config::Recipes::load()?.recipes;
-            let counts = match recipes.get(&name) {
-                Some(r) => profile::Squad::from_recipe(r).counts,
-                None if cat.get(&name).is_some() => {
-                    let mut m = BTreeMap::new();
-                    m.insert(name.clone(), 1u32);
-                    m
-                }
-                None => bail!("unknown squad {name:?} (flywheel squad list)"),
-            };
+            let counts = profile::resolve_squad(&name, &recipes, cat.get(&name).is_some())
+                .ok_or_else(|| anyhow!("unknown squad {name:?} (flywheel squad list)"))?
+                .counts;
             let n: u32 = counts.values().copied().sum();
             crew::CrewFlag::Total(n.max(1))
         }
@@ -40404,11 +40407,9 @@ mod reservation_identity_tests {
     /// other attribution (the ~6 blocked commits failure mode).
     #[test]
     fn reservation_identity_holder_passes_own_commit_guard() {
-        let holder = crate::authority::select_agent_identity(
-            None,
-            &|k| (k == "AGENT_NAME").then(|| "IronSummit".to_string()),
-            None,
-        )
+        let holder = crate::authority::select_agent_identity(None, &|k| {
+            (k == "AGENT_NAME").then(|| "IronSummit".to_string())
+        })
         .expect("env-bound identity");
         let staged = vec!["src/main.rs".to_string(), "src/stages.rs".to_string()];
         let own = vec![Reservation {

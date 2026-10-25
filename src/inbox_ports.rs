@@ -679,7 +679,7 @@ impl Ports for FlywheelPorts {
         {
             let backend =
                 crate::backend::multiplexer_backend(&self.cfg).map_err(|e| e.to_string())?;
-            return match ring_wake(
+            match ring_wake(
                 &crate::pane_write::RexPanes(&*backend),
                 pane_id,
                 wm,
@@ -689,7 +689,7 @@ impl Ports for FlywheelPorts {
             )? {
                 RingDone::Typed => Ok(()),
                 RingDone::NoDoor(no_door) => Err(crate::harness_caps::no_door_line(&no_door)),
-            };
+            }
         }
         #[cfg(not(feature = "backend-superlogical"))]
         {

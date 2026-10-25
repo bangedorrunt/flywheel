@@ -11,7 +11,7 @@ informed: flywheel × toron × beads maintainers; Wheelhouse; captain AND crew h
 
 | Field | Value |
 |-------|-------|
-| **Status** | **Accepted** (2026-09-05, GS-024) |
+| **Status** | **Accepted** (2026-09-05, GS-024). **Amended 2026-10-25:** topology is still not a workflow. The mode set is `open` and `swarm`. A loop is the work plus one verify check. `loop-mode run` stays the bead command and classifies as `open`. Where this record says topology `loop` or `loop-mode`, read that command under open mode. |
 | **Date** | 2026-09-05 |
 | **Decision-makers** | Captain (bangedorrunt) |
 | **Extends** | [ADR-0005](0005-always-on-collab-baseline-and-command-surface.md) (workflow/squad/profile surfaces), [ADR-0006](0006-parameterized-stage-payloads-and-wave-scoped-dispatch.md) (wave-swarm compose token), [toron ADR-0010](../../toron/docs/decisions/0010-execution-wiring-model-registry-headless.md) (`--execute` / mode), [toron ADR-0015](../../toron/docs/decisions/0015-flywheel-toron-integration-contract.md) (one-way flywheel→toron), [toron ADR-0019](../../toron/docs/decisions/0019-bead-verified-execution-and-principle-playbooks.md) (playbook shapes), [toron ADR-0022](../../toron/docs/decisions/0022-phase-native-orchestration.md) (compose grammar), [toron ADR-0024](../../toron/docs/decisions/0024-graph-first-repair-loops-bead-workflow.md) (`VerifySink` / repair), [toron ADR-0025](../../toron/docs/decisions/0025-adopt-graph-dispatch-artifact-reduce-pin-supervision.md), [toron ADR-0026](../../toron/docs/decisions/0026-failure-taxonomy-funded-preflight-fallback-chains-mail-health-escalation.md) |

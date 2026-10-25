@@ -23,7 +23,7 @@ flowchart LR
 | **workflow** | An engine procedure: YAML steps or graph. A step may dispatch a stage to a role. | Not a topology. |
 | **compose token** | A bare `--parts` name (`wave-swarm`, `repair-until-verified`, `beads-lifecycle`) that expands a compiled pipeline inline, in one engine run, one artifact trail. | Not every builtin; ordinary builtins run via `workflow run <name> --execute`. |
 | **profile** | Role bound to harness + model + skills + preamble. `crew: auto` infers unique roles and packs to N (cap `crew.max`, default 5). | Not a compose token. |
-| **topology** | How work is supervised: open, loop, swarm, coalition. Chosen by the briefing classifier. | Not chosen by you (P2). |
+| **mode** | Who works: `open` (one agent in this pane) or `swarm` (a crew). Briefing prints `mode_text`, which names `flywheel-open` or `flywheel-captain`. A crew reads `flywheel-crew`. | Not a third mode named loop. |
 
 ## When to use what
 

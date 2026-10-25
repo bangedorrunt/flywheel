@@ -15,45 +15,24 @@ pub struct HostAuthority {
     pub typesafe_api_key: Option<String>,
 }
 
-/// The ONE identity ladder (bd-05ar).
+/// The ONE identity ladder.
 ///
-/// `explicit` → `TORON_AGENT` → `FLYWHEEL_MAIL_AS` → `AGENT_NAME` →
-/// `config_name`.
-///
-/// The three env rungs are toron's `guard_agent` attribution order EXACTLY,
-/// and that parity is the whole point: the lease holder (toron's strict
-/// guard) and the commit author (the same guard) must be the SAME pin, and
-/// the doorbell actor must be that pin again. Three sites re-implemented
-/// this ladder with three different orders — `AGENT_NAME` first, then
-/// `FLYWHEEL_MAIL_AS` first, then `TORON_AGENT` missing entirely — so a
-/// lease could be held under one pin while the commit was attributed to
-/// another. One ladder, one order, one implementation.
-///
-/// `config_name` is the `[agent_mail].name` rung: it exists only where a
-/// [`crate::config::Config`] is in scope, and it is always LAST.
+/// `explicit` (`--as`) then `AGENT_NAME`. `TORON_AGENT`, `FLYWHEEL_MAIL_AS`,
+/// and `[agent_mail].name` do not supply a pin. Toron's guard reads the same
+/// two rungs, so the lease holder and the commit author stay one pin.
 ///
 /// The ambient [`HostAuthority`] deliberately holds NO identity: a cached
 /// answer is a second answer, and a cached answer is the one that drifts.
 pub fn select_agent_identity(
     explicit: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
-    config_name: Option<&str>,
 ) -> Option<String> {
     if let Some(v) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(v.to_string());
     }
-    for key in ["TORON_AGENT", "FLYWHEEL_MAIL_AS", "AGENT_NAME"] {
-        if let Some(v) = env(key)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return Some(v);
-        }
-    }
-    config_name
-        .map(str::trim)
+    env("AGENT_NAME")
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
 }
 
 /// Wall-clock authority. Reducers never own or read this trait; effects use it
@@ -247,19 +226,8 @@ mod tests {
         assert_eq!(authority.monotonic.now_millis(), 42);
     }
 
-    /// bd-05ar: every site that answers "who am I" MUST answer with the ONE
-    /// ladder, and the ladder MUST run in toron's guard order
-    /// (`TORON_AGENT` > `FLYWHEEL_MAIL_AS` > `AGENT_NAME`).
-    ///
-    /// Before the fix each site had its own order: the ambient authority read
-    /// `AGENT_NAME` first, the comms sender read `FLYWHEEL_MAIL_AS` first and
-    /// never read `TORON_AGENT` at all, and the doorbell inherited the ambient
-    /// authority's order. So with `AGENT_NAME=A` and `TORON_AGENT=B` the
-    /// lease holder resolved one pin and the commit author another — the
-    /// failure the audit measured.
-    ///
-    /// The ambient authority no longer caches an identity at all: a cached
-    /// answer is a second answer, and it is the one that drifts.
+    /// Every site that answers "who am I" reads `--as` then `AGENT_NAME`.
+    /// The old env names and the config name do not supply a pin.
     #[test]
     fn identity_ladder_is_shared_by_every_resolving_site() {
         let env = |k: &str| match k {
@@ -269,71 +237,47 @@ mod tests {
             _ => None,
         };
         assert_eq!(
-            select_agent_identity(None, &env, None).as_deref(),
-            Some("ToronPin"),
-            "the ladder must resolve TORON_AGENT first"
+            select_agent_identity(None, &env).as_deref(),
+            Some("AgentNamePin")
         );
         assert_eq!(
-            crate::comms_send::sender_token(None, None, &env).unwrap(),
-            "ToronPin",
-            "the comms sender must resolve TORON_AGENT first"
+            crate::comms_send::sender_token(None, &env).unwrap(),
+            "AgentNamePin"
         );
         assert_eq!(
-            crate::cmd::doorbell::resolve_as_pin(None, None, &env).as_deref(),
-            Some("ToronPin"),
-            "the doorbell actor must resolve TORON_AGENT first"
+            crate::cmd::doorbell::resolve_as_pin(None, &env).as_deref(),
+            Some("AgentNamePin")
         );
     }
 
-    /// bd-05ar: the pure selection half of the ladder. Explicit wins, the env
-    /// rungs run in the guard's order, empty values never win, and the
-    /// configured name is the LAST rung.
     #[test]
     fn reservation_identity_selection_matches_guard_order() {
         let env = |k: &str| match k {
-            "TORON_AGENT" => None,
-            "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
-            "AGENT_NAME" => Some("AgentName".into()),
-            _ => None,
-        };
-        // explicit beats everything
-        assert_eq!(
-            select_agent_identity(Some("Explicit"), &env, None).as_deref(),
-            Some("Explicit")
-        );
-        // FLYWHEEL_MAIL_AS before AGENT_NAME (TORON_AGENT unset here)
-        assert_eq!(
-            select_agent_identity(None, &env, None).as_deref(),
-            Some("MailAs")
-        );
-        // TORON_AGENT jumps the queue when set (guard parity)
-        let env_t = |k: &str| match k {
             "TORON_AGENT" => Some("Toron".into()),
             "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
             "AGENT_NAME" => Some("AgentName".into()),
             _ => None,
         };
         assert_eq!(
-            select_agent_identity(None, &env_t, None).as_deref(),
-            Some("Toron")
+            select_agent_identity(Some("Explicit"), &env).as_deref(),
+            Some("Explicit")
         );
-        // empty-string vars are skipped, not selected
-        let env_empty = |k: &str| match k {
-            "TORON_AGENT" => Some("  ".into()),
+        assert_eq!(
+            select_agent_identity(None, &env).as_deref(),
+            Some("AgentName")
+        );
+        let only_old = |k: &str| match k {
+            "TORON_AGENT" => Some("Toron".into()),
             "FLYWHEEL_MAIL_AS" => Some("MailAs".into()),
             _ => None,
         };
-        assert_eq!(
-            select_agent_identity(None, &env_empty, None).as_deref(),
-            Some("MailAs")
-        );
-        // the configured name is the LAST rung
-        assert_eq!(
-            select_agent_identity(None, &|_| None, Some("ConfigPin")).as_deref(),
-            Some("ConfigPin")
-        );
-        // nothing anywhere -> no identity
-        assert_eq!(select_agent_identity(None, &|_| None, None), None);
+        assert_eq!(select_agent_identity(None, &only_old), None);
+        let blank = |k: &str| match k {
+            "AGENT_NAME" => Some("  ".into()),
+            _ => None,
+        };
+        assert_eq!(select_agent_identity(None, &blank), None);
+        assert_eq!(select_agent_identity(None, &|_| None), None);
     }
 
     /// bd-lf1u: `now_datetime` must DERIVE from the injected clock, not from
