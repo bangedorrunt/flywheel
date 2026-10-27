@@ -4020,13 +4020,14 @@ mod tests {
         );
     }
 
-    /// c3b.7: herdr IS the active multiplexer (default) but the daemon is
-    /// unreachable → the cleanup must return Err naming the outage, never an
-    /// Ok note that reads like success.
+    /// c3b.7: herdr IS the active multiplexer (explicit `FLYWHEEL_BACKEND=herdr`;
+    /// the default `auto` is rex-primary since bd-rex-default-plane-xn1t) but
+    /// the daemon is unreachable → the cleanup must return Err naming the
+    /// outage, never an Ok note that reads like success.
     #[test]
     fn cleanup_pane_identities_herdr_down_is_err() {
         let _g = crate::config::lock_env();
-        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "herdr") };
         // Point the herdr socket at a dead path so connect fails fast.
         unsafe { std::env::set_var("HERDR_SOCKET_PATH", "/tmp/flywheel-c3b7-dead.sock") };
         let mail = Mail::from_config(None).expect("ok").expect("Some");
@@ -4039,6 +4040,7 @@ mod tests {
             "names the outage + skip: {msg}"
         );
         unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
     /// c3b.7: the active multiplexer is NOT herdr (superlogical) → the cleanup is

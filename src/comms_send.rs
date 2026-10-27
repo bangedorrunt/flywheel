@@ -789,10 +789,10 @@ fn doorbell_owner_in(
 /// Pure: the wake target pane for a pin from a backend listing. Mirrors
 /// `wake_target`'s exactly-one-or-typed-error contract: a pin names its
 /// block label (set by spawn/rename) or its agent name, never a substring.
-// Sender-side wake is compiled with the rex backend; the tests exercise the
-// resolver on its own.
-#[cfg(any(test, feature = "backend-superlogical"))]
-fn backend_wake_target(agents: &[AgentInfo], pin: &str) -> Result<String, String> {
+// Shared with the default send path's rex arm (`resolve_send_targets_dyn`),
+// which needs the same rule, not a copy.
+#[cfg(feature = "backend-superlogical")]
+pub(crate) fn backend_wake_target(agents: &[AgentInfo], pin: &str) -> Result<String, String> {
     let mut hits = agents
         .iter()
         .filter(|a| a.name.as_deref() == Some(pin) || a.display_agent.as_deref() == Some(pin));

@@ -96,7 +96,7 @@ impl Mode {
         })
     }
 
-    /// Steer: needs herdr, resonate, mail, project dir.
+    /// Steer: needs the pane plane, resonate, mail, project dir.
     pub fn steer() -> Self {
         Self {
             needs_beads: false,
@@ -108,7 +108,7 @@ impl Mode {
             needs_playbook_files: false,
         }
     }
-    /// Loop `--work`: needs herdr, resonate, br, beads, mail, project dir.
+    /// Loop `--work`: needs the pane plane, resonate, br, beads, mail, project dir.
     pub fn loop_work() -> Self {
         Self {
             needs_beads: true,
@@ -120,7 +120,7 @@ impl Mode {
             needs_playbook_files: false,
         }
     }
-    /// Loop `--queue` (static stages): needs herdr, resonate, mail, project dir.
+    /// Loop `--queue` (static stages): needs the pane plane, resonate, mail, project dir.
     pub fn loop_queue() -> Self {
         Self {
             needs_beads: false,
@@ -132,7 +132,7 @@ impl Mode {
             needs_playbook_files: false,
         }
     }
-    /// Workflow `--execute`: needs herdr, resonate, mail, project dir, and
+    /// Workflow `--execute`: needs the pane plane, resonate, mail, project dir, and
     /// the playbook-run file conventions (no *V2* / *_improved* /
     /// *_enhanced* new files).
     pub fn workflow() -> Self {
@@ -167,10 +167,12 @@ impl Mode {
 pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    // 1. herdr socket alive (cheapest meaningful check) — skipped for modes
-    //    that never touch panes (cron is store-side only).
+    // 1. pane plane alive (cheapest meaningful check) — skipped for modes
+    //    that never touch panes (cron is store-side only). Asks the SELECTED
+    //    backend, never a hardcoded herdr socket: rex answering is PASS with
+    //    herdr absent; herdr answering is PASS (the fallback works).
     if mode.needs_project || mode.needs_beads || mode.needs_mail {
-        checks.push(check_herdr(cfg));
+        checks.push(check_pane_plane(cfg));
     }
 
     // 2. resonate server reachable
@@ -197,8 +199,9 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     }
 
     // 4b. bd-uona: the panes this project allocated can still host an agent.
-    //     `check_herdr` only pings the socket, so a reaped crew workspace
-    //     read PASS while every dispatched agent died on the readiness wait.
+    //     A plane ping alone cannot see a reaped crew workspace, so a reaped
+    //     workspace once read PASS while every dispatched agent died on the
+    //     readiness wait.
     if mode.needs_project
         && let Some(p) = project
     {
@@ -337,15 +340,25 @@ pub fn to_json(checks: &[Check]) -> Value {
 
 // ─── individual checks (cheapest first) ──────────────────────────────────────
 
-fn check_herdr(cfg: &Config) -> Check {
-    match Client::connect(Some(&cfg.socket_path())) {
-        Ok(c) => match c.ping() {
-            Ok(_) => Check::pass("herdr-socket"),
-            Err(e) => Check::fail("herdr-socket", format!("ping failed: {e}")),
+/// The pane-plane check asks the SELECTED backend (`multiplexer_backend`
+/// plus a real `agent_list`), never a hardcoded herdr socket: rex answering
+/// is PASS with herdr absent, herdr answering is PASS through the fallback,
+/// and neither is FAIL naming both planes with the remedy.
+fn check_pane_plane(cfg: &Config) -> Check {
+    let selected = crate::backend::resolve_backend_name(cfg);
+    match crate::backend::multiplexer_backend(cfg) {
+        Ok(backend) => match backend.agent_list() {
+            Ok(_) => Check::pass("pane-plane"),
+            Err(e) => Check::fail(
+                "pane-plane",
+                format!(
+                    "pane plane unreachable via {selected}: {e:#} — rex CLI missing and herdr daemon down? remedy: install the rex CLI or start herdr (FLYWHEEL_BACKEND=herdr selects herdr explicitly)"
+                ),
+            ),
         },
         Err(e) => Check::fail(
-            "herdr-socket",
-            format!("connect failed: {e} — is herdr running?"),
+            "pane-plane",
+            format!("pane plane unresolvable ({selected}): {e:#}"),
         ),
     }
 }
@@ -454,38 +467,34 @@ fn check_pane_materializable(cfg: &Config, project: &str) -> Check {
             "no registry pins — nothing allocated to host",
         );
     }
-    let mut c = match Client::connect(Some(&cfg.socket_path())) {
-        Ok(c) => c,
+    // The SELECTED pane plane, never a hardcoded herdr socket: rex answers
+    // with herdr absent, herdr answers through the fallback.
+    let backend = match crate::backend::multiplexer_backend(cfg) {
+        Ok(b) => b,
         Err(e) => {
             return Check::fail(
                 "pane-materializable",
-                format!("herdr connect failed: {e:#} — is herdr running?"),
+                format!("pane plane unresolvable: {e:#}"),
             );
         }
     };
-    let herdr_panes: BTreeSet<String> = match c.pane_list(None) {
+    let pane_ids: BTreeSet<String> = match backend.pane_list(None) {
         Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
         Err(e) => {
             return Check::fail("pane-materializable", format!("pane.list failed: {e:#}"));
         }
     };
-    let hosted = hosted_pin_count(&pins, &herdr_panes);
+    let hosted = hosted_pin_count(&pins, &pane_ids);
     if pane_materializable(pins.len(), hosted) {
         return Check::pass("pane-materializable");
     }
-    // "herdr knows no workspace for the allocated id" was the reported shape,
-    // so name which half of it holds — the workspace, or the panes in it.
-    let workspace = match crate::find_workspace(&mut c, project) {
-        Ok(id) => format!("workspace {id} exists but hosts none of them"),
-        Err(_) => format!(
-            "herdr has no workspace matching `{}`",
-            crate::swarm_label(project)
-        ),
-    };
+    // The plane hosts none of the allocated panes: name the plane that was
+    // asked (rex primary, herdr fallback) rather than a herdr workspace id.
+    let via = backend.name();
     Check::fail(
         "pane-materializable",
         format!(
-            "{project} has {} registry pin(s) but herdr hosts 0 of them ({workspace}) — \
+            "{project} has {} registry pin(s) but the pane plane (via {via}) hosts 0 of them — \
              dispatch would start agents that die on the readiness wait with \
              agent_not_running; remediation: respawn the crew \
              (`flywheel spawn {project}`) or clear the stale pins, or pass --skip-preflight",
@@ -868,7 +877,7 @@ mod tests {
     #[test]
     fn to_json_shapes_status_and_message() {
         let checks = vec![
-            Check::pass("herdr-socket"),
+            Check::pass("pane-plane"),
             Check::fail("resonate", "unreachable"),
             Check::skip("beads-db", "not work mode"),
         ];
@@ -883,7 +892,7 @@ mod tests {
     #[test]
     fn render_includes_failures_and_count() {
         let checks = vec![
-            Check::pass("herdr-socket"),
+            Check::pass("pane-plane"),
             Check::fail("br-binary", "br not found on PATH"),
         ];
         let out = render(&checks);
@@ -1430,5 +1439,91 @@ mod tests {
             "the reaped pin's pane is simply not in herdr's set"
         );
         assert_eq!(hosted_pin_count(&[], &herdr), 0, "no pins hosts nothing");
+    }
+
+    /// bd-rex-default-plane-xn1t: the pane-plane check asks the SELECTED
+    /// backend, never a hardcoded herdr socket. Over a fake rex (herdr
+    /// absent) the check PASSes; an unresolvable plane FAILs naming the
+    /// remedy.
+    const PANE_PLANE_FAKE_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|api|block) cmd=$arg; break ;;
+  esac
+done
+case "$cmd" in
+  ls)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-1","label":"work","pane_count":1,"tab_count":1}]}'
+    ;;
+  api)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"build","creator_name":"com.superlogical.terminal"}]}'
+    ;;
+  block)
+    printf '%s\n' '{"records":[{"state":"working"}]}'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// Rex answering is PASS with herdr absent (no herdr socket is touched).
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn pane_plane_passes_over_fake_rex_with_herdr_absent() {
+        // The guard holds the env lock, so the FLYWHEEL_BACKEND mutation
+        // below is serialized with every other env-mutating test.
+        let _guard = crate::backend::superlogical::RexBinGuard::install(PANE_PLANE_FAKE_REX);
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
+        let cfg = crate::config::Config::default();
+        let pass = matches!(check_pane_plane(&cfg).status, Status::Pass);
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        assert!(pass, "rex answering is PASS with herdr absent");
+    }
+
+    /// An unresolvable plane FAILs naming the plane and the remedy (fail
+    /// loud, never a silent fallback).
+    #[test]
+    fn pane_plane_fails_loud_naming_both_planes_when_unresolvable() {
+        let _g = crate::config::lock_env();
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "nonsense") };
+        let cfg = crate::config::Config::default();
+        let status = check_pane_plane(&cfg).status;
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        match status {
+            Status::Fail(msg) => {
+                assert!(msg.contains("pane plane"), "names the plane: {msg}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// bd-rex-default-plane-xn1t: materializability reads the SELECTED
+    /// plane. A registry pin the fake rex hosts is materializable with no
+    /// herdr socket anywhere near the check.
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn pane_materializable_reads_the_selected_plane_not_a_herdr_socket() {
+        let _guard = crate::backend::superlogical::RexBinGuard::install(PANE_PLANE_FAKE_REX);
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
+        // Hermetic XDG state comes with the guard: the registry below lands
+        // in a temp dir, never the operator's real state.
+        let project = "pane-plane-materializable-probe";
+        let registry = vec![crate::state::SpawnEntry::with_mail_identity(
+            "block:fake-1",
+            "probe-oc-1",
+            "ProudLark",
+        )];
+        crate::state::save_spawn_registry(project, &registry).expect("hermetic registry write");
+        let cfg = crate::config::Config::default();
+        let status = check_pane_materializable(&cfg, project).status;
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        match status {
+            Status::Pass => {}
+            other => panic!("rex-hosted pin must be materializable, got {other:?}"),
+        }
     }
 }

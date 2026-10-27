@@ -34,8 +34,6 @@ mod parity;
 #[cfg(feature = "backend-superlogical")]
 pub mod rex_map;
 #[cfg(feature = "backend-superlogical")]
-pub mod rex_spawn;
-#[cfg(feature = "backend-superlogical")]
 pub mod superlogical;
 #[cfg(feature = "mail-toron")]
 pub mod toron;

@@ -25,6 +25,11 @@ use toron_core::backend::{AgentStatus, BackendError, EventStream, PromptLanding}
 #[path = "rex_cli.rs"]
 mod rex_cli;
 
+// Test-only reuse: preflight's pane-plane tests drive the same fake `rex`
+// binary. Test builds only; no production surface.
+#[cfg(test)]
+pub(crate) use rex_cli::RexBinGuard;
+
 use crate::backend::MultiplexerBackend;
 use rex_cli::rex_map::{
     board_of, capture_format, parse_process_view, split_direction, status_for_block,

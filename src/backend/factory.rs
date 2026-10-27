@@ -61,16 +61,12 @@ fn herdr_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> {
     Ok(Box::new(backend))
 }
 
-/// Auto selection: rex sets `REX_SESSION` (plus `REX_BLOCK`/`REX_SERVER`)
-/// in every terminal, so a set non-empty value means this process runs
-/// inside rex and rex is the primary (herdr stays as transport fallback).
-/// An empty or unset value means outside rex: herdr serves directly.
-fn rex_selected_via_env() -> bool {
-    std::env::var("REX_SESSION")
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-}
-
+/// Auto selection: rex first, always. A set `REX_SESSION` only records
+/// that this process runs inside a rex terminal; it never decides WHETHER
+/// rex is tried — `auto` builds the rex primary regardless of
+/// `REX_SESSION` or any herdr socket. Herdr serves only as transport
+/// fallback (see [`FallbackBackend`]). `FLYWHEEL_BACKEND=herdr` selects
+/// herdr explicitly (the honest escape hatch).
 /// Construct the active multiplexer backend. Default = herdr; unrecognized →
 /// actionable error (no silent fallback to the default — ADR-0002 §6). The
 /// `backend-herdr` cargo feature gates the herdr impl; when it's off, the
@@ -86,18 +82,16 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
         // agent_send_keys stay Unsupported and name the method.
         #[cfg(feature = "backend-superlogical")]
         "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
-        // auto: `REX_SESSION` set (inside a rex terminal) → rex primary,
-        // herdr on transport failure only (Connect/Io/Timeout — a
-        // successful rex call never falls through). `REX_SESSION`
-        // empty/unset (outside rex) → herdr directly. A herdr daemon
+        // auto: rex primary on every door, regardless of `REX_SESSION`.
+        // Herdr is transport fallback only (Connect/Io/Timeout — a
+        // successful rex call never falls through). A herdr daemon
         // that is down at startup leaves a primary-only backend behind
         // a loud warning instead of refusing the whole construction.
         #[cfg(feature = "backend-superlogical")]
         "auto" => {
-            #[cfg(feature = "backend-herdr")]
-            if !rex_selected_via_env() {
-                return herdr_backend(cfg);
-            }
+            // Rex primary on every door. No `REX_SESSION` gate here: a
+            // hosted bot, a cron run, and the doorbell have no `REX_SESSION`
+            // and still resolve rex. Herdr is transport fallback only.
             let primary: Box<dyn MultiplexerBackend> =
                 Box::new(crate::backend::superlogical::SuperlogicalBackend);
             #[cfg(feature = "backend-herdr")]
@@ -234,17 +228,17 @@ mod tests {
         assert_eq!(resolve_mail_name(&cfg), "toron");
     }
 
-    /// With the rex backend compiled in, the default name is auto. Inside a
-    /// rex terminal (`REX_SESSION` set) auto constructs rex-first with
-    /// herdr transport fallback: rex resolves lazily per call, and a down
-    /// herdr daemon leaves a primary-only backend behind a warning.
+    /// With the rex backend compiled in, the default name is auto. Auto
+    /// constructs rex-first with herdr transport fallback regardless of
+    /// `REX_SESSION`: rex resolves lazily per call, and a down herdr daemon
+    /// leaves a primary-only backend behind a warning.
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn defaults_resolve_to_auto_and_toron() {
         let _g = lock_env();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
-        unsafe { std::env::set_var("REX_SESSION", "session:test") };
+        unsafe { std::env::remove_var("REX_SESSION") };
         let cfg = Config::default();
         assert_eq!(resolve_backend_name(&cfg), "auto");
         assert_eq!(resolve_mail_name(&cfg), "toron");
@@ -255,20 +249,29 @@ mod tests {
         unsafe { std::env::remove_var("REX_SESSION") };
     }
 
-    /// Auto selection follows `REX_SESSION` (set by the rex server in every
-    /// terminal): set means inside rex, empty or unset means outside.
+    /// Auto is rex-primary on every door: `REX_SESSION` set, empty, or
+    /// unset all construct the same rex-first backend. A hosted bot, a cron
+    /// run, and the doorbell have no `REX_SESSION` and still resolve rex.
+    #[cfg(feature = "backend-superlogical")]
     #[test]
-    fn auto_selection_follows_rex_session_env() {
+    fn auto_ignores_rex_session_env_and_selects_rex_primary() {
         let _g = lock_env();
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        for session in ["session:fake-1", "", "   "] {
+            unsafe { std::env::set_var("REX_SESSION", session) };
+            let cfg = Config::default();
+            let backend = multiplexer_backend(&cfg).expect("auto constructs");
+            assert_eq!(
+                backend.name(),
+                "auto",
+                "REX_SESSION={session:?} must still select rex-first"
+            );
+        }
         unsafe { std::env::remove_var("REX_SESSION") };
-        assert!(!super::rex_selected_via_env(), "unset means outside rex");
-        unsafe { std::env::set_var("REX_SESSION", "") };
-        assert!(!super::rex_selected_via_env(), "empty means outside rex");
-        unsafe { std::env::set_var("REX_SESSION", "   ") };
-        assert!(!super::rex_selected_via_env(), "blank means outside rex");
-        unsafe { std::env::set_var("REX_SESSION", "session:fake-1") };
-        assert!(super::rex_selected_via_env(), "set means inside rex");
-        unsafe { std::env::remove_var("REX_SESSION") };
+        let cfg = Config::default();
+        let backend = multiplexer_backend(&cfg).expect("auto constructs");
+        assert_eq!(backend.name(), "auto", "unset REX_SESSION still rex-first");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
     /// Env overrides config (the precedence contract — flag wiring is R0.6).
     #[test]

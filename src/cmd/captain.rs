@@ -396,7 +396,7 @@ mod tests {
         );
         // The skew the bead observed: the toron store is ahead of the binary.
         let skewed = vec![
-            Check::pass("herdr-socket"),
+            Check::pass("pane-plane"),
             Check::fail(
                 "toron-mail",
                 "migration 17 is applied in the store but this toron build resolves at most 16 \

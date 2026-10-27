@@ -2684,6 +2684,59 @@ fn kind_nth_index(agents: &[AgentInfo], kind: &str, ordinal: u32) -> Option<usiz
         .map(|(i, _)| i)
 }
 
+/// bd-rex-default-plane-xn1t: the default send path's resolver on a non-herdr
+/// plane. Same rule as `comms_send::backend_wake_target` (shared, not copied):
+/// a token names a block label or agent name EXACTLY, or it resolves through
+/// the spawn registry (mail pin, lane name, or pane id → pane ground truth).
+/// Zero hits is a typed miss; two hits is `matches N panes; not ringing`.
+/// `all` reaches every agent in the workspace. Pure over an already-scoped
+/// agent list — the caller loads it through the selected backend.
+#[cfg(feature = "backend-superlogical")]
+fn resolve_send_targets_dyn(
+    agents_in_ws: &[AgentInfo],
+    registry: &[state::SpawnEntry],
+    project: &str,
+    to: &str,
+) -> Result<Vec<AgentInfo>> {
+    let mut out: Vec<AgentInfo> = Vec::new();
+    for tok in to.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if tok == "all" {
+            for a in agents_in_ws {
+                if !out.iter().any(|o| o.pane_id == a.pane_id) {
+                    out.push(a.clone());
+                }
+            }
+            continue;
+        }
+        // Registry pane ground truth first (mail pin or lane name → its pane).
+        if let Some(entry) = registry_entry_for_token(registry, project, tok)
+            && let Some(a) = agents_in_ws.iter().find(|a| a.pane_id == entry.pane_id)
+        {
+            if !out.iter().any(|o| o.pane_id == a.pane_id) {
+                out.push(a.clone());
+            }
+            continue;
+        }
+        // Shared exact rule — block label or agent name, never a substring.
+        match crate::comms_send::backend_wake_target(agents_in_ws, tok) {
+            Ok(pane) => {
+                if let Some(a) = agents_in_ws.iter().find(|a| a.pane_id == pane) {
+                    if !out.iter().any(|o| o.pane_id == a.pane_id) {
+                        out.push(a.clone());
+                    }
+                } else {
+                    bail!("{tok} has no pane in this workspace");
+                }
+            }
+            Err(e) => bail!("{e}"),
+        }
+    }
+    if out.is_empty() {
+        bail!("no agents match --to {to}");
+    }
+    Ok(out)
+}
+
 /// Indices of agents matched by the `--to` wants (bd-4pxy): name-based
 /// resolution is canonical (exact, numbered, or broadened); when a short's
 /// name target matches NOTHING, fall back to a pane-id exact match
@@ -9458,14 +9511,15 @@ projects available: {}",
         }
         bail!("{msg}");
     }
-    // bd-bio8: spawn is herdr-led. Refuse a non-herdr selection before any
-    // side effect instead of silently building herdr panes.
+    // Spawn rides the selected pane plane (bd-rex-default-plane-xn1t):
+    // `auto` and `superlogical` resolve rex-first with herdr as transport
+    // fallback only; `FLYWHEEL_BACKEND=herdr` keeps the herdr `Client` path.
+    // `REX_SESSION` never decides the plane. The unknown-name guard below
+    // refuses before any side effect instead of silently building panes.
     crate::backend::factory::require_herdr_for_spawn(&crate::backend::resolve_backend_name(cfg))?;
-    // Rex door: a set REX_SESSION selects the rex multiplexer arm below —
-    // the herdr `Client` path after it stays exactly as it was. No
-    // `Client::connect` on the rex arm (auto/superlogical resolve through
+    // No `Client::connect` on the rex arm (auto/superlogical resolve through
     // `backend::multiplexer_backend`, rex-first with transport-only fallback).
-    if crate::pane::rex_door_selected() {
+    if crate::backend::resolve_backend_name(cfg) != "herdr" {
         return cmd_spawn_rex(cfg, project, opts);
     }
     let kind_count_escape =
@@ -10830,14 +10884,20 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             backend
                 .pane_run(&pane_id, &command)
                 .map_err(|e| anyhow!("spawn: rex run for {name} ({pane_id}): {e:#}"))?;
-            if let Err(e) = backend.agent_rename(&pane_id, Some(name.as_str())) {
-                eprintln!("flywheel: warn: rex rename {pane_id} → {name} failed: {e:#}");
+            // bd-rex-default-plane-xn1t seam 5: the block is named the mail
+            // PIN, not the lane name, so `backend_wake_target` (name or
+            // display_agent == pin) resolves the pin and the send reports a
+            // ring instead of `no-pane`. The lane name stays in the spawn
+            // registry; the block label is the routable pin.
+            if let Err(e) = backend.agent_rename(&pane_id, Some(identity)) {
+                eprintln!("flywheel: warn: rex rename {pane_id} → {identity} failed: {e:#}");
             }
             // Readiness: the agent reports instead of the shell prompt.
             // Best-effort — a wait failure degrades to dispatch-side
-            // errors, never a panic.
+            // errors, never a panic. Wait on the stable pane id: the label
+            // above just changed to the pin.
             let launched_status: String = match backend.agent_wait(
-                &name,
+                &pane_id,
                 &[herdr::AgentStatus::Idle, herdr::AgentStatus::Working],
                 Some(90_000),
             ) {
@@ -18202,6 +18262,185 @@ fn cmd_send_via_inbox(
     Ok(())
 }
 
+/// bd-rex-default-plane-xn1t: the default send path on a non-herdr plane.
+/// The caller (`cmd_send`) runs the shared prep (stage text, task id, policy
+/// guard, plane tripwires) and passes the rendered text in. This arm then:
+/// resolve through the selected backend's `agent_list` (shared exact rule +
+/// registry), dispatch through `backend.prompt`, and `--wait` through
+/// `backend.prompt_coded` (agent_wait). A semantic reject stays a reject —
+/// no herdr retry exists on this arm, and nothing here mentions herdr: with
+/// a dead socket and a rex selection, every failure names the rex plane.
+/// Rows keep the `prior_status`/`landed` JSON fields. Exit 0 means every
+/// prompt was accepted (or, with `--wait`, settled); anything else is loud.
+/// Divergence from the herdr arm, by acceptance contract: no P0-A fail-loud
+/// gate and no doorbell last_wake gate here — a prompt-ok row is the dispatch
+/// receipt, the same contract as `--via-inbox` `queued`/`woke`.
+#[cfg(feature = "backend-superlogical")]
+#[allow(clippy::too_many_arguments)]
+fn cmd_send_rex(
+    cfg: &Config,
+    project: &str,
+    to: &str,
+    text: &str,
+    stage: Option<&str>,
+    wait: bool,
+    timeout_ms: Option<u64>,
+    force: bool,
+    raw: bool,
+    fire_and_forget: Option<&str>,
+) -> Result<()> {
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
+    let agents = backend.agent_list()?;
+    let in_ws: Vec<AgentInfo> = agents
+        .into_iter()
+        .filter(|a| a.workspace_id == ws_id)
+        .collect();
+    if in_ws.is_empty() {
+        bail!("no agents in workspace {ws_id} — is the swarm spawned?");
+    }
+    let mut registry = state::load_spawn_registry(project);
+    let targets = resolve_send_targets_dyn(&in_ws, &registry, project, to)?;
+    // Same broadcast guard as the herdr arm: a bare short reaching the whole
+    // crew races one prompt across N agents.
+    if !force {
+        let names: Vec<String> = targets
+            .iter()
+            .map(|a| agent_target(a).to_string())
+            .collect();
+        if let Some(group) = bare_short_group_matches(project, to, &names) {
+            bail!(
+                "--to {to} matches {} agents ({}): a bare short reaches the whole crew and would race one prompt across all of them. Use an exact name or numbered short (e.g. flywheel-{}-oc, oc2) to target one agent, or pass --force to broadcast deliberately.",
+                group.len(),
+                group.join(", "),
+                project_base(project)
+            );
+        }
+    }
+    let timeout = timeout_ms.or_else(|| wait.then(|| cfg.timeout_ms()));
+    if wait {
+        eprintln!(
+            "flywheel: --wait: expecting settle (idle|done|blocked), waiting up to {}s…",
+            timeout.unwrap_or_default() / 1000
+        );
+    }
+    let catalog = profile::ProfileCatalog::load();
+    let mut registry_dirty = false;
+    let mut results: Vec<Value> = Vec::new();
+    for a in &targets {
+        let prior = a.agent_status.as_str().to_string();
+        let target = a.pane_id.clone();
+        let name = a.name.clone().unwrap_or_else(|| target.clone());
+        let entry = registry.iter_mut().find(|e| {
+            e.mail_identity.as_deref() == Some(name.as_str())
+                || e.pane_id == target
+                || e.name == name
+        });
+        let (send_text, cond_profile, skills_injected) = match &catalog {
+            Ok(c) => condition_send_target(entry, c, text, raw),
+            Err(e) => {
+                eprintln!("flywheel: profile catalog unavailable ({e:#}) — sending raw");
+                (text.to_string(), None, false)
+            }
+        };
+        if skills_injected {
+            registry_dirty = true;
+        }
+        if text.starts_with("GOAL ") && send_text.len() > durable::DISPATCH_PROMPT_CAP {
+            bail!(
+                "flywheel: dispatched prompt for {} is {} bytes — over the {} byte cap (send conditioning; NOT sent)",
+                durable::bead_id_from_prompt(text).unwrap_or("<unknown>"),
+                send_text.len(),
+                durable::DISPATCH_PROMPT_CAP,
+            );
+        }
+        if wait {
+            let wait_opts = WaitOptions {
+                timeout_ms: timeout,
+                until: vec![AgentStatus::Idle, AgentStatus::Done, AgentStatus::Blocked],
+            };
+            match backend.prompt_coded(&target, &send_text, Some(&wait_opts)) {
+                Ok(landing) => {
+                    let settled: Option<String> = landing.status.map(|s| s.as_str().to_string());
+                    results.push(send_result_row(
+                        agent_target(a),
+                        &prior,
+                        &a.pane_id,
+                        cond_profile.as_deref(),
+                        settled.as_deref(),
+                    ));
+                }
+                Err(e) => {
+                    results.push(wait_failure_row(
+                        agent_target(a),
+                        &prior,
+                        &a.pane_id,
+                        cond_profile.as_deref(),
+                        None,
+                    ));
+                    log(
+                        project,
+                        EventKind::Send,
+                        json!({
+                            "to": to, "stage": stage, "text_len": text.len(), "wait": wait,
+                            "raw": raw, "fire_and_forget": fire_and_forget, "results": results
+                        }),
+                    );
+                    if !std::io::stdout().is_terminal() {
+                        print_json(&json!({ "results": results }));
+                    }
+                    return Err(wait_failure_error(agent_target(a), &e, None, project));
+                }
+            }
+        } else if let Err(e) = backend.prompt(&target, &send_text, None) {
+            return Err(e.into());
+        } else {
+            results.push(send_result_row(
+                agent_target(a),
+                &prior,
+                &a.pane_id,
+                cond_profile.as_deref(),
+                None,
+            ));
+        }
+        if std::io::stdout().is_terminal() {
+            let shown = results
+                .last()
+                .and_then(|r| r.get("settled_status").and_then(|v| v.as_str()))
+                .unwrap_or(&prior);
+            println!(
+                "{} {}",
+                dim(agent_target(a)),
+                status_paint(herdr::parse_agent_status(shown).unwrap_or(AgentStatus::Unknown))
+            );
+        }
+    }
+    if registry_dirty && let Err(e) = state::save_spawn_registry(project, &registry) {
+        eprintln!("flywheel: cannot persist skills_injected for send targets: {e:#}");
+    }
+    log(
+        project,
+        EventKind::Send,
+        json!({
+            "to": to, "stage": stage, "text_len": text.len(), "wait": wait,
+            "raw": raw, "fire_and_forget": fire_and_forget, "results": results
+        }),
+    );
+    if !std::io::stdout().is_terminal() {
+        print_json(&json!({ "results": results }));
+    }
+    if wait
+        && !results
+            .iter()
+            .any(|r| r.get("landed") == Some(&json!(true)))
+    {
+        bail!(
+            "send --wait produced no landed:true receipt — refuse invent-green exit 0. Re-run when the agent can settle."
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
 fn cmd_send(
     cfg: &Config,
@@ -18265,6 +18504,26 @@ fn cmd_send(
     }
 
     check_send_plane_tripwires(&text, plane, unsafe_plane, raw)?;
+
+    // bd-rex-default-plane-xn1t: the default prompt lane rides the selected
+    // pane plane. `auto` and `superlogical` resolve rex-first (herdr is
+    // transport fallback only); only an explicit `herdr` selection takes the
+    // `Client` path below. Nothing on the rex arm mentions herdr.
+    #[cfg(feature = "backend-superlogical")]
+    if crate::backend::resolve_backend_name(cfg) != "herdr" {
+        return cmd_send_rex(
+            cfg,
+            project,
+            to,
+            &text,
+            stage,
+            wait,
+            timeout_ms,
+            force,
+            raw,
+            fire_and_forget.as_deref(),
+        );
+    }
 
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     let ws_id = find_workspace(&mut c, project)?;
@@ -26152,6 +26411,220 @@ mod loop_tests {
     fn bare_short_group_matches_single_agent_is_fine() {
         let names = vec!["flywheel-proj-oc".to_string()];
         assert!(bare_short_group_matches("proj", "oc", &names).is_none());
+    }
+
+    /// bd-rex-default-plane-xn1t: the default send path on a rex plane
+    /// resolves `--to <pin>` through the shared exact rule and prompts once
+    /// on the pin's block — with a dead herdr socket anywhere near it.
+    #[cfg(feature = "backend-superlogical")]
+    const REX_SEND_FAKE_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|session|block|capture|api|run|split|new|do) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    program_status|send-key|write) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+  esac
+done
+case "$cmd:$sub" in
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-9","label":"flywheel-probe-send-rex-default","pane_count":1,"tab_count":1}]}'
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron","creator_name":"com.superlogical.terminal"}]}'
+    ;;
+  block:program_status)
+    printf '%s\n' '{"records":[{"state":"working"}]}'
+    ;;
+  block:write)
+    printf '%s\n' '{}'
+    ;;
+  block:send-key)
+    printf '%s\n' 'keyed'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// The pin resolves and exactly one prompt lands on the pin's block.
+    /// No registry row exists, so this drives the shared exact-match rule;
+    /// a dead herdr socket is present in the environment shape (no socket
+    /// is ever touched — the log must stay herdr-free).
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn rex_send_resolves_pin_and_prompts_once_on_the_rex_target() {
+        let guard = crate::backend::superlogical::RexBinGuard::install(REX_SEND_FAKE_REX);
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
+        let cfg = crate::config::Config::default();
+        let out = cmd_send_rex(
+            &cfg,
+            "probe-send-rex-default",
+            "NeatHeron",
+            "hello probe",
+            None,
+            false,
+            None,
+            false,
+            true,
+            None,
+        );
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        out.expect("rex send of one prompt");
+        let log = guard.log_text();
+        assert_eq!(
+            log.lines().filter(|l| l.contains("write")).count(),
+            1,
+            "exactly one prompt write:\n{log}"
+        );
+        assert_eq!(
+            log.lines().filter(|l| l.contains("send-key")).count(),
+            1,
+            "one submit after the write:\n{log}"
+        );
+        assert!(!log.contains("herdr"), "no herdr contact:\n{log}");
+    }
+
+    /// Registry ground truth: a lane name resolves to its pane even though
+    /// no block carries the lane label (spawn renamed the block to the pin).
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn rex_send_registry_lane_name_resolves_to_pane_ground_truth() {
+        fn send_agent(name: Option<&str>, pane: &str) -> AgentInfo {
+            AgentInfo {
+                agent: None,
+                agent_status: AgentStatus::Idle,
+                cwd: None,
+                display_agent: None,
+                focused: false,
+                foreground_cwd: None,
+                interactive_ready: false,
+                launch_pending: false,
+                name: name.map(str::to_string),
+                pane_id: pane.to_string(),
+                revision: 0,
+                state_change_seq: 0,
+                completion_seq: None,
+                state_labels: serde_json::Map::new(),
+                tab_id: "t1".into(),
+                terminal_id: "term".into(),
+                terminal_title: None,
+                workspace_id: "session:fake-9".into(),
+            }
+        }
+        let agents = vec![send_agent(Some("NeatHeron"), "block:fake-1")];
+        let registry = vec![state::SpawnEntry::with_mail_identity(
+            "block:fake-1",
+            "probe-send-rex-default-coder",
+            "NeatHeron",
+        )];
+        let matched =
+            resolve_send_targets_dyn(&agents, &registry, "probe-send-rex-default", "NeatHeron")
+                .expect("pin resolves");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].pane_id, "block:fake-1");
+        let lane = resolve_send_targets_dyn(
+            &agents,
+            &registry,
+            "probe-send-rex-default",
+            "probe-send-rex-default-coder",
+        )
+        .expect("lane resolves through the registry");
+        assert_eq!(lane.len(), 1);
+        assert_eq!(lane[0].pane_id, "block:fake-1");
+    }
+
+    /// Ambiguity is typed and prompts nothing: two blocks under one display
+    /// name refuse with `matches N panes; not ringing` and the fake log
+    /// shows no write.
+    #[cfg(feature = "backend-superlogical")]
+    #[test]
+    fn rex_send_ambiguity_is_typed_and_prompts_nothing() {
+        let script = REX_SEND_FAKE_REX.replace(
+            r#"{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron","creator_name":"com.superlogical.terminal"}]}"#,
+            r#"{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron"},{"block_id":"block:fake-2","window_id":"window:fake-1","label":"NeatHeron"}]}"#,
+        );
+        let guard = crate::backend::superlogical::RexBinGuard::install(&script);
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
+        let cfg = crate::config::Config::default();
+        let err = cmd_send_rex(
+            &cfg,
+            "probe-send-rex-default",
+            "NeatHeron",
+            "hello probe",
+            None,
+            false,
+            None,
+            false,
+            true,
+            None,
+        )
+        .expect_err("two blocks under one name must refuse");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("matches multiple panes; not ringing"),
+            "typed ambiguity, not a miss: {msg}"
+        );
+        let log = guard.log_text();
+        assert!(
+            !log.lines().any(|l| l.contains("write")),
+            "ambiguity prompts nothing:\n{log}"
+        );
+    }
+
+    /// Fence: the non-herdr send arm is selected by backend name and builds
+    /// no herdr client. Both halves are asserted so neither direction is
+    /// vacuous: the route must exist AND the herdr constructor must be gone.
+    #[test]
+    fn rex_send_arm_constructs_no_herdr_client() {
+        let src = include_str!("main.rs");
+        let send = src
+            .split_once("\nfn cmd_send(")
+            .expect("cmd_send exists")
+            .1
+            .split_once("\nfn mint_task_id()")
+            .expect("cmd_send ends before mint_task_id")
+            .0;
+        assert!(
+            send.contains("cmd_send_rex("),
+            "cmd_send must route to the rex arm"
+        );
+        assert!(
+            send.contains("resolve_backend_name(cfg) != \"herdr\""),
+            "the route is by backend name, never REX_SESSION"
+        );
+        let rex = src
+            .split_once("\nfn cmd_send_rex(")
+            .expect("cmd_send_rex exists")
+            .1
+            .split_once("\nfn cmd_send(")
+            .expect("cmd_send_rex ends at cmd_send")
+            .0;
+        assert!(
+            rex.contains("multiplexer_backend"),
+            "the rex arm resolves through the selected backend"
+        );
+        assert!(
+            rex.contains("backend.prompt("),
+            "the rex arm prompts through the backend trait"
+        );
+        assert!(
+            !rex.contains("Client::connect"),
+            "no herdr client on the rex arm"
+        );
+        assert!(
+            !rex.contains("herdr::Client"),
+            "no herdr client type on the rex arm"
+        );
     }
 
     #[test]
