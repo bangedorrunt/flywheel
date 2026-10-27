@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use toron_core::backend::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
-use toron_core::backend::{AgentStatus, BackendError, EventStream, PromptLanding};
+use toron_core::backend::{
+    AgentStatus, BackendError, BackendErrorCode, EventStream, PromptLanding,
+};
 
 #[path = "rex_cli.rs"]
 mod rex_cli;
@@ -32,18 +34,132 @@ pub(crate) use rex_cli::RexBinGuard;
 
 use crate::backend::MultiplexerBackend;
 use rex_cli::rex_map::{
-    board_of, capture_format, parse_process_view, split_direction, status_for_block,
-    status_from_program_status, tail_lines,
+    board_of, capture_format, child_exit_from_line, parse_process_view, split_direction,
+    status_for_block, status_from_program_status, tail_lines,
 };
 use rex_cli::{
     Rex, RexBlock, RexEventStream, RexFail, RexSession, block_close_args, capture_args,
     events_args, list_blocks_args, ls_args, new_args, parse_blocks, parse_created_block_id,
     parse_created_session, parse_sessions, process_args, program_status_args, rename_args,
-    send_key_args, session_kill_args, split_args, write_args,
+    run_args, send_key_args, session_kill_args, split_args, split_labelled_args, write_args,
 };
+
+/// bd-rex-reliability-ioyz D: a session-scoped event stream.
+///
+/// The trait's `subscribe(&[Subscription])` carries `pane_id` only, so it
+/// cannot name a session — `rex events --json` without `-s` follows the
+/// CALLER's session, which is the wrong plane for a crew in a session we just
+/// created. Measured live: the one-shot `child_exited` never arrived and the
+/// outcome degraded to `unknown`. Subscribe by session here instead.
+pub fn subscribe_session(
+    session: &str,
+) -> Result<Box<dyn EventStream>, toron_core::backend::BackendError> {
+    if session.trim().is_empty() {
+        return Err(RexFail::Rejected {
+            message:
+                "rex events needs a session id (an unscoped stream follows the caller's session)"
+                    .into(),
+        }
+        .into_backend());
+    }
+    let rex = SuperlogicalBackend::rex()?;
+    let child = rex
+        .spawn(&events_args(Some(session)))
+        .map_err(RexFail::into_backend)?;
+    let stream = RexEventStream::start(child, Vec::new()).map_err(RexFail::into_backend)?;
+    Ok(Box::new(stream))
+}
 
 /// Superlogical backend over the `rex` CLI.
 pub struct SuperlogicalBackend;
+
+/// bd-rex-reliability-ioyz (A+B): create ONE crew block with the pin label
+/// **at creation** and `--keep-open`.
+///
+/// Two measured defects this closes, both from the create-then-rename window:
+/// a live agent block labelled `shell` made `backend_wake_target` answer
+/// `no-pane` for a running pin, and a block that closed with its child took
+/// the final screen with it (`rex block capture` → "block target not found").
+///
+/// First block: `rex run` opens a new window. Later blocks ride
+/// `create_split_block` anchored to the previous block — `run` has no anchor
+/// flag, so a `--split` there would follow focus, not the crew order.
+///
+/// `command` is the already-rendered launch line (env prefix + program); it is
+/// run through `sh -c` because `rex run -- …` takes argv and never parses a
+/// shell, while the launch line is produced as one shell line.
+pub fn create_agent_block(
+    session: &str,
+    label: &str,
+    cwd: Option<&str>,
+    command: &str,
+) -> Result<String, toron_core::backend::BackendError> {
+    if command.trim().is_empty() {
+        return Err(RexFail::Rejected {
+            message: "rex run command is empty".into(),
+        }
+        .into_backend());
+    }
+    if label.trim().is_empty() {
+        return Err(RexFail::Rejected {
+            message: "rex run needs a label (the pin) so the block is routable at creation".into(),
+        }
+        .into_backend());
+    }
+    let rex = SuperlogicalBackend::rex()?;
+    let argv = ["sh".to_string(), "-c".to_string(), command.to_string()];
+    let value = rex
+        .json(&run_args(session, label, cwd, &argv))
+        .map_err(RexFail::into_backend)?;
+    parse_created_block_id(&value).map_err(RexFail::into_backend)
+}
+
+/// bd-rex-reliability-ioyz D: parse one `terminal.child_exited` event line
+/// into (block_id, exit_code). The event stream keeps the exit as `Raw`
+/// (see `rex_map::event_from_line`) so the code survives to the caller.
+pub fn child_exit_code(line: &str) -> Option<(String, i32)> {
+    child_exit_from_line(line)
+}
+
+/// Later crew block: `rex split` anchored to `anchor` with the pin label at
+/// creation and `--keep-open`. Same A+B contract as `create_agent_block`;
+/// `direction` is already a rex word (`below`, never herdr `down`).
+pub fn create_split_block(
+    session: &str,
+    anchor: &str,
+    direction: &str,
+    label: &str,
+    cwd: Option<&str>,
+    command: &str,
+) -> Result<String, toron_core::backend::BackendError> {
+    if command.trim().is_empty() {
+        return Err(RexFail::Rejected {
+            message: "rex split command is empty".into(),
+        }
+        .into_backend());
+    }
+    if label.trim().is_empty() {
+        return Err(RexFail::Rejected {
+            message: "rex split needs a label (the pin) so the block is routable at creation"
+                .into(),
+        }
+        .into_backend());
+    }
+    if anchor.trim().is_empty() {
+        return Err(RexFail::Rejected {
+            message: "rex split needs the previous block as anchor, never focus".into(),
+        }
+        .into_backend());
+    }
+    let rex = SuperlogicalBackend::rex()?;
+    let argv = ["sh".to_string(), "-c".to_string(), command.to_string()];
+    let value = rex
+        .json(&split_labelled_args(
+            session, anchor, direction, label, cwd, &argv,
+        ))
+        .map_err(RexFail::into_backend)?;
+    parse_created_block_id(&value).map_err(RexFail::into_backend)
+}
 
 impl SuperlogicalBackend {
     fn rex() -> Result<Rex, toron_core::backend::BackendError> {
@@ -110,6 +226,74 @@ impl SuperlogicalBackend {
         } else {
             Ok(status_from_program_status(&records))
         }
+    }
+
+    /// C: readiness gate with an explicit bound (production: 10 s).
+    /// Tests drive this with milliseconds so the refusal path stays fast.
+    fn prompt_gated(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Duration,
+    ) -> Result<Value, toron_core::backend::BackendError> {
+        let rex = Self::rex()?;
+        let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
+        // A prompt into a booting or busy TUI is lost or misplaces the Enter
+        // (what `--settle-secs` papers over). Write + Enter only at a
+        // prompt-ish status. OSC `clear` removes the record before it folds,
+        // so it never surfaces as an `AgentStatus` here; the three ready
+        // states cover it.
+        let ready = |s: &AgentStatus| {
+            matches!(
+                s,
+                AgentStatus::Idle | AgentStatus::Done | AgentStatus::Blocked
+            )
+        };
+        let mut status = Self::block_status(&rex, &session.session_id, &block.block_id)
+            .map_err(RexFail::into_backend)?;
+        if !ready(&status) {
+            let deadline = std::time::Instant::now() + wait;
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+                status = Self::block_status(&rex, &session.session_id, &block.block_id)
+                    .map_err(RexFail::into_backend)?;
+                if ready(&status) {
+                    break;
+                }
+            }
+        }
+        if !ready(&status) {
+            // Busy, never Connect/Io/Timeout: the fallback arm retries those
+            // on herdr, and a busy pane must never be re-sent there.
+            return Err(BackendError::new(
+                BackendErrorCode::Other("busy".into()),
+                format!(
+                    "rex prompt refused: block {} status {} is not at a prompt",
+                    block.block_id,
+                    status.as_str(),
+                ),
+            ));
+        }
+        self.prompt_ready(&session.session_id, &block.block_id, text)
+    }
+
+    /// Write + Enter once the gate has proven the pane is at a prompt.
+    fn prompt_ready(
+        &self,
+        session: &str,
+        block: &str,
+        text: &str,
+    ) -> Result<Value, toron_core::backend::BackendError> {
+        let rex = Self::rex()?;
+        let receipt = rex
+            .json(&write_args(session, block, text))
+            .map_err(RexFail::into_backend)?;
+        // Submission is part of prompt semantics (herdr `agent.prompt`
+        // submits): `write` only queues bytes, so a prompt without Enter
+        // would sit in the prompt buffer unread.
+        rex.text(&send_key_args(session, block, &["enter"]))
+            .map_err(RexFail::into_backend)?;
+        Ok(receipt)
     }
 }
 
@@ -262,21 +446,7 @@ impl MultiplexerBackend for SuperlogicalBackend {
         text: &str,
         _wait: Option<&WaitOptions>,
     ) -> Result<Value, toron_core::backend::BackendError> {
-        let rex = Self::rex()?;
-        let (session, block) = Self::locate(&rex, target).map_err(RexFail::into_backend)?;
-        let receipt = rex
-            .json(&write_args(&session.session_id, &block.block_id, text))
-            .map_err(RexFail::into_backend)?;
-        // Submission is part of prompt semantics (herdr `agent.prompt`
-        // submits): `write` only queues bytes, so a prompt without Enter
-        // would sit in the prompt buffer unread.
-        rex.text(&send_key_args(
-            &session.session_id,
-            &block.block_id,
-            &["enter"],
-        ))
-        .map_err(RexFail::into_backend)?;
-        Ok(receipt)
+        self.prompt_gated(target, text, Duration::from_secs(10))
     }
 
     fn agent_read(
@@ -806,7 +976,7 @@ case "$cmd:$sub" in
     printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"build","creator_name":"com.superlogical.terminal"}]}'
     ;;
   block:program_status)
-    printf '%s\n' '{"records":[{"state":"working"}]}'
+    printf '%s\n' '{"records":[{"state":"idle"}]}'
     ;;
   block:write)
     printf '%s\n' '{}'
@@ -870,7 +1040,7 @@ esac
         let landed = backend
             .prompt_coded("block:fake-1", "go", None)
             .expect("coded prompt");
-        assert_eq!(landed.status, Some(AgentStatus::Working));
+        assert_eq!(landed.status, Some(AgentStatus::Idle));
         assert_eq!(landed.code, None);
 
         let err = backend
@@ -1024,6 +1194,9 @@ case "$cmd:$sub" in
   block:write)
     printf '%s\n' '{"bytes_written":9}'
     ;;
+  block:program_status)
+    printf '%s\n' '{"records":[{"state":"idle"}]}'
+    ;;
   block:send-key)
     printf '%s\n' 'keyed'
     ;;
@@ -1067,5 +1240,182 @@ esac
         assert!(write_at < key_at, "write lands before Enter:\n{log}");
         assert!(log.contains("block.close"), "{log}");
         assert!(!log.contains("herdr"), "{log}");
+    }
+
+    const CREATE_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|session|block|capture|api|run|split|new|do) cmd=$arg; break ;;
+  esac
+done
+case "$cmd" in
+  run)
+    printf '%s\n' '{"block_ids":["block:new-1"],"window_id":"window:new-1"}'
+    ;;
+  split)
+    printf '%s\n' '{"block_ids":["block:new-2"],"window_id":"window:new-1"}'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// bd-rex-reliability-ioyz (A+B): the first block is created labelled the
+    /// pin with `--keep-open` in its own window — deleting either flag from
+    /// the argv reopens the measured defect, and this test names it.
+    #[test]
+    fn create_agent_block_labels_the_pin_with_keep_open() {
+        let guard = RexBinGuard::install(CREATE_REX);
+        let id = create_agent_block(
+            "session:fake-1",
+            "CoralTurtle",
+            Some("/work"),
+            "env A=1 opencode",
+        )
+        .expect("run creates the block");
+        assert_eq!(id, "block:new-1");
+        let log = guard.log_text();
+        assert!(log.contains("run"), "{log}");
+        assert!(log.contains("--label"), "{log}");
+        assert!(log.contains("CoralTurtle"), "{log}");
+        assert!(log.contains("--keep-open"), "{log}");
+        assert!(log.contains("--json"), "{log}");
+        assert!(!log.contains("--split"), "{log}");
+        assert!(!log.contains("herdr"), "{log}");
+    }
+
+    /// Later blocks split below the previous block anchored to it (never
+    /// focus), labelled the pin with `--keep-open`.
+    #[test]
+    fn create_split_block_anchors_below_with_pin_and_keep_open() {
+        let guard = RexBinGuard::install(CREATE_REX);
+        let id = create_split_block(
+            "session:fake-1",
+            "block:prev-1",
+            "below",
+            "CoralTurtle",
+            Some("/work"),
+            "env A=1 opencode",
+        )
+        .expect("split creates the block");
+        assert_eq!(id, "block:new-2");
+        let log = guard.log_text();
+        assert!(log.contains("split"), "{log}");
+        assert!(log.contains("block:prev-1"), "{log}");
+        assert!(log.contains("--split=below"), "{log}");
+        assert!(log.contains("--label"), "{log}");
+        assert!(log.contains("CoralTurtle"), "{log}");
+        assert!(log.contains("--keep-open"), "{log}");
+        assert!(!log.contains("herdr"), "{log}");
+    }
+
+    /// Empty labels and commands are refused before spawn: an unlabelled
+    /// block reopens the no-pane window, an empty command spawns a bare
+    /// shell the pin can never own.
+    #[test]
+    fn create_blocks_refuse_empty_label_command_and_anchor() {
+        let _guard = RexBinGuard::install(CREATE_REX);
+        assert!(create_agent_block("s", "", Some("/w"), "env A=1 opencode").is_err());
+        assert!(create_agent_block("s", "Pin", Some("/w"), "  ").is_err());
+        assert!(create_split_block("s", "", "below", "Pin", Some("/w"), "env A=1 x").is_err());
+        assert!(create_split_block("s", "block:p", "below", "", Some("/w"), "env A=1 x").is_err());
+        assert!(create_split_block("s", "block:p", "below", "Pin", Some("/w"), "").is_err());
+    }
+
+    const GATE_REX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    ls|api|block) cmd=$arg; break ;;
+  esac
+done
+sub=""
+for arg in "$@"; do
+  case "$arg" in
+    program_status|write|send-key) sub=$arg ;;
+    *list_blocks*) sub=list_blocks ;;
+  esac
+done
+case "$cmd:$sub" in
+  ls:)
+    printf '%s\n' '{"sessions":[{"session_id":"session:fake-1","label":"work"}]}'
+    ;;
+  api:list_blocks)
+    printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"build"}]}'
+    ;;
+  block:program_status)
+    printf '%s\n' '@@STATUS@@'
+    ;;
+  block:write)
+    printf '%s\n' '{"bytes_written":2}'
+    ;;
+  block:send-key)
+    printf '%s\n' 'keyed'
+    ;;
+  *)
+    echo "unexpected $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+
+    /// C: a prompt into a busy pane is refused `busy` before any write.
+    /// `busy` is `Other`, never Connect/Io/Timeout — the fallback arm
+    /// retries those on herdr, and a busy pane must never be re-sent there.
+    #[test]
+    fn prompt_into_a_busy_pane_is_refused_busy_with_no_write() {
+        let script = GATE_REX.replace("@@STATUS@@", r#"{"records":[{"state":"working"}]}"#);
+        let guard = RexBinGuard::install(&script);
+        let err = SuperlogicalBackend
+            .prompt_gated("block:fake-1", "hi", Duration::from_millis(200))
+            .expect_err("working is not a prompt");
+        assert_eq!(err.code(), &BackendErrorCode::Other("busy".into()), "{err}");
+        assert_ne!(err.code(), &BackendErrorCode::Timeout, "{err}");
+        assert_ne!(err.code(), &BackendErrorCode::Io, "{err}");
+        assert_ne!(err.code(), &BackendErrorCode::Connect, "{err}");
+        assert!(err.to_string().contains("working"), "{err}");
+        let log = guard.log_text();
+        assert!(log.contains("program_status"), "{log}");
+        assert!(!log.contains("write"), "no write may land:\n{log}");
+        assert!(!log.contains("send-key"), "no Enter may land:\n{log}");
+    }
+
+    /// C: a prompt at an idle pane writes once, then submits once.
+    #[test]
+    fn prompt_at_an_idle_pane_writes_once_then_submits() {
+        let script = GATE_REX.replace("@@STATUS@@", r#"{"records":[{"state":"idle"}]}"#);
+        let guard = RexBinGuard::install(&script);
+        SuperlogicalBackend
+            .prompt_gated("block:fake-1", "hi", Duration::from_millis(200))
+            .expect("idle is a prompt");
+        let log = guard.log_text();
+        assert_eq!(log.matches("write").count(), 1, "exactly one write:\n{log}");
+        assert_eq!(
+            log.matches("send-key").count(),
+            1,
+            "exactly one submit:\n{log}"
+        );
+        let write_at = log.find("write").expect("write call");
+        let key_at = log.find("send-key").expect("enter call");
+        assert!(write_at < key_at, "write lands before Enter:\n{log}");
+    }
+
+    /// C: a pane that never reaches a prompt inside the bound is `busy`,
+    /// never `Timeout` (a timeout would read as a transport shrug and could
+    /// fall through to herdr).
+    #[test]
+    fn prompt_wait_exhaustion_is_busy_never_timeout() {
+        let script = GATE_REX.replace("@@STATUS@@", r#"{"records":[{"state":"working"}]}"#);
+        let _guard = RexBinGuard::install(&script);
+        let err = SuperlogicalBackend
+            .prompt_gated("block:fake-1", "hi", Duration::from_millis(300))
+            .expect_err("the bound must exhaust");
+        assert_eq!(err.code(), &BackendErrorCode::Other("busy".into()), "{err}");
+        assert_ne!(err.code(), &BackendErrorCode::Timeout, "{err}");
     }
 }

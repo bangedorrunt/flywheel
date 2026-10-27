@@ -6964,6 +6964,45 @@ mod adr0013_spawn_effect_tests {
         );
     }
 
+    /// bd-rex-reliability-ioyz (A+B fence): the post-spawn repair pass
+    /// compares and renames to the mail PIN (`mail_identity`), never the
+    /// lane name. A revert to `e.name` reopens the measured defect (a live
+    /// pin-labelled block renamed back to the lane, unroutable again), so
+    /// this asserts the call site positively names `mail_identity` — a
+    /// symbol-absence grep is not evidence.
+    #[test]
+    fn rex_repair_pass_binds_the_mail_pin_not_the_lane_name() {
+        let src = include_str!("main.rs");
+        let spawn = body_of(
+            src,
+            "\nfn cmd_spawn_rex(",
+            "\nfn doorbell_project_workspaces(",
+        );
+        let repair = spawn
+            .find("bd-rex-reliability-ioyz: the routable label is the mail PIN")
+            .expect("cmd_spawn_rex must carry the A+B repair pass");
+        let repair = &spawn[repair..];
+        let rename = repair
+            .find("backend.agent_rename(&e.pane_id, Some(routable.as_str()))")
+            .expect("the repair rename must pass the routable PIN label");
+        let routable = repair
+            .find("let routable_label = |e: &state::SpawnEntry|")
+            .expect("the repair must route through the routable_label closure");
+        assert!(
+            routable < rename,
+            "the closure must be defined before the rename call"
+        );
+        let closure = &repair[routable..rename];
+        assert!(
+            closure.contains("e.mail_identity"),
+            "the routable label must come from mail_identity: {closure}"
+        );
+        assert!(
+            repair.contains("a.name.as_deref() != Some(routable.as_str())"),
+            "the comparison must be against the PIN label, never e.name"
+        );
+    }
+
     /// I6: the wake read is its own observation row, separate from spawn.
     #[test]
     fn wake_observation_is_separate_journal_evidence() {
@@ -9520,7 +9559,12 @@ projects available: {}",
     // No `Client::connect` on the rex arm (auto/superlogical resolve through
     // `backend::multiplexer_backend`, rex-first with transport-only fallback).
     if crate::backend::resolve_backend_name(cfg) != "herdr" {
+        #[cfg(feature = "backend-superlogical")]
         return cmd_spawn_rex(cfg, project, opts);
+        #[cfg(not(feature = "backend-superlogical"))]
+        bail!(
+            "spawn: the rex pane plane needs the backend-superlogical feature (this is a lean herdr-only build)"
+        );
     }
     let kind_count_escape =
         opts.counts.oc.unwrap_or(0) + opts.counts.pi.unwrap_or(0) + opts.counts.gk.unwrap_or(0) > 0
@@ -10557,6 +10601,51 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
 /// per-kind herdr preflight and the process-liveness probe are skipped
 /// (herdr-client-coupled), and the harness launch-hook bootstrap is not
 /// installed (prime goes through `pane_run`).
+/// bd-rex-reliability-ioyz D: drain the pre-subscribed event stream for
+/// `terminal.child_exited` for `pane`. Raw lines carry the code (the event
+/// map keeps child exits unmapped so the code survives); any other event
+/// is not an exit. Bounded (~1 s): no event inside the bound is unknown,
+/// never success.
+#[cfg(feature = "backend-superlogical")]
+fn poll_child_exit(
+    stream: Option<&mut Box<dyn toron_core::backend::EventStream>>,
+    pane: &str,
+) -> Option<i32> {
+    let stream = stream?;
+    // Drain what the stream has buffered, not a fixed handful: the exit can sit
+    // behind block_created / process_changed / view-change traffic (measured:
+    // 5 events was not enough after a readiness wait, so D read `unknown` for a
+    // block that had plainly exited). `Ok(None)` is the empty-stream stop; the
+    // cap only bounds memory on a pathological stream.
+    for _ in 0..10_000 {
+        match stream.read_event() {
+            Ok(Some(toron_core::backend::BackendEvent::Raw(line))) => {
+                if let Some((block, code)) = crate::backend::superlogical::child_exit_code(&line)
+                    && block == pane
+                {
+                    return Some(code);
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    None
+}
+
+/// D: the recorded outcome for a child that exited with `code`. Nonzero is a
+/// typed failure carrying the code; zero is the one-shot success.
+#[cfg(feature = "backend-superlogical")]
+fn exited_status(name: &str, pane: &str, code: i32) -> String {
+    if code != 0 {
+        eprintln!(
+            "flywheel: {name} ({pane}) exited with code {code} — headless one-shot typed failure"
+        );
+    }
+    format!("exited: {code}")
+}
+
+#[cfg(feature = "backend-superlogical")]
 fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     let dir = project_dir(cfg, project);
     let kind_count_escape =
@@ -10781,6 +10870,35 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
         .first()
         .map(|p| p.pane_id.clone())
         .ok_or_else(|| anyhow!("rex: workspace {} has no panes", ws.workspace_id))?;
+    // D: headless one-shots emit no OSC 7501, so readiness alone reports
+    // unknown. Subscribe BEFORE the blocks are created (an event that
+    // already happened is not replayed); each member races readiness
+    // against terminal.child_exited for its own block below.
+    //
+    // Session-scoped, not `subscribe(&[])`: the trait carries pane ids only, and
+    // an unscoped `rex events` follows the CALLER's session — measured live as
+    // "child_exited never arrives, D degrades to unknown".
+    let mut exit_stream = crate::backend::superlogical::subscribe_session(&ws.workspace_id).ok();
+    // `rex events` is forward-only (no replay), so a block that exits before the
+    // subscription is CONNECTED loses its `child_exited` and the one-shot
+    // degrades to `unknown` — measured live on `rex run -- sh -c 'exit 1'`.
+    // The stream's first line is its own `client_connected` hello; wait for it
+    // before any block exists, then drop back to the short poll bound.
+    if let Some(stream) = exit_stream.as_mut() {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
+        let live = matches!(stream.read_event(), Ok(Some(_)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+        if !live {
+            eprintln!(
+                "flywheel: warn: rex events stream was not live before spawn — a one-shot exit \
+                 code will read unknown (no replay on rex events)"
+            );
+            exit_stream = None;
+        }
+    }
+    if let Some(stream) = exit_stream.as_mut() {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    }
     let mut first = true;
     let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
     let peer_aware = opts.peer_aware && !opts.no_peer_aware;
@@ -10843,15 +10961,12 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 mail_identity.as_deref(),
                 env_model_pin.as_deref(),
             )?;
-            let pane_id = if first {
-                first = false;
-                prev.clone()
-            } else {
-                let p =
-                    backend.pane_split(&prev, "down", Some(&utf8_path(&dir, "workspace dir")?))?;
-                prev = p.pane_id.clone();
-                prev.clone()
-            };
+            // bd-rex-reliability-ioyz A+B: the block is created WITH the pin
+            // label and --keep-open, so the pin is routable from the first
+            // instant and the screen survives the agent exit. First block
+            // opens its own window via `rex run`; later blocks split below
+            // the previous one anchored to it (never focus).
+            let cwd = utf8_path(&dir, "workspace dir")?;
             let peer_args: Vec<String> = peer_template
                 .as_ref()
                 .map(|t| {
@@ -10869,45 +10984,65 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
             if needs_in_arg_prime(&kind) && !has_peer_prime {
                 agent_args.push(boot_prime_line().to_string());
             }
-            // Shell gate: program_status idle/working within 15s, fail
-            // CLOSED (no verify-or-respawn net on this arm).
-            crate::pane::wait_rex_shell_ready(
-                &*backend,
-                &pane_id,
-                &name,
-                &pane_id,
-                Duration::from_secs(15),
-            )?;
-            // No env map on split: the pin + model pin ride as an
-            // `env K=V` command prefix, then rename binds the name.
+            // No env map on `rex run`: the pin + model pin ride as an
+            // `env K=V` command prefix, and the block is labelled the mail PIN
+            // at creation (no create-then-rename window) so `backend_wake_target`
+            // (name or display_agent == pin) resolves it and a send reports a
+            // ring instead of `no-pane`. The shell gate is gone with the shell:
+            // `run` starts the command directly, so there is no prompt to wait
+            // for and no chance to type into an unbooted shell.
             let command = crate::pane::rex_env_command(&pane_env, &kind, &agent_args);
-            backend
-                .pane_run(&pane_id, &command)
-                .map_err(|e| anyhow!("spawn: rex run for {name} ({pane_id}): {e:#}"))?;
-            // bd-rex-default-plane-xn1t seam 5: the block is named the mail
-            // PIN, not the lane name, so `backend_wake_target` (name or
-            // display_agent == pin) resolves the pin and the send reports a
-            // ring instead of `no-pane`. The lane name stays in the spawn
-            // registry; the block label is the routable pin.
-            if let Err(e) = backend.agent_rename(&pane_id, Some(identity)) {
-                eprintln!("flywheel: warn: rex rename {pane_id} → {identity} failed: {e:#}");
-            }
+            // `run` takes no anchor; `split` anchors to the previous block.
+            // Direction is the rex word (`below`), never herdr `down`.
+            let pane_id = if first {
+                crate::backend::superlogical::create_agent_block(
+                    &ws.workspace_id,
+                    identity,
+                    Some(&cwd),
+                    &command,
+                )
+                .map_err(|e| anyhow!("spawn: rex run for {name} (pin {identity}): {e:#}"))?
+            } else {
+                crate::backend::superlogical::create_split_block(
+                    &ws.workspace_id,
+                    &prev,
+                    "below",
+                    identity,
+                    Some(&cwd),
+                    &command,
+                )
+                .map_err(|e| anyhow!("spawn: rex split for {name} (pin {identity}): {e:#}"))?
+            };
+            first = false;
+            prev = pane_id.clone();
             // Readiness: the agent reports instead of the shell prompt.
             // Best-effort — a wait failure degrades to dispatch-side
             // errors, never a panic. Wait on the stable pane id: the label
             // above just changed to the pin.
-            let launched_status: String = match backend.agent_wait(
-                &pane_id,
-                &[herdr::AgentStatus::Idle, herdr::AgentStatus::Working],
-                Some(90_000),
-            ) {
-                Ok(a) => a.agent_status.as_str().to_string(),
-                Err(e) => {
-                    eprintln!(
-                        "flywheel: warn: {name} not ready within 90s of spawn (dispatching anyway): {e}"
-                    );
-                    "unknown".to_string()
-                }
+            // D: try the exit stream BEFORE the 90 s readiness wait. A headless
+            // one-shot emits no OSC 7501, so `agent_wait` can only ever time out
+            // for it — the exit event IS the outcome, and polling first keeps a
+            // one-shot spawn from costing the full readiness bound.
+            let launched_status: String = match poll_child_exit(exit_stream.as_mut(), &pane_id) {
+                Some(code) => exited_status(&name, &pane_id, code),
+                None => match backend.agent_wait(
+                    &pane_id,
+                    &[herdr::AgentStatus::Idle, herdr::AgentStatus::Working],
+                    Some(90_000),
+                ) {
+                    Ok(a) => a.agent_status.as_str().to_string(),
+                    // A resident agent's exit can land while readiness waits.
+                    Err(e) => match poll_child_exit(exit_stream.as_mut(), &pane_id) {
+                        Some(code) => exited_status(&name, &pane_id, code),
+                        // No exit inside the bound: unknown, never success.
+                        None => {
+                            eprintln!(
+                                "flywheel: warn: {name} not ready within 90s of spawn (dispatching anyway): {e}"
+                            );
+                            "unknown".to_string()
+                        }
+                    },
+                },
             };
             if opts.settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(opts.settle_secs));
@@ -10972,8 +11107,11 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 .and_then(|p| profile::skills_digest(&p.skills));
             registry.push(entry);
             println!("  {} {}", kind_paint(&kind), dim(&format!("({})", pane_id)));
+            let exit_code: Option<i32> = launched_status
+                .strip_prefix("exited:")
+                .and_then(|s| s.trim().parse().ok());
             spawned.push(json!({
-                "name": name, "kind": kind, "pane_id": pane_id, "status": launched_status
+                "name": name, "kind": kind, "pane_id": pane_id, "status": launched_status, "exit_code": exit_code
             }));
             booted.push((pane_id.clone(), name.clone(), kind.clone()));
         }
@@ -11044,20 +11182,32 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
     }
 
     if !opts.no_verify && !registry.is_empty() {
+        // bd-rex-reliability-ioyz: the routable label is the mail PIN when the
+        // entry has one (ADR-0018 D1a: the block carries the pin so
+        // `backend_wake_target` resolves it); the lane name is only the
+        // fallback. Comparing against `e.name` here renamed a correctly
+        // labelled pin block back to the lane name — the same "running pin is
+        // unroutable" defect the create-time label closes.
+        let routable_label = |e: &state::SpawnEntry| -> String {
+            e.mail_identity
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .unwrap_or(e.name.as_str())
+                .to_string()
+        };
         let agents_now = backend.agent_list()?;
         for e in &registry {
             if e.pane_id.is_empty() {
                 continue;
             }
-            let unbound = agents_now.iter().any(|a| {
-                a.pane_id == e.pane_id
-                    && (a.name.as_deref().is_none_or(|n| n.is_empty())
-                        || a.name.as_deref() != Some(e.name.as_str()))
-            });
-            if unbound && let Err(err) = backend.agent_rename(&e.pane_id, Some(e.name.as_str())) {
+            let routable = routable_label(e);
+            let unbound = agents_now
+                .iter()
+                .any(|a| a.pane_id == e.pane_id && a.name.as_deref() != Some(routable.as_str()));
+            if unbound && let Err(err) = backend.agent_rename(&e.pane_id, Some(routable.as_str())) {
                 eprintln!(
-                    "flywheel: GS-039 P0-4 name-bind rename {} → {} failed: {err:#}",
-                    e.pane_id, e.name
+                    "flywheel: GS-039 P0-4 name-bind rename {} → {routable} failed: {err:#}",
+                    e.pane_id
                 );
             }
         }
@@ -11065,15 +11215,13 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
         let still_unbound: Vec<String> = registry
             .iter()
             .filter(|e| !e.pane_id.is_empty())
-            .filter(
-                |e| match agents_after.iter().find(|a| a.pane_id == e.pane_id) {
+            .filter(|e| {
+                let routable = routable_label(e);
+                match agents_after.iter().find(|a| a.pane_id == e.pane_id) {
                     None => true,
-                    Some(a) => {
-                        a.name.as_deref().is_none_or(|n| n.is_empty())
-                            || a.name.as_deref() != Some(e.name.as_str())
-                    }
-                },
-            )
+                    Some(a) => a.name.as_deref() != Some(routable.as_str()),
+                }
+            })
             .map(|e| {
                 let seen = agents_after
                     .iter()
@@ -22904,6 +23052,14 @@ mod wake_identity_tests {
     #[test]
     fn arrive_maybe_bind_pane_records_current_pane() {
         let _home = crate::config::test_state_home();
+        // Hermetic: `arrive_maybe_bind_pane` prefers ambient `REX_BLOCK`, so a
+        // test run inside a rex pane would bind the operator's live block
+        // instead of the scripted herdr pane. Clear it for the guard's
+        // lifetime and restore it after, or the test passes in CI and fails on
+        // a rex box. NB: `test_state_home()` above already holds the env lock —
+        // calling `lock_env()` here would self-deadlock (it is the same lock).
+        let prev_rex = std::env::var("REX_BLOCK").ok();
+        unsafe { std::env::remove_var("REX_BLOCK") };
         let data = std::env::temp_dir().join(format!("fw-arrive-bind-{}", uuid::Uuid::new_v4()));
         let prev = std::env::var("HERDR_PANE_ID").ok();
         unsafe { std::env::set_var("TORON_DATA_DIR", &data) };
@@ -22920,6 +23076,10 @@ mod wake_identity_tests {
         match prev {
             Some(v) => unsafe { std::env::set_var("HERDR_PANE_ID", v) },
             None => unsafe { std::env::remove_var("HERDR_PANE_ID") },
+        }
+        match prev_rex {
+            Some(v) => unsafe { std::env::set_var("REX_BLOCK", v) },
+            None => unsafe { std::env::remove_var("REX_BLOCK") },
         }
         crate::mail::cleanup_test_data_dir(&data);
     }
@@ -26440,7 +26600,7 @@ case "$cmd:$sub" in
     printf '%s\n' '{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron","creator_name":"com.superlogical.terminal"}]}'
     ;;
   block:program_status)
-    printf '%s\n' '{"records":[{"state":"working"}]}'
+    printf '%s\n' '{"records":[{"state":"idle"}]}'
     ;;
   block:write)
     printf '%s\n' '{}'

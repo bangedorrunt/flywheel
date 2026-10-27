@@ -13,6 +13,7 @@ use std::io::BufRead;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -46,6 +47,9 @@ pub enum RexFail {
     Spawn { message: String },
     /// We refused before spawn (unknown direction, missing block).
     Rejected { message: String },
+    /// The server predates the client: `rex api list -q` omits a method we
+    /// depend on. Surfaces loud as `rex_version_skew`, never `rex_failed`.
+    VersionSkew { method: &'static str },
 }
 
 impl RexFail {
@@ -68,6 +72,12 @@ impl RexFail {
             Self::Rejected { message } => {
                 BackendError::new(BackendErrorCode::Other("rejected".into()), message)
             }
+            Self::VersionSkew { method } => BackendError::new(
+                BackendErrorCode::Other("rex_version_skew".into()),
+                format!(
+                    "rex server predates the client: method {method} is missing (rex api list -q)"
+                ),
+            ),
         }
     }
 }
@@ -118,6 +128,20 @@ impl Rex {
     }
 
     pub fn run(&self, args: &[String]) -> Result<Output, RexFail> {
+        match self.run_raw(args) {
+            // E: failure path only — a missing method names the skew, so no
+            // command pays the probe's startup latency. The probe is cached
+            // (one `rex api list -q` per process); an unlistable server keeps
+            // the original error, never a skew accusation.
+            Err(RexFail::Exited { code, stderr }) => match self.skew_method() {
+                Some(method) => Err(RexFail::VersionSkew { method }),
+                None => Err(RexFail::Exited { code, stderr }),
+            },
+            other => other,
+        }
+    }
+
+    fn run_raw(&self, args: &[String]) -> Result<Output, RexFail> {
         let mut cmd = std::process::Command::new(&self.bin);
         // Piped stdout is not a terminal, but `--color never` keeps a
         // later redirect from painting the JSON. `--timeout` is rex's own
@@ -147,7 +171,10 @@ impl Rex {
 
     pub fn json(&self, args: &[String]) -> Result<Value, RexFail> {
         let out = self.run(args)?;
-        parse_stdout_json(&out.stdout)
+        parse_stdout_json(&out.stdout).map_err(|bad| match self.skew_method() {
+            Some(method) => RexFail::VersionSkew { method },
+            None => bad,
+        })
     }
 
     pub fn text(&self, args: &[String]) -> Result<String, RexFail> {
@@ -176,6 +203,28 @@ impl Rex {
                 }
             }
         })
+    }
+
+    /// E: version-skew probe on the failure path. One `rex api list -q`
+    /// per process (raw run: the probe itself must never probe).
+    fn skew_method(&self) -> Option<&'static str> {
+        let cached = {
+            let cache = api_cache();
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(text) = guard.as_ref() {
+                text.clone()
+            } else {
+                let text = self
+                    .run_raw(&api_list_args())
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                    .unwrap_or_default();
+                *guard = Some(text.clone());
+                text
+            }
+        };
+        missing_api_method(&cached)
     }
 }
 
@@ -395,6 +444,62 @@ pub fn session_kill_args(session: &str) -> Vec<String> {
     vec!["session".into(), "kill".into(), session.into()]
 }
 
+/// `rex run`: one labelled keep-open block in a new window. Label at creation
+/// (no create-then-rename window) and `--keep-open` so the block survives
+/// the agent exit for `block capture`. Consume `.block_ids[0]` as binding.
+/// `run` takes no anchor: later blocks ride `split_labelled_args` anchored
+/// to the previous block instead of the focused-block race.
+pub fn run_args(session: &str, label: &str, cwd: Option<&str>, command: &[String]) -> Vec<String> {
+    let mut args = vec!["run".into(), "-s".into(), session.into()];
+    if !label.is_empty() {
+        args.push("--label".into());
+        args.push(label.into());
+    }
+    args.push("--keep-open".into());
+    args.push("--json".into());
+    if let Some(dir) = cwd.filter(|s| !s.is_empty()) {
+        args.push("-c".into());
+        args.push(dir.into());
+    }
+    args.push("--".into());
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// `rex split`: one labelled keep-open block anchored to `anchor` (never the
+/// focused block). `direction` is already a rex word (`below`, not `down`).
+/// Same label/keep-open/command contract as `run_args`.
+pub fn split_labelled_args(
+    session: &str,
+    anchor: &str,
+    direction: &str,
+    label: &str,
+    cwd: Option<&str>,
+    command: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "split".into(),
+        "-s".into(),
+        session.into(),
+        "-b".into(),
+        anchor.into(),
+        format!("--split={direction}"),
+    ];
+    if !label.is_empty() {
+        args.push("--label".into());
+        args.push(label.into());
+    }
+    args.push("--keep-open".into());
+    args.push("--json".into());
+    if let Some(dir) = cwd.filter(|s| !s.is_empty()) {
+        args.push("-c".into());
+        args.push(dir.into());
+    }
+    args.push("--".into());
+    args.extend(command.iter().cloned());
+    args
+}
+
 pub fn rename_args(session: &str, block: &str, label: &str) -> Vec<String> {
     // `rename` takes the block positionally: no `-b` flag exists here
     // (unlike `send`/`capture`). Verified against `rex block rename --help`
@@ -430,6 +535,50 @@ pub fn events_args(session: Option<&str>) -> Vec<String> {
         args.push(session.into());
     }
     args
+}
+
+/// E: one cached `rex api list -q` per process. The first failure path pays
+/// for it; every later failure reads the cache.
+pub fn api_list_args() -> Vec<String> {
+    vec!["api".into(), "list".into(), "-q".into()]
+}
+
+/// E: every method a rex call in this file may depend on. Each group passes
+/// when ANY member is present (`run` predates `session.new_split`).
+const REQUIRED_API_GROUPS: &[&[&str]] = &[
+    &["run", "session.new_split"],
+    &["session.set_block_label"],
+    &["block.close"],
+    &["write"],
+    &["send-key"],
+    &["events"],
+    &["session.list"],
+    &["session.kill"],
+];
+
+/// E: first required method missing from `rex api list -q` output, if any.
+/// Empty output is unknown (a dead server), never skew.
+pub fn missing_api_method(output: &str) -> Option<&'static str> {
+    if output.trim().is_empty() {
+        return None;
+    }
+    REQUIRED_API_GROUPS
+        .iter()
+        .find(|group| !group.iter().any(|m| output.contains(m)))
+        .map(|group| group[0])
+}
+
+static API_LIST_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn api_cache() -> &'static Mutex<Option<String>> {
+    API_LIST_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn reset_api_cache() {
+    if let Some(cache) = API_LIST_CACHE.get() {
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// `rex do -e <lua> [--args <json>]`: one-shot Lua, result as JSON.
@@ -858,7 +1007,57 @@ pub mod rex_map {
                 pane: PaneId::new(pane),
             };
         }
+        // D: `terminal.child_exited` stays `Raw` on purpose — mapping it to
+        // `PaneExited` would drop the exit code, and the headless one-shot
+        // outcome IS the code. Parse it with `child_exit_from_line`.
         BackendEvent::Raw(line.to_string())
+    }
+
+    /// D: the headless one-shot outcome. `terminal.child_exited` carries the
+    /// block and its exit code; anything else is not an exit (`None` is
+    /// unknown, never success).
+    ///
+    /// Two shapes are in the wild, and both must parse — a real
+    /// `rex events --json` line nests the name and the fields one level deeper
+    /// than the synthetic fixture does:
+    ///
+    /// ```text
+    /// real:  {"type":"session_event","payload":{"event":{"type":"block_event",
+    ///         "payload":{"block_id":…,"name":"child_exited",
+    ///         "payload":{"exit_code":7}}}}}
+    /// test:  {"type":"terminal.child_exited","payload":{"block_id":…,"exit_code":0}}
+    /// ```
+    ///
+    /// Reading only `type` matched the fixture and never the stream, so the
+    /// live one-shot probe degraded to `unknown` while the tests stayed green.
+    pub fn child_exit_from_line(line: &str) -> Option<(String, i32)> {
+        let value: Value = serde_json::from_str(line.trim()).ok()?;
+        let inner = value.pointer("/payload/event").unwrap_or(&value);
+        // A block event carries the name at `event.payload.name`; the
+        // synthetic fixture puts it at `type`. Read all three or a real stream
+        // line never matches.
+        let name = inner
+            .pointer("/payload/name")
+            .and_then(Value::as_str)
+            .or_else(|| inner.get("name").and_then(Value::as_str))
+            .or_else(|| inner.get("type").and_then(Value::as_str))
+            .unwrap_or("");
+        if !name.ends_with("child_exited") {
+            return None;
+        }
+        let payload = inner.get("payload").unwrap_or(&Value::Null);
+        // The real block event nests its fields under `payload.payload`.
+        let fields = payload.get("payload").unwrap_or(payload);
+        let field = |key: &str| -> Option<&Value> { fields.get(key).or_else(|| payload.get(key)) };
+        let block = field("block_id")
+            .or_else(|| field("id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        let code = field("exit_code")
+            .or_else(|| field("code"))
+            .and_then(Value::as_i64)? as i32;
+        Some((block, code))
     }
 
     fn json_records(record: &Value) -> Value {
@@ -1114,6 +1313,7 @@ pub(crate) fn write_exec(path: &Path, script: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::rex_map::child_exit_from_line;
     use super::*;
     use std::time::Instant;
 
@@ -1157,6 +1357,87 @@ exit 2
         assert!(!joined.contains("session.close"), "{joined}");
         assert!(!joined.contains("session.destroy"), "{joined}");
         assert!(!joined.contains("kill"), "{joined}");
+    }
+
+    /// bd-rex-reliability-ioyz (A+B): the first block opens its own window
+    /// labelled the pin with `--keep-open`. `run` takes no anchor and no
+    /// `--split`: deleting the label reopens the no-pane window, deleting
+    /// `--keep-open` reopens the vanishing-block window.
+    #[test]
+    fn run_args_labels_the_pin_at_creation_with_keep_open() {
+        let cmd = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "env FOO=1 opencode".to_string(),
+        ];
+        let joined = run_args("sess-1", "CoralTurtle", Some("/work"), &cmd).join(" ");
+        assert!(joined.starts_with("run -s sess-1"), "{joined}");
+        assert!(joined.contains("--label CoralTurtle"), "{joined}");
+        assert!(joined.contains("--keep-open"), "{joined}");
+        assert!(joined.contains("--json"), "{joined}");
+        assert!(joined.contains("-c /work"), "{joined}");
+        assert!(joined.contains("-- sh -c"), "{joined}");
+        assert!(!joined.contains("--split"), "{joined}");
+        assert!(!joined.contains("-b "), "{joined}");
+    }
+
+    /// bd-rex-reliability-ioyz (A): `--` precedes the argv so the launch
+    /// line is never parsed as rex flags, and `-c` carries the cwd.
+    #[test]
+    fn run_args_emits_separator_before_argv_with_cwd() {
+        let cmd = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "env FOO=1 opencode".to_string(),
+        ];
+        let args = run_args("sess-1", "CoralTurtle", Some("/work"), &cmd);
+        let sep = args.iter().position(|a| a == "--").expect("-- separator");
+        let sh = args.iter().position(|a| a == "sh").expect("argv");
+        assert!(sep < sh, "-- must precede the argv: {args:?}");
+        let c = args.iter().position(|a| a == "-c").expect("-c");
+        assert_eq!(args.get(c + 1).map(String::as_str), Some("/work"));
+        assert!(args.contains(&"--keep-open".to_string()));
+        assert!(args.contains(&"--json".to_string()));
+    }
+
+    /// Later blocks split below the previous block anchored to it (never
+    /// focus), labelled the pin with `--keep-open`. The direction is the rex
+    /// word `below`: herdr `down` is not a rex direction.
+    #[test]
+    fn split_labelled_args_anchors_below_with_pin_and_keep_open() {
+        let cmd = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "env FOO=1 opencode".to_string(),
+        ];
+        let joined = split_labelled_args(
+            "sess-1",
+            "block:prev-1",
+            "below",
+            "CoralTurtle",
+            Some("/work"),
+            &cmd,
+        )
+        .join(" ");
+        assert!(
+            joined.starts_with("split -s sess-1 -b block:prev-1"),
+            "{joined}"
+        );
+        assert!(joined.contains("--split=below"), "{joined}");
+        assert!(!joined.contains("down"), "{joined}");
+        assert!(joined.contains("--label CoralTurtle"), "{joined}");
+        assert!(joined.contains("--keep-open"), "{joined}");
+        assert!(joined.contains("--json"), "{joined}");
+        assert!(joined.contains("-- sh -c"), "{joined}");
+    }
+
+    /// The spawn binding consumes `.block_ids[0]`, the shape `rex run` and
+    /// `rex split --json` both return.
+    #[test]
+    fn created_block_id_comes_from_block_ids_head() {
+        let value: Value =
+            serde_json::from_str(r#"{"block_ids":["block:new-1"],"window_id":"w1"}"#).unwrap();
+        assert_eq!(parse_created_block_id(&value).unwrap(), "block:new-1");
     }
 
     const DO_FAKE: &str = r#"#!/bin/sh
@@ -1203,6 +1484,99 @@ exit 2
         assert!(!log.contains("herdr"), "{log}");
     }
 
+    /// D: `terminal.child_exited` with code 0 is the one-shot success, read
+    /// off the live event stream (not a pane status — a headless one-shot
+    /// emits no OSC 7501, so no status ever proves it).
+    /// D live: the EXACT line `rex events --json` emits for a headless
+    /// one-shot, captured 2026-10-28 from a real `rex run -- sh -c 'exit 7'`.
+    /// The synthetic fixture below is flatter than the stream — this test is the
+    /// one that was missing when the first live probe degraded to `unknown`.
+    #[test]
+    fn child_exited_real_stream_line_parses() {
+        let line = r#"{"type":"session_event","payload":{"session_id":"session:01a17dfc-24f8-7c4c-b5f4-db563a331d8d","event":{"type":"block_event","payload":{"block_id":"block:01a17dfc-2922-7999-a186-b7c86f574eef","creator_name":"com.superlogical.terminal","name":"child_exited","payload":{"exit_code":7,"error":"exit status 7"}}}}}"#;
+        assert_eq!(
+            child_exit_from_line(line),
+            Some(("block:01a17dfc-2922-7999-a186-b7c86f574eef".to_string(), 7)),
+            "a real stream line names the event in `name`, not `type`"
+        );
+        // A sibling block event that is NOT an exit stays None.
+        let bell = r#"{"type":"session_event","payload":{"event":{"type":"block_event","payload":{"block_id":"block:b","name":"bell","payload":{}}}}}"#;
+        assert_eq!(child_exit_from_line(bell), None);
+    }
+
+    #[test]
+    fn child_exited_zero_is_the_one_shot_success() {
+        let line = r#"{"type":"terminal.child_exited","payload":{"block_id":"block:new-1","exit_code":0}}"#;
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> @@LOG@@\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"events\" ]; then\n    printf '%s\\n' '{}'\n    exit 0\n  fi\ndone\necho \"unexpected $*\" >&2\nexit 2\n",
+            line
+        );
+        let guard = RexBinGuard::install(&script);
+        let rex = Rex::resolve().expect("REX_BIN_DIR/rex");
+        let child = rex.spawn(&events_args(None)).expect("events stream");
+        let mut stream = RexEventStream::start(child, Vec::new()).expect("stream");
+        stream.set_timeout(Some(Duration::from_secs(2)));
+        let got = stream.next_line().expect("line").expect("one line");
+        let exit = child_exit_from_line(&got).expect("child_exited parses");
+        assert_eq!(exit, ("block:new-1".to_string(), 0));
+        // The nested envelope the server actually sends parses the same way.
+        let nested = r#"{"payload":{"event":{"type":"terminal.child_exited","payload":{"block_id":"block:new-1","exit_code":0}}}}"#;
+        assert_eq!(
+            child_exit_from_line(nested),
+            Some(("block:new-1".to_string(), 0))
+        );
+        let log = guard.log_text();
+        assert!(log.contains("events"), "{log}");
+        assert!(log.contains("--json"), "{log}");
+    }
+
+    /// D: a nonzero exit is a typed failure carrying the code, not success.
+    #[test]
+    fn child_exited_nonzero_carries_its_code() {
+        let line = r#"{"type":"terminal.child_exited","payload":{"block_id":"block:new-1","exit_code":1}}"#;
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"events\" ]; then\n    printf '%s\\n' '{}'\n    exit 0\n  fi\ndone\nexit 2\n",
+            line
+        );
+        let _guard = RexBinGuard::install(&script);
+        let rex = Rex::resolve().expect("REX_BIN_DIR/rex");
+        let child = rex.spawn(&events_args(None)).expect("events stream");
+        let mut stream = RexEventStream::start(child, Vec::new()).expect("stream");
+        stream.set_timeout(Some(Duration::from_secs(2)));
+        let got = stream.next_line().expect("line").expect("one line");
+        let exit = child_exit_from_line(&got).expect("child_exited parses");
+        assert_eq!(exit.0, "block:new-1");
+        assert_eq!(exit.1, 1, "the code is the verdict: {exit:?}");
+        assert_ne!(exit.1, 0, "nonzero is failure, never success: {exit:?}");
+        // A status line is not an exit and must never read as one.
+        assert_eq!(
+            child_exit_from_line(r#"{"records":[{"state":"idle"}]}"#),
+            None
+        );
+    }
+
+    /// D: no event inside the bound is `unknown` — explicitly not success.
+    /// A headless wait that times out must never print ready.
+    #[test]
+    fn no_child_exit_inside_the_bound_is_unknown_never_success() {
+        let script = "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"events\" ]; then\n    exit 0\n  fi\ndone\nexit 2\n";
+        let _guard = RexBinGuard::install(script);
+        let rex = Rex::resolve().expect("REX_BIN_DIR/rex");
+        let child = rex.spawn(&events_args(None)).expect("events stream");
+        let mut stream = RexEventStream::start(child, Vec::new()).expect("stream");
+        stream.set_timeout(Some(Duration::from_secs(2)));
+        let end = stream.next_line().expect("eof reads clean");
+        assert!(end.is_none(), "closed stream, no event: {end:?}");
+        let outcome: Option<(String, i32)> = end.and_then(|l| child_exit_from_line(&l));
+        let word = match outcome {
+            Some((_, 0)) => "success",
+            Some(_) => "exited nonzero",
+            None => "unknown",
+        };
+        assert_eq!(word, "unknown");
+        assert_ne!(word, "success", "a timed-out wait is never success");
+    }
+
     /// A child that ignores `--timeout` is killed. That is an interruption,
     /// not `rex_failed`.
     #[test]
@@ -1225,5 +1599,86 @@ exit 2
         let message = err.into_backend().to_string();
         assert!(message.contains("interrupted"), "{message}");
         assert!(!message.contains("rex_failed"), "{message}");
+    }
+
+    /// E: pure shape — a complete list passes, an empty one is unknown
+    /// (never skew), a list omitting `block.close` names it.
+    #[test]
+    fn missing_api_method_names_the_gap() {
+        let full = "run\nsession.new_split\nsession.set_block_label\nblock.close\nwrite\nsend-key\nevents\nsession.list\nsession.kill\n";
+        assert_eq!(missing_api_method(full), None);
+        assert_eq!(missing_api_method(""), None);
+        assert_eq!(missing_api_method("   \n"), None);
+        let without_close = full.replace("block.close\n", "");
+        assert_eq!(missing_api_method(&without_close), Some("block.close"));
+    }
+
+    const VERSION_FAKE: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> @@LOG@@
+for arg in "$@"; do
+  if [ "$arg" = "list" ]; then
+    printf '%s\n' @@METHODS@@
+    exit 0
+  fi
+done
+echo "boom: method_not_found" >&2
+exit 3
+"#;
+
+    /// E: a failing call against a server that omits `block.close` is
+    /// `rex_version_skew` naming the method. The guard is held for the whole
+    /// test and the cache is reset on both sides, so no other fake can slip
+    /// in mid-flight and no probe result can leak out.
+    #[test]
+    fn version_skew_names_the_missing_method() {
+        reset_api_cache();
+        let missing = VERSION_FAKE.replace(
+            "@@METHODS@@",
+            "'run' 'session.set_block_label' 'write' 'send-key' 'events' 'session.list' 'session.kill'",
+        );
+        let guard = RexBinGuard::install(&missing);
+        let rex = Rex::resolve().expect("REX_BIN_DIR/rex");
+        let err = rex.run(&ls_args()).expect_err("fake always fails");
+        assert!(
+            matches!(err, RexFail::VersionSkew { method } if method == "block.close"),
+            "skew names block.close: {err:?}"
+        );
+        let backend_err = err.into_backend();
+        assert!(
+            backend_err.to_string().contains("block.close"),
+            "the message names the method: {backend_err}"
+        );
+        assert!(
+            backend_err.to_string().contains("rex_version_skew"),
+            "the code is skew, not rex_failed: {backend_err}"
+        );
+        let log = guard.log_text();
+        for flag in ["api", "list", "-q"] {
+            assert!(log.contains(flag), "one cached probe: {log}");
+        }
+        reset_api_cache();
+    }
+
+    /// E: against a complete list the original `rex_failed` stands — no
+    /// skew accusation. Same lock/cache discipline as above.
+    #[test]
+    fn complete_api_list_keeps_the_original_failure() {
+        reset_api_cache();
+        let full = VERSION_FAKE.replace(
+            "@@METHODS@@",
+            "'run' 'session.set_block_label' 'block.close' 'write' 'send-key' 'events' 'session.list' 'session.kill'",
+        );
+        let _guard = RexBinGuard::install(&full);
+        let rex = Rex::resolve().expect("REX_BIN_DIR/rex");
+        let err = rex.run(&ls_args()).expect_err("fake always fails");
+        assert!(
+            matches!(err, RexFail::Exited { .. }),
+            "a complete list keeps the original failure: {err:?}"
+        );
+        assert!(
+            err.into_backend().to_string().contains("rex_failed"),
+            "no skew accusation on a complete list"
+        );
+        reset_api_cache();
     }
 }
