@@ -713,11 +713,13 @@ pub(crate) fn model_fallback_intent(
             profile_name: role.to_string(),
             model: profile_model.to_string(),
             harness: harness.to_string(),
+            location: crate::agent_ref::BindingLocation::Pane,
         },
         crate::agent_ref::AgentBinding {
             profile_name: role.to_string(),
             model: route.model_id.clone(),
             harness: route.harness.clone(),
+            location: crate::agent_ref::BindingLocation::Pane,
         },
         // The gate above is RateLimit, so the reason kind is fixed here.
         crate::agent_ref::RebindReason::ModelFallback {
@@ -5457,11 +5459,13 @@ mod pane_registry_fallback_tests {
                 profile_name: "coder".to_string(),
                 model: "fleet/claude-opus-4".to_string(),
                 harness: "claude".to_string(),
+                location: crate::agent_ref::BindingLocation::Pane,
             },
             crate::agent_ref::AgentBinding {
                 profile_name: "coder".to_string(),
                 model: "openai/gpt-5.2".to_string(),
                 harness: "claude".to_string(),
+                location: crate::agent_ref::BindingLocation::Pane,
             },
             crate::agent_ref::RebindReason::ModelFallback {
                 kind: "rate_limit".into(),

@@ -203,6 +203,15 @@ impl AgentRef {
     }
 }
 
+/// Where a binding lives. Pane (default) or Hosted (no block).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BindingLocation {
+    #[default]
+    Pane,
+    Hosted,
+}
+
 /// Replaceable binding — changes only through journaled rebind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentBinding {
@@ -211,6 +220,8 @@ pub struct AgentBinding {
     pub model: String,
     #[serde(default)]
     pub harness: String,
+    #[serde(default)]
+    pub location: BindingLocation,
 }
 
 impl AgentBinding {
@@ -219,6 +230,7 @@ impl AgentBinding {
             profile_name: profile_name.into(),
             model: String::new(),
             harness: String::new(),
+            location: BindingLocation::Pane,
         }
     }
 }
@@ -230,6 +242,25 @@ pub enum RebindReason {
     CaptainRequest { note: String },
     ProfileFallback { kind: String, evidence: String },
     ModelFallback { kind: String, evidence: String },
+}
+
+/// Latest settled binding location for a pin (ADR-0019 D1). Scans the
+/// project log for rebind intents; no settled row means `Pane` — a pin
+/// becomes hosted only by an explicit rebind, never by absence.
+pub fn binding_location_for(project: &str, pin: &str) -> BindingLocation {
+    let Ok(log) = crate::state::read_log(project) else {
+        return BindingLocation::Pane;
+    };
+    let mut loc = BindingLocation::Pane;
+    for e in log.iter() {
+        let Ok(intent): Result<RebindIntent, _> = serde_json::from_value(e.data.clone()) else {
+            continue;
+        };
+        if intent.agent.pin == pin && intent.state == EffectState::Settled {
+            loc = intent.to.location;
+        }
+    }
+    loc
 }
 
 /// Effect-journal states for one agent-lifecycle effect — a rebind attempt

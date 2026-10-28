@@ -67,6 +67,13 @@ pub enum SendError {
         token: String,
         why: String,
     },
+    /// ADR-0019 D12: the sender has not arrived in this project, or the
+    /// address names another project. Refused, not parked (mail has no
+    /// steer payload to park).
+    Unarrived {
+        token: String,
+        why: String,
+    },
     AmbiguousAddress {
         token: String,
         why: String,
@@ -92,6 +99,9 @@ impl std::fmt::Display for SendError {
             ),
             Self::UnknownAddress { token, why } => {
                 write!(f, "unknown address {token}: {why} (nothing sent)")
+            }
+            Self::Unarrived { token, why } => {
+                write!(f, "unarrived {token}: {why} (nothing sent)")
             }
             Self::AmbiguousAddress { token, why } => write!(
                 f,
@@ -295,6 +305,9 @@ pub struct SentRow {
     pub offset: Option<u64>,
     /// `rung`, `no-pane`, `skipped: ...`, or `failed: ...`.
     pub wake: String,
+    /// ADR-0019 D5 delivery word, from the single constructor
+    /// `captain_directory::delivery_of` — never a second reading of `wake`.
+    pub delivery: String,
 }
 
 /// Rounds a send may take when a concurrent sender's epoch claim fences it
@@ -509,6 +522,9 @@ pub async fn append_task(
                 state,
                 offset,
                 wake: String::new(),
+                // Stamped by stamp_delivery() once the wake arms ran; empty
+                // here means unstamped, never a delivery claim.
+                delivery: String::new(),
             }
         })
         .collect())
@@ -635,6 +651,27 @@ pub struct Request<'a> {
     pub task: TaskV1,
 }
 
+/// ADR-0019 D12, pure: an address naming another project is refused.
+/// Mail has no steer payload to park, so a cross-project send never parks.
+fn cross_project_refusal(
+    req_project: &str,
+    tokens: &[String],
+    parsed: &[Address],
+) -> Option<SendError> {
+    tokens
+        .iter()
+        .zip(parsed.iter())
+        .find_map(|(token, addr)| match addr {
+            Address::Pin {
+                project: Some(p), ..
+            } if p.as_str() != req_project => Some(SendError::Unarrived {
+                token: token.clone(),
+                why: format!("address names project {p}, not {req_project}"),
+            }),
+            _ => None,
+        })
+}
+
 /// Resolve, append once, ring. Returns the rows (one per recipient).
 pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
     if !enabled(cfg) {
@@ -658,12 +695,27 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
         .iter()
         .map(|t| parse_address(t))
         .collect::<Result<_, _>>()?;
+    // ADR-0019 D12: an address naming another project is refused before
+    // any I/O — mail never parks cross-project.
+    if let Some(refusal) = cross_project_refusal(req.project, &tokens, &parsed) {
+        return Err(refusal.into());
+    }
     let sender_tok = sender_token(req.from, &|k| std::env::var(k).ok())?;
     let store = store()?;
     let mb = crate::mail::mailbox();
     let project = req.project.to_string();
     let (sender, recipients) = crate::mail::block_on(async {
-        let sender = resolve(mb, &project, &sender_tok).await?;
+        // ADR-0019 D12: a sender that does not resolve in this project has
+        // not arrived in it — refused with `unarrived`, not retried.
+        let sender = resolve(mb, &project, &sender_tok)
+            .await
+            .map_err(|e| match e {
+                SendError::UnknownAddress { token, why } => SendError::Unarrived {
+                    token,
+                    why: format!("sender has not arrived in {project}: {why}"),
+                },
+                other => other,
+            })?;
         let mut out = Vec::new();
         for t in &tokens {
             out.push((t.clone(), resolve(mb, &project, t).await?));
@@ -693,6 +745,8 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
                 Some(pin) => wake_via_backend(cfg, &store, &project, pin, &row.npub),
             };
         }
+        let pins: Vec<Option<&str>> = parsed.iter().map(|a| a.pin()).collect();
+        stamp_delivery(&project, &mut rows, &pins);
         return Ok(rows);
     }
     let mut herdr = crate::herdr::Client::connect(Some(&cfg.socket_path()));
@@ -732,6 +786,8 @@ pub fn send(cfg: &Config, req: Request<'_>) -> Result<Vec<SentRow>> {
             },
         };
     }
+    let pins: Vec<Option<&str>> = parsed.iter().map(|a| a.pin()).collect();
+    stamp_delivery(&project, &mut rows, &pins);
     Ok(rows)
 }
 
@@ -857,6 +913,113 @@ fn wake_target(c: &mut crate::herdr::Client, project: &str, pin: &str) -> Result
 /// The rows as the CLI's JSON.
 pub fn rows_json(rows: &[SentRow]) -> Value {
     json!({ "via": "inbox", "sent": rows })
+}
+
+/// ADR-0019 D5: delivery word for one sent row, from the single constructor.
+/// `wake` is evidence of the prompt attempt only through this mapping —
+/// a test that reads `wake` as proof of delivery must fail against
+/// `delivery` instead.
+fn append_of(state: &str) -> crate::captain_directory::AppendState {
+    use crate::captain_directory::AppendState;
+    if state == "appended" {
+        AppendState::Appended
+    } else if state == "already-appended" {
+        AppendState::AlreadyAppended
+    } else {
+        // Anything else (unknown, empty) reads as no-append; `refused`
+        // never reaches here (append_of_row maps it first).
+        AppendState::Unknown
+    }
+}
+
+/// Refused appends never reach here with a prompt word; anything starting
+/// `refused` is the refusal, and the delivery word stays out of it.
+fn append_of_row(row: &SentRow) -> crate::captain_directory::AppendState {
+    use crate::captain_directory::AppendState;
+    if row.state.starts_with("refused") {
+        AppendState::Refused
+    } else {
+        append_of(&row.state)
+    }
+}
+
+/// Prompt facts read off the wake line: (live pane, prompt supported,
+/// prompt outcome). `None` outcome = not asked (or not answered): no-pane,
+/// skipped, left-to-host, and Skip notes never claim a prompt. A Skip note
+/// (`no <cap> door for harness ...`) still means the pane was found — the
+/// door is closed, not the pane gone.
+fn wake_facts(wake: &str) -> (bool, bool, Option<bool>) {
+    if wake.starts_with("rung") {
+        (true, true, Some(true))
+    } else if wake.starts_with("failed:") {
+        (true, true, Some(false))
+    } else if wake.contains("left to the doorbell host") {
+        (true, true, None)
+    } else if wake.starts_with("no-pane") || wake.starts_with("skipped:") {
+        (false, false, None)
+    } else if wake.starts_with("no ") && wake.contains("door for harness") {
+        // Skip note: the target resolved, but the harness door is closed.
+        (true, false, None)
+    } else {
+        // Anything unrecognized: claim nothing — never invent `woke`.
+        (false, false, None)
+    }
+}
+
+/// Tier snapshot for one mail recipient. Turn never applies on the send
+/// path (no hook fires here); hosted location comes from the binding.
+fn tier_of_recipient(
+    project: &str,
+    pin: Option<&str>,
+    live: bool,
+    prompt_supported: bool,
+) -> crate::captain_directory::Tier {
+    use crate::captain_directory::{Tier, TierSnapshot};
+    let Some(pin) = pin else {
+        return Tier::Unknown;
+    };
+    let registry = crate::state::load_spawn_registry(project);
+    let entry = registry
+        .iter()
+        .find(|e| e.mail_identity.as_deref() == Some(pin));
+    let kind = entry.and_then(|e| e.harness.clone()).unwrap_or_default();
+    let caps = crate::harness_caps::TABLE
+        .iter()
+        .find(|c| c.harness == kind.as_str());
+    let location_hosted = crate::agent_ref::binding_location_for(project, pin)
+        == crate::agent_ref::BindingLocation::Hosted;
+    crate::captain_directory::tier_of(&TierSnapshot {
+        live_block: live,
+        prompt_supported,
+        hook_some: caps.is_some_and(|c| c.hook.is_some()),
+        verified_some: caps.is_some_and(|c| c.verified_by.is_some()),
+        pin_registered: entry.is_some(),
+        location_hosted,
+        has_block: live,
+        // Rows exist only when comms is on (send() refuses otherwise).
+        inbox_enabled: true,
+        rex_degraded: false,
+        positive_no_receiver: false,
+    })
+}
+
+/// Stamp every row's delivery word. Pure over the rows + pins; the only
+/// I/O is the registry/binding reads the tier needs (same sources the
+/// wake arms already consulted).
+fn stamp_delivery(project: &str, rows: &mut [SentRow], pins: &[Option<&str>]) {
+    use crate::captain_directory::delivery_of;
+    for (row, pin) in rows.iter_mut().zip(pins.iter()) {
+        let (live, prompt_supported, prompt) = wake_facts(&row.wake);
+        // A degraded read (backend unavailable) is Unknown, never None.
+        let tier = if row.wake.starts_with("skipped:") {
+            crate::captain_directory::Tier::Unknown
+        } else {
+            tier_of_recipient(project, *pin, live, prompt_supported)
+        };
+        row.delivery = delivery_of(append_of_row(row), tier, prompt)
+            .as_str()
+            .to_string();
+    }
 }
 
 /// Pure: the `task@1` body for a free-text send (title = first line).
@@ -1586,5 +1749,93 @@ mod tests {
             listed_agent("block:c", None, Some("TealOtter")),
         ];
         assert!(backend_wake_target(&two, "TealOtter").is_err());
+    }
+
+    /// ADR-0019 D5: wake lines map to prompt facts; only a `rung` claims
+    /// a prompt. Skip notes and unrecognized lines never invent one.
+    #[test]
+    fn wake_facts_map_only_rung_to_prompted() {
+        assert_eq!(wake_facts("rung wm 1a2b"), (true, true, Some(true)));
+        assert_eq!(wake_facts("failed: timeout"), (true, true, Some(false)));
+        assert_eq!(
+            wake_facts("left to the doorbell host (budgeted, level-triggered)"),
+            (true, true, None)
+        );
+        assert_eq!(wake_facts("no-pane (no live block)"), (false, false, None));
+        assert_eq!(
+            wake_facts("skipped: backend unavailable (x)"),
+            (false, false, None)
+        );
+        assert_eq!(
+            wake_facts("no inject door for harness grok: fall back to mail (x)"),
+            (true, false, None)
+        );
+        assert_eq!(wake_facts("mystery"), (false, false, None));
+    }
+
+    /// ADR-0019 D12: an address naming another project is refused with
+    /// `unarrived`, never resolved cross-project.
+    #[test]
+    fn cross_project_send_is_unarrived() {
+        let tokens = vec!["Pin@other".to_string(), "Pin".to_string()];
+        let parsed = vec![
+            Address::Pin {
+                pin: "Pin".to_string(),
+                project: Some("other".to_string()),
+            },
+            Address::Pin {
+                pin: "Pin".to_string(),
+                project: None,
+            },
+        ];
+        let refusal =
+            cross_project_refusal("here", &tokens, &parsed).expect("cross-project refuses");
+        assert!(matches!(refusal, SendError::Unarrived { .. }));
+        assert!(
+            refusal.to_string().contains("unarrived"),
+            "the code is the result: {refusal}"
+        );
+        assert!(cross_project_refusal("here", &tokens[1..], &parsed[1..]).is_none());
+        assert!(cross_project_refusal("other", &tokens[..1], &parsed[..1]).is_none());
+    }
+
+    /// ADR-0019 D5: delivery comes from the single constructor, not from a
+    /// reading of `wake`. A row the doorbell host owns is `queued` even
+    /// though mail was accepted — a wake-only test (`wake` contains rung)
+    /// does not pass on it.
+    #[test]
+    fn sent_rows_carry_the_delivery_word() {
+        fn row(state: &str, wake: &str) -> SentRow {
+            SentRow {
+                to: "Pin".to_string(),
+                npub: "npub".to_string(),
+                msg_id: "m".to_string(),
+                state: state.to_string(),
+                offset: None,
+                wake: wake.to_string(),
+                delivery: String::new(),
+            }
+        }
+        let mut rows = vec![
+            row("appended", "rung wm 1a2b"),
+            row(
+                "appended",
+                "left to the doorbell host (budgeted, level-triggered)",
+            ),
+            row("appended", "failed: timeout"),
+            row("refused: fenced out", "no-pane (x)"),
+        ];
+        let pins = vec![None, None, None, None];
+        stamp_delivery("no-such-project", &mut rows, &pins);
+        // No registry rows: unregistered pins read Unknown tier. Rung still
+        // means the prompt returned ok — that is `woke` on unknown tier.
+        assert_eq!(rows[0].delivery, "woke");
+        // Accepted by toron, never shown: queued. The wake line alone would
+        // call this delivered; the word says otherwise.
+        assert_eq!(rows[1].delivery, "queued");
+        assert!(!rows[1].wake.contains("rung"));
+        assert_eq!(rows[2].delivery, "queued");
+        // Refusals carry the code, never a delivery word.
+        assert_eq!(rows[3].delivery, "denied");
     }
 }

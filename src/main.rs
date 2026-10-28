@@ -31,6 +31,7 @@ mod authority;
 mod backend;
 mod briefing;
 mod builtin_workflows;
+mod captain_directory;
 mod captain_slot;
 mod catalog_tui;
 mod cli_args;
@@ -1603,6 +1604,10 @@ enum Commands {
         /// payload is a typed conflict.
         #[arg(long)]
         request_key: Option<String>,
+        /// act as this pin (ADR-0019 D10: a pin whose binding location is
+        /// hosted parks for operator approval instead of dispatching)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
     },
     /// Unified workflow surface (ADR-0005 Spec 5 / P3.7) — catalog, lint,
     /// run, scaffold, history, and auto-crew preview. One vocabulary, one
@@ -2456,7 +2461,10 @@ fn resolve_agents(c: &mut Client, ws_id: &str, project: &str, to: &str) -> Resul
 /// (they're herdr-specific and don't need backend-agnosticism yet — migrating
 /// them is churn with no payoff until superlogical ships). The two overloads
 /// share the helper bodies via macros-free duplication (small, narrow).
-fn find_workspace_dyn(backend: &dyn backend::MultiplexerBackend, project: &str) -> Result<String> {
+pub(crate) fn find_workspace_dyn(
+    backend: &dyn backend::MultiplexerBackend,
+    project: &str,
+) -> Result<String> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
     let matches: Vec<herdr::WorkspaceInfo> = backend
         .workspace_list()?
@@ -2914,6 +2922,8 @@ fn main() {
             "send interrupt view output watch zoom attach kill",
             "crew preview|control (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker)",
             "captain watch <project> [--interval N] [--json] [--as <pin>] [--stall --stall-minutes N] [--preflight --preflight-mode steer|loop|workflow|cron] (bd-captain-watch-poll-exit-bbwm: harness resume on the captain inbox. The push is escalate@1 mail from the supervisor. This command blocks on that inbox's water and exits with a preview when strictly-newer mail lands; --stall also exits 0 when every bead is closed, or exits 3 when no pane is working and no commit landed for the threshold with work remaining; an unreadable fleet never alarms; --preflight adds an arm that exits 4 with the FIRST failing check and its remedy line, checked at arm time and each poll. One shot: re-arm after each resume)",
+            "captain directory <project> [--json] (ADR-0019 D2/D4: read-only sessions, tiers, and per-pin addressability — ok <key> or err <code> — from the pure directory projection over an explicitly selected rex backend; never auto/herdr on this path)",
+            "captain approve <project> --request-key <key> --decision approve|deny [--note <text>] --as <operator-pin> (ADR-0019 D10: verify the operator via whois, mail the asker the 4-line body, fetch-back verify, rehash the payload, run it or settle denied; missing row, self-approval, or unverified sender is approval_mismatch, never a dispatch)",
             "loop-mode (alias: loop) run (--resume replays a killed run's checkpoints; default is FRESH) / supervise (child-process --once pass cadence, stops after 3 consecutive failures; a dead-stop probe each pass emits ONE loud escalation + one captain page when no pane is working and no commit landed for --stall-minutes, default 45, with work remaining — a recovering fleet clears it without a second; bd-pane-wedge-detect-respawn-pnyi: a per-pane wedge probe reads each registered pin's pane tail + process liveness and pages ONCE per wedge naming the pin, the pane, and the parked error line, cleared when a commit lands — herdr exposes no CPU counter, so zero-CPU is read as its observable equivalent, process still alive + nothing moved) / status/list/prune/doctor/replay/why work assign collab xproj mail toron steer ledger principles artifacts judgment",
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
@@ -3513,6 +3523,7 @@ fn main() {
             json,
             yes,
             request_key,
+            as_agent,
         }) => preflight_gate(
             &cfg,
             cli.skip_preflight,
@@ -3532,6 +3543,7 @@ fn main() {
                 *json,
                 *yes,
                 request_key.as_deref(),
+                as_agent.as_deref(),
             )
         }),
         Some(Commands::Workflow { cmd }) => {
@@ -6823,6 +6835,41 @@ mod adr0013_spawn_effect_tests {
             add.contains("add_effect.settle("),
             "the add row settles with its own evidence"
         );
+    }
+
+    /// ADR-0019 D10: the approved payload runs the same goal delegate as a
+    /// local steer, with empty crew/reuse meaning absent. Pure command
+    /// construction — execution stays downstream.
+    #[test]
+    fn approved_payload_builds_the_goal_delegate() {
+        let payload = crate::request_receipts::SteerPayload {
+            objective: "o".to_string(),
+            crew: "-".to_string(),
+            direct: true,
+            reuse: "-".to_string(),
+            retain: false,
+            retire_orphans: false,
+            project: "flywheel".to_string(),
+            bead_id: None,
+        };
+        let (name, inputs, crew, execute, mode, project) = match crate::approved_run_cmd(&payload) {
+            crate::cmd::workflow::WorkflowCmd::Run {
+                name,
+                inputs,
+                crew,
+                execute,
+                mode,
+                project,
+                ..
+            } => (name, inputs, crew, execute, mode, project),
+            _ => panic!("approved steer must run the goal delegate"),
+        };
+        assert_eq!(name, "goal-direct");
+        assert!(execute);
+        assert_eq!(mode, "pane");
+        assert_eq!(project.as_deref(), Some("flywheel"));
+        assert_eq!(crew, None, "absent crew stays absent, never \"-\"");
+        assert!(inputs.unwrap_or_default().contains("\"objective\":\"o\""));
     }
 
     /// bd-4fgc: the steer door is effectful (a MaterialContext fact plus a
@@ -17107,6 +17154,7 @@ fn cmd_arrive(
         presence_fresh: !whois_stale,
         last_wake_fresh: snap.dispatcher == "up",
         pane_alive,
+        pull_fresh: false,
         override_pin: captain_override.map(str::to_string),
     };
     let action = captain_slot::next_action(&ev, arriver);
@@ -17330,6 +17378,7 @@ fn captain_fold_health_line(
         presence_fresh: !whois_stale,
         last_wake_fresh: dispatcher_up,
         pane_alive,
+        pull_fresh: false,
         override_pin: override_pin.map(str::to_string),
     };
     let heartbeat_fresh = ev
@@ -17851,6 +17900,7 @@ fn cmd_binding_rebind(
         profile_name: entry.profile.clone().unwrap_or_default(),
         model: entry.model.clone().unwrap_or_default(),
         harness: entry.harness.clone().unwrap_or_default(),
+        location: agent_ref::BindingLocation::Pane,
     };
     let to = agent_ref::AgentBinding {
         profile_name: profile
@@ -17862,6 +17912,13 @@ fn cmd_binding_rebind(
         harness: harness
             .map(str::to_string)
             .unwrap_or_else(|| from.harness.clone()),
+        // Hosted only via the captain-request note (ADR-0019 D1); every
+        // other rebind path stays Pane.
+        location: if note.unwrap_or("").contains("location=hosted") {
+            agent_ref::BindingLocation::Hosted
+        } else {
+            agent_ref::BindingLocation::Pane
+        },
     };
     if profile.is_none() && model.is_none() && harness.is_none() {
         bail!("binding-rebind: pass --profile and/or --model and/or --harness");
@@ -18484,6 +18541,9 @@ fn cmd_send_rex(
                 || e.pane_id == target
                 || e.name == name
         });
+        // ADR-0019 D5: hosted pins have no pane to prompt — they stay queued.
+        let hosted =
+            agent_ref::binding_location_for(project, &name) == agent_ref::BindingLocation::Hosted;
         let (send_text, cond_profile, skills_injected) = match &catalog {
             Ok(c) => condition_send_target(entry, c, text, raw),
             Err(e) => {
@@ -18516,6 +18576,7 @@ fn cmd_send_rex(
                         &a.pane_id,
                         cond_profile.as_deref(),
                         settled.as_deref(),
+                        hosted,
                     ));
                 }
                 Err(e) => {
@@ -18549,6 +18610,7 @@ fn cmd_send_rex(
                 &a.pane_id,
                 cond_profile.as_deref(),
                 None,
+                hosted,
             ));
         }
         if std::io::stdout().is_terminal() {
@@ -18799,6 +18861,9 @@ fn cmd_send(
         // actionable error naming the recovery commands.
         let mut target = agent_target(a).to_string();
         let name = a.name.clone().unwrap_or_else(|| target.clone());
+        // ADR-0019 D5: hosted pins have no pane to prompt — they stay queued.
+        let hosted =
+            agent_ref::binding_location_for(project, &name) == agent_ref::BindingLocation::Hosted;
         // bd-98gd: condition THIS target with its profile's behavior preamble
         // (+ skill-load prefix on first dispatch). Raw only when the target
         // has no profiled entry, its profile is unknown, or --raw was passed
@@ -19045,6 +19110,7 @@ fn cmd_send(
             &a.pane_id,
             cond_profile.as_deref(),
             wait.then_some(status),
+            hosted,
         ));
     }
 
@@ -19217,6 +19283,7 @@ fn send_result_row(
     pane_id: &str,
     profile: Option<&str>,
     settled: Option<&str>,
+    hosted: bool,
 ) -> Value {
     let mut v = json!({
         "target": target,
@@ -19232,6 +19299,22 @@ fn send_result_row(
     } else {
         v["landed"] = json!(false);
     }
+    // ADR-0019 D5: every send result carries delivery. Dispatched to a live
+    // pane without an observed ok is queued; an observed settle on a pane
+    // wakes it. Hosted pins have no pane to prompt — they stay queued.
+    let tier = if hosted {
+        crate::captain_directory::Tier::Pull
+    } else {
+        crate::captain_directory::Tier::Push
+    };
+    v["delivery"] = json!(
+        crate::captain_directory::delivery_of(
+            crate::captain_directory::AppendState::Appended,
+            tier,
+            settled.map(|_| true),
+        )
+        .as_str()
+    );
     v
 }
 
@@ -19258,6 +19341,9 @@ fn wait_failure_row(
     if let Some(s) = observed_status {
         v["observed_status"] = json!(s);
     }
+    // ADR-0019 D5: timeout/stall between claim and settle is Unknown —
+    // never an invented ok, never a silent queue.
+    v["delivery"] = json!(crate::captain_directory::Delivery::Unknown.as_str());
     v
 }
 
@@ -19426,12 +19512,17 @@ fn wait_failure_exit(
         .is_some_and(|s| wait_advance_landed(a.agent_status, s))
     {
         let status = observed.as_deref().unwrap_or("working");
+        // ADR-0019 D5: the prompt was observed to land — woke, unless the
+        // pin is hosted (no pane to prompt, stays queued).
+        let hosted =
+            agent_ref::binding_location_for(project, name) == agent_ref::BindingLocation::Hosted;
         results.push(send_result_row(
             target,
             a.agent_status.as_str(),
             &a.pane_id,
             profile,
             Some(status),
+            hosted,
         ));
         emit(results);
         eprintln!(
@@ -23992,7 +24083,7 @@ fn parse_inprogress_beads_json(raw: &str) -> Result<Vec<durable::ReadyBead>> {
 
 /// Run `br ready --json` in the project dir, returning the ready beads.
 /// Caller decides how to treat an error (the sync loop soft-fails).
-fn load_ready_beads(cfg: &Config, project: &str) -> Result<Vec<durable::ReadyBead>> {
+pub(crate) fn load_ready_beads(cfg: &Config, project: &str) -> Result<Vec<durable::ReadyBead>> {
     let dir = project_dir(cfg, project);
     let out = std::process::Command::new("br")
         .args(["ready", "--json"])
@@ -24009,7 +24100,10 @@ fn load_ready_beads(cfg: &Config, project: &str) -> Result<Vec<durable::ReadyBea
 }
 
 /// Run `br list --status in_progress --json` in the project dir.
-fn load_inprogress_beads(cfg: &Config, project: &str) -> Result<Vec<durable::ReadyBead>> {
+pub(crate) fn load_inprogress_beads(
+    cfg: &Config,
+    project: &str,
+) -> Result<Vec<durable::ReadyBead>> {
     let dir = project_dir(cfg, project);
     let out = std::process::Command::new("br")
         .args(["list", "--status", "in_progress", "--json"])
@@ -24087,7 +24181,7 @@ fn live_reservation_holders(cfg: &Config, project: &str) -> Vec<(String, String)
 
 /// Live `(path, reason, holder)` rows. The resume fold uses these for
 /// `file_blocks_bead`. A mail hiccup is an empty board, never a false block.
-fn live_file_rows(cfg: &Config, project: &str) -> Vec<(String, String, String)> {
+pub(crate) fn live_file_rows(cfg: &Config, project: &str) -> Vec<(String, String, String)> {
     let Ok(key) = project_dir_str(cfg, project) else {
         return Vec::new();
     };
@@ -24923,6 +25017,59 @@ fn cmd_loop(
                     }
                     inprog_items.extend(to_resume);
                     inprog_now = inprog;
+                    // ADR-0019 D9: file-hold notice. An in-progress bead
+                    // suppressed by file_blocks_bead tells its holder once
+                    // per (bead, holder) per 15 minutes through the same
+                    // resume-window store. The watermark is written only
+                    // after toron accepts the mail; a refused mail retries
+                    // next pass.
+                    for b in &inprog_now {
+                        let pane = b.assignee.as_deref().unwrap_or("");
+                        let intended =
+                            durable::path_tokens(&format!("{} {}", b.title, b.description));
+                        if !durable::file_blocks_bead(&b.id, &file_rows, pane, &intended) {
+                            continue;
+                        }
+                        let Some((holder, pattern)) =
+                            durable::file_hold_notice(&b.id, &file_rows, pane, &intended)
+                        else {
+                            continue;
+                        };
+                        let hold_key = format!("filehold\x1f{}\x1f{}", b.id, holder);
+                        if window.get(&hold_key).is_some_and(|t| {
+                            now_us.saturating_sub(*t)
+                                < request_receipts::FILE_HOLD_WINDOW_SECS as i64 * 1_000_000
+                        }) {
+                            continue;
+                        }
+                        let args = toron_core::mailbox::messaging::SendMessage {
+                            project_slug: project.to_string(),
+                            sender_name: "captain".to_string(),
+                            to: vec![holder.clone()],
+                            subject: format!("[file-hold] {}", b.id),
+                            body_md: format!("bead={}\npath={}", b.id, pattern),
+                            ..Default::default()
+                        };
+                        match crate::mail::block_on(crate::mail::comms_mailbox()?.send_message(&args)) {
+                            Ok(_) => {
+                                if let Err(e) = state::update_locked(
+                                    &state::resume_window_file(project),
+                                    |map: &mut std::collections::BTreeMap<String, i64>| {
+                                        map.insert(hold_key.clone(), now_us);
+                                    },
+                                ) {
+                                    eprintln!(
+                                        "flywheel: file-hold watermark for {} failed (continuing): {e:#}",
+                                        b.id
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "flywheel: file-hold mail for {} to {holder} refused (retry next pass): {e:#}",
+                                b.id
+                            ),
+                        }
+                    }
                 }
                 Err(e) => eprintln!("flywheel: br inprogress failed (continuing): {e:#}"),
             }
@@ -30267,6 +30414,266 @@ fn packed_from_flag(
     crew::pack_inferred(&inferred, &req, max).map_err(|e| anyhow!(e))
 }
 
+/// Mail the asker a one-way approval notice (expiry). The body is a notice,
+/// never an approval: `decision=expired` does not parse as approve/deny.
+fn mail_approval_notice(project: &str, asker: &str, key: &str) -> Result<()> {
+    let body = request_receipts::approval_body(key, "expired", "approval wait bound elapsed", None);
+    let args = toron_core::mailbox::messaging::SendMessage {
+        project_slug: project.to_string(),
+        sender_name: asker.to_string(),
+        to: vec![asker.to_string()],
+        subject: "[approval] expired".to_string(),
+        body_md: body,
+        ..Default::default()
+    };
+    crate::mail::block_on(crate::mail::comms_mailbox()?.send_message(&args))?;
+    Ok(())
+}
+
+/// ADR-0019 D9 steer-side verdict for a bead-targeted objective.
+#[derive(Debug, PartialEq)]
+pub(crate) enum HoldVerdict {
+    /// No bead target, no hold, or holder already told: proceed.
+    Clear,
+    /// Held and the holder has a fresh notice (or one inside the window).
+    Held,
+    /// The holder could not be told: leave the slot `Unknown`, never claim
+    /// the steer happened.
+    Unknown(String),
+}
+
+/// ADR-0019 D9 steer-side check: a steer targeting an existing bead
+/// (`bead:<id>` objective) checks before its first pane write. Held mails
+/// the holder (once per window, same store as the loop) and stops the
+/// steer without dispatch.
+pub(crate) fn check_bead_file_hold(
+    cfg: &Config,
+    project_owned: &str,
+    objective: &str,
+) -> Result<HoldVerdict> {
+    let Some(bead_id) = objective
+        .trim()
+        .strip_prefix("bead:")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(HoldVerdict::Clear);
+    };
+    let mut target: Option<(String, String, String)> = None;
+    for beads in [
+        load_inprogress_beads(cfg, project_owned),
+        load_ready_beads(cfg, project_owned),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(b) = beads.iter().find(|b| b.id == bead_id) {
+            target = Some((
+                b.title.clone(),
+                b.description.clone(),
+                b.assignee.clone().unwrap_or_default(),
+            ));
+            break;
+        }
+    }
+    let Some((title, description, pane)) = target else {
+        return Ok(HoldVerdict::Clear);
+    };
+    let intended = durable::path_tokens(&format!("{title} {description}"));
+    let file_rows = live_file_rows(cfg, project_owned);
+    if !durable::file_blocks_bead(bead_id, &file_rows, &pane, &intended) {
+        return Ok(HoldVerdict::Clear);
+    }
+    let Some((holder, pattern)) = durable::file_hold_notice(bead_id, &file_rows, &pane, &intended)
+    else {
+        return Ok(HoldVerdict::Unknown(format!(
+            "target bead {bead_id} is file-held but no holder is named"
+        )));
+    };
+    let now_us = chrono::Utc::now().timestamp_micros();
+    let hold_key = format!("filehold\x1f{bead_id}\x1f{holder}");
+    if state::load_resume_window(project_owned)
+        .get(&hold_key)
+        .is_some_and(|t| {
+            now_us.saturating_sub(*t) < request_receipts::FILE_HOLD_WINDOW_SECS as i64 * 1_000_000
+        })
+    {
+        return Ok(HoldVerdict::Held);
+    }
+    let args = toron_core::mailbox::messaging::SendMessage {
+        project_slug: project_owned.to_string(),
+        sender_name: "captain".to_string(),
+        to: vec![holder.clone()],
+        subject: format!("[file-hold] {bead_id}"),
+        body_md: format!("bead={bead_id}\npath={pattern}"),
+        ..Default::default()
+    };
+    match crate::mail::block_on(crate::mail::comms_mailbox()?.send_message(&args)) {
+        Ok(_) => {
+            if let Err(e) = state::update_locked(
+                &state::resume_window_file(project_owned),
+                |map: &mut std::collections::BTreeMap<String, i64>| {
+                    map.insert(hold_key, now_us);
+                },
+            ) {
+                eprintln!("flywheel: file-hold watermark for {bead_id} failed (continuing): {e:#}");
+            }
+            Ok(HoldVerdict::Held)
+        }
+        Err(e) => Ok(HoldVerdict::Unknown(format!(
+            "holder mail for {bead_id} refused: {e:#}"
+        ))),
+    }
+}
+
+/// ADR-0019 D10 hosted park arm. The caller is hosted (`location == hosted`
+/// for `--as`, no rex block). New key: write `Prepared` then `Parked` with
+/// the typed payload and return handled — no fact, no dispatch. Same key
+/// while parked: `in_flight`. Past the bound: settle `Unknown` with
+/// `approval_expired` and mail the asker. A denied key replays
+/// `approval_denied` and never dispatches. Returns true when the steer is
+/// fully answered here; false means the normal gate path continues.
+#[allow(clippy::too_many_arguments)]
+fn cmd_steer_hosted_park(
+    project_owned: &str,
+    pin: &str,
+    objective: &str,
+    direct: bool,
+    crew: Option<&str>,
+    reuse: Option<&str>,
+    retain: bool,
+    retire_orphans: bool,
+    request_key: Option<&str>,
+) -> Result<bool> {
+    let key = request_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| {
+            anyhow!("steer: hosted pin {pin} parks for approval — pass --request-key <key>")
+        })?;
+    let slot = request_receipts::door_slot(project_owned, "steer", key);
+    let payload = request_receipts::SteerPayload {
+        objective: objective.to_string(),
+        crew: crew.unwrap_or("-").to_string(),
+        direct,
+        reuse: reuse.unwrap_or("-").to_string(),
+        retain,
+        retire_orphans,
+        project: project_owned.to_string(),
+        bead_id: None,
+    };
+    let digest = payload.digest();
+    match request_receipts::load_door_receipt(project_owned, "steer", &slot) {
+        None => {
+            if request_receipts::has_other_parked_steer(project_owned, pin, &slot) {
+                print_json(&json!({
+                    "approval": "in_flight",
+                    "request_key": key,
+                    "slot": slot,
+                    "reason": "another steer is already parked for this pin",
+                }));
+                bail!(
+                    "steer: a parked steer is already awaiting approval for pin {pin} — in_flight"
+                );
+            }
+            request_receipts::park_steer(project_owned, &slot, &digest, payload, pin)?;
+            print_json(&json!({
+                "approval": "required",
+                "request_key": key,
+                "slot": slot,
+                "asker": pin,
+            }));
+            eprintln!(
+                "flywheel: steer parked for operator approval (slot {slot}) — run `flywheel captain approve {project_owned} --request-key {key} --as <operator-pin> --decision approve|deny`"
+            );
+            Ok(true)
+        }
+        Some(row) if row.state == agent_ref::EffectState::Parked => {
+            let parked_at = row.parked_at_ms.ok_or_else(|| {
+                anyhow!(
+                    "steer: parked row for slot {slot} has no park timestamp — approval_mismatch"
+                )
+            })?;
+            if request_receipts::approval_expired(parked_at, request_receipts::now_ms()) {
+                let mut expired = row;
+                expired.state = agent_ref::EffectState::Unknown;
+                expired.evidence = Some("approval_expired".to_string());
+                request_receipts::journal_door_row(project_owned, &expired)?;
+                mail_approval_notice(project_owned, pin, key)?;
+                print_json(&json!({
+                    "approval": "expired",
+                    "request_key": key,
+                    "slot": slot,
+                }));
+                return Ok(true);
+            }
+            print_json(&json!({
+                "approval": "in_flight",
+                "request_key": key,
+                "slot": slot,
+            }));
+            bail!("steer: slot {slot} is parked awaiting approval — in_flight");
+        }
+        Some(row)
+            if row.state == agent_ref::EffectState::Settled
+                && row.evidence.as_deref() == Some("denied") =>
+        {
+            print_json(&json!({
+                "approval": "approval_denied",
+                "request_key": key,
+                "slot": slot,
+                "replay": true,
+            }));
+            eprintln!(
+                "flywheel: steer key already denied (slot {slot}) — approval_denied, not dispatching"
+            );
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Build the workflow command an approved payload runs. Pure: the same
+/// `goal`/`goal-direct` delegate `cmd_steer` uses, with the payload's
+/// fields. Empty crew/reuse (`""`/`"-"`) mean absent, as the park arm
+/// stores them.
+pub(crate) fn approved_run_cmd(payload: &request_receipts::SteerPayload) -> WorkflowCmd {
+    let crew = (!payload.crew.is_empty() && payload.crew != "-").then(|| payload.crew.clone());
+    let reuse = (!payload.reuse.is_empty() && payload.reuse != "-").then(|| payload.reuse.clone());
+    steer_run_cmd(
+        &payload.objective,
+        payload.direct,
+        crew.as_deref(),
+        Some(payload.project.as_str()),
+        reuse.as_deref(),
+        payload.retain,
+        payload.retire_orphans,
+        false,
+        &[],
+        &[],
+    )
+}
+
+/// Run a payload the operator approved (ADR-0019 D10). No briefing —
+/// approval IS the gate. No receipt gate — the parked row already gated
+/// this slot. The dispatch tail duplicates `cmd_steer`'s on purpose:
+/// `the_steer_receipt_gate_precedes_dispatch` owns `cmd_steer`'s shape, so
+/// the shared tail cannot move without breaking that fence.
+pub(crate) fn run_approved_steer(
+    cfg: &Config,
+    payload: &request_receipts::SteerPayload,
+) -> Result<()> {
+    let summary = format!("AUTHORITATIVE OPERATOR OBJECTIVE: {}", payload.objective);
+    append_pending_fact(&crate::config::state_dir(), &payload.project, &summary).map_err(|e| {
+        anyhow!(
+            "approve: could not queue material MaterialContext fact for project {}: {e:#}",
+            payload.project
+        )
+    })?;
+    let run = approved_run_cmd(payload);
+    cmd_workflow(cfg, &run)
+}
+
 /// clap command signature — params map 1:1 to CLI flags (ADR-0002 CLI surface).
 #[allow(clippy::too_many_arguments)]
 fn cmd_steer(
@@ -30281,6 +30688,7 @@ fn cmd_steer(
     json: bool,
     yes: bool,
     request_key: Option<&str>,
+    as_agent: Option<&str>,
 ) -> Result<()> {
     if objective.trim().is_empty() {
         bail!("steer: objective must not be empty");
@@ -30302,6 +30710,34 @@ fn cmd_steer(
         eprintln!("flywheel: steer: inheriting --project={project_owned} from workspace cwd");
     }
     let project: Option<&str> = Some(project_owned.as_str());
+    // ADR-0019 D10 hosted steer: `location == hosted` for `--as` with no
+    // rex block in this process. A local shell steer (no `--as`) stays the
+    // operator's steer and never parks.
+    let hosted_pin: Option<&str> = match as_agent {
+        Some(pin)
+            if request_receipts::is_hosted_caller()
+                && agent_ref::binding_location_for(&project_owned, pin)
+                    == agent_ref::BindingLocation::Hosted =>
+        {
+            Some(pin)
+        }
+        _ => None,
+    };
+    if let Some(pin) = hosted_pin
+        && cmd_steer_hosted_park(
+            &project_owned,
+            pin,
+            objective,
+            direct,
+            crew,
+            reuse,
+            retain,
+            retire_orphans,
+            request_key,
+        )?
+    {
+        return Ok(());
+    }
     // bd-4fgc: a steer is an effectful dispatch (a MaterialContext fact plus a
     // workflow run), so it carries the same request-key receipt as the pane
     // doors. The slot is namespaced per door, so a steer key never names a halt
@@ -30436,6 +30872,29 @@ fn cmd_steer(
             }
         }
     }
+    // ADR-0019 D9: a bead-targeted steer checks the hold before its first
+    // pane write. Held stops the steer without dispatch; the slot settles
+    // file_held only after toron accepted the holder mail.
+    match check_bead_file_hold(cfg, &project_owned, objective)? {
+        HoldVerdict::Clear => {}
+        HoldVerdict::Held => {
+            if let Some(g) = steer_receipt.take() {
+                g.settle_file_held();
+            }
+            print_json(&json!({
+                "file_hold": true,
+                "objective": objective,
+            }));
+            eprintln!("flywheel: steer: target bead is file-held — not dispatching");
+            return Ok(());
+        }
+        HoldVerdict::Unknown(msg) => {
+            if let Some(g) = steer_receipt.take() {
+                g.mark_unknown(&msg);
+            }
+            bail!("steer: file-hold check could not notify the holder: {msg}");
+        }
+    }
     // bd-t86p: ONE compose call — the goal workflow (bead-tracked) or its
     // direct arm (non-bead targets: no tracker, no plan approval gate). The
     // delegate is the full `workflow run --execute --mode pane` machinery:
@@ -30457,7 +30916,7 @@ fn cmd_steer(
     let out = cmd_workflow(cfg, &run);
     if let Some(g) = steer_receipt.take() {
         match &out {
-            Ok(()) => g.settle("steer workflow run dispatched"),
+            Ok(()) => g.settle(request_receipts::Delivery::Queued),
             // The dispatch was attempted and its outcome is unobservable from
             // here: Unknown, never an invented Settled.
             Err(e) => g.mark_unknown(&format!("steer dispatch failed: {e:#}")),
@@ -35419,11 +35878,13 @@ fn cmd_internal_run_headless(
                         profile_name: profile_name.to_string(),
                         model: model_id.clone(),
                         harness: harness.to_string(),
+                        location: agent_ref::BindingLocation::Pane,
                     },
                     agent_ref::AgentBinding {
                         profile_name: next_profile.clone(),
                         model: fb_model_id.clone(),
                         harness: fb_harness.to_string(),
+                        location: agent_ref::BindingLocation::Pane,
                     },
                     agent_ref::RebindReason::ProfileFallback {
                         kind: cf.kind.to_string(),
@@ -41409,7 +41870,14 @@ mod send_result_row_tests {
     /// agent was idle at dispatch. No `landed` without --wait/--confirm.
     #[test]
     fn fire_and_forget_row_is_dispatched_not_landed() {
-        let row = send_result_row("flywheel-toron-coder", "idle", "w1:p1", Some("coder"), None);
+        let row = send_result_row(
+            "flywheel-toron-coder",
+            "idle",
+            "w1:p1",
+            Some("coder"),
+            None,
+            false,
+        );
         assert_eq!(row["target"], "flywheel-toron-coder");
         assert_eq!(row["dispatched"], true, "dispatch is recorded");
         assert_eq!(
@@ -41422,6 +41890,8 @@ mod send_result_row_tests {
             "no bare status field to misread as a miss"
         );
         assert_eq!(row["landed"], false, "landing only after --wait/--confirm");
+        // ADR-0019 D5: dispatched without an observed ok is queued.
+        assert_eq!(row["delivery"], "queued");
     }
 
     /// bd-pin-public-plane-s-easy.9: --wait/--confirm adds `landed: true` +
@@ -41429,12 +41899,21 @@ mod send_result_row_tests {
     /// settled state), not just dispatched.
     #[test]
     fn wait_row_reports_landed_with_settled_status() {
-        let row = send_result_row("flywheel-toron-coder", "idle", "w1:p1", None, Some("done"));
+        let row = send_result_row(
+            "flywheel-toron-coder",
+            "idle",
+            "w1:p1",
+            None,
+            Some("done"),
+            false,
+        );
         assert_eq!(row["dispatched"], true);
         assert_eq!(row["receipt"], true);
         assert_eq!(row["prior_status"], "idle");
         assert_eq!(row["landed"], true, "--wait observed landing");
         assert_eq!(row["settled_status"], "done");
+        // ADR-0019 D5: an observed settle on a pane wakes it.
+        assert_eq!(row["delivery"], "woke");
     }
 
     /// bd-pin-public-plane-s-easy.9: a working agent at target time is a
@@ -41442,9 +41921,18 @@ mod send_result_row_tests {
     /// failure (the captain false-fail root cause).
     #[test]
     fn row_preserves_working_prior_status() {
-        let row = send_result_row("flywheel-toron-coder", "working", "w1:p1", None, None);
+        let row = send_result_row(
+            "flywheel-toron-coder",
+            "working",
+            "w1:p1",
+            None,
+            None,
+            false,
+        );
         assert_eq!(row["dispatched"], true);
         assert_eq!(row["prior_status"], "working");
+        // ADR-0019 D5: delivery rides every row.
+        assert_eq!(row["delivery"], "queued");
     }
 
     /// bd-adr0006-cosmetic-sweep-q0g0: a confirm TIMEOUT is AMBIGUOUS (the
@@ -41664,6 +42152,8 @@ mod send_receipt {
         let row = wait_failure_row("flywheel-oc", "idle", "%3", None, None);
         assert!(row.get("observed_status").is_none());
         assert!(row["profile"].is_null());
+        // ADR-0019 D5: timeout between claim and settle is Unknown.
+        assert_eq!(row["delivery"], "unknown");
     }
 
     /// bd-8vci: the wait-failure error must read as ambiguous (prompt MAY

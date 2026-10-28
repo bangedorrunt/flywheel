@@ -2601,7 +2601,7 @@ pub fn queue_halt(
     )?;
     println!("queued halt for {project} under sup_epoch {epoch}");
     if let Some(g) = receipt {
-        g.settle(&format!("halt queued sup_epoch={epoch}"));
+        g.settle(crate::request_receipts::Delivery::Queued);
     }
     Ok(())
 }

@@ -11,6 +11,7 @@ pub struct CaptainEvidence {
     pub presence_fresh: bool,
     pub last_wake_fresh: bool,
     pub pane_alive: bool,
+    pub pull_fresh: bool,
     /// explicit operator override pin (always wins)
     pub override_pin: Option<String>,
 }
@@ -26,7 +27,7 @@ pub enum CaptainAction {
 pub fn holder_stale(ev: &CaptainEvidence) -> bool {
     match &ev.holder {
         None => true,
-        Some(_) => !(ev.presence_fresh || ev.last_wake_fresh || ev.pane_alive),
+        Some(_) => !(ev.presence_fresh || ev.last_wake_fresh || ev.pane_alive || ev.pull_fresh),
     }
 }
 
@@ -64,7 +65,7 @@ pub fn rebind_hint(ev: &CaptainEvidence, heartbeat_fresh: bool) -> Option<String
     if ev.override_pin.is_some() {
         return None; // explicit override wins; nothing to offer
     }
-    if ev.pane_alive || ev.last_wake_fresh || heartbeat_fresh {
+    if ev.pane_alive || ev.last_wake_fresh || heartbeat_fresh || ev.pull_fresh {
         return None; // a live signal backs the holder
     }
     // Kept only because roster-presence says fresh.
@@ -148,6 +149,7 @@ mod tests {
             presence_fresh: false,
             last_wake_fresh: false,
             pane_alive: false,
+            pull_fresh: false,
             override_pin: None,
         }
     }

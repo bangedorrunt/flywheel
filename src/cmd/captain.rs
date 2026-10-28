@@ -17,6 +17,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use serde_json::{Value, json};
 
+use crate::backend::MultiplexerBackend as _;
 use crate::config::Config;
 use crate::mail::MailInboxFilter;
 use crate::output::print_json;
@@ -54,6 +55,34 @@ pub(crate) enum CaptainCmd {
         #[arg(long, default_value = "loop")]
         preflight_mode: String,
     },
+    /// approve (or deny) a parked hosted steer (ADR-0019 D10): verify the
+    /// operator, mail the asker the 4-line body, rehash the payload, and run
+    /// it. A missing row, self-approval, or an unverified sender is
+    /// approval_mismatch — never a dispatch.
+    Approve {
+        project: String,
+        /// request key of the parked steer
+        #[arg(long)]
+        request_key: String,
+        /// approve or deny
+        #[arg(long)]
+        decision: String,
+        /// one-line note, cut at 500 chars with the cut marked
+        #[arg(long, default_value = "")]
+        note: String,
+        /// act as this operator pin (must differ from the asker)
+        #[arg(long = "as")]
+        as_agent: Option<String>,
+    },
+    /// show the captain directory (ADR-0019 D2/D4): sessions, tiers, and
+    /// addressability for this project's pins. Read-only: no dispatch,
+    /// no journal.
+    Directory {
+        project: String,
+        /// emit one JSON object instead of the human table
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
@@ -89,6 +118,21 @@ pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
                 pf,
             )
         }
+        CaptainCmd::Approve {
+            project,
+            request_key,
+            decision,
+            note,
+            as_agent,
+        } => cmd_captain_approve(
+            cfg,
+            project,
+            request_key,
+            decision,
+            note,
+            as_agent.as_deref(),
+        ),
+        CaptainCmd::Directory { project, json } => cmd_captain_directory(cfg, project, *json),
     }
 }
 
@@ -369,6 +413,542 @@ fn inbox_rows(mail: &crate::mail::Mail, key: &str, since: Option<&str>) -> Resul
     Ok(v.as_array().cloned().unwrap_or_default())
 }
 
+/// ADR-0019 D2/D4: one pin's directory inputs, loaded by the CLI.
+struct DirPin {
+    pin: String,
+    harness: String,
+    pane_id: Option<String>,
+    location_hosted: bool,
+    live: bool,
+    registered: bool,
+}
+
+/// ADR-0019 D2/D4: pure directory assembly over caller-loaded rows. No I/O,
+/// no clock: the CLI loads, this projects with `tier_of`,
+/// `project_directory`, `session_key`, and `resolve_address`.
+fn assemble_directory(
+    pins: &[DirPin],
+    beads: &[(String, Option<String>)],
+    file_rows: &[(String, String, String)],
+) -> (
+    Vec<crate::captain_directory::Session>,
+    bool,
+    Vec<(String, String)>,
+) {
+    use crate::captain_directory as dir;
+    let bead_ids: std::collections::BTreeSet<&str> =
+        beads.iter().map(|(id, _)| id.as_str()).collect();
+    let mut sessions: Vec<dir::Session> = pins
+        .iter()
+        .map(|p| {
+            let block_id = p.pane_id.as_deref().filter(|id| id.starts_with("block:"));
+            let caps = crate::harness_caps::row(p.harness.as_str());
+            let tier = dir::tier_of(&dir::TierSnapshot {
+                live_block: p.live,
+                prompt_supported: p.live,
+                hook_some: caps.is_some_and(|c| c.hook.is_some()),
+                verified_some: caps.is_some_and(|c| c.verified_by.is_some()),
+                pin_registered: p.registered,
+                location_hosted: p.location_hosted,
+                has_block: p.live,
+                inbox_enabled: true,
+                rex_degraded: false,
+                positive_no_receiver: false,
+            });
+            let mut s = dir::Session::new(
+                p.pin.clone(),
+                dir::session_key(
+                    p.location_hosted,
+                    &p.pin,
+                    (!p.harness.is_empty()).then_some(p.harness.as_str()),
+                    None,
+                    block_id,
+                    p.pane_id.as_deref(),
+                    false,
+                ),
+                tier,
+            );
+            s.location_hosted = p.location_hosted;
+            s.pane_id = p.pane_id.clone();
+            s
+        })
+        .collect();
+    sessions.sort_by(|a, b| {
+        (a.pin.clone(), a.session_key.clone()).cmp(&(b.pin.clone(), b.session_key.clone()))
+    });
+    let (directory, truncated) = dir::project_directory(sessions.clone());
+    let _ = directory;
+    // Addressability per pin. Peer holds are viewer-relative, so the
+    // directory reports file holds globally; the sender is the pin itself
+    // when arrived, else the first arrived pin (else the lookup itself is
+    // unarrived, which is the honest answer for a stranger).
+    let bead_assignee: std::collections::BTreeMap<String, String> = beads
+        .iter()
+        .filter_map(|(id, a)| a.clone().map(|a| (id.clone(), a)))
+        .collect();
+    let file_held: std::collections::BTreeSet<String> = file_rows
+        .iter()
+        .filter(|(_, reason, holder)| !holder.is_empty() && bead_ids.contains(reason.as_str()))
+        .map(|(_, reason, _)| reason.clone())
+        .collect();
+    let arrived: std::collections::BTreeSet<String> = pins
+        .iter()
+        .filter(|p| p.registered || p.live)
+        .map(|p| p.pin.clone())
+        .collect();
+    let fallback_sender = arrived.iter().next().cloned().unwrap_or_default();
+    let snap = dir::DirSnapshot {
+        sessions: sessions.clone(),
+        bead_assignee,
+        peer_held_beads: std::collections::BTreeSet::new(),
+        file_held_beads: file_held,
+        arrived_pins: arrived,
+    };
+    let address = pins
+        .iter()
+        .map(|p| {
+            let sender = if snap.arrived_pins.contains(&p.pin) {
+                p.pin.clone()
+            } else {
+                fallback_sender.clone()
+            };
+            let word = match dir::resolve_address(&snap, &p.pin, &sender) {
+                Ok(s) => format!("ok {}", s.session_key),
+                Err(e) => format!("err {}", e.code()),
+            };
+            (p.pin.clone(), word)
+        })
+        .collect();
+    (sessions, truncated, address)
+}
+
+/// ADR-0019 D2/D4 read-only directory.
+///
+/// `flywheel captain directory <project> [--json]`
+fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<()> {
+    // Explicit rex backend on this path: `auto` would return herdr when
+    // REX_SESSION is unset, and herdr has no blocks to project.
+    let backend = crate::backend::superlogical::SuperlogicalBackend;
+    let ws_id = crate::find_workspace_dyn(&backend, project)?;
+    let agents = backend
+        .agent_list()
+        .map_err(|e| anyhow::anyhow!("captain directory: rex backend unavailable: {e:#}"))?;
+    let registry = crate::state::load_spawn_registry(project);
+    let mut pins: Vec<DirPin> = Vec::new();
+    for e in &registry {
+        let pin = e.mail_identity.clone().unwrap_or_else(|| e.name.clone());
+        if pins.iter().any(|p: &DirPin| p.pin == pin) {
+            continue;
+        }
+        let pane_id = if e.pane_id.is_empty() {
+            None
+        } else {
+            Some(e.pane_id.clone())
+        };
+        let live = pane_id.as_deref().is_some_and(|pane| {
+            agents
+                .iter()
+                .any(|a| a.workspace_id == ws_id && a.pane_id == *pane)
+        });
+        pins.push(DirPin {
+            location_hosted: crate::agent_ref::binding_location_for(project, &pin)
+                == crate::agent_ref::BindingLocation::Hosted,
+            pin,
+            harness: e.harness.clone().unwrap_or_default(),
+            pane_id,
+            live,
+            registered: true,
+        });
+    }
+    for a in agents.iter().filter(|a| a.workspace_id == ws_id) {
+        let Some(name) = a.name.clone() else { continue };
+        if pins.iter().any(|p: &DirPin| p.pin == name) {
+            continue;
+        }
+        pins.push(DirPin {
+            location_hosted: crate::agent_ref::binding_location_for(project, &name)
+                == crate::agent_ref::BindingLocation::Hosted,
+            pin: name,
+            harness: String::new(),
+            pane_id: Some(a.pane_id.clone()),
+            live: true,
+            registered: false,
+        });
+    }
+    let mut beads: Vec<(String, Option<String>)> = Vec::new();
+    for bs in [
+        crate::load_inprogress_beads(cfg, project),
+        crate::load_ready_beads(cfg, project),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for b in bs {
+            if !beads.iter().any(|(id, _)| id == &b.id) {
+                beads.push((b.id, b.assignee));
+            }
+        }
+    }
+    let file_rows = crate::live_file_rows(cfg, project);
+    let (sessions, truncated, address) = assemble_directory(&pins, &beads, &file_rows);
+    if json_out {
+        print_json(&json!({
+            "project": project,
+            "sessions": sessions,
+            "truncated": truncated,
+            "address": address.iter().cloned().collect::<std::collections::BTreeMap<String, String>>(),
+        }));
+    } else {
+        for (pin, word) in &address {
+            let tier = sessions
+                .iter()
+                .find(|s| &s.pin == pin)
+                .map(|s| format!("{:?}", s.tier))
+                .unwrap_or_else(|| "?".to_string());
+            println!("{pin} {tier} {word}");
+        }
+        if truncated {
+            eprintln!("flywheel: directory truncated at 100 sessions");
+        }
+    }
+    Ok(())
+}
+/// The clock is an argument; whois, mail, journal, and dispatch follow in
+/// the caller. `payload_ok` is the re-derived-digest check (deny skips it:
+/// a deny ignores any objective).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApproveGate {
+    Missing,
+    InFlight,
+    Replay,
+    DeniedReplay,
+    NoPayload,
+    NoAsker,
+    Expired,
+    Conflict,
+    Ready,
+}
+
+fn approve_row_gate(
+    row: Option<&crate::request_receipts::DoorReceipt>,
+    payload_ok: bool,
+    now_ms: u64,
+) -> ApproveGate {
+    use crate::agent_ref::EffectState;
+    let Some(row) = row else {
+        return ApproveGate::Missing;
+    };
+    match row.state {
+        EffectState::Settled if row.evidence.as_deref() == Some("denied") => {
+            ApproveGate::DeniedReplay
+        }
+        EffectState::Settled => ApproveGate::Replay,
+        EffectState::Parked => {
+            if row.payload.is_none() {
+                return ApproveGate::NoPayload;
+            }
+            if row.asker.is_none() {
+                return ApproveGate::NoAsker;
+            }
+            let Some(ts) = row.parked_at_ms else {
+                return ApproveGate::NoPayload;
+            };
+            if crate::request_receipts::approval_expired(ts, now_ms) {
+                return ApproveGate::Expired;
+            }
+            if payload_ok {
+                ApproveGate::Ready
+            } else {
+                ApproveGate::Conflict
+            }
+        }
+        _ => ApproveGate::InFlight,
+    }
+}
+
+/// ADR-0019 D10 operator approval.
+///
+/// `flywheel captain approve <project> --request-key <key> --decision
+/// approve|deny --note <text> --as <operator-pin>`
+fn cmd_captain_approve(
+    cfg: &Config,
+    project: &str,
+    request_key: &str,
+    decision: &str,
+    note: &str,
+    as_agent: Option<&str>,
+) -> Result<()> {
+    let approver = as_agent.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "captain approve: --as <operator-pin> is required — approval_required, not a silent allow"
+        )
+    })?;
+    if decision != "approve" && decision != "deny" {
+        anyhow::bail!("captain approve: --decision must be approve|deny, got {decision:?}");
+    }
+    let slot = crate::request_receipts::door_slot(project, "steer", request_key);
+    let row = crate::request_receipts::load_door_receipt(project, "steer", &slot);
+    // Deny ignores any objective; approve requires the payload to re-derive.
+    let payload_ok = decision == "deny"
+        || row
+            .as_ref()
+            .and_then(|r| r.payload.as_ref())
+            .is_some_and(|p| {
+                crate::request_receipts::payload_rederives(
+                    p,
+                    row.as_ref().and_then(|r| r.digest.as_deref()).unwrap_or(""),
+                )
+            });
+    let now_ms = crate::request_receipts::now_ms();
+    match approve_row_gate(row.as_ref(), payload_ok, now_ms) {
+        ApproveGate::Missing => {
+            print_json(&json!({
+                "approval": "mismatch",
+                "request_key": request_key,
+                "slot": slot,
+                "reason": "no parked steer for this key",
+            }));
+            anyhow::bail!(
+                "captain approve: no parked steer for key {request_key:?} — approval_mismatch"
+            );
+        }
+        ApproveGate::InFlight => {
+            print_json(&json!({
+                "approval": "in_flight",
+                "request_key": request_key,
+                "slot": slot,
+            }));
+            anyhow::bail!("captain approve: slot {slot} is not parked — in_flight");
+        }
+        ApproveGate::Replay => {
+            print_json(&json!({
+                "approval": "replay",
+                "request_key": request_key,
+                "slot": slot,
+                "replay": true,
+            }));
+            eprintln!("flywheel: approve: slot {slot} already settled — replay, not dispatching");
+            return Ok(());
+        }
+        ApproveGate::DeniedReplay => {
+            print_json(&json!({
+                "approval": "approval_denied",
+                "request_key": request_key,
+                "slot": slot,
+                "replay": true,
+            }));
+            eprintln!(
+                "flywheel: approve: slot {slot} was denied — approval_denied, not dispatching"
+            );
+            return Ok(());
+        }
+        ApproveGate::NoPayload | ApproveGate::NoAsker => {
+            print_json(&json!({
+                "approval": "mismatch",
+                "request_key": request_key,
+                "slot": slot,
+                "reason": "parked row has no payload or no asker",
+            }));
+            anyhow::bail!(
+                "captain approve: parked row for slot {slot} is incomplete — approval_mismatch, never a guess"
+            );
+        }
+        ApproveGate::Conflict => {
+            print_json(&json!({
+                "approval": "mismatch",
+                "request_key": request_key,
+                "slot": slot,
+                "reason": "payload does not re-derive to the row digest",
+            }));
+            anyhow::bail!("captain approve: payload conflict for slot {slot} — row stays Parked");
+        }
+        ApproveGate::Expired => {
+            let mut row = row.expect("gate saw a row");
+            row.state = crate::agent_ref::EffectState::Unknown;
+            row.evidence = Some("approval_expired".to_string());
+            crate::request_receipts::journal_door_row(project, &row)?;
+            let asker = row.asker.clone().unwrap_or_default();
+            if !asker.is_empty() {
+                let body = crate::request_receipts::approval_body(
+                    request_key,
+                    "expired",
+                    "approval wait bound elapsed",
+                    None,
+                );
+                let args = toron_core::mailbox::messaging::SendMessage {
+                    project_slug: project.to_string(),
+                    sender_name: asker.clone(),
+                    to: vec![asker],
+                    subject: "[approval] expired".to_string(),
+                    body_md: body,
+                    ..Default::default()
+                };
+                crate::mail::block_on(crate::mail::comms_mailbox()?.send_message(&args))?;
+            }
+            print_json(&json!({
+                "approval": "expired",
+                "request_key": request_key,
+                "slot": slot,
+            }));
+            return Ok(());
+        }
+        ApproveGate::Ready => {}
+    }
+    let mut row = row.expect("gate Ready means a row");
+    let payload = row.payload.clone().expect("gate Ready means a payload");
+    let asker = row.asker.clone().expect("gate Ready means an asker");
+    // The operator must be a known identity, and must not be the asker.
+    // npub compare is alias-proof; the pin compare covers unarrived askers.
+    let approver_npub = crate::mail::block_on(crate::mail::comms_mailbox()?.whois(project, approver))
+        .map_err(|_| {
+            anyhow::anyhow!("captain approve: unknown approver {approver:?} — approval_mismatch")
+        })?
+        .npub;
+    let asker_npub = crate::mail::block_on(crate::mail::comms_mailbox()?.whois(project, &asker))
+        .ok()
+        .map(|w| w.npub);
+    if asker == approver || asker_npub.as_deref().is_some_and(|a| a == approver_npub) {
+        print_json(&json!({
+            "approval": "mismatch",
+            "request_key": request_key,
+            "slot": slot,
+            "reason": "asker cannot approve its own steer",
+        }));
+        anyhow::bail!("captain approve: asker cannot approve its own steer — approval_mismatch");
+    }
+    // D12: an asker who has not arrived in this project parks cross-project;
+    // the approval body gains the project line, bound to the steer project.
+    let cross_project = asker_npub.is_none();
+    let body = crate::request_receipts::approval_body(
+        request_key,
+        decision,
+        note,
+        cross_project.then_some(payload.project.as_str()),
+    );
+    let args = toron_core::mailbox::messaging::SendMessage {
+        project_slug: project.to_string(),
+        sender_name: approver.to_string(),
+        to: vec![asker.clone()],
+        subject: format!("[approval] {decision} {request_key}"),
+        body_md: body.clone(),
+        ..Default::default()
+    };
+    let sent = crate::mail::block_on(crate::mail::mailbox().send_message(&args))
+        .map_err(|e| anyhow::anyhow!("captain approve: approval mail not accepted: {e:#}"))?;
+    // The body must parse back: never claim a mail our own verifier rejects.
+    // (Notices skip this — `decision=expired` is not an approval.)
+    if crate::request_receipts::parse_approval_body(&body)
+        .filter(|p| p.decision == decision)
+        .is_none()
+    {
+        anyhow::bail!("captain approve: generated body does not parse — approval_mismatch");
+    }
+    if !sent.verified_sender {
+        print_json(&json!({
+            "approval": "mismatch",
+            "request_key": request_key,
+            "slot": slot,
+            "reason": "surface would not vouch for the sender",
+        }));
+        anyhow::bail!("captain approve: unverified sender — approval_mismatch");
+    }
+    // Fetch-back: the asker's inbox must hold the exact lines authorized.
+    // Delivery that cannot be read back is not claimed.
+    let inbox = crate::mail::block_on(crate::mail::comms_mailbox()?.fetch_inbox(
+        &toron_core::mailbox::messaging::FetchInbox {
+            project_slug: project.to_string(),
+            agent_name: asker.clone(),
+            unread_only: false,
+            limit: Some(10),
+            include_bodies: true,
+            ack_overdue_only: false,
+            urgent_only: false,
+            since_ts: None,
+            thread_id: None,
+        },
+    ))
+    .map_err(|e| anyhow::anyhow!("captain approve: inbox read-back failed: {e:#}"))?;
+    if !inbox
+        .iter()
+        .any(|m| m.sender == approver && m.body_md == body)
+    {
+        print_json(&json!({
+            "approval": "mismatch",
+            "request_key": request_key,
+            "slot": slot,
+            "reason": "approval mail not found in asker inbox",
+        }));
+        anyhow::bail!(
+            "captain approve: approval mail not found in asker inbox — approval_mismatch"
+        );
+    }
+    if decision == "deny" {
+        row.state = crate::agent_ref::EffectState::Settled;
+        row.evidence = Some(
+            crate::captain_directory::Delivery::Denied
+                .as_str()
+                .to_string(),
+        );
+        crate::request_receipts::journal_door_row(project, &row)?;
+        print_json(&json!({
+            "approval": "approval_denied",
+            "request_key": request_key,
+            "slot": slot,
+        }));
+        return Ok(());
+    }
+    // ADR-0019 D9: the approved payload targets an existing bead — check the
+    // hold before the first pane write. Held settles file_held (the mail was
+    // accepted); an untellable holder settles Unknown, never a dispatch.
+    match crate::check_bead_file_hold(cfg, project, &payload.objective)? {
+        crate::HoldVerdict::Clear => {}
+        crate::HoldVerdict::Held => {
+            row.state = crate::agent_ref::EffectState::Settled;
+            row.evidence = Some("file_held".to_string());
+            crate::request_receipts::journal_door_row(project, &row)?;
+            print_json(&json!({
+                "approval": "file_held",
+                "request_key": request_key,
+                "slot": slot,
+            }));
+            eprintln!("flywheel: approve: payload target is file-held — not dispatching");
+            return Ok(());
+        }
+        crate::HoldVerdict::Unknown(msg) => {
+            row.state = crate::agent_ref::EffectState::Unknown;
+            row.evidence = Some(msg.clone());
+            crate::request_receipts::journal_door_row(project, &row)?;
+            anyhow::bail!("captain approve: file-hold check could not notify the holder: {msg}");
+        }
+    }
+    // Approve: Parked -> InFlight, run the payload, settle by outcome.
+    row.state = crate::agent_ref::EffectState::InFlight;
+    crate::request_receipts::journal_door_row(project, &row)?;
+    let out = crate::run_approved_steer(cfg, &payload);
+    let delivery = match &out {
+        Ok(()) => crate::captain_directory::Delivery::Queued,
+        Err(_) => crate::captain_directory::Delivery::Unknown,
+    };
+    match &out {
+        Ok(()) => {
+            row.state = crate::agent_ref::EffectState::Settled;
+        }
+        Err(e) => {
+            row.state = crate::agent_ref::EffectState::Unknown;
+            eprintln!("flywheel: approve: payload dispatch failed: {e:#}");
+        }
+    }
+    row.evidence = Some(delivery.as_str().to_string());
+    crate::request_receipts::journal_door_row(project, &row)?;
+    print_json(&json!({
+        "approval": "approved",
+        "request_key": request_key,
+        "slot": slot,
+        "delivery": delivery.as_str(),
+    }));
+    out.map_err(|e| anyhow::anyhow!("captain approve: payload dispatch failed: {e:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +1083,137 @@ mod tests {
             }),
             StallVerdict::Working
         );
+    }
+
+    /// ADR-0019 D10: approve classifies the loaded row before any I/O.
+    /// Missing is mismatch; settled replays (denied replays as
+    /// approval_denied); parked needs payload + asker + timestamp, then
+    /// expiry, then the rehash; anything unresolved is in_flight.
+    #[test]
+    fn approve_row_gate_classifies_before_io() {
+        use crate::agent_ref::EffectState;
+        use crate::request_receipts::{DoorReceipt, SteerPayload};
+
+        fn parked() -> DoorReceipt {
+            let mut r = DoorReceipt::prepare("steer", "s", "d");
+            r.state = EffectState::Parked;
+            r.payload = Some(SteerPayload {
+                objective: "o".to_string(),
+                crew: String::new(),
+                direct: false,
+                reuse: String::new(),
+                retain: false,
+                retire_orphans: false,
+                project: "p".to_string(),
+                bead_id: None,
+            });
+            r.asker = Some("asker".to_string());
+            r.parked_at_ms = Some(1_000);
+            r
+        }
+        let fresh = 1_000 + 60_000;
+        let stale = 1_000 + crate::captain_directory::APPROVAL_WAIT_MS as u64 + 1;
+
+        assert_eq!(approve_row_gate(None, true, fresh), ApproveGate::Missing);
+        let mut settled = parked();
+        settled.state = EffectState::Settled;
+        settled.evidence = Some("queued".to_string());
+        assert_eq!(
+            approve_row_gate(Some(&settled), true, fresh),
+            ApproveGate::Replay
+        );
+        settled.evidence = Some("denied".to_string());
+        assert_eq!(
+            approve_row_gate(Some(&settled), true, fresh),
+            ApproveGate::DeniedReplay
+        );
+        let mut flying = parked();
+        flying.state = EffectState::InFlight;
+        assert_eq!(
+            approve_row_gate(Some(&flying), true, fresh),
+            ApproveGate::InFlight
+        );
+        let mut nopay = parked();
+        nopay.payload = None;
+        assert_eq!(
+            approve_row_gate(Some(&nopay), true, fresh),
+            ApproveGate::NoPayload
+        );
+        let mut noask = parked();
+        noask.asker = None;
+        assert_eq!(
+            approve_row_gate(Some(&noask), true, fresh),
+            ApproveGate::NoAsker
+        );
+        assert_eq!(
+            approve_row_gate(Some(&parked()), true, stale),
+            ApproveGate::Expired
+        );
+        assert_eq!(
+            approve_row_gate(Some(&parked()), false, fresh),
+            ApproveGate::Conflict
+        );
+        assert_eq!(
+            approve_row_gate(Some(&parked()), true, fresh),
+            ApproveGate::Ready
+        );
+    }
+
+    /// ADR-0019 D2/D4: the directory projects tiers, session keys, and
+    /// addressability from loaded rows — no I/O, no clock.
+    #[test]
+    fn directory_assembles_tiers_keys_and_address() {
+        let pins = vec![
+            DirPin {
+                pin: "LivePin".to_string(),
+                harness: "pi".to_string(),
+                pane_id: Some("block:abc".to_string()),
+                location_hosted: false,
+                live: true,
+                registered: true,
+            },
+            DirPin {
+                pin: "HostedPin".to_string(),
+                harness: "grok".to_string(),
+                pane_id: None,
+                location_hosted: true,
+                live: false,
+                registered: true,
+            },
+        ];
+        let (sessions, truncated, address) = assemble_directory(&pins, &[], &[]);
+        assert!(!truncated);
+        let live = sessions.iter().find(|s| s.pin == "LivePin").expect("live");
+        assert_eq!(live.tier, crate::captain_directory::Tier::Push);
+        assert_eq!(live.session_key, "block:block:abc");
+        assert_eq!(
+            address
+                .iter()
+                .find(|(p, _)| p == "LivePin")
+                .map(|(_, w)| w.as_str()),
+            Some("ok block:block:abc")
+        );
+        let hosted = sessions
+            .iter()
+            .find(|s| s.pin == "HostedPin")
+            .expect("hosted");
+        assert_eq!(hosted.tier, crate::captain_directory::Tier::Pull);
+        assert_eq!(hosted.session_key, "hosted:HostedPin");
+        // A file-held bead resolves to its code through the same snapshot.
+        let snap = crate::captain_directory::DirSnapshot {
+            sessions,
+            bead_assignee: [("bd-1".to_string(), "LivePin".to_string())]
+                .into_iter()
+                .collect(),
+            peer_held_beads: std::collections::BTreeSet::new(),
+            file_held_beads: ["bd-1".to_string()].into_iter().collect(),
+            arrived_pins: ["LivePin".to_string(), "HostedPin".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        assert!(matches!(
+            crate::captain_directory::resolve_address(&snap, "bead:bd-1", "LivePin"),
+            Err(e) if e.code() == "file_held"
+        ));
     }
 }

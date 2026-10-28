@@ -103,6 +103,57 @@ pub fn plan_digest(items: &[(String, u32, Option<String>)]) -> String {
     format!("plan:{}", hex::encode(h.finalize()))
 }
 
+/// Delivery word for every send (ADR-0019 D5). Canonical type lives in
+/// `captain_directory` (single constructor, no `From<&str>`); re-exported
+/// here so receipt call sites keep one path. The log stores the word via
+/// `settle`.
+pub use crate::captain_directory::Delivery;
+
+/// Typed steer payload over the digest inputs (ADR-0019 D10). The digest
+/// is re-derived from these typed fields with `payload_digest` — never a
+/// canonical-JSON rehash (serializer byte-stability is nobody's guarantee).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SteerPayload {
+    pub objective: String,
+    #[serde(default)]
+    pub crew: String,
+    #[serde(default)]
+    pub direct: bool,
+    #[serde(default)]
+    pub reuse: String,
+    #[serde(default)]
+    pub retain: bool,
+    #[serde(default)]
+    pub retire_orphans: bool,
+    #[serde(default)]
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bead_id: Option<String>,
+}
+
+impl SteerPayload {
+    pub fn digest(&self) -> String {
+        payload_digest(
+            "steer-v1",
+            &[
+                &self.objective,
+                &self.crew,
+                if self.direct { "direct" } else { "goal" },
+                &self.reuse,
+                if self.retain { "retain" } else { "reap" },
+                if self.retire_orphans {
+                    "orphans"
+                } else {
+                    "keep"
+                },
+            ],
+        )
+    }
+}
+
+/// File-hold notice window: one mail per (bead, holder) per 15 min (D9).
+pub const FILE_HOLD_WINDOW_SECS: u64 = 900;
+
 /// One request-key slot for a door that is NOT an agent lifecycle: a steer
 /// dispatch or a halt. Same four answers as the agent shape (one rule, through
 /// [`gate_core`]), but the row is the door's own, tagged `door_receipt` in the
@@ -116,6 +167,17 @@ pub struct DoorReceipt {
     pub digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// Typed steer payload (D10). Required while a hosted steer is `Parked`;
+    /// old rows read as `None`. Approve never takes a new objective — the
+    /// payload is the only replay source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<SteerPayload>,
+    /// Asker pin recorded at park time; approve refuses when `--as` equals it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asker: Option<String>,
+    /// Park timestamp in unix millis; approve expires past APPROVAL_WAIT_MS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_at_ms: Option<u64>,
 }
 
 impl DoorReceipt {
@@ -126,7 +188,16 @@ impl DoorReceipt {
             state: EffectState::Prepared,
             digest: Some(digest.to_string()),
             evidence: None,
+            payload: None,
+            asker: None,
+            parked_at_ms: None,
         }
+    }
+
+    /// Evidence word recorded at settle time (compat reader for old rows).
+    #[cfg_attr(not(test), allow(dead_code))] // compat reader for pre-payload rows; pinned by test
+    pub fn evidence_word(&self) -> Option<&str> {
+        self.evidence.as_deref()
     }
 }
 
@@ -150,10 +221,19 @@ impl DoorReceiptGuard {
         })
     }
 
-    /// Apply evidence observed (the dispatch really ran): `Settled`.
-    pub fn settle(mut self, evidence: &str) {
-        self.receipt.state = EffectState::Settled;
-        self.receipt.evidence = Some(evidence.to_string());
+    /// Apply delivery word observed (the dispatch really ran): `Settled`.
+    /// The ONLY setter for `Settled` evidence — no `From<&str>` for
+    /// `Delivery`, no direct `.evidence =` outside this module.
+    pub fn settle(mut self, delivery: Delivery) {
+        match delivery {
+            Delivery::Unknown => {
+                self.receipt.state = EffectState::Unknown;
+            }
+            _ => {
+                self.receipt.state = EffectState::Settled;
+            }
+        }
+        self.receipt.evidence = Some(delivery.as_str().to_string());
         let _ = journal_receipt(&self.project, &self.receipt);
     }
 
@@ -170,6 +250,16 @@ impl DoorReceiptGuard {
     pub fn mark_failed(mut self, evidence: &str) {
         self.receipt.state = EffectState::Failed;
         self.receipt.evidence = Some(evidence.to_string());
+        let _ = journal_receipt(&self.project, &self.receipt);
+    }
+
+    /// ADR-0019 D9: file-hold settle. Only after toron accepted the holder
+    /// mail — the steer did not dispatch because the target bead's paths
+    /// are held. `Settled` so a same-key retry replays instead of forking
+    /// a second steer while the hold stands.
+    pub fn settle_file_held(mut self) {
+        self.receipt.state = EffectState::Settled;
+        self.receipt.evidence = Some("file_held".to_string());
         let _ = journal_receipt(&self.project, &self.receipt);
     }
 }
@@ -236,6 +326,88 @@ pub fn load_door_receipt(project: &str, door: &str, slot: &str) -> Option<DoorRe
     })
 }
 
+/// Hosted caller: no rex block in this process (ADR-0019 D5). No block
+/// means `REX_SESSION` empty/unset. A captain sitting in a rex block is
+/// local and never takes the approval park.
+pub fn is_hosted_caller() -> bool {
+    std::env::var("REX_SESSION")
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+}
+
+/// Current unix millis for park timestamps (passed in as arg at pure call
+/// sites; this is the live clock edge only).
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Write `Prepared` then `Parked` with the typed payload (ADR-0019 D10
+/// hosted steer order). A failed journal insert returns the error and leaves
+/// no parked row — the caller must not dispatch.
+pub fn park_steer(
+    project: &str,
+    slot: &str,
+    digest: &str,
+    payload: SteerPayload,
+    asker: &str,
+) -> anyhow::Result<DoorReceipt> {
+    let mut receipt = DoorReceipt::prepare("steer", slot, digest);
+    receipt.payload = Some(payload);
+    receipt.asker = Some(asker.to_string());
+    receipt.parked_at_ms = Some(now_ms());
+    // Prepared first so a crash between writes reads as in-flight, never
+    // as settled.
+    journal_receipt(project, &receipt)?;
+    receipt.state = EffectState::Parked;
+    journal_receipt(project, &receipt)?;
+    Ok(receipt)
+}
+
+/// One parked steer per captain pin: any `Parked` steer receipt in this
+/// project for the same asker with a different slot blocks a second hosted
+/// steer. Only the latest row per slot counts — history rows (a slot that
+/// later settled) do not hold the pin.
+pub fn has_other_parked_steer(project: &str, asker: &str, except_slot: &str) -> bool {
+    let Ok(log) = crate::state::read_log(project) else {
+        return false;
+    };
+    let mut parsed: Vec<DoorReceipt> = Vec::new();
+    for e in log.iter() {
+        let data = &e.data;
+        if data.get("journal").and_then(|v| v.as_str()) != Some("door_receipt") {
+            continue;
+        }
+        let Ok(row): Result<DoorReceipt, _> = serde_json::from_value(data.clone()) else {
+            continue;
+        };
+        parsed.push(row);
+    }
+    latest_parked_other(&parsed, asker, except_slot)
+}
+
+/// Pure core of [`has_other_parked_steer`]: only the latest row per slot
+/// counts — history rows (a slot that later settled) do not hold the pin.
+pub fn latest_parked_other(
+    rows: &[DoorReceipt],
+    asker: &str,
+    except_slot: &str,
+) -> bool {
+    let mut latest: std::collections::BTreeMap<(String, String), &DoorReceipt> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        latest.insert((row.door.clone(), row.slot.clone()), row);
+    }
+    latest.values().any(|row| {
+        row.door == "steer"
+            && row.state == EffectState::Parked
+            && row.slot != except_slot
+            && row.asker.as_deref() == Some(asker)
+    })
+}
+
 /// The last journaled spawn row for `subject`, read from the project event
 /// log. Missing log, unreadable rows, and a row for another phase all read
 /// `None` — an absent receipt is not a settled one.
@@ -250,6 +422,89 @@ pub fn load_spawn_row(project: &str, subject: &str) -> Option<AgentEffect> {
         let row: AgentEffect = serde_json::from_value(data).ok()?;
         (row.subject == subject && row.phase == crate::agent_ref::AgentPhase::Spawn).then_some(row)
     })
+}
+
+/// Journal one door row directly (state transitions the guard does not own:
+/// Parked→InFlight on approve, InFlight→Settled/Denied at the outcome). The
+/// caller owns the transition's validity; the journal only records it.
+pub fn journal_door_row(project: &str, receipt: &DoorReceipt) -> anyhow::Result<()> {
+    journal_receipt(project, receipt)
+}
+
+/// Re-derive check: the parked payload still hashes to the row's digest.
+/// A digest is not reversible, so the payload is the only replay source; a
+/// mismatch is `conflict` and the row stays `Parked`.
+pub fn payload_rederives(payload: &SteerPayload, digest: &str) -> bool {
+    payload.digest() == digest
+}
+
+/// Approval mail body, exactly (ADR-0019 D10). Four lines; a fifth
+/// `project=<slug>` line only for a cross-project hosted steer. The note is
+/// one line, cut at 500 characters with the cut marked.
+pub fn approval_body(
+    request_key: &str,
+    decision: &str,
+    note: &str,
+    project: Option<&str>,
+) -> String {
+    let one_line: String = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = one_line.chars().collect();
+    let cut = if chars.len() > 500 {
+        format!("{} [cut]", chars[..500].iter().collect::<String>())
+    } else {
+        one_line
+    };
+    let mut out =
+        format!("flywheel-approval.v1\nabout={request_key}\ndecision={decision}\nnote={cut}");
+    if let Some(p) = project {
+        out.push_str(&format!("\nproject={p}"));
+    }
+    out
+}
+
+/// Parsed approval body. `None` = `approval_mismatch`: prose that says
+/// "approved" without these lines never authorizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalBody {
+    pub request_key: String,
+    pub decision: String,
+    pub note: String,
+    pub project: Option<String>,
+}
+
+pub fn parse_approval_body(body: &str) -> Option<ApprovalBody> {
+    let mut lines = body.lines();
+    if lines.next()? != "flywheel-approval.v1" {
+        return None;
+    }
+    let about = lines.next()?.strip_prefix("about=")?.to_string();
+    let decision = lines.next()?.strip_prefix("decision=")?.to_string();
+    if decision != "approve" && decision != "deny" {
+        return None;
+    }
+    let note = lines.next()?.strip_prefix("note=")?.to_string();
+    let project = match lines.next() {
+        None => None,
+        Some(l) => Some(l.strip_prefix("project=")?.to_string()),
+    };
+    if lines.next().is_some() {
+        return None;
+    }
+    if about.is_empty() {
+        return None;
+    }
+    Some(ApprovalBody {
+        request_key: about,
+        decision,
+        note,
+        project,
+    })
+}
+
+/// Approval expiry (ADR-0019 D10): past the bound the slot settles `Unknown`
+/// with evidence `approval_expired`. Pure over millis.
+pub fn approval_expired(parked_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(parked_at_ms) > crate::captain_directory::APPROVAL_WAIT_MS as u64
 }
 
 #[cfg(test)]
@@ -443,5 +698,115 @@ mod tests {
             assert_eq!(receipt_gate(Some(&row), &digest), Gate::Proceed);
         }
         assert_eq!(receipt_gate(None, &digest), Gate::Proceed);
+    }
+
+    /// ADR-0019 D10: approval body is exact lines, note cut marked at 500.
+    #[test]
+    fn approval_body_round_trips_and_cuts() {
+        let b = approval_body("k1", "approve", "looks good", None);
+        assert_eq!(
+            b,
+            "flywheel-approval.v1\nabout=k1\ndecision=approve\nnote=looks good"
+        );
+        let p = parse_approval_body(&b).expect("parse");
+        assert_eq!(p.request_key, "k1");
+        assert_eq!(p.decision, "approve");
+        assert_eq!(p.project, None);
+        // Fifth line only cross-project.
+        let bx = approval_body("k2", "deny", "no", Some("toron"));
+        assert!(bx.ends_with("\nproject=toron"));
+        assert_eq!(
+            parse_approval_body(&bx).expect("parse").project,
+            Some("toron".to_string())
+        );
+        // Prose is not approval.
+        assert_eq!(parse_approval_body("approved, ship it"), None);
+        assert_eq!(
+            parse_approval_body("flywheel-approval.v1\nabout=k\ndecision=maybe\nnote=x"),
+            None
+        );
+        // Long note cut at 500 chars with the cut marked, one line.
+        let long = "w ".repeat(400);
+        let bc = approval_body("k3", "approve", &long, None);
+        let note_line = bc.lines().nth(3).expect("note line");
+        assert!(note_line.ends_with(" [cut]"), "cut is marked");
+        assert!(!note_line.contains('\n'));
+        let note_len = note_line
+            .strip_prefix("note=")
+            .expect("prefix")
+            .chars()
+            .count();
+        assert!(note_len <= 500 + " [cut]".len());
+    }
+
+    /// D10: expiry is pure millis math past APPROVAL_WAIT_MS.
+    #[test]
+    fn approval_expiry_bound() {
+        let bound = crate::captain_directory::APPROVAL_WAIT_MS as u64;
+        assert!(!approval_expired(1_000, 1_000 + bound));
+        assert!(approval_expired(1_000, 1_000 + bound + 1));
+    }
+
+    /// The compat reader sees the settled word old rows carry.
+    #[test]
+    fn evidence_word_reads_old_rows() {
+        let mut row = DoorReceipt::prepare("steer", "s", "d");
+        assert_eq!(row.evidence_word(), None);
+        row.evidence = Some("queued".to_string());
+        assert_eq!(row.evidence_word(), Some("queued"));
+    }
+
+    /// D10: history rows do not hold the pin. A slot that parked and later
+    /// settled (denied) must not block a fresh key for the same asker; a
+    /// still-parked other slot must.
+    #[test]
+    fn only_latest_row_per_slot_holds_the_pin() {
+        use crate::agent_ref::EffectState;
+        fn row(slot: &str, state: EffectState, asker: &str) -> DoorReceipt {
+            let mut r = DoorReceipt::prepare("steer", slot, "d");
+            r.state = state;
+            r.asker = Some(asker.to_string());
+            r
+        }
+        // Slot A: parked, then settled denied. Slot B: new key.
+        let history = vec![
+            row("a", EffectState::Prepared, "pin"),
+            row("a", EffectState::Parked, "pin"),
+            row("a", EffectState::Settled, "pin"),
+        ];
+        assert!(
+            !latest_parked_other(&history, "pin", "b"),
+            "a settled slot's parked history must not block a fresh key"
+        );
+        // Slot A parked (latest row Parked), slot B fresh.
+        let parked = vec![row("a", EffectState::Parked, "pin")];
+        assert!(latest_parked_other(&parked, "pin", "b"));
+        assert!(
+            !latest_parked_other(&parked, "other", "b"),
+            "another asker's park does not hold this pin"
+        );
+        assert!(
+            !latest_parked_other(&parked, "pin", "a"),
+            "the slot itself is the caller's own park"
+        );
+    }
+
+    /// D10: payload re-derives to the digest, or the row stays Parked.
+    #[test]
+    fn payload_rederive_matches_or_conflicts() {        let p = SteerPayload {
+            objective: "obj".to_string(),
+            crew: String::new(),
+            direct: false,
+            reuse: String::new(),
+            retain: false,
+            retire_orphans: false,
+            project: "flywheel".to_string(),
+            bead_id: None,
+        };
+        let d = p.digest();
+        assert!(payload_rederives(&p, &d));
+        let mut q = p.clone();
+        q.objective = "changed".to_string();
+        assert!(!payload_rederives(&q, &d));
     }
 }

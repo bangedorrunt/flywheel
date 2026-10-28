@@ -3495,6 +3495,34 @@ pub fn path_tokens(text: &str) -> Vec<String> {
     out
 }
 
+/// ADR-0019 D9: the overlapping other-holder blocking this bead, with the
+/// pattern for the notice body. Own reserved rows first, then bead-named
+/// intended paths. `None` means nothing blocks (or nothing to name).
+pub fn file_hold_notice(
+    bead_id: &str,
+    rows: &[(String, String, String)],
+    self_holder: &str,
+    intended: &[String],
+) -> Option<(String, String)> {
+    let claims: Vec<(String, String)> = rows
+        .iter()
+        .map(|(path, _, holder)| (path.clone(), holder.clone()))
+        .collect();
+    for (path, reason, holder) in rows {
+        if reason == bead_id
+            && holder == self_holder
+            && let Some(other) = other_file_holder(path, &claims, self_holder)
+        {
+            return Some((other.to_string(), path.clone()));
+        }
+    }
+    for path in intended {
+        if let Some(other) = other_file_holder(path, &claims, self_holder) {
+            return Some((other.to_string(), path.clone()));
+        }
+    }
+    None
+}
 /// This bead stops when another pin holds an overlapping path.
 /// `rows` are `(path, reason, holder)`. `intended` is the paths the bead
 /// named and has not reserved yet. An empty holder is not a peer. A bead
@@ -15244,6 +15272,21 @@ mod tests {
             vec!["src/main.rs".to_string()]
         );
         assert!(!file_blocks_bead("bd-1", &files, "", &[]));
+        // ADR-0019 D9: the notice names the other holder and the pattern.
+        // Own rows first: the pattern is our row's path, the holder theirs.
+        assert_eq!(
+            file_hold_notice("bd-1", &files, "Me", &[]),
+            Some(("Other".to_string(), "src/**".to_string()))
+        );
+        assert_eq!(
+            file_hold_notice("bd-2", &files, "Other", &[]),
+            Some(("Me".to_string(), "src/main.rs".to_string()))
+        );
+        assert_eq!(
+            file_hold_notice("bd-9", &files, "Me", &["src/main.rs".to_string()]),
+            Some(("Other".to_string(), "src/main.rs".to_string()))
+        );
+        assert_eq!(file_hold_notice("bd-9", &files, "Nobody", &[]), None);
         assert!(peer_held("bd-peer", &reservations, "MyPane"));
         assert!(
             !peer_held("bd-peer", &reservations, "PeerPane"),

@@ -1,8 +1,8 @@
 <!-- governed-by: ADR-0010, ADR-0011, ADR-0013, ADR-0016, ADR-0018, toron ADR-0015, toron ADR-0018 -->
 ---
-status: proposed
+status: accepted
 date: 2026-10-25
-decision-makers: "Captain (bangedorrunt). Proposed, not accepted. Acceptance is a later word from the operator."
+decision-makers: "Captain (bangedorrunt). Both gates (Contract D0-D7, Policy D8/D10/D12) accepted by the operator in session 2026-10-28; implementation authorized."
 consulted: "reason-network 0.12.12 design study (DESIGN.md, proto.rs, daemon/mail.rs, mcp.rs, skill.md); effect-oriented skill (principles 4, 13, 15); flywheel ADR-0008, ADR-0010, ADR-0011, ADR-0013, ADR-0016, ADR-0018"
 informed: "flywheel, toron, and beads maintainers; every sender on MailSurface; a hosted Grok bot is the first pull client"
 ---
@@ -13,7 +13,7 @@ The filename still says grokbot. That was the first draft. This decision is the 
 
 | Field | Value |
 | --- | --- |
-| **Status** | **Proposed** (2026-10-25). Not accepted. Do not implement past a failing test until the operator accepts this file. |
+| **Status** | **Accepted** (both gates 2026-10-28: Contract D0–D7, Policy D8/D10/D12). Implementation authorized by the operator; a coding agent finding `proposed` in an older copy follows the session word. |
 | **Date** | 2026-10-25 |
 | **Decision-makers** | Captain (bangedorrunt) |
 | **Extends** | [ADR-0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md) (delivery is a receipt, not a hope), [ADR-0011](0011-session-conductor-crew-budget-captain-fcfs-join-loud.md) (captain is FCFS; this adds a paneless freshness bit), [ADR-0013](0013-agent-profile-lifecycle-journaled-rebind.md) (pin and npub stay put; binding gains `location`), [ADR-0016](0016-functional-effect-kernel-redesign.md) (one fold, journal before the provider, four outcomes) |
