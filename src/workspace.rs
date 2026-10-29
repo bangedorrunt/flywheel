@@ -3713,13 +3713,26 @@ mod loop_fold_tests {
     #[test]
     fn loop_fold_no_diagnose_filter() {
         let durable = include_str!("durable.rs");
-        // Check for the specific post-tick filter that was at 6956-6962: filter Diagnose pane_exited
-        let has_filter = durable.contains("filter(|a|")
-            && durable.contains("pane_exited")
-            && durable.contains("poll_actions");
+        // bd-gs8b #4 narrowed (bd-ivno): the deleted shape filtered
+        // Diagnose actions post-tick. A file-wide conjunction of
+        // substrings cannot see its absence — `filter(|a|`,
+        // `pane_exited`, and `poll_actions` all still occur separately
+        // for legitimate reasons — so the fence fires only on a
+        // `.filter(` whose 8-line window mentions Diagnose.
+        let lines: Vec<&str> = durable.lines().collect();
+        let mut violators: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains(".filter(") {
+                let end = (i + 8).min(lines.len());
+                if lines[i..end].join("\n").contains("Diagnose") {
+                    violators.push(i + 1);
+                }
+            }
+        }
         assert!(
-            !has_filter,
-            "RED (bd-gs8b #4): durable.rs still filters Diagnose pane_exited after tick — DELETE the filter"
+            violators.is_empty(),
+            "RED (bd-gs8b #4): durable.rs filters Diagnose post-tick near line(s) {:?} — DELETE the filter",
+            violators
         );
     }
 
