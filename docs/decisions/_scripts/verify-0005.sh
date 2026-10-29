@@ -61,7 +61,11 @@ else
   ok "peer-aware template is not a 5-min idle timer"
 fi
 
-if grep -q 'Loop is bead dispatch, not wake' "$SWARM" || grep -q 'no `loop run` required' "$SWARM"; then
+# bd-verify-greps: normalize whitespace before matching — the template wraps
+# this sentence across two lines ("bead dispatch,\n   not wake"), so a raw
+# line grep reported drift where the words are exactly right.
+SWARM_FLAT=$(tr '\n' ' ' < "$SWARM" | tr -s ' ')
+if printf '%s' "$SWARM_FLAT" | grep -qi 'loop is bead dispatch, not wake' || grep -q 'no `loop run` required' "$SWARM"; then
   ok "swarm playbook: loop optional for peer wake"
 else
   bad "swarm playbook still implies loop is required for peer wake"
@@ -103,8 +107,14 @@ else
   bad "identity_prime missing (SC-D7)"
 fi
 
-if grep -q 'doorbell_sweep_inbox' src/main.rs && grep -q 'parse_inbox_item' src/doorbell.rs; then
-  ok "plane P inbox --since sweep wired"
+# bd-verify-greps: the plane-P inbox sweep moved out of src/main.rs into the
+# inbox host (`run_inbox_only` + `fetch_inbox`), which owns the --since cursor
+# and folds each item through the shared classifier. Same intent, new home:
+# deleting the fetch or the fold still fails this check.
+if grep -q 'fn fetch_inbox' src/doorbell_host.rs \
+   && grep -q 'fn run_inbox_only' src/doorbell_host.rs \
+   && grep -q 'fn parse_inbox_item' crates/doorbell-core/src/lib.rs; then
+  ok "plane P inbox --since sweep wired (inbox host)"
 else
   bad "plane P fetch_inbox sweep missing"
 fi
@@ -115,8 +125,13 @@ else
   bad "PinBudget / take_allowed missing"
 fi
 
-if grep -q 'if !subscribed' src/main.rs; then
-  ok "herdr poll only when subscribe is down"
+# bd-verify-greps: `if !subscribed` belonged to the in-process dispatcher that
+# has since moved into the doorbell daemon. The surviving intent — the event
+# stream is the wake path, and the snapshot poll is only the floor — is
+# ADR-0001(c)'s amended shape, so this check reads the loop's own wiring:
+# both leaves present, with the event batch attached to the tick.
+if grep -q 'poll_events,' src/durable.rs && grep -q 'event_batch' src/durable.rs; then
+  ok "herdr poll is the floor; the event stream is the wake path"
 else
   bad "dispatcher still polls herdr unconditionally"
 fi

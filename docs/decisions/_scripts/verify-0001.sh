@@ -33,7 +33,14 @@ fi
 # (__poll_events leaf, forward-only latency path) AND keeps the heartbeat
 # __poll snapshot as the correctness floor. The old check grepped for the word
 # 'subscribe' which appears in comments — this checks actual call sites.
-if grep -q 'poll_events,' src/durable.rs && grep -q 'poll_swarm,' src/durable.rs; then
+# bd-verify-greps: the call-site SPELLING moved (poll_swarm is registered and
+# invoked through a closure now, so the literal `poll_swarm,` is gone) — the
+# intent did not. Assert the leaf is registered AND the heartbeat path calls
+# it, which is what "both wired" means; deleting either registration still
+# fails this check.
+if grep -q 'poll_events,' src/durable.rs \
+   && grep -q '\.register(poll_swarm)' src/durable.rs \
+   && grep -q 'poll_swarm(' src/durable.rs; then
   ok "event wake + heartbeat poll both wired in swarm_loop"
 else
   bad "swarm_loop missing poll_events wake or poll_swarm heartbeat"
