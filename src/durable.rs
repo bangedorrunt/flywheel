@@ -3587,8 +3587,11 @@ impl WorkAttemptStatus {
     // the annotation fail as soon as something wires these, forcing removal.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "steer-side attempt rendering is unwired until flywheel binds a steer to a bead")
-)]
+        expect(
+            dead_code,
+            reason = "steer-side attempt rendering is unwired until flywheel binds a steer to a bead"
+        )
+    )]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -3602,8 +3605,11 @@ impl WorkAttemptStatus {
 
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "steer-side attempt rendering is unwired until flywheel binds a steer to a bead")
-)]
+        expect(
+            dead_code,
+            reason = "steer-side attempt rendering is unwired until flywheel binds a steer to a bead"
+        )
+    )]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "queued" => Some(Self::Queued),
@@ -3660,7 +3666,10 @@ pub fn live_attempt_for_bead<'a>(
 // binding to supersede. `expect` fails once one is wired.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "steer-side supersede is unwired until flywheel binds a steer to a bead")
+    expect(
+        dead_code,
+        reason = "steer-side supersede is unwired until flywheel binds a steer to a bead"
+    )
 )]
 pub fn supersede_attempt(
     live: &WorkAttempt,

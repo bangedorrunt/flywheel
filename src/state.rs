@@ -1789,7 +1789,10 @@ pub fn load_work_attempts(project: &str) -> Vec<crate::durable::WorkAttempt> {
 // use. `expect` fails once one is wired.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "general attempt write is unwired until a steer supersede calls it")
+    expect(
+        dead_code,
+        reason = "general attempt write is unwired until a steer supersede calls it"
+    )
 )]
 pub fn record_work_attempt(project: &str, attempt: &crate::durable::WorkAttempt) -> Result<()> {
     update_locked(
