@@ -1839,3 +1839,94 @@ mod tests {
         assert_eq!(rows[3].delivery, "denied");
     }
 }
+
+/// bd-wake-line-wm-placeholder-on26: the wake line's `wm` is the recipient's
+/// recorded inbox head, not a per-pin ring counter. These tests are the
+/// bead's VERIFY filter (`test --bin flywheel -- wake_only_tests`): a
+/// vacuous 0-match run proves nothing, so this module must stay non-empty.
+#[cfg(test)]
+mod wake_only_tests {
+    use super::*;
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn task() -> TaskV1 {
+        task_from_text("Fix the doorbell\nsecret brief body", Some("bd-x"), vec![])
+    }
+
+    async fn mem_store() -> InboxStore {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = dir.join("index.sqlite");
+        let pool = toron_core::index::schema::connect(&db.to_string_lossy())
+            .await
+            .unwrap();
+        toron_core::index::schema::migrate(&pool).await.unwrap();
+        InboxStore::new(pool)
+    }
+
+    struct Rec(std::sync::Mutex<Vec<String>>);
+    impl PaneTyper for Rec {
+        fn prompt(&self, target: &str, line: &str) -> Result<()> {
+            self.0.lock().unwrap().push(format!("{target} {line}"));
+            Ok(())
+        }
+        fn keys(&self, _: &str, _: &[&str]) -> Result<()> {
+            Ok(())
+        }
+        fn close(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn append_one(store: &InboxStore, task_id: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let rows = append_task(store, dir.path(), A, &rcpt, "c", task_id, &task())
+            .await
+            .unwrap();
+        assert_eq!(rows[0].state, "appended");
+    }
+
+    /// The rung `wm` equals the recorded head, and ringing twice with no new
+    /// mail repeats the same watermark — a per-ring counter would advance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wm_is_the_recorded_head_not_a_counter() {
+        let store = mem_store().await;
+        append_one(&store, "t-1").await;
+        let head = store.head(B).await.unwrap();
+        assert!(head > 0, "one envelope lands above the empty head");
+
+        let panes = Rec(std::sync::Mutex::new(Vec::new()));
+        let first = ring(&store, &panes, "pane-1", B).await.unwrap();
+        assert_eq!(first, Wm(head), "the rung wm is the recorded head");
+        let second = ring(&store, &panes, "pane-1", B).await.unwrap();
+        assert_eq!(
+            second, first,
+            "no new mail: the watermark repeats, a counter would not"
+        );
+        let lines = panes.0.lock().unwrap();
+        assert_eq!(lines.len(), 2);
+        let want = crate::pane_write::wake_line(Wm(head), Urgency::Normal);
+        assert!(
+            lines.iter().all(|l| l == &format!("pane-1 {want}")),
+            "both rings type the same recorded-head line: {lines:?}"
+        );
+    }
+
+    /// New mail moves the head, and the next ring follows it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wm_follows_the_log_when_new_mail_lands() {
+        let store = mem_store().await;
+        append_one(&store, "t-1").await;
+        let panes = Rec(std::sync::Mutex::new(Vec::new()));
+        let before = ring(&store, &panes, "pane-1", B).await.unwrap();
+        append_one(&store, "t-2").await;
+        let after = ring(&store, &panes, "pane-1", B).await.unwrap();
+        assert!(
+            after > before,
+            "the watermark follows the log: {before:?} -> {after:?}"
+        );
+        assert_eq!(after, Wm(store.head(B).await.unwrap()));
+    }
+}
