@@ -407,11 +407,33 @@ fn loop_mode_pins_loop_run_without_reclassify() {
 /// `/swarm-mode peer-aware=off` maps to `--no-peer-aware`.
 #[test]
 fn swarm_and_loop_modes_are_distinct() {
+    // bd-ydjz: the fence used to grep phrases the templates dropped when
+    // ADR-0005 renamed the modes (multi-crew / captain-led / solo mode /
+    // current harness), so it could only fail. It now asserts the split the
+    // ADR actually owns, in the templates' current words: swarm is a
+    // captain-led crew, loop is ONE pane that names itself the opposite.
     let swarm = read("integrations/prompts/swarm.md.tpl");
     let loop_tpl = read("integrations/prompts/loop.md.tpl");
-    assert!(swarm.contains("multi-crew") && swarm.contains("captain-led"));
-    assert!(loop_tpl.contains("solo mode") && loop_tpl.contains("current harness"));
-    assert!(loop_tpl.contains("opposite of /swarm-mode"));
+    assert!(
+        swarm.contains("One captain") && swarm.contains("crew"),
+        "swarm template must stay captain-led crew work"
+    );
+    assert!(
+        !swarm.contains("ONE pane drives"),
+        "swarm must not describe itself as a single pane"
+    );
+    assert!(
+        loop_tpl.contains("ONE pane drives"),
+        "loop template must describe one pane driving one objective"
+    );
+    assert!(
+        loop_tpl.contains("opposite of /swarm-mode"),
+        "loop must name itself the opposite of /swarm-mode"
+    );
+    assert!(
+        !loop_tpl.contains("up to 5 crew"),
+        "loop must not carry a crew cap"
+    );
 }
 
 /// `/swarm-mode peer-aware=off` maps to `--no-peer-aware`.
