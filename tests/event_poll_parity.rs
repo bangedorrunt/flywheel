@@ -62,6 +62,11 @@ fn hermetic(root: &std::path::Path, herdr_sock: &std::path::Path) -> Command {
         std::fs::create_dir_all(&dir).expect("hermetic subdir");
         cmd.env(var, dir);
     }
+    // bd-mrga: the fake speaks the herdr protocol — pin the backend to
+    // herdr, or `auto` selects the rex primary and the rex client reads
+    // nothing from a herdr-protocol socket (workspace resolution finds no
+    // swarm and the test fails without touching any product code).
+    cmd.env("FLYWHEEL_BACKEND", "herdr");
     cmd.env("HERDR_SOCKET_PATH", herdr_sock);
     cmd
 }
@@ -158,9 +163,17 @@ fn event_and_poll_agree_against_a_fake_herdr() {
     assert_eq!(pushed[0]["pane_id"], FAKE_PANE, "{ev}");
     assert_eq!(pushed[0]["status"], "working", "{ev}");
     assert_eq!(ev["max_seq"], 1, "{ev}");
+    // bd-mrga: this asserts the SHORT TIMEOUT IS HONORED, not how fast a
+    // debug-build process spawns. A 400ms leaf budget plus one process start
+    // measures the host's page cache as much as the event path (observed
+    // 3.4s on a quiet box: spawn + config + herdr connect), which is exactly
+    // the ambient-state dependency the repo forbids in tests. The ceiling
+    // still fails a leaf that ignored --timeout-ms and waited the 30s
+    // default.
     assert!(
-        event_elapsed < Duration::from_millis(2500),
-        "event wait took {event_elapsed:?} (expected << poll interval)"
+        event_elapsed < Duration::from_secs(15),
+        "event wait took {event_elapsed:?} (a short-timeout leaf must not \
+         wait out the 30s default)"
     );
 
     let poll = hermetic(tmp.path(), &sock)
