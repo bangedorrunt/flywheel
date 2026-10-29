@@ -1887,19 +1887,83 @@ impl AuditEdge for StderrAuditEdge {
     }
 }
 
+/// bd-bm6v: Prompt is Brain-gated (budgets, inject_allowed, sinks, digest).
+/// Interpret never budgets/sinks/digests; the edge is a handle into the
+/// Brain's OWN gated queue. Refusal is data (typed fail), never a drop.
+pub trait PromptEdge: Send + Sync {
+    fn enqueue(&self, pin: &str, line: &str) -> Result<(), String>;
+}
+
+pub struct PromptEdgeTag;
+
+impl ServiceTag for PromptEdgeTag {
+    type Service = Arc<dyn PromptEdge>;
+    const ID: &'static str = "flywheel-durable-prompt-edge";
+}
+
+/// Shadow-first production: record beside the live Effect::Prompt path.
+/// Cut over only when shadow enqueue set == live deliver set over the replay
+/// corpus. Never duplicates delivery: the live path still owns the Brain.
+pub struct ShadowPromptEdge;
+
+impl PromptEdge for ShadowPromptEdge {
+    fn enqueue(&self, pin: &str, line: &str) -> Result<(), String> {
+        eprintln!("flywheel: [Prompt shadow] {pin}: {line}");
+        Ok(())
+    }
+}
+
+/// bd-bm6v: detached spawn for FetchInbox / CheckAckSla. Serial dispatch
+/// must never wait on subprocess/scan; the arm claims intent then succeeds
+/// immediately, and rows re-enter through the existing pipe Msgs
+/// (BrainMsg::InboxFetched / SlaFired). Unknown never settles as success.
+pub trait DetachedEdge: Send + Sync {
+    fn spawn(&self, kind: &str) -> Result<(), String>;
+}
+
+pub struct DetachedEdgeTag;
+
+impl ServiceTag for DetachedEdgeTag {
+    type Service = Arc<dyn DetachedEdge>;
+    const ID: &'static str = "flywheel-durable-detached-edge";
+}
+
+/// Shadow-first production: record the spawn beside the live detached path.
+/// The live sweep still performs the fetch/scan; this only proves the claim
+/// precedes the spawn and the immediate success carries no rows.
+pub struct ShadowDetachedEdge;
+
+impl DetachedEdge for ShadowDetachedEdge {
+    fn spawn(&self, kind: &str) -> Result<(), String> {
+        eprintln!("flywheel: [Detached shadow] spawn {kind}");
+        Ok(())
+    }
+}
+
 /// Services for durable interpret (T3), built once per PROCESS, never
 /// dropped: the host lives inside the async Brain, and dropping a
 /// ManagedRuntime there panics (its TokioExecutor owns a tokio Runtime).
 /// A process-wide static is never dropped, so the async-owned host can
-/// safely borrow it. One arm today (Audit); later arms add edged services
-/// to this runtime.
+/// safely borrow it. Audit + Prompt (Brain-gated) + Detached (fetch/scan).
 fn durable_services() -> &'static ManagedRuntime {
     static SERVICES: std::sync::OnceLock<ManagedRuntime> = std::sync::OnceLock::new();
     SERVICES.get_or_init(|| {
-        let layer = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(Arc::new(
+        let audit = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(Arc::new(
             StderrAuditEdge,
         )
             as Arc<dyn AuditEdge>);
+        let prompt = Layer::<PromptEdgeTag, std::convert::Infallible, ()>::from_value(Arc::new(
+            ShadowPromptEdge,
+        )
+            as Arc<dyn PromptEdge>);
+        let detached = Layer::<DetachedEdgeTag, std::convert::Infallible, ()>::from_value(
+            Arc::new(ShadowDetachedEdge) as Arc<dyn DetachedEdge>,
+        );
+        let layer = audit
+            .merge(prompt)
+            .expect("audit+prompt layers merge")
+            .merge(detached)
+            .expect("audit+prompt+detached layers merge");
         ManagedRuntime::make(&layer).expect("durable services build")
     })
 }
@@ -1917,23 +1981,57 @@ impl Interpret<crate::workspace::WorkspaceProgram> for DurableInterpret {
         cmd: &crate::workspace::Cmd,
         services: Option<&BuiltServices>,
     ) -> FxEffect<crate::workspace::Msg, String> {
-        let crate::workspace::Cmd::Audit { kind, pin, detail } = cmd else {
-            return Self::interpret(cmd);
-        };
-        let Some(services) = services else {
-            return Self::interpret(cmd);
-        };
-        let (kind, pin, detail) = (kind.clone(), pin.clone(), detail.clone());
-        let quiet = crate::workspace::Msg::DiagnoseFailed {
+        let quiet = || crate::workspace::Msg::DiagnoseFailed {
             name: crate::workspace::SHADOW_FAILURE_NAME.into(),
         };
-        use_service::<AuditEdgeTag>()
-            .map_err(|_: std::convert::Infallible| String::from("unreachable"))
-            .flat_map(move |edge| match edge.append(&kind, &pin, &detail) {
-                Ok(()) => FxEffect::succeed(quiet.clone()),
-                Err(detail) => FxEffect::fail(detail),
-            })
-            .provide_from(services)
+        match cmd {
+            crate::workspace::Cmd::Audit { kind, pin, detail } => {
+                let Some(services) = services else {
+                    return Self::interpret(cmd);
+                };
+                let (kind, pin, detail) = (kind.clone(), pin.clone(), detail.clone());
+                let q = quiet();
+                use_service::<AuditEdgeTag>()
+                    .map_err(|_: std::convert::Infallible| String::from("unreachable"))
+                    .flat_map(move |edge| match edge.append(&kind, &pin, &detail) {
+                        Ok(()) => FxEffect::succeed(q.clone()),
+                        Err(detail) => FxEffect::fail(detail),
+                    })
+                    .provide_from(services)
+            }
+            crate::workspace::Cmd::Prompt { pin, line } => {
+                let Some(services) = services else {
+                    return Self::interpret(cmd);
+                };
+                let (pin, line) = (pin.clone(), line.clone());
+                let q = quiet();
+                use_service::<PromptEdgeTag>()
+                    .map_err(|_: std::convert::Infallible| String::from("unreachable"))
+                    .flat_map(move |edge| match edge.enqueue(&pin, &line) {
+                        Ok(()) => FxEffect::succeed(q.clone()),
+                        Err(refused) => FxEffect::fail(refused),
+                    })
+                    .provide_from(services)
+            }
+            crate::workspace::Cmd::FetchInbox | crate::workspace::Cmd::CheckAckSla => {
+                let Some(services) = services else {
+                    return Self::interpret(cmd);
+                };
+                let kind: &'static str = match cmd {
+                    crate::workspace::Cmd::FetchInbox => "fetch_inbox",
+                    _ => "check_ack_sla",
+                };
+                let q = quiet();
+                use_service::<DetachedEdgeTag>()
+                    .map_err(|_: std::convert::Infallible| String::from("unreachable"))
+                    .flat_map(move |edge| match edge.spawn(kind) {
+                        Ok(()) => FxEffect::succeed(q.clone()),
+                        Err(refused) => FxEffect::fail(refused),
+                    })
+                    .provide_from(services)
+            }
+            _ => Self::interpret(cmd),
+        }
     }
 }
 
@@ -1962,17 +2060,75 @@ mod durable_tests {
         }
     }
 
-    fn services_with(refuse: bool) -> (ManagedRuntime, Arc<Recorder>) {
+    struct PromptRecorder {
+        ran: std::sync::Mutex<Vec<(String, String)>>,
+        refuse: bool,
+    }
+
+    impl PromptEdge for PromptRecorder {
+        fn enqueue(&self, pin: &str, line: &str) -> Result<(), String> {
+            self.ran.lock().unwrap().push((pin.into(), line.into()));
+            if self.refuse {
+                Err("prompt gate refused".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct DetachedRecorder {
+        ran: std::sync::Mutex<Vec<String>>,
+        refuse: bool,
+    }
+
+    impl DetachedEdge for DetachedRecorder {
+        fn spawn(&self, kind: &str) -> Result<(), String> {
+            self.ran.lock().unwrap().push(kind.into());
+            if self.refuse {
+                Err("spawn refused".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn services_with(
+        refuse: bool,
+    ) -> (
+        ManagedRuntime,
+        Arc<Recorder>,
+        Arc<PromptRecorder>,
+        Arc<DetachedRecorder>,
+    ) {
         let rec = Arc::new(Recorder {
             ran: std::sync::Mutex::new(vec![]),
             refuse,
         });
-        let layer = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(
-            rec.clone() as Arc<dyn AuditEdge>
+        let prompt = Arc::new(PromptRecorder {
+            ran: std::sync::Mutex::new(vec![]),
+            refuse,
+        });
+        let detached = Arc::new(DetachedRecorder {
+            ran: std::sync::Mutex::new(vec![]),
+            refuse,
+        });
+        let audit_layer = Layer::<AuditEdgeTag, std::convert::Infallible, ()>::from_value(
+            rec.clone() as Arc<dyn AuditEdge>,
         );
+        let prompt_layer = Layer::<PromptEdgeTag, std::convert::Infallible, ()>::from_value(
+            prompt.clone() as Arc<dyn PromptEdge>,
+        );
+        let detached_layer = Layer::<DetachedEdgeTag, std::convert::Infallible, ()>::from_value(
+            detached.clone() as Arc<dyn DetachedEdge>,
+        );
+        let layer = audit_layer
+            .merge(prompt_layer)
+            .expect("test audit+prompt merge")
+            .merge(detached_layer)
+            .expect("test audit+prompt+detached merge");
         let rt = ManagedRuntime::make(&layer).expect("value layer builds");
         assert!(rt.context().is_some());
-        (rt, rec)
+        (rt, rec, prompt, detached)
     }
 
     fn audit_cmd() -> workspace::Cmd {
@@ -1985,7 +2141,7 @@ mod durable_tests {
 
     #[test]
     fn audit_arm_runs_through_the_edge() {
-        let (rt, rec) = services_with(false);
+        let (rt, rec, _, _) = services_with(false);
         let exit = Runtime::run(DurableInterpret::interpret_in_env(
             &audit_cmd(),
             rt.context(),
@@ -2025,7 +2181,7 @@ mod durable_tests {
 
     #[test]
     fn edge_refusal_surfaces_typed_failure_named_by_the_fold() {
-        let (rt, rec) = services_with(true);
+        let (rt, rec, _, _) = services_with(true);
         let exit = Runtime::run(DurableInterpret::interpret_in_env(
             &audit_cmd(),
             rt.context(),
@@ -2071,7 +2227,7 @@ mod durable_tests {
 
     #[test]
     fn non_audit_commands_are_not_owned_by_this_arm() {
-        let (rt, rec) = services_with(false);
+        let (rt, rec, prompt_rec, detached_rec) = services_with(false);
         let other = workspace::Cmd::Send {
             name: "n".into(),
             text: "t".into(),
@@ -2079,6 +2235,8 @@ mod durable_tests {
         let exit = Runtime::run(DurableInterpret::interpret_in_env(&other, rt.context()));
         assert!(!exit.is_success(), "unowned arms fail typed, never run");
         assert!(rec.ran.lock().unwrap().is_empty());
+        assert!(prompt_rec.ran.lock().unwrap().is_empty());
+        assert!(detached_rec.ran.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2087,5 +2245,170 @@ mod durable_tests {
         let b = durable_services();
         assert!(std::ptr::eq(a, b), "one runtime per process, never rebuilt");
         assert!(a.context().is_some());
+    }
+
+    // bd-bm6v: Prompt (Brain-gated enqueue) + detached (fetch/scan) arms.
+    fn quiet_preserves_model(msg: &Msg) {
+        let mut model = workspace::WorkspaceModel::default();
+        model.swarm.heal_states.insert(
+            "probe".into(),
+            crate::durable::HealState {
+                awaiting_clear: true,
+                ..Default::default()
+            },
+        );
+        let (next, cmds) = workspace::tick(&model, msg);
+        assert!(cmds.is_empty());
+        assert!(
+            next.swarm
+                .heal_states
+                .get("probe")
+                .expect("kept")
+                .awaiting_clear,
+            "a quiet fold preserves the model"
+        );
+    }
+
+    #[test]
+    fn prompt_arm_enqueue_ok_succeeds_quiet() {
+        let (rt, _, prompt_rec, detached_rec) = services_with(false);
+        let cmd = workspace::Cmd::Prompt {
+            pin: "p".into(),
+            line: "[doorbell] hello".into(),
+        };
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(&cmd, rt.context()));
+        let Exit::Success(msg) = exit else {
+            panic!("bd-bm6v: Prompt with services must succeed quiet via PromptEdge");
+        };
+        assert!(matches!(msg, Msg::DiagnoseFailed { .. }));
+        assert_eq!(
+            prompt_rec.ran.lock().unwrap().as_slice(),
+            &[("p".to_string(), "[doorbell] hello".to_string())]
+        );
+        assert!(detached_rec.ran.lock().unwrap().is_empty());
+        quiet_preserves_model(&msg);
+    }
+
+    #[test]
+    fn prompt_arm_gate_refused_fails_typed() {
+        let (rt, _, prompt_rec, _) = services_with(true);
+        let cmd = workspace::Cmd::Prompt {
+            pin: "p".into(),
+            line: "[doorbell] hello".into(),
+        };
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(&cmd, rt.context()));
+        let Exit::Failure(cause) = exit else {
+            panic!("prompt gate refusal must fail typed, never succeed");
+        };
+        assert_eq!(prompt_rec.ran.lock().unwrap().len(), 1);
+        let msg = workspace::WorkspaceProgram::failure(&Failure::of_cause(cause));
+        assert!(matches!(msg, Msg::DiagnoseFailed { ref name } if name == SHADOW_FAILURE_NAME));
+    }
+
+    #[test]
+    fn prompt_arm_no_services_fails_typed() {
+        let cmd = workspace::Cmd::Prompt {
+            pin: "p".into(),
+            line: "[doorbell] hello".into(),
+        };
+        assert!(!Runtime::run(DurableInterpret::interpret(&cmd)).is_success());
+        assert!(!Runtime::run(DurableInterpret::interpret_in_env(&cmd, None)).is_success());
+    }
+
+    #[test]
+    fn detached_fetch_spawns_and_succeeds_immediately() {
+        let (rt, audit_rec, _, detached_rec) = services_with(false);
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(
+            &workspace::Cmd::FetchInbox,
+            rt.context(),
+        ));
+        let Exit::Success(msg) = exit else {
+            panic!("bd-bm6v: FetchInbox with services must succeed immediately via DetachedEdge");
+        };
+        assert!(matches!(msg, Msg::DiagnoseFailed { .. }));
+        // Immediate success carries no rows: the pipe re-entry delivers them
+        // in a second step, so a duplicate landing stays safe (at-least-once).
+        assert_eq!(
+            detached_rec.ran.lock().unwrap().as_slice(),
+            &["fetch_inbox".to_string()]
+        );
+        assert!(audit_rec.ran.lock().unwrap().is_empty());
+        quiet_preserves_model(&msg);
+    }
+
+    #[test]
+    fn detached_ack_sla_spawns_and_succeeds_immediately() {
+        let (rt, _, _, detached_rec) = services_with(false);
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(
+            &workspace::Cmd::CheckAckSla,
+            rt.context(),
+        ));
+        let Exit::Success(msg) = exit else {
+            panic!("bd-bm6v: CheckAckSla with services must succeed immediately via DetachedEdge");
+        };
+        assert!(matches!(msg, Msg::DiagnoseFailed { .. }));
+        assert_eq!(
+            detached_rec.ran.lock().unwrap().as_slice(),
+            &["check_ack_sla".to_string()]
+        );
+        quiet_preserves_model(&msg);
+    }
+
+    #[test]
+    fn detached_spawn_refused_fails_typed() {
+        let (rt, _, _, detached_rec) = services_with(true);
+        let exit = Runtime::run(DurableInterpret::interpret_in_env(
+            &workspace::Cmd::FetchInbox,
+            rt.context(),
+        ));
+        let Exit::Failure(cause) = exit else {
+            panic!("spawn refusal must fail typed, never succeed");
+        };
+        assert_eq!(detached_rec.ran.lock().unwrap().len(), 1);
+        let msg = workspace::WorkspaceProgram::failure(&Failure::of_cause(cause));
+        assert!(matches!(msg, Msg::DiagnoseFailed { ref name } if name == SHADOW_FAILURE_NAME));
+    }
+
+    #[test]
+    fn detached_no_services_fails_typed() {
+        assert!(
+            !Runtime::run(DurableInterpret::interpret(&workspace::Cmd::FetchInbox)).is_success()
+        );
+        assert!(
+            !Runtime::run(DurableInterpret::interpret_in_env(
+                &workspace::Cmd::FetchInbox,
+                None
+            ))
+            .is_success()
+        );
+        assert!(
+            !Runtime::run(DurableInterpret::interpret(&workspace::Cmd::CheckAckSla)).is_success()
+        );
+        assert!(
+            !Runtime::run(DurableInterpret::interpret_in_env(
+                &workspace::Cmd::CheckAckSla,
+                None
+            ))
+            .is_success()
+        );
+    }
+
+    #[test]
+    fn restart_and_factmiss_stay_on_the_live_path() {
+        // bd-bm6v §3: RestartWatch is host-side + journal-only; FactMiss keeps
+        // Effect::Audit. Neither moves to interpret.
+        let (rt, _, prompt_rec, detached_rec) = services_with(false);
+        for cmd in [
+            workspace::Cmd::RestartWatch,
+            workspace::Cmd::FactMiss { why: "w".into() },
+        ] {
+            let exit = Runtime::run(DurableInterpret::interpret_in_env(&cmd, rt.context()));
+            assert!(
+                !exit.is_success(),
+                "live-path arms stay unowned by interpret"
+            );
+        }
+        assert!(prompt_rec.ran.lock().unwrap().is_empty());
+        assert!(detached_rec.ran.lock().unwrap().is_empty());
     }
 }
