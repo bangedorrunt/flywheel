@@ -2875,13 +2875,16 @@ mod tests {
             "no pid-scoped sqlite"
         );
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        unsafe { std::env::set_var("HOME", "/tmp/flywheel-se2.1-home") };
+        // Non-scratch on purpose: /tmp/* counts as scratch (is_scratch),
+        // which would honour it as a fixture home. A fake operator home
+        // must live outside scratch for this assertion to mean anything.
+        unsafe { std::env::set_var("HOME", "/home/flywheel-se2.1-home") };
         let (data_dir, _) = mailbox_roots();
         // bd-fize: HOME is not an explicit pin — in a TEST process it must
         // not resolve to a live-looking root. The temp root wins instead, so
         // a test never writes identities into a real-looking store.
         assert!(
-            !data_dir.starts_with("/tmp/flywheel-se2.1-home"),
+            !data_dir.starts_with("/home/flywheel-se2.1-home"),
             "bare HOME in a test process must not resolve under HOME: {data_dir:?}"
         );
         assert!(
