@@ -16412,6 +16412,13 @@ mod tests {
     /// collector) contains no direct herdr event construction — the
     /// event stream comes via the backend trait. The scan covers the
     /// non-test source (the loop path), not this test's own strings.
+    ///
+    /// The fence denies code-level coupling only. The loop core legitimately
+    /// *names* herdr in prose and data: the `herdr_name` field (the agent's
+    /// herdr-assigned name — data, not a call), the `LoopMsg::Herdr`
+    /// envelope variant (populated by the backend trait, never by a herdr
+    /// client), and doc comments. A blanket `contains("herdr")` fails on
+    /// those load-bearing names, so it cannot be the fence.
     #[test]
     fn events_primary_grep_no_herdr_in_loop_path() {
         let durable = include_str!("durable.rs");
@@ -16419,10 +16426,24 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("non-test source");
-        assert!(
-            !loop_path.contains("herdr"),
-            "durable.rs (the loop core) must not touch herdr directly"
-        );
+        // Direct herdr code coupling: module paths, client types, direct
+        // event construction. Each is a real call shape, so deleting the
+        // fence's target (a herdr call) fails this test while renaming a
+        // prose mention does not.
+        for denied in [
+            "herdr::",
+            "crate::herdr",
+            "HerdrClient",
+            "herdr_client",
+            "Herdr::",
+            "use herdr",
+            "extern crate herdr",
+        ] {
+            assert!(
+                !loop_path.contains(denied),
+                "durable.rs (the loop core) must not touch herdr directly: found {denied:?}"
+            );
+        }
         let main_src = include_str!("main.rs");
         let collect = main_src
             .split("fn collect_poll_events")
