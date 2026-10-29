@@ -469,10 +469,31 @@ fn legal_close_with_commit_and_gate_row_stays_closed() {
 
     // worker closes first — the loop records the verdict AFTER the close
     // (the close-detect tick runs on a closed bead). `br gate report` is
-    // exactly what the armed `report_pass` invokes; the note carries
-    // sha + receipt. The policy's `closed -> closed` gated self-transition
-    // is what makes post-close recording legal.
+    // exactly what the armed `report_pass` invokes: the note is
+    // command-shaped (sha receipt exit tail cmd, cmd last since a verify
+    // command contains spaces) and the tail file holds this run's VERIFY
+    // evidence (a bare `test -f` prints nothing, so the file records the
+    // command and its real exit status — the bd-3unc rule needs a
+    // non-empty tail, not stdout specifically). A sha-only note is unbound
+    // and the close-check reads it as missing. The policy's `closed ->
+    // closed` gated self-transition is what makes post-close recording
+    // legal.
     close(&dir, &bead_id, &sha);
+    std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
+    let verify_out = run(&dir, "test", &["-f", "README.md"]);
+    assert!(
+        verify_out.status.success(),
+        "cheap VERIFY must exit 0 for the receipt to mean anything"
+    );
+    let receipt = dir.join(format!(
+        ".flywheel/receipts/{bead_id}-{sha}.command-verified.txt"
+    ));
+    std::fs::create_dir_all(receipt.parent().expect("receipt dir")).unwrap();
+    let mut receipt_body = verify_out.stdout.clone();
+    receipt_body.extend_from_slice(
+        format!("\n[exit {}] test -f README.md\n", verify_out.status).as_bytes(),
+    );
+    std::fs::write(&receipt, receipt_body).unwrap();
     run_ok(
         &dir,
         "br",
@@ -487,7 +508,11 @@ fn legal_close_with_commit_and_gate_row_stays_closed() {
             "--status",
             "pass",
             "--note",
-            &format!("sha={sha} receipt={}/x.txt", dir.display()),
+            &format!(
+                "sha={sha} receipt={} exit=0 tail={} cmd=test -f README.md",
+                receipt.display(),
+                receipt.display()
+            ),
         ],
         "br gate report",
     );
