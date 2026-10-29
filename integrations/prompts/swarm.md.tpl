@@ -2,9 +2,8 @@
 # Orchestration: swarm-mode
 
 /swarm-mode is a crew. The captain reads `flywheel-captain`. Each crew
-agent reads `flywheel-crew`. One captain, up to 5 crew members. The
-person's answer is the crew shape when a person is here. A named squad
-is the shape when no person is here.
+agent reads `flywheel-crew`. One captain, up to 5 crew. The person's
+answer is the crew shape when a person is here, else the named squad.
 
 ## Playbook
 
@@ -23,8 +22,7 @@ is the shape when no person is here.
    catalog each objective; add lanes only for a declared multi-lane
    need. GATE->DISPATCH->EXECUTE->OBSERVE->VERIFY->SIGNOFF; parks at
    SIGNOFF, resolve via `flywheel workflow approve`. DISPATCH briefs
-   `--stage ce-execute`, never raw. Alias: `workflow run wave-swarm
-   --execute`. Bind `--inputs '{"captain_pin":"<pin>"}'` so escalations
+   `--stage ce-execute`, never raw. Alias: `workflow run wave-swarm --execute`. Bind `--inputs '{"captain_pin":"<pin>"}'` so escalations
    reach a live pin; ensure the steer channel exists and every spawned
    pin joined it (join-before-post).
 
@@ -47,8 +45,7 @@ is the shape when no person is here.
    assignee, 4min reserve, build slot, TDD RED first,
    commit-before-close with VERIFY tail, stage ONLY reserved paths, on
    [doorbell] pull then act, blocked >10m mail captain, TIMEBOX 90m
-   partial report, prove-it-works. Every dispatch ANNOUNCES its vehicle first
-   line (stage name, compose token, or "none: raw"). --raw for
+   partial report, prove-it-works. Every dispatch ANNOUNCES its vehicle first line. --raw for
    nudges only. No commits for ~2 polls -> nudge; third contact = finish
    or release.
 
@@ -68,7 +65,7 @@ is the shape when no person is here.
 
 ## MATERIAL RECLASSIFY
 
-Once pinned, do not re-run decide casually except on a material event
+Once pinned, re-run decide only on a material event
 (AUTHORITATIVE objective change, explicit topology switch, new work-unit
 class, classifier miss, stage-chain exhaustion): `decide --json` +
 `workflow list --brief` + `stage list`, then announce vehicle / `none: raw`.

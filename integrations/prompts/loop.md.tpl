@@ -4,11 +4,11 @@
 /loop-mode runs `loop-mode run` in open mode. It is not a third mode.
 Read `flywheel-open`. Do not read `flywheel-captain`.
 
-The supplied text is the objective, scope, and flags. ONE pane drives
-ONE objective end-to-end, not a reusable definition. Beads optional:
+Supplied text is the objective, scope, and flags. ONE pane drives
+ONE objective end-to-end. Beads optional:
 `--work` selects bead-backed execution. The opposite of /swarm-mode: no
 parallel lanes, no wave fan-out; a reviewer at checkpoints is an
-exception, not a second crew. The solo agent captains reversible
+exception. The solo agent captains reversible
 decisions; the human objective stays authoritative.
 
 ## MATERIAL RECLASSIFY
@@ -24,7 +24,7 @@ re-run `decide --json` + `workflow list --brief` + `stage list`, announce
    then `flywheel briefing "<objective>" --project <p> --json`. Join
    topology -> do not start a second loop; loop -> continue. `decide`
    is the leaf inside briefing. Before each run, confirm profile + model
-   routing: show default + registry alternatives; blank keeps it; record
+   routing (blank keeps the default); record
    the choice.
 
 1. SETUP: `flywheel loop-mode run <project> --work` after briefing
@@ -79,6 +79,6 @@ The loop pane owns the dispatcher. No harness-native delegation tools
 bypass the registry (doorbell + dispatcher + guards see nothing). Fence:
 `flywheel __subagent-guard <tool>` (exit 2 = deny); observe/stop and
 session-local todo stay legal; mcp__* always allowed; crew panes exempt
-(`--role crew` / `FLYWHEEL_ROLE=crew`). The fence is the guard.
+(`--role crew` / `FLYWHEEL_ROLE=crew`).
 
 {{VERSION}} {{GENERATED}}
