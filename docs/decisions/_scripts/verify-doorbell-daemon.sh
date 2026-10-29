@@ -37,15 +37,9 @@ pass "/health schema present"
 STATUS="$("$BIN" status --state-dir "$STATE" --port "$PORT" 2>/dev/null)"
 echo "$STATUS" | grep -Fq '"alive":true' || fail "status does not report alive"
 pass "status reports alive"
-# Unmanaged-holder refusal: foreign pidfile + live port, no --force.
-cp "$STATE/doorbell.pid" "$STATE/doorbell.pid.real"
-echo 99999999 > "$STATE/doorbell.pid"
-if "$BIN" stop --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1; then
-  fail "stop over unmanaged holder should refuse without --force"
-else
-  pass "unmanaged-holder refusal without --force"
-fi
-mv "$STATE/doorbell.pid.real" "$STATE/doorbell.pid"
+# Unmanaged-holder refusal is proven below, after the real stop, by putting a
+# NON-doorbell listener on the port (bd-xwgh contract: a holder is unmanaged
+# only when neither a live pidfile nor a /health owner names it).
 
 "$BIN" stop --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
   || fail "stop exited non-zero"
@@ -55,6 +49,29 @@ if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
 else
   pass "port dead after stop (5s grace honored)"
 fi
+# Unmanaged-holder refusal (bd-xwgh): a stranger binds the port with no
+# doorbell identity, so neither the pidfile (now dead) nor /health names an
+# owner — stop must refuse without --force rather than kill a stranger.
+python3 - "$PORT" <<'PY' &
+import http.server, socketserver, sys
+port = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"protocol":"not-doorbell"}'
+        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", port), H) as s:
+    s.serve_forever()
+PY
+STRANGER=$!
+for _ in $(seq 1 20); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+"$BIN" stop --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
+  && fail "stop over an unmanaged (stranger) holder must refuse without --force" \
+  || pass "unmanaged-holder refusal without --force"
+kill "$STRANGER" 2>/dev/null; wait "$STRANGER" 2>/dev/null
+sleep 0.5
 echo "-- E13-lite: split-brain fence --"
 "$BIN" start --state-dir "$STATE" --port "$PORT" >/dev/null 2>&1 \
   || { fail "restart for fence tests"; echo "RESULT: FAIL"; exit 1; }

@@ -3581,6 +3581,14 @@ pub enum WorkAttemptStatus {
 }
 
 impl WorkAttemptStatus {
+    // bd-work-attempts-m5x6: the steer-side half of the attempt model has no
+    // call site yet — flywheel has no central steer→bead binding, so a steer
+    // cannot name the generation it supersedes. `expect` (not `allow`) makes
+    // the annotation fail as soon as something wires these, forcing removal.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "steer-side attempt rendering is unwired until flywheel binds a steer to a bead")
+)]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -3592,6 +3600,10 @@ impl WorkAttemptStatus {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "steer-side attempt rendering is unwired until flywheel binds a steer to a bead")
+)]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "queued" => Some(Self::Queued),
@@ -3643,6 +3655,13 @@ pub fn live_attempt_for_bead<'a>(
 /// attempt is marked superseded (its corr and effect key stay readable for
 /// audit) and the replacement starts at generation+1 carrying the new
 /// prompt's corr. Pure — persistence lives in `state`.
+//
+// bd-work-attempts-m5x6: no call site yet — a steer has no central bead
+// binding to supersede. `expect` fails once one is wired.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "steer-side supersede is unwired until flywheel binds a steer to a bead")
+)]
 pub fn supersede_attempt(
     live: &WorkAttempt,
     corr: &str,

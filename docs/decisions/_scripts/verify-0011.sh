@@ -43,10 +43,17 @@ echo "== Wave C (join-loud / FCFS / --live) =="
 grep -q 'CoalitionCmd::Join' src/main.rs && ok "coalition join CLI" || bad "coalition join missing"
 grep -q 'join: bool' src/main.rs && ok "spawn --join" || bad "spawn --join missing"
 grep -q 'fn cmd_arrive' src/main.rs && ok "arrive command" || bad "cmd_arrive missing"
-grep -q 'watch", "--live"' src/main.rs && ok "doorbell watch --live" || bad "watch --live missing"
+# bd-verify-greps: the standalone `doorbell watch --live` door was folded into
+# the doorbell host — every door (arrive/status/recover) lazily heals and
+# attaches a live dispatcher, and the comms loop hosts the inbox wake. The
+# intent is "a pane is woken live, not only by polling"; the witness is the
+# host module plus the arm that starts it.
+grep -q 'fn cmd_doorbell' src/main.rs && grep -q 'doorbell_host' src/main.rs && ok "doorbell live host wired" || bad "watch --live missing"
 grep -q 'previous holder stale' src/captain_slot.rs && ok "FCFS stale claim line" || bad "FCFS claim line missing"
 grep -q 'fn read_mail_counts' src/snapshot.rs && ok "helm mail not hardcoded empty" || bad "mail still hardcoded"
-grep -q 'fn read_held_paths' src/snapshot.rs && ok "helm reservations not hardcoded empty" || bad "reservations still hardcoded"
+# bd-verify-greps: renamed with the one-read board refactor — snapshot reads
+# the reservation board once and projects it through `parse_held_paths`.
+grep -q 'fn parse_held_paths' src/snapshot.rs && ok "helm reservations not hardcoded empty" || bad "reservations still hardcoded"
 grep -q 'JOINING — not spawning' src/briefing.rs && ok "join banner" || bad "join banner missing"
 
 echo "== Wave D (rot / WaitCorr Sweep / nudge cap / SIGNOFF) =="

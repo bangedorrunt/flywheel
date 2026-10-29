@@ -7,6 +7,7 @@
 //! - herdr socket → `--status pin=state` seeds on `__doorbell --once`;
 //! - toron socket → [`DeliveryEvent`]s folded by the real
 //!   [`toron_core::delivery::DeliveryFsm`].
+//!
 //! The decider is the real `workspace::tick` fold (via `once_json`), and
 //! assertions read projections (the injects output), not call counts.
 //! Redaction is structural: the redacted frame keeps id/kind/tags with a

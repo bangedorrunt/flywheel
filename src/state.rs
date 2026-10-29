@@ -1783,6 +1783,14 @@ pub fn load_work_attempts(project: &str) -> Vec<crate::durable::WorkAttempt> {
 /// accumulate — a supersede writes the marked old row AND the replacement,
 /// so both stay readable. Best-effort by contract: callers log and continue
 /// on error.
+//
+// bd-work-attempts-m5x6: no call site yet — the loop records through
+// `record_attempt_resume`; this is the general write a steer supersede will
+// use. `expect` fails once one is wired.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "general attempt write is unwired until a steer supersede calls it")
+)]
 pub fn record_work_attempt(project: &str, attempt: &crate::durable::WorkAttempt) -> Result<()> {
     update_locked(
         &work_attempts_file(project),

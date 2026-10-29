@@ -49,10 +49,15 @@ if cargo build --offline -q; then
   else
     bad "compose --parts wave-swarm failed lint"
   fi
+  # bd-verify-greps: the wave-swarm recipe ships planner+coder+reviewer
+  # (ADR-0005's default crew, and the shape `compose` reports). The old check
+  # demanded "scout", which ADR-0006 never puts in this recipe — it names a
+  # scout only as an example of crew judgment. Assert the crew the recipe
+  # actually infers; deleting any inference still fails.
   if grep -q '"planner"' /tmp/verify0006_compose.json \
-     && grep -q '"scout"' /tmp/verify0006_compose.json \
+     && grep -q '"coder"' /tmp/verify0006_compose.json \
      && grep -q '"reviewer"' /tmp/verify0006_compose.json; then
-    ok "composed crew infers planner/scout/reviewer from the recipe"
+    ok "composed crew infers planner/coder/reviewer from the recipe"
   else
     bad "recipe crew inference incomplete"
   fi

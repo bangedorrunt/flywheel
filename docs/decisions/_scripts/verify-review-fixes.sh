@@ -43,8 +43,10 @@ else
   ok "F2: no never_loop clippy error"
 fi
 
-# F3: xproj --to-project is used (routing context), not silently dropped
-grep -q 'to_project_validated' src/main.rs \
+# F3: xproj --to-project is used (routing context), not silently dropped.
+# bd-verify-greps: the send body lives in src/cmd/xproj.rs after the bd-qbi8
+# split; grepping main.rs alone reported a drop that never happened.
+grep -q 'to_project_validated' src/cmd/xproj.rs \
   && ok "F3: xproj send uses to_project (validated, surfaced)" \
   || bad "F3: xproj to_project dropped again"
 
