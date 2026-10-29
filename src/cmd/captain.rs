@@ -799,11 +799,14 @@ fn cmd_captain_approve(
     let asker = row.asker.clone().expect("gate Ready means an asker");
     // The operator must be a known identity, and must not be the asker.
     // npub compare is alias-proof; the pin compare covers unarrived askers.
-    let approver_npub = crate::mail::block_on(crate::mail::comms_mailbox()?.whois(project, approver))
-        .map_err(|_| {
-            anyhow::anyhow!("captain approve: unknown approver {approver:?} — approval_mismatch")
-        })?
-        .npub;
+    let approver_npub =
+        crate::mail::block_on(crate::mail::comms_mailbox()?.whois(project, approver))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "captain approve: unknown approver {approver:?} — approval_mismatch"
+                )
+            })?
+            .npub;
     let asker_npub = crate::mail::block_on(crate::mail::comms_mailbox()?.whois(project, &asker))
         .ok()
         .map(|w| w.npub);

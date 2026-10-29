@@ -390,11 +390,7 @@ pub fn has_other_parked_steer(project: &str, asker: &str, except_slot: &str) -> 
 
 /// Pure core of [`has_other_parked_steer`]: only the latest row per slot
 /// counts — history rows (a slot that later settled) do not hold the pin.
-pub fn latest_parked_other(
-    rows: &[DoorReceipt],
-    asker: &str,
-    except_slot: &str,
-) -> bool {
+pub fn latest_parked_other(rows: &[DoorReceipt], asker: &str, except_slot: &str) -> bool {
     let mut latest: std::collections::BTreeMap<(String, String), &DoorReceipt> =
         std::collections::BTreeMap::new();
     for row in rows {
@@ -793,7 +789,8 @@ mod tests {
 
     /// D10: payload re-derives to the digest, or the row stays Parked.
     #[test]
-    fn payload_rederive_matches_or_conflicts() {        let p = SteerPayload {
+    fn payload_rederive_matches_or_conflicts() {
+        let p = SteerPayload {
             objective: "obj".to_string(),
             crew: String::new(),
             direct: false,
