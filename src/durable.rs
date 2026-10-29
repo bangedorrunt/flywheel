@@ -3575,6 +3575,143 @@ pub fn closed_reason_lease_ids(
         .collect()
 }
 
+// ---- bd-work-attempts-m5x6: durable work attempts ----
+
+/// Status of one durable work attempt (bd-work-attempts-m5x6). The attempt —
+/// not the loop pass — is the unit steering acts on: a steer writes a new
+/// generation under the same bead intent, and the superseded generation
+/// stays readable for audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkAttemptStatus {
+    Queued,
+    Running,
+    Completed,
+    Interrupted,
+    Failed,
+    Superseded,
+}
+
+impl WorkAttemptStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "interrupted" => Some(Self::Interrupted),
+            "failed" => Some(Self::Failed),
+            "superseded" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+}
+
+/// One generation of work on a bead by a pane: the injected prompt's corr
+/// and the attempt's effect key when the dispatch was journaled. A steer
+/// never edits a row — it supersedes it (status stays readable) and appends
+/// the next generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkAttempt {
+    pub bead_id: String,
+    pub pane: String,
+    pub generation: u64,
+    pub status: WorkAttemptStatus,
+    pub corr: Option<String>,
+    pub effect_key: Option<String>,
+    pub updated_us: i64,
+}
+
+/// Storage/predicate key for one generation. `U+001F` (unit separator) so a
+/// bead or pane id that contains the joiner cannot collide — the same rule
+/// as the resume window's own key.
+pub fn attempt_key(bead: &str, pane: &str, generation: u64) -> String {
+    format!("{bead}\u{1f}{pane}\u{1f}{generation}")
+}
+
+/// The live attempt for one bead: the highest generation across its panes.
+/// None when the bead has no attempt on record (first dispatch). Pure.
+pub fn live_attempt_for_bead<'a>(
+    attempts: &'a [WorkAttempt],
+    bead: &str,
+) -> Option<&'a WorkAttempt> {
+    attempts
+        .iter()
+        .filter(|a| a.bead_id == bead)
+        .max_by_key(|a| a.generation)
+}
+
+/// Steering writes a new generation under the same bead intent: the live
+/// attempt is marked superseded (its corr and effect key stay readable for
+/// audit) and the replacement starts at generation+1 carrying the new
+/// prompt's corr. Pure — persistence lives in `state`.
+pub fn supersede_attempt(
+    live: &WorkAttempt,
+    corr: &str,
+    effect_key: Option<&str>,
+    now_us: i64,
+) -> (WorkAttempt, WorkAttempt) {
+    let mut old = live.clone();
+    old.status = WorkAttemptStatus::Superseded;
+    old.updated_us = now_us;
+    let next = WorkAttempt {
+        bead_id: live.bead_id.clone(),
+        pane: live.pane.clone(),
+        generation: live.generation.saturating_add(1),
+        status: WorkAttemptStatus::Running,
+        corr: Some(corr.to_string()),
+        effect_key: effect_key.map(str::to_string),
+        updated_us: now_us,
+    };
+    (old, next)
+}
+
+/// Attempt-aware resume predicate (bd-work-attempts-m5x6). The loop reads
+/// the live attempt per bead, not only bead status:
+///
+/// - no attempt on record: first dispatch, window rules only;
+/// - completed: finished work stays finished even when the bead row lags;
+/// - superseded: a replaced generation never resumes — its replacement owns
+///   the bead (the caller resolves `live` to the newest generation);
+/// - queued/running/interrupted/failed: the window rule decides — and the
+///   window is keyed on the live generation (`state::attempt_resume_key`),
+///   so a steered replacement is fresh while a repeat send of the live
+///   generation stays suppressed.
+///
+/// Pure: the clock and the looked-up watermark arrive as values.
+pub fn should_resume_attempt(
+    last_resumed_us: Option<i64>,
+    now_us: i64,
+    window_secs: u64,
+    peer_holds: bool,
+    live: Option<&WorkAttempt>,
+) -> bool {
+    if peer_holds {
+        return false;
+    }
+    match live {
+        None => !within_resume_window(last_resumed_us, now_us, window_secs),
+        Some(a)
+            if matches!(
+                a.status,
+                WorkAttemptStatus::Completed | WorkAttemptStatus::Superseded
+            ) =>
+        {
+            false
+        }
+        Some(_) => !within_resume_window(last_resumed_us, now_us, window_secs),
+    }
+}
+
 /// bd-loop-feeds-idle-panes-rh2z: how many consecutive passes a pane may be
 /// starved — idle while its own stalled bead sits inside the resume window —
 /// before the idle-pane rotation exempts it. Two passes at the supervisor's
@@ -19841,5 +19978,111 @@ mod t4_close_tests {
         let a = settle_dispatch_guard_output(&facts, "bd-x", now, 600_000_000);
         let b = settle_dispatch_guard_output(&facts, "bd-x", now, 600_000_000);
         assert_eq!(a, b, "same inputs settle identically");
+    }
+
+    // ---- bd-work-attempts-m5x6: durable work attempts ----
+
+    fn mk_attempt(
+        bead: &str,
+        pane: &str,
+        generation: u64,
+        status: WorkAttemptStatus,
+    ) -> WorkAttempt {
+        WorkAttempt {
+            bead_id: bead.to_string(),
+            pane: pane.to_string(),
+            generation,
+            status,
+            corr: None,
+            effect_key: None,
+            updated_us: 1_000_000_000,
+        }
+    }
+
+    /// bd-work-attempts-m5x6: steering supersedes under the same bead — the
+    /// old generation stays readable as Superseded, the replacement runs at
+    /// generation+1 carrying the new prompt's corr, and the resume window
+    /// treats the replacement as fresh (no watermark) while a repeat send
+    /// of the live generation stays suppressed.
+    #[test]
+    fn attempt_supersede_under_same_bead() {
+        let now = 2_000_000_000i64;
+        let live = WorkAttempt {
+            corr: Some("corr-1".to_string()),
+            effect_key: Some("ek-1".to_string()),
+            ..mk_attempt("bd-x", "PaneA", 1, WorkAttemptStatus::Running)
+        };
+        let (old, next) = supersede_attempt(&live, "corr-2", Some("ek-2"), now);
+        // Same bead intent, next generation.
+        assert_eq!(old.bead_id, "bd-x");
+        assert_eq!(next.bead_id, "bd-x");
+        assert_eq!(next.pane, "PaneA");
+        assert_eq!(next.generation, 2);
+        // The superseded attempt stays readable with its own evidence.
+        assert_eq!(old.status, WorkAttemptStatus::Superseded);
+        assert_eq!(old.corr.as_deref(), Some("corr-1"));
+        assert_eq!(old.effect_key.as_deref(), Some("ek-1"));
+        // The replacement carries the new prompt's corr + effect key.
+        assert_eq!(next.status, WorkAttemptStatus::Running);
+        assert_eq!(next.corr.as_deref(), Some("corr-2"));
+        assert_eq!(next.effect_key.as_deref(), Some("ek-2"));
+        assert_eq!(next.updated_us, now);
+
+        // Live lookup: the highest generation owns the bead.
+        let attempts = vec![old.clone(), next.clone()];
+        assert_eq!(
+            live_attempt_for_bead(&attempts, "bd-x").map(|a| a.generation),
+            Some(2)
+        );
+        assert!(live_attempt_for_bead(&attempts, "bd-y").is_none());
+
+        // Resume: the fresh replacement has no watermark (eligible); a repeat
+        // send of the live generation inside the window stays suppressed; a
+        // completed attempt never resumes even with no watermark.
+        const W: u64 = RESUME_WINDOW_DEFAULT_SECS;
+        assert!(should_resume_attempt(None, now, W, false, Some(&next)));
+        assert!(!should_resume_attempt(
+            Some(now),
+            now,
+            W,
+            false,
+            Some(&next)
+        ));
+        assert!(
+            !should_resume_attempt(None, now, W, true, Some(&next)),
+            "a peer hold suppresses even a fresh generation"
+        );
+        let done = mk_attempt("bd-x", "PaneA", 2, WorkAttemptStatus::Completed);
+        assert!(
+            !should_resume_attempt(None, now, W, false, Some(&done)),
+            "finished work stays finished even when the bead row lags"
+        );
+        assert!(
+            !should_resume_attempt(None, now, W, false, Some(&old)),
+            "a superseded generation never resumes"
+        );
+        assert!(
+            should_resume_attempt(None, now, W, false, None),
+            "a bead with no attempt on record dispatches"
+        );
+    }
+
+    /// Attempt keys are unambiguous across generations (unit separator, like
+    /// the resume window) and statuses round-trip through their spellings.
+    #[test]
+    fn attempt_key_and_status_table() {
+        assert_eq!(attempt_key("bd-x", "PaneA", 2), "bd-x\u{1f}PaneA\u{1f}2");
+        for (s, name) in [
+            (WorkAttemptStatus::Queued, "queued"),
+            (WorkAttemptStatus::Running, "running"),
+            (WorkAttemptStatus::Completed, "completed"),
+            (WorkAttemptStatus::Interrupted, "interrupted"),
+            (WorkAttemptStatus::Failed, "failed"),
+            (WorkAttemptStatus::Superseded, "superseded"),
+        ] {
+            assert_eq!(s.as_str(), name);
+            assert_eq!(WorkAttemptStatus::parse(name), Some(s));
+        }
+        assert_eq!(WorkAttemptStatus::parse("bogus"), None);
     }
 }

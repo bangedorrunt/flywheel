@@ -1752,6 +1752,125 @@ pub fn record_pane_starvation(project: &str, starved: &BTreeMap<String, u32>) ->
     })
 }
 
+// ---- bd-work-attempts-m5x6: durable work-attempt store ----
+
+/// Bound on the per-project attempt registry. Generations accumulate per
+/// bead (superseded rows stay readable), so the cap is generous — and like
+/// every registry here, overflow drops the oldest first.
+pub const WORK_ATTEMPTS_CAP: usize = 500;
+
+pub fn work_attempts_file(project: &str) -> PathBuf {
+    state_dir()
+        .join("work_attempts")
+        .join(format!("{}.json", state_key(project)))
+}
+
+/// The watermark key for one live generation. A steered replacement carries
+/// a new generation, so it has no watermark yet (eligible immediately),
+/// while a repeat send of the live generation hits the recorded one.
+pub fn attempt_resume_key(bead: &str, pane: &str, generation: u64) -> String {
+    crate::durable::attempt_key(bead, pane, generation)
+}
+
+/// Load the project's work attempts. Missing or corrupt files yield an empty
+/// vec — never an error or panic (bookkeeping must not break the loop).
+pub fn load_work_attempts(project: &str) -> Vec<crate::durable::WorkAttempt> {
+    let raw = std::fs::read_to_string(work_attempts_file(project)).unwrap_or_default();
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Record one attempt, upserting by (bead, pane, generation). Generations
+/// accumulate — a supersede writes the marked old row AND the replacement,
+/// so both stay readable. Best-effort by contract: callers log and continue
+/// on error.
+pub fn record_work_attempt(project: &str, attempt: &crate::durable::WorkAttempt) -> Result<()> {
+    update_locked(
+        &work_attempts_file(project),
+        |attempts: &mut Vec<crate::durable::WorkAttempt>| {
+            let key =
+                crate::durable::attempt_key(&attempt.bead_id, &attempt.pane, attempt.generation);
+            match attempts
+                .iter()
+                .position(|a| crate::durable::attempt_key(&a.bead_id, &a.pane, a.generation) == key)
+            {
+                Some(pos) => attempts[pos] = attempt.clone(),
+                None => attempts.push(attempt.clone()),
+            }
+            if attempts.len() > WORK_ATTEMPTS_CAP {
+                let drop = attempts.len() - WORK_ATTEMPTS_CAP;
+                attempts.drain(0..drop);
+            }
+        },
+    )
+}
+
+/// Record one loop resume as a durable attempt (bd-work-attempts-m5x6): the
+/// first resume for a (bead, pane) opens generation 1; later resumes refresh
+/// the live generation's watermark fields without bumping it — generations
+/// advance only on steer/supersede, never on re-send. Returns the recorded
+/// attempt so the caller can key its resume window on the live generation.
+pub fn record_attempt_resume(
+    project: &str,
+    bead: &str,
+    pane: &str,
+    corr: Option<&str>,
+    effect_key: Option<&str>,
+    now_us: i64,
+) -> Result<crate::durable::WorkAttempt> {
+    use crate::durable::{WorkAttempt, WorkAttemptStatus};
+    let mut recorded = WorkAttempt {
+        bead_id: bead.to_string(),
+        pane: pane.to_string(),
+        generation: 1,
+        status: WorkAttemptStatus::Running,
+        corr: corr.map(str::to_string),
+        effect_key: effect_key.map(str::to_string),
+        updated_us: now_us,
+    };
+    update_locked(
+        &work_attempts_file(project),
+        |attempts: &mut Vec<WorkAttempt>| {
+            if let Some(live) = attempts
+                .iter_mut()
+                .filter(|a| a.bead_id == bead && a.pane == pane)
+                .max_by_key(|a| a.generation)
+            {
+                // Refresh the live generation: same work, new evidence. A
+                // superseded row is never refreshed — its replacement owns
+                // the bead (defensive: max generation is live by
+                // construction, but a corrupt file could disagree).
+                if live.status != WorkAttemptStatus::Superseded {
+                    live.updated_us = now_us;
+                    if corr.is_some() {
+                        live.corr = corr.map(str::to_string);
+                    }
+                    if effect_key.is_some() {
+                        live.effect_key = effect_key.map(str::to_string);
+                    }
+                    if matches!(live.status, WorkAttemptStatus::Queued) {
+                        live.status = WorkAttemptStatus::Running;
+                    }
+                    recorded = live.clone();
+                    return;
+                }
+            }
+            recorded.generation = attempts
+                .iter()
+                .filter(|a| a.bead_id == bead && a.pane == pane)
+                .map(|a| a.generation)
+                .max()
+                .map(|g| g.saturating_add(1))
+                .unwrap_or(1);
+            attempts.push(recorded.clone());
+            if attempts.len() > WORK_ATTEMPTS_CAP {
+                let drop = attempts.len() - WORK_ATTEMPTS_CAP;
+                attempts.drain(0..drop);
+            }
+        },
+    )?;
+    Ok(recorded)
+}
+
 /// Keep the newest `LAST_SENT_CAP` records (FIFO: drop the oldest).
 pub fn trim_last_sent(records: &mut Vec<SentRecord>) {
     if records.len() > LAST_SENT_CAP {
@@ -4111,5 +4230,99 @@ mod loops_sidecar_tests {
                 let _ = std::fs::remove_file(&legacy);
             }
         }
+    }
+
+    // ---- bd-work-attempts-m5x6: durable work-attempt persistence ----
+
+    /// Attempts persist per project beside the resume window: record/upsert
+    /// round-trips, generations accumulate under the same bead, and a
+    /// missing file reads as no attempts (bookkeeping never breaks the loop).
+    #[test]
+    fn work_attempts_persist_per_project() {
+        use crate::durable::{WorkAttempt, WorkAttemptStatus};
+        let _g = crate::config::test_state_home();
+        let project = format!("attempts-{}", std::process::id());
+        assert!(
+            load_work_attempts(&project).is_empty(),
+            "missing file reads as no attempts"
+        );
+        let first = WorkAttempt {
+            bead_id: "bd-x".to_string(),
+            pane: "PaneA".to_string(),
+            generation: 1,
+            status: WorkAttemptStatus::Running,
+            corr: Some("corr-1".to_string()),
+            effect_key: None,
+            updated_us: 100,
+        };
+        record_work_attempt(&project, &first).unwrap();
+        let again = WorkAttempt {
+            updated_us: 200,
+            ..first.clone()
+        };
+        record_work_attempt(&project, &again).unwrap();
+        let second = WorkAttempt {
+            generation: 2,
+            status: WorkAttemptStatus::Superseded,
+            corr: None,
+            updated_us: 300,
+            ..first.clone()
+        };
+        record_work_attempt(&project, &second).unwrap();
+        let loaded = load_work_attempts(&project);
+        assert_eq!(
+            loaded.len(),
+            2,
+            "upsert by key, generations accumulate: {loaded:?}"
+        );
+        let live: &WorkAttempt = loaded.iter().max_by_key(|a| a.generation).unwrap();
+        assert_eq!(live.generation, 2);
+        assert_eq!(live.status, WorkAttemptStatus::Superseded);
+        let first_back = loaded.iter().find(|a| a.generation == 1).unwrap();
+        assert_eq!(first_back.updated_us, 200, "upsert replaces the same key");
+    }
+
+    /// The loop's resume seam: the first resume opens generation 1, later
+    /// resumes refresh the live generation (no bump — generations advance
+    /// only on steer), and a resume after a supersede opens the next
+    /// generation. The watermark key follows the live generation, so a
+    /// steered replacement is fresh while a repeat send stays suppressed.
+    #[test]
+    fn attempt_resume_opens_and_refreshes_generations() {
+        use crate::durable::WorkAttemptStatus;
+        let _g = crate::config::test_state_home();
+        let project = format!("attempt-resume-{}", std::process::id());
+        let a1 =
+            record_attempt_resume(&project, "bd-r", "PaneA", Some("corr-1"), None, 100).unwrap();
+        assert_eq!((a1.generation, a1.status), (1, WorkAttemptStatus::Running));
+        let a1b =
+            record_attempt_resume(&project, "bd-r", "PaneA", None, Some("ek-1"), 200).unwrap();
+        assert_eq!(a1b.generation, 1, "a re-send refreshes, never bumps");
+        assert_eq!(a1b.updated_us, 200);
+        assert_eq!(
+            a1b.corr.as_deref(),
+            Some("corr-1"),
+            "absent corr keeps the old"
+        );
+        assert_eq!(a1b.effect_key.as_deref(), Some("ek-1"));
+        let key1 = attempt_resume_key("bd-r", "PaneA", 1);
+        assert_eq!(key1, "bd-r\u{1f}PaneA\u{1f}1");
+        // Steer: mark superseded, record the replacement, resume again.
+        let live = crate::durable::live_attempt_for_bead(&load_work_attempts(&project), "bd-r")
+            .unwrap()
+            .clone();
+        let (old, next) = crate::durable::supersede_attempt(&live, "corr-2", None, 300);
+        record_work_attempt(&project, &old).unwrap();
+        record_work_attempt(&project, &next).unwrap();
+        let a2 = record_attempt_resume(&project, "bd-r", "PaneA", None, None, 400).unwrap();
+        assert_eq!(
+            a2.generation, 2,
+            "resume after a supersede stays on the replacement"
+        );
+        assert_eq!(
+            load_work_attempts(&project).len(),
+            2,
+            "two readable generations under one bead"
+        );
     }
 }
