@@ -3008,7 +3008,21 @@ mod tests {
         assert_eq!(*a.by_day.values().next().unwrap(), 10);
         assert!(a.first_event.is_some(), "first event recorded");
         assert!(a.last_event.is_some(), "last event recorded");
-        assert_eq!(a.first_event, a.last_event, "same-second writes share ts");
+        // bd-e81g: ten rapid writes normally share one ts (second
+        // resolution), but under a loaded suite they can straddle a second
+        // boundary and the strict equality below flakes. Pin the
+        // resolution, not the wall clock: first <= last, at most one
+        // second apart.
+        let t0 = chrono::DateTime::parse_from_rfc3339(a.first_event.as_deref().unwrap())
+            .expect("first ts parses")
+            .timestamp();
+        let t1 = chrono::DateTime::parse_from_rfc3339(a.last_event.as_deref().unwrap())
+            .expect("last ts parses")
+            .timestamp();
+        assert!(
+            t1 >= t0 && t1 - t0 <= 1,
+            "same-or-adjacent second: {t0} vs {t1}"
+        );
 
         // read_log round-trip: every written entry comes back.
         let entries = read_log(&project).unwrap();
