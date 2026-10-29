@@ -789,6 +789,28 @@ impl FileStore {
                     if let Some(p) = prev_seq
                         && s != p + 1
                     {
+                        // bd-3rpb: a seq that moves BACKWARDS (or repeats) has
+                        // no forward gap to describe — `s - 1` / `s - p - 1`
+                        // underflowed u64 and panicked the whole digest on an
+                        // empty-or-rewritten journal. Report it as the tear it
+                        // is instead of doing gap arithmetic that cannot hold.
+                        if s <= p {
+                            torn = Some(TornTail {
+                                at_line: idx + 1,
+                                file: path.display().to_string(),
+                                reason: format!(
+                                    "seq regression: {p} -> {s} (journal is not monotonic; \
+                                     the row was rewritten, duplicated, or rotated underneath \
+                                     the writer)"
+                                ),
+                                missing_seqs: 0,
+                                missing_from: None,
+                                missing_to: None,
+                                rows_withheld: 0,
+                                explained_by_drop: None,
+                            });
+                            break 'files;
+                        }
                         let missing_from = p + 1;
                         let missing_to = s - 1;
                         let missing = s - p - 1;
@@ -1596,6 +1618,31 @@ mod tests {
                 "{name} folds the rows: {body}"
             );
         }
+    }
+
+    /// bd-9blj: a seq that moves BACKWARDS is a tear, not a negative gap.
+    /// The gap arithmetic (`s - 1`, `s - p - 1`) underflowed u64 and panicked
+    /// the whole `doorbell digest` on an empty/rotated journal — and because
+    /// the panic left the exit code at 0, every exit-code smoke stayed green.
+    #[test]
+    fn seq_regression_is_a_tear_not_a_panic() {
+        let (st, dir) = test_store("seqreg");
+        append_seq(&st, "w", 1);
+        append_seq(&st, "w", 2);
+        append_seq(&st, "w", 3);
+        // Rotation or a rewrite put an OLDER seq on the tail.
+        append_seq(&st, "w", 0);
+        let fold = st.fold_workspace("w");
+        let torn = fold.torn.expect("a backwards seq must report a tear");
+        assert!(
+            torn.reason.contains("seq regression"),
+            "reason must name the regression, got {:?}",
+            torn.reason
+        );
+        assert_eq!(torn.missing_seqs, 0, "a regression is not a forward gap");
+        assert_eq!(torn.missing_from, None);
+        assert_eq!(torn.missing_to, None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
