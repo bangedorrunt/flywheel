@@ -3548,17 +3548,6 @@ pub fn file_blocks_bead(
         .any(|path| other_file_holder(path, &claims, self_holder).is_some())
 }
 
-/// Should the loop resume this (bead, pane) now? Suppressed inside the window
-/// and whenever a peer holds the bead's paths.
-pub fn should_resume_bead(
-    last_resumed_us: Option<i64>,
-    now_us: i64,
-    window_secs: u64,
-    peer_holds: bool,
-) -> bool {
-    !peer_holds && !within_resume_window(last_resumed_us, now_us, window_secs)
-}
-
 /// Leases to release because their reason bead is CLOSED — the pure rule behind
 /// the per-pass sweep (`reserve sweep --closed-beads` equivalent). `leases` are
 /// `(handle, reason_bead_id)` pairs; the handle is what the release call needs
@@ -15353,16 +15342,16 @@ mod tests {
         // resume at most once per window: the first pass resumes, every pass
         // inside the window does not, and after the window it resumes again.
         assert!(
-            should_resume_bead(None, now, W, false),
+            should_resume_attempt(None, now, W, false, None),
             "never resumed → resume"
         );
         assert!(
-            !should_resume_bead(Some(now), now, W, false),
+            !should_resume_attempt(Some(now), now, W, false, None),
             "just resumed → no second resume this pass"
         );
-        assert!(!should_resume_bead(Some(secs(800)), now, W, false));
+        assert!(!should_resume_attempt(Some(secs(800)), now, W, false, None));
         assert!(
-            should_resume_bead(Some(secs(1_000)), now, W, false),
+            should_resume_attempt(Some(secs(1_000)), now, W, false, None),
             "past the window"
         );
         assert!(within_resume_window(Some(secs(60)), now, W));
@@ -15436,7 +15425,13 @@ mod tests {
             "empty holder is not a peer"
         );
         assert!(
-            !should_resume_bead(None, now, W, peer_held("bd-peer", &reservations, "MyPane")),
+            !should_resume_attempt(
+                None,
+                now,
+                W,
+                peer_held("bd-peer", &reservations, "MyPane"),
+                None
+            ),
             "peer-held → no resume"
         );
 

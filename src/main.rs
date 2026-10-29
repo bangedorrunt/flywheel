@@ -2956,7 +2956,7 @@ fn main() {
                 "hub": "flywheel catalog [--json] — ratatui multi-panel; refuses non-TTY/NO_COLOR/TERM=dumb naming the CLI (ADR-0007 D4)"
             },
             "wave_dispatch": "loop run --work --wave-label wave-N scopes the ready set by the TYPED `wave` field (bd-wave-gate-typed-authority-27et; schema-18 has shipped — the legacy `wave-N` label is read only as the fallback, and br ready itself holds every higher wave until lower waves close) and holds (naming blockers) while any lower wave-M (M<N) is open/in_progress; default --work unchanged (ADR-0006 D2)",
-            "loop_resume_window": "loop/loop-mode run --work (resume-window sweep, bead 4sa2): an in-progress bead resumes at most ONCE per (bead, pane) in a 15-min window (the watermark persists per project under the state dir, so it survives passes and processes — the in-memory `assigned` set does not); a peer-held bead (a DIFFERENT live pane's reservation reasons to it — a lane split, not a stall) draws NO resume; each pass releases leases whose reason bead is closed via the one pure rule durable::closed_reason_lease_ids. bd-loop-feeds-idle-panes-rh2z adds the idle-pane rotation: each IDLE pane takes ONE bead — its own stalled in-progress bead first, then a ready bead assigned to it, then an unowned ready bead, then any ready bead whose assignee is not a live pane — never a bead another live pane owns or a peer holds, never one already queued, and the picks go at the HEAD of the queue in fleet order (plan_actions pairs the k-th idle agent with the k-th item, so that order is what lands the pick on the pane the rotation chose). A tier-1 hit inside the window still defers for `resume_exempt_passes` consecutive starved passes (config [loop], default 2, counters persisted via state::load_pane_starvation/record_pane_starvation because loop-mode supervise runs each pass as a child process); from that pass the pick is marked window-exempt. Pure: durable::{within_resume_window, peer_held, should_resume_bead, closed_reason_lease_ids, idle_pane_rotation}; fences: resume_window_dedupes_and_respects_peer_holds, loop_feeds_idle_panes_stalled_beads",
+            "loop_resume_window": "loop/loop-mode run --work (resume-window sweep, bead 4sa2): an in-progress bead resumes at most ONCE per (bead, pane) in a 15-min window (the watermark persists per project under the state dir, so it survives passes and processes — the in-memory `assigned` set does not); a peer-held bead (a DIFFERENT live pane's reservation reasons to it — a lane split, not a stall) draws NO resume; each pass releases leases whose reason bead is closed via the one pure rule durable::closed_reason_lease_ids. bd-loop-feeds-idle-panes-rh2z adds the idle-pane rotation: each IDLE pane takes ONE bead — its own stalled in-progress bead first, then a ready bead assigned to it, then an unowned ready bead, then any ready bead whose assignee is not a live pane — never a bead another live pane owns or a peer holds, never one already queued, and the picks go at the HEAD of the queue in fleet order (plan_actions pairs the k-th idle agent with the k-th item, so that order is what lands the pick on the pane the rotation chose). A tier-1 hit inside the window still defers for `resume_exempt_passes` consecutive starved passes (config [loop], default 2, counters persisted via state::load_pane_starvation/record_pane_starvation because loop-mode supervise runs each pass as a child process); from that pass the pick is marked window-exempt. Pure: durable::{within_resume_window, peer_held, should_resume_attempt, closed_reason_lease_ids, idle_pane_rotation}; fences: resume_window_dedupes_and_respects_peer_holds, loop_feeds_idle_panes_stalled_beads",
             "wave_swarm_compose_token": "preferred: workflow compose \"<objective>\" --parts wave-swarm --run (compose token); legacy alias: workflow run wave-swarm --execute. Expands GATE/DISPATCH/EXECUTE/OBSERVE/REVIEW/VERIFY/COMPOUND/SIGNOFF with an await step between each gated pair (retry over verify of .flywheel/wave/<label>-<stage>.done, the marker the predecessor writes; 240 x 30s per-step budget; exhaustion says 'wave in flight … widen the outer bound'). ADR-0009: REVIEW audits diffs pre-verify, COMPOUND captures learnings post-verify; SIGNOFF=request_approval (captain-only), announced by the compose approval drainer — resolve with `flywheel workflow approve`. Ordinary builtins (captain-audit): workflow run <name> --execute, NOT bare --parts. Outer bound: --timeout or FLYWHEEL_COMPOSE_MAX_SECONDS (ADR-0006 D3)",
             "beads_lifecycle_compose_token": "preferred: workflow compose \"<objective>\" --parts beads-lifecycle --run --project <p> (compose token); legacy alias: workflow run beads-lifecycle --execute. grill/create/review1/review2/integrate then implement=call_workflow wave-swarm (new graph) or babysit-bead (inputs.existing_bead / from=bead); verify; outer SIGNOFF. inputs.from=none|session|adr|bead; inputs.until early-exits SUCCESS after any phase; SIGNOFF outer-only (ADR-0008 6.7)",
             "exit_codes": { "0": "ok", "1": "herdr/server error", "2": "usage error", "3": "captain watch --stall: fleet stalled (no pane working + no commit within threshold, work remaining)", "4": "captain watch --preflight: the project's preflight failed (the failing check is named; bd-captain-watch-preflight-arm-snak)" }
@@ -24123,6 +24123,26 @@ pub(crate) fn load_inprogress_beads(
 /// bead-driven mode): resume interrupted in-progress beads first, then hand
 /// out fresh ready beads. Each bead is assigned at most once per loop run
 /// (the `assigned` set is per-invocation state). Pure — fully testable.
+/// bd-g0ge: the window value the loop resume filter gates on — keyed on
+/// the live attempt generation when an attempt row exists, else the legacy
+/// bead key. Pure: the window and the attempts arrive as values, so the
+/// filter and its test read the same lookup.
+fn attempt_window_last_us<'a>(
+    window: &std::collections::BTreeMap<String, i64>,
+    attempts: &'a [durable::WorkAttempt],
+    bead_id: &str,
+    pane: &str,
+) -> (Option<i64>, Option<&'a durable::WorkAttempt>) {
+    let live = durable::live_attempt_for_bead(attempts, bead_id);
+    let last = match live {
+        Some(a) => window
+            .get(&state::attempt_resume_key(bead_id, pane, a.generation))
+            .copied(),
+        None => window.get(&state::resume_key(bead_id, pane)).copied(),
+    };
+    (last, live)
+}
+
 fn work_prompts(
     inprog: &[durable::ReadyBead],
     ready: &[durable::ReadyBead],
@@ -24962,6 +24982,9 @@ fn cmd_loop(
             // and the idle-pane rotation all read the same window, peers and
             // clock — resolved ONCE per pass so the three cannot disagree.
             let window = state::load_resume_window(project);
+            // bd-g0ge: the attempt dimension rides the same pass — loaded
+            // once so the filter and the record below cannot disagree.
+            let attempts = state::load_work_attempts(project);
             // A toron reserve-yield (bead taqf) is one more peer source, so
             // the SAME pure peer-hold rule decides both. A yield whose holder
             // released drops out on the toron side, so no clear path exists
@@ -24983,10 +25006,15 @@ fn cmd_loop(
                         .iter()
                         .filter(|b| {
                             let pane = b.assignee.as_deref().unwrap_or("");
-                            let last = window.get(&state::resume_key(&b.id, pane)).copied();
+                            // bd-g0ge: gate on the live generation, not the
+                            // bead row — a completed/superseded attempt never
+                            // resumes, and a steered replacement generation
+                            // starts with a fresh window.
+                            let (last, live) =
+                                attempt_window_last_us(&window, &attempts, &b.id, pane);
                             let intended =
                                 durable::path_tokens(&format!("{} {}", b.title, b.description));
-                            durable::should_resume_bead(
+                            durable::should_resume_attempt(
                                 last,
                                 now_us,
                                 durable::RESUME_WINDOW_DEFAULT_SECS,
@@ -24994,6 +25022,7 @@ fn cmd_loop(
                                     || durable::file_blocks_bead(
                                         &b.id, &file_rows, pane, &intended,
                                     ),
+                                live,
                             )
                         })
                         .cloned()
@@ -25013,6 +25042,28 @@ fn cmd_loop(
                             eprintln!(
                                 "flywheel: resume-window record for {bead} failed (continuing): {e:#}"
                             );
+                        }
+                        // bd-g0ge: refresh (or open) the attempt row and key
+                        // this pass's window on the live generation, so the
+                        // filter above reads its own write next pass.
+                        match state::record_attempt_resume(project, bead, pane, None, None, now_us)
+                        {
+                            Ok(rec) => {
+                                let key = state::attempt_resume_key(bead, pane, rec.generation);
+                                if let Err(e) = state::update_locked(
+                                    &state::resume_window_file(project),
+                                    |map: &mut std::collections::BTreeMap<String, i64>| {
+                                        map.insert(key.clone(), now_us);
+                                    },
+                                ) {
+                                    eprintln!(
+                                        "flywheel: attempt-resume window record for {bead} failed (continuing): {e:#}"
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "flywheel: attempt resume record for {bead} failed (continuing): {e:#}"
+                            ),
                         }
                     }
                     inprog_items.extend(to_resume);
@@ -25050,7 +25101,9 @@ fn cmd_loop(
                             body_md: format!("bead={}\npath={}", b.id, pattern),
                             ..Default::default()
                         };
-                        match crate::mail::block_on(crate::mail::comms_mailbox()?.send_message(&args)) {
+                        match crate::mail::block_on(
+                            crate::mail::comms_mailbox()?.send_message(&args),
+                        ) {
                             Ok(_) => {
                                 if let Err(e) = state::update_locked(
                                     &state::resume_window_file(project),
@@ -26007,6 +26060,60 @@ mod loop_tests {
         assert_eq!(clamp_active_interval(5), 5);
         assert_eq!(clamp_active_interval(15), 15);
         assert_eq!(clamp_active_interval(30), 30);
+    }
+
+    /// bd-g0ge: the loop resume filter keys the window on the live
+    /// generation — a stale bead-level watermark must not re-arm a
+    /// completed attempt, and a fresh generation window must pass.
+    #[test]
+    fn resume_attempt_window_keys_live_generation() {
+        use std::collections::BTreeMap;
+        let now_us = 1_000_000_000_000_000i64;
+        let mut window: BTreeMap<String, i64> = BTreeMap::new();
+        // Fresh bead-level watermark: the old bead-keyed lookup would read
+        // this and suppress. The filter must read the generation key
+        // instead — absent here, so the live generation is resumable.
+        window.insert(state::resume_key("bd-x", "PaneA"), now_us - 60 * 1_000_000);
+        let attempts = vec![durable::WorkAttempt {
+            bead_id: "bd-x".into(),
+            pane: "PaneA".into(),
+            generation: 3,
+            status: durable::WorkAttemptStatus::Running,
+            corr: None,
+            effect_key: None,
+            updated_us: now_us,
+        }];
+        let live = durable::live_attempt_for_bead(&attempts, "bd-x");
+        assert!(live.is_some_and(|a| a.generation == 3));
+        let (last, live) = attempt_window_last_us(&window, &attempts, "bd-x", "PaneA");
+        assert_eq!(last, None);
+        assert!(durable::should_resume_attempt(
+            last,
+            now_us,
+            durable::RESUME_WINDOW_DEFAULT_SECS,
+            false,
+            live,
+        ));
+        // A completed attempt never resumes, even with a fresh bead-level
+        // watermark (the row lags the finished work).
+        window.insert(state::resume_key("bd-y", "PaneA"), now_us);
+        let done = vec![durable::WorkAttempt {
+            bead_id: "bd-y".into(),
+            pane: "PaneA".into(),
+            generation: 1,
+            status: durable::WorkAttemptStatus::Completed,
+            corr: None,
+            effect_key: None,
+            updated_us: now_us,
+        }];
+        let (last_done, live_done) = attempt_window_last_us(&window, &done, "bd-y", "PaneA");
+        assert!(!durable::should_resume_attempt(
+            last_done,
+            now_us,
+            durable::RESUME_WINDOW_DEFAULT_SECS,
+            false,
+            live_done,
+        ));
     }
 
     #[test]
