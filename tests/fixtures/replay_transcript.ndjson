@@ -1,0 +1,13 @@
+{"frame":"herdr.status","id":"hs-1","seq":1,"agent_status":"idle","pane_id":"w1:p1","pin":"BlueRidge"}
+{"frame":"herdr.status","id":"hs-2","seq":2,"agent_status":"working","pane_id":"w1:p2","pin":"LilacChapel"}
+{"frame":"watch","id":"e1","seq":3,"line":{"content":"idle","id":"e1","kind":20001,"tags":[["p","BlueRidge"]]}}
+{"frame":"watch","id":"r1","seq":4,"line":{"content":"@BlueRidge ack-sla-expired for corr-1 unacked for 40m","id":"r1","kind":9,"tags":[["p","BlueRidge"],["toron-kind","ack-sla-expired"]]}}
+{"frame":"watch","id":"r2","seq":5,"line":{"content":"@Ghost hi","id":"r2","kind":9,"tags":[["p","Ghost"]]}}
+{"frame":"watch","id":"r3","seq":6,"line":{"content":"@LilacChapel hi","id":"r3","kind":9,"tags":[["p","LilacChapel"]]}}
+{"frame":"watch","id":"a1","seq":7,"line":{"content":"do the thing","id":"a1","kind":14,"tags":[["audience","agents"],["corr","corr-7"],["priority","queue"],["wake","tasked"]]}}
+{"frame":"watch","id":"r9","seq":8,"line":{"content":"[redacted]","id":"r9","kind":9,"tags":[["p","BlueRidge"],["toron-kind","ack-sla-expired"]]}}
+{"frame":"toron","id":"t1","seq":9,"event":{"event":"appended","offset":41},"op":"send","recipient":"BlueRidge","task_class":"task"}
+{"frame":"toron","id":"t2","seq":10,"event":{"cursor":41,"event":"read","reader":"BlueRidge"},"op":"delivery"}
+{"frame":"toron","id":"t3","seq":11,"event":{"by":"BlueRidge","event":"accept","gen":1},"op":"delivery"}
+{"frame":"toron","id":"t4","seq":12,"event":{"by":"BlueRidge","event":"done","gen":1},"op":"read"}
+{"frame":"toron","id":"t5","seq":13,"event":{"by":"Captain","event":"verdict","pass":true,"rework":false},"op":"verdict"}
