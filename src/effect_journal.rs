@@ -23,15 +23,17 @@ use anyhow::Result;
 use serde_json::Value;
 
 use anyhow::bail;
-use toron_core::index::workflow_effects::{EffectState, NewRun, RunStatus, WorkflowEffectStore};
+use toron_core::index::workflow_effects::{
+    EffectState, NewRun, RunStatus, WorkflowEffectStore, now_us,
+};
 use toron_core::kernel::{Executor, TokioExecutor};
 use toron_core::mailbox::SendMessage;
 use toron_core::nostr::Tag;
 use toron_mcp::workflow_host::{DispatchRequest, EffectDispatcher};
 use toron_workflow::engine::{
-    ActionInvocation, ActionPartition, EffectRunner, ProviderErrorClass, ProviderOutcome,
-    RunJournal, RunPhase, RunTransition, capability_for_action_type, classify_provider_error_msg,
-    derive_effect_key, partition,
+    ActionInvocation, ActionPartition, EffectRunner, ProviderCapability, ProviderErrorClass,
+    ProviderOutcome, RunJournal, RunPhase, RunTransition, capability_for_action_type,
+    classify_provider_error_msg, derive_effect_key, partition,
 };
 use toron_workflow::identity::{action_digest_of, redact_value};
 use toron_workflow::stamp_workflow_emitted;
@@ -544,10 +546,46 @@ pub fn journals(cfg: &crate::config::Config, inner: EffectRunner) -> Option<Jour
     // borrows, so the two share one connection instead of opening two.
     let plane = mail_plane(cfg);
     match journal_store() {
-        Some(store) => Some(Journals {
-            effect: effect_runner(inner, store.clone(), plane),
-            run: run_journal(store),
-        }),
+        Some(store) => {
+            // bd-effect-sweep-x464: every journaled engine build sweeps
+            // expired leases first through this same run surface (no new
+            // verb, so the skill-sync contract does not fire). Reclaimable
+            // rows are left for the next dispatch (same key, next attempt);
+            // refused rows are already unknown with sweep evidence; unknown
+            // rows page loud here. Best-effort: a sweep failure never fails
+            // the engine build — the dispatch path refuses loud on its own.
+            match submit_journal_wait(sweep_expired_leases(
+                store.clone(),
+                now_us(),
+                SWEEP_LIMIT_DEFAULT,
+            )) {
+                Ok(report) if !report.is_empty() => {
+                    eprintln!(
+                        "flywheel: effect sweep: {} scanned, {} reclaimable (same key), {} refused to unknown, {} paged{}",
+                        report.scanned,
+                        report.reclaimed.len(),
+                        report.refused.len(),
+                        report.paged.len(),
+                        if report.truncated {
+                            " (truncated: more expired rows remain for the next pass)"
+                        } else {
+                            ""
+                        },
+                    );
+                    for (key, reason) in &report.paged {
+                        eprintln!(
+                            "flywheel: effect sweep PAGE {key}: {reason} (run_id/node in the journal row)"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("flywheel: effect sweep failed (continuing without it): {e:#}"),
+            }
+            Some(Journals {
+                effect: effect_runner(inner, store.clone(), plane),
+                run: run_journal(store),
+            })
+        }
         None => {
             eprintln!(
                 "flywheel: no toron index available — effectful workflow leaves will stay \
@@ -786,7 +824,10 @@ fn dispatch_request(inv: &ActionInvocation) -> DispatchRequest {
         action_type: action_type.clone(),
         action_digest: action_digest_of(&redacted),
         redacted_action: Some(redacted),
-        capability: capability_for_action_type(&action_type),
+        // bd-effect-sweep-x464: the HOST declares the mailbox idempotency
+        // contract (corr claim), so an expired-lease mailbox row reclaims
+        // under the same key instead of refusing blind.
+        capability: host_capability_for_action_type(&action_type),
     }
 }
 
@@ -822,6 +863,164 @@ fn fenced_outcome(result: Result<toron_mcp::workflow_host::DispatchResult>) -> V
             "stage": "effect",
         }),
     }
+}
+
+// ---- bd-effect-sweep-x464: expired-lease sweep with per-action policy ----
+
+/// Bound on rows acted on per sweep. The fold is run-scoped (hundreds of
+/// rows); the report names truncation instead of letting one pass grow.
+pub const SWEEP_LIMIT_DEFAULT: usize = 100;
+
+/// The host's replay-capability declaration per action type.
+///
+/// The engine's [`capability_for_action_type`] declares no contract for any
+/// action, so every re-drive after an expired lease refuses blind. The host
+/// knows more about its own mailbox sink: a re-send under the same
+/// (project, sender, corr, subject, body) converges on one rumor through
+/// toron-core's idempotent send claim, so `send_message`/`send_dm` carry an
+/// idempotency key and a crashed owner may be reclaimed under the same
+/// effect key. Every other action keeps the engine's declaration — a blind
+/// retry without a contract stays refused.
+pub fn host_capability_for_action_type(action_type: &str) -> ProviderCapability {
+    match action_type {
+        "send_message" | "send_dm" => ProviderCapability {
+            supports_idempotency_key: true,
+            supports_reconcile_query: false,
+        },
+        _ => capability_for_action_type(action_type),
+    }
+}
+
+/// What the expired-lease sweep decides for one unsettled row. Total over
+/// the states the sweep can meet; terminal rows never reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweepVerdict {
+    /// The next fenced dispatch may reclaim this row under the same key
+    /// with the next attempt. The sweep itself writes nothing — a reclaim
+    /// is a dispatch, and the sweep performs no effect.
+    Reclaim { reason: &'static str },
+    /// No idempotency or query contract: the row moves to `unknown` with
+    /// sweep evidence, and any re-drive refuses blind.
+    RefuseBlindRetry { reason: &'static str },
+    /// Outcome uncertain and no host contract can resolve it: an operator
+    /// decides from the row's evidence. Never settled as success.
+    Page { reason: &'static str },
+}
+
+/// One pure per-action table (bd-effect-sweep-x464): mailbox rows are
+/// reclaimable through the corr claim; uncertainty pages; everything else
+/// refuses blind retry.
+pub fn sweep_verdict(action_type: &str, state: EffectState) -> SweepVerdict {
+    match state {
+        EffectState::InFlight | EffectState::Accepted => match action_type {
+            "send_message" | "send_dm" => SweepVerdict::Reclaim {
+                reason: "mailbox corr claim dedupes an identical retry; the next dispatch reclaims the same key",
+            },
+            _ => SweepVerdict::RefuseBlindRetry {
+                reason: "no idempotency or query contract for this action; reconcile by operator evidence",
+            },
+        },
+        EffectState::Prepared => SweepVerdict::Reclaim {
+            reason: "nothing claimed yet; the next dispatch claims fresh under the same key",
+        },
+        EffectState::Unknown => SweepVerdict::Page {
+            reason: "outcome uncertain after an expired lease; operator decides from the row's evidence",
+        },
+        // Owned by a reconciler or a wake time — the sweep must not steal.
+        EffectState::ReconcilePending | EffectState::Parked => SweepVerdict::RefuseBlindRetry {
+            reason: "owned by a reconciler or a wake time; the sweep does not steal live work",
+        },
+        // Terminal rows never reach the sweep; refusing is the closed shape.
+        EffectState::Settled | EffectState::Failed | EffectState::Cancelled => {
+            SweepVerdict::RefuseBlindRetry {
+                reason: "terminal rows are never swept",
+            }
+        }
+    }
+}
+
+/// What one sweep pass did. `reclaimed` rows are UNTOUCHED — the sweep
+/// performs no effect, so the next fenced dispatch reclaims them under the
+/// same key. `refused` rows moved to `unknown` with sweep evidence.
+/// `paged` rows need an operator.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    pub scanned: usize,
+    pub reclaimed: Vec<String>,
+    pub refused: Vec<(String, String)>,
+    pub paged: Vec<(String, String)>,
+    pub truncated: bool,
+}
+
+impl SweepReport {
+    pub fn is_empty(&self) -> bool {
+        self.reclaimed.is_empty() && self.refused.is_empty() && self.paged.is_empty()
+    }
+}
+
+/// Sweep unsettled effects whose lease expired (bd-effect-sweep-x464):
+/// classify each through [`sweep_verdict`], move refuse-rows to `unknown`
+/// with sweep evidence, leave reclaim-rows for the next dispatch, and page
+/// on unknown. Bounded: at most `limit` rows acted on per pass; the rest
+/// set `truncated` for the next pass. Best-effort reads — a fold failure
+/// errors loud and the caller decides whether to continue.
+pub async fn sweep_expired_leases(
+    store: WorkflowEffectStore,
+    now: i64,
+    limit: usize,
+) -> Result<SweepReport> {
+    let fold = store.fold_projected().await?;
+    let mut report = SweepReport::default();
+    let mut acted = 0usize;
+    // BTreeMap order: deterministic across passes, so truncation resumes
+    // at the same frontier instead of starving one key range.
+    for (key, (row, _)) in fold.effects.iter() {
+        if !matches!(row.state, EffectState::InFlight | EffectState::Accepted) {
+            continue;
+        }
+        if !matches!(row.lease_expires_at, Some(expires) if expires < now) {
+            continue;
+        }
+        report.scanned += 1;
+        if acted >= limit {
+            report.truncated = true;
+            continue;
+        }
+        match sweep_verdict(&row.action_type, row.state) {
+            SweepVerdict::Reclaim { .. } => {
+                report.reclaimed.push(key.clone());
+                acted += 1;
+            }
+            SweepVerdict::RefuseBlindRetry { reason } => {
+                let evidence = serde_json::json!({
+                    "swept": true,
+                    "reason": reason,
+                    "lease_expires_at": row.lease_expires_at,
+                    "swept_at_us": now,
+                    "note": "owner presumed dead: lease expired with the effect unsettled",
+                });
+                let moved = store
+                    .transition_effect(key, EffectState::Unknown, Some(evidence), None)
+                    .await?;
+                if moved {
+                    report.refused.push((key.clone(), reason.to_string()));
+                    acted += 1;
+                } else {
+                    eprintln!(
+                        "flywheel: effect sweep: {key} moved concurrently; left alone (not refused)"
+                    );
+                }
+            }
+            SweepVerdict::Page { reason } => {
+                // Unreachable from the query above (unknown rows carry no
+                // lease) — kept so a future caller sweeping unknown rows
+                // pages instead of inventing an outcome.
+                report.paged.push((key.clone(), reason.to_string()));
+                acted += 1;
+            }
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1812,5 +2011,224 @@ mod tests {
         assert_eq!(super::EXECUTOR_QUEUE_BOUND, 4096);
         let rt = super::journal_runtime();
         assert_eq!(rt.max_blocking_threads(), 4096);
+    }
+
+    // ---- bd-effect-sweep-x464: expired-lease sweep with per-action policy ----
+
+    use toron_core::index::workflow_effects::{ClaimAttempt, NewEffect, now_us};
+
+    /// Crash simulation WITHOUT the runner: prepare + claim directly, then
+    /// leave the row in_flight under an already-expired lease — the owner
+    /// died between claim and invoke. Returns the invocation + key.
+    async fn crashed_in_flight(
+        store: &WorkflowEffectStore,
+        action: Action,
+        run_id: &str,
+        node: &str,
+    ) -> (ActionInvocation, String) {
+        let inv = invocation(action, run_id, node);
+        let key = effect_key_for(&inv);
+        let rendered = serde_json::to_value(&inv.action).unwrap();
+        let (redacted, _) = redact_value(&rendered);
+        store
+            .prepare_effect(NewEffect {
+                effect_key: key.clone(),
+                run_id: run_id.to_string(),
+                project: None,
+                workflow_digest: "wf-digest-1".to_string(),
+                node_path: node.to_string(),
+                iteration_key: None,
+                action_type: inv.action.type_name().to_string(),
+                action_digest: action_digest_of(&redacted),
+                redacted_action: Some(redacted),
+                retention_until: None,
+            })
+            .await
+            .expect("prepare");
+        let claimed = store
+            .claim_attempt(
+                &key,
+                ClaimAttempt {
+                    attempt: 1,
+                    attempt_id: format!("att-{run_id}-a1"),
+                    claim_token: "tok-dead-owner".to_string(),
+                    // Already expired: the owner is dead, not slow.
+                    lease_expires_at: now_us() - 60_000_000,
+                    expected_claim_token: None,
+                },
+            )
+            .await
+            .expect("claim");
+        assert!(claimed, "the dead owner's claim lands");
+        (inv, key)
+    }
+
+    /// bd-effect-sweep-x464: an expired-lease in_flight mailbox row sweeps as
+    /// Reclaim — the sweep writes NOTHING (it performs no effect) — and the
+    /// next fenced dispatch reuses the SAME key with the next attempt. The
+    /// crash neither duplicates the send nor forks the key.
+    #[tokio::test]
+    async fn effect_sweep_reclaims_expired_lease() {
+        let (_dir, store) = test_store().await;
+        let (inv, key) = crashed_in_flight(&store, send_message(), "run-sweep", "notify").await;
+
+        let report = super::sweep_expired_leases(store.clone(), now_us(), 100)
+            .await
+            .expect("sweep runs");
+        assert!(
+            report.reclaimed.contains(&key),
+            "an expired mailbox lease is reclaimable: {report:?}"
+        );
+        assert!(report.refused.is_empty(), "{report:?}");
+        assert!(report.paged.is_empty(), "{report:?}");
+        let row = store.get_effect(&key).await.unwrap().expect("row");
+        assert_eq!(
+            row.state,
+            EffectState::InFlight,
+            "the sweep performs no effect, so the row is untouched: {row:?}"
+        );
+
+        // The next legitimate dispatch reclaims the same key: one delivery,
+        // attempt 2, settled — the transport corr claim (same
+        // project/sender/corr/content) converges the retry onto one rumor.
+        // (The mailbox sink's provider is the plane, not the leaf runner, so
+        // the delivery — not a leaf counter — is what proves one invoke.)
+        let inner: EffectRunner =
+            Arc::new(|inv: &ActionInvocation| Ok(json!({ "action": inv.action.type_name() })));
+        let seen: Arc<std::sync::Mutex<Vec<SendMessage>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let fx = effect_runner(inner, store.clone(), Some(recording_plane(seen.clone())));
+        let out = fx(&inv).expect("re-drive reclaims");
+
+        assert_eq!(
+            out,
+            json!({ "ok": true, "count": 1, "effect_key": key }),
+            "reclaim returns the provider's value under the SAME key: {out}"
+        );
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "exactly one delivery for the reclaiming dispatch"
+        );
+        let tags: Vec<Vec<String>> = sent[0]
+            .extra_tags
+            .iter()
+            .map(|t| t.as_slice().to_vec())
+            .collect();
+        assert!(
+            tags.iter()
+                .any(|t| t.first().map(String::as_str) == Some("corr")
+                    && t.get(1).map(String::as_str) == Some(key.as_str())),
+            "the reclaim re-sends under the same corr (the dedupe key): {tags:?}"
+        );
+        let row = store.get_effect(&key).await.unwrap().expect("row");
+        assert_eq!(row.state, EffectState::Settled, "{row:?}");
+        assert_eq!(row.attempt, 2, "same key, next attempt: {row:?}");
+    }
+
+    /// The other half of the sweep: a crashed dispatch_job has no idempotency
+    /// or query contract, so the sweep classifies it RefuseBlindRetry by
+    /// moving the row to Unknown WITH sweep evidence — and a re-drive refuses
+    /// blind instead of dispatching twice. Never settled as success.
+    #[tokio::test]
+    async fn effect_sweep_refuses_blind_retry_for_dispatch_job() {
+        let (_dir, store) = test_store().await;
+        let (inv, key) = crashed_in_flight(&store, dispatch_job(), "run-sweep-job", "ship").await;
+
+        let report = super::sweep_expired_leases(store.clone(), now_us(), 100)
+            .await
+            .expect("sweep runs");
+        assert!(report.reclaimed.is_empty(), "{report:?}");
+        assert_eq!(report.refused.len(), 1, "{report:?}");
+        assert_eq!(report.refused[0].0, key, "{report:?}");
+        let row = store.get_effect(&key).await.unwrap().expect("row");
+        assert_eq!(row.state, EffectState::Unknown, "{row:?}");
+        assert!(
+            row.failure_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("swept"),
+            "the unknown row carries its sweep evidence: {row:?}"
+        );
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let inner: EffectRunner = Arc::new(move |_inv: &ActionInvocation| {
+            calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({ "ok": true }))
+        });
+        let fx = effect_runner(inner, store.clone(), None);
+        let out = fx(&inv).expect("re-drive answers");
+
+        assert_eq!(out["ok"], json!(false), "refused, not retried: {out}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused blind retry never invokes the provider"
+        );
+        let row = store.get_effect(&key).await.unwrap().expect("row");
+        assert_eq!(row.state, EffectState::Unknown, "{row:?}");
+    }
+
+    /// The host declares the mailbox idempotency contract the engine cannot:
+    /// same (project, sender, corr, subject, body) converges on one rumor,
+    /// so a retry under the same key is a reclaim, not a duplicate.
+    #[test]
+    fn host_capability_declares_mailbox_idempotency() {
+        for action in ["send_message", "send_dm"] {
+            let cap = super::host_capability_for_action_type(action);
+            assert!(
+                cap.supports_idempotency_key,
+                "{action} retries converge on the corr claim"
+            );
+            assert!(
+                !cap.supports_reconcile_query,
+                "{action} has no query path — idempotency only"
+            );
+        }
+        let job = super::host_capability_for_action_type("dispatch_job");
+        assert!(
+            !job.supports_idempotency_key && !job.supports_reconcile_query,
+            "dispatch_job keeps the engine's declaration: no contract, no blind retry"
+        );
+        let unknown = super::host_capability_for_action_type("ghost-action");
+        assert!(
+            !unknown.supports_idempotency_key && !unknown.supports_reconcile_query,
+            "unknown actions stay conservative"
+        );
+    }
+
+    /// The sweep policy table, pinned: per-action verdicts for every
+    /// non-terminal state the sweep can meet.
+    #[test]
+    fn sweep_verdict_table() {
+        use super::SweepVerdict;
+        assert!(matches!(
+            super::sweep_verdict("send_message", EffectState::InFlight),
+            SweepVerdict::Reclaim { .. }
+        ));
+        assert!(matches!(
+            super::sweep_verdict("send_dm", EffectState::Accepted),
+            SweepVerdict::Reclaim { .. }
+        ));
+        assert!(matches!(
+            super::sweep_verdict("send_message", EffectState::Unknown),
+            SweepVerdict::Page { .. }
+        ));
+        assert!(matches!(
+            super::sweep_verdict("dispatch_job", EffectState::InFlight),
+            SweepVerdict::RefuseBlindRetry { .. }
+        ));
+        assert!(
+            matches!(
+                super::sweep_verdict("dispatch_job", EffectState::Unknown),
+                SweepVerdict::Page { .. }
+            ),
+            "uncertainty pages even for non-reclaimable actions"
+        );
+        assert!(matches!(
+            super::sweep_verdict("verify", EffectState::Accepted),
+            SweepVerdict::RefuseBlindRetry { .. }
+        ));
     }
 }
