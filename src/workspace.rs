@@ -24,6 +24,162 @@ pub struct Receipt {
     pub result_path: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Context handoff (bd-context-handoff-064d): coverage-ranged resume instead
+// of an ad-hoc brief.
+//
+// A handoff row records which runs a resumed pane already saw; respawn (and
+// the session-pickup resume brief — one primitive for both) sends only the
+// delta. A missing or stale row falls back to a full brief and says which
+// strategy it used. Pure: callers supply the run list, tick only stores.
+// ---------------------------------------------------------------------------
+
+/// Which resume shape a handoff produced. The default return is the delta,
+/// never a full transcript; FullBrief names itself when it fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HandoffStrategy {
+    DeltaSinceLastSeen,
+    FullBrief,
+}
+
+/// One run the pane may have seen, oldest first. `seq` orders; `id` names.
+#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffRun {
+    pub id: String,
+    pub seq: u64,
+}
+
+/// Auditable handoff row, keyed (project, pin, bead) in the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffRow {
+    pub project: String,
+    pub pin: String,
+    pub bead: String,
+    /// Last run the pane saw (inclusive). The delta starts after this.
+    pub from_run: String,
+    /// Newest run covered when the row was recorded.
+    pub to_run: String,
+    pub strategy: HandoffStrategy,
+    /// Handoff artifact path.
+    pub artifact: String,
+    /// Run that consumed this handoff, once a resume lands. Informational:
+    /// a consumed row still replays its delta idempotently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consuming_run: Option<String>,
+}
+
+/// Model key for one handoff row.
+pub fn handoff_key(project: &str, pin: &str, bead: &str) -> (String, String, String) {
+    (project.into(), pin.into(), bead.into())
+}
+
+/// Stamp one handoff row: coverage `from_run..=to_run`, delta strategy.
+#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+pub fn record_handoff(
+    project: &str,
+    pin: &str,
+    bead: &str,
+    from_run: &str,
+    to_run: &str,
+    artifact: &str,
+) -> HandoffRow {
+    HandoffRow {
+        project: project.into(),
+        pin: pin.into(),
+        bead: bead.into(),
+        from_run: from_run.into(),
+        to_run: to_run.into(),
+        strategy: HandoffStrategy::DeltaSinceLastSeen,
+        artifact: artifact.into(),
+        consuming_run: None,
+    }
+}
+
+/// The delta a resume sends: only runs the pane has NOT seen.
+///
+/// - No row → every run, FullBrief ("no handoff row").
+/// - Stale row (`to_run` unknown, or `from_run` unknown while runs exist)
+///   → every run, FullBrief ("stale handoff row"): coverage is unprovable,
+///   so a delta would risk skipping context.
+/// - Otherwise → runs after `from_run`, DeltaSinceLastSeen (possibly empty:
+///   the pane is already current, so the resume sends nothing).
+#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+pub fn handoff_delta<'a>(
+    row: Option<&HandoffRow>,
+    runs: &'a [HandoffRun],
+) -> (Vec<&'a HandoffRun>, HandoffStrategy, &'static str) {
+    let Some(row) = row else {
+        return (
+            runs.iter().collect(),
+            HandoffStrategy::FullBrief,
+            "no handoff row: full brief",
+        );
+    };
+    let ids: std::collections::HashSet<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+    if !ids.contains(row.to_run.as_str())
+        || (!ids.contains(row.from_run.as_str()) && !runs.is_empty())
+    {
+        return (
+            runs.iter().collect(),
+            HandoffStrategy::FullBrief,
+            "stale handoff row: full brief",
+        );
+    }
+    let after = match runs.iter().position(|r| r.id == row.from_run) {
+        Some(i) => &runs[i + 1..],
+        None => &[][..],
+    };
+    (
+        after.iter().collect(),
+        HandoffStrategy::DeltaSinceLastSeen,
+        "delta since target last seen",
+    )
+}
+
+/// One primitive for the respawn resume AND the session-pickup resume brief:
+/// renders which strategy fired and exactly which runs travel. The delta
+/// carries only unseen runs; the fallback names itself as a full brief.
+#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+pub fn resume_brief(row: Option<&HandoffRow>, runs: &[HandoffRun]) -> (String, HandoffStrategy) {
+    let (unseen, strategy, reason) = handoff_delta(row, runs);
+    let ids: Vec<&str> = unseen.iter().map(|r| r.id.as_str()).collect();
+    let text = match strategy {
+        HandoffStrategy::DeltaSinceLastSeen => {
+            if ids.is_empty() {
+                format!(
+                    "handoff delta: already current at {} — nothing to resend",
+                    row.map(|r| r.to_run.as_str()).unwrap_or("?")
+                )
+            } else {
+                format!(
+                    "handoff delta since {}: {}",
+                    row.map(|r| r.from_run.as_str()).unwrap_or("?"),
+                    ids.join(",")
+                )
+            }
+        }
+        HandoffStrategy::FullBrief => {
+            format!("full brief ({reason}): {}", ids.join(","))
+        }
+    };
+    (text, strategy)
+}
+
+/// Read the stored row for (project, pin, bead) and return the resume delta.
+/// Effect-layer entry point for respawn / session-pickup wiring.
+#[cfg_attr(not(test), allow(dead_code))] // test-proven API; the respawn/pickup wiring lane calls it next
+pub fn resume_runs_for<'a>(
+    model: &'a WorkspaceModel,
+    project: &str,
+    pin: &str,
+    bead: &str,
+    runs: &'a [HandoffRun],
+) -> (Vec<&'a HandoffRun>, HandoffStrategy, &'static str) {
+    let row = model.handoffs.get(&handoff_key(project, pin, bead));
+    handoff_delta(row, runs)
+}
+
 /// Presence verdict per pin; missing key = Unknown (invariant 9).
 /// Governed-by: ADR-0010 D3. Busy/Idle/Dead carry the evidence source:
 /// "presence" (20001 wire authority), "herdr-evidence" (native busy,
@@ -288,6 +444,10 @@ pub struct WorkspaceModel {
     /// ADR-0010 D5 (bd-65he): per-class tick counts (journal+counter
     /// for routine; proves benign/routine classes spend zero prompts).
     pub wake_counters: std::collections::BTreeMap<String, u64>,
+    /// bd-context-handoff-064d: auditable handoff rows keyed
+    /// (project, pin, bead). Pure model data; the effect layer (respawn /
+    /// session-pickup) reads them via `resume_runs_for`.
+    pub handoffs: BTreeMap<(String, String, String), HandoffRow>,
     /// ADR-0010 D5 (bd-65he): last wall-clock seen on a now-bearing Msg.
     pub last_now: u64,
     /// ADR-0010 D5 (bd-65he): wall-clock of the last emitted digest.
@@ -686,6 +846,11 @@ pub enum Msg {
         decide_reason: String,
         /// Passthrough from MaterialContext (sticky predicate).
         explicit_topology: Option<String>,
+    },
+    /// bd-context-handoff-064d: records one auditable handoff row keyed
+    /// (project, pin, bead). Last writer wins; emits nothing.
+    HandoffRecorded {
+        row: HandoffRow,
     },
 }
 
@@ -2095,6 +2260,13 @@ pub fn tick(model: &WorkspaceModel, msg: &Msg) -> (WorkspaceModel, Vec<Cmd>) {
             // re-targets all open corrs by construction. Nothing to copy.
             next.roles.insert(role.clone(), pin.clone());
         }
+        Msg::HandoffRecorded { row } => {
+            // bd-context-handoff-064d: sole writer of the handoffs map.
+            // Last writer wins; the resume reads it via `resume_runs_for`.
+            // Emits nothing — a stored row is not a delivery.
+            let key = handoff_key(&row.project, &row.pin, &row.bead);
+            next.handoffs.insert(key, row.clone());
+        }
         Msg::Presence { pin, state } => {
             // Trusted internal edge (dispatcher jsonl timeout path):
             // no author check — the dispatcher is the trust root here. The
@@ -2422,6 +2594,88 @@ mod tests {
 
     fn empty_model() -> WorkspaceModel {
         WorkspaceModel::default()
+    }
+
+    /// bd-context-handoff-064d: the resume delta covers only unseen runs.
+    #[test]
+    fn handoff_delta_covers_only_unseen_runs() {
+        let runs = vec![
+            HandoffRun {
+                id: "r1".into(),
+                seq: 1,
+            },
+            HandoffRun {
+                id: "r2".into(),
+                seq: 2,
+            },
+            HandoffRun {
+                id: "r3".into(),
+                seq: 3,
+            },
+            HandoffRun {
+                id: "r4".into(),
+                seq: 4,
+            },
+        ];
+        let row = record_handoff("p", "BlueRidge", "bd-1", "r2", "r4", "/tmp/h.json");
+        let (unseen, strategy, reason) = handoff_delta(Some(&row), &runs);
+        assert_eq!(strategy, HandoffStrategy::DeltaSinceLastSeen);
+        assert_eq!(
+            unseen.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r3", "r4"],
+            "{reason}"
+        );
+        // The same row read back through the model agrees (one primitive).
+        let (model, cmds) = tick(&empty_model(), &Msg::HandoffRecorded { row });
+        assert!(cmds.is_empty(), "record emits nothing");
+        let (via_model, _, _) = resume_runs_for(&model, "p", "BlueRidge", "bd-1", &runs);
+        assert_eq!(
+            via_model.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r3", "r4"]
+        );
+        // The brief renders the delta, never the seen prefix.
+        let (brief, strategy) = resume_brief(model.handoffs.values().next(), &runs);
+        assert_eq!(strategy, HandoffStrategy::DeltaSinceLastSeen);
+        assert!(brief.contains("r3") && brief.contains("r4"), "{brief}");
+        assert!(!brief.contains("r1,") && !brief.contains("r2,"), "{brief}");
+        // Already current: empty delta, still the delta strategy.
+        let row = record_handoff("p", "BlueRidge", "bd-1", "r4", "r4", "/tmp/h.json");
+        let (unseen, strategy, _) = handoff_delta(Some(&row), &runs);
+        assert!(unseen.is_empty());
+        assert_eq!(strategy, HandoffStrategy::DeltaSinceLastSeen);
+    }
+
+    #[test]
+    fn handoff_missing_row_falls_back_to_full_brief() {
+        let runs = vec![
+            HandoffRun {
+                id: "r1".into(),
+                seq: 1,
+            },
+            HandoffRun {
+                id: "r2".into(),
+                seq: 2,
+            },
+        ];
+        let (unseen, strategy, reason) = handoff_delta(None, &runs);
+        assert_eq!(strategy, HandoffStrategy::FullBrief);
+        assert_eq!(unseen.len(), 2, "{reason}");
+        let (brief, strategy) = resume_brief(None, &runs);
+        assert_eq!(strategy, HandoffStrategy::FullBrief);
+        assert!(brief.contains("full brief"), "{brief}");
+    }
+
+    #[test]
+    fn handoff_stale_row_falls_back_to_full_brief() {
+        let runs = vec![HandoffRun {
+            id: "r9".into(),
+            seq: 9,
+        }];
+        // to_run unknown to the current run list: coverage unprovable.
+        let row = record_handoff("p", "BlueRidge", "bd-1", "r1", "r4", "/tmp/h.json");
+        let (unseen, strategy, _) = handoff_delta(Some(&row), &runs);
+        assert_eq!(strategy, HandoffStrategy::FullBrief);
+        assert_eq!(unseen.len(), 1);
     }
 
     #[test]
