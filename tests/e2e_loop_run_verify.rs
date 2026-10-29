@@ -245,8 +245,22 @@ fn close(dir: &Path, bead_id: &str, sha: &str) {
 }
 
 /// Record the command-verified gate row — the exact `br gate report` the
-/// armed loop's `report_pass` invokes (note carries sha + receipt).
-fn record_command_verified(dir: &Path, bead_id: &str, sha: &str) {
+/// armed loop's `report_pass` invokes: the note is command-shaped
+/// (`sha receipt exit tail cmd`, cmd last since a verify command contains
+/// spaces) and the tail file holds the real VERIFY output. A sha-only note
+/// is unbound by the bd-3unc rule and the close-check reads it as missing.
+fn record_command_verified(
+    dir: &Path,
+    bead_id: &str,
+    sha: &str,
+    verify: &str,
+    receipt_body: &[u8],
+) {
+    let path = dir.join(format!(
+        ".flywheel/receipts/{bead_id}-{sha}.command-verified.txt"
+    ));
+    std::fs::create_dir_all(path.parent().expect("receipt dir")).unwrap();
+    std::fs::write(&path, receipt_body).unwrap();
     run_ok(
         dir,
         "br",
@@ -262,8 +276,9 @@ fn record_command_verified(dir: &Path, bead_id: &str, sha: &str) {
             "pass",
             "--note",
             &format!(
-                "sha={sha} receipt={}/.flywheel/receipts/{bead_id}-{sha}.command-verified.txt",
-                dir.display()
+                "sha={sha} receipt={} exit=0 tail={} cmd={verify}",
+                path.display(),
+                path.display()
             ),
         ],
         "br gate report",
@@ -288,8 +303,10 @@ fn loop_run_verify_cheap_band_executes_and_legal_close_stays_closed() {
     assert_eq!(cc["status"], "missing", "close-check: {cc}");
     assert_eq!(cc["sha"], sha, "sha derived from the bead's commit");
 
-    // tick part 2: loop-run VERIFY — classify + execute + timeout bound
-    let lr = s.flywheel_json(&[
+    // tick part 2: loop-run VERIFY — classify + execute + timeout bound.
+    // The raw stdout is kept: it becomes the receipt body the gate row's
+    // tail= points at, exactly as report_pass files the executor output.
+    let lr_out = s.flywheel(&[
         "__loop-run-verify",
         dir.to_str().unwrap(),
         &bead_id,
@@ -298,15 +315,23 @@ fn loop_run_verify_cheap_band_executes_and_legal_close_stays_closed() {
         "--timeout-secs",
         "30",
     ]);
+    assert!(
+        lr_out.status.success(),
+        "__loop-run-verify failed: {}",
+        String::from_utf8_lossy(&lr_out.stderr)
+    );
+    let lr: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&lr_out.stdout).trim())
+            .expect("__loop-run-verify bad json");
     assert_eq!(lr["band"], "loop-runnable", "classify loop-runnable: {lr}");
     assert_eq!(lr["exit"], 0, "cheap VERIFY must exit 0: {lr}");
     assert_eq!(lr["verify"], "test -f README.md", "echo the VERIFY: {lr}");
     assert_eq!(lr["dir"], dir.to_str().unwrap(), "runs in the repo dir");
 
     // the armed loop records command-verified (this is the exact br command
-    // `report_pass` runs); the receipt filename it would write is the
-    // sha-bound machine receipt path
-    record_command_verified(&dir, &bead_id, &sha);
+    // `report_pass` runs, receipt file included); the receipt filename is
+    // the sha-bound machine receipt path
+    record_command_verified(&dir, &bead_id, &sha, "test -f README.md", &lr_out.stdout);
 
     // tick part 3: close-check -> legal -> bead STAYS closed, no reopen
     // artifacts (the loop's legal branch removes grace + never reopens)
