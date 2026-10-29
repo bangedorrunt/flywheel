@@ -1052,6 +1052,10 @@ async fn run_embedded_async(
             tx.clone(),
         );
         let bus_bell = std::sync::Arc::clone(&died_bell);
+        // The inbox host's hint line: bus events wake its loop early (the
+        // tick still decides from the log). No host (comms off) means no
+        // hints — the brain path is unaffected.
+        let inbox_hint = _inbox_guard.as_ref().map(|h| h.hint_sender());
         crate::backend::run_mail_off_runtime(move || {
             Ok(spawn_bus_watch(
                 &cfg_b,
@@ -1060,6 +1064,7 @@ async fn run_embedded_async(
                 tx_b,
                 bus_fw,
                 bus_bell,
+                inbox_hint,
             ))
         })
         .await?
@@ -1198,6 +1203,7 @@ fn spawn_bus_watch(
     tx: mpsc::Sender<BrainMsg>,
     fw: doorbell_rt::wake_brain::WatchForwarder,
     died_bell: std::sync::Arc<doorbell_rt::DiedBell>,
+    inbox_hint: Option<std::sync::mpsc::SyncSender<crate::inbox_host::Input>>,
 ) -> bool {
     (|| -> Option<()> {
         let _mail = crate::mail::Mail::from_config(Some(&cfg.toron_mail_config()))
@@ -1236,6 +1242,14 @@ fn spawn_bus_watch(
                 let ev_opt = crate::mail::block_on(sub.next());
                 match ev_opt {
                     Some(toron_core::bus::SubscriptionEvent::Event(e)) => {
+                        // bd-inbox-bus-watch-hints-urgency-4wh6: the bus event
+                        // is an accelerator, never a source of truth. The
+                        // empty hint only wakes the inbox loop early; the tick
+                        // re-observes every recipient from the log, so a lost
+                        // hint (full channel) costs nothing.
+                        if let Some(h) = &inbox_hint {
+                            let _ = h.try_send(crate::inbox_host::Input::Hint(String::new()));
+                        }
                         let tags: Vec<Vec<String>> =
                             e.tags.iter().map(|t| t.clone().to_vec()).collect();
                         let v = serde_json::json!({

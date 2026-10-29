@@ -631,6 +631,13 @@ impl InboxHost {
         let _ = self.tx.try_send(Input::Hint(npub.to_string()));
     }
 
+    /// The channel the bus watch uses to send [`Input::Hint`] accelerators.
+    /// A hint never carries truth — it only wakes the loop early so the next
+    /// tick's `observe` re-reads every recipient sooner.
+    pub fn hint_sender(&self) -> mpsc::SyncSender<Input> {
+        self.tx.clone()
+    }
+
     /// Stop and join the thread.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -1319,6 +1326,37 @@ mod tests {
             1,
             "rang over the channel loop"
         );
+    }
+
+    /// bd-inbox-bus-watch-hints-urgency-4wh6: a bus-watch hint wakes the
+    /// loop early. The host here ticks every 60 s, so a ring inside the
+    /// 10 s deadline can only come from the hint — the tick would need a
+    /// minute. (The tick still decides from the log; the hint carries no
+    /// truth.)
+    #[test]
+    fn a_bus_hint_wakes_the_long_tick_host_early() {
+        let f = Fake::default();
+        set(&f, seen(3, 0, true));
+        let host = InboxHost::spawn(
+            f.clone(),
+            HostCfg {
+                tick: Duration::from_secs(60),
+                clock_scale: 1,
+            },
+        );
+        host.hint_sender()
+            .try_send(Input::Hint(R.into()))
+            .expect("hint channel open");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while f.0.lock().unwrap().rings.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            f.0.lock().unwrap().rings.len(),
+            1,
+            "one hint wakes one early round that rings"
+        );
+        drop(host);
     }
 
     #[test]
