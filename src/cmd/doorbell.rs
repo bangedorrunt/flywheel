@@ -315,7 +315,7 @@ pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Re
             Some((pin, e.pane_id.clone(), e.name.clone()))
         })
         .collect();
-    let herdr = nearby_herdr_agents(cfg);
+    let herdr = nearby_plane_agents(cfg);
     let leases = nearby_leases(project);
     let rows = crate::doorbell::join_nearby(&reg, &herdr, &leases);
     if json {
@@ -328,11 +328,15 @@ pub(crate) fn cmd_doorbell_roster(cfg: &Config, project: &str, json: bool) -> Re
     Ok(())
 }
 
-fn nearby_herdr_agents(cfg: &Config) -> Vec<(String, String, String)> {
-    let Ok(c) = crate::herdr::Client::connect(Some(&cfg.socket_path())) else {
+fn nearby_plane_agents(cfg: &Config) -> Vec<(String, String, String)> {
+    // bd-f8zk: the roster reads the SELECTED plane. It used
+    // to connect to herdr directly, so on a rex plane every spawned pin joined
+    // against an empty herdr set and rendered `state=missing` while its pane
+    // was live and idle.
+    let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
         return Vec::new();
     };
-    let Ok(agents) = c.agent_list() else {
+    let Ok(agents) = backend.agent_list() else {
         return Vec::new();
     };
     agents

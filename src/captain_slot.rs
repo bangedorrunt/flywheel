@@ -115,8 +115,8 @@ pub fn dead_pin_warnings(
             continue;
         }
         out.push(format!(
-            "flywheel: mail send to `{t}` may reach nobody — no live herdr pane, no presence \
-             heartbeat (advisory; mail stays async)"
+            "flywheel: mail send to `{t}` may reach nobody — no live pane on the selected plane, \
+             no presence heartbeat (advisory; mail stays async)"
         ));
     }
     out

@@ -17312,11 +17312,14 @@ fn whois_pane_id(project: &str, pin: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// bd-8pis: live herdr pane ids (status != dead). None when the daemon is
-/// unreachable — the caller trusts whois bindings instead of warn-storming.
-pub(crate) fn live_herdr_panes(cfg: &Config) -> Option<HashSet<String>> {
-    let c = Client::connect(Some(&cfg.socket_path())).ok()?;
-    let agents = c.agent_list().ok()?;
+/// bd-8pis: live pane ids on the SELECTED plane (status != dead). None when
+/// the backend is unreachable — the caller trusts whois bindings instead of
+/// warn-storming. bd-f8zk: this used to connect to herdr
+/// directly, so on a rex plane every rex pane read dead and a live pin drew
+/// a false "no live herdr pane" warning.
+pub(crate) fn live_plane_panes(cfg: &Config) -> Option<HashSet<String>> {
+    let backend = backend::multiplexer_backend(cfg).ok()?;
+    let agents = backend.agent_list().ok()?;
     Some(
         agents
             .into_iter()
@@ -17349,13 +17352,27 @@ pub(crate) fn send_liveness_warnings(
         .collect();
     let heartbeats = presence_pins(project);
     // A whois binding alone can lie (dead panes stay bound) — check it
-    // against the live herdr set when the daemon answers.
-    let live_panes = live_herdr_panes(cfg);
+    // against the live plane set when the backend answers.
+    let live_panes = live_plane_panes(cfg);
+    // bd-f8zk: a spawned pane IS the liveness evidence even
+    // when the pin never ran `arrive` (whois pane_id stays null). Without this
+    // the rex crew drew a false "may reach nobody" advisory on every send.
+    let registry = crate::state::load_spawn_registry(project);
     let mut pane_pins = HashSet::new();
     for p in &resolved {
+        let pin = p.strip_prefix('@').unwrap_or(p);
         let bound = whois_pane_id(project, p);
-        if crate::captain_slot::bound_pane_is_live(bound.as_deref(), live_panes.as_ref()) {
-            pane_pins.insert(p.strip_prefix('@').unwrap_or(p).to_string());
+        let bound_live =
+            crate::captain_slot::bound_pane_is_live(bound.as_deref(), live_panes.as_ref());
+        let spawned_live = registry.iter().any(|e| {
+            e.mail_identity.as_deref() == Some(pin)
+                && crate::captain_slot::bound_pane_is_live(
+                    Some(e.pane_id.as_str()),
+                    live_panes.as_ref(),
+                )
+        });
+        if bound_live || spawned_live {
+            pane_pins.insert(pin.to_string());
         }
     }
     crate::captain_slot::dead_pin_warnings(&resolved, &pane_pins, &heartbeats)
@@ -18151,6 +18168,18 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
         .flatten();
     let mut recovered: Vec<Value> = Vec::new();
     let mut healthy = 0usize;
+    // bd-f8zk: on herdr a pane outlives its agent (the
+    // shell stays at a prompt), so a dead agent respawns IN it. On rex the
+    // block IS the pane: closing it destroys the shell, and `pane_run` on the
+    // stale id can only fail 30 times. Read the plane once; a row whose pane
+    // is gone gets a fresh sibling split, and the registry follows it.
+    let pane_list = backend.pane_list(Some(&ws_id)).ok();
+    let pane_exists = |id: &str| {
+        pane_list
+            .as_ref()
+            .is_none_or(|ps| ps.iter().any(|p| p.pane_id == id))
+    };
+    let mut moved: Vec<(String, String)> = Vec::new();
     for entry in &entries {
         let (pane_id, name) = (&entry.pane_id, &entry.name);
         // bd-recover-accepts-camelcase-pins-z5fz: herdr refuses a CamelCase
@@ -18216,15 +18245,59 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
             }
             RecoverDecision::Respawn { reason } => {
                 // agent died (or its process died — bd-1np) → respawn with
-                // spawn-time kind, reusing the surviving pane.
-                match start_agent_with_retry_dyn(&*backend, &hname, kind, pane_id, &[]) {
-                    Ok(a) => recovered.push(json!({
-                        "name": name, "pane_id": a.pane_id, "action": "respawned",
-                        "kind": kind, "reason": reason
-                    })),
+                // spawn-time kind. Reuse the surviving pane; when the pane
+                // itself is gone (rex closed block), split a sibling first.
+                let target = if pane_exists(pane_id) {
+                    Some(pane_id.clone())
+                } else {
+                    match pane_list.as_ref().and_then(|ps| ps.first()) {
+                        Some(anchor) => match backend.pane_split(&anchor.pane_id, "right", None) {
+                            Ok(p) => Some(p.pane_id),
+                            Err(e) => {
+                                eprintln!(
+                                    "flywheel: recover {name}: pane gone and split failed: {e:#}"
+                                );
+                                None
+                            }
+                        },
+                        None => {
+                            eprintln!(
+                                "flywheel: recover {name}: pane gone and the workspace has no \
+                                 pane to split from"
+                            );
+                            None
+                        }
+                    }
+                };
+                let Some(target) = target else { continue };
+                match start_agent_with_retry_dyn(&*backend, &hname, kind, &target, &[]) {
+                    Ok(a) => {
+                        if a.pane_id != *pane_id {
+                            moved.push((pane_id.clone(), a.pane_id.clone()));
+                        }
+                        recovered.push(json!({
+                            "name": name, "pane_id": a.pane_id, "action": "respawned",
+                            "kind": kind, "reason": reason
+                        }));
+                    }
                     Err(e) => eprintln!("flywheel: recover {name} failed: {e:#}"),
                 }
             }
+        }
+    }
+    // A respawn that minted a new pane (rex) moves the registry row with it,
+    // or the next recover/send/wake resolves the dead block again.
+    if !moved.is_empty() {
+        for e in entries.iter_mut() {
+            if let Some((_, new)) = moved.iter().find(|(old, _)| old == &e.pane_id) {
+                e.pane_id = new.clone();
+            }
+        }
+        if let Err(e) = state::save_spawn_registry(project, &entries) {
+            eprintln!("flywheel: recover registry save failed: {e:#}");
+        }
+        if let Err(e) = state::save_agent_names(&project_dir(cfg, project), &entries) {
+            eprintln!("flywheel: recover agent-names mirror save failed: {e:#}");
         }
     }
     print_json(&json!({
@@ -20916,11 +20989,14 @@ fn cmd_kill(
             bail!("refusing to close {project} without confirmation — pass --force");
         }
     }
-    let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = find_workspace(&mut c, project)?;
+    // bd-f8zk: kill rides the SELECTED plane. It used to
+    // connect to herdr directly, so on a rex plane `find_workspace` never
+    // matched and the verb refused a live workspace ("no flywheel swarm").
+    let backend = backend::multiplexer_backend(cfg)?;
+    let ws_id = find_workspace_dyn(&*backend, project)?;
     // pane-identity bridge files can be cleared (no stale lookups after
     // pane_exited, bd-mail-pane-identity-bridge)
-    let agents: Vec<AgentInfo> = c
+    let agents: Vec<AgentInfo> = backend
         .agent_list()?
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
@@ -20967,7 +21043,7 @@ fn cmd_kill(
             let bead = dispatched.first().cloned().unwrap_or_else(|| name.clone());
             al.drain_pending.insert(name.clone(), bead.clone());
             if let Some(a) = agents.iter().find(|a| a.name.as_deref() == Some(name)) {
-                let _ = c.agent_prompt(&a.pane_id, &crate::durable::drain_prompt(&bead), None);
+                let _ = backend.prompt(&a.pane_id, &crate::durable::drain_prompt(&bead), None);
             }
         }
         state::save_active_loop(project, &al)?;
@@ -21013,7 +21089,7 @@ fn cmd_kill(
         }
         _ => {}
     }
-    c.workspace_close(&ws_id, false)?;
+    backend.workspace_close(&ws_id, false)?;
     doorbell::stop(&config::state_dir(), &ws_label);
     // bd-2o1v lifecycle symmetry: a full close drops THIS spawn's wake
     // subscription rows — panes are gone, so their herdr-sink rows are

@@ -2259,7 +2259,7 @@ fn probe_msgs(
     };
     let presence = std::fs::read_to_string(crate::mail::presence_path()).unwrap_or_default();
     let rows = crate::health_page::registry_rows(cfg, project);
-    let live_panes = crate::live_herdr_panes(cfg);
+    let live_panes = crate::live_plane_panes(cfg);
     for event in crate::health_page::probe_events(
         &crate::config::state_dir(),
         project,
