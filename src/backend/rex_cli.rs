@@ -545,13 +545,20 @@ pub fn api_list_args() -> Vec<String> {
 
 /// E: every method a rex call in this file may depend on. Each group passes
 /// when ANY member is present (`run` predates `session.new_split`).
+///
+/// bd-ne16: the first members were CLI VERBS
+/// (`send-key`, `events`) that are not API methods — api_revision 7 exposes
+/// `client.key` and `block.event` — so the probe reported every ordinary
+/// rex failure as "server predates the client". Historical names stay in the
+/// group for older servers, but each new name must be the REAL method the
+/// verb calls.
 const REQUIRED_API_GROUPS: &[&[&str]] = &[
     &["run", "session.new_split"],
     &["session.set_block_label"],
     &["block.close"],
-    &["write"],
-    &["send-key"],
-    &["events"],
+    &["write", "com.superlogical.terminal.write"],
+    &["send-key", "client.key"],
+    &["events", "block.event"],
     &["session.list"],
     &["session.kill"],
 ];
@@ -1611,6 +1618,22 @@ exit 2
         assert_eq!(missing_api_method("   \n"), None);
         let without_close = full.replace("block.close\n", "");
         assert_eq!(missing_api_method(&without_close), Some("block.close"));
+    }
+
+    /// bd-ne16: api_revision 7 names the methods
+    /// `client.key` / `block.event` / `com.superlogical.terminal.write`, not
+    /// the CLI verbs. A complete list in the SERVER's own vocabulary must pass
+    /// — the old group list called this server skew on every failure.
+    #[test]
+    fn the_live_api_revision_shape_is_not_skew() {
+        let rev7 = "block.close\nblock.event\nclient.key\nclient.keymap\n\
+                    com.superlogical.terminal.write\nsession.kill\nsession.list\n\
+                    session.new_split\nsession.set_block_label\n";
+        assert_eq!(missing_api_method(rev7), None);
+        let without_key = rev7
+            .replace("client.key\n", "")
+            .replace("client.keymap\n", "");
+        assert_eq!(missing_api_method(&without_key), Some("send-key"));
     }
 
     const VERSION_FAKE: &str = r#"#!/bin/sh
