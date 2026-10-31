@@ -15,7 +15,7 @@ Authoring: [docs/workflow-authoring.md](../workflow-authoring.md).
 | steer | `flywheel steer "<target>" [--direct] [--project p]` |
 | open mode | one agent in this pane. Skill `flywheel-open`. `loop-mode run` may walk beads here. It does not spawn a crew |
 | swarm mode | a crew. Skill `flywheel-captain` for the captain, `flywheel-crew` for each crew agent. The captain asks for the squad when a person is here |
-| doorbell | workspace `__doorbell`. Spawn starts it. `flywheel kill` stops it. `/peer-aware-mode` attaches. Shared by loop-mode and swarm-mode when enabled. |
+| doorbell | plane D, not spawn-owned: the durable daemon (`doorbell install`, state under `~/.local/state/doorbell/`) hosts the tick; spawn records a subscription and defers to a healthy daemon (starting a down one when `[doorbell]` is configured), and an embedded mode is the WARNING fallback. `flywheel kill` closes the workspace but never touches the daemon — `doorbell stop` does, and records the deliberate stop. Shared by loop-mode and swarm-mode when enabled. |
 
 ## Functional effect-kernel discipline
 

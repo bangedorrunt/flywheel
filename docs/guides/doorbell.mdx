@@ -207,6 +207,7 @@ plane's own files rather than tracked in RAM, so it survives a restart:
 | Value | Means |
 |---|---|
 | `cli_unresolved` | `toron`/`herdr` not found anywhere above — wakes will not be delivered |
+| `stale_build` | the RUNNING daemon binary is older than a source file it was built from (mtime comparison, not uptime). Reinstall the current source and `launchctl kickstart -k` (or the systemd equivalent); a healthy daemon stays `degraded: []` however long it runs |
 | `inbox_fetch_failing` | an `inbox_error` audit row inside the last 120s: the sweep is failing |
 | `inbox_store_skew` | the toron store is **ahead** of the binary the daemon shells (`/health.binaries.toron`): every fetch refuses with `migration N is applied in <store> but this toron build resolves at most M`. One workspace's row is enough — the store is shared, so the all-workspaces shape `inbox_fetch_failing` waits for can never hold. Fix: reinstall toron from the source that wrote the store. The probe greps for the machine marker `toron-error=store_skew` (or the refusal sentence) in **any** audit row, not for one arm's `kind`, because the arm that opens the store may be `scan_ack_sla` — that row is `ack_sla_store_skew` — and a probe keyed on `inbox_store_skew` alone reads `degraded: []` while the store is refusing |
 | `watch_restart_loop` | more than ~2× the healthy watcher restart rate in 300s. A **quiet** watcher restarts by design (90s idle-exit + retry gate ≈ every 109s); a handful in five minutes is healthy, dozens is a loop |
@@ -284,6 +285,15 @@ per day). The beat now fires on a **change** only: new overdue ids audit
 `ack_sla_fired`, the backlog clearing audits `ack_sla_cleared`. A steady
 backlog is one fact, not one row per minute.
 
+The file is bounded twice. `file_host::rotate_audit_if_oversized` rewrites a
+live file at **5 MiB** down to its last **4000 lines** (tail-read from
+`len - 5 MiB`, dropping the partial first line — never a full parse), so one
+noisy arm cannot grow the plane without limit. `flywheel doorbell gc` removes
+the audit logs of workspaces no dispatcher will serve again: report-only
+without `--yes`, and `--older-than-days` (default 30) also covers a quiet
+workspace whose status file is gone. Rotation caps a live file; GC is what
+deletes an abandoned one.
+
 ### The prompt hop's precondition (`/health.injection`)
 
 A wake reaching a pane needs an *injectable* pane: one typed `InjectGate`
@@ -329,7 +339,7 @@ serve/migrate/ping).
 | Subscriptions | `flywheel doorbell subscribe\|subscriptions\|unsubscribe` (`--project` names the auto-host pair and is required: a project-less row is refused loud, bd-zawk — it would never ring) |
 | Cross-workspace | `flywheel doorbell subscribe --workspace wA --pin P --extra wB --project <slug>` (scope printed, never implicit; `--project` required) |
 | Human wake (no pane) | `flywheel doorbell subscribe --sink webhook --url http://host:port/path` + `DOORBELL_WEBHOOK_ALLOWLIST=host` on the daemon (see above) |
-| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent); `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded`, and `wake` (see Reading `/health.wake` above) |
+| Always-on | `flywheel daemon start` (flywheel + doorbell daemons in one command); `doorbell install` persists across reboots (launchd/systemd, idempotent) and is the durability door: the unit re-runs a job that is not running (`StartInterval 60` + `KeepAlive{SuccessfulExit=false}` on launchd, `Restart=` on systemd), `install` waits out `bootout` and retries `bootstrap` (a failed install fails loud instead of leaving the daemon down), and `stop` writes a `stopped-by-operator` marker so `status` reads STOPPED by operator (deliberate, not an outage) instead of DOWN — `start`/`install` clear it. `/health` answers from the in-memory snapshot and never shells; a cold start answers typed `starting`. `curl 127.0.0.1:18980/health` shows `mode`, `hosted`, `binaries`, `injection`, `degraded`, and `wake` (see Reading `/health.wake` above) |
 
 Cross-project wake is a captain hold: `br hold --kind captain --corr external:<proj>:<bead> <your-bead>` rings once when the foreign bead closes; you still resolve the hold.
 
