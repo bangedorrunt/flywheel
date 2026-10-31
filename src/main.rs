@@ -6569,6 +6569,96 @@ mod gs043_residual_honesty_tests {
             .expect("the bd-g5q4 parse assertions must hold");
     }
 
+    /// bd-vben: `mail whois` carried the bd-g5q4 defect — an optional
+    /// positional (project) before a required one (agent), which panicked in
+    /// clap's debug asserts. Pins the required-first order and the flag form.
+    #[test]
+    fn mail_whois_agent_positional_precedes_project() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let cli = crate::Cli::try_parse_from(["flywheel", "mail", "whois", "TealMarlin"])
+                    .expect("<AGENT> must parse alone");
+                match cli.command {
+                    Some(crate::Commands::Mail {
+                        cmd: crate::cmd::mail::MailCmd::Whois { agent, project, .. },
+                    }) => {
+                        assert_eq!(agent, "TealMarlin");
+                        assert_eq!(project, None);
+                    }
+                    _ => panic!("expected mail whois"),
+                }
+                let cli = crate::Cli::try_parse_from([
+                    "flywheel",
+                    "mail",
+                    "whois",
+                    "TealMarlin",
+                    "proj-a",
+                ])
+                .expect("<AGENT> [PROJECT] must parse");
+                match cli.command {
+                    Some(crate::Commands::Mail {
+                        cmd: crate::cmd::mail::MailCmd::Whois { agent, project, .. },
+                    }) => {
+                        assert_eq!(agent, "TealMarlin");
+                        assert_eq!(project.as_deref(), Some("proj-a"));
+                    }
+                    _ => panic!("expected mail whois (project form)"),
+                }
+            })
+            .expect("spawn the parse thread");
+        handle
+            .join()
+            .expect("the bd-vben whois parse assertions must hold");
+    }
+
+    /// bd-vben: `mail locks show` had the same optional-before-required
+    /// positional shape; the path must come first.
+    #[test]
+    fn mail_locks_show_path_positional_precedes_project() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let cli =
+                    crate::Cli::try_parse_from(["flywheel", "mail", "locks", "show", "src/x.rs"])
+                        .expect("<PATH> must parse alone");
+                match cli.command {
+                    Some(crate::Commands::Mail {
+                        cmd:
+                            crate::cmd::mail::MailCmd::Locks {
+                                cmd: crate::cmd::mail::MailLockCmd::Show { path, project, .. },
+                            },
+                    }) => {
+                        assert_eq!(path, "src/x.rs");
+                        assert_eq!(project, None);
+                    }
+                    _ => panic!("expected mail locks show"),
+                }
+                let cli = crate::Cli::try_parse_from([
+                    "flywheel", "mail", "locks", "show", "src/x.rs", "proj-a",
+                ])
+                .expect("<PATH> [PROJECT] must parse");
+                match cli.command {
+                    Some(crate::Commands::Mail {
+                        cmd:
+                            crate::cmd::mail::MailCmd::Locks {
+                                cmd: crate::cmd::mail::MailLockCmd::Show { path, project, .. },
+                            },
+                    }) => {
+                        assert_eq!(path, "src/x.rs");
+                        assert_eq!(project.as_deref(), Some("proj-a"));
+                    }
+                    _ => panic!("expected mail locks show (project form)"),
+                }
+            })
+            .expect("spawn the parse thread");
+        handle
+            .join()
+            .expect("the bd-vben locks-show parse assertions must hold");
+    }
+
     /// bd-blank-project-spelling-non-mail-doors-76hi: the non-mail sibling
     /// of the blank-spelling rejection — `project_dir(cfg, "")` aliases onto
     /// the workspace root, so every door must fail loud on a blank winning

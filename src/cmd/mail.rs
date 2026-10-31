@@ -120,11 +120,14 @@ pub(crate) enum MailCmd {
     },
     /// resolve an agent's profile (npub, program, model, task)
     Whois {
+        // bd-vben: same defect bd-g5q4 fixed for Search — a required
+        // positional after an optional one trips clap's debug asserts, so
+        // `<AGENT> [PROJECT]` is the only usable order.
+        /// agent (adjective+noun or herdr short name)
+        agent: String,
         project: Option<String>,
         #[arg(long = "project", value_name = "PROJECT")]
         project_flag: Option<String>,
-        /// agent (adjective+noun or herdr short name)
-        agent: String,
     },
     /// register/refresh an agent identity (upsert). One operator is one
     /// identity (bd-register-portability-3c2b): a name is REQUIRED — bind an
@@ -1214,11 +1217,12 @@ pub(crate) enum MailLockCmd {
     },
     /// show the holders of one path/glob (glob-overlap match)
     Show {
+        // bd-vben: required positional precedes the optional one (clap).
+        /// path or glob whose holders to show
+        path: String,
         project: Option<String>,
         #[arg(long = "project", value_name = "PROJECT")]
         project_flag: Option<String>,
-        /// path or glob whose holders to show
-        path: String,
     },
 }
 
