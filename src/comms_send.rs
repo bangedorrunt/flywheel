@@ -27,7 +27,10 @@
 //! fresh claim.
 //!
 //! A different payload under an existing msg id is `PayloadConflict`
-//! (toron#18): a hard error, never a replay.
+//! (toron#18): never a replay. When a concurrent writer minted that id for
+//! its own task, this run's intent never landed and is re-minted under a
+//! fresh triple; the same task id with a different brief is still a hard
+//! error, caught on this run's recorded intent before any send.
 //!
 //! Default on. Opt out with `TORON_COMMS_INBOX=0` or `[comms] inbox_log = false`.
 
@@ -232,7 +235,8 @@ pub fn task_envelope(
 }
 
 /// Pure: a refusal text from the log that means "different content under
-/// this triple" (toron#18). Never retried, never read as a replay.
+/// this triple" (toron#18). Never read as a replay: a recorded intent that
+/// hits it lost its triple to a concurrent writer, so it is re-minted.
 pub fn is_payload_conflict(why: &str) -> bool {
     why.contains("payload conflict")
 }
@@ -463,8 +467,24 @@ pub async fn append_task(
             };
             match plan_send(recorded, offset, store_epoch) {
                 SendPlan::AlreadyAppended { env, offset } => {
-                    verify_recorded(store, &env).await?;
-                    done[i] = Some((env.msg.key(), "already-appended".into(), Some(offset)));
+                    match verify_recorded(store, &env).await {
+                        // A concurrent writer minted the same (producer, epoch,
+                        // seq) for a DIFFERENT task: the id is theirs and this
+                        // intent never landed. The task-id reuse check above
+                        // already ran on this run's own recorded brief, so this
+                        // is a lost race: drop the intent and let the next
+                        // round mint a fresh triple.
+                        Err(e) if is_payload_conflict(&e.to_string()) => {
+                            let _ = std::fs::remove_file(&paths[i]);
+                            last_why[i] =
+                                Some((env.msg.key(), "msg id taken by a concurrent writer".into()));
+                        }
+                        other => {
+                            other?;
+                            done[i] =
+                                Some((env.msg.key(), "already-appended".into(), Some(offset)));
+                        }
+                    }
                 }
                 SendPlan::Resend(env) => resend.push((i, env)),
                 SendPlan::Mint => mint.push(i),
@@ -533,8 +553,10 @@ pub async fn append_task(
 /// Boundary: send one batch through `mail.append` and fold the outcomes
 /// into `done`. A refusal that is not a payload conflict means the append
 /// never landed (fenced by a newer claim, or a seq gap): the intent is
-/// dropped so the next round mints fresh. A payload conflict is a hard
-/// error.
+/// dropped so the next round mints fresh. A payload conflict is a lost
+/// race with a concurrent writer that took our triple: the intent is
+/// dropped the same way, so the next round re-mints (the task-id reuse
+/// check runs on the recorded brief before this point).
 async fn settle_batch(
     store: &InboxStore,
     sender: &str,
@@ -557,7 +579,11 @@ async fn settle_batch(
         let key = env.msg.key();
         match report.sent.get(&key) {
             Some(SendState::Refused(why)) if is_payload_conflict(why) => {
-                return Err(SendError::PayloadConflict { msg_key: key }.into());
+                // The triple is held by another writer's content, so this
+                // append never landed. Drop the intent: the next round mints
+                // a fresh triple instead of failing the step.
+                let _ = std::fs::remove_file(&paths[*i]);
+                last_why[*i] = Some((key, why.clone()));
             }
             Some(SendState::Refused(why)) => {
                 let _ = std::fs::remove_file(&paths[*i]);
@@ -1304,6 +1330,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorded_intent_whose_triple_another_task_took_is_reminted() {
+        let store = mem_store().await;
+        let dir = tempfile::tempdir().unwrap();
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let first = append_task(&store, dir.path(), A, &rcpt, "c", "t-1", &task())
+            .await
+            .unwrap();
+        assert_eq!(first[0].state, "appended");
+        // A concurrent writer planned the SAME (producer, epoch, seq) for a
+        // different task and landed first. Its content is not ours, so the
+        // recorded intent for t-2 can only be re-planned, never replayed.
+        let taken = MsgId::parse_key(&first[0].msg_id).expect("a msg key");
+        let loser = task_envelope(A, B, taken, "c", "t-2", &task()).unwrap();
+        let path = dir
+            .path()
+            .join("comms")
+            .join("outbox")
+            .join(A)
+            .join(format!("{}.json", intent_key("t-2", B)));
+        write_atomic(&path, serde_json::to_string(&loser).unwrap().as_bytes()).unwrap();
+
+        let out = append_task(&store, dir.path(), A, &rcpt, "c", "t-2", &task())
+            .await
+            .expect("a taken triple is a lost race, not a reused task id");
+        assert_eq!(out[0].state, "appended");
+        assert_ne!(
+            out[0].msg_id, first[0].msg_id,
+            "the loser mints under a fresh triple"
+        );
+        assert!(first[0].offset.is_some(), "the winner landed");
+        assert!(out[0].offset.is_some(), "both tasks land");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_cursor_the_host_reads_is_the_one_toron_next_commits() {
         let store = mem_store().await;
         let dir = tempfile::tempdir().unwrap();
@@ -1639,7 +1699,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn different_content_under_a_recorded_triple_is_a_hard_error_never_a_replay() {
+    async fn different_content_under_a_recorded_triple_is_reminted_never_replayed() {
         let store = mem_store().await;
         let dir = tempfile::tempdir().unwrap();
         // The log already holds DIFFERENT content under (A, 0, 0)...
@@ -1647,22 +1707,25 @@ mod tests {
         let held = task_envelope(A, B, msg(0, 0), "c", "t-held", &other_task).unwrap();
         store.append_envelope(&held).await.unwrap();
         // ...and flywheel's intent record for t-x points at that same triple.
+        // The id is the other task's, so t-x never landed: re-mint, never
+        // replay the taken id and never fail the step.
         let mine = task_envelope(A, B, msg(0, 0), "c", "t-x", &task()).unwrap();
         let path = comms_dir(dir.path(), A).join(format!("{}.json", intent_key("t-x", B)));
         write_atomic(&path, serde_json::to_string(&mine).unwrap().as_bytes()).unwrap();
         let head = rows_for(&store, B).await;
         let rcpt = vec![("Birch".to_string(), B.to_string())];
-        let err = append_task(&store, dir.path(), A, &rcpt, "c", "t-x", &task())
+        let rows = append_task(&store, dir.path(), A, &rcpt, "c", "t-x", &task())
             .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err.downcast_ref::<SendError>(),
-                Some(SendError::PayloadConflict { .. })
-            ),
-            "{err:#}"
+            .expect("a taken triple is a lost race, not a reused task id");
+        assert_eq!(rows[0].state, "appended");
+        assert_ne!(rows[0].msg_id, mine.msg.key(), "never replayed as the id");
+        assert!(rows[0].offset.is_some(), "t-x landed under a fresh id");
+        assert!(rows_for(&store, B).await > head, "the held row was not it");
+        assert_ne!(
+            store.lookup(&held.msg).await.unwrap(),
+            rows[0].offset,
+            "the held content is untouched"
         );
-        assert_eq!(rows_for(&store, B).await, head, "nothing appended");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
