@@ -5978,6 +5978,9 @@ pub fn bump_nudge_streak(states: &mut [AgentState], name: &str) -> crate::rot::R
     }
 }
 
+/// Dispatch planner: pair idle agents with queued prompts positionally.
+/// Thin wrapper — no live-owned bead set, so every queued prompt stays
+/// eligible (the pre-bf39z behavior every existing caller relies on).
 pub fn plan_actions(
     model: &LoopModel,
     states: &[AgentState],
@@ -5985,8 +5988,32 @@ pub fn plan_actions(
     digests: &HashMap<String, MailDigest>,
     wake_suppressed: &std::collections::HashSet<String>,
 ) -> Vec<LoopAction> {
+    plan_actions_with_live_owned(
+        model,
+        states,
+        nudge,
+        digests,
+        wake_suppressed,
+        &HashMap::new(),
+    )
+}
+
+/// bd-bf39z: `plan_actions` with the resume candidate set narrowed —
+/// `live_owned` maps bead id → owner pin for beads another LIVE pane owns.
+/// An idle pane skips a bead prompt whose owner is live and is not itself,
+/// falling through to the next eligible item (an unowned ready bead) before
+/// drawing a no-op. Its OWN live-owned bead still sends (rotation tier-1
+/// self-resumes arrive exactly this way). Pure: no I/O, no clock.
+pub fn plan_actions_with_live_owned(
+    model: &LoopModel,
+    states: &[AgentState],
+    nudge: Option<&str>,
+    digests: &HashMap<String, MailDigest>,
+    wake_suppressed: &std::collections::HashSet<String>,
+    live_owned: &HashMap<String, String>,
+) -> Vec<LoopAction> {
     let mut actions = Vec::new();
-    let mut queue_idx = 0;
+    let mut pending: Vec<String> = model.queue.clone();
     for s in states {
         match s.status.as_str() {
             "working" => actions.push(LoopAction::Wait),
@@ -5996,15 +6023,22 @@ pub fn plan_actions(
             // never dispatch to an unclassified agent — queue stays intact
             "unknown" => actions.push(LoopAction::Wait),
             _ => {
-                // idle / done → feed work or nudge
-                if queue_idx < model.queue.len() {
-                    let text = model.queue[queue_idx].clone();
-                    queue_idx += 1;
-                    // bead/resume prompts carry a {AGENT_NAME} placeholder —
-                    // substitute the receiving agent's mail PIN (the
-                    // identity it is addressed by; bd-pin-public-plane-s-easy.2),
-                    // falling back to the herdr name when no pin is known
-                    let pin = s.mail_identity.clone().unwrap_or_else(|| s.name.clone());
+                // idle / done → feed work or nudge. The receiver's pin is
+                // its mail identity (plan_actions substitution rule) else
+                // its name — computed first: eligibility is per-receiver.
+                // bead/resume prompts carry a {AGENT_NAME} placeholder —
+                // substitute the receiving agent's mail PIN (the
+                // identity it is addressed by; bd-pin-public-plane-s-easy.2),
+                // falling back to the herdr name when no pin is known
+                let pin = s.mail_identity.clone().unwrap_or_else(|| s.name.clone());
+                let take = pending
+                    .iter()
+                    .position(|text| match bead_id_from_prompt(text) {
+                        Some(id) => live_owned.get(id).is_none_or(|owner| owner == &pin),
+                        None => true,
+                    });
+                if let Some(j) = take {
+                    let text = pending.remove(j);
                     let base = text.replace("{AGENT_NAME}", &pin);
                     let text = match digests.get(&s.name) {
                         Some(d) => match digest_prefix(d) {
@@ -15485,6 +15519,66 @@ mod tests {
         assert!(
             closed_reason_lease_ids(&leases, &std::collections::HashSet::new()).is_empty(),
             "no closed set → nothing"
+        );
+    }
+
+    /// bd-bf39z: the loop never resumes another live pane's bead. Two
+    /// in-progress beads owned by live Busy panes plus two unowned ready
+    /// beads: idle panes are fed the unowned beads, and the live-owned
+    /// resumes are never sent.
+    #[test]
+    fn loop_never_resumes_another_live_panes_bead() {
+        let live_owned: HashMap<String, String> = HashMap::from([
+            ("bd-owned-a".to_string(), "BusyPinA".to_string()),
+            ("bd-owned-b".to_string(), "BusyPinB".to_string()),
+        ]);
+        let queue = vec![
+            resume_brief("bd-owned-a", "owned work a"),
+            resume_brief("bd-owned-b", "owned work b"),
+            brief("bd-free-c", "free work c"),
+            brief("bd-free-d", "free work d"),
+        ];
+        let states = vec![
+            st("busy-a", "working"),
+            st("busy-b", "working"),
+            st("idle-p", "idle"),
+            st("idle-q", "idle"),
+        ];
+        let actions = plan_actions_with_live_owned(
+            &LoopModel {
+                queue,
+                ..Default::default()
+            },
+            &states,
+            None,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            &live_owned,
+        );
+        let sent: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LoopAction::Send { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent.len(),
+            2,
+            "only the two idle panes are fed: {actions:?}"
+        );
+        assert!(
+            sent[0].contains("bd-free-c"),
+            "first idle pane falls through to unowned: {sent:?}"
+        );
+        assert!(
+            sent[1].contains("bd-free-d"),
+            "second idle pane falls through to unowned: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .all(|t| !t.contains("bd-owned-a") && !t.contains("bd-owned-b")),
+            "live-owned resumes never send: {sent:?}"
         );
     }
 
