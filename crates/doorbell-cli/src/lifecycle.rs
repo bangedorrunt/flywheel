@@ -1803,6 +1803,19 @@ fn reload_plan(uid: &str, unit: &std::path::Path) -> Vec<Vec<String>> {
     ]
 }
 
+/// bd-rhevm: the bootout→bootstrap settle race, measured twice on 2026-10-31.
+/// `bootstrap` right after `bootout` returns `Bootstrap failed: 5:
+/// Input/output error` while launchd is still tearing the job down, and the
+/// job is then left UNLOADED — so the daemon is DOWN and `StartInterval`
+/// cannot fire either, because the JOB is gone. The plan therefore waits for
+/// the label to disappear (bounded) and retries the post-bootout bootstrap.
+const SETTLE_POLLS: u32 = 50; // 50 × 100ms = 5s
+const SETTLE_POLL_MS: u64 = 100;
+/// First try plus two retries: enough to cross a launchd settle, short enough
+/// that an operator with a genuinely bad unit is not left waiting.
+const BOOTSTRAP_ATTEMPTS: u32 = 3;
+const BOOTSTRAP_BACKOFF_MS: [u64; 2] = [300, 900];
+
 /// Run the plan in order: the first bootstrap/kickstart success wins;
 /// `bootout` never blocks the fresh load (an already-unloaded job is not
 /// an error — bd-yvte's absence classifier decides that). Every real
@@ -1833,20 +1846,87 @@ fn run_reload_plan(plan: &[Vec<String>]) -> std::result::Result<(), String> {
 /// best-effort `continue` dropped its cause from the list entirely.
 fn run_reload_plan_with(
     plan: &[Vec<String>],
+    exec: impl FnMut(&[String]) -> (bool, String),
+) -> std::result::Result<(), String> {
+    // The live edge sleeps; tests inject a no-op clock (effect law: no real
+    // sleep in a unit test, no ambient clock in the fold).
+    run_reload_plan_in(plan, exec, |ms| {
+        std::thread::sleep(Duration::from_millis(ms))
+    })
+}
+
+/// Does `launchctl print <domain>` still report the job? Bounded, so a domain
+/// that never settles degrades into a named failure instead of a hang.
+fn wait_until_unloaded(
+    exec: &mut impl FnMut(&[String]) -> (bool, String),
+    sleep: &mut impl FnMut(u64),
+    domain: &str,
+) -> bool {
+    let probe: Vec<String> = vec!["launchctl".into(), "print".into(), domain.into()];
+    for i in 0..SETTLE_POLLS {
+        if !exec(&probe).0 {
+            return true;
+        }
+        if i + 1 < SETTLE_POLLS {
+            sleep(SETTLE_POLL_MS);
+        }
+    }
+    false
+}
+
+/// One bootstrap, retried across launchd's settle. Only the post-bootout arm
+/// retries (see the caller): a first-attempt bootstrap that fails "already
+/// loaded" is a fresh-install no-op, not a race.
+fn bootstrap_with_retry(
+    exec: &mut impl FnMut(&[String]) -> (bool, String),
+    sleep: &mut impl FnMut(u64),
+    cmd: &[String],
+) -> (bool, String) {
+    let mut last = exec(cmd);
+    let mut attempt = 0u32;
+    while !last.0 && attempt + 1 < BOOTSTRAP_ATTEMPTS {
+        sleep(BOOTSTRAP_BACKOFF_MS[attempt as usize]);
+        attempt += 1;
+        last = exec(cmd);
+    }
+    last
+}
+
+fn run_reload_plan_in(
+    plan: &[Vec<String>],
     mut exec: impl FnMut(&[String]) -> (bool, String),
+    mut sleep: impl FnMut(u64),
 ) -> std::result::Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
     let mut stale_drop_failed: Option<String> = None;
+    let mut dropped = false;
     for cmd in plan {
         let step = cmd.get(1).cloned().unwrap_or_default();
-        let (ok, err) = exec(cmd);
         if step == "bootout" {
+            let (ok, err) = exec(cmd);
             if !ok && !bootout_absent(&err) {
                 stale_drop_failed = Some(err.clone());
                 errors.push(format!("{step}: {err}"));
+                continue;
             }
+            // bd-rhevm: the label must be GONE before the next bootstrap.
+            let domain = cmd.get(2).cloned().unwrap_or_default();
+            if !wait_until_unloaded(&mut exec, &mut sleep, &domain) {
+                let why = format!(
+                    "{domain} was still loaded after {}ms; the job never settled",
+                    SETTLE_POLLS as u64 * SETTLE_POLL_MS
+                );
+                stale_drop_failed = Some(why.clone());
+                errors.push(format!("bootout-settle: {why}"));
+            }
+            dropped = true;
             continue; // never a blocker for the fresh-load arms
         }
+        let (ok, err) = if step == "bootstrap" && dropped {
+            bootstrap_with_retry(&mut exec, &mut sleep, cmd)
+        } else {
+            exec(cmd)
+        };
         if ok {
             if step == "kickstart"
                 && let Some(drop_err) = &stale_drop_failed
@@ -1884,6 +1964,17 @@ fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
         // (`kickstart -k`) restarted the LOADED definition, so a rewritten
         // plist (e.g. the toron MCP env) never reached a running job.
         if let Err(e) = run_reload_plan(&reload_plan(&uid, &path)) {
+            // bd-rhevm: never exit with the job unloaded and a bare EIO. The
+            // operator must know the daemon is down AND how to bring it back —
+            // StartInterval cannot rescue this, the job itself is gone.
+            eprintln!(
+                "doorbell: INSTALL FAILED — the job may now be UNLOADED, so the daemon is DOWN \
+                 and StartInterval cannot fire (it re-runs a LOADED job; an unloaded one is gone)."
+            );
+            eprintln!(
+                "doorbell: recover with: launchctl bootstrap gui/{uid} {} && launchctl kickstart -k {domain}",
+                path.display()
+            );
             anyhow::bail!("{e} for {domain}");
         }
         println!("doorbell: autostart installed ({})", path.display());
@@ -3431,5 +3522,124 @@ mod status_verdict_tests {
                 "systemd must restart on a clean exit"
             );
         }
+    }
+}
+
+/// bd-rhevm: `doorbell install` must never leave the job unloaded.
+#[cfg(test)]
+mod reload_settle_tests {
+    use super::*;
+
+    fn flat(cmd: &[String]) -> String {
+        cmd.join(" ")
+    }
+
+    /// The measured race, scripted: the job is already loaded (fresh bootstrap
+    /// fails "already loaded"), bootout lags so `print` still reports the label
+    /// for two polls, then the first bootstrap returns the real EIO — and a
+    /// retry succeeds. Before this fix the plan bailed on that EIO with the job
+    /// unloaded.
+    #[test]
+    fn install_reload_retries_bootstrap_after_bootout() {
+        let plan = reload_plan("501", Path::new("/tmp/doorbell.plist"));
+        let mut seen_bootout = false;
+        let mut prints = 0;
+        let mut post_drop_bootstraps = 0;
+        let mut slept = Vec::new();
+        let res = run_reload_plan_in(
+            &plan,
+            |cmd| match cmd.get(1).map(String::as_str) {
+                Some("bootstrap") if !seen_bootout => (false, "service already loaded".into()),
+                Some("bootout") => {
+                    seen_bootout = true;
+                    (true, String::new())
+                }
+                Some("print") => {
+                    prints += 1;
+                    if prints < 3 {
+                        (true, "gui/501/com.doorbell.serve = { ... }".into())
+                    } else {
+                        (false, "Could not find service".into())
+                    }
+                }
+                Some("bootstrap") => {
+                    post_drop_bootstraps += 1;
+                    if post_drop_bootstraps == 1 {
+                        (false, "Bootstrap failed: 5: Input/output error".into())
+                    } else {
+                        (true, String::new())
+                    }
+                }
+                _ => (false, "unexpected step".into()),
+            },
+            |ms| slept.push(ms),
+        );
+        assert!(res.is_ok(), "the retry must load the job: {res:?}");
+        assert_eq!(
+            prints, 3,
+            "the plan must poll the label away before re-bootstrapping"
+        );
+        assert_eq!(
+            post_drop_bootstraps, 2,
+            "the EIO must be retried exactly once more"
+        );
+        assert!(
+            !slept.is_empty(),
+            "waiting is the fix — a retry with no settle is the same race"
+        );
+    }
+
+    /// A label that never disappears must not hang, and must not let
+    /// `kickstart -k` pass for success (it would restart the OLD definition).
+    #[test]
+    fn reload_plan_fails_loudly_when_the_label_never_settles() {
+        let plan = reload_plan("501", Path::new("/tmp/doorbell.plist"));
+        let res = run_reload_plan_in(
+            &plan,
+            |cmd| match cmd.get(1).map(String::as_str) {
+                Some("bootstrap") if cmd.len() > 3 => (false, "service already loaded".into()),
+                Some("bootout") => (true, String::new()),
+                Some("print") => (true, "still loaded".into()),
+                Some("kickstart") => (true, String::new()),
+                _ => (false, "unexpected step".into()),
+            },
+            |_ms| {},
+        );
+        let err = res.expect_err("a job that never unloads must not read as success");
+        assert!(err.contains("never settled"), "{err}");
+        assert!(
+            err.contains("OLD definition"),
+            "a kickstart after a failed drop must be refused: {err}"
+        );
+    }
+
+    /// The live edge tolerates the plan's probe: `run_reload_plan_with` (the
+    /// 2-arg seam every existing scripted test uses) must stay a pure fold
+    /// over the scripted world, never reaching launchctl.
+    #[test]
+    fn the_scripted_seam_never_waits_when_the_label_is_already_gone() {
+        let plan = vec![
+            vec!["launchctl".into(), "bootout".into(), "gui/501/x".into()],
+            vec![
+                "launchctl".into(),
+                "bootstrap".into(),
+                "gui/501".into(),
+                "/tmp/x.plist".into(),
+            ],
+        ];
+        let mut steps = Vec::new();
+        let res = run_reload_plan_with(&plan, |cmd| {
+            steps.push(flat(cmd));
+            // The probe is the ONE step that answers "unloaded" — without this
+            // the fold would poll ten times and the count below would catch it.
+            if cmd.get(1).map(String::as_str) == Some("print") {
+                (false, "Could not find service".into())
+            } else {
+                (true, String::new())
+            }
+        });
+        assert!(res.is_ok(), "{res:?}");
+        // bootout, one probe (unloaded), bootstrap.
+        assert_eq!(steps.len(), 3, "{steps:?}");
     }
 }
