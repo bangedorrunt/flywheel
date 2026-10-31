@@ -460,6 +460,31 @@ Net: kameo confirms the shape (single-writer brain, bounded edges, death-as-mess
 
 ---
 
+## Amendment — measured split-brain and ordered Phase 3 completion plan (bd-hgbes, 2026-10-31)
+
+Measured at HEAD 8860253b (facts, not vibes):
+
+1. Split-brain is live: `host_for()` returns Embedded whenever comms is on (the default), and `local_loop_after_proxy(proxied=true, comms_on=true)` returns true; `ensure_running` only early-returns Attach when `!comms_on`. A daemon-hosted workspace runs the daemon FileHost loop AND a local `__doorbell` child loop — ADR-0012 D9/E13 allows exactly one prompt per ring.
+2. The unblock blocker is one port: the daemon host cannot type the inbox wake because `toron_core::inbox_program::InboxProgram` + the `src/inbox_host.rs` Ports host (ADR-0040/0041) are flywheel-only (code comment: `flywheel#22 gap S3`).
+3. Three budget stores (effective cap is the sum, not a cap): serve `emit-budget-<project>.json`, inbox per-workspace `ring-budget.json` (both on disk, including dead scratch projects), plus doorbell queue budget.
+4. `cron start` blocks a foreground terminal; ADR-0012 line 241 already notes cron ticks need a foreground flywheel worker.
+5. Port drift: serve 7337 vs daemon 8787 (bd-zdal).
+6. `__doorbell` children are detached by design (`process_group(0)`) and outlive CLI and workspace (bd-gefp).
+
+Ordered completion plan (in this order, each with its witness):
+
+- S1 status/host-exit honesty [bd-gefp]: status names the daemon verdict when health is dead; host exits when its workspace no longer resolves; no per-workspace ring-budget files for dead scratch projects. Witness: status shows dead verdict; dead-workspace host exits; no leaked budget file.
+- S2 one serve port [bd-zdal]: one constant for `serve` + `daemon` + plist + ADR-0012 + docs; standalone `flywheel serve` deleted or aliased. Witness: both doors report the same port; docs agree.
+- S3 port the inbox writer behind `doorbell-rt` Ports, then flip `host_for`/`local_loop_after_proxy` so exactly one loop runs; proof is the embedded-vs-daemon journal diff (`docs/decisions/_scripts/verify-0012.sh`) empty. If the parity proof is not green, do NOT flip the default. Witness: journal diff empty; one loop per hosted workspace.
+- S4 host cron as one more loop in the daemon. Witness: cron fires with zero foreground flywheel worker.
+- S5 delete the detached `__doorbell` child path + WatcherGen/pid/gen sidecars last; keep the in-process embedded host only as degraded mode. Witness: no `__doorbell` child process; degraded mode still wakes when the daemon is down.
+
+NOT-unify list (supervision only if it pays): `toron serve` 18080, chiebukuro, rex/herdr are separate products — unify supervision, not implementations.
+
+Per-step gate: `bash docs/decisions/_scripts/verify-0012.sh` stays green; any S-step that turns it red stops the sequence.
+
+---
+
 ## More information
 
 - Rev 1 stack study (BrightOtter, 2026-09-09): reducer/dispatcher seam at `Cmd::from_doorbell`/`from_loop` (`src/workspace.rs`); seven constraints C1–C7.
