@@ -284,6 +284,105 @@ pub fn route_wake(input: &RouteInput) -> GateDecision {
     }
 }
 
+/// Pane plane (bd-hv2j): classify a pane id by shape. `block:<uuid>` is a
+/// rex block; `<workspace>:p<N>` is a herdr pane. Anything else is
+/// unclassifiable (None) — never guessed, so an unknown shape keeps the
+/// old `no_route` fate instead of a false mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanePlane {
+    Herdr,
+    Rex,
+}
+
+impl PanePlane {
+    pub fn name(&self) -> &'static str {
+        match self {
+            PanePlane::Herdr => "herdr",
+            PanePlane::Rex => "rex",
+        }
+    }
+}
+
+pub fn pane_plane(pane_id: &str) -> Option<PanePlane> {
+    if pane_id.starts_with("block:") {
+        return Some(PanePlane::Rex);
+    }
+    if let Some((_, after)) = pane_id.split_once(':') {
+        let b = after.as_bytes();
+        if b.len() >= 2 && b[0] == b'p' && b[1].is_ascii_digit() {
+            return Some(PanePlane::Herdr);
+        }
+    }
+    None
+}
+
+/// Selected backend name -> the plane its roster view can see. `auto` is
+/// rex-primary with herdr as transport-only fallback (bd-rex-default-plane-xn1t),
+/// so it reads the rex plane.
+pub fn selected_plane_from_backend_name(name: &str) -> Option<PanePlane> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "herdr" => Some(PanePlane::Herdr),
+        "rex" | "superlogical" | "auto" => Some(PanePlane::Rex),
+        _ => None,
+    }
+}
+
+/// Cross-plane digest reason (bd-hv2j): when the selected backend's shape
+/// disagrees with the registry rows it is routing, name both planes instead
+/// of a `no_route` digest that blames the mail. `Some` only when the row set
+/// is non-empty and EVERY classifiable row lives on another plane; a merely
+/// empty set or an unclassifiable shape keeps the old fate.
+pub fn plane_mismatch_reason(selected: PanePlane, row_panes: &[&str]) -> Option<String> {
+    if row_panes.is_empty() {
+        return None;
+    }
+    let mut known = 0u32;
+    for pane in row_panes {
+        match pane_plane(pane) {
+            Some(plane) if plane == selected => return None,
+            Some(_) => known += 1,
+            None => {}
+        }
+    }
+    if known == 0 {
+        return None;
+    }
+    let rows_plane = match selected {
+        PanePlane::Herdr => PanePlane::Rex,
+        PanePlane::Rex => PanePlane::Herdr,
+    };
+    Some(format!(
+        "plane_mismatch: selected={} rows={} (bd-hv2j)",
+        selected.name(),
+        rows_plane.name(),
+    ))
+}
+
+/// Host adopt gate (bd-hv2j): a host must refuse (loudly) to adopt a
+/// workspace whose rows all live on another plane.
+pub fn workspace_adopt_refused(selected: PanePlane, row_panes: &[&str]) -> bool {
+    plane_mismatch_reason(selected, row_panes).is_some()
+}
+
+/// Plane-aware routing decide (bd-hv2j): a cross-plane unroutable pin
+/// digests with the `plane_mismatch` reason; everything else folds through
+/// `route_wake` unchanged.
+pub fn route_wake_with_plane(
+    input: &RouteInput,
+    selected: PanePlane,
+    row_panes: &[&str],
+) -> GateDecision {
+    if !input.has_route
+        && let Some(reason) = plane_mismatch_reason(selected, row_panes)
+    {
+        return GateDecision::Digest {
+            pin: input.pin.clone(),
+            reason,
+        };
+    }
+    route_wake(input)
+}
+
 /// ADR-0010 D2 (bd-8jlv): one presented wake — the line as prompted,
 /// bound to the tick generation that presented it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

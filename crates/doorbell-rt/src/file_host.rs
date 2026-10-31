@@ -686,6 +686,16 @@ fn prompt_target<'a>(pane: &'a str, name: &'a str) -> &'a str {
     if pane.is_empty() { name } else { pane }
 }
 
+/// Selected pane plane (bd-hv2j): the plane this host's roster view reads.
+/// `FLYWHEEL_BACKEND` names the selected backend (`auto` is rex-primary);
+/// unset/unknown keeps the historical herdr view this host has always read.
+fn selected_plane() -> doorbell_core::wake_core::PanePlane {
+    std::env::var("FLYWHEEL_BACKEND")
+        .ok()
+        .and_then(|n| doorbell_core::wake_core::selected_plane_from_backend_name(&n))
+        .unwrap_or(doorbell_core::wake_core::PanePlane::Herdr)
+}
+
 /// (pane_id, agent_status, toron_pin token) rows from one
 /// `herdr agent list`. Empty vec = herdr did not answer (same guard as
 /// the status/pane readers): callers keep prior state, never clear it.
@@ -956,6 +966,10 @@ pub struct FileHost {
     /// `reducer.model.unroutable`; kept here too so the index change guard
     /// notices a pin gaining/losing its route without the pin set changing.
     unroutable_pins: Vec<String>,
+    /// bd-hv2j: workspace-level plane refusal. `Some` while the registry rows
+    /// all live on another plane than this host's roster view; `normalize`
+    /// then digests `no_route` wakes as `plane_mismatch` instead.
+    plane_mismatch_reason: Option<String>,
     index_refreshed_at: u64,
     /// Shared with the watch delivery closure. bd-kz54 follow-up: the backoff
     /// used to be owned only by `restart_wake`, so NOTHING could clear it —
@@ -1078,6 +1092,7 @@ impl FileHost {
             tombstones: BTreeMap::new(),
             reaped_pins: Vec::new(),
             unroutable_pins: Vec::new(),
+            plane_mismatch_reason: None,
             captain_routed_pins: Vec::new(),
             index_refreshed_at: 0,
             retry: std::sync::Arc::new(std::sync::Mutex::new(crate::policy::WatchRetry::default())),
@@ -1330,6 +1345,33 @@ impl FileHost {
     /// lapses (mirrors the embedded 60s rule; whois failures keep None).
     fn refresh_index(&mut self) {
         let rows = self.registry_rows();
+        // bd-hv2j: refuse (loudly) to adopt a workspace whose rows all live
+        // on another plane than this host's roster view. Cross-plane rows
+        // can never route, so they stay unroutable and their wakes digest
+        // as `plane_mismatch`, never a `no_route` that blames the mail.
+        // Read-only: no pane writes, no registry mutation.
+        let selected = selected_plane();
+        let row_panes: Vec<&str> = rows.iter().map(|(_, pane, _)| pane.as_str()).collect();
+        let mismatch = doorbell_core::wake_core::plane_mismatch_reason(selected, &row_panes);
+        match &mismatch {
+            Some(reason) if self.plane_mismatch_reason.as_deref() != Some(reason.as_str()) => {
+                self.audit_file(
+                    "plane_mismatch",
+                    serde_json::json!({
+                        "workspace": self.cfg.workspace,
+                        "selected": selected.name(),
+                        "rows": rows.len(),
+                        "why": reason,
+                    }),
+                );
+                eprintln!(
+                    "doorbell: refusing workspace {}: {}",
+                    self.cfg.workspace, reason
+                );
+            }
+            _ => {}
+        }
+        self.plane_mismatch_reason = mismatch;
         let mut pins: Vec<String> = rows.iter().map(|(p, _, _)| p.clone()).collect();
         // bd-bk9t: a subscribed pin with no registry row has no pane and no
         // target, so its status can never leave "unknown" and no queue drain
@@ -1363,6 +1405,19 @@ impl FileHost {
         for pin in reap.vanished {
             if !unroutable.contains(&pin) {
                 unroutable.push(pin);
+            }
+        }
+        // bd-hv2j: refused-adoption rows are never targets. Their panes live
+        // on another plane, so no roster will ever name them; forcing them
+        // unroutable now (instead of after the stale-grace window) keeps the
+        // digest honest from the first sweep.
+        if self.plane_mismatch_reason.is_some() {
+            for (pin, pane, _) in &rows {
+                let cross = doorbell_core::wake_core::pane_plane(pane)
+                    .is_some_and(|plane| plane != selected);
+                if cross && !unroutable.contains(pin) {
+                    unroutable.push(pin.clone());
+                }
             }
         }
         let swept: Vec<String> = pins
@@ -1759,6 +1814,13 @@ impl FileHost {
                     detail: serde_json::json!(detail),
                 },
                 doorbell_core::DoorbellAction::Digest { pin, line, why } => {
+                    // bd-hv2j: a cross-plane unroutable pin digests as
+                    // `plane_mismatch`, never a `no_route` that blames the mail.
+                    let why = if why == "no_route" {
+                        self.plane_mismatch_reason.clone().unwrap_or(why)
+                    } else {
+                        why
+                    };
                     Effect::Digest { pin, line, why }
                 }
             })
