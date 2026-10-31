@@ -38,6 +38,8 @@ Ack-overdue reads (`flywheel __ack-overdue`, `Mail::ack_overdue`) are **in-proce
 
 Mailbox root: `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Never per-pid temp. `src/mail.rs` + `src/coalition.rs` share this.
 
+Plane selection is resolved once per process (`factory::resolve_plane`) and every door reads that one answer — spawn, `status`, `snapshot`, crew launch, `preflight`, captain. `REX_SESSION` records where the process runs; it is not evidence of the plane. So `auto` is rex whenever the rex CLI answers, env or no env (`bd-mknvb`), an explicit `superlogical` pin never falls back silently, and a fallback prints one line naming its reason. A door that keyed on the env instead split the planes: spawn wrote a rex session while `status` read herdr (`bd-l7b05`).
+
 `auto` retries a call on herdr only for transport codes (`Connect`/`Io`/`Timeout`); semantic rejects surface loud, never masked. Pane ids are backend-namespaced (herdr `wX:pY`, rex `block:`/`session:`), and `pane_keep` matches `"herdr"` exactly, so auto skips herdr-only janitor work in the safe direction. Agent status on both backends folds one OSC 7501 grammar (`toron_core::osc7501::Board`; `src/backend/rex_map.rs`). One-shot Lua rides `rex do -e` (`integrations/rex/session-snapshot.lua`); handler scripts would outlive the call bound and must not ride it.
 
 Liveness on rex, strongest signal first: explicit 7501 records (interactive
@@ -46,7 +48,7 @@ headless `opencode run` one-shots leave no records), then the foreground
 process (`process` block method: agent binary in front is Working, a shell
 is at a prompt), then `child_exited`/`process_changed` events. `pane_run` executes in the pane on both backends (text plus Enter); a headless one-shot belongs in Lua `rex.exec`, not in `pane_run`.
 
-Manual rex crews (spawn is herdr-led and refuses): `rex new` a session, `split` blocks, `block rename` each to its pin, start the harness via the block itself, and record `pane_id`/`name`/`harness` rows in the project's `.flywheel/agent-names.json` mirror (recover/rebind read it when the registry is empty). Bindings verify through the rex label (label plus session) with provenance `rex-label`; stamped-token panes keep the token path on every backend. Inbox observe on rex reads classified `agent_list` rows projected onto the pane shape; `pane_list` leaves status Unknown by construction and would silence every ring.
+Manual rex crews (the escape hatch for a harness with no spawn recipe): `rex new` a session, `split` blocks, `block rename` each to its pin, start the harness via the block itself, and record `pane_id`/`name`/`harness` rows in the project's `.flywheel/agent-names.json` mirror (recover/rebind read it when the registry is empty). Bindings verify through the rex label (label plus session) with provenance `rex-label`; stamped-token panes keep the token path on every backend. Inbox observe on rex reads classified `agent_list` rows projected onto the pane shape; `pane_list` leaves status Unknown by construction and would silence every ring.
 
 ```bash
 flywheel backend list --json

@@ -13,7 +13,7 @@ The filename still says grokbot. That was the first draft. This decision is the 
 
 | Field | Value |
 | --- | --- |
-| **Status** | **Accepted** (both gates 2026-10-28: Contract D0–D7, Policy D8/D10/D12). Implementation authorized by the operator; a coding agent finding `proposed` in an older copy follows the session word. |
+| **Status** | **Accepted** (both gates 2026-10-28: Contract D0–D7, Policy D8/D10/D12). Implementation authorized by the operator; a coding agent finding `proposed` in an older copy follows the session word. **Amended 2026-10-31:** the `auto` env gate is gone — `factory::resolve_plane` (bd-mknvb) resolves the plane without `REX_SESSION`, and every door follows it (bd-l7b05); read `rex_selected_via_env` in the body as historical. |
 | **Date** | 2026-10-25 |
 | **Decision-makers** | Captain (bangedorrunt) |
 | **Extends** | [ADR-0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md) (delivery is a receipt, not a hope), [ADR-0011](0011-session-conductor-crew-budget-captain-fcfs-join-loud.md) (captain is FCFS; this adds a paneless freshness bit), [ADR-0013](0013-agent-profile-lifecycle-journaled-rebind.md) (pin and npub stay put; binding gains `location`), [ADR-0016](0016-functional-effect-kernel-redesign.md) (one fold, journal before the provider, four outcomes) |
