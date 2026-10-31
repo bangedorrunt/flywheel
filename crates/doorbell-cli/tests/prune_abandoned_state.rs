@@ -124,6 +124,8 @@ fn daemon_prunes_abandoned_state_and_names_every_family() {
     let _ = child.kill();
     let out = child.wait_with_output().expect("wait daemon");
     let _ = sleeper.kill();
+    // Clippy: a spawned child must be reaped, not just signalled.
+    let _ = sleeper.wait();
     let log = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
