@@ -11,11 +11,18 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn scratch() -> PathBuf {
+    // `SystemTime::now()` has microsecond resolution on macOS, so two parallel
+    // tests could mint the SAME root (same pid, same nanos) — and then one
+    // test's `stopped-by-operator` marker made the other read STOPPED. The
+    // clean-export suite caught it; a counter makes the root unique per call.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("dbcl-dead-{}-{nanos}", std::process::id()));
+    let seq = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("dbcl-dead-{}-{nanos}-{seq}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
 }
