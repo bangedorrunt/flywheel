@@ -1192,7 +1192,7 @@ async fn run_embedded_async(
                 break;
             }
             ticks += 1;
-            if ticks % WORKSPACE_PROBE_SECS == 0 {
+            if ticks.is_multiple_of(WORKSPACE_PROBE_SECS) {
                 let (cfg_p, project_p, ws_p) =
                     (probe_cfg.clone(), probe_project.clone(), probe_ws.clone());
                 let presence = tokio::task::spawn_blocking(move || {
