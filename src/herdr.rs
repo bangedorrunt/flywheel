@@ -2079,8 +2079,11 @@ fn sqlite_json(db: &Path, sql: &str) -> Result<Value> {
         .output()
         .with_context(|| format!("run sqlite3 against {}", db.display()))?;
     if !out.status.success() {
+        // bd-5t31z: name the store, or a schema drift reads as sqlite's
+        // argument parse error and looks like a broken command line.
         bail!(
-            "sqlite3 query failed: {}",
+            "sqlite3 query failed on {}: {}",
+            db.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -2157,6 +2160,58 @@ fn summarize_part(data: &str) -> Option<Value> {
     }
 }
 
+/// bd-5t31z: which session-store layout a store exposes, decided from its
+/// table list BEFORE any query runs. Pure, so the drift is testable without
+/// a database and without depending on the installed sqlite3.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionSchema {
+    /// The v1 layout this reader speaks: `session` + `part`.
+    V1,
+    /// Anything else — opencode has moved to `session_v2` + `session_part`.
+    Drift { present: Vec<String> },
+}
+
+fn session_schema_from_tables(tables: &[String]) -> SessionSchema {
+    let has = |t: &str| tables.iter().any(|x| x == t);
+    if has("session") && has("part") {
+        SessionSchema::V1
+    } else {
+        SessionSchema::Drift {
+            present: tables.to_vec(),
+        }
+    }
+}
+
+/// The typed failure a drifted store earns: the DB, the plane, the tables
+/// this reader needs, and the tables the store DOES carry. Pure so the
+/// wording is pinned by a test.
+fn session_store_drift_error(db: &Path, present: &[String]) -> String {
+    format!(
+        "opencode session store drifted at {} (plane: opencode structured session store): \
+         no `session`+`part` tables, so nothing was queried. This reader speaks the v1 layout; \
+         the store carries [{}] (bd-5t31z — map the newer layout before trusting this output)",
+        db.display(),
+        present.join(", ")
+    )
+}
+
+/// The store's table list, read through the same sqlite3 shell the queries
+/// use. An error here is a real read failure (the file is opened), not drift.
+fn session_tables(db: &Path) -> Result<Vec<String>> {
+    let rows = sqlite_json(
+        db,
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+    )?;
+    Ok(rows
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// bd-eign.5: read an agent's structured output from the opencode session
 /// store. Resolution: exact `session_id` wins; else the LATEST session whose
 /// `directory` matches `project_dir` (optionally narrowed to an opencode role
@@ -2174,6 +2229,11 @@ pub fn read_session_log(
             "opencode session store not found: {} (run opencode first)",
             db.display()
         );
+    }
+    // bd-5t31z: a drifted schema must fail as a typed platform fact naming the
+    // store, never as sqlite's "Parse error in 3rd command line argument".
+    if let SessionSchema::Drift { present } = session_schema_from_tables(&session_tables(&db)?) {
+        bail!("{}", session_store_drift_error(&db, &present));
     }
     let (sid, meta): (String, Value) = if let Some(sid) = session_id {
         let rows = sqlite_json(
@@ -2234,6 +2294,77 @@ pub fn read_session_log(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod session_schema_tests {
+    use super::*;
+
+    /// bd-5t31z: `flywheel output` assumed a `session` table and died with
+    /// sqlite's argument parse error, naming neither the store nor the plane.
+    /// This drives the REAL reader against a drifted fixture store, so
+    /// deleting the preflight (which re-enters the `session` query) turns the
+    /// message assertions red.
+    #[test]
+    fn output_reports_a_missing_session_table() {
+        // The measured drift, 2026-10-31: opencode's v2 layout.
+        let v2 = vec![
+            "session_message".to_string(),
+            "session_part".to_string(),
+            "session_v2".to_string(),
+        ];
+        assert_eq!(
+            session_schema_from_tables(&v2),
+            SessionSchema::Drift {
+                present: v2.clone()
+            }
+        );
+        let v1 = vec!["part".to_string(), "session".to_string()];
+        assert_eq!(session_schema_from_tables(&v1), SessionSchema::V1);
+        // Half a v1 store is drift too: `session` alone still queries `part`.
+        assert!(matches!(
+            session_schema_from_tables(&["session".to_string()]),
+            SessionSchema::Drift { .. }
+        ));
+
+        let dir = std::env::temp_dir().join(format!("fw-output-drift-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("opencode.db");
+        let _ = std::fs::remove_file(&db);
+        let created = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg("CREATE TABLE session_v2 (id text PRIMARY KEY); CREATE TABLE session_part (data text);")
+            .status()
+            .expect("sqlite3 must be installed — the reader shells it too");
+        assert!(created.success(), "fixture store created");
+
+        // SAFETY: OPENCODE_DB has exactly one reader (this module) and no
+        // other test in this binary touches it.
+        unsafe { std::env::set_var("OPENCODE_DB", &db) };
+        let err = read_session_log("/nonexistent-dir", None, None, 10)
+            .expect_err("a drifted store must fail, never read as an empty session");
+        unsafe { std::env::remove_var("OPENCODE_DB") };
+        let _ = std::fs::remove_file(&db);
+
+        let msg = err.to_string();
+        assert!(msg.contains("opencode session store drifted"), "{msg}");
+        assert!(
+            msg.contains(&db.display().to_string()),
+            "names the store: {msg}"
+        );
+        assert!(
+            msg.contains("plane: opencode structured session store"),
+            "names the plane: {msg}"
+        );
+        assert!(
+            msg.contains("session_v2"),
+            "names what the store does carry: {msg}"
+        );
+        assert!(
+            !msg.contains("Parse error"),
+            "sqlite's argument noise must not be the diagnosis: {msg}"
+        );
+    }
 }
 
 /// First line of `text`, trimmed, capped at 200 chars with an ellipsis.
