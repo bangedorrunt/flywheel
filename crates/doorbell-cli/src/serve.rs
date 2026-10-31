@@ -972,11 +972,19 @@ pub async fn run(cfg: &Config) -> Result<()> {
             );
             let report =
                 store.prune_unhosted_workspace_logs(&live, UNHOSTED_JOURNAL_MAX_AGE_SECS, now);
-            if report.journals_removed > 0 || report.audits_removed > 0 {
+            if report.journals_removed > 0
+                || report.audits_removed > 0
+                || report.sidecars_removed > 0
+                || report.leases_removed > 0
+            {
+                // Never delete silently: every family the prune can remove is
+                // named, so a reader of the log can tell a janitor from a bug.
                 eprintln!(
-                    "doorbell: pruned {} journal + {} audit file(s) for unhosted workspaces, freed {} byte(s) ({} left: too young)",
+                    "doorbell: pruned {} journal + {} audit + {} sidecar + {} lease file(s) for abandoned workspaces, freed {} byte(s) ({} left: too young)",
                     report.journals_removed,
                     report.audits_removed,
+                    report.sidecars_removed,
+                    report.leases_removed,
                     report.bytes_freed,
                     report.skipped_young
                 );
