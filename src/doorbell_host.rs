@@ -24,6 +24,10 @@ use tokio::sync::mpsc;
 type WakeTaskSlot =
     Arc<Mutex<Option<(tokio::task::AbortHandle, Arc<std::sync::atomic::AtomicBool>)>>>;
 
+/// bd-gefp: how often the embedded host asks the plane whether its workspace
+/// still resolves. The 1s liveness poll decides; this only paces the probe.
+const WORKSPACE_PROBE_SECS: u64 = 30;
+
 /// The embedded host: owns the reducer model and every flywheel-shaped
 /// capability the brain orchestrates.
 pub struct RtHost {
@@ -1161,8 +1165,19 @@ async fn run_embedded_async(
     let pid_path = doorbell::pid_file(&config::state_dir(), workspace);
     let gen_path = doorbell::gen_file(&config::state_dir(), workspace);
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("flywheel"));
+    // bd-gefp: the deliberate detach (process_group(0) in spawn_child) has no
+    // matching exit trigger, so a host whose workspace was closed outlives it.
+    // The workspace is the trigger, NOT the parent: every probe asks the
+    // SELECTED plane whether this workspace still resolves, and `Unreadable`
+    // is never an exit (a plane mid-restart must not kill a live host).
+    let probe_cfg = cfg.clone();
+    let probe_project = project.to_string();
+    let probe_ws = workspace.to_string();
+    let probe_dir = config::state_dir();
     let shutdown_tx = tx.clone();
     let _liveness = tokio::spawn(async move {
+        let mut gone_streak = 0u32;
+        let mut ticks = 0u64;
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             if !pid_path.exists() {
@@ -1175,6 +1190,24 @@ async fn run_embedded_async(
                     "flywheel doorbell: binary changed since watcher start; retiring without further wakes"
                 );
                 break;
+            }
+            ticks += 1;
+            if ticks % WORKSPACE_PROBE_SECS == 0 {
+                let (cfg_p, project_p, ws_p) =
+                    (probe_cfg.clone(), probe_project.clone(), probe_ws.clone());
+                let presence = tokio::task::spawn_blocking(move || {
+                    doorbell::probe_workspace_presence(&cfg_p, &project_p, &ws_p)
+                })
+                .await
+                .unwrap_or(doorbell::WorkspacePresence::Unreadable);
+                if let Some(reason) =
+                    doorbell::host_exit_check(&probe_dir, &probe_ws, &mut gone_streak, presence)
+                {
+                    eprintln!(
+                        "flywheel doorbell: workspace {probe_ws} no longer resolves on the plane; retiring ({reason})"
+                    );
+                    break;
+                }
             }
         }
         let _ = shutdown_tx.send(BrainMsg::Shutdown).await;

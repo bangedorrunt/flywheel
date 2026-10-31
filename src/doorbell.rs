@@ -432,6 +432,91 @@ pub fn stop(state_dir: &Path, workspace: &str) {
     let _ = fs::remove_file(gen_file(state_dir, workspace));
 }
 
+/// What the SELECTED plane says about the workspace a host watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePresence {
+    Present,
+    Gone,
+    /// The plane could not be read. NEVER an exit: unknown is not absent, the
+    /// same rule the captain's stall probe applies to a degraded fleet. A
+    /// plane mid-restart must not kill a live host.
+    Unreadable,
+}
+
+/// Consecutive `Gone` probes needed before a host retires. One miss is a plane
+/// mid-restart; three in a row (90s at the 30s probe cadence) is a workspace
+/// that no longer exists. bd-gefp.
+pub const WORKSPACE_GONE_STREAK: u32 = 3;
+
+/// The exit decision, pure: `seen` is the running `Gone` count. `Present` and
+/// `Unreadable` RESET it, so a transient plane hiccup can never retire a live
+/// host.
+pub fn host_exit_reason(seen: &mut u32, presence: WorkspacePresence) -> Option<&'static str> {
+    match presence {
+        WorkspacePresence::Gone => {
+            *seen += 1;
+            (*seen >= WORKSPACE_GONE_STREAK).then_some("workspace-gone")
+        }
+        WorkspacePresence::Present | WorkspacePresence::Unreadable => {
+            *seen = 0;
+            None
+        }
+    }
+}
+
+/// Journal ONE host-exit reason row. The audit channel, not the tick journal:
+/// an exit is not a tick, and the audit log is the evidence channel for
+/// lifecycle facts (`FileStore::append_audit` is its single writer).
+pub fn journal_host_exit(state_dir: &Path, workspace: &str, reason: &str) {
+    let store = doorbell_rt::FileStore::new(state_dir.to_path_buf());
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "workspace": workspace,
+        "kind": "host_exit",
+        "reason": reason,
+    });
+    let _ = store.append_audit(workspace, entry);
+}
+
+/// One liveness evaluation: decide, and journal WHY when the host retires.
+/// The liveness poll and the witness test both call THIS, so neither the
+/// decision nor the journal write can be deleted and stay green.
+pub fn host_exit_check(
+    state_dir: &Path,
+    workspace: &str,
+    seen: &mut u32,
+    presence: WorkspacePresence,
+) -> Option<&'static str> {
+    let reason = host_exit_reason(seen, presence)?;
+    journal_host_exit(state_dir, workspace, reason);
+    Some(reason)
+}
+
+/// Ask the selected plane whether this host's workspace still resolves.
+/// A read error is `Unreadable`, never `Gone`.
+pub fn probe_workspace_presence(
+    cfg: &crate::config::Config,
+    project: &str,
+    workspace: &str,
+) -> WorkspacePresence {
+    let Ok(backend) = crate::backend::multiplexer_backend(cfg) else {
+        return WorkspacePresence::Unreadable;
+    };
+    let Ok(list) = backend.workspace_list() else {
+        return WorkspacePresence::Unreadable;
+    };
+    let mut labels =
+        crate::workspace_label_aliases(project, crate::state::load_spawn_meta(project).as_deref());
+    if !labels.iter().any(|l| l == workspace) {
+        labels.push(workspace.to_string());
+    }
+    if list.iter().any(|ws| labels.iter().any(|l| l == &ws.label)) {
+        WorkspacePresence::Present
+    } else {
+        WorkspacePresence::Gone
+    }
+}
+
 /// Cutover registration (bd-asr2.13, Phase 3): spawn records one
 /// subscription row per pinned crew member (herdr sink, own workspace —
 /// local-actor allowed, D6). Best-effort: a store failure warns loudly and
@@ -4237,6 +4322,102 @@ mod audit_rotation_tests {
         assert!(
             text.contains("\"i\":7999"),
             "the newest row was rotated away"
+        );
+    }
+}
+
+/// bd-gefp: a host must not outlive the workspace it watches.
+#[cfg(test)]
+mod bd_gefp_host_exit_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fw-gefp-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The bead's witness: the host retires only on a sustained `Gone` read,
+    /// and journals WHY. `Unreadable` never retires a live host (a plane
+    /// mid-restart is not an absent workspace), and one `Present` resets the
+    /// streak, so a flicker cannot accumulate into an exit.
+    #[test]
+    fn doorbell_host_exits_when_its_workspace_is_gone() {
+        let dir = scratch("exit");
+        let ws = "flywheel-scratch-100927";
+        let mut seen = 0u32;
+
+        // Present and Unreadable are both "keep running".
+        assert_eq!(
+            host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Present),
+            None
+        );
+        assert_eq!(seen, 0);
+        assert_eq!(
+            host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Unreadable),
+            None
+        );
+        assert_eq!(
+            host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Gone),
+            None,
+            "one Gone is a plane hiccup, not an exit"
+        );
+        // A present read resets the streak: absence must be CONSECUTIVE.
+        assert_eq!(
+            host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Present),
+            None
+        );
+        assert_eq!(seen, 0);
+        assert_eq!(
+            host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Gone),
+            None
+        );
+        assert_eq!(
+            host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Gone),
+            None
+        );
+        let reason = host_exit_check(&dir, ws, &mut seen, WorkspacePresence::Gone)
+            .expect("WORKSPACE_GONE_STREAK consecutive Gone reads retire the host");
+        assert_eq!(reason, "workspace-gone");
+
+        // It journaled WHY, in the audit channel for this workspace.
+        let store = doorbell_rt::FileStore::new(dir.clone());
+        let audit = std::fs::read_to_string(store.audit_file(ws))
+            .expect("the exit reason must be journaled, not just printed");
+        assert!(audit.contains("\"kind\":\"host_exit\""), "audit: {audit}");
+        assert!(
+            audit.contains("\"reason\":\"workspace-gone\""),
+            "audit: {audit}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The wiring, not just the decision: the embedded host's liveness poll
+    /// must CALL the shared check. Deleting the call (or reverting to a bare
+    /// eprintln) must not stay green.
+    #[test]
+    fn the_liveness_poll_calls_the_shared_exit_check() {
+        // Whitespace-collapsed so a reformat cannot make this vacuous.
+        let src = include_str!("doorbell_host.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            src.contains(
+                "doorbell::host_exit_check(&probe_dir, &probe_ws, &mut gone_streak, presence)"
+            ),
+            "the liveness poll must evaluate and journal through host_exit_check"
+        );
+        assert!(
+            src.contains("doorbell::probe_workspace_presence(&cfg_p, &project_p, &ws_p)"),
+            "the poll must ask the SELECTED plane, not read a stale local file"
         );
     }
 }

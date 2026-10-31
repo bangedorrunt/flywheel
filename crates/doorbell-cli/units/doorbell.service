@@ -8,10 +8,14 @@ Type=simple
 ExecStart=DOORBELL_BIN serve DOORBELL_SERVE_ARGS
 Environment=DOORBELL_STATE_DIR_KEY=DOORBELL_STATE_DIR_VALUE
 Environment=DOORBELL_TORON_MCP_URL_KEY=DOORBELL_TORON_MCP_URL_VALUE
-# Restart=on-failure with SuccessfulExit=false semantics: a clean exit
-# (e.g. port conflict, which exits 0) must STAY dead — no respawn war
-# (bd-serve-double-spawn lesson).
-Restart=on-failure
+# Restart=always is the systemd half of the launchd pair (StartInterval +
+# KeepAlive{SuccessfulExit=false}). on-failure left a daemon that exited 0
+# ("shutdown received") dead for six hours while every gate read green
+# (measured 2026-10-31). A deliberate stop is not a restart: `systemctl stop`
+# suppresses the restart and `doorbell stop` records the intent marker, so
+# "down" and "stopped by the operator" stay distinguishable.
+# bd-c9y6n's wedged-runtime exit 1 is what keeps this from looping on a hang.
+Restart=always
 RestartSec=5
 
 [Install]

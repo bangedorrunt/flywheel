@@ -24,6 +24,17 @@
     </dict>
     <key>ThrottleInterval</key>
     <integer>5</integer>
+    <!-- The supervision pair, and both halves are load-bearing:
+         KeepAlive{SuccessfulExit=false} restarts a CRASHED job, but a job
+         that exits 0 (shutdown received, port conflict) is "successful" and
+         launchd leaves it dead — measured: the daemon was DOWN six hours on
+         2026-10-31 while every gate read green. StartInterval re-runs a
+         loaded job that is not running, so a clean exit is also recovered.
+         `doorbell stop` still unloads (bootout), which is the intent fence:
+         an unloaded job has no StartInterval to fire. bd-c9y6n is the other
+         half (a wedged runtime exits 1 after 180s without a beat). -->
+    <key>StartInterval</key>
+    <integer>60</integer>
     <!-- bd-m7yp: launchd's default soft maxfiles for a job is 256, and this
          daemon is a SERVER: it holds one descriptor per wake subscriber and
          one per hosted workspace. Measured: 257 descriptors against the 256

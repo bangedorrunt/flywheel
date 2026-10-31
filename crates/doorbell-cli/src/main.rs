@@ -111,7 +111,11 @@ async fn main() -> anyhow::Result<()> {
     let arm = armstate::resolve(&persisted, &cfg.hosts, cli.unhost);
     let mut cfg = cfg;
     cfg.hosts = arm.hosts.clone();
-    armstate::announce(&arm.hosts, arm.source);
+    // bd-gefp: the armed line is an ARM transcript, so only an arm verb may
+    // print it. It used to be unconditional, which made `doorbell status`
+    // print "armed on ... (3 from persisted state)" directly above
+    // `"alive": false` — a lie about liveness in the one command an operator
+    // reads to find out whether anything is being served.
 
     // bd-fpd5: migrate-once off the legacy platform dir into the XDG
     // default. Explicit --state-dir / DOORBELL_STATE_DIR means
@@ -130,9 +134,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     match cli.cmd {
-        Cmd::Start => lifecycle::start(&cfg),
+        Cmd::Start => {
+            armstate::announce(&arm.hosts, arm.source);
+            lifecycle::start(&cfg)
+        }
         Cmd::Stop { force } => lifecycle::stop(&cfg, force),
-        Cmd::Restart => lifecycle::restart(&cfg),
+        Cmd::Restart => {
+            armstate::announce(&arm.hosts, arm.source);
+            lifecycle::restart(&cfg)
+        }
         Cmd::Status => lifecycle::status(&cfg),
         Cmd::Install => lifecycle::install(&cfg),
         Cmd::Serve | Cmd::InternalServe => {

@@ -4,7 +4,7 @@
 //! STAY dead — the bd-serve-double-spawn lesson); no `always`.
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const DEFAULT_PORT: u16 = 18980;
@@ -971,6 +971,8 @@ fn start_failure_brief(
 pub fn start(cfg: &Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("create state dir {}", cfg.state_dir.display()))?;
+    // Asking for it running IS the intent, adopt path included.
+    clear_stop_intent(&cfg.state_dir);
     if let Some(pid) = try_adopt(cfg)? {
         println!(
             "doorbell: already running (pid {pid}, port {}) — adopted",
@@ -1256,6 +1258,8 @@ pub fn start(cfg: &Config) -> Result<()> {
 /// socket holders without --force (never clobbers a stranger's bind).
 pub fn stop(cfg: &Config, force: bool) -> Result<()> {
     let msg = stop_with_budgets(cfg, &mut PlatformSupervisor, force, STOP_GRACE, KILL_GRACE)?;
+    // Only a stop that actually landed records the intent.
+    mark_stopped_by_operator(&cfg.state_dir);
     println!("{msg}");
     Ok(())
 }
@@ -1456,6 +1460,49 @@ pub fn restart(cfg: &Config) -> Result<()> {
     restart_after_stop(|| stop(cfg, false), || start(cfg))
 }
 
+/// The one human line a status READ owes an operator. Pure, so the dead-daemon
+/// wording is pinned by a test instead of by a live daemon (bd-gefp).
+pub fn status_summary(alive: bool, hosts: usize, stopped_by_operator: bool) -> String {
+    if alive {
+        format!("doorbell status: daemon UP — serving {hosts} host(s)")
+    } else if stopped_by_operator {
+        format!(
+            "doorbell status: daemon STOPPED by operator — deliberate, not an outage \
+             ({hosts} host(s) in state)"
+        )
+    } else {
+        format!("doorbell status: daemon DOWN — nothing is served ({hosts} host(s) in state)")
+    }
+}
+
+/// The deliberate-stop intent marker (bd-gefp follow-up, steady-state daemon).
+///
+/// Once the unit re-runs a job that is not running (launchd `StartInterval`,
+/// systemd `Restart=always`), "the daemon is down" stops being evidence of
+/// failure: `stop` also unloads/disable the job, and this marker records WHICH
+/// it was, so status and preflight can say "deliberate" instead of "outage".
+/// Written by `stop`, cleared by `start` and `install`.
+pub fn stop_intent_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("stopped-by-operator")
+}
+
+pub fn mark_stopped_by_operator(state_dir: &Path) {
+    if let Err(e) = std::fs::write(stop_intent_file(state_dir), b"doorbell stop\n") {
+        eprintln!(
+            "doorbell: cannot record the stop intent ({e}) — an outage and a deliberate \
+             stop now look alike"
+        );
+    }
+}
+
+pub fn clear_stop_intent(state_dir: &Path) {
+    let _ = std::fs::remove_file(stop_intent_file(state_dir));
+}
+
+pub fn is_intentionally_stopped(state_dir: &Path) -> bool {
+    stop_intent_file(state_dir).is_file()
+}
+
 pub fn status(cfg: &Config) -> Result<()> {
     let local_pid = managed(cfg);
     let health = health_probe(cfg);
@@ -1474,8 +1521,17 @@ pub fn status(cfg: &Config) -> Result<()> {
         }
     }
     let (alive, pid, pid_source) = status_liveness(local_pid, health.as_ref());
+    let stopped_by_operator = is_intentionally_stopped(&cfg.state_dir);
+    // bd-gefp: the human verdict. A dead daemon serves NOTHING, so the read
+    // says so instead of leaving an arm line to imply otherwise. Stderr keeps
+    // stdout's JSON intact and additive.
+    eprintln!(
+        "{}",
+        status_summary(alive, cfg.hosts.len(), stopped_by_operator)
+    );
     let out = serde_json::json!({
         "alive": alive,
+        "stopped_by_operator": stopped_by_operator,
         "pid": pid,
         "pid_source": pid_source,
         "port": cfg.port,
@@ -1501,6 +1557,7 @@ fn toron_mcp_url() -> String {
 /// unit and the pidfile path never diverge. Other platforms: loud error
 /// naming manual `doorbell start`.
 pub fn install(cfg: &Config) -> Result<()> {
+    clear_stop_intent(&cfg.state_dir);
     let exe = std::env::current_exe().context("current_exe")?;
     let body = render_autostart(
         &exe.display().to_string(),
@@ -3282,5 +3339,82 @@ mod tests {
         // Protocol peer without an owner row: nothing to attest.
         let no_owner = serde_json::json!({"protocol": doorbell_rt::api::PING.protocol});
         assert_eq!(classify_owner(None, Some(&no_owner)), OwnerVerdict::Unknown);
+    }
+}
+
+/// bd-gefp: the status read names the daemon verdict.
+#[cfg(test)]
+mod status_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn status_of_a_dead_daemon_says_down_and_never_armed() {
+        let dead = status_summary(false, 3, false);
+        assert!(dead.contains("daemon DOWN"), "{dead}");
+        assert!(dead.contains("nothing is served"), "{dead}");
+        assert!(dead.contains("3 host(s) in state"), "{dead}");
+        assert!(
+            !dead.contains("armed"),
+            "the arm transcript is not a status verdict: {dead}"
+        );
+
+        let live = status_summary(true, 2, false);
+        assert!(live.contains("daemon UP"), "{live}");
+        assert!(live.contains("serving 2 host(s)"), "{live}");
+    }
+
+    /// A deliberate stop is not an outage: once the unit re-runs an idle job,
+    /// "down" alone would read as failure and send an operator hunting a daemon
+    /// the operator themself stopped.
+    #[test]
+    fn a_deliberate_stop_reads_as_stopped_not_down() {
+        let stopped = status_summary(false, 0, true);
+        assert!(stopped.contains("STOPPED by operator"), "{stopped}");
+        assert!(stopped.contains("deliberate, not an outage"), "{stopped}");
+        assert!(!stopped.contains("daemon DOWN"), "{stopped}");
+    }
+
+    /// The marker is the fence's memory: written by stop, cleared by start.
+    #[test]
+    fn stop_intent_marker_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbcl-intent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_intentionally_stopped(&dir), "absent marker means not stopped");
+        mark_stopped_by_operator(&dir);
+        assert!(is_intentionally_stopped(&dir), "stop must record the intent");
+        clear_stop_intent(&dir);
+        assert!(!is_intentionally_stopped(&dir), "start must clear it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The installed unit must carry BOTH supervision halves: KeepAlive alone
+    /// leaves a clean exit dead (the measured six-hour outage).
+    #[test]
+    fn the_installed_unit_recovers_a_clean_exit() {
+        let body = render_autostart(
+            "/usr/local/bin/doorbell",
+            "/tmp/db-state",
+            18980,
+            "/tmp/fw-state",
+            &[],
+            "http://127.0.0.1:18080/mcp",
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(body.contains("<key>StartInterval</key>"), "launchd needs StartInterval");
+            assert!(body.contains("<integer>60</integer>"), "the interval is 60s");
+            assert!(body.contains("SuccessfulExit"), "KeepAlive half stays");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(body.contains("Restart=always"), "systemd must restart on a clean exit");
+        }
     }
 }
