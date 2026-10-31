@@ -797,9 +797,62 @@ fn daemon_lease_kind_for(comms_flag_on: bool) -> Option<&'static str> {
     Some(doorbell_rt::lease::KIND_NO_TEXT)
 }
 
+/// Durable-daemon deadman. A wedged runtime keeps the process "alive" while it
+/// serves nothing: `doorbell status` reads up, launchd's
+/// `KeepAlive{SuccessfulExit=false}` has nothing to restart, and the hourly
+/// prune never runs. A plain OS thread — never a tokio task, because a wedged
+/// runtime must not be able to silence its own deadman — watches a beat that
+/// only the runtime can move, and exits NONZERO (the code the supervisor
+/// restarts) when the beat stops.
+///
+/// Ceiling, stated: this catches a wedged RUNTIME. A single wedged host loop
+/// still lets the runtime beat; that is `/health.injection` and the pane-wedge
+/// probe's job, not this one's.
+const DEADMAN_BEAT_SECS: u64 = 10;
+const DEADMAN_STALL_SECS: u64 = 180;
+const DEADMAN_CHECK_SECS: u64 = 15;
+
+/// Pure: does a runtime that has not beat since `anchor` count as stalled?
+fn deadman_fired(now: u64, anchor: u64) -> bool {
+    now.saturating_sub(anchor) > DEADMAN_STALL_SECS
+}
+
 pub async fn run(cfg: &Config) -> Result<()> {
     use doorbell_rt::lease;
     let now = lease::unix_now();
+    // Durable: start the beat + its deadman before any await. The beat is
+    // touched by a tokio task and read by a plain thread, so neither can hide
+    // the other's stall.
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let beat = std::sync::Arc::new(AtomicU64::new(now));
+        let beater = std::sync::Arc::clone(&beat);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(DEADMAN_BEAT_SECS));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                beater.store(lease::unix_now(), Ordering::Relaxed);
+            }
+        });
+        let started = now;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(DEADMAN_CHECK_SECS));
+                let now = lease::unix_now();
+                let anchor = beat.load(Ordering::Relaxed).max(started);
+                if deadman_fired(now, anchor) {
+                    eprintln!(
+                        "doorbell: DEADMAN — the runtime has not beat for over {DEADMAN_STALL_SECS}s \
+                         (last beat {anchor}, now {now}): the process is alive but serving nothing. \
+                         Exiting 1 so the supervisor (KeepAlive{{SuccessfulExit=false}}) restarts it; \
+                         inspect with `doorbell status` and the journal."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
     // D9 layer 1 first, per workspace: a live lease means another writer
     // runs there — refuse before touching its socket (never clobber a
     // stranger's bind). Leases live in the FLYWHEEL state dir, shared
@@ -4405,6 +4458,36 @@ mod tests {
                 "a health snapshot older than a sweep era lies"
             );
         }
+    }
+
+    /// durable: the deadman fires only after a SILENT runtime — the startup
+    /// anchor protects a slow boot, and a beat inside the window never fires.
+    /// (The exit itself is the supervisor's restart signal, not a return value;
+    /// this pins the decision, and the thread above is its only caller.)
+    #[test]
+    fn deadman_fires_only_after_a_silent_runtime() {
+        let start = 1_000u64;
+        assert!(
+            !super::deadman_fired(start + 1, start),
+            "a fresh boot is not a stall"
+        );
+        assert!(
+            !super::deadman_fired(start + super::DEADMAN_STALL_SECS, start),
+            "exactly at the window is not yet a stall"
+        );
+        assert!(
+            super::deadman_fired(start + super::DEADMAN_STALL_SECS + 1, start),
+            "one second past the window is a stall"
+        );
+        let recent = start + 1_000;
+        assert!(
+            !super::deadman_fired(recent + 10, recent),
+            "a beating runtime never fires"
+        );
+        assert!(
+            super::deadman_fired(recent + super::DEADMAN_STALL_SECS + 1, recent),
+            "the check is relative to the last beat, not process start"
+        );
     }
 
     /// gc/live: the prune's protected set is hosted rows PLUS live leases.
