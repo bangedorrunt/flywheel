@@ -17,6 +17,9 @@ use anyhow::Result;
 use clap::Subcommand;
 use serde_json::{Value, json};
 
+// bd-nmmf4: the trait is only needed by the rex-only directory path
+// (`agent_list`); a herdr-only build must not warn about it.
+#[cfg(feature = "backend-superlogical")]
 use crate::backend::MultiplexerBackend as _;
 use crate::config::Config;
 use crate::mail::MailInboxFilter;
@@ -525,6 +528,12 @@ fn assemble_directory(
 /// ADR-0019 D2/D4 read-only directory.
 ///
 /// `flywheel captain directory <project> [--json]`
+///
+/// bd-nmmf4: this path is rex-only by design, so it needs the rex backend's
+/// cargo feature. A lean herdr-only build used to fail to COMPILE here
+/// (the function named a cfg-gated module unconditionally); it now answers
+/// the same question with a loud, actionable refusal.
+#[cfg(feature = "backend-superlogical")]
 fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<()> {
     // Explicit rex backend on this path: `auto` would return herdr when
     // REX_SESSION is unset, and herdr has no blocks to project.
@@ -612,6 +621,17 @@ fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<
         }
     }
     Ok(())
+}
+
+/// ADR-0019 D2/D4 read-only directory, in a build WITHOUT the rex backend.
+/// bd-nmmf4: the directory projects rex blocks, so a herdr-only build cannot
+/// answer it — refuse loudly instead of failing to compile.
+#[cfg(not(feature = "backend-superlogical"))]
+fn cmd_captain_directory(_cfg: &Config, _project: &str, _json_out: bool) -> Result<()> {
+    anyhow::bail!(
+        "captain directory needs the rex backend (build with --features backend-superlogical); \
+         a herdr-only build has no blocks to project"
+    )
 }
 /// The clock is an argument; whois, mail, journal, and dispatch follow in
 /// the caller. `payload_ok` is the re-derived-digest check (deny skips it:
