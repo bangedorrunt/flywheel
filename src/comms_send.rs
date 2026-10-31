@@ -318,21 +318,54 @@ pub struct SentRow {
 /// (the refused append never landed, so minting again cannot duplicate).
 const MAX_ROUNDS: usize = 24;
 
-/// One async mutex per sender npub, process-wide. Claim-to-settle is the
-/// window in which a concurrent run of the SAME sender fences us (a claim
-/// fences every lower epoch at once), so runs of one sender in one process
-/// take turns instead of fencing each other. Across processes there is no
-/// lock (and no lock file): contenders recover through the jittered
-/// retry rounds.
-fn sender_gate(sender: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-    static GATES: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let mut g = GATES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    g.entry(sender.to_string()).or_default().clone()
+/// One sender's turn (bd-or1zt): the critical section that owns the journal
+/// epoch claim. It used to be a process-local mutex, which serialized nothing
+/// between the `__send` SUBPROCESSES a parallel workflow stage spawns
+/// (pane.rs `Command::new(exe) __send --confirm`, one per `dispatch_job`
+/// leaf): each child claimed its own journal epoch, and a claim fences every
+/// lower epoch at once, so each child fenced the other's in-flight append and
+/// two DMs from one actor livelocked until `MAX_ROUNDS`.
+///
+/// The turn is an advisory `flock` on `comms/outbox/<sender>/.turn.lock`:
+/// one lock per sender whether the contender is a task or a process, and the
+/// kernel releases it when the holder dies (a crashed sender cannot wedge the
+/// gate the way a stale lock FILE could).
+pub(crate) struct SenderTurn {
+    file: std::fs::File,
+}
+
+impl Drop for SenderTurn {
+    fn drop(&mut self) {
+        // Closing the fd releases the flock; unlocking first says so.
+        let _ = self.file.unlock();
+    }
+}
+
+/// The turn's lock file lives with the sender's outbox, so one state dir
+/// means one turn — which is exactly the scope the epoch claim has.
+pub(crate) fn sender_turn_path(state_dir: &Path, sender: &str) -> PathBuf {
+    comms_dir(state_dir, sender).join(".turn.lock")
+}
+
+/// Boundary: take the sender's turn, waiting until it is free. Acquiring on
+/// the blocking pool keeps a parked Tokio worker from holding the gate.
+pub(crate) async fn take_sender_turn(state_dir: &Path, sender: &str) -> Result<SenderTurn> {
+    let path = sender_turn_path(state_dir, sender);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let turn = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        file.lock()?;
+        Ok::<_, std::io::Error>(SenderTurn { file })
+    })
+    .await
+    .context("sender turn task")??;
+    Ok(turn)
 }
 
 /// Pure: the backoff before retry round `round` (>= 1) given a random
@@ -394,26 +427,26 @@ pub async fn append_task(
     let dir = comms_dir(state_dir, sender);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let run = run_id();
-    let gate = sender_gate(sender);
+    // One sender, one turn (bd-or1zt), held for the WHOLE send: the
+    // recovery, every local epoch claim, and every append the claim fences
+    // are one critical section. Across processes, not just tasks.
+    let _turn = take_sender_turn(state_dir, sender).await?;
     let body = serde_json::to_value(task)?;
 
     // 1. Reconcile whatever a crashed earlier run journaled (toron's
     //    mail.append recovery): present -> settled, absent -> appended with
     //    the SAME triple.
     //
-    //    The recovery takes the sender's turn (bd-3s2q). The outbox CLAIMS a
-    //    journal epoch, and a claim fences every lower epoch at once, so a
-    //    recovery outside the turn fenced a live peer's in-flight append:
-    //    "stale epoch for producer <npub>#journal: sent 12, current 13".
-    //    One sender, one turn: the claim and the appends it fences are the
-    //    same critical section, so a run's own epoch is never fenced by a
+    //    The recovery runs inside the sender's turn (bd-3s2q). The outbox
+    //    CLAIMS a journal epoch, and a claim fences every lower epoch at once,
+    //    so a recovery outside the turn fenced a live peer's in-flight
+    //    append: "stale epoch for producer <npub>#journal: sent 12, current
+    //    13". One sender, one turn: the claim and the appends it fences are
+    //    the same critical section, so a run's own epoch is never fenced by a
     //    peer that is still writing under it.
-    {
-        let _turn = gate.lock().await;
-        outbox::send_and_recover(store.clone(), sender.to_string(), Vec::new())
-            .await
-            .map_err(|e| anyhow!("recover sender intents: {e}"))?;
-    }
+    outbox::send_and_recover(store.clone(), sender.to_string(), Vec::new())
+        .await
+        .map_err(|e| anyhow!("recover sender intents: {e}"))?;
 
     // (msg key, state, offset) once a recipient is settled; `last_why` keeps
     // the latest refusal for a recipient still pending.
@@ -439,8 +472,8 @@ pub async fn append_task(
             )))
             .await;
         }
-        // Claim-to-settle is one critical section per sender in this process.
-        let _turn = gate.lock().await;
+        // Claim-to-settle is one critical section per sender, held by the
+        // turn taken at the top of this function.
         // 2. Plan each pending recipient from its intent record and the log.
         let store_epoch = store.producer_epoch(sender).await?;
         let mut resend: Vec<(usize, Envelope)> = Vec::new();
@@ -1134,25 +1167,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_sender_one_gate_distinct_senders_distinct_gates() {
-        assert!(std::sync::Arc::ptr_eq(
-            &sender_gate("npub-a"),
-            &sender_gate("npub-a")
-        ));
-        assert!(!std::sync::Arc::ptr_eq(
-            &sender_gate("npub-a"),
-            &sender_gate("npub-b")
-        ));
-        let g = sender_gate("npub-a");
-        let _held = g.lock().await;
+    async fn one_sender_one_turn_distinct_senders_distinct_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = take_sender_turn(dir.path(), A).await.unwrap();
+        // A SECOND open of the same path is the peer `__send` process's
+        // shape: flock is per file description, so it waits while ours is
+        // held. A process-local mutex would let it through — which is the
+        // defect bd-or1zt measured.
+        std::fs::create_dir_all(sender_turn_path(dir.path(), A).parent().unwrap()).unwrap();
+        let peer = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(sender_turn_path(dir.path(), A))
+            .unwrap();
         assert!(
-            sender_gate("npub-a").try_lock().is_err(),
-            "same sender takes turns"
+            peer.try_lock().is_err(),
+            "same sender takes turns across processes"
         );
+        std::fs::create_dir_all(sender_turn_path(dir.path(), B).parent().unwrap()).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(sender_turn_path(dir.path(), B))
+            .unwrap();
         assert!(
-            sender_gate("npub-b").try_lock().is_ok(),
-            "other senders do not wait"
+            other.try_lock().is_ok(),
+            "other senders do not wait for A's turn"
         );
+        other.unlock().unwrap();
+        drop(held);
+        assert!(
+            peer.try_lock().is_ok(),
+            "the turn is released when its holder drops it"
+        );
+        peer.unlock().unwrap();
     }
 
     use super::*;
@@ -1569,16 +1619,14 @@ mod tests {
     async fn concurrent_runs_never_share_an_epoch() {
         let store = mem_store().await;
         let rcpt = vec![("Birch".to_string(), B.to_string())];
-        let (d1, d2, d3) = (
-            tempfile::tempdir().unwrap(),
-            tempfile::tempdir().unwrap(),
-            tempfile::tempdir().unwrap(),
-        );
+        // bd-or1zt: one state dir (the outbox root is per USER, not per run),
+        // so the three contenders take the same turn and claim in sequence.
+        let d = tempfile::tempdir().unwrap();
         let t = task();
         let (r1, r2, r3) = tokio::join!(
-            append_task(&store, d1.path(), A, &rcpt, "c", "t-a", &t),
-            append_task(&store, d2.path(), A, &rcpt, "c", "t-b", &t),
-            append_task(&store, d3.path(), A, &rcpt, "c", "t-c", &t),
+            append_task(&store, d.path(), A, &rcpt, "c", "t-a", &t),
+            append_task(&store, d.path(), A, &rcpt, "c", "t-b", &t),
+            append_task(&store, d.path(), A, &rcpt, "c", "t-c", &t),
         );
         let rows = [r1.unwrap(), r2.unwrap(), r3.unwrap()];
         let mut epochs: Vec<u64> = rows.iter().map(|r| epoch_of(&r[0].msg_id)).collect();
@@ -1600,7 +1648,7 @@ mod tests {
         let store = mem_store().await;
         let rcpt = vec![("Birch".to_string(), B.to_string())];
         let dir = tempfile::tempdir().unwrap();
-        let held = sender_gate(A).lock_owned().await;
+        let held = take_sender_turn(dir.path(), A).await.unwrap();
         let (st, d, r) = (store.clone(), dir.path().to_path_buf(), rcpt.clone());
         let run =
             tokio::spawn(async move { append_task(&st, &d, A, &r, "c", "t-gated", &task()).await });
@@ -1620,6 +1668,45 @@ mod tests {
         assert_eq!(rows[0].state, "appended");
     }
 
+    /// bd-or1zt: the two writers that livelocked were `__send` SUBPROCESSES
+    /// (pane.rs spawns one per parallel `dispatch_job` leaf), each with its
+    /// own process-local gate. The turn is one flock on the shared outbox, so
+    /// the second DM waits for the first instead of claiming an epoch that
+    /// fences it. Mutation: drop the `take_sender_turn` call and this test
+    /// reproduces `stale epoch ... #journal` (the two claims interleave).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_parallel_dms_from_one_actor_land_instead_of_fencing() {
+        let store = mem_store().await;
+        let rcpt = vec![("Birch".to_string(), B.to_string())];
+        let dir = tempfile::tempdir().unwrap();
+        let t = task();
+        let (risk, oracle) = tokio::join!(
+            append_task(&store, dir.path(), A, &rcpt, "c", "t-diverge-risk", &t),
+            append_task(&store, dir.path(), A, &rcpt, "c", "t-diverge-oracle", &t),
+        );
+        for rows in [&risk, &oracle] {
+            let rows = rows
+                .as_ref()
+                .expect("no stale-epoch refusal: the turn serializes the claims");
+            assert_eq!(rows[0].state, "appended", "{rows:?}");
+            assert!(rows[0].offset.is_some(), "{rows:?}");
+        }
+        assert_ne!(
+            risk.as_ref().unwrap()[0].msg_id,
+            oracle.as_ref().unwrap()[0].msg_id,
+            "two tasks, two envelopes"
+        );
+        assert_eq!(
+            store
+                .read_stream(toron_core::inbox::INBOX_STREAM, None)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "both DMs landed"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn many_concurrent_runs_of_one_sender_all_land_on_distinct_epochs() {
         let store = mem_store().await;
@@ -1627,11 +1714,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut set = tokio::task::JoinSet::new();
         for i in 0..12 {
-            let (st, d, r) = (
-                store.clone(),
-                dir.path().join(format!("r{i}")),
-                rcpt.clone(),
-            );
+            let (st, d, r) = (store.clone(), dir.path().to_path_buf(), rcpt.clone());
             set.spawn(async move {
                 append_task(&st, &d, A, &r, "c", &format!("t-many-{i}"), &task()).await
             });
@@ -1648,7 +1731,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_single_run_needs_no_lock_or_epoch_file() {
+    async fn a_single_run_needs_no_epoch_file() {
         let store = mem_store().await;
         let dir = tempfile::tempdir().unwrap();
         let rcpt = vec![("Birch".to_string(), B.to_string())];
@@ -1657,13 +1740,19 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].state, "appended");
         assert_eq!(epoch_of(&rows[0].msg_id), 0, "the first claim is epoch 0");
-        let names: Vec<String> = std::fs::read_dir(comms_dir(dir.path(), A))
+        let mut names: Vec<String> = std::fs::read_dir(comms_dir(dir.path(), A))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(
-            names.iter().all(|n| n.ends_with(".json")) && names.len() == 1,
-            "only the intent record, no lock/epoch file: {names:?}"
+        names.sort();
+        // bd-or1zt: the turn IS the lock file (`.turn.lock`, an flock, never
+        // an epoch record); the only other file is the intent.
+        assert_eq!(
+            names,
+            vec![
+                ".turn.lock".to_string(),
+                format!("{}.json", intent_key("t-1", B))
+            ]
         );
         // The claim is what the log now says the epoch is.
         assert_eq!(store.producer_epoch(A).await.unwrap(), Some(0));
