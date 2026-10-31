@@ -258,8 +258,23 @@ print(hit[0]["pane"] if hit else "")
 [ "$NEW_PANE" = "$V_PANE" ] && die "registry still names the dead pane $V_PANE"
 pass "recover minted $NEW_PANE for $V_PIN"
 
-# Reachability is the real claim: a send must resolve and land on it. The
-# recovered harness may still be booting, so retry while it settles.
+# A recovered agent may be finishing a task the steer replayed into it, and a
+# BUSY pane refuses prompts by design ("status working is not at a prompt").
+# Wait for the recovered pane to reach a prompt before probing reachability —
+# the claim is "the recovered pane takes a NEW send", not "it is idle instantly".
+for _w in $(seq 1 24); do
+  ST=$(status_json | python3 -c '
+import json,sys
+pane=sys.argv[1]
+d=json.load(sys.stdin)
+print(next((a.get("status") or "" for a in d.get("agents",[]) if a.get("pane_id")==pane), ""))
+' "$NEW_PANE")
+  [ "$ST" = "idle" ] && break
+  sleep 10
+done
+[ "$ST" = "idle" ] || die "recovered pane $NEW_PANE never reached a prompt (last status $ST)"
+
+# Reachability is the real claim: a send must resolve and land on it.
 SEND2=""
 landed2=0
 for _attempt in 1 2 3 4 5 6; do
