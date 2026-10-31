@@ -2113,12 +2113,14 @@ fn cap(s: &str, max: usize) -> String {
 /// the key observability win over scrollback.
 fn summarize_tool_state(state: &Value) -> Value {
     let status = state.get("status").and_then(Value::as_str).unwrap_or("?");
+    // v2 tool inputs are OBJECTS (`{"command": "..."}`), so the JSON form is
+    // capped too — an uncapped `to_string` defeated the cap entirely.
     let input = state
         .get("input")
         .map(|v| {
             v.as_str()
                 .map(|s| cap(s, 2000))
-                .unwrap_or_else(|| v.to_string())
+                .unwrap_or_else(|| cap(&v.to_string(), 2000))
         })
         .unwrap_or_default();
     let output = state
@@ -2126,7 +2128,7 @@ fn summarize_tool_state(state: &Value) -> Value {
         .map(|v| {
             v.as_str()
                 .map(|s| cap(s, 4000))
-                .unwrap_or_else(|| v.to_string())
+                .unwrap_or_else(|| cap(&v.to_string(), 4000))
         })
         .unwrap_or_default();
     json!({
@@ -2141,6 +2143,12 @@ fn summarize_tool_state(state: &Value) -> Value {
 /// user-visible content.
 fn summarize_part(data: &str) -> Option<Value> {
     let v: Value = serde_json::from_str(data).ok()?;
+    summarize_part_value(&v)
+}
+
+/// The same summarizer over an ALREADY-parsed part. opencode v2 nests parts
+/// in `session_message.data.content[]`, so the reader has values, not strings.
+fn summarize_part_value(v: &Value) -> Option<Value> {
     let kind = v.get("type").and_then(Value::as_str)?;
     match kind {
         "text" => v
@@ -2153,7 +2161,14 @@ fn summarize_part(data: &str) -> Option<Value> {
             .map(|t| json!({"kind": "reasoning", "text": cap(t, 2000)})),
         "tool" => Some(json!({
             "kind": "tool",
-            "tool": v.get("tool").and_then(Value::as_str).unwrap_or("?"),
+            // opencode v2 names the tool `name`; v1 used `tool`. Accept both
+            // (a `?` here is the difference between an observability win and
+            // a wall of anonymous tool rows).
+            "tool": v
+                .get("name")
+                .or_else(|| v.get("tool"))
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
             "state": summarize_tool_state(v.get("state").unwrap_or(&Value::Null)),
         })),
         _ => None,
@@ -2165,9 +2180,13 @@ fn summarize_part(data: &str) -> Option<Value> {
 /// a database and without depending on the installed sqlite3.
 #[derive(Debug, PartialEq, Eq)]
 enum SessionSchema {
-    /// The v1 layout this reader speaks: `session` + `part`.
+    /// The v1 layout this reader speaks first: `session` + `part`.
     V1,
-    /// Anything else — opencode has moved to `session_v2` + `session_part`.
+    /// opencode v2 (2026-10): `session_v2` + `session_message`. The message
+    /// row's `data.content[]` carries the parts; `session_part` exists but is
+    /// empty in the measured store (8444 messages, 0 parts).
+    V2,
+    /// Anything else — name the tables rather than blame sqlite.
     Drift { present: Vec<String> },
 }
 
@@ -2175,6 +2194,8 @@ fn session_schema_from_tables(tables: &[String]) -> SessionSchema {
     let has = |t: &str| tables.iter().any(|x| x == t);
     if has("session") && has("part") {
         SessionSchema::V1
+    } else if has("session_v2") && has("session_message") {
+        SessionSchema::V2
     } else {
         SessionSchema::Drift {
             present: tables.to_vec(),
@@ -2182,14 +2203,15 @@ fn session_schema_from_tables(tables: &[String]) -> SessionSchema {
     }
 }
 
-/// The typed failure a drifted store earns: the DB, the plane, the tables
-/// this reader needs, and the tables the store DOES carry. Pure so the
+/// The typed failure a drifted store earns: the DB, the plane, the layouts
+/// this reader speaks, and the tables the store DOES carry. Pure so the
 /// wording is pinned by a test.
 fn session_store_drift_error(db: &Path, present: &[String]) -> String {
     format!(
         "opencode session store drifted at {} (plane: opencode structured session store): \
-         no `session`+`part` tables, so nothing was queried. This reader speaks the v1 layout; \
-         the store carries [{}] (bd-5t31z — map the newer layout before trusting this output)",
+         no `session`+`part` (v1) and no `session_v2`+`session_message` (v2) tables, so nothing \
+         was queried. The store carries [{}] (bd-5t31z — map the newer layout before trusting \
+         this output)",
         db.display(),
         present.join(", ")
     )
@@ -2232,14 +2254,22 @@ pub fn read_session_log(
     }
     // bd-5t31z: a drifted schema must fail as a typed platform fact naming the
     // store, never as sqlite's "Parse error in 3rd command line argument".
-    if let SessionSchema::Drift { present } = session_schema_from_tables(&session_tables(&db)?) {
-        bail!("{}", session_store_drift_error(&db, &present));
+    // Two layouts are spoken: v1 (`session`+`part`) and opencode v2
+    // (`session_v2`+`session_message`, parts nested in `data.content[]`).
+    let schema = session_schema_from_tables(&session_tables(&db)?);
+    if let SessionSchema::Drift { present } = &schema {
+        bail!("{}", session_store_drift_error(&db, present));
     }
+    let session_table = match schema {
+        SessionSchema::V1 => "session",
+        SessionSchema::V2 => "session_v2",
+        SessionSchema::Drift { .. } => unreachable!("drift returns above"),
+    };
     let (sid, meta): (String, Value) = if let Some(sid) = session_id {
         let rows = sqlite_json(
             &db,
             &format!(
-                "SELECT id, title, agent, model, time_updated FROM session WHERE id='{}'",
+                "SELECT id, title, agent, model, time_updated FROM {session_table} WHERE id='{}'",
                 sq(sid)
             ),
         )?;
@@ -2253,7 +2283,7 @@ pub fn read_session_log(
             .map(|r| format!(" AND agent='{}'", sq(r)))
             .unwrap_or_default();
         let sql = format!(
-            "SELECT id, title, agent, model, time_updated FROM session \
+            "SELECT id, title, agent, model, time_updated FROM {session_table} \
              WHERE directory='{}'{agent_clause} ORDER BY time_updated DESC LIMIT 1",
             sq(project_dir)
         );
@@ -2268,19 +2298,49 @@ pub fn read_session_log(
         let sid = arr[0]["id"].as_str().unwrap_or_default().to_string();
         (sid, Value::Array(arr))
     };
-    let parts_sql = format!(
-        "SELECT data FROM part WHERE session_id='{}' ORDER BY time_created, id LIMIT {}",
-        sq(&sid),
-        limit.max(1)
-    );
-    let raw = sqlite_json(&db, &parts_sql)?;
-    let parts: Vec<Value> = raw
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| row["data"].as_str().and_then(summarize_part))
-        .collect();
+    let parts: Vec<Value> = match schema {
+        SessionSchema::V1 => {
+            let parts_sql = format!(
+                "SELECT data FROM part WHERE session_id='{}' ORDER BY time_created, id LIMIT {}",
+                sq(&sid),
+                limit.max(1)
+            );
+            sqlite_json(&db, &parts_sql)?
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|row| row["data"].as_str().and_then(summarize_part))
+                .collect()
+        }
+        SessionSchema::V2 => {
+            // One row per MESSAGE; the parts are nested in `data.content[]`.
+            // `seq` is the session's monotonic order (the measured store has
+            // 8444 messages and 0 `session_part` rows, so reading the part
+            // table would silently return nothing).
+            let msg_sql = format!(
+                "SELECT data FROM session_message WHERE session_id='{}' ORDER BY seq LIMIT {}",
+                sq(&sid),
+                limit.max(1)
+            );
+            sqlite_json(&db, &msg_sql)?
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|row| row["data"].as_str())
+                .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+                .flat_map(|msg| {
+                    msg.get("content")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter_map(|part| summarize_part_value(&part))
+                .collect()
+        }
+        SessionSchema::Drift { .. } => unreachable!("drift returns above"),
+    };
     let mut out = json!({
         "session_id": sid,
         "directory": project_dir,
@@ -2307,20 +2367,25 @@ mod session_schema_tests {
     /// message assertions red.
     #[test]
     fn output_reports_a_missing_session_table() {
-        // The measured drift, 2026-10-31: opencode's v2 layout.
-        let v2 = vec![
-            "session_message".to_string(),
-            "session_part".to_string(),
-            "session_v2".to_string(),
-        ];
+        // The measured DRIFT shape: a v2 store whose message table is missing
+        // (the part table alone cannot carry content).
+        let drifted = vec!["session_part".to_string(), "session_v2".to_string()];
         assert_eq!(
-            session_schema_from_tables(&v2),
+            session_schema_from_tables(&drifted),
             SessionSchema::Drift {
-                present: v2.clone()
+                present: drifted.clone()
             }
         );
         let v1 = vec!["part".to_string(), "session".to_string()];
         assert_eq!(session_schema_from_tables(&v1), SessionSchema::V1);
+        // opencode v2: `session_v2` + `session_message` (the parts are nested
+        // in the message data; the part TABLE is present but empty).
+        let v2_schema = vec![
+            "session_v2".to_string(),
+            "session_message".to_string(),
+            "session_part".to_string(),
+        ];
+        assert_eq!(session_schema_from_tables(&v2_schema), SessionSchema::V2);
         // Half a v1 store is drift too: `session` alone still queries `part`.
         assert!(matches!(
             session_schema_from_tables(&["session".to_string()]),
@@ -2364,6 +2429,68 @@ mod session_schema_tests {
             !msg.contains("Parse error"),
             "sqlite's argument noise must not be the diagnosis: {msg}"
         );
+
+        // The SAME function reads the mapped v2 layout: the round that made
+        // the drift loud must not be the round that leaves the data unread
+        // (opencode's measured store: 8444 session_message rows, 0 parts).
+        let db2 = dir.join("opencode-v2.db");
+        let _ = std::fs::remove_file(&db2);
+        let msg1 = json!({
+            "type": "assistant",
+            "content": [
+                {"type": "text", "text": "hello v2"},
+                {"type": "tool", "name": "shell",
+                 "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"}}
+            ]
+        })
+        .to_string();
+        let msg2 = json!({
+            "type": "assistant",
+            "content": [
+                {"type": "reasoning", "text": "thinking"},
+                {"type": "step-start"}
+            ]
+        })
+        .to_string();
+        // One quote helper: the payloads are single-quoted SQL literals.
+        let q = |s: &str| s.replace('\'', "''");
+        let sql = format!(
+            "CREATE TABLE session_v2 (id text PRIMARY KEY, title text, agent text, \
+             model text, directory text, time_updated integer); \
+             CREATE TABLE session_message (id text PRIMARY KEY, session_id text, \
+             seq integer, data text); \
+             INSERT INTO session_v2 VALUES ('ses_test','V2 fixture','build','model-x', \
+             '/tmp/v2proj',123); \
+             INSERT INTO session_message VALUES ('m1','ses_test',1,'{}'); \
+             INSERT INTO session_message VALUES ('m2','ses_test',2,'{}');",
+            q(&msg1),
+            q(&msg2)
+        );
+        let created = std::process::Command::new("sqlite3")
+            .arg(&db2)
+            .arg(&sql)
+            .status()
+            .expect("sqlite3 must be installed — the reader shells it too");
+        assert!(created.success(), "v2 fixture store created");
+        // SAFETY: same single-reader invariant as above; this function is the
+        // only place that touches OPENCODE_DB.
+        unsafe { std::env::set_var("OPENCODE_DB", &db2) };
+        let got = read_session_log("/tmp/v2proj", None, None, 10).expect("v2 store reads");
+        unsafe { std::env::remove_var("OPENCODE_DB") };
+        let _ = std::fs::remove_file(&db2);
+        assert_eq!(got["session_id"], "ses_test");
+        assert_eq!(got["title"], "V2 fixture");
+        let parts = got["parts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            parts.len(),
+            3,
+            "text + tool + reasoning, step-start skipped: {parts:?}"
+        );
+        assert_eq!(parts[0]["kind"], "text");
+        assert_eq!(parts[0]["text"], "hello v2");
+        assert_eq!(parts[1]["kind"], "tool");
+        assert_eq!(parts[1]["tool"], "shell", "v2 names the tool `name`");
+        assert_eq!(parts[2]["kind"], "reasoning");
     }
 }
 
