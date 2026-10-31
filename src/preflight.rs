@@ -193,9 +193,11 @@ pub fn run(cfg: &Config, mode: Mode, project: Option<&str>) -> Vec<Check> {
     // 2. resonate server reachable
     checks.push(check_resonate(cfg));
 
-    // 2b. doorbell daemon (bd-0gmw): advisory only — a configured daemon
-    //     being down degrades to the embedded loop, so this warns (skip)
-    //     and never blocks.
+    // 2b. doorbell daemon (durability ask; supersedes bd-0gmw's advisory
+    //     SKIP): a configured [doorbell] url makes the loop DEFER to that
+    //     daemon, so "configured but not serving" is an OUTAGE and fails
+    //     loud with the reason, the unit, the port, and the remedy. No
+    //     section means embedded mode — an honest SKIP.
     checks.push(check_doorbell(cfg));
 
     // 3. br binary on PATH — only bead-driven modes (matches the Mode doc:
@@ -394,23 +396,45 @@ fn check_resonate(cfg: &Config) -> Check {
     }
 }
 
-/// bd-0gmw: advisory doorbell entry. A configured daemon being down is a
-/// warning (skip), never a FAIL — embedded mode still works. Mirrors the
-/// advisory-skip pattern; there is no blocking outcome here.
+/// The doorbell entry SPEAKS (durability ask, bd-c9y6n follow-up). With
+/// `[doorbell] url` configured the loop DEFERS to that daemon, so an
+/// unreachable one means nothing serves wakes — the old SKIP made a six-hour
+/// outage invisible to every gate (all green while nothing rang). Unset stays
+/// an honest SKIP: embedded mode has nothing to miss.
+///
+/// `daemon_healthy` is the probe the rest of flywheel uses; its `false` covers
+/// both "nothing listening" and "too busy to answer /health in the budget"
+/// (bd-2zqk measured the second kind at 33% on the old budgets), so the line
+/// says both and does NOT tell the operator to start a second daemon.
+/// `doorbell::daemon_health_probe` already carries the precise reason —
+/// adopting it here waits for the doorbell work holding `src/doorbell.rs`.
 fn check_doorbell(cfg: &Config) -> Check {
-    match cfg.doorbell_url() {
-        None => Check::skip("doorbell", "embedded (no [doorbell] url configured)"),
-        Some(url) => {
-            if crate::doorbell::daemon_healthy(&url) {
-                Check::pass("doorbell")
-            } else {
-                Check::skip(
-                    "doorbell",
-                    "configured daemon unreachable — remediation: doorbell start | doorbell install | flywheel daemon start",
-                )
-            }
-        }
+    let Some(url) = cfg.doorbell_url() else {
+        return Check::skip("doorbell", "embedded (no [doorbell] url configured)");
+    };
+    if crate::doorbell::daemon_healthy(&url) {
+        return Check::pass("doorbell");
     }
+    Check::fail(
+        "doorbell",
+        format!(
+            "[doorbell] url is configured but no daemon answers /health at {url} (port {}) — \
+             either it is down or it is too busy to answer; nothing rings wakes while the \
+             section is set; unit com.doorbell.serve (launchd) / doorbell.service \
+             (systemd --user); remediation: doorbell start | doorbell install | \
+             flywheel daemon start (re-probe first if it was healthy a moment ago — do not \
+             start a second daemon)",
+            port_of(&url)
+        ),
+    )
+}
+
+/// The port a configured URL names (`http://127.0.0.1:18980` -> `18980`).
+/// Message-only: a URL with no explicit port reports `default`.
+fn port_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    hostport.rsplit_once(':').map_or("default", |(_, p)| p)
 }
 
 fn check_br() -> Check {
@@ -911,6 +935,53 @@ mod tests {
         assert_eq!(v["checks"][1]["status"], "fail");
         assert_eq!(v["checks"][1]["message"], "unreachable");
         assert_eq!(v["checks"][2]["status"], "skip");
+    }
+
+    /// The durability ask: a CONFIGURED daemon that nothing serves is an
+    /// OUTAGE, not a silent SKIP — a six-hour doorbell outage was green on
+    /// every gate while nothing rang. Mutation: restore the SKIP arm and this
+    /// fails. Port 1 refuses the connection, so the arm is NotListening
+    /// deterministically (no live daemon, no ambient state).
+    #[test]
+    fn a_configured_but_dead_doorbell_fails_loud() {
+        let cfg = crate::config::Config {
+            doorbell: Some(crate::config::DoorbellSection {
+                url: Some("http://127.0.0.1:1".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let check = check_doorbell(&cfg);
+        match &check.status {
+            Status::Fail(msg) => {
+                assert!(msg.contains("no daemon answers"), "{msg}");
+                assert!(msg.contains("port 1"), "names the port: {msg}");
+                assert!(msg.contains("com.doorbell.serve"), "names the unit: {msg}");
+                assert!(msg.contains("doorbell start"), "names the remedy: {msg}");
+            }
+            other => panic!("a configured dead daemon must FAIL, got {other:?}"),
+        }
+    }
+
+    /// No section = embedded mode: nothing to miss, and the note says so.
+    #[test]
+    fn no_configured_daemon_stays_an_honest_skip() {
+        let cfg = crate::config::Config {
+            doorbell: None,
+            ..Default::default()
+        };
+        match check_doorbell(&cfg).status {
+            Status::Skip(reason) => assert!(reason.contains("embedded"), "{reason}"),
+            other => panic!("embedded mode must SKIP, got {other:?}"),
+        }
+    }
+
+    /// The port in the message comes from the URL, not a constant.
+    #[test]
+    fn the_doorbell_message_names_the_configured_port() {
+        assert_eq!(port_of("http://127.0.0.1:18980"), "18980");
+        assert_eq!(port_of("http://127.0.0.1:18980/health?x=1"), "18980");
+        assert_eq!(port_of("http://127.0.0.1"), "default");
     }
 
     #[test]
