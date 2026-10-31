@@ -161,6 +161,10 @@ pub struct PruneReport {
     /// Audit logs removed (`<ws>.audit.jsonl`). The `.audit.loudmiss`
     /// tombstone is never pruned (it dedups tears across audit pruning).
     pub audits_removed: usize,
+    /// Dead-host records removed (`<ws>.pid|.gen|.project`).
+    pub sidecars_removed: usize,
+    /// Stale owner leases removed (`owner-<ws>.json`).
+    pub leases_removed: usize,
     /// Files this process could not remove (permissions, a race with a writer).
     pub remove_failed: usize,
 }
@@ -233,20 +237,28 @@ impl FileStore {
             .join(format!("{workspace}.audit.jsonl"))
     }
 
-    /// bd-lorot: delete per-workspace logs for workspaces this daemon no longer
+    /// bd-lorot: delete per-workspace state for workspaces this daemon no longer
     /// hosts AND has not touched recently.
     ///
-    /// Both file kinds accumulate one-per-workspace and nothing ever removed
-    /// them, so the set only grew. `known_journal_workspaces` reads the journals
-    /// directory and reports one entry per file, which is the input to
-    /// `known_workspaces` and therefore to the standby wake-blind signal: a
-    /// workspace the plane served once, months ago, kept the daemon reporting
-    /// "a fleet expects rings I will not deliver" forever. Measured: 913 journal
-    /// files, 20 MB, `known_workspaces` 858.
+    /// Every family here accumulates one-per-workspace and nothing ever removed
+    /// it, so the set only grew: journals, `watch-*` liveness stamps, and the
+    /// audit/host records added by gc/audit and gc/sidecars. `known_journal_workspaces`
+    /// reads the journals directory and reports one entry per file, which is the
+    /// input to `known_workspaces` and therefore to the standby wake-blind
+    /// signal: a workspace the plane served once, months ago, kept the daemon
+    /// reporting "a fleet expects rings I will not deliver" forever. Measured:
+    /// 913 journal files, 20 MB, `known_workspaces` 858; then 470 files / 74 MB
+    /// in `doorbell/` (16 audit logs = 20.5 MB, 23 dead pid + 71 gen + 57
+    /// project + 31 stale leases).
     ///
     /// Two conditions, both required, and the second is what makes this safe:
     /// - the workspace is not in `live` (not currently hosted), AND
     /// - its newest log mtime is older than `max_age_secs`.
+    ///
+    /// The host-record families add their own liveness guard — a live pid for
+    /// sidecars, a live lease for `owner-*.json` — because `.pid` is written
+    /// once at spawn and never refreshed, so age alone would delete a live
+    /// idle host's identity.
     ///
     /// A brand-new workspace whose host loop has not written yet is therefore
     /// never a candidate, so a just-spawned crew cannot have its journal deleted
@@ -315,26 +327,82 @@ impl FileStore {
         //
         // One read_dir for both families (it used to scan twice, once per
         // stamp suffix).
+        // gc/sidecars: the per-workspace host records a dead host leaves
+        // behind — `<ws>.pid`, `<ws>.gen`, `<ws>.project`, `owner-<ws>.json`.
+        // A dead pid makes all of them garbage, but nothing ever removed
+        // them: measured here 23 dead pid files, 71 gen, 57 project and 31
+        // stale owner leases (half of the 470 files in the dir). The guard is
+        // the PID, not the mtime alone: `.pid` is written once at spawn and
+        // never refreshed, so age alone would delete a live idle host's
+        // identity. `<ws>.unanswered` is NOT pruned — it is load-bearing by
+        // policy (a cleanup that empties it silently disarms the gate).
+        let leased: std::collections::BTreeSet<String> =
+            crate::lease::live_leases(&self.state_dir, now_secs)
+                .into_iter()
+                .map(|(ws, _)| ws)
+                .collect();
+        let mut live_hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Ok(hosts) = std::fs::read_dir(self.state_dir.join("doorbell")) {
+            for entry in hosts.filter_map(std::result::Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(ws) = name.strip_suffix(".pid") else {
+                    continue;
+                };
+                let alive = std::fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u32>().ok())
+                    .is_some_and(crate::lease::pid_alive);
+                if alive {
+                    live_hosts.insert(ws.to_string());
+                }
+            }
+        }
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Stamp,
+            Audit,
+            Sidecar,
+            Lease,
+        }
         let Ok(entries) = std::fs::read_dir(self.state_dir.join("doorbell")) else {
             return report;
         };
         for entry in entries.filter_map(std::result::Result::ok) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let parsed = if let Some(ws) = name
+            let parsed: Option<(&str, Kind)> = if let Some(ws) = name
                 .strip_prefix("watch-")
                 .and_then(|n| n.strip_suffix(".hb"))
                 .or_else(|| {
                     name.strip_prefix("watch-")
                         .and_then(|n| n.strip_suffix(".event"))
                 }) {
-                Some((ws, true))
+                Some((ws, Kind::Stamp))
+            } else if let Some(ws) = name.strip_suffix(".audit.jsonl") {
+                Some((ws, Kind::Audit))
+            } else if let Some(ws) = name
+                .strip_suffix(".pid")
+                .or_else(|| name.strip_suffix(".gen"))
+                .or_else(|| name.strip_suffix(".project"))
+            {
+                Some((ws, Kind::Sidecar))
+            } else if let Some(ws) = name
+                .strip_prefix("owner-")
+                .and_then(|n| n.strip_suffix(".json"))
+            {
+                Some((ws, Kind::Lease))
             } else {
-                name.strip_suffix(".audit.jsonl").map(|ws| (ws, false))
+                None
             };
-            let Some((ws, is_stamp)) = parsed else {
+            let Some((ws, kind)) = parsed else {
                 continue;
             };
             if ws.is_empty() || live.contains(ws) {
+                continue;
+            }
+            if matches!(kind, Kind::Sidecar) && live_hosts.contains(ws) {
+                continue;
+            }
+            if matches!(kind, Kind::Lease) && leased.contains(ws) {
                 continue;
             }
             let Ok(md) = entry.metadata() else { continue };
@@ -352,10 +420,11 @@ impl FileStore {
             }
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => {
-                    if is_stamp {
-                        report.stamps_removed += 1;
-                    } else {
-                        report.audits_removed += 1;
+                    match kind {
+                        Kind::Stamp => report.stamps_removed += 1,
+                        Kind::Audit => report.audits_removed += 1,
+                        Kind::Sidecar => report.sidecars_removed += 1,
+                        Kind::Lease => report.leases_removed += 1,
                     }
                     report.bytes_freed += md.len();
                 }
@@ -2381,6 +2450,82 @@ mod prune_tests {
             "the young one is reported, not silently kept"
         );
         assert!(report.bytes_freed > 0, "freed bytes are reported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gc/sidecars: a dead host's pid/gen/project records and its stale owner
+    /// lease go; a live host's stay even when the files are old, because
+    /// `.pid` is written once at spawn and never refreshed — age alone would
+    /// delete a live idle host's identity.
+    #[test]
+    fn prune_takes_dead_host_sidecars_and_stale_leases_but_spares_live_ones() {
+        let dir = std::env::temp_dir().join(format!("prune-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("dirs");
+        let store = FileStore::new(&dir);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        const OLD: u64 = 30 * 24 * 60 * 60;
+        let me = std::process::id();
+        let lease = |pid: u32, heartbeat: u64| {
+            serde_json::json!({
+                "pid": pid,
+                "boot_id": "test",
+                "host": "test",
+                "started_unix": heartbeat,
+                "heartbeat_unix": heartbeat,
+            })
+            .to_string()
+        };
+
+        let doorbell = dir.join("doorbell");
+        let files: Vec<(std::path::PathBuf, String)> = vec![
+            (doorbell.join("gone.pid"), "999999\n".into()),
+            (doorbell.join("gone.gen"), "{}".into()),
+            (doorbell.join("gone.project"), "p".into()),
+            (doorbell.join("owner-gone.json"), lease(999999, now - OLD)),
+            (doorbell.join("live.pid"), format!("{me}\n")),
+            (doorbell.join("live.gen"), "{}".into()),
+            (doorbell.join("live.project"), "p".into()),
+            (doorbell.join("owner-live.json"), lease(me, now)),
+        ];
+        for (path, body) in &files {
+            std::fs::write(path, body).expect("write");
+        }
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - OLD);
+        for (path, _) in &files {
+            std::fs::File::open(path)
+                .and_then(|f| f.set_modified(old))
+                .expect("age");
+        }
+
+        let report = store.prune_unhosted_workspace_logs(&BTreeSet::new(), 7 * 24 * 60 * 60, now);
+
+        assert!(
+            !doorbell.join("gone.pid").exists()
+                && !doorbell.join("gone.gen").exists()
+                && !doorbell.join("gone.project").exists(),
+            "a dead host's records are garbage: {report:?}"
+        );
+        assert!(
+            !doorbell.join("owner-gone.json").exists(),
+            "a stale lease is reclaimable state, not an owner"
+        );
+        assert!(
+            doorbell.join("live.pid").exists()
+                && doorbell.join("live.gen").exists()
+                && doorbell.join("live.project").exists(),
+            "a live pid protects its records even when they are old"
+        );
+        assert!(
+            doorbell.join("owner-live.json").exists(),
+            "a live lease is the deference record; never a candidate"
+        );
+        assert_eq!(report.sidecars_removed, 3, "pid+gen+project: {report:?}");
+        assert_eq!(report.leases_removed, 1, "only the stale lease: {report:?}");
+        assert_eq!(report.audits_removed, 0, "no audit files in this fixture");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
