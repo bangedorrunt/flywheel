@@ -274,7 +274,7 @@ pub(crate) const PANE_TEXT_CALLS: &[&str] = &[
 pub(crate) const LEGACY_PANE_TEXT_SITES: &[(&str, usize)] = &[
     ("src/cmd/doorbell.rs", 1),
     ("src/herdr.rs", 1),
-    ("src/main.rs", 9),
+    ("src/main.rs", 8),
 ];
 
 /// The file allowed to type into panes.
