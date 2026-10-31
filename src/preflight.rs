@@ -24,6 +24,9 @@ use crate::{command_exists, resonate_health};
 pub struct Check {
     pub name: &'static str,
     pub status: Status,
+    /// A pass that has something to say (bd-mknvb: which plane served).
+    /// Status stays `Pass` — every pass/fail consumer is unchanged.
+    pub note: Option<String>,
 }
 
 /// Check outcome.
@@ -42,18 +45,30 @@ impl Check {
         Self {
             name,
             status: Status::Pass,
+            note: None,
+        }
+    }
+    /// A pass whose detail names HOW it passed (bd-mknvb: the plane that
+    /// actually served, e.g. `auto -> herdr fallback: rex CLI not found`).
+    pub(crate) fn pass_note(name: &'static str, note: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: Status::Pass,
+            note: Some(note.into()),
         }
     }
     pub(crate) fn fail(name: &'static str, msg: impl Into<String>) -> Self {
         Self {
             name,
             status: Status::Fail(msg.into()),
+            note: None,
         }
     }
     pub(crate) fn skip(name: &'static str, reason: &'static str) -> Self {
         Self {
             name,
             status: Status::Skip(reason),
+            note: None,
         }
     }
 }
@@ -295,7 +310,10 @@ pub fn render(checks: &[Check]) -> String {
     let _ = writeln!(out, "preflight:");
     for c in checks {
         let line = match &c.status {
-            Status::Pass => format!("  {} {}", crate::output::ok("PASS"), c.name),
+            Status::Pass => match &c.note {
+                Some(note) => format!("  {} {} — {note}", crate::output::ok("PASS"), c.name),
+                None => format!("  {} {}", crate::output::ok("PASS"), c.name),
+            },
             Status::Fail(msg) => {
                 format!("  {} {} — {}", crate::output::error("FAIL"), c.name, msg)
             }
@@ -325,7 +343,7 @@ pub fn to_json(checks: &[Check]) -> Value {
         "passed": all_pass(checks),
         "checks": checks.iter().map(|c| {
             let (status, message) = match &c.status {
-                Status::Pass => ("pass", None),
+                Status::Pass => ("pass", c.note.as_deref()),
                 Status::Fail(msg) => ("fail", Some(msg.as_str())),
                 Status::Skip(reason) => ("skip", Some(*reason)),
             };
@@ -344,21 +362,27 @@ pub fn to_json(checks: &[Check]) -> Value {
 /// plus a real `agent_list`), never a hardcoded herdr socket: rex answering
 /// is PASS with herdr absent, herdr answering is PASS through the fallback,
 /// and neither is FAIL naming both planes with the remedy.
+///
+/// bd-mknvb: the PASS line names the plane that ACTUALLY served. `auto` on a
+/// host without the rex CLI used to PASS silently through the fallback, so
+/// an operator who believed rex was primary got green lights on herdr.
 fn check_pane_plane(cfg: &Config) -> Check {
-    let selected = crate::backend::resolve_backend_name(cfg);
+    let plane = crate::backend::resolve_plane(cfg);
     match crate::backend::multiplexer_backend(cfg) {
         Ok(backend) => match backend.agent_list() {
+            Ok(_) if plane.is_fallback() => Check::pass_note("pane-plane", plane.reason.clone()),
             Ok(_) => Check::pass("pane-plane"),
             Err(e) => Check::fail(
                 "pane-plane",
                 format!(
-                    "pane plane unreachable via {selected}: {e:#} — rex CLI missing and herdr daemon down? remedy: install the rex CLI or start herdr (FLYWHEEL_BACKEND=herdr selects herdr explicitly)"
+                    "pane plane unreachable via {}: {e:#} — remedy: install the rex CLI or start herdr (FLYWHEEL_BACKEND=herdr selects herdr explicitly)",
+                    plane.reason
                 ),
             ),
         },
         Err(e) => Check::fail(
             "pane-plane",
-            format!("pane plane unresolvable ({selected}): {e:#}"),
+            format!("pane plane unresolvable ({}): {e:#}", plane.reason),
         ),
     }
 }

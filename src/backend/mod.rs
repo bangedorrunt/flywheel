@@ -24,6 +24,10 @@
 //! Real impls override what they support (ADR-0002 §6 — open-to-extension).
 
 pub mod factory;
+// bd-mknvb: the plane that will actually serve, and why — one derivation for
+// the spawn arm, `backend list`, preflight, and the parity e2e.
+pub use factory::{Plane, resolve_plane};
+
 // The primary/fallback pair is constructed only by the superlogical "auto"
 // arm, so the module is compiled with that backend.
 #[cfg(feature = "backend-superlogical")]

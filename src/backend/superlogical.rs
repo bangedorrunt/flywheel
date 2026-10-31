@@ -25,7 +25,7 @@ use toron_core::backend::{
 };
 
 #[path = "rex_cli.rs"]
-mod rex_cli;
+pub(crate) mod rex_cli;
 
 // Test-only reuse: preflight's pane-plane tests drive the same fake `rex`
 // binary. Test builds only; no production surface.

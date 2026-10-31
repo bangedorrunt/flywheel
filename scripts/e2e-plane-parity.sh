@@ -47,6 +47,10 @@ say "plane: FLYWHEEL_BACKEND=$BACKEND"
 import json,sys
 d=json.load(sys.stdin)
 print(" active:", [b["name"] for b in d["backends"] if b.get("active")])
+r=d.get("resolved") or {}
+# bd-mknvb: name the plane that ACTUALLY serves, so a 10/10 here is
+# attributable to rex or to the herdr fallback instead of the configured name.
+print(" resolved:", r.get("configured"), "->", r.get("plane"), "|", r.get("reason"))
 ' || true
 
 BASE="${TMPDIR:-/tmp}/rexparity.$$"

@@ -9729,17 +9729,26 @@ projects available: {}",
         }
         bail!("{msg}");
     }
-    // Spawn rides the selected pane plane (bd-rex-default-plane-xn1t):
-    // `auto` and `superlogical` resolve rex-first with herdr as transport
-    // fallback only; `FLYWHEEL_BACKEND=herdr` keeps the herdr `Client` path.
-    // `REX_SESSION` never decides the plane. The unknown-name guard below
-    // refuses before any side effect instead of silently building panes.
-    crate::backend::factory::require_herdr_for_spawn(&crate::backend::resolve_backend_name(cfg))?;
-    // No `Client::connect` on the rex arm (auto/superlogical resolve through
-    // `backend::multiplexer_backend`, rex-first with transport-only fallback).
-    if crate::backend::resolve_backend_name(cfg) != "herdr" {
+    // Spawn rides the RESOLVED plane (bd-mknvb): the configured name is not
+    // evidence that rex can answer. On a host without the rex CLI, `auto`
+    // must dispatch on the herdr fallback — it used to take the rex arm, build
+    // a herdr workspace, and then die in `rex run`. An explicit rex pin with
+    // no CLI fails HERE, before any workspace exists.
+    // `REX_SESSION` never decides the plane. The unknown-name guard refuses
+    // before any side effect instead of silently building panes.
+    let plane = crate::backend::resolve_plane(cfg);
+    crate::backend::factory::require_herdr_for_spawn(&plane.configured)?;
+    if plane.plane == crate::backend::Plane::Rex {
         #[cfg(feature = "backend-superlogical")]
-        return cmd_spawn_rex(cfg, project, opts);
+        {
+            if !plane.rex_reachable {
+                bail!(
+                    "spawn: {} — install the rex CLI or select the fallback (FLYWHEEL_BACKEND=herdr)",
+                    plane.reason
+                );
+            }
+            return cmd_spawn_rex(cfg, project, opts);
+        }
         #[cfg(not(feature = "backend-superlogical"))]
         bail!(
             "spawn: the rex pane plane needs the backend-superlogical feature (this is a lean herdr-only build)"

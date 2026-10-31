@@ -72,7 +72,20 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
                     "compiled_feature": compiled.contains(&name),
                 }));
             }
-            print_json(&json!({"backends": rows}));
+            let resolved = crate::backend::resolve_plane(cfg);
+            print_json(&json!({
+                "backends": rows,
+                // bd-mknvb: the plane that will ACTUALLY serve, with the
+                // reason. `active` above is the CONFIGURED name — a door that
+                // asks "who answers?" reads this, never the name.
+                "resolved": {
+                    "configured": resolved.configured,
+                    "plane": resolved.plane.name(),
+                    "rex_reachable": resolved.rex_reachable,
+                    "fallback": resolved.is_fallback(),
+                    "reason": resolved.reason,
+                },
+            }));
         }
         BackendCmd::Status => {
             let mux = crate::backend::resolve_backend_name(cfg);
