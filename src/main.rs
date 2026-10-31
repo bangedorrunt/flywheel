@@ -17585,7 +17585,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     // otherwise keep the herdr client. Read-only either way — status
     // never creates a session.
     let (ws_id, agents, dead): (String, Vec<herdr::AgentInfo>, Vec<(String, String)>) =
-        if crate::pane::rex_door_selected() {
+        if crate::pane::rex_door_selected(cfg) {
             let backend = crate::backend::factory::multiplexer_backend(cfg)?;
             let ws_id = find_workspace_dyn(&*backend, project)?;
             let agents = backend

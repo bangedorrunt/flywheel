@@ -535,7 +535,7 @@ pub fn pre_spawn_crew(
     // Rex door: a set REX_SESSION selects the rex multiplexer arm below —
     // the herdr `Client` path after it stays exactly as it was. No
     // `Client::connect` on the rex arm.
-    if rex_door_selected() {
+    if rex_door_selected(cfg) {
         return pre_spawn_crew_rex(
             cfg,
             project,
@@ -747,10 +747,13 @@ fn shell_gate_refusal(name: &str, pane_id: &str) -> anyhow::Error {
 /// Rex-native spawn door (LinenQuill: `REX_SESSION` selects the multiplexer).
 /// A set, non-empty `REX_SESSION` means this process runs inside rex, so the
 /// doors target rex; empty/missing keeps today's herdr `Client` path.
-pub(crate) fn rex_door_selected() -> bool {
-    std::env::var("REX_SESSION")
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+pub(crate) fn rex_door_selected(cfg: &crate::config::Config) -> bool {
+    // NOT `REX_SESSION`: since bd-rex-default-plane `auto` is rex-primary
+    // whatever the env says, so a door keyed on the env split the planes —
+    // measured 2026-10-31 with the rex CLI restored: `rex list` showed the
+    // spawned session, while `flywheel status` took the herdr client and
+    // reported "no flywheel swarm". One resolved plane (bd-mknvb), one door.
+    crate::backend::factory::resolve_plane(cfg).plane == crate::backend::factory::Plane::Rex
 }
 
 /// `program_status` readiness: `idle` (at prompt) and `working` (program
@@ -5567,17 +5570,30 @@ mod rex_door_tests {
         }
     }
 
-    /// Selection contract (LinenQuill): empty/missing `REX_SESSION` keeps
-    /// herdr; a set value selects rex.
+    /// The pane door follows the RESOLVED plane, never `REX_SESSION`:
+    /// a herdr pin wins even inside a rex terminal, and an explicit
+    /// superlogical pin selects rex. (The old contract let the env split the
+    /// planes: `rex list` saw the session while `flywheel status` read herdr.)
     #[test]
-    fn empty_rex_session_selects_herdr_and_set_selects_rex() {
+    fn the_door_follows_the_resolved_plane_not_rex_session() {
         let _guard = crate::config::lock_env();
-        unsafe { std::env::remove_var("REX_SESSION") };
-        assert!(!rex_door_selected());
-        unsafe { std::env::set_var("REX_SESSION", "") };
-        assert!(!rex_door_selected());
         unsafe { std::env::set_var("REX_SESSION", "sess-1") };
-        assert!(rex_door_selected());
+        let mut cfg = crate::config::Config {
+            backend: Some(crate::config::BackendConfig {
+                multiplexer: "herdr".to_string(),
+                mail: "toron".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !rex_door_selected(&cfg),
+            "a herdr pin wins over REX_SESSION"
+        );
+        cfg.backend = Some(crate::config::BackendConfig {
+            multiplexer: "superlogical".to_string(),
+            mail: "toron".to_string(),
+        });
+        assert!(rex_door_selected(&cfg), "an explicit rex pin selects rex");
         unsafe { std::env::remove_var("REX_SESSION") };
     }
 

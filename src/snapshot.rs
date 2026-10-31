@@ -259,7 +259,7 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
     // creates a session.
     let mut pins = Vec::new();
     let mut launch_pending: u32 = 0;
-    if crate::pane::rex_door_selected() {
+    if crate::pane::rex_door_selected(cfg) {
         let aliases = crate::workspace_label_aliases(
             project,
             crate::state::load_spawn_meta(project).as_deref(),
