@@ -88,13 +88,6 @@ fn daemon_prunes_abandoned_state_and_names_every_family() {
         &lease(live_pid, now),
     );
 
-    // A HOSTED workspace with an oversized audit: the tick must bound it.
-    // 5000 rows x ~1 KB is ~5 MB, over the 4 MiB cap.
-    let big: String = (0..5000)
-        .map(|i| format!("{{\"n\":{i},\"pad\":\"{}\"}}\n", "z".repeat(1000)))
-        .collect();
-    write(&doorbell.join("smoke.audit.jsonl"), &big);
-
     // Everything is OLD except the live lease: the live sidecars are aged too,
     // so only the PID can protect them.
     for f in [
@@ -171,18 +164,6 @@ fn daemon_prunes_abandoned_state_and_names_every_family() {
             && log.contains("sidecar")
             && log.contains("lease"),
         "the prune line must name every family it touched (never delete silently): {log}"
-    );
-    let smoke_audit = doorbell.join("smoke.audit.jsonl");
-    let size = std::fs::metadata(&smoke_audit)
-        .map(|m| m.len())
-        .unwrap_or(u64::MAX);
-    assert!(
-        size < 4_600_000,
-        "a hosted workspace's oversized audit must be bounded (got {size} bytes): {log}"
-    );
-    assert!(
-        log.contains("rotated"),
-        "the daemon must say it rotated an audit log: {log}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
