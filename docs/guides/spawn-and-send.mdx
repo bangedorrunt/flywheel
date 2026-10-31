@@ -5,7 +5,7 @@ description: Pins, profiles, strict model routing, spawn verification, and dispa
 
 ## Names
 
-A **pin** (adjective + noun, `DustySparrow`) is the public mail name. `flywheel mail whois <project> <name>` resolves pin to npub. A spawned crew member gets a unique pin drawn at spawn, registered in `agent-names.json` as `mail_identity`, and injected into the pane; crews never self-register a second name.
+A **pin** (adjective + noun, `DustySparrow`) is the public mail name. `flywheel mail whois <name> <project>` resolves pin to npub. A spawned crew member gets a unique pin drawn at spawn, registered in `agent-names.json` as `mail_identity`, and injected into the pane; crews never self-register a second name.
 
 Composed names pass through unhashed: `crew-<workflow>-<role>` and `flywheel-<base>-<profile>` are legal in `--as`/`--to` as-is. A raw harness pane with no registry entry is addressable by its agent kind (`--to grok`) or its pane id; the send error lists every raw pane as `kind (pane_id)`. Never `--to coder1`: the seq-1 grammar is invalid, the first agent of a profile has no suffix. Unregistered free strings fail loud; there is no silent hash rewrite.
 
