@@ -3386,9 +3386,15 @@ mod status_verdict_tests {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!is_intentionally_stopped(&dir), "absent marker means not stopped");
+        assert!(
+            !is_intentionally_stopped(&dir),
+            "absent marker means not stopped"
+        );
         mark_stopped_by_operator(&dir);
-        assert!(is_intentionally_stopped(&dir), "stop must record the intent");
+        assert!(
+            is_intentionally_stopped(&dir),
+            "stop must record the intent"
+        );
         clear_stop_intent(&dir);
         assert!(!is_intentionally_stopped(&dir), "start must clear it");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3408,13 +3414,22 @@ mod status_verdict_tests {
         );
         #[cfg(target_os = "macos")]
         {
-            assert!(body.contains("<key>StartInterval</key>"), "launchd needs StartInterval");
-            assert!(body.contains("<integer>60</integer>"), "the interval is 60s");
+            assert!(
+                body.contains("<key>StartInterval</key>"),
+                "launchd needs StartInterval"
+            );
+            assert!(
+                body.contains("<integer>60</integer>"),
+                "the interval is 60s"
+            );
             assert!(body.contains("SuccessfulExit"), "KeepAlive half stays");
         }
         #[cfg(not(target_os = "macos"))]
         {
-            assert!(body.contains("Restart=always"), "systemd must restart on a clean exit");
+            assert!(
+                body.contains("Restart=always"),
+                "systemd must restart on a clean exit"
+            );
         }
     }
 }

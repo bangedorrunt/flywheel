@@ -1382,7 +1382,6 @@ pub fn dead_audit_files(
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let horizon = std::time::Duration::from_secs(horizon_days.saturating_mul(86_400));
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -1398,23 +1397,41 @@ pub fn dead_audit_files(
         let Ok(md) = entry.metadata() else {
             continue;
         };
-        let idle = md
+        let Some(mtime) = md
             .modified()
             .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|age| age > horizon);
-        let reason = match read_project_sidecar(state_dir, workspace) {
-            Some(project) if Path::new(&project).is_absolute() && !Path::new(&project).exists() => {
-                "project-gone"
-            }
-            _ if idle => "idle",
-            _ => continue,
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+        else {
+            continue;
+        };
+        let now_secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // gc/one-rule (bd-io2ws): the verdict is the SAME pure decision the
+        // daemon's hourly prune uses. This door keeps its own horizon (an
+        // operator may ask for 30 days) and its own listing.
+        let project_gone = read_project_sidecar(state_dir, workspace)
+            .is_some_and(|p| Path::new(&p).is_absolute() && !Path::new(&p).exists());
+        let Some(abandon) = doorbell_rt::store::audit_abandon_reason(
+            workspace,
+            mtime,
+            project_gone,
+            &std::collections::BTreeSet::new(),
+            horizon_days.saturating_mul(86_400),
+            now_secs,
+        ) else {
+            continue;
         };
         out.push(DeadAuditFile {
             workspace: workspace.to_string(),
             path,
             bytes: md.len(),
-            reason,
+            reason: match abandon {
+                doorbell_rt::store::AuditAbandon::ProjectGone => "project-gone",
+                doorbell_rt::store::AuditAbandon::Idle => "idle",
+            },
         });
     }
     out.sort_by(|a, b| a.workspace.cmp(&b.workspace));
@@ -4294,6 +4311,74 @@ mod audit_gc_tests {
         let found = dead_audit_files(dir.path(), 30, SystemTime::now(), |_| false);
         assert_eq!(found.len(), 1);
         assert!(found[0].path.ends_with("ws.audit.jsonl"));
+    }
+
+    /// gc/one-rule (bd-io2ws): the on-demand door and the daemon's hourly
+    /// prune must reach the SAME verdict, because they share one pure
+    /// predicate (`doorbell_rt::store::audit_abandon_reason`). Three shapes:
+    /// vanished project (dead at any age), idle past the horizon, young.
+    #[test]
+    fn doorbell_gc_and_daemon_prune_share_one_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        // 1. Vanished absolute project path, FRESH file.
+        write_audit(dir.path(), "project-gone");
+        std::fs::write(
+            project_sidecar(dir.path(), "project-gone"),
+            "/tmp/gone-forever-io2ws",
+        )
+        .unwrap();
+        // 2. Bare project name, idle 40 days.
+        write_audit(dir.path(), "idle");
+        std::fs::write(project_sidecar(dir.path(), "idle"), "idle").unwrap();
+        let old = now - Duration::from_secs(40 * 86_400);
+        std::fs::File::open(audit_file(dir.path(), "idle"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // 3. Young, no sidecar.
+        write_audit(dir.path(), "young");
+
+        let found = dead_audit_files(dir.path(), 30, now, |_| false);
+        let gc: std::collections::BTreeMap<&str, &str> = found
+            .iter()
+            .map(|f| (f.workspace.as_str(), f.reason))
+            .collect();
+        assert_eq!(gc.get("project-gone"), Some(&"project-gone"));
+        assert_eq!(gc.get("idle"), Some(&"idle"));
+        assert!(!gc.contains_key("young"), "a young log is not a candidate");
+
+        let live = std::collections::BTreeSet::new();
+        let mtime = |ws: &str| {
+            std::fs::metadata(audit_file(dir.path(), ws))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let daemon = |ws: &str, project_gone: bool| {
+            doorbell_rt::store::audit_abandon_reason(
+                ws,
+                mtime(ws),
+                project_gone,
+                &live,
+                30 * 86_400,
+                now_secs,
+            )
+        };
+        assert_eq!(
+            daemon("project-gone", true),
+            Some(doorbell_rt::store::AuditAbandon::ProjectGone)
+        );
+        assert_eq!(
+            daemon("idle", false),
+            Some(doorbell_rt::store::AuditAbandon::Idle)
+        );
+        assert_eq!(daemon("young", false), None);
     }
 }
 
