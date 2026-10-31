@@ -434,6 +434,76 @@ impl FileStore {
         report
     }
 
+    /// gc/audit-rotate: bound ONE workspace's audit log.
+    ///
+    /// The audit is append-only and had NO rotation: the comments in this file
+    /// still name an `AUDIT_MAX_BYTES` that was never implemented, and the only
+    /// bound was deleting the whole file once its workspace went unhosted for a
+    /// week. Measured here: 17 MB in one dead workspace and 5.8 MB in two LIVE
+    /// ones, still growing. Keep the newest `keep_lines` rows when the file is
+    /// over `max_bytes`; write a temp and rename so a crash leaves either the
+    /// old file or the new one, never a half-written audit.
+    ///
+    /// Returns `None` when the file is absent or under the cap (the common
+    /// case: one `metadata` call), `Some((kept, freed))` when it rotated.
+    pub fn bound_audit_log(
+        &self,
+        workspace: &str,
+        max_bytes: u64,
+        keep_lines: usize,
+    ) -> std::io::Result<Option<(usize, u64)>> {
+        let path = self.audit_file(workspace);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return Ok(None);
+        };
+        if meta.len() <= max_bytes {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        let lines: Vec<&str> = raw.lines().collect();
+        // Keep the largest NEWEST suffix that fits BOTH budgets: at most
+        // `keep_lines` rows and at most `max_bytes` bytes. Keeping rows alone is
+        // not a bound: 4000 rows of 4 KB is 16 MB, the measured shape.
+        let mut kept: Vec<&str> = Vec::new();
+        let mut bytes = 0u64;
+        for line in lines.iter().rev() {
+            let add = line.len() as u64 + 1;
+            if kept.len() >= keep_lines || bytes + add > max_bytes {
+                break;
+            }
+            kept.push(line);
+            bytes += add;
+        }
+        // The audit must never vanish: if one newest row is already over the
+        // byte budget, keep that row.
+        if kept.is_empty()
+            && let Some(newest) = lines.last()
+        {
+            kept.push(newest);
+            bytes = newest.len() as u64 + 1;
+        }
+        kept.reverse();
+        let mut body = String::new();
+        for line in &kept {
+            body.push_str(line);
+            body.push('\n');
+        }
+        let tmp = path.with_file_name(format!(
+            "{}.tmp.{}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("audit"),
+            std::process::id()
+        ));
+        if let Err(e) = private_write(&tmp, body.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(Some((kept.len(), meta.len() - bytes)))
+    }
+
     pub fn wake_file(&self, workspace: &str) -> PathBuf {
         self.state_dir
             .join(format!("doorbell-wake-{workspace}.json"))
@@ -2526,6 +2596,81 @@ mod prune_tests {
         assert_eq!(report.sidecars_removed, 3, "pid+gen+project: {report:?}");
         assert_eq!(report.leases_removed, 1, "only the stale lease: {report:?}");
         assert_eq!(report.audits_removed, 0, "no audit files in this fixture");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gc/audit-rotate: a busy workspace's audit is bounded to the newest rows
+    /// and stays owner-only; a file under the cap is never rewritten.
+    #[test]
+    fn audit_logs_are_bounded_to_the_newest_rows() {
+        let dir = std::env::temp_dir().join(format!("audit-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("dirs");
+        let store = FileStore::new(&dir);
+        let path = store.audit_file("busy");
+        let body: String = (0..100)
+            .map(|i| {
+                format!(
+                    "{{\"kind\":\"row\",\"n\":{i},\"pad\":\"{}\"}}\n",
+                    "x".repeat(40)
+                )
+            })
+            .collect();
+        std::fs::write(&path, &body).expect("write");
+        let before = std::fs::metadata(&path).expect("meta").len();
+
+        let Some((kept, freed)) = store
+            .bound_audit_log("busy", before / 2, 10)
+            .expect("rotate")
+        else {
+            panic!("a file over the cap must rotate");
+        };
+        assert_eq!(kept, 10, "keeps exactly the newest rows");
+        assert!(freed > 0, "freed bytes are reported");
+        let after = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = after.lines().collect();
+        assert_eq!(lines.len(), 10, "bounded");
+        assert!(
+            lines[9].contains("\"n\":99"),
+            "newest row survives: {}",
+            lines[9]
+        );
+        assert!(
+            lines[0].contains("\"n\":90"),
+            "oldest kept is the 90th: {}",
+            lines[0]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the rewrite stays owner-only");
+        }
+        assert!(
+            store
+                .bound_audit_log("busy", u64::MAX, 10)
+                .expect("under cap")
+                .is_none(),
+            "a file under the cap is never rewritten"
+        );
+
+        // The BYTE budget binds too, or "4000 rows" would still allow a 16 MB
+        // file: 8 rows of ~1 KB with a 2500-byte cap keeps 2 rows.
+        let wide_path = store.audit_file("wide");
+        let wide: String = (0..8)
+            .map(|i| format!("{{\"n\":{i},\"pad\":\"{}\"}}\n", "y".repeat(1000)))
+            .collect();
+        std::fs::write(&wide_path, wide).expect("write wide");
+        let Some((kept_wide, _)) = store.bound_audit_log("wide", 2500, 4000).expect("wide") else {
+            panic!("a wide file over the byte cap must rotate");
+        };
+        assert_eq!(kept_wide, 2, "the byte budget binds before keep_lines");
+        let wide_after = std::fs::read_to_string(&wide_path).expect("read wide");
+        assert_eq!(wide_after.lines().count(), 2, "bounded by bytes");
+        assert!(
+            wide_after.contains("\"n\":7"),
+            "the newest wide row survives: {wide_after}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

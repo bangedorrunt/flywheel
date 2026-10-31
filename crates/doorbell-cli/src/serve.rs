@@ -311,6 +311,11 @@ const WATCH_WINDOW_SECS: u64 = 300;
 /// reversible, and the failure mode of being too eager is a live crew losing its
 /// wake record, while being too late only costs a file.
 const UNHOSTED_JOURNAL_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// gc/audit-rotate: a per-workspace audit past this size keeps only the newest
+/// `AUDIT_KEEP_LINES` rows. The store comments have named both since before the
+/// rotation existed; these constants make the names true.
+const AUDIT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const AUDIT_KEEP_LINES: usize = 4000;
 const WATCH_RESTARTS_ALLOWED_PER_WS: usize = 6;
 
 /// gc/live: the set the hourly prune may NOT touch — every workspace this
@@ -988,6 +993,33 @@ pub async fn run(cfg: &Config) -> Result<()> {
                     report.bytes_freed,
                     report.skipped_young
                 );
+            }
+            // gc/audit-rotate: bound every remaining audit log. The prune above
+            // removed the abandoned ones; these are the live/hosted ones, which
+            // had NO cap at all — measured 5.8 MB each, still growing, because
+            // the store's `AUDIT_MAX_BYTES` was a comment and never a bound.
+            if let Ok(entries) = std::fs::read_dir(prune_state.join("doorbell")) {
+                let mut rotated = 0usize;
+                let mut freed = 0u64;
+                for entry in entries.filter_map(std::result::Result::ok) {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let Some(ws) = name.strip_suffix(".audit.jsonl") else {
+                        continue;
+                    };
+                    match store.bound_audit_log(ws, AUDIT_MAX_BYTES, AUDIT_KEEP_LINES) {
+                        Ok(Some((_, bytes))) => {
+                            rotated += 1;
+                            freed += bytes;
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("doorbell: audit rotate failed for {ws}: {e}"),
+                    }
+                }
+                if rotated > 0 {
+                    eprintln!(
+                        "doorbell: rotated {rotated} audit log(s) over {AUDIT_MAX_BYTES} byte(s) down to {AUDIT_KEEP_LINES} rows, freed {freed} byte(s)"
+                    );
+                }
             }
         }
     });
