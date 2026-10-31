@@ -119,13 +119,19 @@ DOORBELL_TORON_BIN=true DOORBELL_HERDR_BIN=true \
   --flywheel-state-dir "$SMOKE_D/fw" --host smokeproj/smokews >"$SMOKE_D/serve.log" 2>&1 &
 SMOKE_WATCHER=$!
 smoke_cleanup() {
-  # bd-2o1v: killing the watcher orphans serve (reparented, keeps the
-  # port AND the lease and poisons the next run). Always kill the port
-  # holder too — 18999 is this smoke's own port.
-  kill -9 "$SMOKE_WATCHER" 2>/dev/null
+  # bd-2o1v + bd-yhi8r: NEVER kill -9 the watcher first — killing timeout
+  # orphans serve (reparented, keeps the port AND the lease and poisons
+  # the next run, and the lease FILE then fails later checks against a
+  # daemon that is already dead). Graceful first: TERM the port holder
+  # (the daemon itself), give it a beat to drain and release, and only
+  # then KILL stragglers. The watcher is reaped last via `wait`.
   local holder
   holder=$(lsof -tiTCP:18999 2>/dev/null)
+  [ -n "$holder" ] && kill -TERM $holder 2>/dev/null
+  sleep 2
+  holder=$(lsof -tiTCP:18999 2>/dev/null)
   [ -n "$holder" ] && kill -9 $holder 2>/dev/null
+  kill -9 "$SMOKE_WATCHER" 2>/dev/null
 }
 smoke_ok=0
 for _ in $(seq 1 30); do
@@ -134,15 +140,25 @@ for _ in $(seq 1 30); do
 done
 [ "$smoke_ok" -eq 1 ] || { smoke_cleanup; fail "serve smoke never reached hosted mode"; }
 sleep 3
-grep -q '"stage":"sweep"' "$SMOKE_D/fw/journals/doorbell-journal-smokews.jsonl" 2>/dev/null \
-  || { smoke_cleanup; fail "hosted loop journaled no sweeps"; }
-pass "serve smoke hosted + sweeping"
+if grep -q '"stage":"sweep"' "$SMOKE_D/fw/journals/doorbell-journal-smokews.jsonl" 2>/dev/null; then
+  pass "serve smoke hosted + sweeping"
+else
+  smoke_cleanup
+  fail "hosted loop journaled no sweeps"
+fi
 # TERM fires at 12s; graceful exit releases the per-ws lease. A KILL
 # fallback (137) leaves the lease held and fails the next check loudly.
+# bd-yhi8r: ONE verdict for the shutdown — the wait code and the lease
+# file must agree, so a half-clean stop cannot print PASS.
 wait "$SMOKE_WATCHER"
-[ "$?" -eq 0 ] || fail "serve did not exit clean on SIGTERM"
-[ -e "$SMOKE_D/fw/doorbell/owner-smokews.json" ] && fail "graceful stop left the lease held"
-pass "serve SIGTERM graceful (leases released)"
+smoke_status=$?
+if [ -e "$SMOKE_D/fw/doorbell/owner-smokews.json" ]; then lease_held=1; else lease_held=0; fi
+if [ "$smoke_status" -eq 0 ] && [ "$lease_held" -eq 0 ]; then
+  pass "serve SIGTERM graceful (leases released)"
+else
+  [ "$smoke_status" -eq 0 ] || fail "serve did not exit clean on SIGTERM (exit $smoke_status)"
+  [ "$lease_held" -eq 0 ] || fail "graceful stop left the lease held"
+fi
 rm -rf "$SMOKE_D"
 smoke_cleanup
 echo "== ADR-0012 Phase 4 clock-jump (bd-d60u) =="

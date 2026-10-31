@@ -1477,6 +1477,60 @@ impl FileHost {
                 self.npubs.insert(pin.clone(), npub);
             }
         }
+        // bd-yhi8r: a sweep that changed routing state is a decision worth
+        // one journal row — the brain journals when tick effects decide, and
+        // the pending-audit channel is how a state transition becomes one.
+        // Steady idle stays silent (rv23 #3); boot adoption, vanish, and
+        // reap transitions journal exactly once, which is what the daemon
+        // smoke folds to prove the hosted loop sweeps.
+        if self.pending_audit.is_none()
+            && (pins != self.index_pins_raw || unroutable != self.unroutable_pins)
+        {
+            self.pending_audit = Some((
+                "index_routing_changed".into(),
+                serde_json::json!({
+                    "workspace": self.cfg.workspace,
+                    "pins": pins.len(),
+                    "unroutable": unroutable.len(),
+                }),
+            ));
+        }
+        // bd-yhi8r: a sweep that changed routing state is a decision worth
+        // one journal row — the brain journals when tick effects decide, and
+        // the pending-audit channel is how a state transition becomes one.
+        // Steady idle stays silent (rv23 #3); boot adoption, vanish, and
+        // reap transitions journal exactly once, which is what the daemon
+        // smoke folds to prove the hosted loop sweeps.
+        if self.pending_audit.is_none()
+            && (pins != self.index_pins_raw || unroutable != self.unroutable_pins)
+        {
+            self.pending_audit = Some((
+                "index_routing_changed".into(),
+                serde_json::json!({
+                    "workspace": self.cfg.workspace,
+                    "pins": pins.len(),
+                    "unroutable": unroutable.len(),
+                }),
+            ));
+        }
+        // bd-yhi8r: a sweep that changed routing state is a decision worth
+        // one journal row — the brain journals when tick effects decide, and
+        // the pending-audit channel is how a state transition becomes one.
+        // Steady idle stays silent (rv23 #3); boot adoption, vanish, and
+        // reap transitions journal exactly once, which is what the daemon
+        // smoke folds to prove the hosted loop sweeps.
+        if self.pending_audit.is_none()
+            && (pins != self.index_pins_raw || unroutable != self.unroutable_pins)
+        {
+            self.pending_audit = Some((
+                "index_routing_changed".into(),
+                serde_json::json!({
+                    "workspace": self.cfg.workspace,
+                    "pins": pins.len(),
+                    "unroutable": unroutable.len(),
+                }),
+            ));
+        }
         self.npubs.retain(|p, _| pins.contains(p));
         self.reducer.model.index = doorbell_core::SelfIndex::default();
         for pin in &pins {
@@ -3386,6 +3440,16 @@ mod tests {
     fn role_bound_is_classification_neutral() {
         let (mut host, _dir) = host_with_registry("t5", entries());
         host.refresh_index();
+        // bd-yhi8r: production drains a refresh's routing-change audit on
+        // the sweep tick that follows maintenance, so flush through Sweep
+        // here — RoleBound itself must still add nothing.
+        let drained = host.tick(&BrainMsg::Sweep { now: 1 });
+        assert!(
+            drained.iter().any(
+                |e| matches!(e, Effect::Audit { kind, .. } if kind == "index_routing_changed")
+            ),
+            "refresh adoption must surface once: {drained:?}"
+        );
         let fx = host.tick(&BrainMsg::RoleBound {
             role: "coder".into(),
             pin: "PinA".into(),
