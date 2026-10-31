@@ -313,6 +313,20 @@ const WATCH_WINDOW_SECS: u64 = 300;
 const UNHOSTED_JOURNAL_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const WATCH_RESTARTS_ALLOWED_PER_WS: usize = 6;
 
+/// gc/live: the set the hourly prune may NOT touch — every workspace this
+/// daemon hosts plus every workspace holding a live lease. A lease is the
+/// honest liveness source for a workspace this daemon does not host (the
+/// comms-on local loop is its writer), and "not hosted by me" alone was too
+/// narrow: it could delete an idle-but-live crew's only wake history.
+fn prune_live_set(
+    hosted: &std::collections::BTreeSet<String>,
+    leases: impl IntoIterator<Item = String>,
+) -> std::collections::BTreeSet<String> {
+    let mut live = hosted.clone();
+    live.extend(leases);
+    live
+}
+
 fn workspace_audit_path(fw_state: &std::path::Path, ws: &str) -> std::path::PathBuf {
     fw_state.join("doorbell").join(format!("{ws}.audit.jsonl"))
 }
@@ -926,7 +940,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
     // bd-lorot: the workspaces this daemon actually hosts, captured BEFORE the
     // tick moves `cfg`. The prune may only touch workspaces outside this set.
-    let prune_live: std::collections::BTreeSet<String> =
+    let prune_hosted: std::collections::BTreeSet<String> =
         cfg.hosts.iter().map(|(_, ws)| ws.clone()).collect();
     let prune_state = cfg.flywheel_state.clone();
     let rotate_tick = tokio::spawn(async move {
@@ -945,15 +959,26 @@ pub async fn run(cfg: &Config) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let report = store.prune_unhosted_workspace_logs(
-                &prune_live,
-                UNHOSTED_JOURNAL_MAX_AGE_SECS,
-                now,
+            // gc/live: a workspace with a LIVE LEASE is alive even when this
+            // daemon does not host it (the comms-on local loop is its writer),
+            // so "hosted by me" alone is too narrow: it could delete an
+            // idle-but-live crew's only wake history. Hosted rows stay in
+            // unconditionally; leases widen the protected set.
+            let live = prune_live_set(
+                &prune_hosted,
+                doorbell_rt::lease::live_leases(&prune_state, now)
+                    .into_iter()
+                    .map(|(ws, _)| ws),
             );
-            if report.journals_removed > 0 {
+            let report =
+                store.prune_unhosted_workspace_logs(&live, UNHOSTED_JOURNAL_MAX_AGE_SECS, now);
+            if report.journals_removed > 0 || report.audits_removed > 0 {
                 eprintln!(
-                    "doorbell: pruned {} journal file(s) for unhosted workspaces, freed {} byte(s) ({} left: too young)",
-                    report.journals_removed, report.bytes_freed, report.skipped_young
+                    "doorbell: pruned {} journal + {} audit file(s) for unhosted workspaces, freed {} byte(s) ({} left: too young)",
+                    report.journals_removed,
+                    report.audits_removed,
+                    report.bytes_freed,
+                    report.skipped_young
                 );
             }
         }
@@ -4340,5 +4365,27 @@ mod tests {
                 "a health snapshot older than a sweep era lies"
             );
         }
+    }
+
+    /// gc/live: the prune's protected set is hosted rows PLUS live leases.
+    /// The narrowing this replaces ("only what THIS daemon hosts") could
+    /// delete an idle-but-live crew's only wake history — a workspace the
+    /// daemon does not host still has a writer when comms is on.
+    #[test]
+    fn prune_live_set_keeps_hosted_rows_and_live_leases() {
+        let hosted = std::collections::BTreeSet::from(["hosted-a".to_string()]);
+        let live = super::prune_live_set(&hosted, ["leased-b".to_string(), "hosted-a".to_string()]);
+        assert!(
+            live.contains("hosted-a"),
+            "hosted rows are never prune candidates"
+        );
+        assert!(
+            live.contains("leased-b"),
+            "a live lease protects its workspace even when this daemon does not host it"
+        );
+        assert!(
+            !live.contains("gone-c"),
+            "an unhosted, unleleased workspace stays a candidate"
+        );
     }
 }

@@ -158,6 +158,9 @@ pub struct PruneReport {
     pub skipped_young: usize,
     /// Liveness stamp files removed (`watch-<ws>.hb` / `.event`).
     pub stamps_removed: usize,
+    /// Audit logs removed (`<ws>.audit.jsonl`). The `.audit.loudmiss`
+    /// tombstone is never pruned (it dedups tears across audit pruning).
+    pub audits_removed: usize,
     /// Files this process could not remove (permissions, a race with a writer).
     pub remove_failed: usize,
 }
@@ -301,41 +304,62 @@ impl FileStore {
         // workspace nobody hosts is a liveness artifact vouching for nothing,
         // and a reader who trusts a file over the hosted set is worse off than
         // one with no file. Measured 10 stale, the oldest 14.4 days.
-        for (prefix, suffix) in [("watch-", ".hb"), ("watch-", ".event")] {
-            let Ok(entries) = std::fs::read_dir(self.state_dir.join("doorbell")) else {
+        //
+        // gc/audit: the AUDIT logs get the same two guards. Nothing ever
+        // removed them — the journal prune predates them and the audit rotate
+        // only bounds ONE workspace's file. Measured on this host: 74 MB in
+        // this dir, 17 MB of it one long-dead workspace's audit log. The
+        // `.audit.loudmiss` tombstone is deliberately NOT pruned (its comment
+        // above: a bounded store cannot hold dedup state for itself), so the
+        // suffix table names the one big file only.
+        //
+        // One read_dir for both families (it used to scan twice, once per
+        // stamp suffix).
+        let Ok(entries) = std::fs::read_dir(self.state_dir.join("doorbell")) else {
+            return report;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let parsed = if let Some(ws) = name
+                .strip_prefix("watch-")
+                .and_then(|n| n.strip_suffix(".hb"))
+                .or_else(|| {
+                    name.strip_prefix("watch-")
+                        .and_then(|n| n.strip_suffix(".event"))
+                }) {
+                Some((ws, true))
+            } else {
+                name.strip_suffix(".audit.jsonl").map(|ws| (ws, false))
+            };
+            let Some((ws, is_stamp)) = parsed else {
                 continue;
             };
-            for entry in entries.filter_map(std::result::Result::ok) {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(ws) = name
-                    .strip_prefix(prefix)
-                    .and_then(|n| n.strip_suffix(suffix))
-                else {
-                    continue;
-                };
-                if ws.is_empty() || live.contains(ws) {
-                    continue;
-                }
-                let Ok(md) = entry.metadata() else { continue };
-                let Some(mtime) = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                else {
-                    continue;
-                };
-                if !age_ok(mtime) {
-                    report.skipped_young += 1;
-                    continue;
-                }
-                match std::fs::remove_file(entry.path()) {
-                    Ok(()) => {
+            if ws.is_empty() || live.contains(ws) {
+                continue;
+            }
+            let Ok(md) = entry.metadata() else { continue };
+            let Some(mtime) = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+            else {
+                continue;
+            };
+            if !age_ok(mtime) {
+                report.skipped_young += 1;
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {
+                    if is_stamp {
                         report.stamps_removed += 1;
-                        report.bytes_freed += md.len();
+                    } else {
+                        report.audits_removed += 1;
                     }
-                    Err(_) => report.remove_failed += 1,
+                    report.bytes_freed += md.len();
                 }
+                Err(_) => report.remove_failed += 1,
             }
         }
         report
@@ -2289,6 +2313,73 @@ mod prune_tests {
             "the young one is reported, not silently kept"
         );
         assert_eq!(report.remove_failed, 0);
+        assert!(report.bytes_freed > 0, "freed bytes are reported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gc/audit: an unhosted workspace's audit log is the biggest file in the
+    /// flywheel state dir and nothing ever removed it (74 MB measured in
+    /// `doorbell/`, 17 MB of it one long-dead workspace). Same two guards as
+    /// the journals — unhosted AND old. The `.audit.loudmiss` tombstone stays
+    /// on purpose: its own comment says a bounded store cannot hold dedup
+    /// state for itself, so pruning it would re-report a tear.
+    #[test]
+    fn prune_takes_unhosted_audit_logs_and_keeps_the_loudmiss_tombstone() {
+        let dir = std::env::temp_dir().join(format!("prune-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("doorbell")).expect("dirs");
+        let store = FileStore::new(&dir);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        const OLD: u64 = 30 * 24 * 60 * 60;
+
+        for ws in ["gone-audit", "live-audit", "young-audit"] {
+            std::fs::write(store.audit_file(ws), "line\n").expect("write");
+        }
+        let loudmiss = store
+            .audit_file("gone-audit")
+            .with_file_name("gone-audit.audit.loudmiss");
+        std::fs::write(&loudmiss, "fingerprint\n").expect("write loudmiss");
+
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - OLD);
+        for ws in ["gone-audit", "live-audit"] {
+            std::fs::File::open(store.audit_file(ws))
+                .and_then(|f| f.set_modified(old))
+                .expect("age audit");
+        }
+        std::fs::File::open(&loudmiss)
+            .and_then(|f| f.set_modified(old))
+            .expect("age loudmiss");
+
+        let live: BTreeSet<String> = BTreeSet::from(["live-audit".to_string()]);
+        let report = store.prune_unhosted_workspace_logs(&live, 7 * 24 * 60 * 60, now);
+
+        assert_eq!(
+            report.audits_removed, 1,
+            "only the unhosted old audit log: {report:?}"
+        );
+        assert!(
+            !store.audit_file("gone-audit").exists(),
+            "a dead workspace's audit log is the file this policy exists to reclaim"
+        );
+        assert!(
+            store.audit_file("live-audit").exists(),
+            "a HOSTED workspace's audit log is evidence, never a candidate"
+        );
+        assert!(
+            store.audit_file("young-audit").exists(),
+            "a young audit log belongs to a workspace that may still be live"
+        );
+        assert!(
+            loudmiss.exists(),
+            "the loudmiss tombstone is never pruned (it dedups tears across audit pruning)"
+        );
+        assert_eq!(
+            report.skipped_young, 1,
+            "the young one is reported, not silently kept"
+        );
         assert!(report.bytes_freed > 0, "freed bytes are reported");
         let _ = std::fs::remove_dir_all(&dir);
     }
