@@ -1634,17 +1634,29 @@ fn refresh_health_snapshot(app: &AppState) {
     };
 }
 
-/// Serve /health from the snapshot (bd-o86s): a fresh cache returns
-/// instantly (no shells, no greps); a stale/cold cache recomputes inline
-/// once so the response is never older than TTL plus one compute.
+/// Serve /health from the snapshot (bd-o86s) and NEVER block on a shell.
+///
+/// The old shape recomputed inline whenever the cache was older than the TTL.
+/// `health_body` runs `herdr`/`toron` as subprocesses, so one loaded host made
+/// `/health` take longer than any client budget while the daemon was perfectly
+/// healthy — measured live 2026-10-31 during a Rust LTO build: `doorbell
+/// status` said "daemon DOWN — nothing is served" and preflight FAILED on a
+/// daemon that was up. A health read is a read: serve the last snapshot (at
+/// most one TTL stale, refreshed by the tick) and never launch a subprocess
+/// from the request path. A truly cold start gets a typed "starting" body.
 fn cached_health_body(app: &AppState) -> String {
-    let fresh = app.health.lock().computed_at.elapsed().as_secs() < HEALTH_CACHE_TTL_SECS;
     let body = app.health.lock().body.clone();
-    if fresh && !body.is_empty() {
+    if !body.is_empty() {
         return body;
     }
-    refresh_health_snapshot(app);
-    app.health.lock().body.clone()
+    serde_json::json!({
+        "protocol": "doorbell.v1",
+        "mode": "starting",
+        "hosted": [],
+        "degraded": ["health_starting"],
+        "standby_hint": "the first health snapshot is still computing; reads never wait on shells",
+    })
+    .to_string()
 }
 
 const REQUEST_LIMIT: usize = 4096;
@@ -4420,12 +4432,43 @@ mod tests {
             })),
         };
         assert_eq!(cached_health_body(&app), "CANNED");
+        // A STALE snapshot must still be served as-is: recomputing inline runs
+        // herdr/toron subprocesses, and one loaded host made /health exceed any
+        // client budget while the daemon was healthy (measured live 2026-10-31).
+        app.health.lock().computed_at = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3_600))
+            .unwrap_or_else(Instant::now);
+        assert_eq!(
+            cached_health_body(&app),
+            "CANNED",
+            "a stale snapshot is served; the tick owns recompute"
+        );
         const {
             assert!(
                 HEALTH_CACHE_TTL_SECS <= 30,
                 "a health snapshot older than a sweep era lies"
             );
         }
+    }
+
+    /// durable: a COLD cache answers with a typed starting body, never a shell.
+    #[test]
+    fn cold_health_cache_answers_starting_without_shells() {
+        use super::{AppState, CachedHealth, cached_health_body};
+        use std::time::Instant;
+        let app = AppState {
+            started: Instant::now(),
+            fw_state: std::env::temp_dir().join("db-health-cold"),
+            hosted: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            health: std::sync::Arc::new(parking_lot::Mutex::new(CachedHealth {
+                body: String::new(),
+                computed_at: Instant::now(),
+            })),
+        };
+        let body = cached_health_body(&app);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["mode"], "starting");
+        assert_eq!(v["protocol"], "doorbell.v1");
     }
 
     /// durable: the deadman fires only after a SILENT runtime — the startup
