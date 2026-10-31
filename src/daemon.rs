@@ -34,6 +34,10 @@ pub fn default_state_dir() -> PathBuf {
 /// The LaunchAgent label / systemd unit name.
 pub const DAEMON_LABEL: &str = "dev.flywheel.daemon";
 
+/// The one serve port: `flywheel serve` and every `flywheel daemon` verb
+/// default to it, and the generated launchd/systemd unit runs it (bd-zdal).
+pub const SERVE_PORT_DEFAULT: u16 = 8787;
+
 pub fn read_pidfile(path: &Path) -> Option<u32> {
     let s = std::fs::read_to_string(path).ok()?;
     s.trim().parse::<u32>().ok()
@@ -801,13 +805,13 @@ mod tests {
         let xml = plist_xml(
             "dev.flywheel.daemon",
             Path::new("/usr/local/bin/flywheel"),
-            8787,
+            SERVE_PORT_DEFAULT,
             Path::new("/tmp/out.log"),
             Path::new("/tmp/err.log"),
         );
         assert!(xml.contains("/usr/local/bin/flywheel"));
         assert!(xml.contains("<string>serve</string>"));
-        assert!(xml.contains("<string>8787</string>"));
+        assert!(xml.contains(&format!("<string>{SERVE_PORT_DEFAULT}</string>")));
         assert!(xml.contains("SuccessfulExit"));
         assert!(xml.contains("RunAtLoad"));
     }

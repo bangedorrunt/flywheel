@@ -1696,7 +1696,7 @@ enum Commands {
     },
     /// Local REST + SSE server (feature: serve)
     Serve {
-        #[arg(long, default_value = "7337")]
+        #[arg(long, default_value_t = crate::daemon::SERVE_PORT_DEFAULT)]
         port: u16,
     },
     /// In-process toron mailbox/MCP integration (ADR-0003 Decision 3A, bd-o8j.1)
@@ -6426,6 +6426,48 @@ mod workspace_origin_tests {
             settle < typed,
             "cmd_add must settle BEFORE typing the identity prime (bd-eign.6 L2)"
         );
+    }
+}
+
+#[cfg(test)]
+mod serve_port_tests {
+    use crate::daemon::SERVE_PORT_DEFAULT;
+
+    /// bd-zdal: `flywheel serve` and `flywheel daemon <verb>` are two doors to
+    /// ONE service — both must default to the same port, else `daemon status`
+    /// probes a port a bare `serve` never binds and its `--force` remediation
+    /// cannot see the stray holder.
+    #[test]
+    fn serve_port_default_is_one_constant() {
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let cli = crate::Cli::try_parse_from(["flywheel", "serve"]).expect("serve parses");
+                match cli.command {
+                    Some(crate::Commands::Serve { port }) => {
+                        assert_eq!(port, SERVE_PORT_DEFAULT, "serve default")
+                    }
+                    _ => panic!("expected serve"),
+                }
+                #[cfg(feature = "serve")]
+                for verb in ["start", "stop", "restart", "status"] {
+                    let cli = crate::Cli::try_parse_from(["flywheel", "daemon", verb])
+                        .expect("daemon verb parses");
+                    let port = match cli.command {
+                        Some(crate::Commands::Daemon { cmd }) => match cmd {
+                            crate::cmd::daemon::DaemonCmd::Start { port }
+                            | crate::cmd::daemon::DaemonCmd::Stop { port, .. }
+                            | crate::cmd::daemon::DaemonCmd::Restart { port, .. }
+                            | crate::cmd::daemon::DaemonCmd::Status { port } => port,
+                        },
+                        _ => panic!("expected daemon"),
+                    };
+                    assert_eq!(port, SERVE_PORT_DEFAULT, "daemon {verb} default");
+                }
+            })
+            .expect("spawn the parse thread");
+        handle.join().expect("serve port defaults must agree");
     }
 }
 
@@ -34738,8 +34780,9 @@ fn cmd_tutorial() -> Result<()> {
          \x20 - flywheel mail unlock <project>          release your locks\n\n\
          Automation:\n\
          \x20 - flywheel --robot-snapshot     full JSON state\n\
-         \x20 - flywheel serve                REST + SSE (port 7337)\n",
-        config::config_dir().join("workflows.toml").display()
+         \x20 - flywheel serve                REST + SSE (port {})\n",
+        config::config_dir().join("workflows.toml").display(),
+        crate::daemon::SERVE_PORT_DEFAULT
     );
     Ok(())
 }
