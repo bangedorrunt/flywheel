@@ -199,11 +199,11 @@ pub fn read_lanes(project_dir: &std::path::Path, now: u64) -> (Vec<LaneRow>, boo
 /// duplicates resolve to the flywheel-owned label — the same rule as
 /// `find_workspace_dyn` in main.rs. Pure so the contract is testable.
 fn pick_snapshot_workspace(
-    workspaces: &[crate::herdr::WorkspaceInfo],
+    workspaces: &[crate::hc_support::WorkspaceInfo],
     aliases: &[String],
     owned_label: &str,
 ) -> Option<String> {
-    let matches: Vec<&crate::herdr::WorkspaceInfo> = workspaces
+    let matches: Vec<&crate::hc_support::WorkspaceInfo> = workspaces
         .iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
         .collect();
@@ -225,14 +225,14 @@ fn pick_snapshot_workspace(
 /// Fold one workspace's agents into snapshot pin rows. Shared by the herdr
 /// and rex doors so both report the same shape.
 fn collect_pin_rows(
-    agents: &[crate::herdr::AgentInfo],
+    agents: &[crate::hc_support::AgentInfo],
     ws_id: &str,
     source: &str,
     pins: &mut Vec<PinRow>,
     launch_pending: &mut u32,
 ) {
     for a in agents.iter().filter(|a| a.workspace_id == ws_id) {
-        if crate::herdr::agent_still_booting(a) {
+        if crate::hc_support::agent_still_booting(a) {
             *launch_pending = launch_pending.saturating_add(1);
         }
         let herdr_status = a.agent_status.as_str();
@@ -288,7 +288,7 @@ pub fn assemble(cfg: &crate::config::Config, project: &str, ws_label: &str, now:
             Err(_) => degraded.push("pins".to_string()),
         }
     } else {
-        match crate::herdr::Client::connect(Some(&cfg.socket_path())) {
+        match crate::hc_support::Client::connect(Some(&cfg.socket_path())) {
             Ok(mut c) => match crate::find_workspace(&mut c, project) {
                 Ok(ws_id) => match c.agent_list() {
                     Ok(agents) => {
@@ -930,8 +930,8 @@ mod adr0010_d10_tests {
         assert_eq!(pins[0].bead.as_deref(), Some("bd-zgi9"));
     }
 
-    fn ws(id: &str, label: &str) -> crate::herdr::WorkspaceInfo {
-        crate::herdr::WorkspaceInfo {
+    fn ws(id: &str, label: &str) -> crate::hc_support::WorkspaceInfo {
+        crate::hc_support::WorkspaceInfo {
             workspace_id: id.to_string(),
             number: 0,
             label: label.to_string(),
@@ -939,7 +939,7 @@ mod adr0010_d10_tests {
             pane_count: 1,
             tab_count: 1,
             active_tab_id: String::new(),
-            agent_status: crate::herdr::AgentStatus::Unknown,
+            agent_status: crate::hc_support::AgentStatus::Unknown,
             cwd: None,
         }
     }

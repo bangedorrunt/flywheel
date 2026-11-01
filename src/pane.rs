@@ -45,7 +45,7 @@ use crate::elm::{
 use crate::backend::MultiplexerBackend;
 use crate::config::Config;
 use crate::crew::CrewPlan;
-use crate::herdr::{AgentStatus, Client};
+use crate::hc_support::{AgentStatus, Client};
 use crate::models::{FallbackRoute, ModelRegistry};
 use crate::profile::ProfileCatalog;
 use crate::state::SpawnEntry;
@@ -97,7 +97,7 @@ impl LiveRegistry {
 pub fn live_registry_for_dispatch(project: &str) -> LiveRegistry {
     let entries = crate::state::load_spawn_registry(project);
     let live: std::collections::HashSet<String> =
-        match Client::connect(None).and_then(|c| c.pane_list(None)) {
+        match Client::connect(None).and_then(|c| c.pane_list()) {
             Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
             Err(_) => entries.iter().map(|e| e.pane_id.clone()).collect(),
         };
@@ -198,7 +198,7 @@ pub fn settle_for_role_slot(project: &str, role: &str, nth: Option<usize>) -> Op
         || {
             Client::connect(None)
                 .ok()
-                .and_then(|c| c.pane_list(None).ok())
+                .and_then(|c| c.pane_list().ok())
                 .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
         },
         WINDOW_MS,
@@ -400,7 +400,7 @@ pub fn reap_closed_rows(
 /// keeps panes listed, so nothing is gone). Fail-open: an unlistable
 /// backend keeps every row (existing behavior).
 pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
-    let live: std::collections::HashSet<String> = match c.pane_list(None) {
+    let live: std::collections::HashSet<String> = match c.pane_list() {
         Ok(panes) => panes.into_iter().map(|p| p.pane_id).collect(),
         Err(e) => {
             eprintln!("flywheel: dead-row reap skipped (pane list failed: {e:#})");
@@ -457,7 +457,7 @@ pub fn find_dead_rows(
 /// bd-nwnb: dead registry rows for status output. Fail-open: an
 /// unlistable backend reports none (never error the status render).
 pub fn dead_registry_rows(project: &str, c: &mut Client) -> Vec<(String, String)> {
-    let Ok(panes) = c.pane_list(None) else {
+    let Ok(panes) = c.pane_list() else {
         return Vec::new();
     };
     let live: std::collections::HashSet<String> = panes.into_iter().map(|p| p.pane_id).collect();
@@ -1163,7 +1163,7 @@ fn spawn_crew_into(
     // Fail-open: an unlistable backend keeps every row (existing behavior).
     let mut registry: Vec<SpawnEntry> = state::load_spawn_registry(project);
     let mut live_known: Option<std::collections::HashSet<String>> = c
-        .pane_list(None)
+        .pane_list()
         .ok()
         .map(|panes| panes.into_iter().map(|p| p.pane_id).collect());
     if let Some(live) = &live_known {
@@ -1255,7 +1255,7 @@ fn spawn_crew_into(
                         // EMPTY (no live agent session on it); if none is,
                         // SPLIT a fresh pane off the root instead of binding
                         // into an occupied one.
-                        let panes = c.pane_list(Some(ws_id))?;
+                        let panes = c.pane_list()?;
                         let agents = c.agent_list()?;
                         let occupied: std::collections::HashSet<String> =
                             agents.iter().map(|a| a.pane_id.clone()).collect();
@@ -1279,7 +1279,7 @@ fn spawn_crew_into(
                                 let root = pane_ids.first().cloned().ok_or_else(|| {
                                     anyhow!("pane crew: no root pane in workspace {ws_id}")
                                 })?;
-                                let split = crate::herdr::pane_split(
+                                let split = crate::hc_support::pane_split(
                                     c,
                                     &root,
                                     "down",
@@ -1291,7 +1291,7 @@ fn spawn_crew_into(
                         }
                     }
                     Some(p) => {
-                        let split = crate::herdr::pane_split(
+                        let split = crate::hc_support::pane_split(
                             c,
                             p,
                             "down",
@@ -1327,7 +1327,7 @@ fn spawn_crew_into(
                 // `fail-closed`); refuse with the real reason instead. A
                 // measured fresh pane needs ~770ms, so a 15s budget that
                 // expires is a genuinely broken shell, not a slow one.
-                if !crate::herdr::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
+                if !crate::hc_support::wait_shell_prompt(c, &pane_id, Duration::from_secs(15)) {
                     return Err(shell_gate_refusal(&name, &pane_id));
                 }
                 // AGENT_ARG / the pane-env pin were resolved BEFORE the pane
@@ -2452,9 +2452,9 @@ pub(crate) fn pane_env_for_launch(
     mail_identity: Option<&str>,
     env_model_pin: Option<&str>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut env = crate::herdr::herdr_integration_env(cfg, mail_identity);
+    let mut env = crate::hc_support::herdr_integration_env(cfg, mail_identity);
     if let Some(model) = env_model_pin {
-        crate::herdr::apply_opencode_model_pin(&mut env, model)?;
+        crate::hc_support::apply_opencode_model_pin(&mut env, model)?;
     }
     Ok(env)
 }
@@ -2653,7 +2653,7 @@ pub fn launch_spawn_job(
         (e.pane_id, name)
     } else {
         let dir = crate::project_dir(cfg, project);
-        let panes = c.pane_list(Some(ws_id))?;
+        let panes = c.pane_list()?;
         let prev = panes
             .last()
             .map(|p| p.pane_id.clone())
@@ -2666,7 +2666,7 @@ pub fn launch_spawn_job(
         // the life of the process it launches.
         let pane_env =
             pane_env_for_launch(cfg, mail_identity.as_deref(), plan.env_model_pin.as_deref())?;
-        let split = crate::herdr::pane_split(
+        let split = crate::hc_support::pane_split(
             &mut c,
             &prev,
             "down",
@@ -5559,7 +5559,7 @@ mod bd_d7zu_shell_gate_tests {
 mod rex_door_tests {
     use super::{rex_door_selected, rex_env_command, rex_shell_ready, wait_rex_shell_ready};
     use crate::backend::MultiplexerBackend;
-    use crate::herdr::{AgentInfo, AgentStatus, BackendError};
+    use crate::hc_support::{AgentInfo, AgentStatus, BackendError};
     use std::collections::BTreeMap;
     use std::time::Duration;
 

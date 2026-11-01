@@ -9,7 +9,7 @@
 //! (removed); behavioral deltas are marked DELTA with their reason.
 
 use crate::config::Config;
-use crate::herdr::{Client, StreamOutcome, Subscription};
+use crate::hc_support::{Client, StreamOutcome, Subscription};
 use crate::{config, doorbell, state, workspace};
 use doorbell_rt::{BrainMsg, Effect, FileStore, Host};
 use std::collections::{HashMap, HashSet};
@@ -333,7 +333,7 @@ impl RtHost {
                 return;
             };
             let subs = Subscription::agent_status_changed_many(attempt_ids.iter().cloned());
-            match crate::herdr::subscribe(&mut sub_client, &subs) {
+            match crate::hc_support::subscribe(&mut sub_client, &subs) {
                 Ok(s) => {
                     stream = Some(s);
                     break;
@@ -345,7 +345,7 @@ impl RtHost {
                     );
                     let live: HashSet<String> = Client::connect(Some(&socket))
                         .ok()
-                        .and_then(|c| c.pane_list(None).ok())
+                        .and_then(|c| c.pane_list().ok())
                         .map(|panes| panes.into_iter().map(|p| p.pane_id).collect())
                         .unwrap_or_default();
                     attempt_ids.retain(|id| live.contains(id));
@@ -372,8 +372,8 @@ impl RtHost {
                 match stream.read_outcome() {
                     Ok(StreamOutcome::Event(ev)) => {
                         let ev = *ev;
-                        if let crate::herdr::HerdrEventData::PaneAgentStatusChanged(change)
-                        | crate::herdr::HerdrEventData::PaneAgentStatusChangedSub(change) =
+                        if let crate::hc_support::HerdrEventData::PaneAgentStatusChanged(change)
+                        | crate::hc_support::HerdrEventData::PaneAgentStatusChangedSub(change) =
                             ev.data
                         {
                             let pin = pin_by_pane
@@ -467,7 +467,7 @@ fn reconcile_status_after_events_lost(
 }
 
 /// Pull AgentInfo rows out of a session.snapshot payload when present.
-fn agents_from_session_snapshot(snap: &serde_json::Value) -> Option<Vec<crate::herdr::AgentInfo>> {
+fn agents_from_session_snapshot(snap: &serde_json::Value) -> Option<Vec<crate::hc_support::AgentInfo>> {
     // Common shapes: { agents: [...] } or { panes: [...] } with agent fields,
     // or nested under tabs. Prefer an agents array; else try panes.
     if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {

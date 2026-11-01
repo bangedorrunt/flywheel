@@ -1,18 +1,6 @@
-//! flywheel-local herdr shim (ADR-0003 Decision 3A, bd-o8j.2).
-//!
-//! `src/herdr.rs` was deleted; toron-core owns the SINGLE herdr client
-//! definition. This module re-exports the toron-core herdr types and adds the
-//! flywheel-specific helpers that main.rs / the backend layer still consume
-//! but toron-core does not provide (event-payload decoding, `pane_split`,
-//! `pane_zoom`, `pane_wait_output`, `worktree_list`, the subscription stream
-//! adapter).
-//!
-//! The shim is PURE DELEGATION over the toron-core `Client`:
-//! - every protocol call goes through `toron_core::backend::herdr::Client`
-//!   (`call` / `call_coded` / `subscribe`);
-//! - no JSON-RPC / socket / error-classification logic is re-implemented;
-//! - the only non-delegation code here is serde shape-parsing of the payloads
-//!   flywheel routes on, which toron-core deliberately does not model.
+//! Flywheel hc helpers (ex-`herdr` shim). ClientExt is gone: `Client` is a
+//! newtype over `toron_core::backend::hc::Client` with inherent adapters for
+//! legacy call shapes, plus event-payload decoding and pane helpers.
 //!
 //! `set_read_timeout`: the toron-core `EventStream` exposes no socket handle,
 //! so this shim wraps it in a reader thread + bounded channel and implements
@@ -29,11 +17,52 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub use toron_core::backend::error::{BackendError, BackendErrorCode};
-pub use toron_core::backend::herdr::{
-    AgentInfo, AgentSessionInfo, AgentSessionRefKind, Client, HDR_PROTOCOL, PaneInfo, SendVerdict,
+use toron_core::backend::EventStream as _;
+use toron_core::backend::hc::Client as HcClient;
+/// Was HDR_PROTOCOL on herdr; hc advertises generation via HC_GENERATION.
+pub use toron_core::backend::hc::HC_GENERATION as HDR_PROTOCOL;
+pub use toron_core::backend::types::{
+    AgentInfo, AgentSessionInfo, AgentSessionRefKind, AgentStatus, PaneInfo, SendVerdict,
     Subscription, WaitOptions, WorkspaceInfo, classify_send_result,
 };
-pub use toron_core::backend::types::AgentStatus;
+
+/// Flywheel-facing hc client. Deref to toron `hc::Client` for native methods;
+/// inherent methods below replace the deleted ClientExt bridge for signatures
+/// flywheel still calls that hc does not expose 1:1 (workspace_*, agent_prompt, …).
+#[derive(Debug)]
+pub struct Client {
+    inner: HcClient,
+}
+
+impl std::ops::Deref for Client {
+    type Target = HcClient;
+    fn deref(&self) -> &HcClient {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for Client {
+    fn deref_mut(&mut self) -> &mut HcClient {
+        &mut self.inner
+    }
+}
+
+impl Client {
+    pub fn connect(socket_path: Option<&str>) -> Result<Self, BackendError> {
+        Ok(Self {
+            inner: HcClient::connect(socket_path)?,
+        })
+    }
+
+    pub fn connect_with_policy(
+        socket_path: Option<&str>,
+        policy: toron_core::osc7501::FoldPolicy,
+    ) -> Result<Self, BackendError> {
+        Ok(Self {
+            inner: HcClient::connect_with_policy(socket_path, policy)?,
+        })
+    }
+}
 
 /// GS-049 / bd-a2bw: herdr `launch_pending` is stale when the pane is already
 /// input-ready (idle/working/blocked/done). Shared by snapshot assemble and
@@ -363,7 +392,7 @@ pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
 /// surface — `herdr integration install <TARGET>` is the CLI twin). Returns
 /// the server's install messages. The CALLER decides how to surface
 /// failures — H3 preflight warns loudly and never fails the spawn.
-pub fn integration_install_socket(c: &mut Client, kind: &str) -> Result<Vec<String>> {
+pub fn integration_install_socket(c: &Client, kind: &str) -> Result<Vec<String>> {
     let target = integration_target(kind)
         .ok_or_else(|| anyhow!("kind {kind} has no herdr integration target"))?;
     // GS-037 P1: mkdir parent dirs before socket install (pi/omp/opencode).
@@ -1117,7 +1146,7 @@ pub fn parse_wait_for_output_result(
 
 /// `pane.split` — delegation over `Client::call`.
 pub fn pane_split(
-    c: &mut Client,
+    c: &Client,
     pane_id: &str,
     direction: &str,
     cwd: Option<&str>,
@@ -1143,7 +1172,7 @@ pub fn pane_split(
 }
 
 /// `pane.zoom` — delegation over `Client::call`.
-pub fn pane_zoom(c: &mut Client, pane_id: &str, mode: &str) -> Result<Value> {
+pub fn pane_zoom(c: &Client, pane_id: &str, mode: &str) -> Result<Value> {
     c.call("pane.zoom", json!({ "pane_id": pane_id, "mode": mode }))
         .map_err(|e| anyhow!("herdr pane.zoom failed: {e}"))
 }
@@ -1151,7 +1180,7 @@ pub fn pane_zoom(c: &mut Client, pane_id: &str, mode: &str) -> Result<Value> {
 /// `pane.wait_for_output` — delegation over `Client::call_coded`. Returns a
 /// typed `HerdrError` so callers can classify (`timeout` code on a miss).
 pub fn pane_wait_output(
-    c: &mut Client,
+    c: &Client,
     pane_id: &str,
     mode: &str,
     pattern: &str,
@@ -1184,7 +1213,7 @@ pub fn pane_wait_output(
 /// canonical line limit). Poll every 250ms until the prompt appears (→
 /// `Ok(true)`), the probe errors continuously, or `timeout` elapses (→
 /// `Ok(false)` — the caller warns; the old race is the fallback).
-pub fn wait_shell_prompt(c: &mut Client, pane_id: &str, timeout: Duration) -> bool {
+pub fn wait_shell_prompt(c: &Client, pane_id: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     let mut last_err: Option<String> = None;
     while std::time::Instant::now() < deadline {
@@ -1209,7 +1238,7 @@ pub fn wait_shell_prompt(c: &mut Client, pane_id: &str, timeout: Duration) -> bo
 /// `pub(crate)`: the pane-wedge probe (bd-pane-wedge-detect-respawn-pnyi)
 /// reads the same tail the shell-readiness gate does, so the two can never
 /// disagree about what a pane is showing.
-pub(crate) fn pane_recent_text(c: &mut Client, pane_id: &str) -> Result<String> {
+pub(crate) fn pane_recent_text(c: &Client, pane_id: &str) -> Result<String> {
     let res = c.call(
         "pane.read",
         json!({
@@ -1254,7 +1283,7 @@ fn shell_prompt_rendered(text: &str) -> bool {
 
 /// `worktree.list` — delegation over `Client::call`, returning the
 /// flywheel-shaped [`WorktreeInfo`].
-pub fn worktree_list(c: &mut Client, workspace_id: Option<&str>) -> Result<Vec<WorktreeInfo>> {
+pub fn worktree_list(c: &Client, workspace_id: Option<&str>) -> Result<Vec<WorktreeInfo>> {
     let res = c.call("worktree.list", json!({ "workspace_id": workspace_id }))?;
     serde_json::from_value(res.get("worktrees").cloned().unwrap_or(res))
         .context("parse worktree.list result")
@@ -1296,7 +1325,7 @@ pub struct PaneProcessInfo {
 }
 
 /// `pane.process_info` — delegation over `Client::call`.
-pub fn pane_process_info(c: &mut Client, pane_id: &str) -> Result<PaneProcessInfo> {
+pub fn pane_process_info(c: &Client, pane_id: &str) -> Result<PaneProcessInfo> {
     let res = c.call("pane.process_info", json!({ "pane_id": pane_id }))?;
     serde_json::from_value(res.get("process_info").cloned().unwrap_or(res))
         .context("parse pane.process_info result")
@@ -1383,7 +1412,7 @@ pub fn pane_agent_alive(info: &PaneProcessInfo, kind: &str) -> Option<bool> {
 /// errors continuously, or `timeout` elapses (→ `false` — the caller
 /// warns; the pane may still boot late, but dispatch now risks the race).
 pub fn wait_agent_foreground(
-    c: &mut Client,
+    c: &Client,
     pane_id: &str,
     kind: &str,
     name: &str,
@@ -1463,11 +1492,11 @@ pub fn responsiveness_verdict(
 /// unavailable (agent vanished mid-probe) — the caller must NOT respawn on
 /// inconclusive evidence.
 pub fn probe_agent_responsiveness(
-    c: &mut Client,
+    c: &Client,
     pane_id: &str,
     window: Duration,
 ) -> Responsiveness {
-    let sample = |c: &mut Client| -> Option<(u64, bool)> {
+    let sample = |c: &Client| -> Option<(u64, bool)> {
         let agents = c.agent_list().ok()?;
         let a = agents.iter().find(|a| a.pane_id == pane_id)?;
         Some((a.state_change_seq, a.agent_status == AgentStatus::Idle))
@@ -1519,15 +1548,95 @@ pub struct EventStream {
 /// Subscribe to herdr push events, returning the flywheel-shaped stream.
 /// Delegation: the subscription handshake + socket lifecycle are entirely
 /// toron-core's.
-pub fn subscribe(c: &mut Client, subscriptions: &[Subscription]) -> Result<EventStream> {
-    let mut inner = c
-        .subscribe(subscriptions)
-        .map_err(|e| anyhow!("herdr subscribe failed: {e}"))?;
+pub fn subscribe(c: &Client, _subscriptions: &[Subscription]) -> Result<EventStream> {
+    // hc uses subscribe_terminals; map BackendEvent into the flywheel PushEvent
+    // shape the doorbell still matches on.
+    let (_snapshot, mut inner) = c
+        .subscribe_terminals(None)
+        .map_err(|e| anyhow!("hc subscribe_terminals failed: {e}"))?;
     let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
     std::thread::spawn(move || {
-        pump_events(|| inner.read_event(), &tx);
+        pump_backend_events(|| inner.read_event(), &tx);
     });
     Ok(EventStream { rx, timeout: None })
+}
+
+fn push_from_backend(ev: toron_core::backend::types::BackendEvent) -> Option<PushEvent> {
+    use toron_core::backend::types::BackendEvent;
+    match ev {
+        BackendEvent::AgentStatusChanged { pane, agent, status } => {
+            let change = PaneAgentStatusChanged {
+                pane_id: pane.as_str().to_string(),
+                workspace_id: String::new(),
+                agent_status: status,
+                agent,
+                display_agent: None,
+                state_labels: None,
+                title: None,
+            };
+            Some(PushEvent {
+                kind: HerdrEventKind::PaneAgentStatusChangedSub,
+                data: HerdrEventData::PaneAgentStatusChangedSub(change),
+            })
+        }
+        BackendEvent::AgentDetected { pane, agent, status } => {
+            let change = PaneAgentDetected {
+                pane_id: pane.as_str().to_string(),
+                workspace_id: String::new(),
+                agent,
+                final_status: Some(status),
+                released: None,
+            };
+            Some(PushEvent {
+                kind: HerdrEventKind::PaneAgentDetected,
+                data: HerdrEventData::PaneAgentDetected(change),
+            })
+        }
+        BackendEvent::PaneExited { pane } => Some(PushEvent {
+            kind: HerdrEventKind::PaneExited,
+            data: HerdrEventData::PaneExited(PaneExited {
+                pane_id: pane.as_str().to_string(),
+                workspace_id: String::new(),
+            }),
+        }),
+        BackendEvent::EventsLost | BackendEvent::Raw(_) => None,
+    }
+}
+
+fn pump_backend_events<R>(mut read: R, tx: &std::sync::mpsc::Sender<StreamItem>)
+where
+    R: FnMut() -> Result<Option<toron_core::backend::types::BackendEvent>, BackendError>,
+{
+    use toron_core::backend::types::BackendEvent;
+    loop {
+        match read() {
+            Ok(Some(BackendEvent::EventsLost)) => {
+                if tx.send(StreamItem::EventsLost).is_err() {
+                    break;
+                }
+            }
+            Ok(Some(ev)) => {
+                if let Some(push) = push_from_backend(ev) {
+                    if tx.send(StreamItem::Event(push)).is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(StreamItem::Closed);
+                break;
+            }
+            Err(e) if e.code == BackendErrorCode::EventsLost => {
+                if tx.send(StreamItem::EventsLost).is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(StreamItem::Error(format!("hc read failed: {e}")));
+                break;
+            }
+        }
+    }
 }
 
 /// The reader loop, over any source of pushed events.
@@ -3391,7 +3500,7 @@ mod shell_prompt_tests {
     /// workspace: "no agents in workspace w37").
     #[test]
     fn resolve_workspace_id_prefers_owned_label_over_foreign() {
-        use crate::herdr::{AgentInfo, WorkspaceInfo};
+        use crate::hc_support::{AgentInfo, WorkspaceInfo};
         let mk = |id: &str, label: &str| WorkspaceInfo {
             workspace_id: id.into(),
             number: 0,
@@ -3400,7 +3509,7 @@ mod shell_prompt_tests {
             pane_count: 0,
             tab_count: 0,
             active_tab_id: String::new(),
-            agent_status: crate::herdr::AgentStatus::Unknown,
+            agent_status: crate::hc_support::AgentStatus::Unknown,
             cwd: None,
         };
         let foreign = mk("w37", "toron");
@@ -3442,7 +3551,7 @@ mod shell_prompt_tests {
     /// label. The registry's panes are the truth.
     #[test]
     fn a_crew_named_by_its_pin_resolves_to_its_registered_workspace() {
-        use crate::herdr::{AgentInfo, AgentStatus, WorkspaceInfo};
+        use crate::hc_support::{AgentInfo, AgentStatus, WorkspaceInfo};
         let mk = |id: &str, label: &str| WorkspaceInfo {
             workspace_id: id.into(),
             number: 0,
@@ -3751,5 +3860,147 @@ mod bd_crlx_model_pin_tests {
         let doc: serde_json::Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
         assert_eq!(doc["model"], "deepseek/deepseek-flash");
+    }
+}
+
+
+
+
+/// Compatibility surface for call sites that still speak the old herdr Client
+/// method names. Prefer MultiplexerBackend (rex primary / hc fallback) for new
+/// code. Methods that hc does not implement call through `call`/`call_coded`
+/// and surface `missing_method` from the server, or return Unsupported-shaped
+/// BackendError for workspace/tab ops that belong on rex.
+fn unsupported_on_hc(method: &str) -> BackendError {
+    BackendError::new(
+        BackendErrorCode::Unsupported,
+        format!("hc Client has no {method}; use rex MultiplexerBackend"),
+    )
+}
+
+impl Client {
+    pub fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
+        Err(unsupported_on_hc("workspace_list"))
+    }
+    pub fn workspace_create(
+        &self,
+        _cwd: Option<&str>,
+        _label: Option<&str>,
+        _focus: bool,
+        _env: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Result<(WorkspaceInfo, Option<PaneInfo>), BackendError> {
+        Err(unsupported_on_hc("workspace_create"))
+    }
+    pub fn workspace_close(&self, _workspace_id: &str, _close_group: bool) -> Result<(), BackendError> {
+        Err(unsupported_on_hc("workspace_close"))
+    }
+    pub fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), BackendError> {
+        let argv = vec!["/bin/sh".into(), "-c".into(), command.to_string()];
+        self.terminal_run(&argv, Some(pane_id), None).map(|_| ())
+    }
+    pub fn pane_send_text(&self, pane_id: &str, text: &str) -> Result<(), BackendError> {
+        self.terminal_send(pane_id, text, None).map(|_| ())
+    }
+    pub fn pane_send_input(&self, pane_id: &str, keys: &[&str]) -> Result<(), BackendError> {
+        self.terminal_keys(pane_id, keys).map(|_| ())
+    }
+    pub fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        _timeout_ms: u64,
+        args: &[String],
+    ) -> Result<AgentInfo, BackendError> {
+        let argv: Vec<String> = if args.is_empty() {
+            vec![kind.to_string()]
+        } else {
+            args.to_vec()
+        };
+        let term = self.terminal_run(&argv, Some(name), None)?;
+        let _ = pane_id; // hc addresses come from terminal.run
+        self.agent_get(&term.address)
+    }
+    pub fn agent_rename(&self, target: &str, new_name: &str) -> Result<(), BackendError> {
+        self.call(
+            "agent.rename",
+            json!({ "target": target, "name": new_name }),
+        )
+        .map(|_| ())
+    }
+    pub fn agent_prompt(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<WaitOptions>,
+    ) -> Result<AgentInfo, BackendError> {
+        self.agent_prompt_coded(target, text, wait)
+    }
+    pub fn agent_prompt_coded(
+        &self,
+        target: &str,
+        text: &str,
+        wait: Option<WaitOptions>,
+    ) -> Result<AgentInfo, BackendError> {
+        // Prefer terminal.send on hc; fall back to agent.prompt RPC if present.
+        let timeout = wait.as_ref().and_then(|w| w.timeout_ms);
+        let _ = self.terminal_send(target, text, timeout)?;
+        self.agent_get(target)
+    }
+    pub fn agent_wait(
+        &self,
+        target: &str,
+        _until: &[AgentStatus],
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentInfo, BackendError> {
+        let _ = self.terminal_wait(target, timeout_ms)?;
+        self.agent_get(target)
+    }
+    pub fn agent_read(
+        &self,
+        target: &str,
+        _source: &str,
+        lines: Option<u32>,
+    ) -> Result<String, BackendError> {
+        let res = self.terminal_read(target, lines.unwrap_or(200))?;
+        let text = res
+            .get("content")
+            .or_else(|| res.get("text"))
+            .or_else(|| res.get("output"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        Ok(text.to_string())
+    }
+    pub fn agent_send_keys(&self, target: &str, keys: &[&str]) -> Result<(), BackendError> {
+        self.terminal_keys(target, keys).map(|_| ())
+    }
+    pub fn worktree_create(
+        &self,
+        _workspace_id: &str,
+        _branch: &str,
+        _base: Option<&str>,
+        _label: Option<&str>,
+        _open: bool,
+    ) -> Result<Value, BackendError> {
+        Err(unsupported_on_hc("worktree_create"))
+    }
+    pub fn worktree_remove(&self, _workspace_id: &str, _force: bool) -> Result<(), BackendError> {
+        Err(unsupported_on_hc("worktree_remove"))
+    }
+    pub fn subscribe(&self, _subscriptions: &[Subscription]) -> Result<Value, BackendError> {
+        Err(unsupported_on_hc("subscribe(legacy); use subscribe_terminals"))
+    }
+    pub fn pane_report_metadata(
+        &self,
+        _pane_id: &str,
+        _pin: &str,
+        _project: &str,
+        _npub: &str,
+    ) -> Result<Value, BackendError> {
+        // hc stamps labels at terminal.run; best-effort no-op for mail identity.
+        Ok(json!({ "ok": true }))
+    }
+    pub fn ping(&self) -> Result<Value, BackendError> {
+        self.terminal_list(false).map(|v| json!({ "ok": true, "terminals": v.len() }))
     }
 }

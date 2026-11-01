@@ -23,11 +23,11 @@
 
 use crate::backend::MultiplexerBackend;
 use crate::config::{self, Config};
-use crate::herdr::{AgentStatus, Client};
+use crate::hc_support::{AgentStatus, Client};
 use crate::inbox_host::{Bind, Observation, Ports, Seen};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use toron_core::backend::herdr::{TOKEN_NPUB, TOKEN_PIN};
+use toron_core::backend::types::{TOKEN_NPUB, TOKEN_PIN};
 use toron_core::inbox::InboxStore;
 use toron_core::inbox_program::DeafCause;
 use toron_core::wake::{PaneState, Urgency};
@@ -138,7 +138,7 @@ fn looks_like_pin(label: &str) -> bool {
 /// labels collide across sessions, ids do not. Provenance reads
 /// `rex-label`, never `report_metadata`.
 pub fn verify_rex_binding(
-    pane: &crate::herdr::PaneInfo,
+    pane: &crate::hc_support::PaneInfo,
     session_id: &str,
     pin: &str,
     npub: &str,
@@ -158,7 +158,7 @@ pub fn verify_rex_binding(
 /// (`shell`), not the pin, and the session is the operator's session, not
 /// the project workspace label. A label that is a *different* pin stays
 /// unverified: that block belongs to someone else.
-pub fn verify_rex_block(pane: &crate::herdr::PaneInfo, pin: &str, npub: &str) -> Bind {
+pub fn verify_rex_block(pane: &crate::hc_support::PaneInfo, pin: &str, npub: &str) -> Bind {
     let other_pin = pane
         .label
         .as_deref()
@@ -274,8 +274,8 @@ impl FlywheelPorts {
     /// block records plus the process fallback; rex rows carry no stamped
     /// tokens, so verification downstream takes the label path by
     /// construction. Label prefers the agent name, falling back to display.
-    fn agent_to_pane(a: &crate::herdr::AgentInfo) -> crate::herdr::PaneInfo {
-        crate::herdr::PaneInfo {
+    fn agent_to_pane(a: &crate::hc_support::AgentInfo) -> crate::hc_support::PaneInfo {
+        crate::hc_support::PaneInfo {
             pane_id: a.pane_id.clone(),
             terminal_id: a.terminal_id.clone(),
             workspace_id: a.workspace_id.clone(),
@@ -315,7 +315,7 @@ impl FlywheelPorts {
     /// backend up → Gone; missing with it down → Unknown (never a false
     /// Gone when the backend itself is unreachable).
     fn pane_observation(
-        panes: &[crate::herdr::PaneInfo],
+        panes: &[crate::hc_support::PaneInfo],
         pane_id: &str,
         up: bool,
         pin: &str,
@@ -622,7 +622,7 @@ impl Ports for FlywheelPorts {
             let up = client.is_some();
             let panes = client
                 .as_ref()
-                .and_then(|c| c.pane_list(None).ok())
+                .and_then(|c| c.pane_list().ok())
                 .unwrap_or_default();
             // Token verification needs no session id.
             (panes, up, String::new())
@@ -725,7 +725,7 @@ impl Ports for FlywheelPorts {
         }
         let client = self.client()?;
         let p = client
-            .pane_list(None)
+            .pane_list()
             .ok()?
             .into_iter()
             .find(|p| p.pane_id == e.pane_id)?;
@@ -1188,8 +1188,8 @@ mod tests {
         }
     }
 
-    fn listed_pane(id: &str, status: AgentStatus, pin: &str, npub: &str) -> crate::herdr::PaneInfo {
-        crate::herdr::PaneInfo {
+    fn listed_pane(id: &str, status: AgentStatus, pin: &str, npub: &str) -> crate::hc_support::PaneInfo {
+        crate::hc_support::PaneInfo {
             pane_id: id.to_string(),
             terminal_id: String::new(),
             workspace_id: "w1".to_string(),
@@ -1255,7 +1255,7 @@ mod tests {
         assert_eq!(bind, None);
     }
 
-    fn listed_block(id: &str, session: &str, label: &str) -> crate::herdr::PaneInfo {
+    fn listed_block(id: &str, session: &str, label: &str) -> crate::hc_support::PaneInfo {
         // A rex block: creator-set label, no stamped tokens.
         let mut pane = listed_pane(id, AgentStatus::Idle, label, "npub1x");
         pane.workspace_id = session.to_string();
@@ -1375,7 +1375,7 @@ mod tests {
     /// projected panes always take the label path downstream.
     #[test]
     fn agent_projection_carries_status_label_and_session() {
-        let agent = crate::herdr::AgentInfo {
+        let agent = crate::hc_support::AgentInfo {
             agent: Some("com.superlogical.terminal".to_string()),
             agent_status: AgentStatus::Idle,
             cwd: None,

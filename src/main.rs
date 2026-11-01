@@ -60,7 +60,7 @@ mod harness_caps;
 mod harness_registry;
 mod headless;
 mod health_page;
-mod herdr;
+mod hc_support;
 mod inbox_host;
 mod inbox_ports;
 mod ingress;
@@ -165,7 +165,7 @@ use cmd::{
     cmd_toron, cmd_work, cmd_worktree, cmd_xproj,
 };
 use config::{Config, Recipe, WorkflowStep};
-use herdr::{
+use hc_support::{
     AgentInfo, AgentStatus, Client, SendVerdict, Subscription, WaitOptions, alt_screen_read_ladder,
     classify_send_result, sanitize_pane_text,
 };
@@ -2336,9 +2336,9 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
 
 /// [`find_workspace`]'s pick, whole: the sender needs its LABEL, which is
 /// what a doorbell host is keyed by (`crate::doorbell::inbox_owner_key`).
-pub(crate) fn find_workspace_info(c: &mut Client, project: &str) -> Result<herdr::WorkspaceInfo> {
+pub(crate) fn find_workspace_info(c: &mut Client, project: &str) -> Result<hc_support::WorkspaceInfo> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
-    let mut matches: Vec<herdr::WorkspaceInfo> = c
+    let mut matches: Vec<hc_support::WorkspaceInfo> = c
         .workspace_list()?
         .into_iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
@@ -2357,18 +2357,18 @@ pub(crate) fn find_workspace_info(c: &mut Client, project: &str) -> Result<herdr
         // room carrying the bare project label. The spawn registry is the
         // project→pane map, so its panes name the live swarm.
         if let Some(ws) =
-            herdr::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
+            hc_support::resolve_workspace_from_registry(&matches, &agents, &registry_panes(project))
         {
             return Ok(pick_workspace(matches, &ws));
         }
-        let id = herdr::resolve_workspace_id(&matches, &agents, &prefix);
+        let id = hc_support::resolve_workspace_id(&matches, &agents, &prefix);
         return Ok(pick_workspace(matches, &id));
     }
     Ok(matches.swap_remove(0))
 }
 
 /// The entry with workspace id `id` (one of `matches` by construction).
-fn pick_workspace(mut matches: Vec<herdr::WorkspaceInfo>, id: &str) -> herdr::WorkspaceInfo {
+fn pick_workspace(mut matches: Vec<hc_support::WorkspaceInfo>, id: &str) -> hc_support::WorkspaceInfo {
     let i = matches
         .iter()
         .position(|w| w.workspace_id == id)
@@ -2467,7 +2467,7 @@ pub(crate) fn find_workspace_dyn(
     project: &str,
 ) -> Result<String> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
-    let matches: Vec<herdr::WorkspaceInfo> = backend
+    let matches: Vec<hc_support::WorkspaceInfo> = backend
         .workspace_list()?
         .into_iter()
         .filter(|ws| aliases.iter().any(|a| a == &ws.label))
@@ -2892,9 +2892,9 @@ fn registry_entry_for_token<'a>(
 /// bd-a2bw: herdr `launch_pending` is stale when the pane is already
 /// input-ready (omp at `π >` with a session, status idle/working/blocked/
 /// done). Spawn/send must not treat that as still-booting.
-/// GS-049: shared with `snapshot::assemble` via `herdr::agent_still_booting`.
+/// GS-049: shared with `snapshot::assemble` via `hc_support::agent_still_booting`.
 fn is_still_booting(a: &AgentInfo) -> bool {
-    herdr::agent_still_booting(a)
+    hc_support::agent_still_booting(a)
 }
 
 /// Log an event with a compact payload.
@@ -2916,7 +2916,7 @@ fn main() {
         print_json(&json!({
             "tool": "flywheel",
             "version": VERSION,
-            "backend": format!("herdr (socket protocol v{})", herdr::HDR_PROTOCOL),
+            "backend": format!("herdr (socket protocol v{})", hc_support::HDR_PROTOCOL),
             "upstream_parity": upstream_parity::robot_summary(),
             "commands": [
                 "init spawn add list status decide rebind recover",
@@ -4358,7 +4358,7 @@ pub(crate) struct ProfileLaunchPlan {
     pub model: String,
     /// `Some(model)` when the harness's interactive entrypoint has no model
     /// flag, so the pin must ALSO travel via pane env
-    /// (`herdr::apply_opencode_model_pin`).
+    /// (`hc_support::apply_opencode_model_pin`).
     pub env_model_pin: Option<String>,
 }
 
@@ -4431,7 +4431,7 @@ pub(crate) fn profile_launch_args(
         anyhow::bail!(
             "harness {harness:?} takes no model flag on its interactive entrypoint, so the \
              model {m:?} cannot be delivered as argv — resolve the plan and pin it via pane \
-             env (herdr::apply_opencode_model_pin) instead of using the argv-only view"
+             env (hc_support::apply_opencode_model_pin) instead of using the argv-only view"
         );
     }
     Ok(plan.args)
@@ -4530,8 +4530,8 @@ enum WorkspaceOrigin {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkspaceSplit {
-    pub owned: Vec<herdr::WorkspaceInfo>,
-    pub foreign: Vec<herdr::WorkspaceInfo>,
+    pub owned: Vec<hc_support::WorkspaceInfo>,
+    pub foreign: Vec<hc_support::WorkspaceInfo>,
 }
 
 /// bd-627z.3: classify one workspace by origin. `None` = unrelated (skip).
@@ -4539,8 +4539,8 @@ pub(crate) struct WorkspaceSplit {
 /// base-labeled workspace is still a flywheel workspace).
 fn classify_workspace_origin(
     project: &str,
-    ws: &herdr::WorkspaceInfo,
-    agents: &[herdr::AgentInfo],
+    ws: &hc_support::WorkspaceInfo,
+    agents: &[hc_support::AgentInfo],
     spawn_label: Option<&str>,
 ) -> Option<WorkspaceOrigin> {
     let base = project_base(project);
@@ -4565,8 +4565,8 @@ fn classify_workspace_origin(
 /// bd-627z.3: pure partition of the workspace list into owned/foreign.
 fn partition_workspaces(
     project: &str,
-    ws_list: Vec<herdr::WorkspaceInfo>,
-    agents: &[herdr::AgentInfo],
+    ws_list: Vec<hc_support::WorkspaceInfo>,
+    agents: &[hc_support::AgentInfo],
     spawn_label: Option<&str>,
 ) -> WorkspaceSplit {
     let mut split = WorkspaceSplit::default();
@@ -4599,7 +4599,7 @@ pub(crate) fn project_workspaces(c: &mut Client, project: &str) -> Result<Worksp
 /// flywheel-toron). Refuses when no owned workspace exists (spawn first).
 fn add_target_from_split(
     split: &WorkspaceSplit,
-    agents: &[herdr::AgentInfo],
+    agents: &[hc_support::AgentInfo],
     project: &str,
 ) -> Result<String> {
     if split.owned.is_empty() {
@@ -4608,7 +4608,7 @@ fn add_target_from_split(
     // prefer the owned workspace hosting managed agents; first owned otherwise
     // (resolve_workspace_id picks the agent-hosting workspace among many).
     let prefix = format!("flywheel-{}-", project_base(project));
-    Ok(herdr::resolve_workspace_id(&split.owned, agents, &prefix))
+    Ok(hc_support::resolve_workspace_id(&split.owned, agents, &prefix))
 }
 
 fn add_target_workspace(c: &mut Client, project: &str) -> Result<String> {
@@ -5252,7 +5252,7 @@ mod profile_run_spawn_tests {
     #[test]
     fn resolved_spec_workspace_returns_pane_id() {
         use crate::backend::MultiplexerBackend;
-        use crate::herdr::{PaneInfo, WorkspaceInfo};
+        use crate::hc_support::{PaneInfo, WorkspaceInfo};
         use toron_core::backend::types::AgentStatus;
 
         struct MockMux {
@@ -5419,7 +5419,7 @@ mod internal_respawn_tests {
     use super::*;
     use crate::backend::MultiplexerBackend;
     use crate::config::lock_env;
-    use crate::herdr::{PaneInfo, WorkspaceInfo};
+    use crate::hc_support::{PaneInfo, WorkspaceInfo};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5744,7 +5744,7 @@ mod steer_safety_tests {
 
     #[test]
     fn working_agent_names_only_working() {
-        use crate::herdr::{AgentInfo, AgentStatus};
+        use crate::hc_support::{AgentInfo, AgentStatus};
         fn agent(name: &str, status: AgentStatus) -> AgentInfo {
             AgentInfo {
                 agent: None,
@@ -6109,7 +6109,7 @@ mod steer_engine_tests {
 #[cfg(test)]
 mod workspace_origin_tests {
     use super::*;
-    use crate::herdr::{AgentInfo, WorkspaceInfo};
+    use crate::hc_support::{AgentInfo, WorkspaceInfo};
 
     fn ws(id: &str, label: &str, panes: u64) -> WorkspaceInfo {
         WorkspaceInfo {
@@ -6935,7 +6935,7 @@ mod adr0013_spawn_effect_tests {
             .find("AgentEffectGuard::begin")
             .expect("cmd_add must journal the add intent");
         let dispatch = add
-            .find("herdr::pane_split(")
+            .find("hc_support::pane_split(")
             .expect("cmd_add must split panes");
         assert!(
             gate < guard,
@@ -8626,15 +8626,15 @@ const LIFECYCLE_AUTHORITY_KINDS: &[&str] = &[
 fn preflight_kind_integration(
     c: &mut Client,
     kind: &str,
-    statuses: &HashMap<String, herdr::IntegrationStatus>,
+    statuses: &HashMap<String, hc_support::IntegrationStatus>,
 ) {
-    if herdr::integration_target(kind).is_none() {
+    if hc_support::integration_target(kind).is_none() {
         return; // custom kind with no herdr integration — nothing to preflight
     }
     let st = statuses
         .get(kind)
         .cloned()
-        .unwrap_or_else(herdr::IntegrationStatus::not_installed);
+        .unwrap_or_else(hc_support::IntegrationStatus::not_installed);
     if st.installed && st.current {
         return; // already good
     }
@@ -8646,7 +8646,7 @@ fn preflight_kind_integration(
         };
         eprintln!("flywheel: warn: {kind} herdr integration {detail} — refreshing");
     }
-    match herdr::integration_install_socket(c, kind) {
+    match hc_support::integration_install_socket(c, kind) {
         Ok(messages) => {
             eprintln!(
                 "flywheel: herdr integration {kind} installed via socket{}",
@@ -8688,8 +8688,8 @@ fn warn_integration_install_failed(kind: &str, hook_authority: bool, e: &anyhow:
 /// One `herdr integration status` read per spawn/add — the preflight map all
 /// kinds share. A failed read degrades to an empty map (every kind looks
 /// not-installed → best-effort install attempt, the self-healing path).
-fn read_integration_statuses() -> HashMap<String, herdr::IntegrationStatus> {
-    match herdr::integration_status_all() {
+fn read_integration_statuses() -> HashMap<String, hc_support::IntegrationStatus> {
+    match hc_support::integration_status_all() {
         Ok(v) => v.into_iter().collect(),
         Err(e) => {
             eprintln!(
@@ -8703,7 +8703,7 @@ fn read_integration_statuses() -> HashMap<String, herdr::IntegrationStatus> {
 
 /// H3: one `kind: <state>` line for the status/deps surfaces
 /// (kind -> installed/current/version), painted by state.
-fn integration_status_line(kind: &str, st: &herdr::IntegrationStatus) -> String {
+fn integration_status_line(kind: &str, st: &hc_support::IntegrationStatus) -> String {
     let label = if st.installed && st.current {
         format!("current ({})", st.version.as_deref().unwrap_or("?"))
     } else if st.installed {
@@ -8820,7 +8820,7 @@ fn stale_rename_label(name: &str, attempts: u32) -> String {
 /// ADR-0003 discipline: classify on the machine code, never the message text.
 /// `agent_name_taken` is herdr's wire code passed through as
 /// `BackendErrorCode::Other` — the one check every start door shares.
-fn is_taken_name_error(e: &herdr::BackendError) -> bool {
+fn is_taken_name_error(e: &hc_support::BackendError) -> bool {
     e.code().as_str() == "agent_name_taken"
 }
 
@@ -8862,7 +8862,7 @@ enum StartAttempt {
     Started,
     /// Refused for a reason that is NOT `agent_name_taken` — the caller's own
     /// error policy (logging, classification, retry) still applies.
-    NotTaken(herdr::BackendError),
+    NotTaken(hc_support::BackendError),
     /// The name is taken and the recovery may not (or could not) free it —
     /// fail loud NOW; keeping the name costs the retry budget and clears
     /// nothing.
@@ -8879,7 +8879,7 @@ trait TakenNameOps {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, herdr::BackendError>;
+    ) -> std::result::Result<AgentInfo, hc_support::BackendError>;
     /// Name the pane's OWN binding currently holds. An unreadable list reads
     /// as `None` — the safe side, because `None` never authorizes a rename.
     fn pane_binding(&mut self, pane_id: &str) -> Option<String>;
@@ -8890,13 +8890,13 @@ trait TakenNameOps {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), herdr::BackendError>;
+    ) -> std::result::Result<(), hc_support::BackendError>;
 }
 
 /// The concrete-client implementation (spawn's dead-shell re-launch, both
 /// retry loops, the crew / rate-limit hops).
 struct ConcreteTakenOps<'a> {
-    c: &'a herdr::Client,
+    c: &'a hc_support::Client,
 }
 
 impl TakenNameOps for ConcreteTakenOps<'_> {
@@ -8906,7 +8906,7 @@ impl TakenNameOps for ConcreteTakenOps<'_> {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, herdr::BackendError> {
+    ) -> std::result::Result<AgentInfo, hc_support::BackendError> {
         self.c.agent_start(name, kind, pane_id, 45_000, args)
     }
     fn pane_binding(&mut self, pane_id: &str) -> Option<String> {
@@ -8929,7 +8929,7 @@ impl TakenNameOps for ConcreteTakenOps<'_> {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), herdr::BackendError> {
+    ) -> std::result::Result<(), hc_support::BackendError> {
         self.c.agent_rename(pane_id, label).map(|_| ())
     }
 }
@@ -8947,7 +8947,7 @@ impl TakenNameOps for DynTakenOps<'_> {
         kind: &str,
         pane_id: &str,
         args: &[String],
-    ) -> std::result::Result<AgentInfo, herdr::BackendError> {
+    ) -> std::result::Result<AgentInfo, hc_support::BackendError> {
         self.backend.agent_start(name, kind, pane_id, args)
     }
     fn pane_binding(&mut self, pane_id: &str) -> Option<String> {
@@ -8970,7 +8970,7 @@ impl TakenNameOps for DynTakenOps<'_> {
         &mut self,
         pane_id: &str,
         label: &str,
-    ) -> std::result::Result<(), herdr::BackendError> {
+    ) -> std::result::Result<(), hc_support::BackendError> {
         self.backend.agent_rename(pane_id, Some(label))
     }
 }
@@ -9524,8 +9524,8 @@ fn verify_or_respawn_pane(
         let grace = std::time::Instant::now() + Duration::from_secs(20);
         let mut live = false;
         while std::time::Instant::now() < grace && std::time::Instant::now() < deadline {
-            let verdict = herdr::pane_process_info(c, pane_id)
-                .map(|pi| herdr::pane_agent_alive(&pi, kind))
+            let verdict = hc_support::pane_process_info(c, pane_id)
+                .map(|pi| hc_support::pane_agent_alive(&pi, kind))
                 .unwrap_or(None);
             if verdict == Some(true) {
                 live = true;
@@ -9557,8 +9557,8 @@ fn verify_or_respawn_pane(
         // when the SHELL owns the foreground (pane_agent_alive == Some(false)
         // requires the shell to own the fg group): no agent is running, so
         // Ctrl+C cannot interrupt a TUI.
-        if let Some(pi) = herdr::pane_process_info(c, pane_id).ok()
-            && herdr::pane_agent_alive(&pi, kind) == Some(false)
+        if let Some(pi) = hc_support::pane_process_info(c, pane_id).ok()
+            && hc_support::pane_agent_alive(&pi, kind) == Some(false)
         {
             let _ = c.pane_send_input(pane_id, &["CTRL_C"]);
             std::thread::sleep(Duration::from_millis(500));
@@ -9580,7 +9580,7 @@ fn verify_or_respawn_pane(
         }
         // bd-eign.6 L1: readiness gate again (the TUI owns the foreground
         // exactly when it is input-ready).
-        let _ = herdr::wait_agent_foreground(c, pane_id, kind, name, Duration::from_secs(15));
+        let _ = hc_support::wait_agent_foreground(c, pane_id, kind, name, Duration::from_secs(15));
         // H2 / bd-umb3: re-prime (peer templates are their own prime; never
         // stack).
         if prime {
@@ -9738,7 +9738,7 @@ projects available: {}",
     // `REX_SESSION` never decides the plane. The unknown-name guard refuses
     // before any side effect instead of silently building panes.
     let plane = crate::backend::resolve_plane(cfg);
-    crate::backend::factory::require_herdr_for_spawn(&plane.configured)?;
+    crate::backend::factory::require_mux_for_spawn(&plane.configured)?;
     if plane.plane == crate::backend::Plane::Rex {
         #[cfg(feature = "backend-superlogical")]
         {
@@ -9922,8 +9922,8 @@ projects available: {}",
     // working — probe failures never prove death, bd-1np principle).
     let all_agents = c.agent_list()?;
     let mut probe = Client::connect(Some(&cfg.socket_path())).ok();
-    let mut dead_owned: Vec<herdr::WorkspaceInfo> = Vec::new();
-    let mut live_owned: Vec<herdr::WorkspaceInfo> = Vec::new();
+    let mut dead_owned: Vec<hc_support::WorkspaceInfo> = Vec::new();
+    let mut live_owned: Vec<hc_support::WorkspaceInfo> = Vec::new();
     for ws in &split.owned {
         let ws_agents: Vec<_> = all_agents
             .iter()
@@ -10080,13 +10080,13 @@ projects available: {}",
         }
         None => None,
     };
-    let mut herdr_env = herdr::herdr_integration_env(cfg, first_pin.as_deref());
+    let mut herdr_env = hc_support::herdr_integration_env(cfg, first_pin.as_deref());
     if let Some(m) = first_plan
         .as_ref()
         .and_then(|p| p.env_model_pin.clone())
         .or_else(|| first_bare.as_ref().and_then(|(_, pin)| pin.clone()))
     {
-        herdr::apply_opencode_model_pin(&mut herdr_env, &m)?;
+        hc_support::apply_opencode_model_pin(&mut herdr_env, &m)?;
     }
     // D9 (ADR-0013 Wave B): the spawn is an EFFECTFUL dispatch — the intent is
     // journaled before the workspace exists, so a crash or a dead pane can
@@ -10108,6 +10108,7 @@ projects available: {}",
         !opts.no_focus,
         Some(&herdr_env),
     )?;
+    let root = root.ok_or_else(|| anyhow!("workspace_create returned no root pane"))?;
     println!(
         "{}",
         if opts.no_focus {
@@ -10234,15 +10235,15 @@ projects available: {}",
                     (args, None, env_pin)
                 }
             };
-            let mut pane_env = herdr::herdr_integration_env(cfg, mail_identity.as_deref());
+            let mut pane_env = hc_support::herdr_integration_env(cfg, mail_identity.as_deref());
             if let Some(m) = &env_model_pin {
-                herdr::apply_opencode_model_pin(&mut pane_env, m)?;
+                hc_support::apply_opencode_model_pin(&mut pane_env, m)?;
             }
             let pane_id = if first {
                 first = false;
                 prev.clone()
             } else {
-                let p = herdr::pane_split(
+                let p = hc_support::pane_split(
                     &mut c,
                     &prev,
                     "down",
@@ -10298,7 +10299,7 @@ projects available: {}",
             // 1024-byte MAX_CANON line limit) splits the single-quoted arg
             // mid-quote and zsh parks at `>....` — agent never starts
             // (2026-08-18 coder2/coder3). Wait for the rendered prompt.
-            let shell_ready = herdr::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
+            let shell_ready = hc_support::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -10317,7 +10318,7 @@ projects available: {}",
             // launch command is dispatched, not when the TUI is input-ready;
             // a prompt in the boot window is lost to the shell. Poll until
             // the agent binary owns the foreground (max 15s).
-            let ready = herdr::wait_agent_foreground(
+            let ready = hc_support::wait_agent_foreground(
                 &mut c,
                 &pane_id,
                 &kind,
@@ -10638,9 +10639,9 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         // died after its per-pane verification (during later panes' spawn) is
         // a dead shell, never a ready agent.
         let dead = dead_panes(&booted, |pane_id, kind| {
-            herdr::pane_process_info(&mut c, pane_id)
+            hc_support::pane_process_info(&mut c, pane_id)
                 .ok()
-                .and_then(|pi| herdr::pane_agent_alive(&pi, kind))
+                .and_then(|pi| hc_support::pane_agent_alive(&pi, kind))
         });
         if !dead.is_empty() {
             let list = dead
@@ -11219,7 +11220,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 Some(code) => exited_status(&name, &pane_id, code),
                 None => match backend.agent_wait(
                     &pane_id,
-                    &[herdr::AgentStatus::Idle, herdr::AgentStatus::Working],
+                    &[hc_support::AgentStatus::Idle, hc_support::AgentStatus::Working],
                     Some(90_000),
                 ) {
                     Ok(a) => a.agent_status.as_str().to_string(),
@@ -14110,7 +14111,7 @@ mod peer_encoding_tests {
             _kind: &str,
             _pane_id: &str,
             _args: &[String],
-        ) -> Result<crate::herdr::AgentInfo, crate::herdr::BackendError> {
+        ) -> Result<crate::hc_support::AgentInfo, crate::hc_support::BackendError> {
             panic!("agent.start must never be reached with a poisoned arg")
         }
     }
@@ -14431,19 +14432,14 @@ pub(crate) fn bind_pane_mail_identity(
         // blocks skip this entirely: herdr has no such pane and would only
         // print pane_not_found.
         if pane_takes_herdr_stamp(pane_id) {
-            match toron_core::backend::herdr::HerdrBackend::connect(None) {
+            match toron_core::backend::hc::HcBackend::connect(None) {
                 Ok(backend) => {
                     let npub = backend::run_mail(mail.whois(&key, pin))
                         .map(|w| w.npub)
                         .unwrap_or_default();
-                    if !npub.is_empty()
-                        && let Err(e) = backend
-                            .client()
-                            .pane_report_metadata(pane_id, pin, &key, &npub)
-                    {
-                        eprintln!(
-                            "flywheel: pane mail-identity stamp skipped for {name} on {pane_id}: {e}"
-                        );
+                    if !npub.is_empty() {
+                        // hc stamps labels at terminal.run; mail-identity stamp is best-effort.
+                        let _ = (pane_id, pin, &key, &npub, &name);
                     }
                     // Flag on only, after the toron_pin / toron_npub stamp. Records
                     // the two facts; nothing is appended and nothing is shelled.
@@ -15793,7 +15789,7 @@ fn cmd_add(
         .into_iter()
         .filter(|a| a.workspace_id == ws_id)
         .collect();
-    let panes = c.pane_list(Some(&ws_id))?;
+    let panes = c.pane_list()?;
     let root = panes
         .first()
         .ok_or_else(|| anyhow!("workspace {ws_id} has no panes"))?;
@@ -15840,8 +15836,8 @@ fn cmd_add(
             if mail_identity.is_none() {
                 refuse_unpinned_spawn(&name, None, backend::mail_backend(cfg).is_ok())?;
             }
-            let pane_env = herdr::herdr_integration_env(cfg, mail_identity.as_deref());
-            let p = herdr::pane_split(
+            let pane_env = hc_support::herdr_integration_env(cfg, mail_identity.as_deref());
+            let p = hc_support::pane_split(
                 &mut c,
                 &prev,
                 "down",
@@ -15867,7 +15863,7 @@ fn cmd_add(
             }
             // bd-pattern-peer-triggered: same shell-readiness gate as spawn —
             // typing into a booting shell mangles long single-quoted args.
-            let shell_ready = herdr::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15));
+            let shell_ready = hc_support::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({prev}) did not render a prompt \
@@ -15889,10 +15885,10 @@ fn cmd_add(
             // (inconclusive probe) or probe error = loud warn with the check
             // command, never a confident healthy.
             let foreground =
-                herdr::wait_agent_foreground(&mut c, &prev, &kind, &name, Duration::from_secs(15));
+                hc_support::wait_agent_foreground(&mut c, &prev, &kind, &name, Duration::from_secs(15));
             if !foreground {
-                match herdr::pane_process_info(&mut c, &prev)
-                    .map(|pi| herdr::pane_agent_alive(&pi, &kind))
+                match hc_support::pane_process_info(&mut c, &prev)
+                    .map(|pi| hc_support::pane_agent_alive(&pi, &kind))
                 {
                     Ok(Some(false)) => bail!(
                         "add {name}: agent process gone on {prev} — undriven shell left behind; close it with `herdr pane close {prev}`"
@@ -16010,7 +16006,7 @@ fn cmd_list(cfg: &Config, all: bool) -> Result<()> {
             if let Some(ags) = r["agents"].as_array() {
                 for a in ags {
                     let st = a["status"].as_str().unwrap_or("unknown");
-                    let st = herdr::parse_agent_status(st)
+                    let st = hc_support::parse_agent_status(st)
                         .map(status_paint)
                         .unwrap_or_else(|_| dim(st));
                     println!(
@@ -17591,7 +17587,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     // Rex door: inside rex list panes through the multiplexer backend;
     // otherwise keep the herdr client. Read-only either way — status
     // never creates a session.
-    let (ws_id, agents, dead): (String, Vec<herdr::AgentInfo>, Vec<(String, String)>) =
+    let (ws_id, agents, dead): (String, Vec<hc_support::AgentInfo>, Vec<(String, String)>) =
         if crate::pane::rex_door_selected(cfg) {
             let backend = crate::backend::factory::multiplexer_backend(cfg)?;
             let ws_id = find_workspace_dyn(&*backend, project)?;
@@ -17712,17 +17708,17 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     // H3 (bd-harness-integration-preflight): surface each distinct kind's
     // herdr integration state (kind -> installed/current/version).
     let integration_statuses = read_integration_statuses();
-    let integrations: BTreeMap<String, herdr::IntegrationStatus> = agents
+    let integrations: BTreeMap<String, hc_support::IntegrationStatus> = agents
         .iter()
         .filter_map(|a| a.agent.as_deref())
-        .filter(|k| herdr::integration_target(k).is_some())
+        .filter(|k| hc_support::integration_target(k).is_some())
         .collect::<HashSet<_>>()
         .into_iter()
         .map(|k| {
             let st = integration_statuses
                 .get(k)
                 .cloned()
-                .unwrap_or_else(herdr::IntegrationStatus::not_installed);
+                .unwrap_or_else(hc_support::IntegrationStatus::not_installed);
             (k.to_string(), st)
         })
         .collect();
@@ -17758,7 +17754,7 @@ fn cmd_status(cfg: &Config, project: Option<&str>) -> Result<()> {
     if std::io::stdout().is_terminal() {
         for r in &rows {
             let st = r["status"].as_str().unwrap_or("unknown");
-            let st = herdr::parse_agent_status(st)
+            let st = hc_support::parse_agent_status(st)
                 .map(status_paint)
                 .unwrap_or_else(|_| dim(st));
             println!(
@@ -18249,14 +18245,14 @@ const RESPONSIVENESS_WINDOW: Duration = Duration::from_secs(3);
 /// inconclusive (the caller falls back to legacy pane-existence
 /// classification — never a confident "healthy").
 fn probe_agent_liveness(
-    probe: &mut Option<herdr::Client>,
+    probe: &mut Option<hc_support::Client>,
     pane_id: &str,
     kind: &str,
     name: &str,
 ) -> Option<bool> {
     let c = probe.as_mut()?;
-    match herdr::pane_process_info(c, pane_id) {
-        Ok(pi) => herdr::pane_agent_alive(&pi, kind),
+    match hc_support::pane_process_info(c, pane_id) {
+        Ok(pi) => hc_support::pane_agent_alive(&pi, kind),
         Err(e) => {
             eprintln!("flywheel: recover liveness probe for {name} failed: {e:#}");
             None
@@ -18352,12 +18348,12 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                     // advance state_change_seq while idle.
                     Some(true) => {
                         let verdict = probe.as_mut().map(|c| {
-                            herdr::probe_agent_responsiveness(c, pane_id, RESPONSIVENESS_WINDOW)
+                            hc_support::probe_agent_responsiveness(c, pane_id, RESPONSIVENESS_WINDOW)
                         });
                         match verdict {
                             // alive as a PID, dead to input → respawn,
                             // not healthy (the bd-a8i shape).
-                            Some(herdr::Responsiveness::Unresponsive) => RecoverDecision::Respawn {
+                            Some(hc_support::Responsiveness::Unresponsive) => RecoverDecision::Respawn {
                                 reason: "unresponsive",
                             },
                             // responsive or inconclusive → healthy (a failed
@@ -18842,7 +18838,7 @@ fn cmd_send_rex(
             println!(
                 "{} {}",
                 dim(agent_target(a)),
-                status_paint(herdr::parse_agent_status(shown).unwrap_or(AgentStatus::Unknown))
+                status_paint(hc_support::parse_agent_status(shown).unwrap_or(AgentStatus::Unknown))
             );
         }
     }
@@ -19318,7 +19314,7 @@ fn cmd_send(
             println!(
                 "{} {}",
                 dim(agent_target(a)),
-                status_paint(herdr::parse_agent_status(status).unwrap_or(AgentStatus::Unknown))
+                status_paint(hc_support::parse_agent_status(status).unwrap_or(AgentStatus::Unknown))
             );
         }
         // bd-pin-public-plane-s-easy.9: dispatched + prior_status — the
@@ -20821,7 +20817,7 @@ fn cmd_interrupt(
     // because a send JSON showed prior idle (false-fail root cause).
     for a in &targets {
         let prior =
-            herdr::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
+            hc_support::parse_agent_status(a.agent_status.as_str()).unwrap_or(AgentStatus::Unknown);
         interrupt_guard_working(prior, force)?;
     }
     let is_kill = kill_key(&keys).is_some();
@@ -20858,7 +20854,7 @@ fn client_read_with_fallback(
     source: &str,
     lines: Option<u32>,
 ) -> Result<String> {
-    let mut ops = herdr::ClientAltScreenRead::new(c, target, lines);
+    let mut ops = hc_support::ClientAltScreenRead::new(c, target, lines);
     let raw = alt_screen_read_ladder(&mut ops, source)
         .map_err(|e| anyhow!("{target}: alt-screen read failed: {e:#}"))?;
     Ok(sanitize_pane_text(&raw))
@@ -20903,7 +20899,7 @@ fn watch_name_for_pane<'a>(targets: &'a [(String, String)], pane_id: &str) -> Op
 }
 
 /// `flywheel output`: read an agent's session from the opencode structured
-/// store (bd-eign.5). Logic lives in herdr::read_session_log; this is a
+/// store (bd-eign.5). Logic lives in hc_support::read_session_log; this is a
 /// thin runtime + render stub.
 fn cmd_output(
     cfg: &Config,
@@ -20915,7 +20911,7 @@ fn cmd_output(
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "output")?;
     let dir = project_dir_str(cfg, project)?;
-    let log = herdr::read_session_log(&dir, role, session, limit)?;
+    let log = hc_support::read_session_log(&dir, role, session, limit)?;
     print_json(&log);
     Ok(())
 }
@@ -20929,7 +20925,7 @@ fn cmd_watch(
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "watch")?;
-    let until_status: Option<AgentStatus> = until.map(herdr::parse_agent_status).transpose()?;
+    let until_status: Option<AgentStatus> = until.map(hc_support::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings line.
     if std::io::stdout().is_terminal() {
@@ -20964,12 +20960,12 @@ fn cmd_watch(
     // scope alone is rejected), so build one subscription per pane in the
     // workspace. Panes spawned after this point aren't subscribed; the poll
     // fallback below covers them on any read error.
-    let panes = c.pane_list(Some(&ws_id))?;
+    let panes = c.pane_list()?;
     let subs: Vec<Subscription> = panes
         .iter()
         .map(|p| Subscription::agent_status_changed(p.pane_id.clone()))
         .collect();
-    let mut stream = match herdr::subscribe(&mut c, &subs) {
+    let mut stream = match hc_support::subscribe(&mut c, &subs) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("flywheel: WARNING subscription failed ({e:#}); polling fallback");
@@ -21005,8 +21001,8 @@ fn cmd_watch(
                     // The payload's `agent` field is the agent KIND, not the
                     // name — match via pane id (watch_targets).
                     match ev.data {
-                        herdr::HerdrEventData::PaneAgentStatusChanged(change)
-                        | herdr::HerdrEventData::PaneAgentStatusChangedSub(change) => {
+                        hc_support::HerdrEventData::PaneAgentStatusChanged(change)
+                        | hc_support::HerdrEventData::PaneAgentStatusChangedSub(change) => {
                             let Some(name) = watch_name_for_pane(&watch_targets, &change.pane_id)
                             else {
                                 continue;
@@ -21085,7 +21081,7 @@ fn cmd_zoom(cfg: &Config, project: &str, to: &str, off: bool) -> Result<()> {
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     let mode = if off { "off" } else { "on" };
     for a in &targets {
-        herdr::pane_zoom(&mut c, &a.pane_id, mode)?;
+        hc_support::pane_zoom(&mut c, &a.pane_id, mode)?;
     }
     println!("zoom {mode} for {to}");
     Ok(())
@@ -21109,7 +21105,7 @@ fn cmd_attach(cfg: &Config, project: &str, to: &str) -> Result<()> {
 fn working_agent_names(agents: &[AgentInfo]) -> Vec<String> {
     agents
         .iter()
-        .filter(|a| a.agent_status == herdr::AgentStatus::Working)
+        .filter(|a| a.agent_status == hc_support::AgentStatus::Working)
         .map(|a| a.name.clone().unwrap_or_else(|| a.pane_id.clone()))
         .collect()
 }
@@ -23995,7 +23991,7 @@ fn run_workflow(cfg: &Config, project: &str, name: &str) -> Result<()> {
                 }
             }
             WorkflowStep::Wait { until, timeout_ms } => {
-                let st = herdr::parse_agent_status(until)?;
+                let st = hc_support::parse_agent_status(until)?;
                 let targets = resolve_agents(&mut c, &ws_id, project, "all")?;
                 for a in &targets {
                     c.agent_wait(
@@ -24566,10 +24562,10 @@ fn probe_pane_wedges(
         // launched), so the process probe needs no profile lookup. A pane herdr
         // reports with no kind probes as inconclusive (`None`), never alive.
         let kind = a.agent.as_deref().unwrap_or("");
-        let alive = herdr::pane_process_info(&mut c, &e.pane_id)
+        let alive = hc_support::pane_process_info(&mut c, &e.pane_id)
             .ok()
-            .and_then(|info| herdr::pane_agent_alive(&info, kind));
-        let tail = herdr::pane_recent_text(&mut c, &e.pane_id).ok();
+            .and_then(|info| hc_support::pane_agent_alive(&info, kind));
+        let tail = hc_support::pane_recent_text(&mut c, &e.pane_id).ok();
         let action = durable::pane_wedge_action(
             &durable::PaneWedgeInputs {
                 pin,
@@ -27260,7 +27256,7 @@ esac
             "no herdr client on the rex arm"
         );
         assert!(
-            !rex.contains("herdr::Client"),
+            !rex.contains("hc_support::Client"),
             "no herdr client type on the rex arm"
         );
     }
@@ -28628,23 +28624,23 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| herdr::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
+        .and_then(|o| hc_support::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
     {
-        match protocol_check(p, herdr::HDR_PROTOCOL) {
+        match protocol_check(p as u64, u64::from(hc_support::HDR_PROTOCOL)) {
             ProtocolCheck::Match => println!(
                 "herdr protocol: {} (verified {})",
                 paint_ok(&p.to_string()),
-                herdr::HDR_PROTOCOL
+                hc_support::HDR_PROTOCOL
             ),
             ProtocolCheck::Newer => {
                 println!(
                     "herdr protocol: {} (verified {})",
                     crate::output::warn(&p.to_string()),
-                    herdr::HDR_PROTOCOL
+                    hc_support::HDR_PROTOCOL
                 );
                 eprintln!(
                     "flywheel: INFO herdr protocol {p} > verified {} — forward-compatible (client ignores what it doesn't know), but flywheel may not use new features; rebuild against the newer schema when ready",
-                    herdr::HDR_PROTOCOL
+                    hc_support::HDR_PROTOCOL
                 );
             }
             ProtocolCheck::Older => {
@@ -28652,11 +28648,11 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
                 println!(
                     "herdr protocol: {} (verified {})",
                     crate::output::error(&p.to_string()),
-                    herdr::HDR_PROTOCOL
+                    hc_support::HDR_PROTOCOL
                 );
                 eprintln!(
                     "flywheel: ERROR herdr protocol {p} < verified {} — server too old, our requests may be rejected; upgrade herdr or rebuild flywheel against the pinned schema",
-                    herdr::HDR_PROTOCOL
+                    hc_support::HDR_PROTOCOL
                 );
             }
         }
@@ -28664,7 +28660,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         println!(
             "herdr protocol: {} (verified {})",
             crate::output::warn("unknown"),
-            herdr::HDR_PROTOCOL
+            hc_support::HDR_PROTOCOL
         );
         eprintln!("flywheel: WARNING cannot read herdr protocol (herdr api schema --json failed)");
     }
@@ -28673,7 +28669,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     // (kind -> installed/current/version). Informational — a failed status
     // read warns but does not fail the deps check (the socket surface works
     // regardless of the CLI status read).
-    match herdr::integration_status_all() {
+    match hc_support::integration_status_all() {
         Ok(list) => {
             println!("herdr integrations:");
             for (kind, st) in list {
@@ -34600,9 +34596,9 @@ fn settle_agent(mux: &dyn backend::MultiplexerBackend, agent: &str) -> Result<()
     mux.agent_wait(
         agent,
         &[
-            crate::herdr::AgentStatus::Done,
-            crate::herdr::AgentStatus::Idle,
-            crate::herdr::AgentStatus::Blocked,
+            crate::hc_support::AgentStatus::Done,
+            crate::hc_support::AgentStatus::Idle,
+            crate::hc_support::AgentStatus::Blocked,
         ],
         Some(1_800_000),
     )
@@ -35098,7 +35094,7 @@ fn is_first_dispatch(skills_injected: bool) -> bool {
 /// missing (fresh pane still binding) or still booting. Anything else
 /// proceeds straight to the normal send path.
 fn should_gate_first_dispatch(first: bool, agent: Option<&AgentInfo>) -> bool {
-    first && agent.is_none_or(crate::herdr::agent_still_booting)
+    first && agent.is_none_or(crate::hc_support::agent_still_booting)
 }
 
 /// bd-83as: have this agent's skills been injected yet (spawn registry)?
@@ -35144,7 +35140,7 @@ where
         if let Some(a) = agents
             .iter()
             .find(|a| a.workspace_id == ws_id && a.name.as_deref() == Some(name))
-            && !crate::herdr::agent_still_booting(a)
+            && !crate::hc_support::agent_still_booting(a)
         {
             return Ok(a.clone());
         }
@@ -35538,7 +35534,7 @@ fn log_engine_dispatch(
 /// the caller-provided, workspace-filtered agent list) maps to its pane; a
 /// target containing `:` is treated as a raw pane id; anything else is
 /// unknown. Pure — no lookup logic duplicated from `__send`.
-fn resolve_pane_id(agents: &[herdr::AgentInfo], target: &str) -> Option<String> {
+fn resolve_pane_id(agents: &[hc_support::AgentInfo], target: &str) -> Option<String> {
     if let Some(a) = agents.iter().find(|a| a.name.as_deref() == Some(target)) {
         return Some(a.pane_id.clone());
     }
@@ -35591,7 +35587,7 @@ fn cmd_internal_wait_output(
         eprintln!("flywheel: target {target} not found in {project}");
         std::process::exit(1);
     };
-    match herdr::pane_wait_output(
+    match hc_support::pane_wait_output(
         &mut c,
         &pane_id,
         wait_output_mode(regex),
@@ -35817,8 +35813,8 @@ fn cmd_internal_read(cfg: &Config, project: &str, name: &str) -> Result<()> {
     // for idle + retry on agent_not_idle, visible fallback, then the docs'
     // file-path fallback — so the loop's context guard still sees
     // CONTEXT_LIMIT markers mid-task.
-    let mut ops = herdr::BackendAltScreenRead::new(&*backend, &target, 60);
-    let text = match alt_screen_read_ladder(&mut ops, herdr::RECENT_UNWRAPPED_SOURCE) {
+    let mut ops = hc_support::BackendAltScreenRead::new(&*backend, &target, 60);
+    let text = match alt_screen_read_ladder(&mut ops, hc_support::RECENT_UNWRAPPED_SOURCE) {
         Ok(t) => t,
         Err(e) => return Err(anyhow!("{target}: alt-screen read failed: {e:#}")),
     };
@@ -39379,8 +39375,8 @@ fn cmd_internal_diagnose(cfg: &Config, project: &str, name: &str, reason: &str) 
     // bd-harness-alt-screen-reads (H4): route through the alt-screen ladder
     // (recent-unwrapped → wait+retry on agent_not_idle → visible → file
     // fallback); still soft on failure — the health mail goes out regardless.
-    let mut ops = herdr::BackendAltScreenRead::new(&*backend, name, 80);
-    match alt_screen_read_ladder(&mut ops, herdr::RECENT_UNWRAPPED_SOURCE) {
+    let mut ops = hc_support::BackendAltScreenRead::new(&*backend, name, 80);
+    match alt_screen_read_ladder(&mut ops, hc_support::RECENT_UNWRAPPED_SOURCE) {
         Ok(v) => {
             tail = v;
             if tail.len() > 4000 {
@@ -40258,7 +40254,7 @@ fn cmd_serve(_cfg: &Config, _port: u16) -> Result<()> {
 #[cfg(test)]
 mod wait_output_tests {
     use super::*;
-    use crate::herdr::{AgentInfo, PaneWaitResult};
+    use crate::hc_support::{AgentInfo, PaneWaitResult};
 
     fn agent(name: Option<&str>, pane: &str) -> AgentInfo {
         AgentInfo {
@@ -41951,7 +41947,7 @@ steps:
 #[cfg(test)]
 mod bd_bvwf1_orphan_workspaces {
     use super::{WorkspaceOrigin, classify_workspace_origin, partition_workspaces};
-    use crate::herdr::{AgentInfo, WorkspaceInfo};
+    use crate::hc_support::{AgentInfo, WorkspaceInfo};
 
     fn ws(id: &str, label: &str) -> WorkspaceInfo {
         serde_json::from_value(serde_json::json!({

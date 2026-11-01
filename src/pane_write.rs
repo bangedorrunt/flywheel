@@ -122,7 +122,7 @@ pub trait PaneTyper {
 }
 
 /// herdr as the pane boundary.
-pub struct HerdrPanes<'a>(pub &'a crate::herdr::Client);
+pub struct HerdrPanes<'a>(pub &'a crate::hc_support::Client);
 
 impl PaneTyper for HerdrPanes<'_> {
     fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
@@ -182,7 +182,7 @@ impl PaneTyper for RexPanes<'_> {
 /// `pane.send_text` + settle + Enter (retried; Enter alone is retried once the
 /// text has landed, the text is never re-typed). Same boot semantics as the
 /// legacy prime, but reachable only with a closed [`PaneWrite`].
-pub struct BootPanes<'a>(pub &'a crate::herdr::Client);
+pub struct BootPanes<'a>(pub &'a crate::hc_support::Client);
 
 impl PaneTyper for BootPanes<'_> {
     fn prompt(&self, target: &str, line: &str) -> anyhow::Result<()> {
@@ -226,7 +226,7 @@ impl PaneTyper for BootPanes<'_> {
 /// Spawn-time bootstrap: type the per-harness [`PaneWrite::LaunchBootstrap`]
 /// constant into a fresh pane. Best-effort like the legacy prime (a failed
 /// bootstrap warns, never fails the spawn); returns whether it landed.
-pub fn launch_bootstrap_into(c: &crate::herdr::Client, pane_id: &str, harness: Harness) -> bool {
+pub fn launch_bootstrap_into(c: &crate::hc_support::Client, pane_id: &str, harness: Harness) -> bool {
     match write(
         &BootPanes(c),
         pane_id,
@@ -502,7 +502,7 @@ mod tests {
             &self,
             target: &str,
             text: &str,
-            _wait: Option<&toron_core::backend::herdr::WaitOptions>,
+            _wait: Option<&toron_core::backend::WaitOptions>,
         ) -> Result<serde_json::Value, toron_core::backend::BackendError> {
             self.0
                 .lock()

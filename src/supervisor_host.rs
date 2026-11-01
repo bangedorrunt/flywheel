@@ -1326,8 +1326,8 @@ impl LivePorts {
             .map(|e| e.pane_id)
     }
 
-    fn client(&self) -> Option<crate::herdr::Client> {
-        crate::herdr::Client::connect(Some(&self.cfg.socket_path())).ok()
+    fn client(&self) -> Option<crate::hc_support::Client> {
+        crate::hc_support::Client::connect(Some(&self.cfg.socket_path())).ok()
     }
 
     fn page_captain(&self, line: &str) {

@@ -810,7 +810,7 @@ pub(crate) fn cmd_doorbell_re_inject(cfg: &Config, project: &str) -> Result<()> 
     crate::ensure_doorbell_supervisor();
     let registry = crate::state::load_spawn_registry(project);
     let peer_tpl = include_str!("../../integrations/peer-aware.md.tpl");
-    let c = crate::herdr::Client::connect(Some(&cfg.socket_path()))?;
+    let c = crate::hc_support::Client::connect(Some(&cfg.socket_path()))?;
     let mut injected = 0;
     for e in &registry {
         if e.pane_id.is_empty() {

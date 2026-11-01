@@ -1998,7 +1998,7 @@ impl Mail {
                         "note": "active multiplexer is not herdr; pane identity cleanup not applicable",
                     }));
                 }
-                match toron_core::backend::herdr::HerdrBackend::connect(None) {
+                match toron_core::backend::hc::HcBackend::connect(None) {
                     Ok(backend) => {
                         let pruned = mailbox().cleanup_pane_identities(&backend)?;
                         Ok(json!({ "pruned": pruned }))
@@ -2340,30 +2340,24 @@ impl Mail {
     /// below, never an error.
     pub fn resolve_pane_identity(&self, project_key: &str, pane_id: &str) -> Value {
         if multiplexer_is_herdr()
-            && let Ok(backend) = toron_core::backend::herdr::HerdrBackend::connect(None)
+            && let Ok(backend) = toron_core::backend::hc::HcBackend::connect(None)
         {
             let client = backend.client();
-            if let Ok(workspaces) = client.workspace_list() {
-                for ws in workspaces {
-                    let panes = client.pane_list(Some(&ws.workspace_id)).unwrap_or_default();
-                    match panes.iter().find(|p| p.pane_id == pane_id) {
-                        Some(pane) => {
-                            if let Some(pin) = pane
-                                .tokens
-                                .get(toron_core::backend::herdr::TOKEN_PIN)
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty())
-                            {
-                                return json!({
-                                    "agent_name": pin,
-                                    "pane_id": pane_id,
-                                    "source": "pane-token",
-                                });
-                            }
-                            break; // pane live but unstamped → file bridge
-                        }
-                        None => continue, // not in this workspace → keep looking
+            if let Ok(panes) = client.pane_list() {
+                if let Some(pane) = panes.iter().find(|p| p.pane_id == pane_id) {
+                    if let Some(pin) = pane
+                        .tokens
+                        .get(toron_core::backend::types::TOKEN_PIN)
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        return json!({
+                            "agent_name": pin,
+                            "pane_id": pane_id,
+                            "source": "pane-token",
+                        });
                     }
+                    // pane live but unstamped → file bridge
                 }
             }
         }
@@ -4071,7 +4065,7 @@ mod tests {
     /// (same file-miss shape as before, never Err).
     #[test]
     fn resolve_prefers_pane_tokens_over_files() {
-        let pane: toron_core::backend::herdr::PaneInfo =
+        let pane: toron_core::backend::PaneInfo =
             serde_json::from_value(serde_json::json!({
                 "pane_id": "w1:p1",
                 "terminal_id": "term_test",
@@ -4083,7 +4077,7 @@ mod tests {
                 "tokens": { "toron_pin": "DustySparrow" },
             }))
             .expect("test pane parses");
-        let agent: toron_core::backend::herdr::AgentInfo =
+        let agent: toron_core::backend::AgentInfo =
             serde_json::from_value(serde_json::json!({
                 "agent_status": "working",
                 "focused": false,
