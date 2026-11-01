@@ -1280,28 +1280,31 @@ pub fn dead_dispatchers(state_dir: &Path) -> Vec<(String, String)> {
 // `no_effect_underscore_binding` allow in [lints.clippy]).
 #[resonate_sdk::function]
 async fn heal_tick(_args: ()) -> Result<Vec<String>> {
+    heal_tick_body()
+        .await
+        .map_err(|e| resonate_sdk::error::Error::Application {
+            message: format!("supervisor heal: {e:#}"),
+        })
+}
+
+/// The heal itself as a plain async fn (bd-flywheel-cron-elm-cn7p): the
+/// ElmCron host calls this directly — the macro name above is not callable.
+/// Same body, anyhow errors instead of the SDK error shape.
+pub async fn heal_tick_body() -> anyhow::Result<Vec<String>> {
     let state_dir = crate::config::state_dir();
     let exe = std::env::current_exe()?;
     let mut healed = Vec::new();
     for (label, project) in dead_dispatchers(&state_dir) {
         if let Err(e) = ensure_running(&exe, &state_dir, &label, &project) {
-            return Err(resonate_sdk::error::Error::Application {
-                message: format!("supervisor heal {label}: {e:#}"),
-            });
+            return Err(anyhow::anyhow!("supervisor heal {label}: {e:#}"));
         }
         healed.push(label.clone());
     }
     Ok(healed)
 }
 
-/// Register the supervisor leaf on a Resonate instance (the schedule fires
-/// `heal_tick`; see SUPERVISOR_CRON).
-pub fn supervisor_function_registered(r: &mut resonate_sdk::prelude::Resonate) -> Result<()> {
-    r.register(heal_tick)
-        .map_err(|e| anyhow::anyhow!("register doorbell heal_tick: {e}"))
-}
-
-/// The cron the schedule fires on: every minute.
+/// The cron the ElmCron host fires on: every minute (bd-flywheel-cron-elm-cn7p:
+/// folded from the server-side supervisor registration, which is gone).
 pub const SUPERVISOR_CRON: &str = "* * * * *";
 pub const SUPERVISOR_NAME: &str = "doorbell-supervisor";
 

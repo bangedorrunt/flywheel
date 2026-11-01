@@ -11705,43 +11705,13 @@ fn doorbell_project_workspaces(project: &str) -> Vec<String> {
 /// connected stay queued and execute at-least-once later. Server
 /// unreachable → skip silently; the lazy fallback still covers us.
 fn ensure_doorbell_supervisor() {
-    use resonate_sdk::prelude::ResonateConfig;
-    let Some(url) = pane::cli_engine_store_url() else {
-        return;
-    };
-    // The runtime + Resonate instance are leaked deliberately: the network
-    // pollers must stay alive for the PROCESS lifetime so this process
-    // works as a supervisor worker (the __doorbell children are long-lived;
-    // short CLI commands contribute one poll cycle then exit).
-    let rt = Box::leak(Box::new(
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("supervisor runtime"),
-    ));
-    let result: anyhow::Result<()> = rt.block_on(async {
-        let mut r = resonate_sdk::prelude::Resonate::new(ResonateConfig {
-            url: Some(url),
-            group: Some("flywheel-doorbell".into()),
-            ..Default::default()
-        });
-        doorbell::supervisor_function_registered(&mut r)?;
-        // Idempotent by name: an existing schedule is fine.
-        let _ = r
-            .schedule(
-                doorbell::SUPERVISOR_NAME,
-                doorbell::SUPERVISOR_CRON,
-                "heal_tick",
-                (),
-            )
-            .await;
-        // Keep the instance alive (never stopped — worker for life).
-        std::mem::forget(r);
-        Ok(())
-    });
-    if let Err(e) = result {
-        eprintln!("flywheel: doorbell supervisor setup skipped: {e:#}");
-    }
+    // bd-flywheel-cron-elm-cn7p: the every-minute heal rides the ElmCron
+    // host inside `flywheel cron start` (doorbell-supervisor schedule).
+    // The server-side schedule is gone on purpose — registering it here
+    // would double-heal alongside the cron host. Interactive paths still
+    // lazy-heal per workspace; the call site below stays so the notice
+    // fires where the old registration ran.
+    eprintln!("flywheel: doorbell supervisor rides the cron host (no server schedule registered)");
 }
 
 /// Thin proxy to the daemon CLI when it hosts wake (bd-asr2.5, D1).
