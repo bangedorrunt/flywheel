@@ -57,7 +57,7 @@ flowchart LR
     K9["kind 9 room post / mention / job"] --> J
     K9 --> WL["watch --live (subscribe_trusted)"]
     K9 --> MB["mail inbox --since last"]
-    J --> P["herdr prompt: one [doorbell] line"]
+    J --> P["plane prompt: one [doorbell] line"]
     P --> AK["presence working, or kind-9 reply within 120s"]
 ```
 
@@ -82,14 +82,14 @@ Findings longer than about 20 lines go to a durable file first; the post carries
 | toron unreachable | no mail, no reservations | claim with explicit assignee, record file scope in a bead comment, check `git status` + `br list --status in_progress`, minimal scope, note it in the close reason |
 | doorbell port held by a foreign owner | `doorbell start` fails loud | port conflict, not corruption: stop the foreign holder or relocate the daemon |
 | no live fleet, stale reservations | briefing may read file contention | check `held_paths` holders; stale leases are visible in `toron list_file_reservations` |
-| dispatcher absent, herdr socket up | panes can run but no flywheel supervision | `flywheel daemon start`; embedded doorbell degrades loudly |
+| dispatcher absent, hc socket up | panes can run but no flywheel supervision | `flywheel daemon start`; embedded doorbell degrades loudly |
 
 ## Where things live
 
 | Path / port | Owner |
 |---|---|
 | `~/.config/flywheel/` | `config.toml`, `workflows/`, `crons/`, `profiles/`, `models/`, `policy/` |
-| `~/.config/herdr/herdr.sock` | herdr socket |
+| `$XDG_STATE_HOME/herdr-core/default/default.sock` | hc socket |
 | `<project>/.flywheel/agent-state/<name>.json` | per-agent context (git-ignored) |
 | `~/.local/state/flywheel/` | flywheel loops, journals, runs, facts, doorbell state |
 | `~/.local/state/toron/toron.pid` | toron pidfile (non-launchd hosts) |

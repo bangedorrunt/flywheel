@@ -24,7 +24,7 @@ is raw and has to be addressed by its agent kind or pane id instead. Do not
 reroute silently to whatever does resolve: a message that lands on the wrong
 agent is worse than one that fails.
 
-The tracker uses different names: br claims take the herdr slug (`flywheel-toron-coder`), never a pin.
+The tracker uses different names: br claims take the plane slug (`flywheel-toron-coder`), never a pin.
 
 ## Profiles and spawn
 
@@ -56,7 +56,7 @@ Spawn fails closed:
 - `launch_pending` is not idle. Wait; never add a second harness.
 - After settle, exit 1 if any pane is missing, empty-named, or wrong-named.
 - `--retire-orphans` is opt-in; default never silently reaps.
-- `flywheel status` may briefly show `workspaces: []` after a verified spawn. Trust the spawn verification; take names from the send error's `available:` list or `herdr workspace list`.
+- `flywheel status` may briefly show `workspaces: []` after a verified spawn. Trust the spawn verification; take names from the send error's `available:` list or `flywheel status / hc ls`.
 
 Panes are peer-aware by default (`integrations/peer-aware.md.tpl`). Opt out per spawn with `--no-peer-aware`; never pass `--peer-aware`.
 
@@ -101,4 +101,4 @@ Stage payloads substitute `{{k}}` slots from repeatable `--param k=v`. Reserved 
 
 ## The send receipt
 
-The send JSON reports `dispatched: true` plus `prior_status` (herdr status at target time). `prior_status: idle` is not a miss: the brief landed while the target was idle. `landed: true` appears only after `--wait`/`--confirm`. Exit 0 with `dispatched` is success for fire-and-forget. Never probe with `READY?`. Never interrupt an agent herdr shows `working`; interrupt of a working agent needs `--force`.
+The send JSON reports `dispatched: true` plus `prior_status` (plane status at target time). `prior_status: idle` is not a miss: the brief landed while the target was idle. `landed: true` appears only after `--wait`/`--confirm`. Exit 0 with `dispatched` is success for fire-and-forget. Never probe with `READY?`. Never interrupt an agent the plane shows `working`; interrupt of a working agent needs `--force`.

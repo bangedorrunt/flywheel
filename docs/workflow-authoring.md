@@ -73,15 +73,15 @@ pane (profile resolution yielded none), pane-mode dispatch falls back to the ste
 loud WARNING naming the downgrade; it bails only when no role pane exists either.
 
 **Key fields:**
-- `harness` — `pi | oc | grok | omp | ...` (omp is a first-class herdr kind; `herdr agent start --kind omp` works).
+- `harness` — `pi | oc | grok | omp | ...` (omp is a first-class hc kind; `hc run --bg --kind omp` works).
 - `model` — resolved against `~/.config/flywheel/models.toml` (ADR-0010 Spec D); injected into the spawn via the harness's model flag.
 - `behavior` — the system-prompt preamble. **Prepended to every dispatched prompt** (ADR-0010 Spec C) — this is how the role "takes effect."
 - `role` — free-form label, NOT access control. Prompt-shaping only.
 - `exec` *(ADR-0010)* — `pane` (default; you observe) or `headless` (autonomous; logged; no pane).
 
 > **Harnesses:** `oc`/`pi`/`gk` are the legacy shorts (opencode/pi/grok). `omp` spawns directly
-> (`herdr agent start --kind omp`). `pa` (prime-agent) is NOT yet a herdr kind — defer until
-> herdr lists it. Custom harnesses via `[harness.<name>] spawn_cmd` in `profiles.toml`.
+> (`hc run --bg --kind omp`). `pa` (prime-agent) is NOT yet an hc kind — defer until
+> hc lists it. Custom harnesses via `[harness.<name>] spawn_cmd` in `profiles.toml`.
 
 ---
 
@@ -188,7 +188,7 @@ flywheel workflow run ship-feature --execute --inputs '{"feature":"add X"}' --cr
 ```
 
 **What happens on `--execute`** (ADR-0010 Spec A–C): flywheel pre-spawns the crew
-(`crew → cmd_spawn → herdr agent_start`), injecting each profile's `model` via the harness flag.
+(`crew → cmd_spawn → plane agent_start`), injecting each profile's `model` via the harness flag.
 Each `spawn` step's prompt is **prepended with the profile's `behavior` preamble** and dispatched
 to the bound pane. `parallel over: "@crew.coder"` fans the build across both coders; results
 collect into `{{steps.build}}`. Without `--execute`: the no-op runner (control-flow only).

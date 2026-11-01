@@ -62,9 +62,9 @@ Monitor git and beads for truth, not mail. Address the captain by pin: `flywheel
 
 ## Harness integration
 
-Lifecycle-authority kinds (idle/working/blocked from hook events): pi, omp, kimi, opencode, kilo, mastracode, grok. `pa` reports via built-in socket but has no herdr kind: spawn via recipe fallback and drive with `pane.send_text`. Unknown kinds fail `agent.start` with `unsupported_agent_kind`; kinds with a spawn recipe fall back to `pane.run`.
+Lifecycle-authority kinds (idle/working/blocked from hook events): pi, omp, kimi, opencode, kilo, mastracode, grok. `pa` reports via built-in socket but has no hc kind: spawn via recipe fallback and drive with `pane.send_text`. Unknown kinds fail `agent.start` with `unsupported_agent_kind`; kinds with a spawn recipe fall back to `pane.run`.
 
-Symptom `agent_not_ready: not an active named agent`, or a pane without lifecycle state in `herdr agent list`: load the harness-integration reference (env injection, boot prime, preflight, pane primitives, alt-screen ladder) before prompting.
+Symptom `agent_not_ready: not an active named agent`, or a pane without lifecycle state in `hc ls`: load the harness-integration reference (env injection, boot prime, preflight, pane primitives, alt-screen ladder) before prompting.
 
 ## Teardown
 

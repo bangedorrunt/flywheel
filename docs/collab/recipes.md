@@ -19,7 +19,7 @@ flywheel debate "Should we feature-flag backend X?" --rounds 3 \
 
 - Thread: `debate-<ts>`
 - A opens FOR; alternate counters; judge summarizes winner
-- Requires mail + herdr agents already registered
+- Requires mail + plane agents already registered
 
 ---
 

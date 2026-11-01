@@ -129,7 +129,7 @@ flywheel workflow run <name> --inputs '{"goal":"..."}'
 # real execution, headless (steps via __run-headless subprocesses)
 flywheel workflow run <name> --execute --mode headless
 
-# real execution, pane (pre-spawns a real herdr crew, dispatches via __send)
+# real execution, pane (pre-spawns a real plane crew, dispatches via __send)
 flywheel workflow run <name> --execute --mode pane --project <project>
 ```
 
@@ -390,12 +390,12 @@ claim.
 | :--- | :--- | :--- |
 | run "succeeded" but nothing happened | dry-run default (no `--execute`) | re-run with `--execute` |
 | compose reports unknown stage/role | typo'd part | `flywheel workflow list` / stage library names are exact |
-| `agent_not_ready` during pane dispatch | crew still booting | transient — the runner retries with backoff; persistent = check the pane (herdr agent get) |
+| `agent_not_ready` during pane dispatch | crew still booting | transient — the runner retries with backoff; persistent = check the pane (hc get) |
 | step recorded, no dispatch | recording runner (dry-run) or headless mode without execute | use `--execute`; check `--mode` |
 | slash command not expanding (opencode) | dead `command/` dir (pre-fix) or stale files | `flywheel integration opencode`, check `commands/` (plural) |
 | lint exit 2 | YAML parse failure | fix syntax; never bypass |
 | lint exit 1 | blocking playbook rule | read the rule id; comply (e.g. feature needs `data_shape`) |
-| prompt to a blocked agent refused (`agent_blocked`) | herdr 0.8.2 refuses prompts into approval dialogs | resolve the dialog (escalation tiers will mail you) — do not retry-loop the prompt |
+| prompt to a blocked agent refused (`agent_blocked`) | hc refuses prompts into approval dialogs | resolve the dialog (escalation tiers will mail you) — do not retry-loop the prompt |
 
 ---
 

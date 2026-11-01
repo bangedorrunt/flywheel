@@ -1,17 +1,17 @@
 ---
 title: flywheel
-description: Fleet orchestration over herdr panes. The session door, topology classification, durable loops, workflow compose, and cron.
+description: Fleet orchestration over hc/rex panes. The session door, topology classification, durable loops, workflow compose, and cron.
 ---
 
-flywheel turns a directory of terminal agents into a supervised fleet. It owns the session door, classifies each goal into exactly one dispatch primitive, drives herdr panes, and runs durable loops that crash-resume with the same invocation.
+flywheel turns a directory of terminal agents into a supervised fleet. It owns the session door, classifies each goal into exactly one dispatch primitive, drives hc/rex panes, and runs durable loops that crash-resume with the same invocation.
 
-Dependency direction is one way: flywheel depends on toron-workflow, toron-workflow on toron-core. Work is tracked in br; flywheel never forks its own tracker. Coordination rides toron; panes ride herdr.
+Dependency direction is one way: flywheel depends on toron-workflow, toron-workflow on toron-core. Work is tracked in br; flywheel never forks its own tracker. Coordination rides toron; panes ride the selected plane (rex/hc).
 
 ```mermaid
 flowchart LR
     F["flywheel<br/>orchestration"] --> TW["toron-workflow<br/>engine"]
     TW --> TC["toron-core<br/>mailbox, bus"]
-    F -->|"drives"| H["herdr<br/>panes"]
+    F -->|"drives"| H["pane plane<br/>(hc/rex)"]
     F -->|"claims, closes"| B["br<br/>ledger"]
 ```
 

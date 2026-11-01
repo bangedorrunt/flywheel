@@ -143,11 +143,11 @@ ladder: CLI > `TORON_*` env > `./.toron.toml` > `~/.config/toron/`
 | `XDG_STATE_HOME` | state root (unset macOS fallback: `~/.local/state` — unified 2026-09-13, was Application Support for the CLI only) |
 | `FLYWHEEL_SOCKET/ROOT/TIMEOUT/BACKEND/MAIL/TORON_URL/TOKEN/MAIL_NAME/CREW_MAX/VERIFY_STRICT/COMPOSE_MAX_SECONDS/DISPATCH_TTL_SECS/PANE_STALL_SECS/RECLAIM_*/MCP_TIMEOUT_SECS/NO_DOORBELL_ENSURE` | per-name overrides (TIMEOUT fail-loud) |
 | `DOORBELL_STATE_DIR` / `DOORBELL_FLYWHEEL_STATE_DIR` / `DOORBELL_PORT` | daemon dir/port resolution (unit exports the first; state default: `$DOORBELL_STATE_DIR` > `$XDG_STATE_HOME/doorbell` > `~/.local/state/doorbell`, legacy `~/Library/Application Support/doorbell` auto-migrated once) |
-| `DOORBELL_TORON_BIN` / `DOORBELL_HERDR_BIN` | watch/prompt child binaries (tests set `true`) |
+| `DOORBELL_TORON_BIN` / `DOORBELL_HC_BIN` | watch/prompt child binaries (tests set `true`) |
 | `DOORBELL_WEBHOOK_ALLOWLIST` | egress hosts allowed for `--sink webhook` rows (comma/space separated, exact or `.suffix`; absent = the daemon registers no webhook adapter and those wakes stay digest-visible) |
 | `TORON_DATA_DIR` / `TORON_MCP_DATA_DIR` / `TORON_KEY_PASSPHRASE` | toron roots + operator key (never `TORON_OPERATOR_PASSPHRASE`) |
 | `RESONATE_URL` | durable-loop server (default `http://localhost:8001`) |
-| `HERDR_SOCKET_PATH` | multiplexer socket |
+| `HC_SOCKET_PATH` | hc session socket |
 | `AGENT_NAME` | the only pin env. `--as` wins. `TORON_AGENT` and `FLYWHEEL_MAIL_AS` do not supply a pin. Unset means the guard blocks the commit |
 | `FLYWHEEL_JEV` | judgment gate (bd-0glq P7: on by default). Unset = auto (enrich iff `TYPESAFE_API_KEY` is set, else loud `jev: unconfigured` passthrough, never escalate); `1/true/yes` = force on (deny escalates even keyless); `0/false/no` = force off (byte-identical) |
 | `TYPESAFE_API_KEY` | System One key, mikasa-only custody. Absent = unconfigured lane (marker, no escalate); present + failure = I4 hard escalate. Never commit a real key |
@@ -211,7 +211,7 @@ fresh-binary SIGKILL (ad-hoc `codesign -s -`); malformed plist env
 |---|---|---|---|
 | toron reservations | holder activity | intent 5min / held 90d; the LOOP releases on a verified close (reason == bead id) | `toron reserve release --project … --as …`; operator `release-by-reason <bead>` |
 | doorbell subscriptions | pane/workspace alive | `kill` drops its spawn rows; daemon reaps week-silent spawn rows | `flywheel doorbell unsubscribe <id>` |
-| spawn registry pins | herdr pane exists | none automatic (heal warns) | `flywheel recover`; `toron role clear` |
+| spawn registry pins | hc terminal exists | none automatic (heal warns) | `flywheel recover`; `toron role clear` |
 | doorbell journals | subscription present | rotation 5k lines / 5 MiB (never silent loss) | archive, never delete |
 | bead claims | `updated_at` movement | stale ~2h (agent) / ~1 day (human) | reclaim with audit comment |
 | toron bus events | — | 100k cap / 90d prune | — |

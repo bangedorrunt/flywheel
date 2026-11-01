@@ -18,7 +18,7 @@ flywheel deps --ensure                  # toolchain health; starts resonate if d
 running (launchd com.toron.serve)
 br: idle
 bv: idle
-herdr: idle
+plane: idle
 resonate server: idle
 mail (toron): idle
 config: /Users/you/.config/flywheel/config.toml
@@ -32,7 +32,7 @@ expects of a harness and what the installed harness provides — for example a p
 that the installed binary does not have. Read the `WARNING` line it prints, because that names
 the exact function or agent list to update. `flywheel deps --ensure` repairs missing
 dependencies, but it cannot repair drift, by design: drift needs a human to decide which side
-is right. `flywheel preflight` adds herdr socket, operator key, toron mail, and standing orders
+is right. `flywheel preflight` adds hc socket, operator key, toron mail, and standing orders
 to the same check; fix FAILs there before any fleet work, because the loop and compose engine
 need resonate at `http://localhost:8001`.
 

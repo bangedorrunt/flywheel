@@ -182,7 +182,7 @@ flowchart TB
   end
   subgraph effect ["Effect actor — I/O only"]
     H["handle_workspace_cmds / doorbell host"]
-    D["decide / briefing / herdr / toron / journal"]
+    D["decide / briefing / plane / toron / journal"]
     H --> D
     D -->|"results re-enter as Msg"| MSG
   end

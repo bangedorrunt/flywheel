@@ -6,19 +6,19 @@ Pluggable multiplexer + mail. Spine targets traits, not concretes.
 
 | Role | Trait | Default | Stubs |
 |------|-------|---------|-------|
-| Multiplexer | `toron_core::backend::Backend` (re-export `MultiplexerBackend`) | auto = rex-first + herdr fallback (`backend-superlogical`); herdr when that feature is off | none (single selected backend) |
+| Multiplexer | `toron_core::backend::Backend` (re-export `MultiplexerBackend`) | auto = rex-first + hc fallback (`backend-superlogical`); hc when that feature is off | none (single selected backend) |
 | Mail | `toron_core::mailbox::surface::MailSurface` | toron (`mail-toron`) | none (single backend) |
 
 Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
 ## Identity vocabulary (ids never match across backends)
 
-| Term | herdr | rex | Notes |
+| Term | hc | rex | Notes |
 |------|-------|-----|-------|
 | Session id | workspace id (`w22`) | session id (`session:…`) | Opaque; compare only within one backend |
 | Session label | workspace label | session label | Human-readable; collides across sessions — never an identity |
 | Pane id | `wX:pY` | block id (`block:…`) | Opaque; compare only within one backend |
-| Agent name | herdr agent name | block label | Set by spawn/rename (the trusted writer); the wake binding checks it |
+| Agent name | hc terminal name | block label | Set by spawn/rename (the trusted writer); the wake binding checks it |
 | Binding stamp | `report_metadata` tokens | none — label plus session id | Provenance `report_metadata` vs `rex-label`; never mix the checks |
 
 ## Selection
@@ -27,7 +27,7 @@ Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
 | Var / key | Values | Default |
 |-----------|--------|---------|
-| `FLYWHEEL_BACKEND` / `[backend] multiplexer` | herdr \| superlogical \| auto | auto (feature on) / herdr (feature off) |
+| `FLYWHEEL_BACKEND` / `[backend] multiplexer` | hc | superlogical | auto | auto (feature on) / hc (feature off) |
 | `FLYWHEEL_MAIL` / `[backend] mail` | toron | toron |
 | `FLYWHEEL_TORON_URL` / `TOKEN` | `[mail.toron]` only | config.toml |
 | `FLYWHEEL_MAIL_NAME` | `[agent_mail] name` | `flywheel` |
@@ -38,9 +38,9 @@ Ack-overdue reads (`flywheel __ack-overdue`, `Mail::ack_overdue`) are **in-proce
 
 Mailbox root: `TORON_DATA_DIR` > `TORON_MCP_DATA_DIR` > `$XDG_DATA_HOME/toron` > `~/.local/share/toron`. Never per-pid temp. `src/mail.rs` + `src/coalition.rs` share this.
 
-Plane selection is resolved once per process (`factory::resolve_plane`) and every door reads that one answer — spawn, `status`, `snapshot`, crew launch, `preflight`, captain. `REX_SESSION` records where the process runs; it is not evidence of the plane. So `auto` is rex whenever the rex CLI answers, env or no env (`bd-mknvb`), an explicit `superlogical` pin never falls back silently, and a fallback prints one line naming its reason. A door that keyed on the env instead split the planes: spawn wrote a rex session while `status` read herdr (`bd-l7b05`).
+Plane selection is resolved once per process (`factory::resolve_plane`) and every door reads that one answer — spawn, `status`, `snapshot`, crew launch, `preflight`, captain. `REX_SESSION` records where the process runs; it is not evidence of the plane. So `auto` is rex whenever the rex CLI answers, env or no env (`bd-mknvb`), an explicit `superlogical` pin never falls back silently, and a fallback prints one line naming its reason. A door that keyed on the env instead split the planes: spawn wrote a rex session while `status` read hc (`bd-l7b05`).
 
-`auto` retries a call on herdr only for transport codes (`Connect`/`Io`/`Timeout`); semantic rejects surface loud, never masked. Pane ids are backend-namespaced (herdr `wX:pY`, rex `block:`/`session:`), and `pane_keep` matches `"herdr"` exactly, so auto skips herdr-only janitor work in the safe direction. Agent status on both backends folds one OSC 7501 grammar (`toron_core::osc7501::Board`; `src/backend/rex_map.rs`). One-shot Lua rides `rex do -e` (`integrations/rex/session-snapshot.lua`); handler scripts would outlive the call bound and must not ride it.
+`auto` retries a call on hc only for transport codes (`Connect`/`Io`/`Timeout`); semantic rejects surface loud, never masked. Pane ids are backend-namespaced (hc `t7`/`terminal:`, rex `block:`/`session:`), and `pane_keep` matches `"hc"` exactly, so auto skips plane-only janitor work in the safe direction. Agent status on both backends folds one OSC 7501 grammar (`toron_core::osc7501::Board`; `src/backend/rex_map.rs`). One-shot Lua rides `rex do -e` (`integrations/rex/session-snapshot.lua`); handler scripts would outlive the call bound and must not ride it.
 
 Liveness on rex, strongest signal first: explicit 7501 records (interactive
 pane sessions emit working/blocked/done with titles — verified live;
@@ -56,7 +56,7 @@ flywheel backend status
 flywheel backend default <multiplexer|mail> <name>
 ```
 
-herdr protocol v20. Socket: `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
+hc OpenRPC. Socket: `HC_SOCKET_PATH` or `$XDG_STATE_HOME/herdr-core/$HC_SESSION/$HC_SESSION.sock`.
 
 ## Effect-kernel authority
 
