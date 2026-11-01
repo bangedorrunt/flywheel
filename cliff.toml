@@ -67,7 +67,7 @@ commit_parsers = [
     # feature landings; the bug-fix beads land in Bug Fixes.
     { message = "^flywheel integration|^integration:", group = "<!-- 0 -->🚀 Features" },
     { message = "^duplicate-label|^pi agents spawn nameless|^bd-nil|^Bd-nil", group = "<!-- 1 -->🐛 Bug Fixes" },
-    { message = "^escalate|^respawn agents stuck|^state-file contract|^adaptive poll|^config surface|^per-agent last-sent|^resume-dedup|^typed pane wait|^__wait-output|^context verdict|^never dispatch|^confirmed sends|^--interval-active|^herdr protocol drift|^dedupe re-sends|^integration gate", group = "<!-- 0 -->🚀 Features" },
+    { message = "^escalate|^respawn agents stuck|^state-file contract|^adaptive poll|^config surface|^per-agent last-sent|^resume-dedup|^typed pane wait|^__wait-output|^context verdict|^never dispatch|^confirmed sends|^--interval-active|^hc protocol drift|^dedupe re-sends|^integration gate", group = "<!-- 0 -->🚀 Features" },
     { message = "^clippy", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
     { message = ".*", group = "<!-- 10 -->💼 Other" },
 ]

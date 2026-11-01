@@ -28,24 +28,27 @@ mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force
 `mbx +nightly-aarch64-apple-darwin test --exclude-ignored` is invalid.
 Live ignored tests need a multiplexer + mail (see Test sandbox).
 
-## Pane plane (rex default)
+## Pane plane (rex default, hc fallback)
 
-Default build features: `serve` + `backend-herdr` + `backend-superlogical` +
+Default build features: `serve` + `backend-hc` + `backend-superlogical` +
 `mail-toron`. Selection:
-`FLYWHEEL_BACKEND` / `[backend] multiplexer` ∈ `{auto,superlogical,herdr}`.
+`FLYWHEEL_BACKEND` / `[backend] multiplexer` ∈ `{auto,superlogical,hc}`.
 
-- `auto` (default when `backend-superlogical` is compiled in): **rex-primary**.
-  Every door reads one resolution (`backend::factory::resolve_plane`) —
-  spawn, status, snapshot, crew launch, preflight, captain.
-- `FLYWHEEL_BACKEND=herdr` selects herdr explicitly.
+- `auto` (default when `backend-superlogical` is compiled in): **rex-primary**
+  with **hc fallback** when no rex CLI is on PATH. Every door reads one
+  resolution (`backend::factory::resolve_plane`) — spawn, status, snapshot,
+  crew launch, preflight, captain.
+- `FLYWHEEL_BACKEND=hc` selects the hc plane explicitly.
 - `REX_SESSION` is a hint about where a process runs, never proof of the plane.
-- `flywheel preflight` reports a `pane-plane` check, not a herdr socket.
+- `flywheel preflight` reports a `pane-plane` check, not a raw socket probe.
 - Agent status on both backends folds **OSC 7501** program status
   (`idle|working|done|blocked|error|clear`) via `toron_core::osc7501::Board`.
   Spec: https://www.superlogical.com/rex/docs/build/program-status
-- Rex vocabulary: **session** / **block** (not herdr workspace/pane). Ids are
-  `session:…` / `block:…` and never compare across backends.
-- Discover the connected server: `rex api list`, `rex api describe <method>`,
+- Rex vocabulary: **session** / **block** (not hc workspace/pane/terminal). Ids
+  are `session:…` / `block:…` and never compare across backends.
+- hc vocabulary: **terminal** / **session** (`HC_SESSION`, `HC_TERMINAL_ID`);
+  socket via `HC_SOCKET_PATH` or `$XDG_STATE_HOME/herdr-core/$session/$session.sock`.
+- Discover the connected rex server: `rex api list`, `rex api describe <method>`,
   `rex api call …`. Useful methods include `session.create`,
   `session.new_split`, `session.view`, and block method
   `com.superlogical.terminal.program_status`. One-shot Lua: `rex do -e`
@@ -57,10 +60,9 @@ Default build features: `serve` + `backend-herdr` + `backend-superlogical` +
 
 ## Hosted control plane (hc)
 
-`FLYWHEEL_BACKEND=hc` is reserved for toron-core's hc backend (Part B of the
-hc-plane revamp). Until that lands, `auto` / `superlogical` remain the pane
-plane and `herdr` stays the explicit escape hatch. Do not document herdr as
-the default.
+`FLYWHEEL_BACKEND=hc` selects toron-core's hc OpenRPC backend (`src/hc_support.rs`).
+`auto` stays rex-primary with hc as the compiled-in fallback. Do not document a
+retired multiplexer alias as the default — that plane is gone.
 
 
 ## Test sandbox (hard)

@@ -6,8 +6,9 @@
 # Companion surfaces: models.toml, profiles.toml, workflows/*.yaml, crons/*.yaml,
 # stages.toml (see docs/configuration.md). Judgment env: .env.example.
 
-# herdr socket path (default ~/.config/herdr/herdr.sock)
-# socket_path = "~/.config/herdr/herdr.sock"
+# hc session socket (default: HC_SOCKET_PATH, else
+# $XDG_STATE_HOME/herdr-core/$HC_SESSION/$HC_SESSION.sock)
+# socket_path = "~/.local/state/herdr-core/default/default.sock"
 
 # default project root (default ~/workspace)
 # workspace_root = "~/workspace"
@@ -18,16 +19,16 @@
 # Resonate server URL for the durable loop (default http://localhost:8001)
 # resonate_url = "http://localhost:8001"
 
-# short name -> herdr agent kind (defaults: oc=opencode, pi=pi, gk=grok;
+# short name -> hc agent kind (defaults: oc=opencode, pi=pi, gk=grok;
 # unknown shorts pass through verbatim and fail loud at agent.start)
 # [kinds]
 # claude = "claude"
 
 # backend selection (defaults: multiplexer=auto with the rex backend compiled
-# in, else herdr; mail=toron). Values: herdr | superlogical | auto.
+# in, else hc; mail=toron). Values: hc | superlogical | auto.
 # Env overrides: FLYWHEEL_BACKEND / FLYWHEEL_MAIL.
 # [backend]
-# multiplexer = "herdr"
+# multiplexer = "hc"
 # mail = "toron"
 
 # mail transport (single-backend toron since bd-euav).

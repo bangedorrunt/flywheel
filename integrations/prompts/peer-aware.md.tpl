@@ -19,7 +19,7 @@ them as implementation work.
 
 1. IDENTITY: PUBLIC ADDRESS is the registered mail pin (`AGENT_NAME` /
    `FLYWHEEL_MAIL_AS`). Use it for `--as` / `--to` / reserve / guard /
-   presence. The herdr slug is only an internal pane handle; never use it
+   presence. The plane terminal/pane id is only an internal handle; never use it
    for those operations.
 
 2. ATTACH: `flywheel spawn` already started the doorbell for a managed

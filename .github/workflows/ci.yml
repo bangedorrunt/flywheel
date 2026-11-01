@@ -2,7 +2,7 @@
 # Actions; every local "suite green" claim was unverifiable remotely).
 #
 # Scope: bin tests + check/clippy/fmt are hermetic and run here. The five
-# integration files that shell out to herdr/br/toron-daemon
+# integration files that shell out to hc/br/toron-daemon
 # (e2e_serialize_worktree, e2e_verdict_reopen, event_poll_parity,
 # collab_patterns_e2e, chain_unblock_conformance) are env-dependent and run
 # on dev machines with the full stack adjacent; clippy --all-targets still
@@ -147,11 +147,11 @@ jobs:
             durable)
               timeout 20m cargo test --bin flywheel -- durable:: ;;
             tick-family)
-              timeout 20m cargo test --bin flywheel -- workspace:: doorbell:: doorbell_tick:: state:: herdr_shim:: mail_shim:: wake_identity_tests:: timeout_presence_tests:: waitcorr_doorbell_only_tests:: s_proof_tests:: renew_sweep_tests:: journal_effect_tests:: ;;
+              timeout 20m cargo test --bin flywheel -- workspace:: doorbell:: doorbell_tick:: state:: hc_support:: mail_shim:: wake_identity_tests:: timeout_presence_tests:: waitcorr_doorbell_only_tests:: s_proof_tests:: renew_sweep_tests:: journal_effect_tests:: ;;
             engine-family)
               timeout 20m cargo test --bin flywheel -- integration_tests:: builtin_workflows:: decide:: loop_tests:: verdict:: models:: crew:: cron:: config:: headless:: backend:: failure:: stages:: profile:: pane:: preflight:: plane_route:: coalition:: ;;
             rest)
-              timeout 20m cargo test --bin flywheel -- --skip durable:: --skip workspace:: --skip doorbell:: --skip doorbell_tick:: --skip state:: --skip herdr_shim:: --skip mail_shim:: --skip wake_identity_tests:: --skip timeout_presence_tests:: --skip waitcorr_doorbell_only_tests:: --skip s_proof_tests:: --skip renew_sweep_tests:: --skip journal_effect_tests:: --skip integration_tests:: --skip builtin_workflows:: --skip decide:: --skip loop_tests:: --skip verdict:: --skip models:: --skip crew:: --skip cron:: --skip config:: --skip headless:: --skip backend:: --skip failure:: --skip stages:: --skip profile:: --skip pane:: --skip preflight:: --skip plane_route:: --skip coalition:: ;;
+              timeout 20m cargo test --bin flywheel -- --skip durable:: --skip workspace:: --skip doorbell:: --skip doorbell_tick:: --skip state:: --skip hc_support:: --skip mail_shim:: --skip wake_identity_tests:: --skip timeout_presence_tests:: --skip waitcorr_doorbell_only_tests:: --skip s_proof_tests:: --skip renew_sweep_tests:: --skip journal_effect_tests:: --skip integration_tests:: --skip builtin_workflows:: --skip decide:: --skip loop_tests:: --skip verdict:: --skip models:: --skip crew:: --skip cron:: --skip config:: --skip headless:: --skip backend:: --skip failure:: --skip stages:: --skip profile:: --skip pane:: --skip preflight:: --skip plane_route:: --skip coalition:: ;;
             slices)
               timeout 10m cargo test --test adr0027_slice1
               timeout 10m cargo test --test adr0027_slice3

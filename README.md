@@ -1,7 +1,7 @@
 # flywheel
 
-Multi-agent swarm orchestrator with **pluggable backends** (default: **herdr**
-multiplexer + **toron** coordination) — an NTM-parity daily loop for
+Multi-agent swarm orchestrator with **pluggable backends** (default: **rex** auto with **hc**
+fallback + **toron** coordination) — an NTM-parity daily loop for
 opencode / pi / grok. Spawn swarms, dispatch the daily-driver stages (P1→P8),
 monitor states, checkpoint progress. Tracker: **br/bv**.
 
@@ -39,8 +39,8 @@ cargo install --path . --force
 
 Config: `~/.config/flywheel/config.toml` (see `config.example.toml`).
 Copy [`.env.example`](.env.example) → `.env` for local backend overrides
-(`.env` is gitignored). Default stack needs a running herdr server
-(herdr.sock) — `flywheel deps` checks everything.
+(`.env` is gitignored). Default stack needs a running pane plane (rex and/or hc;
+socket via `HC_SOCKET_PATH` / `$XDG_STATE_HOME/herdr-core/…`) — `flywheel deps` checks everything.
 
 > Re-install after pulling: workflow-surface features resolve from the
 > installed binary, not your working tree.
@@ -140,7 +140,7 @@ Facts that drive the reducer:
 | Fact | Source | Consequence |
 |------|--------|-------------|
 | `LedgerFact` (claimed/closed/reopened/blocked) | close-detect | phase transitions; close-detect → VERIFY |
-| `PaneStalled {reason, evidence_tail}` | herdr status + scrollback evidence | classified `rate_limit` / `network` / `model_truncated` / `silent_idle`; watching tier warns early, Diagnose tier acts |
+| `PaneStalled {reason, evidence_tail}` | hc/rex status + scrollback evidence | classified `rate_limit` / `network` / `model_truncated` / `silent_idle`; watching tier warns early, Diagnose tier acts |
 | `LeaseLapsed {path}` | renewal leaf | reservation renewal before dispatch; lapse is loud, never silent |
 | `Reclaim` | pane exited + budget exhausted | reservation released by reason, audit comment, bead reopened — never `br close` |
 | `GitFact` | pre-commit guard | every attributed commit lands in the fact journal |
@@ -310,11 +310,12 @@ resolve by semantic name only (`fresh-eyes-explore`, `ce-execute` — p-codes
 retired, ADR-0009). `send --stage NAME --param k=v` substitutes template
 slots; a missing required slot exits naming it.
 
-## Backend protocol (herdr default)
+## Backend protocol (hc plane)
 
-Socket protocol v19, one JSON-RPC request per connection (newline-delimited);
-`events.subscribe` keeps a long-lived stream. See `src/herdr.rs` /
-`src/backend/herdr.rs`.
+OpenRPC over the hc session socket (`HC_SOCKET_PATH` or
+`$XDG_STATE_HOME/herdr-core/$HC_SESSION/$HC_SESSION.sock`);
+`events.subscribe` keeps a long-lived stream. See `src/hc_support.rs` and
+toron-core's `backend/hc.rs`.
 
 ## Collaboration patterns
 
@@ -341,7 +342,7 @@ git cliff --bump                   # release: bump, tag, write
 
 ## Exit codes
 
-0 ok · 1 herdr/server error · 2 usage error. stdout = data, stderr = messages,
+0 ok · 1 hc/server error · 2 usage error. stdout = data, stderr = messages,
 `--json` for machine output (color auto-disabled when piped / `NO_COLOR`).
 
 ## Roadmap
