@@ -390,7 +390,7 @@ claim.
 | :--- | :--- | :--- |
 | run "succeeded" but nothing happened | dry-run default (no `--execute`) | re-run with `--execute` |
 | compose reports unknown stage/role | typo'd part | `flywheel workflow list` / stage library names are exact |
-| `agent_not_ready` during pane dispatch | crew still booting | transient — the runner retries with backoff; persistent = check the pane (hc get) |
+| A send reports `started:false` during pane dispatch | crew still booting | transient — the runner retries with backoff; persistent = check the pane (`hc get`, `hc read`) |
 | step recorded, no dispatch | recording runner (dry-run) or headless mode without execute | use `--execute`; check `--mode` |
 | slash command not expanding (opencode) | dead `command/` dir (pre-fix) or stale files | `flywheel integration opencode`, check `commands/` (plural) |
 | lint exit 2 | YAML parse failure | fix syntax; never bypass |

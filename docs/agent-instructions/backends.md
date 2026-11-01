@@ -15,11 +15,11 @@ Factory: `src/backend/factory.rs`. Code: `src/backend/`.
 
 | Term | hc | rex | Notes |
 |------|-------|-----|-------|
-| Session id | workspace id (`w22`) | session id (`session:…`) | Opaque; compare only within one backend |
+| Session id | workspace id = root terminal address (`hc:t1`) | session id (`session:…`) | Opaque; compare only within one backend |
 | Session label | workspace label | session label | Human-readable; collides across sessions — never an identity |
-| Pane id | `wX:pY` | block id (`block:…`) | Opaque; compare only within one backend |
-| Agent name | hc terminal name | block label | Set by spawn/rename (the trusted writer); the wake binding checks it |
-| Binding stamp | `report_metadata` tokens | none — label plus session id | Provenance `report_metadata` vs `rex-label`; never mix the checks |
+| Pane id | terminal address (`t7`, `hc:t7`) | block id (`block:…`) | Opaque; compare only within one backend |
+| Agent name | hc `toron_pin` label, else terminal name | block label | Set by spawn/rename (the trusted writer); the wake binding checks it |
+| Binding stamp | `terminal.label` (`toron_pin` / `toron_project` / `toron_npub`) | none — label plus session id | Provenance `hc-label` vs `rex-label`; never mix the checks |
 
 ## Selection
 
