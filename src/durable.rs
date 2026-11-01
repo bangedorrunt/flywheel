@@ -45,7 +45,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use resonate_sdk::function;
 use resonate_sdk::prelude::*;
 use toron_core::mailbox::overlaps;
 
@@ -1237,30 +1236,6 @@ pub(crate) fn not_ready_mail_status(v: &serde_json::Value) -> &'static str {
 /// (missing/malformed `## VERIFY` fence, ADR-0019). The underlying
 /// `__mail-not-ready` command always exits 0 with `{ok, notified, error}` —
 /// a mail hiccup must never kill the loop.
-#[function]
-async fn mail_not_ready(args: NotReadyMailArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args([
-        "__mail-not-ready",
-        &args.project,
-        &args.bead_id,
-        &args.title,
-    ]);
-    if let Some(reason) = &args.reason {
-        cmd.args(["--reason", reason]);
-    }
-    let out = run_leaf_cmd(cmd, "__mail-not-ready").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__mail-not-ready failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    Ok(serde_json::from_str(raw.trim())
-        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
-}
 
 /// Args for the `__mail-done` leaf (programmatic done-mail, 2026-08-18):
 /// the loop mails the captain the close-reason REPORT when a watched bead
@@ -1279,22 +1254,6 @@ pub struct MailDoneArgs {
 /// Checkpointed leaf — mail the captain that bead `bead_id` closed with a
 /// legal verdict. Always exits 0 with `{ok, notified, error}` — a mail
 /// hiccup must never kill the loop.
-#[function]
-async fn mail_done(args: MailDoneArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__mail-done", &args.project, &args.bead_id]);
-    let out = run_leaf_cmd(cmd, "__mail-done").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__mail-done failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    Ok(serde_json::from_str(raw.trim())
-        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
-}
 
 /// Args for the `__reservation-board` leaf (ADR-0019 Spec 3.4/3.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1311,22 +1270,6 @@ pub struct ReservationBoardArgs {
 /// board LIVE via [`reservation_board_live`].
 /// Always exits 0 — a mail hiccup degrades to an empty board (no
 /// suppression, existing behavior), never a loop crash.
-#[function]
-async fn reservation_board(args: ReservationBoardArgs) -> Result<Vec<(String, String)>> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__reservation-board", &args.project]);
-    let out = run_leaf_cmd(cmd, "__reservation-board").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__reservation-board failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_default();
-    Ok(parse_reservation_rows(&v))
-}
 
 /// Parse the `__reservation-board` JSON into `(path, reason)` rows. Shared
 /// by the checkpointed leaf and the live read (bd-9tbb).
@@ -1441,22 +1384,6 @@ pub struct CloseCheckArgs {
 /// `{status: missing, sha, receipt_eligible}` | `{status: no-commit}`. The
 /// loop reopens (and mails once per (bead, sha)) on anything non-legal.
 /// Always exits 0 — a git/br hiccup must never kill the loop.
-#[function]
-async fn close_check(args: CloseCheckArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__close-check", &args.project, &args.bead_id]);
-    let out = run_leaf_cmd(cmd, "__close-check").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__close-check failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    Ok(serde_json::from_str(raw.trim())
-        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
-}
 
 /// Args for the `__reopen-bead` leaf (ADR-0019, bd-w1-reopen-f6tw).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1470,23 +1397,7 @@ pub struct ReopenBeadArgs {
 
 /// Checkpointed leaf — reopen an unverified close: `br reopen` (idempotent)
 /// + ONE mail per (bead, sha) on `thread_id=<bead_id>` (marker-deduped,
-/// durable across ticks and invocations). Always exits 0.
-#[function]
-async fn reopen_bead(args: ReopenBeadArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__reopen-bead", &args.project, &args.bead_id, &args.sha]);
-    let out = run_leaf_cmd(cmd, "__reopen-bead").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__reopen-bead failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    Ok(serde_json::from_str(raw.trim())
-        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
-}
+///   durable across ticks and invocations). Always exits 0.
 
 /// Args for the `__verify-dispatch` leaf (ADR-0019 Spec 4,
 /// bd-w1-verifier-degrade-a6fk).
@@ -1513,34 +1424,6 @@ pub struct VerifyDispatchArgs {
 /// the captain exactly once (marker-deduped) + never respawns. Returns
 /// `{plan: none-required|degrade|dispatch, model?}`. Always exits 0 — a
 /// block/mail hiccup must never kill the loop.
-#[function]
-async fn verify_dispatch(args: VerifyDispatchArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__verify-dispatch", &args.project, &args.bead_id]);
-    if let Some(w) = &args.worker_model {
-        cmd.args(["--worker-model", w]);
-    }
-    if let Some(c) = &args.candidates {
-        cmd.args(["--candidates", &c.join(",")]);
-    }
-    if let Some(b) = &args.blast {
-        cmd.args(["--blast", b]);
-    }
-    if let Some(a) = &args.ac {
-        cmd.args(["--ac", a]);
-    }
-    let out = run_leaf_cmd(cmd, "__verify-dispatch").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__verify-dispatch failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    Ok(serde_json::from_str(raw.trim())
-        .unwrap_or_else(|_| serde_json::json!({ "raw": raw.trim() })))
-}
 
 /// Args for the `__loop-run-verify` leaf (ADR-0019 cheap band,
 /// bd-w1-loop-run-verify-mbbe).
@@ -1579,7 +1462,6 @@ fn verdict_at(authority: &crate::authority::RuntimeAuthority) -> chrono::DateTim
 /// the seam: `&Info` as the first parameter leaves the durable args (and the
 /// replay key built from them) untouched, because `&Info` is supplied by the
 /// runtime and is not serialized.
-#[function]
 async fn loop_run_verify(info: &Info, args: LoopRunVerifyArgs) -> Result<Value> {
     let authority = info.get_dependency::<crate::authority::RuntimeAuthority>();
     let exe = self_exe().map_err(map_err)?;
@@ -2294,18 +2176,6 @@ pub struct DiagnoseArgs {
     pub reason: String,
 }
 
-/// Args for the xproj-inbox leaf (cross-project swarm receive path).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct XprojInboxArgs {
-    pub project: String,
-    #[serde(default = "default_xproj_limit")]
-    pub limit: u32,
-}
-
-fn default_xproj_limit() -> u32 {
-    30
-}
-
 /// Mail digest for one agent (loop-side wake signal, fed by `__mail-digest`).
 ///
 /// Honest fields: toron's projection has NO read-state (`unread_only` is a
@@ -2665,44 +2535,9 @@ pub fn pane_wedge_action(i: &PaneWedgeInputs<'_>, already_paged: bool) -> PaneWe
     }
 }
 
-#[function]
-async fn poll_swarm(args: PollArgs) -> Result<Vec<AgentState>> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(poll_swarm_argv(&args.project, &args.to));
-    let out = run_leaf_cmd(cmd, "__poll").await?;
-    if !out.status.success() {
-        // Swarm gone / not spawned — soft-fail to empty so the loop settles
-        // rather than aborting the durable run.
-        let reason = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        eprintln!(
-            "flywheel: __poll soft-fail (swarm absent?): {}",
-            if reason.is_empty() {
-                format!("__poll exit {}", out.status)
-            } else {
-                reason
-            }
-        );
-        return Ok(Vec::new());
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__poll bad JSON: {e}: {raw}")))?;
-    let pairs = v
-        .get("agents")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| map_err(anyhow::anyhow!("__poll missing agents: {raw}")))?;
-    let mut out_states = Vec::with_capacity(pairs.len());
-    for p in pairs {
-        out_states.push(parse_poll_entry(p).map_err(map_err)?);
-    }
-    Ok(out_states)
-}
-
 /// Collect hc push events for up to `timeout_ms` (forward-only).
 /// Checkpointed. Empty batch on stream failure is a soft outcome (the
 /// heartbeat `__poll` remains the correctness floor).
-#[function]
 async fn poll_events(args: PollEventsArgs) -> Result<PollEventsBatch> {
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
@@ -2826,23 +2661,6 @@ pub fn log_poll_events(project: &str, batch: &PollEventsBatch) {
 
 /// List ready beads via the flywheel binary (`br ready --json` in the project).
 /// Checkpointed.
-#[function]
-async fn poll_ready(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__ready", &args.project]);
-    let out = run_leaf_cmd(cmd, "__ready").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__ready failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__ready bad JSON: {e}: {raw}")))?;
-    parse_bead_list(&v, "__ready").map_err(map_err)
-}
 
 /// Parse the `{"beads": [...]}` leaf output shared by `__ready` (id/title)
 /// and `__inprogress` (id/title/assignee) into `ReadyBead` rows. Pure —
@@ -3959,24 +3777,6 @@ pub fn escalation_tier(
     }
 }
 
-#[function]
-async fn poll_inprogress(args: ReadyArgs) -> Result<Vec<ReadyBead>> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__inprogress", &args.project]);
-    let out = run_leaf_cmd(cmd, "__inprogress").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__inprogress failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__inprogress bad JSON: {e}: {raw}")))?;
-    parse_bead_list(&v, "__inprogress").map_err(map_err)
-}
-
 /// Args for the `__reclaim-stranded` leaf (bd-627z.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReclaimArgs {
@@ -3997,107 +3797,14 @@ pub struct ReclaimResult {
 /// Reclaim stranded in_progress beads (bd-627z.1): each in_progress bead
 /// whose assignee is NOT a live agent is re-opened to ready via the
 /// `__reclaim-stranded` leaf. Checkpointed. Returns the reclaimed ids.
-#[function]
-async fn reclaim_stranded(args: ReclaimArgs) -> Result<ReclaimResult> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args([
-        "__reclaim-stranded",
-        &args.project,
-        "--live",
-        &args.live.join(","),
-    ]);
-    let out = run_leaf_cmd(cmd, "__reclaim-stranded").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__reclaim-stranded failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__reclaim-stranded bad JSON: {e}: {raw}")))?;
-    Ok(ReclaimResult {
-        reclaimed: v
-            .get("reclaimed")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        failed: v
-            .get("failed")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-    })
-}
 
 /// Agent kind (opencode/pi/grok) for respawn. Checkpointed.
-#[function]
-async fn poll_kind(args: PollKindArgs) -> Result<String> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__kind", &args.project, &args.name]);
-    let out = run_leaf_cmd(cmd, "__kind").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__kind failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
 
 /// The profile name an agent serves (bd-gsvn.1), from the spawn registry.
 /// Checkpointed leaf — the workflow body never reads files directly (replay
 /// determinism). Empty = plain swarm agent (no profile → raw dispatch).
-#[function]
-async fn resolve_agent_profile(args: ProfileArgs) -> Result<String> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__profile", &args.project, &args.name]);
-    let out = run_leaf_cmd(cmd, "__profile").await?;
-    if !out.status.success() {
-        // A registry hiccup must not stall dispatch: an empty profile keeps
-        // the send raw (byte-identical legacy path). Never a leaf failure.
-        eprintln!(
-            "flywheel: __profile failed for {} (sending raw): {}",
-            args.name,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return Ok(String::new());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
 
 /// Recent agent output via the flywheel binary. Checkpointed.
-#[function]
-async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__read", &args.project, &args.name]);
-    let out = run_leaf_cmd(cmd, "__read").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__read failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__read bad JSON: {e}: {raw}")))?;
-    let ro = parse_read_output(&v);
-    // The host captured this observation in the serializable leaf args, so
-    // the checkpointed result and replay use the same freshness instant.
-    Ok(context_verdict(
-        &ro.terminal,
-        ro.state.as_ref(),
-        args.now_unix,
-    ))
-}
 
 /// Replace an exhausted agent with a fresh instance in a new pane.
 /// Checkpointed. Logs a `Respawn` event (side effect inside the leaf so the
@@ -4108,7 +3815,6 @@ async fn read_output(args: ReadArgs) -> Result<ContextVerdict> {
 /// effect). The context_limit path passes `--force`: an idle-but-exhausted
 /// agent is healthy and MUST still be respawned — its replay window is
 /// documented at `__respawn` (main.rs).
-#[function]
 async fn respawn_agent(args: RespawnArgs) -> Result<()> {
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
@@ -4170,7 +3876,6 @@ pub struct SendOutcome {
 /// Send one prompt via the flywheel binary. Checkpointed side effect.
 /// With confirm, returns the parsed landing verdict; the legacy path returns
 /// an outcome with `landed: None`.
-#[function]
 async fn send_prompt(args: SendArgs) -> Result<SendOutcome> {
     // build-plan §5: with the comms inbox on, the leaf IS the mail.append
     // effect, in process (no `__send` subprocess, no typing, no resend).
@@ -4407,86 +4112,20 @@ async fn blocked_ack_gate(args: &NotifyArgs) -> bool {
 /// transition.
 /// bd-a7j leaf: reload the project's expected-reply entries through a
 /// checkpointed subprocess (collab may have written new ones mid-run).
-#[function]
-async fn load_expected_replies(args: ExpectedArgs) -> Result<Vec<crate::state::ExpectedReply>> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(load_expected_replies_argv(&args));
-    let out = run_leaf_cmd(cmd, "__expected-replies").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__expected-replies failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__expected-replies bad JSON: {e}: {raw}")))?;
-    Ok(parse_expected_reply_entries(&v))
-}
 
 /// bd-a7j leaf: newest (message id, author) in the thread from the asked
 /// agent. Checkpointed — replay sees the same head, so reminder/escalation
 /// decisions reproduce exactly.
-#[function]
-async fn check_reply(args: CheckReplyArgs) -> Result<(Option<String>, Option<String>)> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(check_reply_argv(&args));
-    let out = run_leaf_cmd(cmd, "__check-reply").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__check-reply failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__check-reply bad JSON: {e}: {raw}")))?;
-    Ok(parse_reply_check(&v))
-}
 
 /// bd-a7j leaf: log `reply_missing` + dispatch the concrete reminder
 /// (checkpointed unit — the event and the send land together or not at all;
 /// the send recurses into `__send` with the loop invocation, so the last-sent
 /// registry dedups re-fires on crash-resume).
-#[function]
-async fn remind_reply(args: RemindArgs) -> Result<SendOutcome> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(remind_reply_argv(&args));
-    let out = run_leaf_cmd(cmd, "__remind-reply").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__remind-reply failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let outcome: SendOutcome = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__remind-reply bad JSON: {e}: {raw}")))?;
-    Ok(outcome)
-}
 
 /// bd-a7j leaf: drop a satisfied (agent, thread) expectation so it stops
 /// keeping the loop alive. Checkpointed — the workflow body never writes
 /// files (cg6.1 discipline).
-#[function]
-async fn reply_settled(args: ReplySettledArgs) -> Result<()> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(reply_settled_argv(&args));
-    let out = run_leaf_cmd(cmd, "__reply-settled").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__reply-settled failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(())
-}
 
-#[function]
 async fn notify_blocked(args: NotifyArgs) -> Result<EscalationOutcome> {
     // ADR-0001 A6: the ladder is gated on the observed ack, read off toron's
     // per-recipient read state (not inferred from elapsed time). The read
@@ -4608,55 +4247,7 @@ pub struct ComposeInboxArgs {
     pub limit: u32,
 }
 
-#[function]
-async fn poll_compose_requests(
-    args: ComposeInboxArgs,
-) -> Result<(Vec<ComposeRequestRow>, Vec<String>)> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args([
-        "__compose-inbox",
-        &args.project,
-        "--limit",
-        &args.limit.to_string(),
-    ]);
-    let out = run_leaf_cmd(cmd, "__compose-inbox").await?;
-    if !out.status.success() {
-        return Ok((vec![], vec![]));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value =
-        serde_json::from_str(raw.trim()).unwrap_or(json!({ "items": [], "allowlist": [] }));
-    let items = v.get("items").cloned().unwrap_or(json!([]));
-    let rows: Vec<ComposeRequestRow> = serde_json::from_value(items).unwrap_or_default();
-    let allowlist = v
-        .get("allowlist")
-        .and_then(|a| serde_json::from_value::<Vec<String>>(a.clone()).ok())
-        .unwrap_or_default();
-    Ok((rows, allowlist))
-}
-
 /// Scan orchestrator inbox for `[xproj]` requests. Soft-fail empty.
-#[function]
-async fn poll_xproj_inbox(args: XprojInboxArgs) -> Result<Vec<crate::XprojInboxItem>> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args([
-        "__xproj-inbox",
-        &args.project,
-        "--limit",
-        &args.limit.to_string(),
-    ]);
-    let out = run_leaf_cmd(cmd, "__xproj-inbox").await?;
-    if !out.status.success() {
-        return Ok(vec![]);
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value = serde_json::from_str(raw.trim()).unwrap_or(json!({ "items": [] }));
-    let items = v.get("items").cloned().unwrap_or(json!([]));
-    let parsed: Vec<crate::XprojInboxItem> = serde_json::from_value(items).unwrap_or_default();
-    Ok(parsed)
-}
 
 /// bd-dispatch-dedupe-2zlz leaf: run the GOAL gate for one bead. Collects
 /// thread signals + receipts freshness via the `__dispatch-guard` collector,
@@ -4713,63 +4304,11 @@ pub(crate) fn settle_dispatch_guard_output(
 }
 
 /// scan that says hold always wins.
-#[function]
-async fn dispatch_guard_scan(args: DispatchGuardArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__dispatch-guard", &args.project, &args.bead]);
-    let out = match run_leaf_cmd(cmd, "__dispatch-guard").await {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            eprintln!(
-                "flywheel: dispatch-guard scan failed (fail-open): {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return Ok(json!({ "bead": args.bead, "dispatch": true, "reason": "scan failed" }));
-        }
-        Err(e) => {
-            eprintln!("flywheel: dispatch-guard scan error (fail-open): {e}");
-            return Ok(json!({ "bead": args.bead, "dispatch": true, "reason": "scan error" }));
-        }
-    };
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let facts: Value = serde_json::from_str(raw.trim())
-        .map_err(|e| map_err(anyhow::anyhow!("__dispatch-guard bad JSON: {e}: {raw}")))?;
-    let signals: Vec<(i64, GuardSignalKind)> = facts
-        .get("signals")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| {
-                    let ts = s.get("ts_us").and_then(Value::as_i64)?;
-                    let kind = match s.get("kind").and_then(Value::as_str)? {
-                        "claim" => GuardSignalKind::Claim,
-                        "announce" => GuardSignalKind::Announce,
-                        "done" => GuardSignalKind::Done,
-                        "stand_down" => GuardSignalKind::StandDown,
-                        "handoff" => GuardSignalKind::Handoff,
-                        _ => return None,
-                    };
-                    Some((ts, kind))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let facts = DispatchGuardFacts {
-        signals,
-        receipts_fresh_us: facts.get("receipts_fresh_us").and_then(Value::as_i64),
-    };
-    match eval_dispatch_guard(&facts, args.now_us, args.dispatch_ttl_us) {
-        Ok(()) => Ok(json!({ "bead": args.bead, "dispatch": true, "reason": null })),
-        Err(reason) => Ok(json!({ "bead": args.bead, "dispatch": false, "reason": reason })),
-    }
-}
 
 /// Spawn the swarm for a parsed `[xproj]` request (full loop branch).
 /// Delegates to the `__xproj-spawn` leaf which calls `cmd_spawn` + replies
 /// in-thread. Soft-fail: spawn errors are surfaced in-thread by the leaf, the
 /// loop continues.
-#[function]
 async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
     // cg6.3: at-most-once per request — mark BEFORE spawning so a crash-
     // window replay no-ops instead of spawning two swarms for one [xproj]
@@ -4817,7 +4356,6 @@ async fn spawn_xproj(args: XprojSpawnArgs) -> Result<()> {
 
 /// Diagnose an unresponsive agent: capture recent output + high-importance
 /// health mail (bd-event-self-heal). Soft-fail: never kill the loop.
-#[function]
 async fn diagnose_agent(args: DiagnoseArgs) -> Result<Value> {
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
@@ -4866,26 +4404,6 @@ pub struct RenewLeaseArgs {
 /// idempotently (renewing an already-fresh lease is a no-op). Best-effort by
 /// contract: the caller logs a failure and continues — a missed renew is
 /// recoverable on the next tick and must never kill an overnight loop.
-#[function]
-async fn renew_leases(args: RenewLeaseArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args([
-        "__renew-leases",
-        &args.project,
-        &args.extend_seconds.to_string(),
-    ]);
-    let out = run_leaf_cmd(cmd, "__renew-leases").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__renew-leases failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout)
-        .map_err(|e| map_err(anyhow::anyhow!("__renew-leases bad JSON: {e}: {stdout}")))
-}
 
 /// bd-bd79: filtered renewal — renew only leases whose reason matches an
 /// in_progress bead with a live assignee and that are near expiry.
@@ -4921,7 +4439,6 @@ fn renew_filtered_sync(
     Ok(json!({ "renewed": v.renewed, "paths": paths }))
 }
 
-#[function]
 async fn renew_filtered_leases(args: RenewFilteredArgs) -> Result<Value> {
     if args.paths.is_empty() {
         return Ok(json!({ "renewed": 0, "paths": [] }));
@@ -4957,25 +4474,6 @@ pub struct ReleaseBeadLocksArgs {
 /// resumed idempotently (a no-op release is fine). Best-effort by contract:
 /// the caller logs a failure and continues — a failed release is recoverable
 /// on a later tick and must never kill the loop.
-#[function]
-async fn release_bead_locks(args: ReleaseBeadLocksArgs) -> Result<Value> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(["__release-bead-locks", &args.project, &args.bead_id]);
-    let out = run_leaf_cmd(cmd, "__release-bead-locks").await?;
-    if !out.status.success() {
-        return Err(map_err(anyhow::anyhow!(
-            "__release-bead-locks failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout).map_err(|e| {
-        map_err(anyhow::anyhow!(
-            "__release-bead-locks bad JSON: {e}: {stdout}"
-        ))
-    })
-}
 
 /// Lease TTL policy for loop-made reservations: an initial TTL of
 /// Renewal extension per heartbeat tick: `4 × heartbeat_interval`, floored at
@@ -5436,26 +4934,6 @@ pub struct ContextInboxArgs {
 /// Scan the orchestrator inbox for exact-body CONTEXT_LIMIT crew replies
 /// (bd-context-limit-honor-luqg). Runs `__context-inbox`; a failure yields
 /// an empty list — a mail hiccup must never stall the loop.
-#[function]
-async fn poll_context_inbox(args: ContextInboxArgs) -> Result<Vec<crate::XprojInboxItem>> {
-    let exe = self_exe().map_err(map_err)?;
-    let mut cmd = Command::new(&exe);
-    cmd.args([
-        "__context-inbox",
-        &args.project,
-        "--limit",
-        &args.limit.to_string(),
-    ]);
-    let out = run_leaf_cmd(cmd, "__context-inbox").await?;
-    if !out.status.success() {
-        return Ok(vec![]);
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let v: Value = serde_json::from_str(raw.trim()).unwrap_or(json!({ "items": [] }));
-    let items = v.get("items").cloned().unwrap_or(json!([]));
-    let parsed: Vec<crate::XprojInboxItem> = serde_json::from_value(items).unwrap_or_default();
-    Ok(parsed)
-}
 
 /// Map a CONTEXT_LIMIT sender to the crew agent it saturates: MAIL PIN
 /// first (the identity the contract addresses), then the bare terminal name.
@@ -6610,32 +6088,23 @@ fn blind_completion_count(complete_now: bool, leaf_failed: bool, consecutive: u3
     }
 }
 
-/// bd-swarm-loop-durable-panic-atlo: the outcome marker a RESUMED invocation
-/// returns when the stale-checkpoint signature trips. `run_durable_loop` sees
-/// it, starts one fresh invocation, and the operator gets one loud line.
-pub const STALE_CHECKPOINT_DEGRADE: &str = "stale-checkpoint-degrade";
-
 /// bd-swarm-loop-durable-panic-atlo: what the blind-completion door does once
 /// [`blind_completion_count`] reaches the abort threshold (pure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlindCompletion {
     /// Below the threshold — keep polling (the WARN prints each pass).
     Continue,
-    /// Threshold on a RESUMED invocation: its checkpointed leaf results no
-    /// longer fit this binary. Degrade to a fresh run instead of aborting.
-    DegradeFresh,
-    /// Threshold on a fresh run: nothing to degrade to. Abort with the fix.
+    /// Threshold reached: abort with the fix. No stale-checkpoint degrade —
+    /// plain async execution has no replay, so a resumed run cannot deserialize
+    /// stale leaves.
     Abort,
 }
 
-/// Pure: the blind-completion outcome for (resumed, failures, threshold).
-/// A resumed invocation degrades to a fresh run; only a fresh invocation
-/// (which cannot be replaying stale checkpoints) aborts.
-pub fn blind_completion_outcome(resumed: bool, failures: u32, threshold: u32) -> BlindCompletion {
+/// Pure: the blind-completion outcome for (failures, threshold).
+/// A blind run aborts once the threshold trips; there is no degrade path.
+pub fn blind_completion_outcome(_resumed: bool, failures: u32, threshold: u32) -> BlindCompletion {
     if failures < threshold {
         BlindCompletion::Continue
-    } else if resumed {
-        BlindCompletion::DegradeFresh
     } else {
         BlindCompletion::Abort
     }
@@ -6868,7 +6337,6 @@ pub struct ReclaimBeadArgs {
     pub terminal_name: String,
     pub reason: String,
 }
-#[function]
 async fn reclaim_bead(args: ReclaimBeadArgs) -> Result<Value> {
     let exe = self_exe().map_err(map_err)?;
     let mut cmd = Command::new(&exe);
@@ -7104,10 +6572,9 @@ pub fn self_heal_step(
 /// cg6.2: leaf errors NEVER abort the loop — on a poll_kind or respawn_agent
 /// failure the failure is logged and the queue is left unchanged (the next
 /// poll re-derives the agent's state; the send-dedup prevents duplicates).
-#[allow(clippy::too_many_arguments)] // the single respawn point: ctx, params, queue,
+#[allow(clippy::too_many_arguments)] // the single respawn point: params, queue,
 // kinds, name, text, reason, attempts — every parameter is load-bearing.
 async fn respawn_and_requeue(
-    ctx: &Context,
     params: &LoopParams,
     queue: &mut Vec<String>,
     kinds: &std::collections::HashMap<String, String>,
@@ -7136,19 +6603,15 @@ async fn respawn_and_requeue(
             }
         },
     };
-    if let Err(e) = ctx
-        .run(
-            respawn_agent,
-            RespawnArgs {
-                project: params.project.clone(),
-                name: name.to_string(),
-                kind,
-                reason: reason.to_string(),
-                attempts,
-                text_hash: text.map(crate::state::fnv1a64),
-            },
-        )
-        .await
+    if let Err(e) = respawn_agent(RespawnArgs {
+        project: params.project.clone(),
+        name: name.to_string(),
+        kind,
+        reason: reason.to_string(),
+        attempts,
+        text_hash: text.map(crate::state::fnv1a64),
+    })
+    .await
     {
         // cg6.2: hc hiccup during respawn must not kill the loop — the
         // prompt is NOT requeued (the respawn may not have happened; the
@@ -7297,12 +6760,11 @@ pub fn spawn_graph_vehicle(
     Ok(VehicleOutcome::Spawned)
 }
 
-#[function]
-async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
-    // bd-0fvb: the host edge resolves the authority once and injects it;
-    // the durable function reads it from the invocation context, so a
-    // replay never re-resolves ambient process state behind the checkpoint.
-    let authority = ctx.get_dependency::<crate::authority::RuntimeAuthority>();
+async fn swarm_loop(
+    authority: crate::authority::RuntimeAuthority,
+    params: LoopParams,
+) -> Result<String> {
+    // bd-0fvb: host edge resolves authority once and passes it in; plain async, no replay.
     // bd-bpd9: beads whose graph vehicle was already spawned this process.
     let mut graph_invoked: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ADR-0026 W2: loop-identity fail-loud — hard-error at start if no usable key
@@ -7475,16 +6937,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
         // ---- event wake (latency optimization, forward-only) ----
         // Blocks up to wait_secs collecting push events. Empty batch on
         // idle/timeout is normal. Stream errors soft-fail into heartbeat.
-        let event_batch: PollEventsBatch = match ctx
-            .run(
-                poll_events,
-                PollEventsArgs {
-                    project: params.project.clone(),
-                    timeout_ms: wait_secs.saturating_mul(1000),
-                    after_seq: event_cursor_seq,
-                },
-            )
-            .await
+        let event_batch: PollEventsBatch = match poll_events(PollEventsArgs {
+            project: params.project.clone(),
+            timeout_ms: wait_secs.saturating_mul(1000),
+            after_seq: event_cursor_seq,
+        })
+        .await
         {
             Ok(b) => b,
             Err(e) => {
@@ -7615,19 +7073,15 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             let req = crate::parse_xproj_request(&combined);
             let action = if let Some(r) = req.filter(|r| !r.recipe.is_empty()) {
                 // FULL BRANCH: spawn the requested swarm directly.
-                let spawned = ctx
-                    .run(
-                        spawn_xproj,
-                        XprojSpawnArgs {
-                            project: params.project.clone(),
-                            message_id: item.id.clone(),
-                            thread_id: item.thread_id.clone(),
-                            from: item.from.clone(),
-                            recipe: r.recipe.clone(),
-                            workers: r.workers,
-                        },
-                    )
-                    .await;
+                let spawned = spawn_xproj(XprojSpawnArgs {
+                    project: params.project.clone(),
+                    message_id: item.id.clone(),
+                    thread_id: item.thread_id.clone(),
+                    from: item.from.clone(),
+                    recipe: r.recipe.clone(),
+                    workers: r.workers,
+                })
+                .await;
                 match &spawned {
                     Ok(()) => {
                         // cg6.6: mark seen only AFTER a successful spawn —
@@ -7762,7 +7216,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
             );
             ctx_suppressed.insert(target.clone());
             respawn_and_requeue(
-                ctx,
                 &params,
                 &mut queue,
                 &agent_kinds,
@@ -8699,16 +8152,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 leases_to_renew_simple(&board, &inprog_for_renew, &live_names);
             if !to_renew.is_empty() {
                 let paths: Vec<String> = to_renew.iter().map(|(p, _)| p.clone()).collect();
-                match ctx
-                    .run(
-                        renew_filtered_leases,
-                        RenewFilteredArgs {
-                            project: params.project.clone(),
-                            paths: paths.clone(),
-                            extend_seconds: renew_extend,
-                        },
-                    )
-                    .await
+                match renew_filtered_leases(RenewFilteredArgs {
+                    project: params.project.clone(),
+                    paths: paths.clone(),
+                    extend_seconds: renew_extend,
+                })
+                .await
                 {
                     Ok(v) => {
                         let renewed = v.get("renewed").and_then(Value::as_u64).unwrap_or(0);
@@ -9295,7 +8744,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     if verdict == ContextVerdict::Exhausted {
                         clear_dispatch_pending(&mut dispatch_pending, name, Some(false));
                         respawn_and_requeue(
-                            ctx,
                             &params,
                             &mut queue,
                             &agent_kinds,
@@ -9307,42 +8755,36 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         .await; // cg6.2: soft — leaf failures logged inside
                         continue;
                     }
-                    let outcome = match ctx
-                        .run(
-                            send_prompt,
-                            SendArgs {
-                                project: params.project.clone(),
-                                name: name.clone(),
-                                text: text.clone(),
-                                confirm: params.confirm_sends,
-                                confirm_timeout_ms: params.confirm_timeout_ms,
-                                invocation: params.invocation.clone(),
-                                iteration,
-                                profile: match crate::elm::leaf::run_leaf_journaled(
-                                    &params.project,
-                                    "__profile",
-                                    &[&params.project, name],
-                                    &format!("profile:{}:{name}", params.project),
-                                ) {
-                                    Ok(v) => v
-                                        .as_str()
-                                        .map(|s| s.to_string())
-                                        .or_else(|| {
-                                            v.get("raw")
-                                                .and_then(|r| r.as_str())
-                                                .map(|s| s.to_string())
-                                        })
-                                        .unwrap_or_default(),
-                                    Err(e) => {
-                                        eprintln!(
-                                            "flywheel: __profile failed for {name} (sending raw): {e}"
-                                        );
-                                        String::new()
-                                    }
-                                },
-                            },
-                        )
-                        .await
+                    let outcome = match send_prompt(SendArgs {
+                        project: params.project.clone(),
+                        name: name.clone(),
+                        text: text.clone(),
+                        confirm: params.confirm_sends,
+                        confirm_timeout_ms: params.confirm_timeout_ms,
+                        invocation: params.invocation.clone(),
+                        iteration,
+                        profile: match crate::elm::leaf::run_leaf_journaled(
+                            &params.project,
+                            "__profile",
+                            &[&params.project, name],
+                            &format!("profile:{}:{name}", params.project),
+                        ) {
+                            Ok(v) => v
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    v.get("raw").and_then(|r| r.as_str()).map(|s| s.to_string())
+                                })
+                                .unwrap_or_default(),
+                            Err(e) => {
+                                eprintln!(
+                                    "flywheel: __profile failed for {name} (sending raw): {e}"
+                                );
+                                String::new()
+                            }
+                        },
+                    })
+                    .await
                     {
                         Ok(o) => o,
                         // leaf error = the prompt did not land (agent dropped
@@ -9399,7 +8841,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                             let attempts = send_failures.get(name).copied().unwrap_or(0);
                             let reason = outcome.reason.as_deref().unwrap_or("stalled");
                             respawn_and_requeue(
-                                ctx,
                                 &params,
                                 &mut queue,
                                 &agent_kinds,
@@ -9426,20 +8867,16 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // replayed, never re-executed; even an in-flight
                         // re-execution derives from persisted state, so the
                         // tier cannot jump).
-                        let out = match ctx
-                            .run(
-                                notify_blocked,
-                                NotifyArgs {
-                                    project: params.project.clone(),
-                                    name: name.clone(),
-                                    now_us: authority.now_unix() as i64 * 1_000_000,
-                                    first_blocked_ts: None,
-                                    interval_secs: params.interval_secs,
-                                    params: serde_json::to_value(&params)
-                                        .unwrap_or(serde_json::Value::Null),
-                                },
-                            )
-                            .await
+                        let out = match notify_blocked(NotifyArgs {
+                            project: params.project.clone(),
+                            name: name.clone(),
+                            now_us: authority.now_unix() as i64 * 1_000_000,
+                            first_blocked_ts: None,
+                            interval_secs: params.interval_secs,
+                            params: serde_json::to_value(&params)
+                                .unwrap_or(serde_json::Value::Null),
+                        })
+                        .await
                         {
                             Ok(o) => o,
                             Err(e) => {
@@ -9503,21 +8940,17 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                 LoopAction::Nudge { name } => {
                     let rot_hit = bump_nudge_streak(&mut states, name);
                     if rot_hit == crate::rot::RotAction::Compact {
-                        let _ = ctx
-                            .run(
-                                send_prompt,
-                                SendArgs {
-                                    project: params.project.clone(),
-                                    name: name.clone(),
-                                    text: crate::rot::compact_prompt().into(),
-                                    confirm: params.confirm_sends,
-                                    confirm_timeout_ms: params.confirm_timeout_ms,
-                                    invocation: params.invocation.clone(),
-                                    iteration,
-                                    profile: String::new(),
-                                },
-                            )
-                            .await;
+                        let _ = send_prompt(SendArgs {
+                            project: params.project.clone(),
+                            name: name.clone(),
+                            text: crate::rot::compact_prompt().into(),
+                            confirm: params.confirm_sends,
+                            confirm_timeout_ms: params.confirm_timeout_ms,
+                            invocation: params.invocation.clone(),
+                            iteration,
+                            profile: String::new(),
+                        })
+                        .await;
                     }
                     if let Some(n) = &params.nudge {
                         // same failure contract as the Send path: a leaf error
@@ -9525,42 +8958,36 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         // escalate to a respawn so the fresh instance gets
                         // nudged next poll. A nudge consumes nothing from the
                         // queue, so there is nothing to requeue.
-                        let outcome = match ctx
-                            .run(
-                                send_prompt,
-                                SendArgs {
-                                    project: params.project.clone(),
-                                    name: name.clone(),
-                                    text: n.clone(),
-                                    confirm: params.confirm_sends,
-                                    confirm_timeout_ms: params.confirm_timeout_ms,
-                                    invocation: params.invocation.clone(),
-                                    iteration,
-                                    profile: match crate::elm::leaf::run_leaf_journaled(
-                                        &params.project,
-                                        "__profile",
-                                        &[&params.project, name],
-                                        &format!("profile:{}:{name}", params.project),
-                                    ) {
-                                        Ok(v) => v
-                                            .as_str()
-                                            .map(|s| s.to_string())
-                                            .or_else(|| {
-                                                v.get("raw")
-                                                    .and_then(|r| r.as_str())
-                                                    .map(|s| s.to_string())
-                                            })
-                                            .unwrap_or_default(),
-                                        Err(e) => {
-                                            eprintln!(
-                                                "flywheel: __profile failed for {name} (sending raw): {e}"
-                                            );
-                                            String::new()
-                                        }
-                                    },
-                                },
-                            )
-                            .await
+                        let outcome = match send_prompt(SendArgs {
+                            project: params.project.clone(),
+                            name: name.clone(),
+                            text: n.clone(),
+                            confirm: params.confirm_sends,
+                            confirm_timeout_ms: params.confirm_timeout_ms,
+                            invocation: params.invocation.clone(),
+                            iteration,
+                            profile: match crate::elm::leaf::run_leaf_journaled(
+                                &params.project,
+                                "__profile",
+                                &[&params.project, name],
+                                &format!("profile:{}:{name}", params.project),
+                            ) {
+                                Ok(v) => v
+                                    .as_str()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| {
+                                        v.get("raw").and_then(|r| r.as_str()).map(|s| s.to_string())
+                                    })
+                                    .unwrap_or_default(),
+                                Err(e) => {
+                                    eprintln!(
+                                        "flywheel: __profile failed for {name} (sending raw): {e}"
+                                    );
+                                    String::new()
+                                }
+                            },
+                        })
+                        .await
                         {
                             Ok(o) => o,
                             Err(e) => SendOutcome {
@@ -9593,7 +9020,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                                 let attempts = send_failures.get(name).copied().unwrap_or(0);
                                 let reason = outcome.reason.as_deref().unwrap_or("stalled");
                                 respawn_and_requeue(
-                                    ctx,
                                     &params,
                                     &mut queue,
                                     &agent_kinds,
@@ -9608,16 +9034,12 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     }
                 }
                 LoopAction::Diagnose { name, reason } => {
-                    let diag = ctx
-                        .run(
-                            diagnose_agent,
-                            DiagnoseArgs {
-                                project: params.project.clone(),
-                                name: name.clone(),
-                                reason: reason.clone(),
-                            },
-                        )
-                        .await;
+                    let diag = diagnose_agent(DiagnoseArgs {
+                        project: params.project.clone(),
+                        name: name.clone(),
+                        reason: reason.clone(),
+                    })
+                    .await;
                     match diag {
                         Ok(_) => {
                             // awaiting_clear/diagnose_count advanced in tick's
@@ -9734,7 +9156,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         continue;
                     }
                     respawn_and_requeue(
-                        ctx,
                         &params,
                         &mut queue,
                         &agent_kinds,
@@ -9752,18 +9173,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                     terminal_name,
                     reason,
                 } => {
-                    let _ = ctx
-                        .run(
-                            reclaim_bead,
-                            ReclaimBeadArgs {
-                                project: params.project.clone(),
-                                bead_id: bead_id.clone(),
-                                pin: pin.clone(),
-                                terminal_name: terminal_name.clone(),
-                                reason: reason.clone(),
-                            },
-                        )
-                        .await;
+                    let _ = reclaim_bead(ReclaimBeadArgs {
+                        project: params.project.clone(),
+                        bead_id: bead_id.clone(),
+                        pin: pin.clone(),
+                        terminal_name: terminal_name.clone(),
+                        reason: reason.clone(),
+                    })
+                    .await;
                     any_work = true;
                 }
                 LoopAction::Wait => {}
@@ -9863,12 +9280,6 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
                         );
                         wait_secs = params.active_interval_secs.clamp(5, 30);
                     }
-                    BlindCompletion::DegradeFresh => {
-                        eprintln!(
-                            "flywheel: {blind_complete_failures} consecutive critical-leaf failures with an empty world on a RESUMED invocation — the checkpointed leaf results do not fit this binary (stale-checkpoint signature). Degrading to a fresh run; checkpoints are not replayed."
-                        );
-                        return Ok(STALE_CHECKPOINT_DEGRADE.to_string());
-                    }
                     BlindCompletion::Abort => {
                         return Err(map_err(anyhow::anyhow!(
                             "loop abort: {blind_complete_failures} consecutive critical-leaf failures while the world looked empty (poll_events/poll_swarm/poll_ready/poll_inprogress/expected-replies) — the loop cannot see the tracker or the swarm. Fix: `flywheel loop-mode doctor --fix` (diagnose loop infrastructure), then re-run."
@@ -9916,116 +9327,14 @@ async fn swarm_loop(ctx: &Context, params: LoopParams) -> Result<String> {
 
 /// Register the durable functions and start (or resume) the loop invocation.
 /// Returns the workflow result; the process must stay alive while awaiting.
-pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::Result<String> {
-    let url = cfg
-        .resonate_url()
-        .unwrap_or_else(|| "http://127.0.0.1:8001".to_string());
-    // bd-fw-durable-worker-errors-65a: a worker polls its GROUP anycast —
-    // the default group accumulates STALE pending invocations (killed runs
-    // from previous days), and a fresh worker would execute every one of
-    // them: replaying their checkpointed children against the CURRENT leaf
-    // sequence causes child-id collisions (one leaf reads another's stored
-    // result → serialization errors) and cross-project dispatch. A
-    // per-project group scopes the worker to its own task.
-    let base = params.project.rsplit('/').next().unwrap_or(&params.project);
-    // bd-0fvb: resolve the host authority ONCE here and inject it into the
-    // durable world — swarm_loop takes it from the invocation context, so
-    // the checkpointed function never resolves ambient process state.
+pub async fn run_durable_loop(_cfg: &Config, mut params: LoopParams) -> anyhow::Result<String> {
+    // bd-flywheel-loop-substrate-ftpm: Resonate-free runner — local durable
+    // liveness row (ActiveLoop) + pid-registry dead-owner sweep. No server,
+    // no worker/group anycast, no checkpoint replay.
+    // bd-0fvb: resolve the host authority once and pass it to the loop body.
     let authority = crate::authority::RuntimeAuthority::resolve();
-    let resonate = Resonate::new(ResonateConfig {
-        url: Some(url.clone()),
-        group: Some(format!("flywheel-{base}")),
-        ..Default::default()
-    })
-    .with_dependency(authority.clone());
 
-    resonate
-        .register(swarm_loop)
-        .map_err(|e| anyhow::anyhow!("register swarm_loop: {e}"))?;
-    resonate
-        .register(poll_swarm)
-        .map_err(|e| anyhow::anyhow!("register poll_swarm: {e}"))?;
-    resonate
-        .register(poll_events)
-        .map_err(|e| anyhow::anyhow!("register poll_events: {e}"))?;
-    resonate
-        .register(send_prompt)
-        .map_err(|e| anyhow::anyhow!("register send_prompt: {e}"))?;
-    resonate
-        .register(notify_blocked)
-        .map_err(|e| anyhow::anyhow!("register notify_blocked: {e}"))?;
-    resonate
-        .register(diagnose_agent)
-        .map_err(|e| anyhow::anyhow!("register diagnose_agent: {e}"))?;
-    resonate
-        .register(poll_xproj_inbox)
-        .map_err(|e| anyhow::anyhow!("register poll_xproj_inbox: {e}"))?;
-    resonate
-        .register(spawn_xproj)
-        .map_err(|e| anyhow::anyhow!("register spawn_xproj: {e}"))?;
-    resonate
-        .register(renew_leases)
-        .map_err(|e| anyhow::anyhow!("register renew_leases: {e}"))?;
-    resonate
-        .register(renew_filtered_leases)
-        .map_err(|e| anyhow::anyhow!("register renew_filtered_leases: {e}"))?;
-    resonate
-        .register(release_bead_locks)
-        .map_err(|e| anyhow::anyhow!("register release_bead_locks: {e}"))?;
-    resonate
-        .register(poll_ready)
-        .map_err(|e| anyhow::anyhow!("register poll_ready: {e}"))?;
-    resonate
-        .register(dispatch_guard_scan)
-        .map_err(|e| anyhow::anyhow!("register dispatch_guard_scan: {e}"))?;
-    resonate
-        .register(mail_not_ready)
-        .map_err(|e| anyhow::anyhow!("register mail_not_ready: {e}"))?;
-    resonate
-        .register(close_check)
-        .map_err(|e| anyhow::anyhow!("register close_check: {e}"))?;
-    resonate
-        .register(reopen_bead)
-        .map_err(|e| anyhow::anyhow!("register reopen_bead: {e}"))?;
-    resonate
-        .register(verify_dispatch)
-        .map_err(|e| anyhow::anyhow!("register verify_dispatch: {e}"))?;
-    resonate
-        .register(loop_run_verify)
-        .map_err(|e| anyhow::anyhow!("register loop_run_verify: {e}"))?;
-    resonate
-        .register(reservation_board)
-        .map_err(|e| anyhow::anyhow!("register reservation_board: {e}"))?;
-    resonate
-        .register(poll_inprogress)
-        .map_err(|e| anyhow::anyhow!("register poll_inprogress: {e}"))?;
-    resonate
-        .register(reclaim_stranded)
-        .map_err(|e| anyhow::anyhow!("register reclaim_stranded: {e}"))?;
-    resonate
-        .register(load_expected_replies)
-        .map_err(|e| anyhow::anyhow!("register load_expected_replies: {e}"))?;
-    resonate
-        .register(check_reply)
-        .map_err(|e| anyhow::anyhow!("register check_reply: {e}"))?;
-    resonate
-        .register(remind_reply)
-        .map_err(|e| anyhow::anyhow!("register remind_reply: {e}"))?;
-    resonate
-        .register(reply_settled)
-        .map_err(|e| anyhow::anyhow!("register reply_settled: {e}"))?;
-    resonate
-        .register(read_output)
-        .map_err(|e| anyhow::anyhow!("register read_output: {e}"))?;
-    resonate
-        .register(poll_kind)
-        .map_err(|e| anyhow::anyhow!("register poll_kind: {e}"))?;
-    resonate
-        .register(resolve_agent_profile)
-        .map_err(|e| anyhow::anyhow!("register resolve_agent_profile: {e}"))?;
-    resonate
-        .register(respawn_agent)
-        .map_err(|e| anyhow::anyhow!("register respawn_agent: {e}"))?;
+    // no Resonate registration — plain async leaves, no worker/group.
 
     // Resume semantics (bd-swarm-loop-durable-panic-atlo): resuming a pending
     // invocation is OPT-IN via --resume. A pending promise at start belongs to
@@ -10042,15 +9351,13 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
     // bd-0fvb: stamped from the same authority instance that was injected.
     let now_nanos = authority.clock.now_nanos();
     let prior = crate::state::load_active_loop(&params.project)?;
-    let prior_pending = match &prior {
-        Some(al) => promise_pending(&resonate, &al.id).await?,
-        None => false,
-    };
+    // Local liveness row: a stored ActiveLoop id means a prior invocation exists.
+    // No server query — the pid registry decides live vs dead below.
+    let prior_pending = prior.is_some();
     let start = loop_start_decision(prior_pending, params.force, params.resume);
-    // the workflow body must know whether THIS invocation resumed — the
-    // stale-checkpoint degrade keys off it
+    // `params.resume` records whether this run resumed; no checkpoint replay exists.
     params.resume = start == LoopStart::Resume;
-    let mut id = match (start, prior) {
+    let id = match (start, prior) {
         (LoopStart::Resume, Some(al)) => {
             eprintln!(
                 "flywheel: resuming existing loop {} (--resume)",
@@ -10064,14 +9371,9 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
                     "flywheel: --force rejecting stale loop invocation {} (fresh run)",
                     dim_id(&al.id)
                 );
-                let v = resonate_sdk::types::Value::from_serializable(serde_json::json!({
-                    "rejected": "force-takeover",
-                }))
-                .unwrap_or_default();
-                let _ = resonate.promises.reject(&al.id, v).await;
             } else {
                 eprintln!(
-                    "flywheel: previous loop invocation {} is still pending but its run is dead — starting FRESH (checkpoints are NOT replayed; pass --resume to replay the killed run)",
+                    "flywheel: previous loop invocation {} is still pending but its run is dead — starting FRESH (no replay; pass --resume to reuse the id)",
                     dim_id(&al.id)
                 );
             }
@@ -10090,58 +9392,35 @@ pub async fn run_durable_loop(cfg: &Config, mut params: LoopParams) -> anyhow::R
         )?,
     };
 
-    // bd-87hq: clear the project's OTHER stale pending loop invocations on the
-    // server (killed/abandoned runs). The worker's group anycast replays them,
-    // and replaying their checkpointed children against the CURRENT leaf
-    // sequence causes child-id collisions — one leaf reads another's stored
-    // result → the poll_* serialization errors. Preserve `id` (the invocation
-    // this run owns/resumes); reject the rest. Unconditional so a plain
-    // `flywheel loop run` is safe, not only --force.
-    clear_stale_loop_invocations(&resonate, base, Some(&id)).await;
+    // Dead-owner sweep over local rows (no server): select stale row ids
+    // with the same prefix rule, then drop a dead pid entry.
+    // Keeps `stale_loop_reject_ids`/`id_is_project_loop` live on rows.
+    {
+        let base = params.project.rsplit('/').next().unwrap_or(&params.project);
+        let (_schema, loops) =
+            crate::state::load_loops_registry().unwrap_or((0, Default::default()));
+        let ids: Vec<&str> = loops.values().map(|al| al.id.as_str()).collect();
+        let _candidates = stale_loop_reject_ids(&ids, base, Some(&id));
+        let pids = crate::state::load_loop_pids();
+        if let Some(entry) = pids.get(&params.project)
+            && !crate::state::pid_alive(entry.pid)
+        {
+            crate::state::unregister_loop(&params.project, entry.pid);
+        }
+    }
 
-    // bd-bvwf.4: verify ownership before the durable run — a newer process may
+    // bd-bvwf.4: verify ownership before the run — a newer process may
     // have taken over the pid registry while this one resolved its
     // invocation; the loser must never run it (two loops = double sends).
     crate::state::ensure_loop_owner(&params.project)?;
 
-    // bd-swarm-loop-durable-panic-atlo: a resumed invocation whose replay hits
-    // the stale-checkpoint signature returns STALE_CHECKPOINT_DEGRADE instead
-    // of aborting; take it over with ONE fresh invocation. The fresh run
-    // cannot replay stale checkpoints, so a second marker means the
-    // environment (tracker/swarm) is genuinely unreadable — abort.
-    let mut can_degrade = start == LoopStart::Resume;
-    loop {
-        // the workflow must know its own invocation id for the last-sent
-        // registry (bd-resume-dedup filters records to the SAME invocation)
-        params.invocation = id.clone();
-        let task = resonate.run(&id, swarm_loop, params.clone());
-        let result: String = task
-            .await
-            .map_err(|e| anyhow::anyhow!("durable loop invocation failed: {e}"))?;
-        if result == STALE_CHECKPOINT_DEGRADE {
-            if can_degrade {
-                eprintln!(
-                    "flywheel: invocation {} hit the stale-checkpoint signature — starting a FRESH run; checkpoints are not replayed",
-                    dim_id(&id)
-                );
-                can_degrade = false;
-                params.resume = false;
-                id = fresh_loop_id(
-                    &params.project,
-                    &serde_json::to_value(&params)?,
-                    "swarm-loop",
-                    authority.clock.now_nanos(),
-                )?;
-                continue;
-            }
-            let _ = resonate.stop().await;
-            anyhow::bail!(
-                "loop is blind on a fresh run (critical leaf failures with an empty world) — fix: `flywheel loop-mode doctor --fix`, then re-run"
-            );
-        }
-        let _ = resonate.stop().await;
-        return Ok(result);
-    }
+    // Direct execution: no worker, no replay, no stop handle.
+    // Process exit + dead-owner sweep is the stop path.
+    params.invocation = id.clone();
+    let result: String = swarm_loop(authority, params)
+        .await
+        .map_err(|e| anyhow::anyhow!("durable loop failed: {e}"))?;
+    Ok(result)
 }
 
 fn dim_id(id: &str) -> String {
@@ -10226,52 +9505,6 @@ fn stale_loop_reject_ids<'a>(ids: &[&'a str], base: &str, except: Option<&str>) 
         .collect()
 }
 
-/// bd-87hq: reject stale PENDING loop invocations for `base` on the resonate
-/// server. Killed/abandoned loop runs leave pending root promises; the
-/// worker's group anycast replays them, and replaying their checkpointed
-/// children against the CURRENT leaf sequence causes child-id collisions —
-/// one leaf reads another's stored result → the `poll_*` serialization errors
-/// (`missing field name`, `invalid type: map, expected a sequence`, …).
-/// Clearing them gives the worker a clean slate. Best-effort: logs + continues.
-async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str, except: Option<&str>) {
-    let mut cursor: Option<String> = None;
-    let mut cleared = 0u32;
-    loop {
-        let result = match resonate
-            .promises
-            .search(Some("pending"), None, Some(200), cursor.as_deref())
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("flywheel: stale-loop search failed (continuing): {e}");
-                return;
-            }
-        };
-        let ids: Vec<&str> = result.promises.iter().map(|p| p.id.as_str()).collect();
-        let value = resonate_sdk::types::Value::from_serializable(serde_json::json!({
-            "rejected": "stale-loop-takeover"
-        }))
-        .unwrap_or_default();
-        for id in stale_loop_reject_ids(&ids, base, except) {
-            match resonate.promises.reject(id, value.clone()).await {
-                Ok(_) => cleared += 1,
-                Err(e) => eprintln!("flywheel: stale-loop reject {id} failed: {e}"),
-            }
-        }
-        match result.cursor {
-            Some(c) if !c.is_empty() => cursor = Some(c),
-            _ => break,
-        }
-    }
-    if cleared > 0 {
-        eprintln!(
-            "flywheel: cleared {} stale pending loop invocation(s) for {base}",
-            cleared
-        );
-    }
-}
-
 /// Run the loop (bd-w4-delete-dup-sbh8): the engine-backed loop BODY is
 /// deleted — the durable `swarm_loop` is the single keeper and `plan_actions`
 /// its one planning definition. `flywheel loop run --engine` routes here: a
@@ -10280,18 +9513,7 @@ async fn clear_stale_loop_invocations(resonate: &Resonate, base: &str, except: O
 pub async fn run_engine_loop(cfg: &Config, params: LoopParams) -> anyhow::Result<String> {
     run_durable_loop(cfg, params).await
 }
-/// True when the promise exists and is still pending.
-/// Only a server 404 (no record) counts as "not pending"; genuine query
-/// failures propagate — treating a transient Resonate outage as "no record"
-/// would start a second concurrent loop and duplicate sends.
-async fn promise_pending(resonate: &Resonate, id: &str) -> anyhow::Result<bool> {
-    match resonate.promises.get(id).await {
-        Ok(rec) => Ok(matches!(rec.state, PromiseState::Pending)),
-        Err(Error::ServerError { code: 404, .. }) => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("query loop promise {id}: {e}")),
-    }
-}
-
+// Local liveness row (ActiveLoop) is the pending record — no server query.
 /// bd-gny: verdict over the promise state + loop-process liveness. The
 /// monitor loop's promise stays PENDING for its entire lifetime (it resolves
 /// only when the loop ends), so the raw state alone cannot distinguish a
@@ -15325,9 +14547,8 @@ mod tests {
         };
     }
 
-    /// bd-swarm-loop-durable-panic-atlo: a resumed invocation facing the
-    /// stale-checkpoint signature DEGRADES to a fresh run; only a fresh one
-    /// (which cannot be replaying stale checkpoints) aborts.
+    /// bd-swarm-loop-durable-panic-atlo: a blind run aborts once the threshold
+    /// trips; there is no stale-checkpoint degrade — plain async has no replay.
     #[test]
     fn blind_completion_degrades_resumed_and_aborts_fresh() {
         let t = DEFAULT_LEAF_FAILURE_ABORT_POLLS;
@@ -15339,14 +14560,11 @@ mod tests {
             blind_completion_outcome(false, t - 1, t),
             BlindCompletion::Continue
         );
-        assert_eq!(
-            blind_completion_outcome(true, t, t),
-            BlindCompletion::DegradeFresh
-        );
-        // stays degradable beyond the threshold (no abort storm)
+        assert_eq!(blind_completion_outcome(true, t, t), BlindCompletion::Abort);
+        // stays abort beyond the threshold (no degrade storm)
         assert_eq!(
             blind_completion_outcome(true, t + 5, t),
-            BlindCompletion::DegradeFresh
+            BlindCompletion::Abort
         );
         assert_eq!(
             blind_completion_outcome(false, t, t),
