@@ -146,9 +146,7 @@ pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
             as_agent.as_deref(),
         ),
         CaptainCmd::Directory { project, json } => cmd_captain_directory(cfg, project, *json),
-        CaptainCmd::PullFreshTick { project, as_agent } => {
-            cmd_pull_fresh_tick(project, as_agent)
-        }
+        CaptainCmd::PullFreshTick { project, as_agent } => cmd_pull_fresh_tick(project, as_agent),
     }
 }
 
@@ -539,7 +537,6 @@ fn assemble_directory(
         .collect();
     (sessions, truncated, address)
 }
-
 
 /// ADR-0019 D2 amendment: one mikasa-side pull-fresh tick.
 fn cmd_pull_fresh_tick(project: &str, pin: &str) -> Result<()> {

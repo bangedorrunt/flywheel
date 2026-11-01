@@ -1188,7 +1188,12 @@ mod tests {
         }
     }
 
-    fn listed_pane(id: &str, status: AgentStatus, pin: &str, npub: &str) -> crate::hc_support::PaneInfo {
+    fn listed_pane(
+        id: &str,
+        status: AgentStatus,
+        pin: &str,
+        npub: &str,
+    ) -> crate::hc_support::PaneInfo {
         crate::hc_support::PaneInfo {
             pane_id: id.to_string(),
             terminal_id: String::new(),
@@ -1232,15 +1237,8 @@ mod tests {
         assert_eq!(state, PaneState::Working);
         assert!(bind.is_some_and(|b| b.verified));
 
-        let (state, bind) = FlywheelPorts::pane_observation(
-            &panes,
-            "w1:p1",
-            true,
-            pin,
-            "npub1other",
-            "hc",
-            "w1",
-        );
+        let (state, bind) =
+            FlywheelPorts::pane_observation(&panes, "w1:p1", true, pin, "npub1other", "hc", "w1");
         assert_eq!(state, PaneState::Working);
         assert!(bind.is_some_and(|b| !b.verified));
 

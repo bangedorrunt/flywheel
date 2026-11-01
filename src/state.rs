@@ -3828,7 +3828,7 @@ mod loops_sidecar_tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },

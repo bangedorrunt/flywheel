@@ -4063,30 +4063,28 @@ mod tests {
     /// (same file-miss shape as before, never Err).
     #[test]
     fn resolve_prefers_pane_tokens_over_files() {
-        let pane: toron_core::backend::PaneInfo =
-            serde_json::from_value(serde_json::json!({
-                "pane_id": "w1:p1",
-                "terminal_id": "term_test",
-                "workspace_id": "w1",
-                "tab_id": "w1:t1",
-                "focused": false,
-                "agent_status": "working",
-                "revision": 1,
-                "tokens": { "toron_pin": "DustySparrow" },
-            }))
-            .expect("test pane parses");
-        let agent: toron_core::backend::AgentInfo =
-            serde_json::from_value(serde_json::json!({
-                "agent_status": "working",
-                "focused": false,
-                "name": "OldOccupant",
-                "pane_id": "w1:p1",
-                "revision": 1,
-                "tab_id": "w1:t1",
-                "terminal_id": "term_test",
-                "workspace_id": "w1",
-            }))
-            .expect("test agent parses");
+        let pane: toron_core::backend::PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id": "w1:p1",
+            "terminal_id": "term_test",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "focused": false,
+            "agent_status": "working",
+            "revision": 1,
+            "tokens": { "toron_pin": "DustySparrow" },
+        }))
+        .expect("test pane parses");
+        let agent: toron_core::backend::AgentInfo = serde_json::from_value(serde_json::json!({
+            "agent_status": "working",
+            "focused": false,
+            "name": "OldOccupant",
+            "pane_id": "w1:p1",
+            "revision": 1,
+            "tab_id": "w1:t1",
+            "terminal_id": "term_test",
+            "workspace_id": "w1",
+        }))
+        .expect("test agent parses");
         assert_eq!(
             toron_core::mailbox::identity::resolve_pin_for_pane(&[pane], &[agent], "w1:p1"),
             Some("DustySparrow".to_string()),

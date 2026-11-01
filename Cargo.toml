@@ -2,7 +2,7 @@
 name = "flywheel"
 version = "0.9.0"
 edition = "2024"
-description = "Multi-agent swarm orchestrator on herdr and rex (Superlogical) backends — NTM-parity daily loop for opencode/pi/grok"
+description = "Multi-agent swarm orchestrator on hc and rex (Superlogical) backends — NTM-parity daily loop for opencode/pi/grok"
 license = "MIT"
 
 [workspace]
@@ -57,13 +57,13 @@ crossterm = "0.28"
 dialoguer = "0.11"
 
 [features]
-# Default build: the `serve` HTTP surface + herdr + superlogical (rex)
+# Default build: the `serve` HTTP surface + hc + superlogical (rex)
 # multiplexers + toron mail (the only mail backend since bd-euav; selected
 # via FLYWHEEL_MAIL=toron).
-default = ["serve", "backend-herdr", "backend-superlogical", "mail-toron"]
+default = ["serve", "backend-hc", "backend-superlogical", "mail-toron"]
 serve = ["dep:axum", "dep:tokio-stream", "dep:futures-core"]
 # Multiplexer backends (ADR-0002)
-backend-herdr = []
+backend-hc = []
 backend-superlogical = []
 # Mail backends (ADR-0002, bd-euav single-backend: toron only)
 mail-toron = []

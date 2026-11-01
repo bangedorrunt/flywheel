@@ -136,11 +136,12 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             );
         }
         ControlVerbCmd::Exit => {
-            // pane.close — the agent goes with the pane. Exit deliberately
+            // terminal.kill — the agent goes with the terminal. Exit deliberately
             // touches NOTHING else: reservations (toron leases) and dirty
             // worktree files are preserved (control::EXIT_POSTCONDITION).
-            c.call_coded("pane.close", json!({ "pane_id": a.pane_id }))
-                .with_context(|| format!("pane.close for {name} ({})", a.pane_id))?;
+            c.terminal_kill(&a.pane_id)
+                .map(|_| ())
+                .with_context(|| format!("terminal.kill for {name} ({})", a.pane_id))?;
             println!(
                 "exited {name} ({}) — reservations + dirty files preserved",
                 a.pane_id
@@ -176,8 +177,9 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
 
             // Journaled transaction: checkpoint → stop → launch → commit/rollback.
             crate::control::save_relaunch_journal(project, &old)?;
-            c.call_coded("pane.close", json!({ "pane_id": a.pane_id }))
-                .with_context(|| format!("stop old pane for {name} ({})", a.pane_id))?;
+            c.terminal_kill(&a.pane_id)
+                .map(|_| ())
+                .with_context(|| format!("stop old terminal for {name} ({})", a.pane_id))?;
 
             // Fresh pane from the workspace root (same env contract as add).
             let panes = c.pane_list()?;

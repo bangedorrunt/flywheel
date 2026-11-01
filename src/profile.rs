@@ -441,7 +441,8 @@ impl ProfileCatalog {
     /// profile-create time instead of failing later at spawn).
     pub fn canonical_harness(&self, kind: &str) -> Option<String> {
         let k = normalize_harness_alias(kind);
-        if crate::hc_support::INTEGRATION_KINDS.contains(&k.as_str()) || self.harnesses.contains_key(&k)
+        if crate::hc_support::INTEGRATION_KINDS.contains(&k.as_str())
+            || self.harnesses.contains_key(&k)
         {
             return Some(k);
         }

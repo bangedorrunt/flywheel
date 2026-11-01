@@ -1028,8 +1028,8 @@ fn spawn_crew_into_rex(
                 mail_identity,
                 skills_injected: false,
                 incarnation,
-            harness_session: None,
-});
+                harness_session: None,
+            });
             eprintln!("  crew {}: {} ({}) @{}", label, name, agent_pane_id, role);
             if let Some(live) = live_known.as_mut() {
                 live.insert(agent_pane_id.clone());
@@ -1455,8 +1455,8 @@ fn spawn_crew_into(
                 mail_identity,
                 skills_injected: false,
                 incarnation,
-            harness_session: None,
-});
+                harness_session: None,
+            });
             eprintln!("  crew {}: {} ({}) @{}", label, name, agent_pane_id, role);
             // bd-qx0z: panes split here are live by construction — track
             // them so the returned LiveRegistry covers the fresh crew even
@@ -4095,7 +4095,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4108,7 +4108,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4142,7 +4142,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4155,7 +4155,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4168,7 +4168,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4181,7 +4181,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4258,7 +4258,7 @@ mod tests {
                     model_pin: None,
                     skills_digest: None,
                     mail_identity: None,
-            harness_session: None,
+                    harness_session: None,
                     skills_injected: false,
                     incarnation: 0,
                 })
@@ -4396,7 +4396,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4410,7 +4410,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 1,
             },
@@ -4623,7 +4623,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4636,7 +4636,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -4664,7 +4664,7 @@ mod tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
-            harness_session: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
@@ -5624,10 +5624,7 @@ mod rex_door_tests {
             }),
             ..Default::default()
         };
-        assert!(
-            !rex_door_selected(&cfg),
-            "an hc pin wins over REX_SESSION"
-        );
+        assert!(!rex_door_selected(&cfg), "an hc pin wins over REX_SESSION");
         cfg.backend = Some(crate::config::BackendConfig {
             multiplexer: "superlogical".to_string(),
             mail: "toron".to_string(),

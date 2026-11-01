@@ -11,7 +11,7 @@
 //! Test names: adr0010_d13_* — filtered by `mbx +nightly-aarch64-apple-darwin test adr0010_d13`.
 
 const MAIN: &str = include_str!("../src/main.rs");
-const SHIM: &str = include_str!("../src/hc.rs");
+const SHIM: &str = include_str!("../src/hc_support.rs");
 const SWARM: &str = include_str!("../integrations/prompts/swarm.md.tpl");
 const LOOP: &str = include_str!("../integrations/prompts/loop.md.tpl");
 const OPEN: &str = include_str!("../integrations/prompts/open.md.tpl");
@@ -57,7 +57,7 @@ fn adr0010_d13_observe_stop_and_todo_allowlist() {
 
 #[test]
 fn adr0010_d13_crew_exemption_env_marker_at_pane_split() {
-    // Crew panes are exempt: every pane.split pane carries FLYWHEEL_ROLE=crew
+    // Crew panes are exempt: every terminal.run pane carries FLYWHEEL_ROLE=crew
     // (the captain rides the root workspace env → enforced by default).
     assert!(
         SHIM.contains("FLYWHEEL_ROLE"),

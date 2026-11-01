@@ -372,9 +372,12 @@ impl RtHost {
                 match stream.read_outcome() {
                     Ok(StreamOutcome::Event(ev)) => {
                         let ev = *ev;
-                        if let crate::hc_support::TerminalEventData::PaneAgentStatusChanged(change)
-                        | crate::hc_support::TerminalEventData::PaneAgentStatusChangedSub(change) =
-                            ev.data
+                        if let crate::hc_support::TerminalEventData::PaneAgentStatusChanged(
+                            change,
+                        )
+                        | crate::hc_support::TerminalEventData::PaneAgentStatusChangedSub(
+                            change,
+                        ) = ev.data
                         {
                             let pin = pin_by_pane
                                 .get(&change.pane_id)
@@ -467,7 +470,9 @@ fn reconcile_status_after_events_lost(
 }
 
 /// Pull AgentInfo rows out of a session.snapshot payload when present.
-fn agents_from_session_snapshot(snap: &serde_json::Value) -> Option<Vec<crate::hc_support::AgentInfo>> {
+fn agents_from_session_snapshot(
+    snap: &serde_json::Value,
+) -> Option<Vec<crate::hc_support::AgentInfo>> {
     // Common shapes: { agents: [...] } or { panes: [...] } with agent fields,
     // or nested under tabs. Prefer an agents array; else try panes.
     if let Some(arr) = snap.get("agents").and_then(|v| v.as_array()) {

@@ -839,5 +839,4 @@ mod tests {
             None => unsafe { std::env::remove_var("REX_SESSION") },
         }
     }
-
 }

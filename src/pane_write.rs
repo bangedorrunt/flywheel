@@ -226,7 +226,11 @@ impl PaneTyper for BootPanes<'_> {
 /// Spawn-time bootstrap: type the per-harness [`PaneWrite::LaunchBootstrap`]
 /// constant into a fresh pane. Best-effort like the legacy prime (a failed
 /// bootstrap warns, never fails the spawn); returns whether it landed.
-pub fn launch_bootstrap_into(c: &crate::hc_support::Client, pane_id: &str, harness: Harness) -> bool {
+pub fn launch_bootstrap_into(
+    c: &crate::hc_support::Client,
+    pane_id: &str,
+    harness: Harness,
+) -> bool {
     match write(
         &BootPanes(c),
         pane_id,

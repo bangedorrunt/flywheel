@@ -166,7 +166,11 @@ pub fn resolve_plane(cfg: &Config) -> ResolvedPlane {
                 .to_string(),
         ),
         "auto" if rex_compiled => match rex_cli_present(cfg) {
-            Ok(path) => (Plane::Rex, true, format!("auto -> rex ({})", path.display())),
+            Ok(path) => (
+                Plane::Rex,
+                true,
+                format!("auto -> rex ({})", path.display()),
+            ),
             Err(why) => (Plane::Hc, false, format!("auto -> hc fallback: {why}")),
         },
         "auto" => (
@@ -677,8 +681,10 @@ mod spawn_gate_tests {
         // RexBinGuard holds the crate-wide env lock; plane probe reads cfg.rex_bin_dir.
         let bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
-        let mut cfg = Config::default();
-        cfg.rex_bin_dir = Some(bin.dir_path().display().to_string());
+        let cfg = Config {
+            rex_bin_dir: Some(bin.dir_path().display().to_string()),
+            ..Config::default()
+        };
         let plane = resolve_plane(&cfg);
         assert_eq!(plane.configured, "auto");
         assert_eq!(plane.plane, Plane::Hc, "{}", plane.reason);
@@ -700,8 +706,10 @@ mod spawn_gate_tests {
     fn auto_with_a_rex_cli_resolves_to_rex() {
         let bin = crate::backend::superlogical::rex_cli::RexBinGuard::install("exit 0");
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
-        let mut cfg = Config::default();
-        cfg.rex_bin_dir = Some(bin.dir_path().display().to_string());
+        let cfg = Config {
+            rex_bin_dir: Some(bin.dir_path().display().to_string()),
+            ..Config::default()
+        };
         let plane = resolve_plane(&cfg);
         assert_eq!(plane.plane, Plane::Rex, "{}", plane.reason);
         assert!(plane.rex_reachable);
@@ -720,8 +728,10 @@ mod spawn_gate_tests {
     fn an_explicit_rex_pin_never_reports_a_fallback() {
         let bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
-        let mut cfg = Config::default();
-        cfg.rex_bin_dir = Some(bin.dir_path().display().to_string());
+        let cfg = Config {
+            rex_bin_dir: Some(bin.dir_path().display().to_string()),
+            ..Config::default()
+        };
         let plane = resolve_plane(&cfg);
         assert_eq!(
             plane.plane,
@@ -753,8 +763,10 @@ mod spawn_gate_tests {
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         // Poison the env the old probe used; config must still see the binary.
         unsafe { std::env::remove_var("REX_BIN_DIR") };
-        let mut cfg = Config::default();
-        cfg.rex_bin_dir = Some(bin.dir_path().display().to_string());
+        let cfg = Config {
+            rex_bin_dir: Some(bin.dir_path().display().to_string()),
+            ..Config::default()
+        };
         let plane = resolve_plane(&cfg);
         assert_eq!(plane.plane, Plane::Rex, "{}", plane.reason);
         assert!(plane.rex_reachable, "{}", plane.reason);

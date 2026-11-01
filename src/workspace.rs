@@ -4478,11 +4478,7 @@ mod presence_model_tests {
                 _ => Presence::Unknown,
             };
             assert_eq!(v, expected, "hc={hc}");
-            assert_eq!(
-                verdict_for(None, hc, false),
-                dead_endpoint,
-                "hc={hc}"
-            );
+            assert_eq!(verdict_for(None, hc, false), dead_endpoint, "hc={hc}");
             assert_eq!(
                 verdict_for(Some(&Presence::Unknown), hc, true),
                 v,

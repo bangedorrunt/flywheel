@@ -58,7 +58,6 @@ mod tests {
         }
     }
 
-
     // ---- error coercion: the path real transport errors take ----
 
     #[test]
@@ -157,11 +156,10 @@ mod tests {
         assert_eq!(ok.status, Some(AgentStatus::Working));
         assert_eq!(ok.code, None);
         // coded error: Err(toron BackendError) → status None, code Some
-        let err =
-            map_prompt_result(Err(toron_core::backend::BackendError::new(
-                toron_core::backend::error::BackendErrorCode::AgentPromptStalled,
-                "x",
-            )));
+        let err = map_prompt_result(Err(toron_core::backend::BackendError::new(
+            toron_core::backend::error::BackendErrorCode::AgentPromptStalled,
+            "x",
+        )));
         assert_eq!(err.status, None);
         assert_eq!(err.code.as_deref(), Some("agent_prompt_stalled"));
     }

@@ -84,7 +84,10 @@ mod tests {
             ]
         );
         // Mutant: dropping --as would poll as the operator, not the pin.
-        assert!(argv.windows(2).any(|w| w[0] == "--as" && w[1] == "HostedGrok"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--as" && w[1] == "HostedGrok")
+        );
     }
 
     #[test]

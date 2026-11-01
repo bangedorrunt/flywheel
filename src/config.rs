@@ -1464,7 +1464,8 @@ daily = [
         let cfg = Config::default();
         assert_eq!(
             cfg.socket_path(),
-            tmp.join("herdr-core/default/default.sock").to_string_lossy()
+            tmp.join("herdr-core/default/default.sock")
+                .to_string_lossy()
         );
         match prev_state {
             Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
@@ -1487,7 +1488,8 @@ daily = [
         let cfg = Config::default();
         assert_eq!(
             cfg.socket_path(),
-            home.join(".local/state/herdr-core/default/default.sock").to_string_lossy(),
+            home.join(".local/state/herdr-core/default/default.sock")
+                .to_string_lossy(),
             "socket default is ~/.local/state/herdr-core/default/default.sock"
         );
         match prev_home {

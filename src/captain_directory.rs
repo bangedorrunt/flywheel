@@ -723,10 +723,7 @@ mod tests {
     fn capture_harness_session_reads_grok_env() {
         let prev = std::env::var("GROK_SESSION_ID").ok();
         unsafe { std::env::set_var("GROK_SESSION_ID", "sess-abc") };
-        assert_eq!(
-            capture_harness_session("grok").as_deref(),
-            Some("sess-abc")
-        );
+        assert_eq!(capture_harness_session("grok").as_deref(), Some("sess-abc"));
         assert_eq!(capture_harness_session("pi"), None);
         assert_eq!(capture_harness_session("opencode"), None);
         unsafe { std::env::set_var("GROK_SESSION_ID", "  ") };

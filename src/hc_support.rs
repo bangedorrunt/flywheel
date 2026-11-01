@@ -16,8 +16,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub use toron_core::backend::error::{BackendError, BackendErrorCode};
 use toron_core::backend::EventStream as _;
+pub use toron_core::backend::error::{BackendError, BackendErrorCode};
 use toron_core::backend::hc::Client as HcClient;
 /// Was HDR_PROTOCOL on hc; hc advertises generation via HC_GENERATION.
 pub use toron_core::backend::hc::HC_GENERATION as HDR_PROTOCOL;
@@ -86,11 +86,10 @@ pub fn agent_still_booting(a: &AgentInfo) -> bool {
 /// bd-bug-omp-hc-wedge: the HC_* launch env an hc-launched
 /// harness needs to activate its hc extension (omp's
 /// hc-omp-agent-state.ts gates on HC_SOCKET_PATH + pane/terminal id).
-/// hc's agent.start has NO env param and does not inherit pane env
-/// (direct exec), so the caller must inject at pane creation:
-/// workspace.create / pane.split both accept env. hc fills the per-pane
-/// ids (HC_TERMINAL_ID/TAB/WORKSPACE_ID) itself at agent.start; we supply
-/// the two workspace-level vars.
+/// The agent runs as the shell's child and inherits pane env, so the
+/// caller injects at terminal creation: `terminal.run` accepts env + cwd.
+/// hc fills the per-terminal ids (HC_TERMINAL_ID/...) itself at run; we
+/// supply the two workspace-level vars.
 ///
 /// bd-pin-public-plane-s-easy.2: the pane env additionally carries the
 /// agent's mail PIN (`AGENT_NAME` + `FLYWHEEL_MAIL_AS`) so a spawned agent
@@ -141,8 +140,8 @@ pub fn apply_opencode_go_api_key_alias(env: &mut std::collections::BTreeMap<Stri
 
 /// bd-crlx: pin an opencode TUI agent's model for one pane.
 ///
-/// opencode v2's ROOT command (the one `hc agent start --kind opencode`
-/// launches) has no `--model` flag — the flag exists only on `opencode run`.
+/// opencode v2's ROOT command (the one the opencode harness launch runs)
+/// has no `--model` flag — the flag exists only on `opencode run`.
 /// The TUI's model is config, so the pin rides the pane env as
 /// `OPENCODE_CONFIG_CONTENT`.
 ///
@@ -201,35 +200,13 @@ pub fn apply_opencode_model_pin(
     Ok(())
 }
 
-/// GS-037 P1: hc `integration.install` fails when parent config dirs are
-/// missing (pi/omp/opencode). Create the documented parent dirs before install
-/// so zero-touch spawn works on a cold box.
-pub fn ensure_integration_parent_dirs(kind: &str) {
-    // P4: authority injects — one HOME read in HostAuthority, not per site.
-    let home = std::path::PathBuf::from(crate::authority::HostAuthority::resolve().home);
-    let dirs: &[&str] = match kind {
-        "pi" => &[".pi/agent/extensions"],
-        "opencode" => &[".config/opencode/plugins"],
-        _ => &[],
-    };
-    for rel in dirs {
-        let p = home.join(rel);
-        if let Err(e) = std::fs::create_dir_all(&p) {
-            eprintln!(
-                "flywheel: warn: cannot create {} for {kind} integration install: {e}",
-                p.display()
-            );
-        }
-    }
-}
-
 /// Parse `AgentStatus` from its wire string (the old inherent `parse` —
 /// toron-core exposes `FromStr` instead, so this is a thin free wrapper).
 pub fn parse_agent_status(s: &str) -> Result<AgentStatus> {
     s.parse().map_err(|e| anyhow!("{e}"))
 }
 
-/// Parse the protocol version from `hc api schema --json` output (the
+/// Parse the protocol version from `hc schema --json` output (the
 /// top-level `protocol` field). `None` on any failure — the caller decides
 /// how to surface an unreadable schema.
 pub fn parse_protocol(raw: &str) -> Option<u64> {
@@ -238,8 +215,10 @@ pub fn parse_protocol(raw: &str) -> Option<u64> {
         .and_then(|v| v.get("protocol").and_then(Value::as_u64))
 }
 
-/// An hc agent integration's install state, parsed from a
-/// `hc integration status` line (`<kind>: <state> (<path>)`).
+/// A harness kind's integration install state. hc 0.1.16 exposes no
+/// integration surface, so every live status is `not_installed` — the H3
+/// preflight warns (with the manual remedy) and never fails the spawn.
+/// `flywheel status` / `flywheel deps` surface this state per kind.
 ///
 /// H3 (bd-harness-integration-preflight): spawn preflights each launched
 /// kind's integration and installs it when missing/outdated; `flywheel
@@ -271,11 +250,10 @@ impl IntegrationStatus {
     }
 }
 
-/// Canonical hc integration kinds (`hc integration status` /
-/// `hc integration install` surface, hc.dev/docs/preview/integrations/
-/// build 2026-08-04-d78e3d3b5126). Flywheel custom kinds without an hc
-/// integration are NOT in this list — preflight skips them (nothing to
-/// install, nothing to report).
+/// Harness kinds flywheel can spawn that historically shipped an hc
+/// integration (pre-0.1.16 `hc integration install` surface). Flywheel
+/// custom kinds without one are NOT in this list — preflight skips them
+/// (nothing to install, nothing to report).
 pub const INTEGRATION_KINDS: &[&str] = &[
     "pi",
     "claude",
@@ -294,10 +272,9 @@ pub const INTEGRATION_KINDS: &[&str] = &[
     "grok",
 ];
 
-/// Map a flywheel kind to the socket `integration.install` target (the
-/// `IntegrationTarget` enum). `None` when the kind has no hc integration.
-/// The only spelling difference: `antigravity-cli` (CLI display) vs
-/// `antigravity_cli` (socket enum).
+/// Map a flywheel kind to its historical integration target name. `None`
+/// when the kind has no hc integration. The only spelling difference:
+/// `antigravity-cli` (display) vs `antigravity_cli` (old socket enum).
 pub fn integration_target(kind: &str) -> Option<&'static str> {
     if kind == "antigravity-cli" {
         return Some("antigravity_cli");
@@ -305,112 +282,30 @@ pub fn integration_target(kind: &str) -> Option<&'static str> {
     INTEGRATION_KINDS.iter().copied().find(|k| *k == kind)
 }
 
-/// Parse one line of `hc integration status` output into `(kind, status)`.
-/// `None` for a line that does not match the `<kind>: <state> (<path>)`
-/// grammar hc 0.8.0-preview emits. States:
-/// - `current (v9) (/path)`        → installed + current
-/// - `outdated (v3 < v4) (/path)`  → installed, not current
-/// - `not installed (/path)`       → not installed
-pub fn parse_integration_status_line(line: &str) -> Option<(&str, IntegrationStatus)> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let (kind, rest) = line.split_once(": ")?;
-    let kind = kind.trim();
-    // The path is the LAST ` (...) ` group; state text precedes it.
-    let (state_part, path) = match rest.rfind(" (") {
-        Some(idx) if rest[idx..].ends_with(')') => (
-            &rest[..idx],
-            Some(rest[idx + 2..rest.len() - 1].to_string()),
-        ),
-        _ => (rest, None),
-    };
-    let (installed, current, version, expected_version) = if let Some(inner) = state_part
-        .strip_prefix("current (")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        (true, true, Some(inner.to_string()), None)
-    } else if let Some(inner) = state_part
-        .strip_prefix("outdated (")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let (v, exp) = inner.split_once(" < ").unwrap_or((inner, ""));
-        (
-            true,
-            false,
-            Some(v.to_string()),
-            (!exp.is_empty()).then(|| exp.to_string()),
-        )
-    } else if state_part.trim() == "not installed" {
-        (false, false, None, None)
-    } else {
-        // Unknown state text — shape drift: treat as not installed and
-        // drop the path claim rather than inventing a state.
-        (false, false, None, None)
-    };
-    Some((
-        kind,
-        IntegrationStatus {
-            installed,
-            current,
-            version,
-            expected_version,
-            path,
-        },
-    ))
-}
-
-/// Parse full `hc integration status` output into per-kind statuses
-/// (one call, N kinds — spawn/deps reuse the map). Kinds absent from the
-/// output are omitted; callers fall back to [`IntegrationStatus::not_installed`].
-pub fn parse_integration_status_output(raw: &str) -> Vec<(String, IntegrationStatus)> {
-    raw.lines()
-        .filter_map(parse_integration_status_line)
-        .map(|(k, s)| (k.to_string(), s))
-        .collect()
-}
-
-/// Run `hc integration status` once and return every kind's state.
+/// hc 0.1.16 exposes no integration surface (verified: `hc --help` has no
+/// `integration` subcommand and the schema lists no `integration.*` method),
+/// so there is nothing to report — every kind reads `not_installed` and the
+/// H3 preflight warns with the manual remedy. The map shape is kept (not
+/// deleted) because `spawn`/`status`/`deps` share it; the one-line note keeps
+/// the degraded preflight visible instead of silently green.
 pub fn integration_status_all() -> Result<Vec<(String, IntegrationStatus)>> {
-    let out = std::process::Command::new("hc")
-        .args(["integration", "status"])
-        .output()
-        .map_err(|e| anyhow!("cannot run `hc integration status`: {e}"))?;
-    if !out.status.success() {
-        bail!(
-            "`hc integration status` failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(parse_integration_status_output(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
+    eprintln!(
+        "flywheel: note: hc 0.1.16 has no integration surface — integration preflight degraded (all kinds read not-installed)"
+    );
+    Ok(Vec::new())
 }
 
-/// Install a kind's hc integration through the socket `integration.install`
-/// method (hc 0.8.0-preview raw method; the socket is the in-process
-/// surface — `hc integration install <TARGET>` is the CLI twin). Returns
-/// the server's install messages. The CALLER decides how to surface
-/// failures — H3 preflight warns loudly and never fails the spawn.
-pub fn integration_install_socket(c: &Client, kind: &str) -> Result<Vec<String>> {
-    let target = integration_target(kind)
+/// Install a kind's hc integration: hc 0.1.16 has none (no `integration`
+/// subcommand, no `integration.*` method), so this always fails loud with
+/// the manual remedy. The CALLER (H3 preflight) warns and never fails the
+/// spawn — do not invent a CLI subcommand here.
+pub fn integration_install_socket(_c: &Client, kind: &str) -> Result<Vec<String>> {
+    let _ = integration_target(kind)
         .ok_or_else(|| anyhow!("kind {kind} has no hc integration target"))?;
-    // GS-037 P1: mkdir parent dirs before socket install (pi/omp/opencode).
-    ensure_integration_parent_dirs(target);
-    let resp = c.call("integration.install", json!({ "target": target }))?;
-    let messages = resp
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Ok(messages)
+    bail!(
+        "hc 0.1.16 exposes no integration install for {kind} — lifecycle-state reporting runs \
+         on process-based heuristics until the harness reports on its own"
+    )
 }
 
 /// Strip terminal control sequences and TUI box-drawing chrome from a pane
@@ -556,9 +451,9 @@ pub fn resolve_workspace_from_registry(
 // models the client, not the per-event payload shapes flywheel routes on.
 // ---------------------------------------------------------------------------
 
-/// push notification payload wrapper (`kind` = wire event name, `data` =
-/// typed payload). Parsed from the raw `(kind, Value)` the toron-core
-/// `EventStream::read_event` yields.
+/// push notification payload wrapper (`kind` names the producer, `data`
+/// is the typed payload). Built at the toron-core `BackendEvent` edge by
+/// `push_from_backend` — the bin matches on the typed `data` variant.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // bin matches on the typed `data` variant; `kind` is informational
 pub struct PushEvent {
@@ -566,193 +461,27 @@ pub struct PushEvent {
     pub data: TerminalEventData,
 }
 
-/// All hc event kinds: the 26 server events (snake_case wire names) plus
-/// the 3 subscription pushes (dot namespaced wire names). `parse` accepts
-/// both namespaces; `as_wire_str` returns the exact wire name.
+/// The live push kinds: hc 0.1.16 has no pane/workspace hierarchy and no
+/// snake_case server events — toron-core's `BackendEvent` is the whole
+/// push surface, and only status + exit carry routing facts. Anything else
+/// a future backend emits is dropped at `push_from_backend` (the consumers
+/// ignore it today via wildcard arms, so the drop changes no behavior).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by tests + the reactor; bin matches on data today
 pub enum TerminalEventKind {
-    WorkspaceCreated,
-    WorkspaceUpdated,
-    WorkspaceMetadataUpdated,
-    WorkspaceClosed,
-    WorkspaceRenamed,
-    WorkspaceMoved,
-    WorkspaceReordered,
-    WorkspaceFocused,
-    WorktreeCreated,
-    WorktreeOpened,
-    WorktreeRemoved,
-    TabCreated,
-    TabClosed,
-    TabRenamed,
-    TabMoved,
-    TabFocused,
-    PaneCreated,
-    PaneClosed,
-    PaneUpdated,
-    PaneFocused,
-    PaneMoved,
-    PaneOutputChanged,
-    PaneExited,
-    PaneAgentDetected,
-    PaneAgentStatusChanged,
-    LayoutUpdated,
     PaneAgentStatusChangedSub,
-    PaneOutputMatched,
-    PaneScrollChanged,
+    PaneExited,
 }
 
-impl TerminalEventKind {
-    /// Parse a wire event name. Accepts both namespaces: the 26 snake_case
-    /// server events and the 3 dotted subscription events.
-    #[allow(dead_code)]
-    pub fn parse(s: &str) -> Result<Self> {
-        use TerminalEventKind::{
-            LayoutUpdated, PaneAgentDetected, PaneAgentStatusChanged, PaneAgentStatusChangedSub,
-            PaneClosed, PaneCreated, PaneExited, PaneFocused, PaneMoved, PaneOutputChanged,
-            PaneOutputMatched, PaneScrollChanged, PaneUpdated, TabClosed, TabCreated, TabFocused,
-            TabMoved, TabRenamed, WorkspaceClosed, WorkspaceCreated, WorkspaceFocused,
-            WorkspaceMetadataUpdated, WorkspaceMoved, WorkspaceRenamed, WorkspaceReordered,
-            WorkspaceUpdated, WorktreeCreated, WorktreeOpened, WorktreeRemoved,
-        };
-        let kind = match s {
-            "workspace_created" => WorkspaceCreated,
-            "workspace_updated" => WorkspaceUpdated,
-            "workspace_metadata_updated" => WorkspaceMetadataUpdated,
-            "workspace_closed" => WorkspaceClosed,
-            "workspace_renamed" => WorkspaceRenamed,
-            "workspace_moved" => WorkspaceMoved,
-            "workspace_reordered" => WorkspaceReordered,
-            "workspace_focused" => WorkspaceFocused,
-            "worktree_created" => WorktreeCreated,
-            "worktree_opened" => WorktreeOpened,
-            "worktree_removed" => WorktreeRemoved,
-            "tab_created" => TabCreated,
-            "tab_closed" => TabClosed,
-            "tab_renamed" => TabRenamed,
-            "tab_moved" => TabMoved,
-            "tab_focused" => TabFocused,
-            "pane_created" => PaneCreated,
-            "pane_closed" => PaneClosed,
-            "pane_updated" => PaneUpdated,
-            "pane_focused" => PaneFocused,
-            "pane_moved" => PaneMoved,
-            "pane_output_changed" => PaneOutputChanged,
-            "pane_exited" => PaneExited,
-            "pane_agent_detected" => PaneAgentDetected,
-            "pane_agent_status_changed" => PaneAgentStatusChanged,
-            "layout_updated" => LayoutUpdated,
-            "pane.agent_status_changed" => PaneAgentStatusChangedSub,
-            "pane.output_matched" => PaneOutputMatched,
-            "pane.scroll_changed" => PaneScrollChanged,
-            other => bail!("unknown hc event kind: {other}"),
-        };
-        Ok(kind)
-    }
-}
-
-// ---- typed event payloads ----
+// ---- typed push payloads ----
 //
-// Field sets mirror the live schema (`hc api schema --json` →
-// `schemas/event/$defs/EventData.oneOf`). Nested objects that flywheel does
-// not consume yet stay `Value` — the goal is type safety for the fields we
-// route on, not a full model of every payload. `WorkspaceInfo` and `PaneInfo`
-// (re-exported from toron-core) are reused for the nested payloads.
+// Only what the doorbell + watch loop route on (status + exit). hc 0.1.16
+// has no workspace/tab/worktree event surface, so the pre-hc payload
+// structs are deleted — `push_from_backend` builds these two from
+// toron-core's `BackendEvent`, nothing parses wire payloads here.
+// `WorktreeInfo` below is not an event payload: it is the flywheel-shaped
+// worktree record the (empty-on-hc) `worktree_list` returns.
 
-/// tab payload (nested object; consumed fields only).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[allow(dead_code)]
-pub struct TabInfo {
-    #[serde(default)]
-    pub tab_id: String,
-    #[serde(default)]
-    pub workspace_id: String,
-    #[serde(default)]
-    pub label: String,
-    #[serde(default)]
-    pub number: u64,
-    #[serde(default)]
-    pub focused: bool,
-    #[serde(default)]
-    pub pane_count: u64,
-    #[serde(default)]
-    pub agent_status: Option<AgentStatus>,
-}
-
-/// scroll payload for `pane.scroll_changed` subscription events.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneScrollInfo {
-    #[serde(default)]
-    pub offset_from_bottom: u64,
-    #[serde(default)]
-    pub max_offset_from_bottom: u64,
-    #[serde(default)]
-    pub viewport_rows: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorkspaceCreated {
-    pub workspace: WorkspaceInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorkspaceUpdated {
-    pub workspace: WorkspaceInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorkspaceMetadataUpdated {
-    pub workspace: WorkspaceInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorkspaceClosed {
-    pub workspace_id: String,
-    #[serde(default)]
-    pub workspace: Option<WorkspaceInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorkspaceRenamed {
-    pub workspace_id: String,
-    pub label: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorkspaceMoved {
-    pub workspace_id: String,
-    pub insert_index: u64,
-    #[serde(default)]
-    pub workspaces: Vec<WorkspaceInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorkspaceReordered {
-    #[serde(default)]
-    pub workspace_ids: Vec<String>,
-    #[serde(default)]
-    pub workspaces: Vec<WorkspaceInfo>,
-    #[serde(default)]
-    pub before_workspace_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorkspaceFocused {
-    pub workspace_id: String,
-}
-
-/// flywheel-shaped worktree record (`worktree.list`). toron-core's
-/// `WorktreeInfo` models the create/remove payloads, not this listing shape.
+/// flywheel-shaped worktree record. toron-core's `WorktreeInfo` models the
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct WorktreeInfo {
@@ -766,121 +495,8 @@ pub struct WorktreeInfo {
     pub label: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorktreeCreated {
-    pub workspace: WorkspaceInfo,
-    pub worktree: WorktreeInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorktreeOpened {
-    pub workspace: WorkspaceInfo,
-    pub worktree: WorktreeInfo,
-    #[serde(default)]
-    pub already_open: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct WorktreeRemoved {
-    pub workspace_id: String,
-    #[serde(default)]
-    pub workspace: Option<WorkspaceInfo>,
-    pub worktree: WorktreeInfo,
-    #[serde(default)]
-    pub forced: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TabCreated {
-    pub tab: TabInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TabClosed {
-    pub tab_id: String,
-    pub workspace_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TabRenamed {
-    pub tab_id: String,
-    pub workspace_id: String,
-    pub label: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TabMoved {
-    pub tab_id: String,
-    pub workspace_id: String,
-    pub insert_index: u64,
-    #[serde(default)]
-    pub tabs: Vec<TabInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TabFocused {
-    pub tab_id: String,
-    pub workspace_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneCreated {
-    pub pane: PaneInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneClosed {
-    pub pane_id: String,
-    pub workspace_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneUpdated {
-    pub pane: PaneInfo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneFocused {
-    pub pane_id: String,
-    pub workspace_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneMoved {
-    pub pane: PaneInfo,
-    pub previous_pane_id: String,
-    pub previous_workspace_id: String,
-    pub previous_tab_id: String,
-    #[serde(default)]
-    pub closed_tab_id: Option<String>,
-    #[serde(default)]
-    pub closed_workspace_id: Option<String>,
-    #[serde(default)]
-    pub created_tab: Option<TabInfo>,
-    #[serde(default)]
-    pub created_workspace: Option<WorkspaceInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneOutputChanged {
-    pub pane_id: String,
-    pub workspace_id: String,
-    pub revision: u64,
-}
+/// A terminal ended. Built from toron-core's `BackendEvent::PaneExited` —
+/// the only exit signal the doorbell routes on.
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
@@ -889,22 +505,13 @@ pub struct PaneExited {
     pub workspace_id: String,
 }
 
+/// An agent's status changed. Built from toron-core's
+/// `BackendEvent::AgentStatusChanged` (the `Sub` variant is the subscribe
+/// push; the bare variant is what the watch loop's `match` names — both
+/// carry this payload).
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneAgentDetected {
-    pub pane_id: String,
-    pub workspace_id: String,
-    #[serde(default)]
-    pub agent: Option<String>,
-    #[serde(default)]
-    pub final_status: Option<AgentStatus>,
-    #[serde(default)]
-    pub released: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-// wire-contract struct: parsed from the hc protocol; not every
-// field is consumed by the client — the unused ones must still deserialize.
+// Wire-shaped payload: the bin routes on pane_id + agent_status; the other
+// fields must still deserialize (never invent defaults for them).
 #[allow(dead_code)]
 pub struct PaneAgentStatusChanged {
     pub pane_id: String,
@@ -919,114 +526,18 @@ pub struct PaneAgentStatusChanged {
     pub title: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct LayoutUpdated {
-    // not consumed yet — type `PaneLayoutSnapshot` when the reactor lands
-    #[serde(default)]
-    pub layout: Value,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneOutputMatchedEvent {
-    pub pane_id: String,
-    #[serde(default)]
-    pub matched_line: Option<String>,
-    #[serde(default)]
-    pub read: Value,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct PaneScrollChangedEvent {
-    pub pane_id: String,
-    pub workspace_id: String,
-    #[serde(default)]
-    pub scroll: PaneScrollInfo,
-}
-
-/// Typed payload of a `PushEvent`, dispatched on the envelope's `kind`.
+/// Typed payload of a `PushEvent`: the live pushes only. The bare
+/// `PaneAgentStatusChanged` variant is what the watch loop + doorbell match
+/// arms name (the subscription push lands as `..Sub` with the same payload).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // variant payloads consumed by tests + reactor
-#[allow(clippy::large_enum_variant, clippy::enum_variant_names)] // wire-fidelity names; parsed once per event
+// The bare StatusChanged variant is match-named but never constructed here
+// (its push arrives as ..Sub); Exited's payload is routed, never read.
+// The Pane prefix mirrors the toron BackendEvent names the pushes map from.
+#[allow(dead_code, clippy::enum_variant_names)]
 pub enum TerminalEventData {
-    WorkspaceCreated(WorkspaceCreated),
-    WorkspaceUpdated(WorkspaceUpdated),
-    WorkspaceMetadataUpdated(WorkspaceMetadataUpdated),
-    WorkspaceClosed(WorkspaceClosed),
-    WorkspaceRenamed(WorkspaceRenamed),
-    WorkspaceMoved(WorkspaceMoved),
-    WorkspaceReordered(WorkspaceReordered),
-    WorkspaceFocused(WorkspaceFocused),
-    WorktreeCreated(WorktreeCreated),
-    WorktreeOpened(WorktreeOpened),
-    WorktreeRemoved(WorktreeRemoved),
-    TabCreated(TabCreated),
-    TabClosed(TabClosed),
-    TabRenamed(TabRenamed),
-    TabMoved(TabMoved),
-    TabFocused(TabFocused),
-    PaneCreated(PaneCreated),
-    PaneClosed(PaneClosed),
-    PaneUpdated(PaneUpdated),
-    PaneFocused(PaneFocused),
-    PaneMoved(PaneMoved),
-    PaneOutputChanged(PaneOutputChanged),
-    PaneExited(PaneExited),
-    PaneAgentDetected(PaneAgentDetected),
     PaneAgentStatusChanged(PaneAgentStatusChanged),
-    LayoutUpdated(LayoutUpdated),
     PaneAgentStatusChangedSub(PaneAgentStatusChanged),
-    PaneOutputMatched(PaneOutputMatchedEvent),
-    PaneScrollChanged(PaneScrollChangedEvent),
-}
-
-impl TerminalEventData {
-    /// Deserialize the payload `data` for the given `kind`.
-    #[allow(dead_code)]
-    pub fn from_kind(kind: TerminalEventKind, data: Value) -> Result<Self> {
-        use TerminalEventKind::{
-            LayoutUpdated, PaneAgentDetected, PaneAgentStatusChanged, PaneAgentStatusChangedSub,
-            PaneClosed, PaneCreated, PaneExited, PaneFocused, PaneMoved, PaneOutputChanged,
-            PaneOutputMatched, PaneScrollChanged, PaneUpdated, TabClosed, TabCreated, TabFocused,
-            TabMoved, TabRenamed, WorkspaceClosed, WorkspaceCreated, WorkspaceFocused,
-            WorkspaceMetadataUpdated, WorkspaceMoved, WorkspaceRenamed, WorkspaceReordered,
-            WorkspaceUpdated, WorktreeCreated, WorktreeOpened, WorktreeRemoved,
-        };
-        use serde_json::from_value;
-        Ok(match kind {
-            WorkspaceCreated => Self::WorkspaceCreated(from_value(data)?),
-            WorkspaceUpdated => Self::WorkspaceUpdated(from_value(data)?),
-            WorkspaceMetadataUpdated => Self::WorkspaceMetadataUpdated(from_value(data)?),
-            WorkspaceClosed => Self::WorkspaceClosed(from_value(data)?),
-            WorkspaceRenamed => Self::WorkspaceRenamed(from_value(data)?),
-            WorkspaceMoved => Self::WorkspaceMoved(from_value(data)?),
-            WorkspaceReordered => Self::WorkspaceReordered(from_value(data)?),
-            WorkspaceFocused => Self::WorkspaceFocused(from_value(data)?),
-            WorktreeCreated => Self::WorktreeCreated(from_value(data)?),
-            WorktreeOpened => Self::WorktreeOpened(from_value(data)?),
-            WorktreeRemoved => Self::WorktreeRemoved(from_value(data)?),
-            TabCreated => Self::TabCreated(from_value(data)?),
-            TabClosed => Self::TabClosed(from_value(data)?),
-            TabRenamed => Self::TabRenamed(from_value(data)?),
-            TabMoved => Self::TabMoved(from_value(data)?),
-            TabFocused => Self::TabFocused(from_value(data)?),
-            PaneCreated => Self::PaneCreated(from_value(data)?),
-            PaneClosed => Self::PaneClosed(from_value(data)?),
-            PaneUpdated => Self::PaneUpdated(from_value(data)?),
-            PaneFocused => Self::PaneFocused(from_value(data)?),
-            PaneMoved => Self::PaneMoved(from_value(data)?),
-            PaneOutputChanged => Self::PaneOutputChanged(from_value(data)?),
-            PaneExited => Self::PaneExited(from_value(data)?),
-            PaneAgentDetected => Self::PaneAgentDetected(from_value(data)?),
-            PaneAgentStatusChanged => Self::PaneAgentStatusChanged(from_value(data)?),
-            LayoutUpdated => Self::LayoutUpdated(from_value(data)?),
-            PaneAgentStatusChangedSub => Self::PaneAgentStatusChangedSub(from_value(data)?),
-            PaneOutputMatched => Self::PaneOutputMatched(from_value(data)?),
-            PaneScrollChanged => Self::PaneScrollChanged(from_value(data)?),
-        })
-    }
+    PaneExited(PaneExited),
 }
 
 /// Typed plane protocol error carrying the machine-readable code.
@@ -1053,7 +564,7 @@ fn to_plane_error(e: toron_core::backend::error::BackendError) -> PlaneError {
     }
 }
 
-/// Result of a `pane.wait_for_output` wait.
+/// Result of a pane output wait.
 ///
 /// `read` is the matched terminal snapshot's text, treated as an opaque
 /// string — pane waits do NOT interpret agent lifecycle.
@@ -1066,40 +577,45 @@ pub struct PaneWaitResult {
     pub read: String,
 }
 
-/// Request params for `pane.wait_for_output` (protocol v18).
+/// Request params for a `terminal.wait` output wait.
 ///
-/// `mode` mirrors the CLI's `--match`/`--regex`: `"match"` is a literal
-/// substring search, `"regex"` a Rust regex (hc-side). Anything else is a
-/// caller bug — bail with code `"usage"`.
+/// `mode` mirrors the CLI's `--match`/`--regex`, but hc matches plain text
+/// only: `"match"` passes the pattern through, `"regex"` is refused loud
+/// (a regex passed as plain text would silently never match). `timeout_ms`
+/// becomes seconds (the wire unit); `None` omits it (server default 180s).
+/// Anything else is a caller bug — bail with code `"usage"`.
 pub fn wait_for_output_params(
     pane_id: &str,
     mode: &str,
     pattern: &str,
     timeout_ms: Option<u64>,
 ) -> std::result::Result<Value, PlaneError> {
-    let match_type = match mode {
-        "match" => "substring",
-        "regex" => "regex",
-        other => {
-            return Err(PlaneError {
-                code: "usage".into(),
-                message: format!(
-                    "unknown pane wait-output mode: {other} (expected \"match\" or \"regex\")"
-                ),
-            });
-        }
-    };
-    Ok(json!({
-        "pane_id": pane_id,
-        "source": "recent",
-        "match": { "type": match_type, "value": pattern },
-        "strip_ansi": true,
-        "timeout_ms": timeout_ms,
-    }))
+    if mode != "match" {
+        return Err(PlaneError {
+            code: "usage".into(),
+            message: format!(
+                "unknown pane wait-output mode: {mode} (hc terminal.wait matches plain text only; \
+                 pass \"match\" or drop --regex)"
+            ),
+        });
+    }
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "terminal".into(),
+        Value::String(toron_core::backend::hc::strip_id_prefix(pane_id).to_string()),
+    );
+    params.insert("output".into(), Value::String(pattern.to_string()));
+    if let Some(ms) = timeout_ms {
+        params.insert("timeout".into(), json!(ms as f64 / 1000.0));
+    }
+    Ok(Value::Object(params))
 }
 
-/// Parse a `pane.wait_for_output` result envelope. Defensive: `read` is an
-/// object carrying the snapshot text; any shape drift becomes code `"parse"`.
+/// Map a `terminal.wait` result onto the wait outcome. `reason == "output"`
+/// is the match; `"timeout"` is the check-in (miss → code `"timeout"`);
+/// `"exit"`/`"status"` mean the program ended first (code `"ended"`).
+/// Any other reason is shape drift (code `"parse"`). The matched text is
+/// read back with `terminal.read` — the wait result carries no snapshot.
 pub fn parse_wait_for_output_result(
     res: &Value,
 ) -> std::result::Result<PaneWaitResult, PlaneError> {
@@ -1107,39 +623,39 @@ pub fn parse_wait_for_output_result(
         code: "parse".into(),
         message: msg,
     };
-    if res.get("type").and_then(Value::as_str) != Some("output_matched") {
-        return Err(parse_err(format!(
-            "unexpected pane.wait_for_output result: {res}"
-        )));
-    }
+    let reason = res
+        .get("reason")
+        .and_then(Value::as_str)
+        .ok_or_else(|| parse_err(format!("terminal.wait result missing reason: {res}")))?;
     let pane_id = res
-        .get("pane_id")
+        .get("terminal")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            parse_err(format!(
-                "pane.wait_for_output result missing pane_id: {res}"
-            ))
-        })?
-        .to_string();
-    let matched_line = res
-        .get("matched_line")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let read = res
-        .get("read")
-        .and_then(|r| r.get("text"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            parse_err(format!(
-                "pane.wait_for_output result missing read.text: {res}"
-            ))
-        })?
-        .to_string();
-    Ok(PaneWaitResult {
-        pane_id,
-        matched_line,
-        read,
-    })
+        .map(toron_core::backend::hc::prefix_id)
+        .ok_or_else(|| parse_err(format!("terminal.wait result missing terminal: {res}")))?;
+    match reason {
+        "output" => Ok(PaneWaitResult {
+            pane_id,
+            // The wait result names no line — the text comes from the
+            // read-back below, so there is no single matched line to name.
+            matched_line: None,
+            read: res
+                .get("read")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default(),
+        }),
+        "timeout" => Err(PlaneError {
+            code: "timeout".into(),
+            message: format!("no output match in {pane_id} within timeout"),
+        }),
+        "exit" | "status" => Err(PlaneError {
+            code: "ended".into(),
+            message: format!("terminal {pane_id} ended before any output match (reason: {reason})"),
+        }),
+        other => Err(parse_err(format!(
+            "unexpected terminal.wait reason {other:?}: {res}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,7 +664,11 @@ pub fn parse_wait_for_output_result(
 // `call` / `call_coded` — zero protocol logic here.
 // ---------------------------------------------------------------------------
 
-/// `pane.split` — delegation over `Client::call`.
+/// A new shell terminal via `terminal.run` (hc has no splits, only
+/// top-level terminals; `direction` is ignored). No `argv`: the server runs
+/// its own shell. `parent` keeps the tree so the workspace shell owns its
+/// panes. Returns the terminal as `PaneInfo` (looked up from `pane_list`
+/// so the shape carries the daemon's own folded status, not a re-fold).
 pub fn pane_split(
     c: &Client,
     pane_id: &str,
@@ -1156,12 +676,21 @@ pub fn pane_split(
     cwd: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<PaneInfo> {
+    let _ = direction; // hc has no splits — every pane is a top-level terminal
     let mut params = serde_json::Map::new();
-    params.insert("target_pane_id".into(), serde_json::json!(pane_id));
-    params.insert("direction".into(), serde_json::json!(direction));
-    params.insert("cwd".into(), serde_json::json!(cwd));
+    params.insert(
+        "parent".into(),
+        serde_json::json!(toron_core::backend::hc::strip_id_prefix(pane_id)),
+    );
+    // Crew panes are independent peers: a child ends with its parent unless
+    // outlived, and the chain parent here is just the previous pane — one
+    // crew member exiting must never kill the rest. Keep the lineage
+    // (parent) without the lifecycle coupling (outlive_parent).
+    if let Some(cwd) = cwd {
+        params.insert("cwd".into(), serde_json::json!(cwd));
+    }
     if let Some(env) = env {
-        // ADR-0010 D13: every pane.split pane is a CREW pane (the captain
+        // ADR-0010 D13: every split pane is a CREW pane (the captain
         // rides the root pane's workspace-level env). Stamp the role so the
         // subagent-guard fence exempts crew: the deny list must disarm
         // nobody it does not own. Caller-supplied wins on collision.
@@ -1170,13 +699,24 @@ pub fn pane_split(
             .or_insert_with(|| "crew".to_string());
         params.insert("env".into(), serde_json::json!(env));
     }
-    let res = c.call("pane.split", serde_json::Value::Object(params))?;
-    serde_json::from_value(res.get("pane").cloned().unwrap_or(res))
-        .context("parse pane.split result")
+    // No argv: hc runs its own shell for an argv-less terminal.run.
+    params.insert("outlive_parent".into(), serde_json::json!(true));
+    let res: toron_core::backend::hc::Terminal =
+        serde_json::from_value(c.call("terminal.run", serde_json::Value::Object(params))?)
+            .context("parse terminal.run result")?;
+    let want = toron_core::backend::hc::prefix_id(&res.address);
+    c.pane_list()
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .find(|p| p.pane_id == want)
+        .ok_or_else(|| anyhow!("terminal.run created {want} but pane_list cannot see it"))
 }
 
-/// `pane.wait_for_output` — delegation over `Client::call_coded`. Returns a
-/// typed `PlaneError` so callers can classify (`timeout` code on a miss).
+/// Wait for `pattern` in a pane's output via `terminal.wait` (plain-text
+/// `output` match). Returns a typed `PlaneError` so callers can classify
+/// (`timeout` code on a miss, `ended` when the program exits first).
+/// `regex` mode is refused loud: hc's output match is plain text only, and
+/// a regex passed as plain text would silently never match.
 pub fn pane_wait_output(
     c: &Client,
     pane_id: &str,
@@ -1185,18 +725,22 @@ pub fn pane_wait_output(
     timeout_ms: Option<u64>,
 ) -> std::result::Result<PaneWaitResult, PlaneError> {
     let params = wait_for_output_params(pane_id, mode, pattern, timeout_ms)?;
-    let res = c
-        .call_coded("pane.wait_for_output", params)
-        .map_err(to_plane_error)?;
-    parse_wait_for_output_result(&res)
+    let res = c.call("terminal.wait", params).map_err(to_plane_error)?;
+    let mut hit = parse_wait_for_output_result(&res)?;
+    // The wait result carries no snapshot text — read it back so `read` is
+    // the matched terminal's text, as the old envelope provided.
+    if hit.read.is_empty() {
+        hit.read = pane_recent_text(c, pane_id).unwrap_or_default();
+    }
+    Ok(hit)
 }
 
 /// Spawn shell-readiness gate (bd-pattern-peer-triggered): poll a
 /// freshly-split pane until its shell has rendered a prompt, so the launch
 /// command lands in an INTERACTIVE shell — not a booting one.
 ///
-/// Why this gate exists: hc's `agent.start` types the launch command
-/// into the pane's PTY immediately after `pane.split` returns. A new
+/// Why this gate exists: the launch command is typed
+/// into the pane's PTY immediately after `terminal.run` returns. A new
 /// pane's shell is still starting up (zsh running `.zshrc`, prompt not yet
 /// rendered) and the PTY is in CANONICAL mode with a 1024-byte line limit
 /// (`MAX_CANON`). The peer-aware template renders to a ~2.6KB single-quoted
@@ -1206,7 +750,7 @@ pub fn pane_wait_output(
 /// survived only because its first `agent.start` errored (shell not yet an
 /// available shell) and the retry's 3s sleep let it finish booting.
 ///
-/// Signal: `pane.read` recent output contains a rendered prompt — a shell
+/// Signal: `terminal.read` recent output contains a rendered prompt — a shell
 /// prints its prompt exactly when the line editor is up (raw mode, no
 /// canonical line limit). Poll every 250ms until the prompt appears (→
 /// `Ok(true)`), the probe errors continuously, or `timeout` elapses (→
@@ -1231,24 +775,15 @@ pub fn wait_shell_prompt(c: &Client, pane_id: &str, timeout: Duration) -> bool {
     false
 }
 
-/// Recent text of a pane (`pane.read`, source=recent, format=text).
+/// Recent text of a pane (`terminal.read` + `lines`; `ReadResult.text`).
 ///
 /// `pub(crate)`: the pane-wedge probe (bd-pane-wedge-detect-respawn-pnyi)
 /// reads the same tail the shell-readiness gate does, so the two can never
 /// disagree about what a pane is showing.
 pub(crate) fn pane_recent_text(c: &Client, pane_id: &str) -> Result<String> {
-    let res = c.call(
-        "pane.read",
-        json!({
-            "pane_id": pane_id,
-            "source": "recent",
-            "lines": 30,
-            "format": "text",
-            "strip_ansi": true,
-        }),
-    )?;
-    let read = res.get("read").cloned().unwrap_or(res);
-    Ok(read
+    // terminal.read strips the hc: prefix itself; the result IS ReadResult.
+    let res = c.terminal_read(pane_id, 30).map_err(|e| anyhow!("{e}"))?;
+    Ok(res
         .get("text")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
@@ -1279,19 +814,20 @@ fn shell_prompt_rendered(text: &str) -> bool {
     }
 }
 
-/// `worktree.list` — delegation over `Client::call`, returning the
-/// flywheel-shaped [`WorktreeInfo`].
-pub fn worktree_list(c: &Client, workspace_id: Option<&str>) -> Result<Vec<WorktreeInfo>> {
-    let res = c.call("worktree.list", json!({ "workspace_id": workspace_id }))?;
-    serde_json::from_value(res.get("worktrees").cloned().unwrap_or(res))
-        .context("parse worktree.list result")
+/// `worktree.list` — hc 0.1.16 exposes no worktree method, and a terminal
+/// backend has no linked-worktree concept, so the honest answer is empty:
+/// the preflight's `linked_worktrees` filter stays green and `flywheel
+/// worktree list` prints "no worktrees". (The `worktree_create` /
+/// `worktree_remove` client methods already return Unsupported.)
+pub fn worktree_list(_c: &Client, _workspace_id: Option<&str>) -> Result<Vec<WorktreeInfo>> {
+    Ok(Vec::new())
 }
 
 // ---------------------------------------------------------------------------
-// Process liveness probe (bd-1np): `pane.process_info`.
+// Process liveness probe (bd-1np): `terminal.get` foreground.
 // ---------------------------------------------------------------------------
 
-/// One foreground process in a pane (`pane.process_info`).
+/// One foreground process in a pane (from `terminal.get` `foreground`).
 ///
 /// The agent process (opencode/pi/grok/omp) appears here with `pid ==
 /// foreground_process_group_id` while it runs; when the process dies the pane
@@ -1307,7 +843,7 @@ pub struct PaneProcessInfoProcess {
     pub argv0: Option<String>,
 }
 
-/// Result of `pane.process_info` (bd-1np). `foreground_processes` lists the
+/// Result of the `terminal.get` liveness read (bd-1np). `foreground_processes` lists the
 /// the group leader (`pid == foreground_process_group_id`); the `shell_pid`
 /// is the pane's shell, which reclaims the foreground after the agent exits.
 #[derive(Debug, Clone, Deserialize)]
@@ -1322,17 +858,51 @@ pub struct PaneProcessInfo {
     pub foreground_processes: Vec<PaneProcessInfoProcess>,
 }
 
-/// `pane.process_info` — delegation over `Client::call`.
+/// Process liveness probe (bd-1np) via `terminal.get`: `Terminal.pid` is
+/// the shell, `foreground.{pid,name,argv}` is the foreground group leader
+/// (the agent while it lives; the shell reclaims it after the agent exits).
+/// Parsed from the raw result — toron-core's `Terminal` drops the
+/// `foreground` object, and it is the only liveness signal here.
 pub fn pane_process_info(c: &Client, pane_id: &str) -> Result<PaneProcessInfo> {
-    let res = c.call("pane.process_info", json!({ "pane_id": pane_id }))?;
-    serde_json::from_value(res.get("process_info").cloned().unwrap_or(res))
-        .context("parse pane.process_info result")
+    let res = c.call(
+        "terminal.get",
+        json!({ "terminal": toron_core::backend::hc::strip_id_prefix(pane_id) }),
+    )?;
+    let shell_pid = res.get("pid").and_then(Value::as_u64);
+    let (foreground_process_group_id, foreground_processes) = match res.get("foreground") {
+        Some(fg) if !fg.is_null() => {
+            let pid = fg.get("pid").and_then(Value::as_u64);
+            let procs = match (pid, fg.get("name").and_then(Value::as_str)) {
+                (Some(pid), Some(name)) => vec![PaneProcessInfoProcess {
+                    pid,
+                    name: name.to_string(),
+                    argv0: fg
+                        .get("argv")
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.first())
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }],
+                _ => Vec::new(),
+            };
+            (pid, procs)
+        }
+        _ => (None, Vec::new()),
+    };
+    Ok(PaneProcessInfo {
+        pane_id: toron_core::backend::hc::prefix_id(toron_core::backend::hc::strip_id_prefix(
+            pane_id,
+        )),
+        foreground_process_group_id,
+        shell_pid,
+        foreground_processes,
+    })
 }
 
 /// Known agent-kind → process-name mapping for the liveness probe (bd-1np).
-/// These are the canonical executables hc launches per kind
-/// (`hc agent start --kind <KIND>`); the foreground process's `name` /
-/// `argv0` matches one of these while the agent lives.
+/// These are the canonical executables the harness launch runs per kind;
+/// the foreground process's `name` / `argv0` matches one of these while
+/// the agent lives.
 pub fn kind_process_names(kind: &str) -> &'static [&'static str] {
     match kind {
         "opencode" => &["opencode"],
@@ -1358,7 +928,7 @@ fn process_name_matches(candidate: &str, expected: &str) -> bool {
             .is_some_and(|stem| stem == expected)
 }
 
-/// Pure liveness verdict from a `pane.process_info` snapshot (bd-1np).
+/// Pure liveness verdict from a `terminal.get` snapshot (bd-1np).
 ///
 /// The agent process is alive iff its binary appears in the pane's foreground
 /// processes (hc's process-info lists the whole foreground group; the live
@@ -1396,7 +966,7 @@ pub fn pane_agent_alive(info: &PaneProcessInfo, kind: &str) -> Option<bool> {
     Some(false)
 }
 
-/// Spawn-to-dispatch readiness gate (bd-eign.6): poll `pane.process_info`
+/// Spawn-to-dispatch readiness gate (bd-eign.6): poll `terminal.get`
 ///
 /// hc's `agent.start` returns once the launch command is dispatched, NOT
 /// when the agent TUI is ready to receive input — during the 2-30s boot
@@ -1489,11 +1059,7 @@ pub fn responsiveness_verdict(
 /// classify with the pure verdict. `Inconclusive` when either sample is
 /// unavailable (agent vanished mid-probe) — the caller must NOT respawn on
 /// inconclusive evidence.
-pub fn probe_agent_responsiveness(
-    c: &Client,
-    pane_id: &str,
-    window: Duration,
-) -> Responsiveness {
+pub fn probe_agent_responsiveness(c: &Client, pane_id: &str, window: Duration) -> Responsiveness {
     let sample = |c: &Client| -> Option<(u64, bool)> {
         let agents = c.agent_list().ok()?;
         let a = agents.iter().find(|a| a.pane_id == pane_id)?;
@@ -1545,24 +1111,51 @@ pub struct EventStream {
 
 /// Subscribe to hc push events, returning the flywheel-shaped stream.
 /// Delegation: the subscription handshake + socket lifecycle are entirely
-/// toron-core's.
-pub fn subscribe(c: &Client, _subscriptions: &[Subscription]) -> Result<EventStream> {
+/// toron-core's. One all-terminals stream (`events.subscribe` takes a single
+/// terminal, not a list — one socket, never one per pane); the requested
+/// pane ids filter at the mapping edge, so the doorbell never sees
+/// unregistered panes (which fell back to pin=pane_id and injected phantom
+/// pins). An empty subscription list means all panes (current behavior).
+pub fn subscribe(c: &Client, subscriptions: &[Subscription]) -> Result<EventStream> {
     // hc uses subscribe_terminals; map BackendEvent into the flywheel PushEvent
     // shape the doorbell still matches on.
     let (_snapshot, mut inner) = c
         .subscribe_terminals(None)
         .map_err(|e| anyhow!("hc subscribe_terminals failed: {e}"))?;
+    // Pane-id allow-set for the mapping edge: stripped bare addresses, so
+    // `hc:t7` and `t7` spellings meet. Empty = subscribe to everything.
+    let allowed: std::collections::HashSet<String> = subscriptions
+        .iter()
+        .map(|s| toron_core::backend::hc::strip_id_prefix(&s.pane_id).to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
     std::thread::spawn(move || {
-        pump_backend_events(|| inner.read_event(), &tx);
+        pump_backend_events(|| inner.read_event(), &tx, &allowed);
     });
     Ok(EventStream { rx, timeout: None })
 }
 
-fn push_from_backend(ev: toron_core::backend::types::BackendEvent) -> Option<PushEvent> {
+fn push_from_backend(
+    ev: toron_core::backend::types::BackendEvent,
+    allowed: &std::collections::HashSet<String>,
+) -> Option<PushEvent> {
     use toron_core::backend::types::BackendEvent;
+    // Mapping-edge filter (steering 6): drop pushes for panes outside the
+    // subscription set. Empty set = all panes.
+    let pane_in_scope = |pane: &toron_core::backend::types::PaneId| {
+        allowed.is_empty()
+            || allowed.contains(toron_core::backend::hc::strip_id_prefix(pane.as_str()))
+    };
     match ev {
-        BackendEvent::AgentStatusChanged { pane, agent, status } => {
+        BackendEvent::AgentStatusChanged {
+            pane,
+            agent,
+            status,
+        } => {
+            if !pane_in_scope(&pane) {
+                return None;
+            }
             let change = PaneAgentStatusChanged {
                 pane_id: pane.as_str().to_string(),
                 workspace_id: String::new(),
@@ -1577,32 +1170,33 @@ fn push_from_backend(ev: toron_core::backend::types::BackendEvent) -> Option<Pus
                 data: TerminalEventData::PaneAgentStatusChangedSub(change),
             })
         }
-        BackendEvent::AgentDetected { pane, agent, status } => {
-            let change = PaneAgentDetected {
-                pane_id: pane.as_str().to_string(),
-                workspace_id: String::new(),
-                agent,
-                final_status: Some(status),
-                released: None,
-            };
+        BackendEvent::PaneExited { pane } => {
+            if !pane_in_scope(&pane) {
+                return None;
+            }
             Some(PushEvent {
-                kind: TerminalEventKind::PaneAgentDetected,
-                data: TerminalEventData::PaneAgentDetected(change),
+                kind: TerminalEventKind::PaneExited,
+                data: TerminalEventData::PaneExited(PaneExited {
+                    pane_id: pane.as_str().to_string(),
+                    workspace_id: String::new(),
+                }),
             })
         }
-        BackendEvent::PaneExited { pane } => Some(PushEvent {
-            kind: TerminalEventKind::PaneExited,
-            data: TerminalEventData::PaneExited(PaneExited {
-                pane_id: pane.as_str().to_string(),
-                workspace_id: String::new(),
-            }),
-        }),
-        BackendEvent::EventsLost | BackendEvent::Raw(_) => None,
+        // Dropped at the edge: no consumer routes on detected/gap/unknown
+        // (the watch loop + doorbell ignore them via wildcard arms), so
+        // dropping here changes no behavior — and keeps the push surface
+        // to the two routed kinds.
+        BackendEvent::AgentDetected { .. } | BackendEvent::EventsLost | BackendEvent::Raw(_) => {
+            None
+        }
     }
 }
 
-fn pump_backend_events<R>(mut read: R, tx: &std::sync::mpsc::Sender<StreamItem>)
-where
+fn pump_backend_events<R>(
+    mut read: R,
+    tx: &std::sync::mpsc::Sender<StreamItem>,
+    allowed: &std::collections::HashSet<String>,
+) where
     R: FnMut() -> Result<Option<toron_core::backend::types::BackendEvent>, BackendError>,
 {
     use toron_core::backend::types::BackendEvent;
@@ -1614,7 +1208,7 @@ where
                 }
             }
             Ok(Some(ev)) => {
-                if let Some(push) = push_from_backend(ev)
+                if let Some(push) = push_from_backend(ev, allowed)
                     && tx.send(StreamItem::Event(push)).is_err()
                 {
                     break;
@@ -1637,64 +1231,11 @@ where
     }
 }
 
-/// The reader loop, over any source of pushed events.
-///
-/// A gap (`events_lost`) is a NOTICE, not a death: toron-core's
-/// `read_event` returns a typed error and leaves the reader on the open
-/// socket, so the stream is still good. This loop used to BREAK on a gap,
-/// which killed the subscription: the doorbell then cleared its coverage
-/// and re-subscribed from scratch - a NEW socket per gap (the daemon's
-/// socket count grew at the gap rate) and a fresh subscriber that starts
-/// BEHIND the ring, so it was told `events_lost` again. One upstream gap
-/// fanned out into a gap per subscriber and a socket per re-subscribe.
-#[allow(dead_code)]
-fn pump_events<R>(mut read: R, tx: &std::sync::mpsc::Sender<StreamItem>)
-where
-    R: FnMut() -> Result<Option<(String, serde_json::Value)>, BackendError>,
-{
-    loop {
-        match read() {
-            Ok(Some((kind, data))) => {
-                let ev = match TerminalEventKind::parse(&kind) {
-                    Ok(k) => match TerminalEventData::from_kind(k, data) {
-                        Ok(data) => PushEvent { kind: k, data },
-                        Err(e) => {
-                            let _ = tx.send(StreamItem::Error(format!(
-                                "malformed hc event {kind}: {e}"
-                            )));
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        let _ = tx.send(StreamItem::Error(format!(
-                            "unknown hc event kind {kind}: {e}"
-                        )));
-                        break;
-                    }
-                };
-                if tx.send(StreamItem::Event(ev)).is_err() {
-                    break;
-                }
-            }
-            Ok(None) => {
-                let _ = tx.send(StreamItem::Closed);
-                break;
-            }
-            Err(e) if e.code == BackendErrorCode::EventsLost => {
-                // In band, and the stream goes on: the caller reconciles the
-                // status facts and keeps the subscription.
-                if tx.send(StreamItem::EventsLost).is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(StreamItem::Error(format!("hc read failed: {e}")));
-                break;
-            }
-        }
-    }
-}
-
+/// Gap history (bd-v9k6), kept with the live loop: a gap used to BREAK the
+/// reader, which killed the subscription — the doorbell cleared coverage
+/// and re-subscribed (a NEW socket per gap; the fresh subscriber started
+/// BEHIND the ring, so it was told `events_lost` again). The loop below
+/// delivers the gap in band and keeps reading instead.
 impl EventStream {
     /// Read one pushed event. `Ok(None)` when the server closes the stream;
     /// `Err` on a read timeout (when a deadline was set), transient I/O, or
@@ -1739,18 +1280,17 @@ impl EventStream {
 #[cfg(test)]
 mod events_lost_tests {
     use super::*;
+    use toron_core::backend::types::{BackendEvent, PaneId};
 
-    /// bd-v9k6: a gap is a NOTICE, not a death. The reader loop used to
-    /// break on `events_lost`, which killed the subscription: the doorbell
-    /// cleared its coverage and re-subscribed (a NEW socket per gap, and the
-    /// daemon's socket count grew at the gap rate), and the fresh subscriber
-    /// started BEHIND the ring, so it was told `events_lost` again. One
-    /// upstream gap fanned out into a gap and a socket per subscriber.
+    /// bd-v9k6 on the LIVE loop: a gap is a NOTICE, not a death — delivered
+    /// in band, and the loop keeps reading past it (same contract the dead
+    /// `pump_events` loop pinned; the coverage migrates with the code).
     #[test]
     fn a_gap_is_delivered_in_band_and_the_stream_keeps_reading() {
         let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
+        let allowed = std::collections::HashSet::new();
         let mut calls = 0u32;
-        pump_events(
+        pump_backend_events(
             || {
                 calls += 1;
                 match calls {
@@ -1758,18 +1298,16 @@ mod events_lost_tests {
                         BackendErrorCode::EventsLost,
                         "subscriber fell behind",
                     )),
-                    2 => Ok(Some((
-                        "pane.agent_status_changed".to_string(),
-                        serde_json::json!({
-                            "pane_id": "w7X:p1",
-                            "workspace_id": "w7X",
-                            "agent_status": "idle",
-                        }),
-                    ))),
+                    2 => Ok(Some(BackendEvent::AgentStatusChanged {
+                        pane: PaneId::new("hc:t7"),
+                        agent: Some("opencode".to_string()),
+                        status: AgentStatus::Idle,
+                    })),
                     _ => Ok(None),
                 }
             },
             &tx,
+            &allowed,
         );
         let items: Vec<StreamItem> = rx.try_iter().collect();
         assert!(
@@ -1784,6 +1322,89 @@ mod events_lost_tests {
             items.iter().any(|i| matches!(i, StreamItem::Event(_))),
             "the event after the gap still arrives"
         );
+    }
+
+    /// Detected pushes carry no routing fact: they drop at the edge so the
+    /// push surface stays the two routed kinds (consumers ignored them via
+    /// wildcard arms, so the drop changes no behavior).
+    #[test]
+    fn agent_detected_drops_at_the_edge() {
+        let allowed = std::collections::HashSet::new();
+        let ev = BackendEvent::AgentDetected {
+            pane: PaneId::new("hc:t7"),
+            agent: Some("opencode".to_string()),
+            status: AgentStatus::Working,
+        };
+        assert!(push_from_backend(ev, &allowed).is_none());
+    }
+
+    /// Steering 6: two panes in the stream, one subscribed — only the
+    /// subscribed pane reaches the channel (single socket, filter at the
+    /// mapping edge). Empty set = all panes (existing behavior).
+    #[test]
+    fn subscribe_filter_drops_unsubscribed_panes() {
+        use std::collections::HashSet;
+        fn status_for(pane: &str) -> BackendEvent {
+            BackendEvent::AgentStatusChanged {
+                pane: PaneId::new(pane),
+                agent: Some("opencode".to_string()),
+                status: AgentStatus::Idle,
+            }
+        }
+        // Filtered: only hc:t8 arrives.
+        let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
+        let allowed: HashSet<String> = ["t8".to_string()].into_iter().collect();
+        let mut calls = 0u32;
+        pump_backend_events(
+            || {
+                calls += 1;
+                match calls {
+                    1 => Ok(Some(status_for("hc:t7"))),
+                    2 => Ok(Some(status_for("hc:t8"))),
+                    _ => Ok(None),
+                }
+            },
+            &tx,
+            &allowed,
+        );
+        let panes: Vec<String> = rx
+            .try_iter()
+            .filter_map(|i| match i {
+                StreamItem::Event(e) => match e.data {
+                    TerminalEventData::PaneAgentStatusChangedSub(c) => Some(c.pane_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(panes, vec!["hc:t8".to_string()]);
+        // Empty set = all panes.
+        let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
+        let allowed = HashSet::new();
+        let mut calls = 0u32;
+        pump_backend_events(
+            || {
+                calls += 1;
+                match calls {
+                    1 => Ok(Some(status_for("hc:t7"))),
+                    2 => Ok(Some(status_for("hc:t8"))),
+                    _ => Ok(None),
+                }
+            },
+            &tx,
+            &allowed,
+        );
+        let panes: Vec<String> = rx
+            .try_iter()
+            .filter_map(|i| match i {
+                StreamItem::Event(e) => match e.data {
+                    TerminalEventData::PaneAgentStatusChangedSub(c) => Some(c.pane_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(panes, vec!["hc:t7".to_string(), "hc:t8".to_string()]);
     }
 }
 
@@ -1938,7 +1559,11 @@ mod plane_launch_env_tests {
     #[test]
     fn env_carries_pin_as_agent_name_and_mail_as() {
         let env = plane_launch_env(&cfg(), Some("DustySparrow"));
-        assert!(env.get("HC_SOCKET_PATH").map(|s| s.contains("herdr-core")).unwrap_or(false));
+        assert!(
+            env.get("HC_SOCKET_PATH")
+                .map(|s| s.contains("herdr-core"))
+                .unwrap_or(false)
+        );
         assert_eq!(env.get("HC_SESSION").map(String::as_str), Some("default"));
         assert_eq!(
             env.get("AGENT_NAME").map(String::as_str),
@@ -3302,124 +2927,15 @@ mod pi_tail_tests {
     }
 }
 
-/// H3 (bd-harness-integration-preflight): `hc integration status` CLI
-/// output parser + install-target mapping. The gate is
-/// `cargo test -p flywheel integration_status`.
+/// H3 (bd-harness-integration-preflight): install-target mapping for the
+/// harness kinds. hc 0.1.16 exposes no integration surface, so the status
+/// parsers are deleted (nothing to parse) and every live status is
+/// `not_installed` — the gate is `cargo test -p flywheel integration_status`.
 #[cfg(test)]
 mod integration_status_tests {
-    use super::{
-        INTEGRATION_KINDS, IntegrationStatus, integration_target, parse_integration_status_line,
-        parse_integration_status_output,
-    };
+    use super::{INTEGRATION_KINDS, IntegrationStatus, integration_target};
 
-    /// `current (vN) (/path)` → installed + current, version captured.
-    #[test]
-    fn integration_status_parser_current() {
-        let (kind, st) = parse_integration_status_line(
-            "opencode: current (v9) (/Users/bangedorrunt/.config/opencode/plugins/plane-agent-state.js)",
-        )
-        .expect("current line parses");
-        assert_eq!(kind, "opencode");
-        assert!(st.installed);
-        assert!(st.current);
-        assert_eq!(st.version.as_deref(), Some("v9"));
-        assert_eq!(st.expected_version, None);
-        assert_eq!(
-            st.path.as_deref(),
-            Some("/Users/bangedorrunt/.config/opencode/plugins/plane-agent-state.js")
-        );
-    }
-
-    /// `outdated (vN < vM) (/path)` → installed, not current, both versions.
-    #[test]
-    fn integration_status_parser_outdated() {
-        let (kind, st) = parse_integration_status_line(
-            "hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/plane-agent-state/__init__.py)",
-        )
-        .expect("outdated line parses");
-        assert_eq!(kind, "hermes");
-        assert!(st.installed);
-        assert!(!st.current);
-        assert_eq!(st.version.as_deref(), Some("v3"));
-        assert_eq!(st.expected_version.as_deref(), Some("v4"));
-        assert_eq!(
-            st.path.as_deref(),
-            Some("/Users/bangedorrunt/.hermes/plugins/plane-agent-state/__init__.py")
-        );
-    }
-
-    /// `not installed (/path)` → installed=false, no versions.
-    #[test]
-    fn integration_status_parser_not_installed() {
-        let (kind, st) = parse_integration_status_line(
-            "claude: not installed (/Users/bangedorrunt/.claude/hooks/plane-agent-state.sh)",
-        )
-        .expect("not-installed line parses");
-        assert_eq!(kind, "claude");
-        assert!(!st.installed);
-        assert!(!st.current);
-        assert_eq!(st.version, None);
-        assert_eq!(st.expected_version, None);
-        assert_eq!(
-            st.path.as_deref(),
-            Some("/Users/bangedorrunt/.claude/hooks/plane-agent-state.sh")
-        );
-    }
-
-    /// A path containing spaces (hc prints the literal path) must not
-    /// break the state extraction — the LAST ` (...) ` group is the path.
-    #[test]
-    fn integration_status_parser_path_with_spaces() {
-        let (_, st) = parse_integration_status_line(
-            "kimi: current (v2) (/Users/bangedorrunt/Library/Application Support/kimi/hooks/plane-agent-state.sh)",
-        )
-        .expect("spacey path line parses");
-        assert!(st.installed && st.current);
-        assert_eq!(
-            st.path.as_deref(),
-            Some("/Users/bangedorrunt/Library/Application Support/kimi/hooks/plane-agent-state.sh")
-        );
-    }
-
-    /// Unknown state text = shape drift: never invent a state, treat as
-    /// not installed (the path group is still data — keep it).
-    #[test]
-    fn integration_status_parser_unknown_state_defaults_not_installed() {
-        let (kind, st) = parse_integration_status_line("foo: mysterious (v1) (/tmp/x)")
-            .expect("unknown-state line still parses kind");
-        assert_eq!(kind, "foo");
-        assert!(!st.installed);
-        assert_eq!(st.path.as_deref(), Some("/tmp/x"));
-    }
-
-    /// Empty / malformed lines are skipped (multi-line output parses as a
-    /// map; a shape-drifted line must not poison the rest).
-    #[test]
-    fn integration_status_parser_skips_garbage_lines() {
-        assert!(parse_integration_status_line("").is_none());
-        assert!(parse_integration_status_line("   ").is_none());
-        assert!(parse_integration_status_line("no-colon-line").is_none());
-    }
-
-    /// Full-output parse: the real 0.8.0-preview shape, all states present.
-    #[test]
-    fn integration_status_output_parses_all_kinds() {
-        let raw = "\
-pi: current (v8) (/Users/bangedorrunt/.pi/agent/extensions/plane-agent-state.ts)
-omp: current (v8) (/Users/bangedorrunt/.omp/agent/extensions/hc-omp-agent-state.ts)
-claude: not installed (/Users/bangedorrunt/.claude/hooks/plane-agent-state.sh)
-hermes: outdated (v3 < v4) (/Users/bangedorrunt/.hermes/plugins/plane-agent-state/__init__.py)
-";
-        let map: std::collections::HashMap<_, _> =
-            parse_integration_status_output(raw).into_iter().collect();
-        assert_eq!(map.len(), 4);
-        assert!(map["pi"].installed && map["pi"].current);
-        assert!(map["pi"].installed && map["pi"].current);
-        assert!(!map["claude"].installed);
-        assert!(map["hermes"].installed && !map["hermes"].current);
-    }
-
-    /// Every canonical kind maps to a socket target; the underscore twin
+    /// Every canonical kind maps to a target; the underscore twin
     /// resolves too; custom flywheel kinds resolve to None (preflight skips).
     #[test]
     fn integration_status_target_mapping() {
@@ -3500,7 +3016,7 @@ mod shell_prompt_tests {
     /// workspace: "no agents in workspace w37").
     #[test]
     fn resolve_workspace_id_prefers_owned_label_over_foreign() {
-        use crate::hc_support::{AgentInfo, WorkspaceInfo};
+        use crate::hc_support::{AgentInfo, AgentStatus, WorkspaceInfo};
         let mk = |id: &str, label: &str| WorkspaceInfo {
             workspace_id: id.into(),
             number: 0,
@@ -3509,7 +3025,7 @@ mod shell_prompt_tests {
             pane_count: 0,
             tab_count: 0,
             active_tab_id: String::new(),
-            agent_status: crate::hc_support::AgentStatus::Unknown,
+            agent_status: AgentStatus::Unknown,
             cwd: None,
         };
         let foreign = mk("w37", "toron");
@@ -3682,38 +3198,21 @@ mod shell_gate_e2e {
     #[ignore = "bd-d7zu LIVE probe: needs a live hc daemon"]
     fn real_pane_reaches_a_detected_prompt() {
         let cfg = crate::Config::load().expect("config");
-        let mut c = Client::connect(Some(&cfg.socket_path())).expect("hc connect");
-        let created = c
-            .call(
-                "workspace.create",
-                json!({ "label": "flywheel-shell-gate-e2e", "cwd": "/tmp", "focus": false }),
-            )
-            .expect("workspace.create");
-        let ws = created
-            .get("workspace")
-            .cloned()
-            .unwrap_or_else(|| created.clone());
-        let ws_id = ws
-            .get("workspace_id")
-            .and_then(|v| v.as_str())
-            .expect("workspace_id")
-            .to_string();
-        let root_obj = created
-            .get("root_pane")
-            .cloned()
-            .unwrap_or_else(|| created.clone());
-        let root = root_obj
-            .get("pane_id")
-            .and_then(|v| v.as_str())
-            .expect("root pane id")
-            .to_string();
-        let split = pane_split(&mut c, &root, "down", Some("/tmp"), None).expect("pane_split");
+        let c = Client::connect(Some(&cfg.socket_path())).expect("hc connect");
+        // hc has no workspaces: the "workspace" is a shell terminal whose
+        // address is the workspace id; the split pane is its child.
+        let (ws, root) = c
+            .workspace_create(Some("/tmp"), Some("flywheel-shell-gate-e2e"), false, None)
+            .expect("workspace_create");
+        let ws_id = ws.workspace_id.clone();
+        let root = root.expect("workspace_create returns a root pane").pane_id;
+        let split = pane_split(&c, &root, "down", Some("/tmp"), None).expect("pane_split");
         let pane = split.pane_id.clone();
 
         let started = std::time::Instant::now();
-        let ready = wait_shell_prompt(&mut c, &pane, Duration::from_secs(15));
+        let ready = wait_shell_prompt(&c, &pane, Duration::from_secs(15));
         let elapsed = started.elapsed();
-        let matched_on = pane_recent_text(&mut c, &pane)
+        let matched_on = pane_recent_text(&c, &pane)
             .ok()
             .and_then(|t| {
                 t.lines()
@@ -3723,7 +3222,8 @@ mod shell_gate_e2e {
             })
             .unwrap_or_default();
 
-        let _ = c.call("workspace.close", json!({ "workspace_id": ws_id.clone() }));
+        let _ = c.workspace_close(&ws_id, true);
+        let _ = c.terminal_kill(&pane);
 
         // The artifact: what the gate saw, on a real pane.
         println!("gate: ready={ready} elapsed={elapsed:?} matched_on={matched_on:?}");
@@ -3863,9 +3363,6 @@ mod bd_crlx_model_pin_tests {
     }
 }
 
-
-
-
 /// Compatibility surface for call sites that still speak the old hc Client
 /// method names. Prefer MultiplexerBackend (rex primary / hc fallback) for new
 /// code. Methods that hc does not implement call through `call`/`call_coded`
@@ -3878,25 +3375,108 @@ fn unsupported_on_hc(method: &str) -> BackendError {
     )
 }
 
+/// Label stamped on every workspace shell so `workspace_list` can find it
+/// again (hc has no workspaces — the shell terminal IS the workspace).
+const WORKSPACE_LABEL_KEY: &str = "flywheel_workspace";
+
+fn workspace_info_for(term: &toron_core::backend::hc::Terminal) -> Option<WorkspaceInfo> {
+    let label = term.labels.get(WORKSPACE_LABEL_KEY)?.clone();
+    Some(WorkspaceInfo {
+        workspace_id: toron_core::backend::hc::prefix_id(&term.address),
+        number: 0,
+        label,
+        focused: false,
+        pane_count: 0,
+        tab_count: 0,
+        active_tab_id: String::new(),
+        agent_status: AgentStatus::Unknown,
+        cwd: term.cwd.clone(),
+    })
+}
+
 impl Client {
+    /// hc has no workspaces: the workspace shells (stamped
+    /// [`WORKSPACE_LABEL_KEY`] at create) listed as workspaces. Empty when
+    /// none exists — so list-then-create flows create.
     pub fn workspace_list(&self) -> Result<Vec<WorkspaceInfo>, BackendError> {
-        Err(unsupported_on_hc("workspace_list"))
+        let terms = self.terminal_list(false)?;
+        Ok(terms.iter().filter_map(workspace_info_for).collect())
     }
+    /// A workspace is a shell terminal: `terminal.run` with cwd + env and NO
+    /// argv (the server runs its own shell). The id IS the address; the
+    /// label rides [`WORKSPACE_LABEL_KEY`] so `workspace_list` (and hence
+    /// `find_workspace`) sees it. Returns the root pane too.
     pub fn workspace_create(
         &self,
-        _cwd: Option<&str>,
-        _label: Option<&str>,
+        cwd: Option<&str>,
+        label: Option<&str>,
         _focus: bool,
-        _env: Option<&std::collections::BTreeMap<String, String>>,
+        env: Option<&std::collections::BTreeMap<String, String>>,
     ) -> Result<(WorkspaceInfo, Option<PaneInfo>), BackendError> {
-        Err(unsupported_on_hc("workspace_create"))
+        let mut params = serde_json::Map::new();
+        if let Some(cwd) = cwd {
+            params.insert("cwd".into(), json!(cwd));
+        }
+        // ADR-0010 D13: the workspace shell is a CREW shell, same stamp as
+        // every split pane (the agents it spawns inherit this env).
+        let mut owned = env.cloned().unwrap_or_default();
+        owned
+            .entry("FLYWHEEL_ROLE".to_string())
+            .or_insert_with(|| "crew".to_string());
+        params.insert("env".into(), json!(owned));
+        if let Some(label) = label {
+            params.insert("labels".into(), json!({ WORKSPACE_LABEL_KEY: label }));
+        }
+        // No argv: hc runs its own shell for an argv-less terminal.run.
+        // The root shell is a peer, not a child: no_parent so no death
+        // couples it to whatever terminal started the spawn (usually none —
+        // the CLI runs outside hc — but explicit beats default here).
+        params.insert("no_parent".into(), serde_json::json!(true));
+        let res: toron_core::backend::hc::Terminal = serde_json::from_value(
+            self.call("terminal.run", Value::Object(params))
+                .map_err(|e| {
+                    BackendError::new(
+                        e.code().clone(),
+                        format!("terminal.run (workspace shell): {}", e.message),
+                    )
+                })?,
+        )
+        .map_err(|e| {
+            BackendError::new(
+                toron_core::backend::error::BackendErrorCode::Malformed,
+                format!("parse terminal.run result: {e}"),
+            )
+        })?;
+        let ws = workspace_info_for(&res).unwrap_or(WorkspaceInfo {
+            workspace_id: toron_core::backend::hc::prefix_id(&res.address),
+            number: 0,
+            label: label.unwrap_or_default().to_string(),
+            focused: false,
+            pane_count: 0,
+            tab_count: 0,
+            active_tab_id: String::new(),
+            agent_status: AgentStatus::Unknown,
+            cwd: res.cwd.clone(),
+        });
+        let want = ws.workspace_id.clone();
+        let root = self
+            .pane_list()
+            .map(|panes| panes.into_iter().find(|p| p.pane_id == want))?;
+        Ok((ws, root))
     }
-    pub fn workspace_close(&self, _workspace_id: &str, _close_group: bool) -> Result<(), BackendError> {
-        Err(unsupported_on_hc("workspace_close"))
+    /// The workspace is a shell terminal: killing it ends the tree.
+    pub fn workspace_close(
+        &self,
+        workspace_id: &str,
+        _close_group: bool,
+    ) -> Result<(), BackendError> {
+        self.terminal_kill(workspace_id).map(|_| ())
     }
+    /// Run `command` IN the pane: `terminal.send` pastes the text and presses
+    /// Enter in that terminal (hc has no remote-run — spawning a sibling
+    /// terminal here orphaned a shell per call).
     pub fn pane_run(&self, pane_id: &str, command: &str) -> Result<(), BackendError> {
-        let argv = vec!["/bin/sh".into(), "-c".into(), command.to_string()];
-        self.terminal_run(&argv, Some(pane_id), None).map(|_| ())
+        self.terminal_send(pane_id, command, None).map(|_| ())
     }
     pub fn pane_send_text(&self, pane_id: &str, text: &str) -> Result<(), BackendError> {
         self.terminal_send(pane_id, text, None).map(|_| ())
@@ -3904,6 +3484,11 @@ impl Client {
     pub fn pane_send_input(&self, pane_id: &str, keys: &[&str]) -> Result<(), BackendError> {
         self.terminal_keys(pane_id, keys).map(|_| ())
     }
+    /// Start the agent IN the existing pane: the shell-quoted `kind + args`
+    /// line is typed into the shell via `terminal.send` (which pastes and
+    /// presses Enter), so the agent runs as that shell's child with the
+    /// pane's env. A second `terminal.run` here orphaned a shell per spawn
+    /// and lost the pane env — never do that.
     pub fn agent_start(
         &self,
         name: &str,
@@ -3912,19 +3497,21 @@ impl Client {
         _timeout_ms: u64,
         args: &[String],
     ) -> Result<AgentInfo, BackendError> {
-        let argv: Vec<String> = if args.is_empty() {
-            vec![kind.to_string()]
-        } else {
-            args.to_vec()
-        };
-        let term = self.terminal_run(&argv, Some(name), None)?;
-        let _ = pane_id; // hc addresses come from terminal.run
-        self.agent_get(&term.address)
+        let _ = name; // the pane keeps its address; the pin rides toron_pin via agent_rename
+        let line = crate::recipe_launch_command(kind, args);
+        self.terminal_send(pane_id, &line, None)?;
+        self.agent_get(pane_id)
     }
+    /// Rename the agent by stamping its mail pin: `terminal.label` with
+    /// `toron_pin` = new name (mail routing reads `toron_pin`). hc exposes
+    /// no `agent.rename` — never send it.
     pub fn agent_rename(&self, target: &str, new_name: &str) -> Result<(), BackendError> {
-        self.call(
-            "agent.rename",
-            json!({ "target": target, "name": new_name }),
+        self.call_coded(
+            "terminal.label",
+            json!({
+                "terminal": toron_core::backend::hc::strip_id_prefix(target),
+                "labels": { "toron_pin": new_name },
+            }),
         )
         .map(|_| ())
     }
@@ -3989,7 +3576,9 @@ impl Client {
     }
     #[allow(dead_code)]
     pub fn subscribe(&self, _subscriptions: &[Subscription]) -> Result<Value, BackendError> {
-        Err(unsupported_on_hc("subscribe(legacy); use subscribe_terminals"))
+        Err(unsupported_on_hc(
+            "subscribe(legacy); use subscribe_terminals",
+        ))
     }
     #[allow(dead_code)]
     pub fn pane_report_metadata(
@@ -4003,6 +3592,129 @@ impl Client {
         Ok(json!({ "ok": true }))
     }
     pub fn ping(&self) -> Result<Value, BackendError> {
-        self.terminal_list(false).map(|v| json!({ "ok": true, "terminals": v.len() }))
+        self.terminal_list(false)
+            .map(|v| json!({ "ok": true, "terminals": v.len() }))
+    }
+}
+
+/// Migration witness (hc 0.1.16 port): every raw RPC literal in
+/// `src/hc_support.rs` + `src/cmd/crew.rs` must name a method the hc schema
+/// fixture lists. A pre-hc literal (`pane.split`, `agent.rename`, …)
+/// reintroduced here fails this test instead of failing at runtime behind
+/// a typed `missing_method`. Cheap + deterministic: two `include_str!`s
+/// and the checked-in fixture, no daemon, no network.
+#[cfg(test)]
+mod hc_method_witness_tests {
+    /// Fixture: the authoritative 0.1.16 method list (toron branch).
+    const SCHEMA: &str =
+        include_str!("../../toron/crates/toron-core/tests/fixtures/hc-schema-0.1.16.json");
+    const HC_SUPPORT_SRC: &str = include_str!("hc_support.rs");
+    const CREW_SRC: &str = include_str!("cmd/crew.rs");
+
+    /// Raw RPC literals: the method string of each `.call("…")` /
+    /// `.call_coded("…")` site. An occurrence is a call only when the
+    /// token after the quote matches `[a-z][a-z0-9_.]*` — anything else
+    /// (the scanner's own `.find(".call(\"")` line, prose, a non-literal
+    /// call) is skipped so the witness scans itself clean.
+    fn rpc_literals(src: &str) -> Vec<String> {
+        fn token(after: &str) -> Option<(&str, &str)> {
+            let mut len = 0;
+            for b in after.bytes() {
+                if b.is_ascii_lowercase() || b == b'.' || b == b'_' || len > 0 && b.is_ascii_digit()
+                {
+                    len += 1;
+                } else {
+                    break;
+                }
+            }
+            if len > 0 && after.as_bytes()[0].is_ascii_lowercase() {
+                Some(after.split_at(len))
+            } else {
+                None
+            }
+        }
+        let mut out = Vec::new();
+        for line in src.lines() {
+            // Doc/prose mentions (including this module's own docs) are not
+            // calls — a commented-out call is a deleted call, which is the
+            // desired direction, so comment lines carry no witness weight.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            loop {
+                let next = rest
+                    .find(".call(\"")
+                    .map(|p| (p, ".call(\"".len()))
+                    .or_else(|| {
+                        rest.find(".call_coded(\"")
+                            .map(|p| (p, ".call_coded(\"".len()))
+                    });
+                let Some((pos, skip)) = next else { break };
+                let after = &rest[pos + skip..];
+                match token(after) {
+                    Some((method, tail)) => {
+                        out.push(method.to_string());
+                        rest = tail;
+                    }
+                    None => rest = after,
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scanner_ignores_its_own_source_line() {
+        // The scanner's own `.find(".call(\"")` line contains the pattern
+        // but no method token — it must yield nothing, or the witness
+        // fails on itself (finding 5).
+        let own = r#"let next = rest.find(".call(\"").map(|p| (p, ".call(\"".len()));"#;
+        assert_eq!(rpc_literals(own), Vec::<String>::new());
+        assert_eq!(
+            rpc_literals(r#"let x = c.call("terminal.kill", v)?;"#),
+            vec!["terminal.kill".to_string()]
+        );
+        assert_eq!(
+            rpc_literals(r#"c.call_coded("terminal.label", json!({}));"#),
+            vec!["terminal.label".to_string()]
+        );
+    }
+
+    #[test]
+    fn every_raw_rpc_literal_is_an_hc_schema_method() {
+        let schema: serde_json::Value =
+            serde_json::from_str(SCHEMA).expect("hc schema fixture parses");
+        let methods: std::collections::HashSet<String> = schema
+            .get("methods")
+            .and_then(|m| m.as_array())
+            .expect("schema has methods[]")
+            .iter()
+            .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            methods.contains("terminal.run"),
+            "fixture must list terminal.run (sanity — wrong fixture?)"
+        );
+        for (name, src, must_find) in [
+            ("hc_support.rs", HC_SUPPORT_SRC, true),
+            // crew.rs currently makes no raw calls (both pane.close sites
+            // became typed terminal_kill) — vacuous pass is correct there;
+            // the assert still guards a reintroduced raw literal.
+            ("cmd/crew.rs", CREW_SRC, false),
+        ] {
+            let literals = rpc_literals(src);
+            assert!(
+                !must_find || !literals.is_empty(),
+                "{name}: scanner found no RPC literals (scanner broken?)"
+            );
+            for method in literals {
+                assert!(
+                    methods.contains(&method),
+                    "{name}: raw RPC {method:?} is not an hc 0.1.16 schema method — port it or delete it"
+                );
+            }
+        }
     }
 }

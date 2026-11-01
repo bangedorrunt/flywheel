@@ -3086,7 +3086,7 @@ mod tests {
         assert!(super::straggler_note(&clean).is_none());
     }
     use super::{
-        REAP_AFTER_SECS, any_fresh, bins_allow_hosting, plane_workspace_labels, inbox_path_down,
+        REAP_AFTER_SECS, any_fresh, bins_allow_hosting, inbox_path_down, plane_workspace_labels,
         reap_candidates, unhosted_subscribed,
     };
 
@@ -4007,12 +4007,7 @@ mod tests {
             Some("http://127.0.0.1:19100/wake"),
             "other",
         );
-        let hc = row(
-            "f",
-            SinkKind::Hc,
-            Some("http://127.0.0.1:19200/wake"),
-            "w",
-        );
+        let hc = row("f", SinkKind::Hc, Some("http://127.0.0.1:19200/wake"), "w");
         let (regs, refused) = super::webhook_registrations(&[elsewhere, hc], "w", &allow);
         assert!(regs.is_empty(), "scope + sink kind both gate: {regs:?}");
         assert!(refused.is_empty(), "neither is an error: {refused:?}");

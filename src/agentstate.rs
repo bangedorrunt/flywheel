@@ -106,7 +106,8 @@ pub fn read_state_for_agent(
     mail_pin: Option<&str>,
 ) -> Option<AgentStateFile> {
     let mut best: Option<(u64, AgentStateFile)> = None;
-    for name in std::iter::once(terminal_name).chain(mail_pin.into_iter().filter(|p| *p != terminal_name))
+    for name in
+        std::iter::once(terminal_name).chain(mail_pin.into_iter().filter(|p| *p != terminal_name))
     {
         let Some(f) = read_one_state_file(project_dir, name) else {
             continue;

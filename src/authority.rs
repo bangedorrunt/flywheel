@@ -8,6 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct HostAuthority {
+    // No live reader since the hc integration surface went away (hc 0.1.16
+    // has no `integration install` to mkdir for); kept as resolved-once
+    // authority with test pins rather than re-reading HOME per call site.
+    #[allow(dead_code)]
     pub home: String,
     pub cwd: std::path::PathBuf,
     pub exe: std::path::PathBuf,

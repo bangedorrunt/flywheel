@@ -18,7 +18,10 @@ pub enum TerminalEvent {
     /// A pane's agent status changed (idle/working/blocked/unknown).
     PaneAgentStatusChanged { pane_id: String, status: String },
     /// A pane exited: process gone.
-    PaneExited { pane_id: String, terminal_name: String },
+    PaneExited {
+        pane_id: String,
+        terminal_name: String,
+    },
 }
 
 /// Minimal typed watch hit (the `toron watch --once` doorbell).
@@ -580,11 +583,7 @@ mod tests {
         };
         let (next, cmds) = ws_tick(&ws, &WsMsg::Hc { event: pe });
         assert_eq!(cmds, [] as [crate::workspace::Cmd; 0]);
-        assert_eq!(
-            next.swarm.pending_events.len(),
-            1,
-            "Hc buffers into model'"
-        );
+        assert_eq!(next.swarm.pending_events.len(), 1, "Hc buffers into model'");
         let (next2, _) = ws_tick(&next, &WsMsg::Tick { now: 0 });
         assert!(
             next2.swarm.pending_events.is_empty(),

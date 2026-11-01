@@ -58,9 +58,9 @@ mod failure;
 mod fs_util;
 mod harness_caps;
 mod harness_registry;
+mod hc_support;
 mod headless;
 mod health_page;
-mod hc_support;
 mod inbox_host;
 mod inbox_ports;
 mod ingress;
@@ -68,8 +68,8 @@ mod init_scaffold;
 mod intent;
 mod lead_claim;
 mod private_fs;
-mod pull_fresh_poller;
 mod proc;
+mod pull_fresh_poller;
 mod recipient_guard;
 mod redact;
 mod request_receipts;
@@ -1979,7 +1979,7 @@ enum Commands {
     /// exit 2 = deny (JSON names the stem + the sanctioned alternative).
     /// Delegation-shaped stems: agent|subagent|task|workflow|spawn|dispatch|
     /// worktree|delegate; mcp__* excluded; observe/stop + session-local todo
-    /// allowlisted. Crew panes pass --role crew (exempt — pane.split stamps
+    /// allowlisted. Crew panes pass --role crew (exempt — terminal.run stamps
     /// FLYWHEEL_ROLE=crew). Crew panes can still be flywheel spawn'd.
     #[command(name = "__subagent-guard", hide = true)]
     __SubagentGuard {
@@ -2262,7 +2262,8 @@ fn agent_name_n(project: &str, short: &str, ordinal: u32) -> String {
 /// ordinal of that kind.
 fn resolve_agent_default(project: &str, value: &str) -> String {
     let v = value.trim();
-    let already_concrete = v.starts_with("flywheel-") || v.contains(':') || terminal_mail_name(v) == v;
+    let already_concrete =
+        v.starts_with("flywheel-") || v.contains(':') || terminal_mail_name(v) == v;
     if v.is_empty() || already_concrete {
         v.to_string()
     } else {
@@ -2328,7 +2329,10 @@ pub(crate) fn find_workspace(c: &mut Client, project: &str) -> Result<String> {
 
 /// [`find_workspace`]'s pick, whole: the sender needs its LABEL, which is
 /// what a doorbell host is keyed by (`crate::doorbell::inbox_owner_key`).
-pub(crate) fn find_workspace_info(c: &mut Client, project: &str) -> Result<hc_support::WorkspaceInfo> {
+pub(crate) fn find_workspace_info(
+    c: &mut Client,
+    project: &str,
+) -> Result<hc_support::WorkspaceInfo> {
     let aliases = workspace_label_aliases(project, state::load_spawn_meta(project).as_deref());
     let mut matches: Vec<hc_support::WorkspaceInfo> = c
         .workspace_list()?
@@ -2360,7 +2364,10 @@ pub(crate) fn find_workspace_info(c: &mut Client, project: &str) -> Result<hc_su
 }
 
 /// The entry with workspace id `id` (one of `matches` by construction).
-fn pick_workspace(mut matches: Vec<hc_support::WorkspaceInfo>, id: &str) -> hc_support::WorkspaceInfo {
+fn pick_workspace(
+    mut matches: Vec<hc_support::WorkspaceInfo>,
+    id: &str,
+) -> hc_support::WorkspaceInfo {
     let i = matches
         .iter()
         .position(|w| w.workspace_id == id)
@@ -4599,7 +4606,11 @@ fn add_target_from_split(
     // prefer the owned workspace hosting managed agents; first owned otherwise
     // (resolve_workspace_id picks the agent-hosting workspace among many).
     let prefix = format!("flywheel-{}-", project_base(project));
-    Ok(hc_support::resolve_workspace_id(&split.owned, agents, &prefix))
+    Ok(hc_support::resolve_workspace_id(
+        &split.owned,
+        agents,
+        &prefix,
+    ))
 }
 
 fn add_target_workspace(c: &mut Client, project: &str) -> Result<String> {
@@ -8661,10 +8672,10 @@ fn warn_integration_install_failed(kind: &str, hook_authority: bool, e: &anyhow:
     eprintln!(
         "\n!!! WARNING: the hc integration for {kind} is missing or outdated and the \
          auto-install failed.\n\
-         Fix: run `hc integration install {kind}` manually \
-         (hc.dev/docs/preview/integrations/).\n\
+         hc 0.1.16 has no integration surface (no `hc integration` subcommand, no \
+         `integration.*` method), so there is nothing to install.\n\
          {kind} detection falls back to process-based heuristics until the integration reports.\n\
-         (integration.install via socket failed: {e:#})\n"
+         (integration install failed: {e:#})\n"
     );
     if hook_authority {
         eprintln!(
@@ -8676,9 +8687,10 @@ fn warn_integration_install_failed(kind: &str, hook_authority: bool, e: &anyhow:
     }
 }
 
-/// One `hc integration status` read per spawn/add — the preflight map all
-/// kinds share. A failed read degrades to an empty map (every kind looks
-/// not-installed → best-effort install attempt, the self-healing path).
+/// One integration-status read per spawn/add — the preflight map all
+/// kinds share. hc 0.1.16 has no integration surface, so the map is always
+/// empty (every kind reads not-installed → install attempt → loud warning,
+/// never a spawn failure).
 fn read_integration_statuses() -> HashMap<String, hc_support::IntegrationStatus> {
     match hc_support::integration_status_all() {
         Ok(v) => v.into_iter().collect(),
@@ -10446,8 +10458,7 @@ projects available: {}",
             entry.model_pin = model_pin;
             entry.skills_digest = skills_digest;
             // ADR-0019 D6: capture GROK_SESSION_ID (etc.) at register time.
-            entry.harness_session =
-                captain_directory::capture_harness_session(&kind);
+            entry.harness_session = captain_directory::capture_harness_session(&kind);
             registry.push(entry);
             println!(
                 "  {} {}",
@@ -11211,7 +11222,10 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 Some(code) => exited_status(&name, &pane_id, code),
                 None => match backend.agent_wait(
                     &pane_id,
-                    &[hc_support::AgentStatus::Idle, hc_support::AgentStatus::Working],
+                    &[
+                        hc_support::AgentStatus::Idle,
+                        hc_support::AgentStatus::Working,
+                    ],
                     Some(90_000),
                 ) {
                     Ok(a) => a.agent_status.as_str().to_string(),
@@ -11290,8 +11304,7 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 .and_then(|pname| catalog.get(pname))
                 .and_then(|p| profile::skills_digest(&p.skills));
             // ADR-0019 D6: capture GROK_SESSION_ID (etc.) at register time.
-            entry.harness_session =
-                captain_directory::capture_harness_session(&kind);
+            entry.harness_session = captain_directory::capture_harness_session(&kind);
             registry.push(entry);
             println!("  {} {}", kind_paint(&kind), dim(&format!("({})", pane_id)));
             let exit_code: Option<i32> = launched_status
@@ -14623,7 +14636,7 @@ pub(crate) fn binding_state(registry_name: &str, live: Option<Option<&str>>) -> 
 
 #[cfg(test)]
 mod terminal_agent_name_tests {
-    use super::{BindingState, binding_state, terminal_agent_name, is_terminal_legal_name};
+    use super::{BindingState, binding_state, is_terminal_legal_name, terminal_agent_name};
 
     /// bd-recover-accepts-camelcase-pins-z5fz: a CamelCase pin is accepted by
     /// recover (mapped to a legal terminal name); an already-legal terminal name is
@@ -18339,14 +18352,20 @@ fn cmd_recover(cfg: &Config, project: &str) -> Result<()> {
                     // advance state_change_seq while idle.
                     Some(true) => {
                         let verdict = probe.as_mut().map(|c| {
-                            hc_support::probe_agent_responsiveness(c, pane_id, RESPONSIVENESS_WINDOW)
+                            hc_support::probe_agent_responsiveness(
+                                c,
+                                pane_id,
+                                RESPONSIVENESS_WINDOW,
+                            )
                         });
                         match verdict {
                             // alive as a PID, dead to input → respawn,
                             // not healthy (the bd-a8i shape).
-                            Some(hc_support::Responsiveness::Unresponsive) => RecoverDecision::Respawn {
-                                reason: "unresponsive",
-                            },
+                            Some(hc_support::Responsiveness::Unresponsive) => {
+                                RecoverDecision::Respawn {
+                                    reason: "unresponsive",
+                                }
+                            }
                             // responsive or inconclusive → healthy (a failed
                             // probe never respawns an agent — bd-1np
                             // principle).
@@ -19305,7 +19324,9 @@ fn cmd_send(
             println!(
                 "{} {}",
                 dim(agent_target(a)),
-                status_paint(hc_support::parse_agent_status(status).unwrap_or(AgentStatus::Unknown))
+                status_paint(
+                    hc_support::parse_agent_status(status).unwrap_or(AgentStatus::Unknown)
+                )
             );
         }
         // bd-pin-public-plane-s-easy.9: dispatched + prior_status — the
@@ -20916,7 +20937,8 @@ fn cmd_watch(
 ) -> Result<()> {
     // bd-blank-project-spelling-non-mail-doors-76hi
     check_project_spelling(project, "watch")?;
-    let until_status: Option<AgentStatus> = until.map(hc_support::parse_agent_status).transpose()?;
+    let until_status: Option<AgentStatus> =
+        until.map(hc_support::parse_agent_status).transpose()?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
     // ADR-0010 D10 (bd-67qg): one snapshot call feeds the TTY bearings line.
     if std::io::stdout().is_terminal() {
@@ -28591,7 +28613,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     }
 
     // hc protocol drift check. The socket has no protocol method in v18,
-    // so we shell out to the hc CLI itself (`api schema --json` — the
+    // so we shell out to the hc CLI itself (`schema --json` — the
     // canonical source; same binary as the socket server, so CLI vs socket
     // drift is not a concern). HDR_PROTOCOL is the *verified floor*: live ==
     // pin is green, live > pin is forward-compatible INFO (hc is additive
@@ -28599,7 +28621,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
     // bead later), live < pin is ERROR + exit 1 (server too old — the safety
     // net, per ADR-0001 gap A1).
     if let Some(p) = std::process::Command::new("hc")
-        .args(["api", "schema", "--json"])
+        .args(["schema", "--json"])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -28641,7 +28663,11 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
             crate::output::warn("unknown"),
             hc_support::HDR_PROTOCOL
         );
-        eprintln!("flywheel: WARNING cannot read hc protocol (hc api schema --json failed)");
+        eprintln!(
+            "flywheel: WARNING cannot read an hc protocol number from `hc schema --json` \
+             (0.1.16 has no top-level `protocol` field; the socket `hello` generation is \
+             authoritative — the client still enforces it on connect)"
+        );
     }
 
     // H3 (bd-harness-integration-preflight): per-kind integration state
@@ -35566,13 +35592,7 @@ fn cmd_internal_wait_output(
         eprintln!("flywheel: target {target} not found in {project}");
         std::process::exit(1);
     };
-    match hc_support::pane_wait_output(
-        &c,
-        &pane_id,
-        wait_output_mode(regex),
-        pattern,
-        timeout_ms,
-    ) {
+    match hc_support::pane_wait_output(&c, &pane_id, wait_output_mode(regex), pattern, timeout_ms) {
         Ok(r) => {
             print_json(&wait_output_json(
                 true,
@@ -35922,9 +35942,11 @@ fn respawn_with_backend(
         {
             eprintln!("flywheel: mail clear_pane_identity failed for {old}: {e}");
         }
-        if let Err(e) =
-            backend::run_mail(mail.write_pane_identity(key, &fresh.pane_id, &terminal_mail_name(name)))
-        {
+        if let Err(e) = backend::run_mail(mail.write_pane_identity(
+            key,
+            &fresh.pane_id,
+            &terminal_mail_name(name),
+        )) {
             eprintln!(
                 "flywheel: mail write_pane_identity failed for {name} on {}: {e}",
                 fresh.pane_id
@@ -43225,7 +43247,7 @@ mod idempot_tests {
 
 #[cfg(test)]
 mod ingress_wiring_tests {
-    use crate::ingress::{TerminalEvent, IngressEvent, WatchHit};
+    use crate::ingress::{IngressEvent, TerminalEvent, WatchHit};
 
     #[test]
     fn ingress_wiring_all_variants_go_through_handle_ingress() {

@@ -3204,10 +3204,7 @@ mod tests {
                 reason: "delivery failed: endpoint down".into(),
             })
             .await;
-        assert!(
-            brain.sinks.parked("hc").await,
-            "no factory: stays parked"
-        );
+        assert!(brain.sinks.parked("hc").await, "no factory: stays parked");
     }
 }
 

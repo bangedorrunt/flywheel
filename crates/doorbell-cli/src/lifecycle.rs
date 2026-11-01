@@ -1745,10 +1745,7 @@ pub fn render_autostart(
                 "DOORBELL_TORON_BIN_KEY",
                 doorbell_rt::binpath::TORON_BIN_ENV,
             )
-            .replace(
-                "DOORBELL_HC_BIN_KEY",
-                doorbell_rt::binpath::HC_BIN_ENV,
-            )
+            .replace("DOORBELL_HC_BIN_KEY", doorbell_rt::binpath::HC_BIN_ENV)
             .replace("DOORBELL_TORON_BIN_VALUE", &resolved_bin_value("toron"))
             .replace("DOORBELL_HC_BIN_VALUE", &resolved_bin_value("hc"))
     }
