@@ -2455,9 +2455,9 @@ pub fn project_hash(project_key: &str) -> String {
     hex::encode(hasher.finalize()).chars().take(12).collect()
 }
 
-/// Sanitize a pane id for use as a filename: strip a tmux `%` prefix, map
+/// Sanitize a pane id for use as a filename: strip a legacy `%` prefix, map
 /// `:` to `-` and other filesystem-unsafe chars to `_` (agent-mail core
-/// parity — hc `w1:p1` → `w1-p1`). Empty → `unknown`.
+/// parity — hc `t7` → `t7`, rex `block:1` → `block-1`). Empty → `unknown`.
 fn sanitize_pane_id(pane_id: &str) -> String {
     let stripped = pane_id.strip_prefix('%').unwrap_or(pane_id);
     let mut out = String::with_capacity(stripped.len());

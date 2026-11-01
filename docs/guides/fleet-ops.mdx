@@ -62,9 +62,9 @@ Monitor git and beads for truth, not mail. Address the captain by pin: `flywheel
 
 ## Harness integration
 
-Lifecycle-authority kinds (idle/working/blocked from hook events): pi, omp, kimi, opencode, kilo, mastracode, grok. `pa` reports via built-in socket but has no hc kind: spawn via recipe fallback and drive with `pane.send_text`. Unknown kinds fail `agent.start` with `unsupported_agent_kind`; kinds with a spawn recipe fall back to `pane.run`.
+Lifecycle authority is the program's own OSC 7501 report (idle/working/done/blocked/error): pi, omp, kimi, opencode, kilo, mastracode, grok. hc has no agent-kind enum: `terminal.send` types into any terminal, and an unknown kind is a flywheel catalog error, not an hc one. A harness that reports nothing stays `unknown` — readable and typeable, but not injectable (`should_inject` = idle|done|blocked), so its wakes go to the digest.
 
-Symptom `agent_not_ready: not an active named agent`, or a pane without lifecycle state in `hc ls`: load the harness-integration reference (env injection, boot prime, preflight, pane primitives, alt-screen ladder) before prompting.
+Symptom: a pane that never leaves `unknown` in `hc ls`, or a send that reports `started:false`. Load the harness-integration reference (env injection, boot prime, preflight, pane primitives, read ladder) before prompting.
 
 ## Teardown
 

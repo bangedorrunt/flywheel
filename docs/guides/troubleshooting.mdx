@@ -5,8 +5,8 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 
 | Symptom | Meaning | Fix |
 |---|---|---|
-| `agent_not_ready: not an active named agent` | Pane not promptable, or kind lacks lifecycle state | Retry with the pane id; then `hc send <pane_id>`; load the harness-integration reference if it persists |
-| `unsupported_agent_kind` | Unknown kind with no spawn recipe | Drive with `pane.send_text` until hc lists the kind |
+| Pane never leaves `unknown`, or a send reports `started:false` | The harness reports no OSC 7501 status, or the TUI is still booting | `hc read <t>` before resending (the text may have landed); an unreported pane is readable/typeable but not injectable, so its wakes are digest-bound |
+| `unknown kind` at spawn | flywheel's catalog has no launch command for the kind | Add the kind to config `[kinds]`; hc itself has no agent-kind enum |
 | Spawn exits 1, `swarm not ready` | `launch_pending` is normal | Wait; never add a second harness. Spawn fails closed after settle on any missing/empty/wrong-named pane |
 | `flywheel status` shows `workspaces: []` right after spawn | Race between state write and status read | Trust the spawn verification; take names from the send error's `available:` list or `flywheel status / hc ls` |
 | Send misses an idle agent | It did not miss: `prior_status: idle` means the brief landed | Only `landed: true` after `--wait`/`--confirm` counts as confirmed delivery |
@@ -21,7 +21,7 @@ description: Named failures and their fixes. Door, spawn, loop, compose, and doo
 | Flood guard pause | More than 3 ready beads | One-poll pause, then dispatch resumes; not an error |
 | `unknown compose token` / `unknown stage` | Installed binary predates the feature | Rebuild: `mbx +nightly-aarch64-apple-darwin install --path . --force`; verify from a non-repo cwd |
 | `no flywheel swarm` | Wrong cwd or absolute path | Run `loop-mode run <slug> --work` from the parent workspace directory |
-| `agent_not_ready` after agent restart, name `null` | Lost binding | `flywheel rebind` restores registered names; `recover` also respawns the dead |
+| Pane found but its name is `null` after a restart | Lost binding (the `toron_pin` label went with the old terminal) | `flywheel rebind` restores registered names; `recover` also respawns the dead |
 | SIGKILL on the binary | Stale signature | `codesign --force --sign - ~/.cargo/bin/flywheel` |
 | doorbell `answered by foreign owner, not child <pid>` | Port 18980 conflict | Stop the foreign holder or relocate; arrival itself was unaffected |
 | preflight `resonate ... connection refused` | Durable engine down | `flywheel deps --ensure` starts it, or run open-vehicle work and say so in the trail |

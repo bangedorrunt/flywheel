@@ -149,7 +149,7 @@ pub fn check_job_tripwire(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Plane {
     Job,      // 43001–43006
-    Doorbell, // watch + hc agent.prompt
+    Doorbell, // watch + hc terminal.send
     Kind9,    // crew-visible
     GiftWrap, // 1059 / rumor 14 (private)
 }

@@ -1,7 +1,9 @@
 //! `flywheel agent` subcommand types (split from `main.rs`, bd-qbi8).
 //! bd-swarm-cockpit-pczs: `tail` reads a pin's recent actions from the
-//! session hc reports for its pane (`agent_session`) — the path/id names
-//! the exact session, so there is no newest-file guessing.
+//! session the pane reports (`agent_session`) — the path/id names the exact
+//! session, so there is no newest-file guessing. hc 0.1.16 reports no agent
+//! session, so on the hc plane this bails loud and names the gap instead of
+//! guessing; use `flywheel output` or `hc read`.
 
 use std::io::IsTerminal;
 

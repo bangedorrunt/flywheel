@@ -4,6 +4,11 @@ Date: 2026-10-21. Lane: `bd-aec2`. Vehicle: open (current pane), pin `IvoryMarli
 Rubric: effect-oriented principles 1-15 + the elm-effect ADR-0002 sibling-port "Done"
 checklists for flywheel / toron / beads (`~/.agents/skills/elm-effect/references/migrate-*.md`).
 
+> **Historical snapshot.** Written before the herdr TUI → herdr-core (`hc`)
+> migration (toron ADR-0044). Where this document says `herdr`, `herdr agent`,
+> or `HERDR_*`, read the plane as it was on 2026-10-21; the current commands
+> are `hc` and the `HC_*` env. Findings and commits are unchanged history.
+
 Every finding names the code path that breaks. Anything I could not read myself was
 spot-verified before it went in; the verification is stated inline.
 Live measurements are against the running system on 2026-10-21 (macOS, `~/.local/state`,

@@ -1259,9 +1259,10 @@ enum Commands {
         limit: u32,
     },
     /// bd-swarm-cockpit-pczs: agent-session reads. `agent tail <pin>` shows
-    /// the pin's recent actions (tool calls / commands) from the session
-    /// hc reports (`agent_session`) — the debugging surface that used to
-    /// require finding the raw pi session JSONL by hand.
+    /// the pin's recent actions (tool calls / commands) from the session the
+    /// pane reports (`agent_session`) — the debugging surface that used to
+    /// require finding the raw pi session JSONL by hand. hc 0.1.16 reports
+    /// none, so on hc it bails loud (use `flywheel output` / `hc read`).
     Agent {
         #[command(subcommand)]
         cmd: AgentCmd,
@@ -3013,7 +3014,7 @@ fn main() {
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
             "status <project> + progress [<project>] [--json] (bd-swarm-cockpit-pczs cockpit reads: status rows carry pin/npub/pane/verdict/bead/reservations/last_active_ts_us and print JSON when not a TTY; progress groups beads by wave-N label — closed/in_progress/ready/blocked/unknown — and names dispatching_wave, the lowest ready/in-progress wave; project defaults to the workspace cwd)",
-            "agent tail <pin> [--project <p>] [--json] [--n N] (bd-swarm-cockpit-pczs: the pin's recent actions — tool calls / commands — from the session hc reports on the pane's agent_session; path sessions read the pi JSONL, id sessions read the opencode store; no newest-file guessing)",
+            "agent tail <pin> [--project <p>] [--json] [--n N] (bd-swarm-cockpit-pczs: the pin's recent actions — tool calls / commands — from the session the pane reports on agent_session; path sessions read the pi JSONL, id sessions read the opencode store; no newest-file guessing. hc 0.1.16 reports no agent_session, so on hc it bails loud — use `flywheel output` or `hc read`)",
             "helm <project> (session-start drain: OPEN DECISIONS, UNREAD STATUS, RECORD DIVERGENCE)",
                 "coalition debate plan-review profile squad model slot catalog runs list/show/pending/digest/reconcile",
                 "workflow cron recipes workflows pipeline template stage ensemble",
@@ -8534,17 +8535,15 @@ mod spawn_boot_reliability_tests {
 }
 
 #[allow(clippy::too_many_arguments)] // clap command handler: one param per CLI flag.
-/// bd-bug-omp-hc-wedge: harnesses whose hc integration holds FULL
-/// lifecycle-hook authority (hc skips screen/process detection for them)
-/// The neutral boot prompt that opens the agent.prompt gate. H2
-/// (bd-harness-pane-send-text-7fe8): delivered via `pane.send_text` after the
+/// The neutral boot prompt that opens the prompt gate. H2
+/// (bd-harness-pane-send-text-7fe8): delivered via `terminal.send` after the
 /// TUI owns the foreground (works for any kind, non-agent panes too), not as
 /// a positional MESSAGES launch arg.
 ///
 /// Lifecycle-authority kinds — pi/omp/kimi/opencode/kilo/mastracode (+grok) —
-/// gate agent.prompt on a processed prompt when their hc integration is
-/// reporting; the prime is harmless for all kinds and removes the
-/// detection-class race entirely (bd-bug-omp-hc-wedge, H5
+/// only accept a prompt once their TUI owns the foreground; hc 0.1.16 has no
+/// integration surface, so the foreground/readiness check plus this prime is
+/// what removes the detection-class race (bd-bug-omp-hc-wedge, H5
 /// bd-harness-prime-kind-list-eivx).
 fn boot_prime_line() -> &'static str {
     "Boot ready check: reply exactly READY and await captain instructions."
@@ -14303,12 +14302,13 @@ mod peer_encoding_tests {
 
 /// Register a spawned agent as an agent-mail identity (ADR-0001
 /// mail-register-on-spawn) and bridge it to its hc terminal (ADR-0001 A4,
-/// bd-mail-pane-identity-bridge): agent-mail only writes identity files for
-/// tmux panes, so flywheel writes the canonical identity file for the
-/// hc terminal itself — `resolve_pane_identity` can then map the pane to the
-/// name. Best-effort: if mail isn't configured or the backend returns an
-/// error, the spawn still succeeded — log a warning and continue. The agent
-/// becomes addressable by name in mail once registered.
+/// bd-mail-pane-identity-bridge): toron holds no per-pane identity files, so
+/// the bridge is the pane's `toron_pin`/`toron_project`/`toron_npub` labels
+/// (`terminal.label`) plus the local identity file flywheel keeps for its own
+/// reads — `resolve_pane_identity` can then map the pane to the name.
+/// Best-effort: if mail isn't configured or the backend returns an error, the
+/// spawn still succeeded — log a warning and continue. The agent becomes
+/// addressable by name in mail once registered.
 ///
 /// bd-627z.2: a CONFIGURED-but-unreachable daemon (the [mail.toron] url is
 /// set, the daemon is down) is NOT a silent skip — it gets a prominent
@@ -14547,13 +14547,34 @@ pub(crate) fn bind_pane_mail_identity(
         // print pane_not_found.
         if pane_takes_hc_stamp(pane_id) {
             match toron_core::backend::hc::HcBackend::connect(None) {
-                Ok(_backend) => {
+                Ok(backend) => {
                     let npub = backend::run_mail(mail.whois(&key, pin))
                         .map(|w| w.npub)
                         .unwrap_or_default();
+                    // bd-ab2p: the pane's LABELS are the mail identity (toron
+                    // holds no per-pane files), so stamp them here. Best-effort
+                    // like the file bridge above: a label failure is a stderr
+                    // note, never a spawn failure.
+                    let mut labels = std::collections::BTreeMap::from([
+                        (
+                            toron_core::backend::types::TOKEN_PIN.to_string(),
+                            pin.to_string(),
+                        ),
+                        (
+                            toron_core::backend::types::TOKEN_PROJECT.to_string(),
+                            project.to_string(),
+                        ),
+                    ]);
                     if !npub.is_empty() {
-                        // hc stamps labels at terminal.run; mail-identity stamp is best-effort.
-                        let _ = (pane_id, pin, &key, &npub, &name);
+                        labels.insert(
+                            toron_core::backend::types::TOKEN_NPUB.to_string(),
+                            npub.clone(),
+                        );
+                    }
+                    if let Err(e) = backend.client().terminal_label(pane_id, &labels) {
+                        eprintln!(
+                            "flywheel: pane mail-identity stamp failed for {name} on {pane_id}: {e}"
+                        );
                     }
                     // Flag on only, after the toron_pin / toron_npub stamp. Records
                     // the two facts; nothing is appended and nothing is shelled.
