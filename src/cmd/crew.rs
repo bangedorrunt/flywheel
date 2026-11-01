@@ -191,7 +191,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             }
             let dir = crate::project_dir(cfg, project);
             let new_pane = crate::hc_support::pane_split(
-                &mut c,
+                &c,
                 &root.pane_id,
                 "down",
                 Some(&crate::utf8_path(&dir, "workspace dir")?),
@@ -199,7 +199,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             )?;
             let pane_id = new_pane.pane_id.clone();
             let shell_ready =
-                crate::hc_support::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
+                crate::hc_support::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -211,7 +211,7 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
                 crate::control::RelaunchAction::Commit => {
                     let _ = launch.with_context(|| format!("launch {name} ({kind})"))?;
                     let _ = crate::hc_support::wait_agent_foreground(
-                        &mut c,
+                        &c,
                         &pane_id,
                         &kind,
                         &name,

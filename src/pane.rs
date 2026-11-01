@@ -2667,7 +2667,7 @@ pub fn launch_spawn_job(
         let pane_env =
             pane_env_for_launch(cfg, mail_identity.as_deref(), plan.env_model_pin.as_deref())?;
         let split = crate::hc_support::pane_split(
-            &mut c,
+            &c,
             &prev,
             "down",
             Some(&crate::utf8_path(&dir, "workspace dir")?),

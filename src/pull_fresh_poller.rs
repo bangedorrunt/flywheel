@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // governed-by: ADR-0019 D2 (amendment 2026-11-01: mikasa-side pull-fresh poller)
 //! Mikasa-side pull-fresh poller for a hosted Grok Bot captain.
 //!

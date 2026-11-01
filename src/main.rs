@@ -10244,7 +10244,7 @@ projects available: {}",
                 prev.clone()
             } else {
                 let p = hc_support::pane_split(
-                    &mut c,
+                    &c,
                     &prev,
                     "down",
                     Some(&utf8_path(&dir, "workspace dir")?),
@@ -10299,7 +10299,7 @@ projects available: {}",
             // 1024-byte MAX_CANON line limit) splits the single-quoted arg
             // mid-quote and zsh parks at `>....` — agent never starts
             // (2026-08-18 coder2/coder3). Wait for the rendered prompt.
-            let shell_ready = hc_support::wait_shell_prompt(&mut c, &pane_id, Duration::from_secs(15));
+            let shell_ready = hc_support::wait_shell_prompt(&c, &pane_id, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({pane_id}) did not render a prompt \
@@ -10319,7 +10319,7 @@ projects available: {}",
             // a prompt in the boot window is lost to the shell. Poll until
             // the agent binary owns the foreground (max 15s).
             let ready = hc_support::wait_agent_foreground(
-                &mut c,
+                &c,
                 &pane_id,
                 &kind,
                 &name,
@@ -10639,7 +10639,7 @@ the panes may still be live in herdr; `--no-verify` skips this check in scripts"
         // died after its per-pane verification (during later panes' spawn) is
         // a dead shell, never a ready agent.
         let dead = dead_panes(&booted, |pane_id, kind| {
-            hc_support::pane_process_info(&mut c, pane_id)
+            hc_support::pane_process_info(&c, pane_id)
                 .ok()
                 .and_then(|pi| hc_support::pane_agent_alive(&pi, kind))
         });
@@ -14433,7 +14433,7 @@ pub(crate) fn bind_pane_mail_identity(
         // print pane_not_found.
         if pane_takes_herdr_stamp(pane_id) {
             match toron_core::backend::hc::HcBackend::connect(None) {
-                Ok(backend) => {
+                Ok(_backend) => {
                     let npub = backend::run_mail(mail.whois(&key, pin))
                         .map(|w| w.npub)
                         .unwrap_or_default();
@@ -15838,7 +15838,7 @@ fn cmd_add(
             }
             let pane_env = hc_support::herdr_integration_env(cfg, mail_identity.as_deref());
             let p = hc_support::pane_split(
-                &mut c,
+                &c,
                 &prev,
                 "down",
                 Some(&utf8_path(&dir, "workspace dir")?),
@@ -15863,7 +15863,7 @@ fn cmd_add(
             }
             // bd-pattern-peer-triggered: same shell-readiness gate as spawn —
             // typing into a booting shell mangles long single-quoted args.
-            let shell_ready = hc_support::wait_shell_prompt(&mut c, &prev, Duration::from_secs(15));
+            let shell_ready = hc_support::wait_shell_prompt(&c, &prev, Duration::from_secs(15));
             if !shell_ready {
                 eprintln!(
                     "flywheel: warn: shell for {name} ({prev}) did not render a prompt \
@@ -15885,9 +15885,9 @@ fn cmd_add(
             // (inconclusive probe) or probe error = loud warn with the check
             // command, never a confident healthy.
             let foreground =
-                hc_support::wait_agent_foreground(&mut c, &prev, &kind, &name, Duration::from_secs(15));
+                hc_support::wait_agent_foreground(&c, &prev, &kind, &name, Duration::from_secs(15));
             if !foreground {
-                match hc_support::pane_process_info(&mut c, &prev)
+                match hc_support::pane_process_info(&c, &prev)
                     .map(|pi| hc_support::pane_agent_alive(&pi, &kind))
                 {
                     Ok(Some(false)) => bail!(
@@ -20965,7 +20965,7 @@ fn cmd_watch(
         .iter()
         .map(|p| Subscription::agent_status_changed(p.pane_id.clone()))
         .collect();
-    let mut stream = match hc_support::subscribe(&mut c, &subs) {
+    let mut stream = match hc_support::subscribe(&c, &subs) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("flywheel: WARNING subscription failed ({e:#}); polling fallback");
@@ -21081,7 +21081,7 @@ fn cmd_zoom(cfg: &Config, project: &str, to: &str, off: bool) -> Result<()> {
     let targets = resolve_agents(&mut c, &ws_id, project, to)?;
     let mode = if off { "off" } else { "on" };
     for a in &targets {
-        hc_support::pane_zoom(&mut c, &a.pane_id, mode)?;
+        hc_support::pane_zoom(&c, &a.pane_id, mode)?;
     }
     println!("zoom {mode} for {to}");
     Ok(())
@@ -24543,7 +24543,7 @@ fn probe_pane_wedges(
     if entries.is_empty() {
         return Vec::new();
     }
-    let Ok(mut c) = Client::connect(Some(&cfg.socket_path())) else {
+    let Ok(c) = Client::connect(Some(&cfg.socket_path())) else {
         return Vec::new();
     };
     let Ok(agents) = c.agent_list() else {
@@ -24562,10 +24562,10 @@ fn probe_pane_wedges(
         // launched), so the process probe needs no profile lookup. A pane herdr
         // reports with no kind probes as inconclusive (`None`), never alive.
         let kind = a.agent.as_deref().unwrap_or("");
-        let alive = hc_support::pane_process_info(&mut c, &e.pane_id)
+        let alive = hc_support::pane_process_info(&c, &e.pane_id)
             .ok()
             .and_then(|info| hc_support::pane_agent_alive(&info, kind));
-        let tail = hc_support::pane_recent_text(&mut c, &e.pane_id).ok();
+        let tail = hc_support::pane_recent_text(&c, &e.pane_id).ok();
         let action = durable::pane_wedge_action(
             &durable::PaneWedgeInputs {
                 pin,
@@ -28626,7 +28626,7 @@ fn cmd_deps(cfg: &Config, ensure: bool) -> Result<()> {
         .filter(|o| o.status.success())
         .and_then(|o| hc_support::parse_protocol(&String::from_utf8_lossy(&o.stdout)))
     {
-        match protocol_check(p as u64, u64::from(hc_support::HDR_PROTOCOL)) {
+        match protocol_check(p, u64::from(hc_support::HDR_PROTOCOL)) {
             ProtocolCheck::Match => println!(
                 "herdr protocol: {} (verified {})",
                 paint_ok(&p.to_string()),
@@ -35588,7 +35588,7 @@ fn cmd_internal_wait_output(
         std::process::exit(1);
     };
     match hc_support::pane_wait_output(
-        &mut c,
+        &c,
         &pane_id,
         wait_output_mode(regex),
         pattern,

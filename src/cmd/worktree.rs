@@ -39,7 +39,7 @@ pub(crate) fn cmd_worktree(cfg: &Config, cmd: &WorktreeCmd) -> Result<()> {
     match cmd {
         WorktreeCmd::List { project } => {
             let ws_id = crate::find_workspace(&mut c, project)?;
-            let v = crate::hc_support::worktree_list(&mut c, Some(&ws_id))?;
+            let v = crate::hc_support::worktree_list(&c, Some(&ws_id))?;
             for w in &v {
                 println!(
                     "{}  {}  {}",

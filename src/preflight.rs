@@ -614,7 +614,7 @@ fn check_worktree(cfg: &Config, project: &str) -> Check {
         Ok(id) => id,
         Err(e) => return Check::fail("worktree", format!("workspace lookup failed: {e}")),
     };
-    let all = match crate::hc_support::worktree_list(&mut c, Some(&ws_id)) {
+    let all = match crate::hc_support::worktree_list(&c, Some(&ws_id)) {
         Ok(v) => v,
         Err(e) => return Check::fail("worktree", format!("worktree.list failed: {e}")),
     };

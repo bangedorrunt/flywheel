@@ -87,7 +87,7 @@ fn cmd_agent_tail(
     crate::check_project_spelling(&project, "agent tail")?;
     let dir = crate::project_dir_str(cfg, &project)?;
     let mut c = Client::connect(Some(&cfg.socket_path()))?;
-    let ws_id = crate::find_workspace(&mut c, &project)?;
+    let _ws_id = crate::find_workspace(&mut c, &project)?;
     let panes = c.pane_list()?;
     let registry = crate::state::load_spawn_registry(&dir);
     let Some(pane) = pin_pane(&panes, &registry, pin) else {

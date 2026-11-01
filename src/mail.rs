@@ -2343,23 +2343,21 @@ impl Mail {
             && let Ok(backend) = toron_core::backend::hc::HcBackend::connect(None)
         {
             let client = backend.client();
-            if let Ok(panes) = client.pane_list() {
-                if let Some(pane) = panes.iter().find(|p| p.pane_id == pane_id) {
-                    if let Some(pin) = pane
-                        .tokens
-                        .get(toron_core::backend::types::TOKEN_PIN)
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                    {
-                        return json!({
-                            "agent_name": pin,
-                            "pane_id": pane_id,
-                            "source": "pane-token",
-                        });
-                    }
-                    // pane live but unstamped → file bridge
-                }
+            if let Ok(panes) = client.pane_list()
+                && let Some(pane) = panes.iter().find(|p| p.pane_id == pane_id)
+                && let Some(pin) = pane
+                    .tokens
+                    .get(toron_core::backend::types::TOKEN_PIN)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            {
+                return json!({
+                    "agent_name": pin,
+                    "pane_id": pane_id,
+                    "source": "pane-token",
+                });
             }
+            // pane missing or unstamped → file bridge
         }
         let path = canonical_identity_path(project_key, pane_id);
         match std::fs::read_to_string(&path) {

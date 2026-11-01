@@ -99,7 +99,6 @@ impl ResolvedPlane {
 /// executable `rex` on PATH. Presence only: it never spawns rex, so a cheap
 /// probe is safe on every door.
 fn rex_cli_present(cfg: &Config) -> std::result::Result<std::path::PathBuf, String> {
-    use std::path::PathBuf;
     // Prefer Config.rex_bin_dir (tests / explicit config) over process-global
     // REX_BIN_DIR alone — avoids races when parallel tests mutate the env.
     if let Some(dir) = cfg.rex_bin_dir() {

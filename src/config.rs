@@ -626,14 +626,14 @@ impl Config {
     pub fn socket_path(&self) -> String {
         // hc resolve order (toron_core::backend::hc::resolve_socket_path):
         // explicit config → HC_SOCKET_PATH → $XDG_STATE_HOME/herdr-core/$session/$session.sock
-        // (session defaults to `default`). HC_SOCKET_PATH is not consulted.
+        // (session defaults to `default`).
         if let Some(p) = self.socket_path.clone().filter(|s| !s.is_empty()) {
             return p;
         }
-        if let Ok(p) = std::env::var("HC_SOCKET_PATH") {
-            if !p.is_empty() {
-                return p;
-            }
+        if let Ok(p) = std::env::var("HC_SOCKET_PATH")
+            && !p.is_empty()
+        {
+            return p;
         }
         let session = std::env::var("HC_SESSION").unwrap_or_else(|_| "default".into());
         let state = std::env::var_os("XDG_STATE_HOME")
@@ -1450,43 +1450,54 @@ daily = [
         }
     }
 
-    /// is1.6: the herdr socket fallback converges with `config_dir()`
-    /// (XDG_CONFIG_HOME first), matching the canonical herdr client in
-    /// toron-core (`HC_SOCKET_PATH` else `$XDG_CONFIG_HOME/herdr-core/default/default.sock`).
+    /// hc socket fallback matches toron `resolve_socket_path`: HC_SOCKET_PATH
+    /// else `$XDG_STATE_HOME/herdr-core/default/default.sock`.
     #[test]
-    fn socket_path_follows_xdg_config_home() {
+    fn socket_path_follows_xdg_state_home() {
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::remove_var("HC_SOCKET_PATH") };
         let tmp = std::env::temp_dir().join(format!("flywheel-sock-xdg-{}", std::process::id()));
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp) };
         let cfg = Config::default();
         assert_eq!(
             cfg.socket_path(),
             tmp.join("herdr-core/default/default.sock").to_string_lossy()
         );
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        match prev_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
     }
 
-    /// is1.6: no XDG_CONFIG_HOME → `~/.config/herdr-core/default/default.sock` (never
-    /// `dirs::config_dir()` / macOS Application Support).
+    /// No XDG_STATE_HOME → `~/.local/state/herdr-core/default/default.sock`.
     #[test]
-    fn socket_path_falls_back_to_home_dot_config() {
+    fn socket_path_falls_back_to_home_local_state() {
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::remove_var("HC_SOCKET_PATH") };
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
         let home = std::env::temp_dir().join(format!("flywheel-sock-home-{}", std::process::id()));
+        let prev_home = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &home) };
         let cfg = Config::default();
         assert_eq!(
             cfg.socket_path(),
-            home.join(".config/herdr-core/default/default.sock").to_string_lossy(),
-            "socket default is ~/.config/herdr-core/default/default.sock, not Application Support"
+            home.join(".local/state/herdr-core/default/default.sock").to_string_lossy(),
+            "socket default is ~/.local/state/herdr-core/default/default.sock"
         );
-        unsafe { std::env::remove_var("HOME") };
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match prev_state {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
     }
 
     /// is1.6: a non-numeric FLYWHEEL_TIMEOUT aborts Config::load() naming

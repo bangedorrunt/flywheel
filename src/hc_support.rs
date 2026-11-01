@@ -54,6 +54,7 @@ impl Client {
         })
     }
 
+    #[allow(dead_code)]
     pub fn connect_with_policy(
         socket_path: Option<&str>,
         policy: toron_core::osc7501::FoldPolicy,
@@ -604,6 +605,7 @@ pub enum HerdrEventKind {
 impl HerdrEventKind {
     /// Parse a wire event name. Accepts both namespaces: the 26 snake_case
     /// server events and the 3 dotted subscription events.
+    #[allow(dead_code)]
     pub fn parse(s: &str) -> Result<Self> {
         use HerdrEventKind::{
             LayoutUpdated, PaneAgentDetected, PaneAgentStatusChanged, PaneAgentStatusChangedSub,
@@ -981,6 +983,7 @@ pub enum HerdrEventData {
 
 impl HerdrEventData {
     /// Deserialize the payload `data` for the given `kind`.
+    #[allow(dead_code)]
     pub fn from_kind(kind: HerdrEventKind, data: Value) -> Result<Self> {
         use HerdrEventKind::{
             LayoutUpdated, PaneAgentDetected, PaneAgentStatusChanged, PaneAgentStatusChangedSub,
@@ -1616,10 +1619,10 @@ where
                 }
             }
             Ok(Some(ev)) => {
-                if let Some(push) = push_from_backend(ev) {
-                    if tx.send(StreamItem::Event(push)).is_err() {
-                        break;
-                    }
+                if let Some(push) = push_from_backend(ev)
+                    && tx.send(StreamItem::Event(push)).is_err()
+                {
+                    break;
                 }
             }
             Ok(None) => {
@@ -1649,6 +1652,7 @@ where
 /// socket count grew at the gap rate) and a fresh subscriber that starts
 /// BEHIND the ring, so it was told `events_lost` again. One upstream gap
 /// fanned out into a gap per subscriber and a socket per re-subscribe.
+#[allow(dead_code)]
 fn pump_events<R>(mut read: R, tx: &std::sync::mpsc::Sender<StreamItem>)
 where
     R: FnMut() -> Result<Option<(String, serde_json::Value)>, BackendError>,
@@ -3987,9 +3991,11 @@ impl Client {
     pub fn worktree_remove(&self, _workspace_id: &str, _force: bool) -> Result<(), BackendError> {
         Err(unsupported_on_hc("worktree_remove"))
     }
+    #[allow(dead_code)]
     pub fn subscribe(&self, _subscriptions: &[Subscription]) -> Result<Value, BackendError> {
         Err(unsupported_on_hc("subscribe(legacy); use subscribe_terminals"))
     }
+    #[allow(dead_code)]
     pub fn pane_report_metadata(
         &self,
         _pane_id: &str,

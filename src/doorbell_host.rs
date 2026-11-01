@@ -329,11 +329,11 @@ impl RtHost {
 
         let mut stream = None;
         for _round in 0..3 {
-            let Ok(mut sub_client) = Client::connect(Some(&socket)) else {
+            let Ok(sub_client) = Client::connect(Some(&socket)) else {
                 return;
             };
             let subs = Subscription::agent_status_changed_many(attempt_ids.iter().cloned());
-            match crate::hc_support::subscribe(&mut sub_client, &subs) {
+            match crate::hc_support::subscribe(&sub_client, &subs) {
                 Ok(s) => {
                     stream = Some(s);
                     break;
