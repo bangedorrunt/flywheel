@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 use toron_core::backend::AgentStatus;
-use toron_core::backend::herdr::{PaneInfo, WorkspaceInfo};
+use toron_core::backend::{PaneInfo, WorkspaceInfo};
 use toron_core::osc7501::{Board, ProgramState, parse_report};
 
 /// A Rex session is a herdr workspace; the session id is the workspace id.
@@ -118,38 +118,10 @@ fn apply_record(board: &mut Board, order: &mut Vec<String>, item: &Value) {
 
 /// Fold one terminal's board into a single status. Pure: no I/O, no clock.
 ///
-/// A root record speaks for the whole terminal, so a blocked child never
-/// hides a working root. With no root, one blocked child blocks; otherwise
-/// the newest surviving record speaks, and a cleared one is gone.
-pub(crate) fn fold_status(board: &Board, order: &[String]) -> AgentStatus {
-    if let Some(root) = board.get("") {
-        return status_of(root.state);
-    }
-    if order.iter().any(|id| {
-        board
-            .get(id)
-            .is_some_and(|r| r.state == ProgramState::Blocked)
-    }) {
-        return AgentStatus::Blocked;
-    }
-    order
-        .iter()
-        .rev()
-        .find_map(|id| board.get(id))
-        .map_or(AgentStatus::Unknown, |r| status_of(r.state))
-}
-
-fn status_of(state: ProgramState) -> AgentStatus {
-    match state {
-        ProgramState::Idle => AgentStatus::Idle,
-        ProgramState::Working => AgentStatus::Working,
-        ProgramState::Blocked => AgentStatus::Blocked,
-        ProgramState::Done => AgentStatus::Done,
-        // A failed program is not a finished one, and not an idle one.
-        ProgramState::Error => AgentStatus::Unknown,
-        // Never stored: `clear` removes records in the fold above.
-        ProgramState::Clear => AgentStatus::Unknown,
-    }
+/// Attention policy (shared with hc via `toron_core::osc7501::fold`): a
+/// blocked child outranks a working root. RootWins is not used here.
+pub(crate) fn fold_status(board: &Board, _order: &[String]) -> AgentStatus {
+    toron_core::osc7501::fold(board, toron_core::osc7501::FoldPolicy::Attention)
 }
 
 #[cfg(test)]
@@ -194,15 +166,16 @@ mod tests {
     }
 
     #[test]
-    fn root_record_outranks_a_blocked_child() {
+    fn blocked_child_outranks_a_working_root() {
+        // Attention: a blocked child beats a working root.
         let records = serde_json::json!([
             osc("state=working:app=deploy"),
             osc("state=blocked:id=eu-west:kind=permission"),
         ])
         .to_string();
-        assert_eq!(status_from_records(&records), AgentStatus::Working);
+        assert_eq!(status_from_records(&records), AgentStatus::Blocked);
 
-        // No root: a blocked child blocks the terminal.
+        // No root: a blocked child still blocks the terminal.
         let child_only = serde_json::json!([
             osc("state=working:id=us-east"),
             osc("state=blocked:id=eu-west"),

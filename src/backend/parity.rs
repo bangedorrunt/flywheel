@@ -25,7 +25,39 @@
 #[cfg(test)]
 mod tests {
     use crate::backend::{BackendError, InboxQuery, MailSurface, MultiplexerBackend, run_mail};
-    use crate::herdr::HerdrError;
+
+    fn map_prompt_result(
+        r: std::result::Result<toron_core::backend::AgentInfo, toron_core::backend::BackendError>,
+    ) -> crate::backend::PromptLanding {
+        match r {
+            Ok(info) => crate::backend::PromptLanding {
+                status: Some(info.agent_status),
+                code: None,
+            },
+            Err(e) => crate::backend::PromptLanding {
+                status: None,
+                code: Some(e.code().as_str().to_string()),
+            },
+        }
+    }
+
+    #[derive(Debug)]
+    struct LegacyMuxError {
+        code: String,
+        message: String,
+    }
+    impl std::fmt::Display for LegacyMuxError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}: {}", self.code, self.message)
+        }
+    }
+    impl std::error::Error for LegacyMuxError {}
+    impl From<LegacyMuxError> for BackendError {
+        fn from(e: LegacyMuxError) -> Self {
+            BackendError::Other(anyhow::anyhow!(e))
+        }
+    }
+
 
     // ---- error coercion: the path real transport errors take ----
 
@@ -39,12 +71,12 @@ mod tests {
     }
 
     #[test]
-    fn herdr_error_coerces_to_other_preserving_code_and_message() {
-        let herdr_err = HerdrError {
+    fn legacy_error_coerces_to_other_preserving_code_and_message() {
+        let legacy_err = LegacyMuxError {
             code: "agent_prompt_stalled".into(),
             message: "no lifecycle change within 5s".into(),
         };
-        let err: BackendError = herdr_err.into();
+        let err: BackendError = legacy_err.into();
         match err {
             BackendError::Other(e) => {
                 let s = e.to_string();
@@ -100,9 +132,9 @@ mod tests {
     /// contract under test (no socket needed).
     #[test]
     fn prompt_landing_maps_landed_status_and_coded_error() {
-        use crate::herdr::{AgentInfo, AgentStatus};
+        use toron_core::backend::{AgentInfo, AgentStatus};
         // landed: Ok(AgentInfo) → status Some, code None
-        let ok = crate::backend::herdr::map_prompt_result(Ok(AgentInfo {
+        let ok = map_prompt_result(Ok(AgentInfo {
             agent: Some("pi".into()),
             agent_status: AgentStatus::Working,
             cwd: None,
@@ -126,7 +158,7 @@ mod tests {
         assert_eq!(ok.code, None);
         // coded error: Err(toron BackendError) → status None, code Some
         let err =
-            crate::backend::herdr::map_prompt_result(Err(toron_core::backend::BackendError::new(
+            map_prompt_result(Err(toron_core::backend::BackendError::new(
                 toron_core::backend::error::BackendErrorCode::AgentPromptStalled,
                 "x",
             )));

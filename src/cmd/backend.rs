@@ -20,7 +20,7 @@ pub(crate) enum BackendCmd {
     Default {
         /// multiplexer | mail
         kind: String,
-        /// backend name (herdr|superlogical|toron)
+        /// backend name (hc|superlogical|toron)
         name: String,
     },
 }
@@ -44,13 +44,13 @@ pub(crate) fn cmd_backend(cfg: &Config, cmd: &BackendCmd) -> Result<()> {
             // A default build still lists the name so the env contract is
             // visible, and marks it stub because the feature is off.
             for (name, stub) in [
-                ("herdr", false),
+                ("hc", false),
                 ("superlogical", cfg!(not(feature = "backend-superlogical"))),
                 // auto is a selection mode, not a compiled backend: ready
                 // when both sides are compiled in.
                 (
                     "auto",
-                    !(cfg!(feature = "backend-herdr") && cfg!(feature = "backend-superlogical")),
+                    !(cfg!(feature = "backend-hc") && cfg!(feature = "backend-superlogical")),
                 ),
             ] {
                 rows.push(json!({

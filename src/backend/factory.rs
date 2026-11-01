@@ -5,7 +5,7 @@
 //!
 //! Selection precedence (flag > env > `.env` > config.toml > default):
 //! - `FLYWHEEL_BACKEND` (`auto` when the rex backend is compiled in, else
-//!   `herdr`; `superlogical` pins rex without fallback)
+//!   `hc`; `superlogical` pins rex without fallback)
 //! - `FLYWHEEL_MAIL`    (`toron`; the agentmail backend is deleted, bd-euav)
 //!
 //! Mail backend routing (ADR-0003 V2/V3 — fixes the BUG1 shared-url misroute):
@@ -23,13 +23,13 @@ use crate::config::Config;
 #[cfg(feature = "mail-toron")]
 use crate::mail::Mail;
 
-/// Default multiplexer backend name: rex-first with herdr fallback when the
-/// rex backend is compiled in, else herdr.
+/// Default multiplexer backend name: rex-first with hc fallback when the
+/// rex backend is compiled in, else hc.
 #[cfg(feature = "backend-superlogical")]
 pub const DEFAULT_BACKEND: &str = "auto";
 /// Default multiplexer backend name (the rex backend is not compiled in).
 #[cfg(not(feature = "backend-superlogical"))]
-pub const DEFAULT_BACKEND: &str = "herdr";
+pub const DEFAULT_BACKEND: &str = "hc";
 /// Default mail backend name.
 pub const DEFAULT_MAIL: &str = "toron";
 
@@ -57,14 +57,14 @@ pub fn resolve_mail_name(cfg: &Config) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plane {
     Rex,
-    Herdr,
+    Hc,
 }
 
 impl Plane {
     pub fn name(self) -> &'static str {
         match self {
             Self::Rex => "rex",
-            Self::Herdr => "herdr",
+            Self::Hc => "hc",
         }
     }
 }
@@ -73,11 +73,11 @@ impl Plane {
 /// every consumer — the spawn arm, `backend list`, preflight's pane-plane, and
 /// the parity e2e — because the configured name is not evidence that rex can
 /// answer: `auto` used to pick the rex spawn arm while the transport fell back
-/// to herdr, so a host without the rex CLI created a herdr workspace and then
+/// to hc, so a host without the rex CLI created an hc terminal set and then
 /// died in `rex run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPlane {
-    /// What the env/config asked for (`auto` | `herdr` | `superlogical`).
+    /// What the env/config asked for (`auto` | `hc` | `superlogical`).
     pub configured: String,
     /// What will serve.
     pub plane: Plane,
@@ -88,9 +88,9 @@ pub struct ResolvedPlane {
 }
 
 impl ResolvedPlane {
-    /// `auto` (or a typo) that had to leave the primary for herdr.
+    /// `auto` (or a typo) that had to leave the primary for hc.
     pub fn is_fallback(&self) -> bool {
-        self.plane == Plane::Herdr && self.configured != "herdr"
+        self.plane == Plane::Hc && self.configured != "hc"
     }
 }
 
@@ -98,29 +98,27 @@ impl ResolvedPlane {
 /// (no PATH fall-through — the same contract as `Rex::resolve`), else an
 /// executable `rex` on PATH. Presence only: it never spawns rex, so a cheap
 /// probe is safe on every door.
-fn rex_cli_present() -> std::result::Result<std::path::PathBuf, String> {
+fn rex_cli_present(cfg: &Config) -> std::result::Result<std::path::PathBuf, String> {
     use std::path::PathBuf;
-    match std::env::var("REX_BIN_DIR") {
-        Ok(dir) if !dir.trim().is_empty() => {
-            let path = PathBuf::from(dir.trim()).join("rex");
-            if executable_file(&path) {
-                Ok(path)
-            } else {
-                Err(format!(
-                    "rex CLI not found ({} is not an executable file)",
-                    path.display()
-                ))
-            }
+    // Prefer Config.rex_bin_dir (tests / explicit config) over process-global
+    // REX_BIN_DIR alone — avoids races when parallel tests mutate the env.
+    if let Some(dir) = cfg.rex_bin_dir() {
+        let path = dir.join("rex");
+        if executable_file(&path) {
+            return Ok(path);
         }
-        Ok(_) => Err("rex CLI not found (REX_BIN_DIR is empty)".to_string()),
-        Err(_) => std::env::var_os("PATH")
-            .and_then(|paths| {
-                std::env::split_paths(&paths)
-                    .map(|d| d.join("rex"))
-                    .find(|p| executable_file(p))
-            })
-            .ok_or_else(|| "rex CLI not found (no rex on PATH)".to_string()),
+        return Err(format!(
+            "rex CLI not found ({} is not an executable file)",
+            path.display()
+        ));
     }
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join("rex"))
+                .find(|p| executable_file(p))
+        })
+        .ok_or_else(|| "rex CLI not found (no rex on PATH)".to_string())
 }
 
 fn executable_file(path: &std::path::Path) -> bool {
@@ -141,16 +139,16 @@ fn executable_file(path: &std::path::Path) -> bool {
 }
 
 /// Resolve the pane plane (bd-mknvb): `auto` rides rex only when the rex CLI
-/// can answer, else herdr WITH THE REASON; `superlogical` is an explicit rex
-/// pin (a missing CLI fails loud, never a silent fallback); `herdr` is herdr.
+/// can answer, else hc WITH THE REASON; `superlogical` is an explicit rex
+/// pin (a missing CLI fails loud, never a silent fallback); `hc` is hc.
 /// A fallback prints ONE line per process — the fallback stays per call (it is
 /// the transport contract), the operator hears about it once.
 pub fn resolve_plane(cfg: &Config) -> ResolvedPlane {
     let configured = resolve_backend_name(cfg);
     let rex_compiled = cfg!(feature = "backend-superlogical");
     let (plane, rex_reachable, reason) = match configured.as_str() {
-        "herdr" => (Plane::Herdr, false, "herdr (configured)".to_string()),
-        "superlogical" if rex_compiled => match rex_cli_present() {
+        "hc" => (Plane::Hc, false, "hc (configured)".to_string()),
+        "superlogical" if rex_compiled => match rex_cli_present(cfg) {
             Ok(path) => (
                 Plane::Rex,
                 true,
@@ -165,25 +163,25 @@ pub fn resolve_plane(cfg: &Config) -> ResolvedPlane {
         "superlogical" => (
             Plane::Rex,
             false,
-            "superlogical: the rex backend is not compiled into this build (lean herdr-only build)"
+            "superlogical: the rex backend is not compiled into this build (lean hc-only build)"
                 .to_string(),
         ),
-        "auto" if rex_compiled => match rex_cli_present() {
+        "auto" if rex_compiled => match rex_cli_present(cfg) {
             Ok(path) => (Plane::Rex, true, format!("auto -> rex ({})", path.display())),
-            Err(why) => (Plane::Herdr, false, format!("auto -> herdr fallback: {why}")),
+            Err(why) => (Plane::Hc, false, format!("auto -> hc fallback: {why}")),
         },
         "auto" => (
-            Plane::Herdr,
+            Plane::Hc,
             false,
-            "auto -> herdr: the rex backend is not compiled into this build (lean herdr-only build)"
+            "auto -> hc: the rex backend is not compiled into this build (lean hc-only build)"
                 .to_string(),
         ),
         other => (
-            Plane::Herdr,
+            Plane::Hc,
             false,
             format!(
                 "{other}: unknown multiplexer backend (spawn refuses; set FLYWHEEL_BACKEND \
-                 to herdr|auto|superlogical)"
+                 to hc|auto|superlogical)"
             ),
         ),
     };
@@ -208,10 +206,10 @@ fn note_missing_primary_once(reason: &str) {
     }
 }
 
-/// Construct the herdr backend (connects the client itself, ADR-0005 P1).
-#[cfg(feature = "backend-herdr")]
-fn herdr_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> {
-    let backend = toron_core::backend::herdr::HerdrBackend::connect(Some(&cfg.socket_path()))
+/// Construct the hc backend (connects the client itself, ADR-0005 P1).
+#[cfg(feature = "backend-hc")]
+fn hc_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> {
+    let backend = toron_core::backend::hc::HcBackend::connect(Some(&cfg.socket_path()))
         .map_err(|e| BackendError::Other(anyhow::anyhow!("{e}")))?;
     Ok(Box::new(backend))
 }
@@ -219,18 +217,21 @@ fn herdr_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> {
 /// Auto selection: rex first, always. A set `REX_SESSION` only records
 /// that this process runs inside a rex terminal; it never decides WHETHER
 /// rex is tried — `auto` builds the rex primary regardless of
-/// `REX_SESSION` or any herdr socket. Herdr serves only as transport
-/// fallback (see [`FallbackBackend`]). `FLYWHEEL_BACKEND=herdr` selects
-/// herdr explicitly (the honest escape hatch).
-/// Construct the active multiplexer backend. Default = herdr; unrecognized →
-/// actionable error (no silent fallback to the default — ADR-0002 §6). The
-/// `backend-herdr` cargo feature gates the herdr impl; when it's off, the
-/// name falls through to `other` with a feature-aware error.
+/// `REX_SESSION` or any hc socket. hc serves only as transport
+/// fallback (see [`FallbackBackend`]). `FLYWHEEL_BACKEND=hc` selects
+/// hc explicitly (the honest escape hatch).
+///
+/// Construct the active multiplexer backend. Default is `auto` (rex-primary
+/// when `backend-superlogical` is compiled; otherwise hc). An
+/// unrecognized name is an actionable error (no silent fallback —
+/// ADR-0002 §6). The `backend-hc` cargo feature gates the hc impl;
+/// when it's off, the name falls through to `other` with a feature-aware
+/// error.
 pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> {
     let name = resolve_backend_name(cfg);
     match name.as_str() {
-        #[cfg(feature = "backend-herdr")]
-        "herdr" => herdr_backend(cfg),
+        #[cfg(feature = "backend-hc")]
+        "hc" => hc_backend(cfg),
         // superlogical: rex CLI (feature `backend-superlogical`). With the
         // feature off, the arm is compiled out and the name falls through
         // to `other` -> "not compiled in". subscribe, agent_wait, and
@@ -238,27 +239,27 @@ pub fn multiplexer_backend(cfg: &Config) -> Result<Box<dyn MultiplexerBackend>> 
         #[cfg(feature = "backend-superlogical")]
         "superlogical" => Ok(Box::new(crate::backend::superlogical::SuperlogicalBackend)),
         // auto: rex primary on every door, regardless of `REX_SESSION`.
-        // Herdr is transport fallback only (Connect/Io/Timeout — a
-        // successful rex call never falls through). A herdr daemon
+        // hc is transport fallback only (Connect/Io/Timeout — a
+        // successful rex call never falls through). An hc server
         // that is down at startup leaves a primary-only backend behind
         // a loud warning instead of refusing the whole construction.
         #[cfg(feature = "backend-superlogical")]
         "auto" => {
             // Rex primary on every door. No `REX_SESSION` gate here: a
             // hosted bot, a cron run, and the doorbell have no `REX_SESSION`
-            // and still resolve rex. Herdr is transport fallback only.
+            // and still resolve rex. hc is transport fallback only.
             let primary: Box<dyn MultiplexerBackend> =
                 Box::new(crate::backend::superlogical::SuperlogicalBackend);
-            #[cfg(feature = "backend-herdr")]
+            #[cfg(feature = "backend-hc")]
             let fallback: Option<Box<dyn MultiplexerBackend>> =
-                match toron_core::backend::herdr::HerdrBackend::connect(Some(&cfg.socket_path())) {
+                match toron_core::backend::hc::HcBackend::connect(Some(&cfg.socket_path())) {
                     Ok(backend) => Some(Box::new(backend)),
                     Err(e) => {
-                        eprintln!("auto backend: herdr unavailable ({e}); rex-only");
+                        eprintln!("auto backend: hc unavailable ({e}); rex-only");
                         None
                     }
                 };
-            #[cfg(not(feature = "backend-herdr"))]
+            #[cfg(not(feature = "backend-hc"))]
             let fallback: Option<Box<dyn MultiplexerBackend>> = None;
             Ok(Box::new(crate::backend::fallback::FallbackBackend::new(
                 primary, fallback,
@@ -299,17 +300,17 @@ pub fn mail_backend(cfg: &Config) -> Result<Box<dyn MailSurface>> {
     }
 }
 
-/// Rex native door: `herdr`, `auto`, and `superlogical` all spawn. Any other
+/// Rex native door: `hc`, `auto`, and `superlogical` all spawn. Any other
 /// selection fails loud before any side effect instead of silently building
 /// panes on the wrong backend.
-pub fn require_herdr_for_spawn(name: &str) -> Result<()> {
-    if matches!(name, "herdr" | "auto" | "superlogical") {
+pub fn require_mux_for_spawn(name: &str) -> Result<()> {
+    if matches!(name, "hc" | "auto" | "superlogical") {
         return Ok(());
     }
     Err(BackendError::Unsupported {
         backend: name.to_string(),
         method: "spawn",
-        reason: "unknown multiplexer backend for spawn (want herdr, auto, or superlogical)"
+        reason: "unknown multiplexer backend for spawn (want hc, auto, or superlogical)"
             .to_string(),
     })
 }
@@ -338,16 +339,16 @@ pub fn compiled_backends() -> Vec<&'static str> {
     // fully stripped build no `extend` survives, so scope the allow to that.
     #[cfg_attr(
         not(any(
-            feature = "backend-herdr",
+            feature = "backend-hc",
             feature = "backend-superlogical",
             feature = "mail-toron"
         )),
         allow(unused_mut)
     )]
     let mut out: Vec<&'static str> = Vec::new();
-    #[cfg(feature = "backend-herdr")]
+    #[cfg(feature = "backend-hc")]
     {
-        out.extend(["herdr"]);
+        out.extend(["hc"]);
     }
     #[cfg(feature = "backend-superlogical")]
     {
@@ -370,22 +371,22 @@ mod tests {
     // env lock (config::lock_env, 193.2) — a per-module lock would still
     // race sibling modules' env-mutating tests.
 
-    /// Defaults resolve to herdr + toron when nothing is set (the build
+    /// Defaults resolve to hc + toron when nothing is set (the build
     /// without the rex backend; with it, the default is auto).
     #[cfg(not(feature = "backend-superlogical"))]
     #[test]
-    fn defaults_resolve_to_herdr_and_toron() {
+    fn defaults_resolve_to_hc_and_toron() {
         let _g = lock_env();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
         unsafe { std::env::remove_var("FLYWHEEL_MAIL") };
         let cfg = Config::default();
-        assert_eq!(resolve_backend_name(&cfg), "herdr");
+        assert_eq!(resolve_backend_name(&cfg), "hc");
         assert_eq!(resolve_mail_name(&cfg), "toron");
     }
 
     /// With the rex backend compiled in, the default name is auto. Auto
-    /// constructs rex-first with herdr transport fallback regardless of
-    /// `REX_SESSION`: rex resolves lazily per call, and a down herdr daemon
+    /// constructs rex-first with hc transport fallback regardless of
+    /// `REX_SESSION`: rex resolves lazily per call, and a down hc server
     /// leaves a primary-only backend behind a warning.
     #[cfg(feature = "backend-superlogical")]
     #[test]
@@ -458,7 +459,7 @@ mod tests {
     }
 
     /// An unknown backend name returns an actionable Unsupported (not a silent
-    /// fallback to herdr). Verifies the factory error path without needing a
+    /// fallback to hc). Verifies the factory error path without needing a
     /// live socket (the name is bogus so it fails at the match, not connect).
     #[test]
     fn unknown_backend_name_is_unsupported_not_silent_fallback() {
@@ -504,15 +505,15 @@ mod tests {
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
-    /// The default build compiles herdr + toron (the `default`
-    /// feature set is `["serve", "backend-herdr", "mail-toron"]`).
+    /// The default build compiles hc + toron (the `default`
+    /// feature set is `["serve", "backend-hc", "mail-toron"]`).
     /// This is the feature-matrix contract —
     /// compiled_backends() must reflect the actual cfg gates (it's what
     /// `flywheel backend list` will surface in R0.10).
     #[test]
-    fn default_build_compiles_herdr_and_toron() {
+    fn default_build_compiles_hc_and_toron() {
         let backends = super::compiled_backends();
-        assert!(backends.contains(&"herdr"), "herdr missing: {backends:?}");
+        assert!(backends.contains(&"hc"), "hc missing: {backends:?}");
         #[cfg(feature = "mail-toron")]
         assert!(backends.contains(&"toron"), "toron missing: {backends:?}");
         assert!(
@@ -636,24 +637,24 @@ mod tests {
 
 #[cfg(test)]
 mod spawn_gate_tests {
-    use super::require_herdr_for_spawn;
+    use super::require_mux_for_spawn;
     use super::{Plane, resolve_plane};
     use crate::backend::BackendError;
     use crate::config::{Config, lock_env};
 
-    /// Rex native door: herdr, auto, and superlogical all pass the gate.
+    /// Rex native door: hc, auto, and superlogical all pass the gate.
     /// Unknown names still refuse loud before any side effect, naming the
     /// method and the fix. No live socket needed: the gate decides on the
     /// name alone.
     #[test]
-    fn spawn_gate_passes_herdr_and_rex_modes() {
-        for name in ["herdr", "auto", "superlogical"] {
+    fn spawn_gate_passes_hc_and_rex_modes() {
+        for name in ["hc", "auto", "superlogical"] {
             assert!(
-                require_herdr_for_spawn(name).is_ok(),
+                require_mux_for_spawn(name).is_ok(),
                 "{name} must pass the spawn gate"
             );
         }
-        match require_herdr_for_spawn("nonsense") {
+        match require_mux_for_spawn("nonsense") {
             Err(BackendError::Unsupported {
                 backend, method, ..
             }) => {
@@ -665,27 +666,29 @@ mod spawn_gate_tests {
         }
     }
 
-    /// bd-mknvb: `auto` on a host without the rex CLI resolves to the HERDR
+    /// bd-mknvb: `auto` on a host without the rex CLI resolves to the HC
     /// FALLBACK with the reason. The measured failure was the rex spawn arm
     /// being chosen from the configured name while the transport fell back:
-    /// a herdr workspace was built, then `rex run` died.
+    /// an hc terminal set was built, then `rex run` died.
     /// Mutation: drop the CLI probe from `resolve_plane`'s auto arm (always
     /// rex) and this test fails — the spawn arm follows this value.
     #[cfg(feature = "backend-superlogical")]
     #[test]
-    fn auto_without_a_rex_cli_resolves_to_the_herdr_fallback() {
-        // RexBinGuard holds the crate-wide env lock; set the selection inside.
-        let _bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
+    fn auto_without_a_rex_cli_resolves_to_the_hc_fallback() {
+        // RexBinGuard holds the crate-wide env lock; plane probe reads cfg.rex_bin_dir.
+        let bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
-        let plane = resolve_plane(&Config::default());
+        let mut cfg = Config::default();
+        cfg.rex_bin_dir = Some(bin.dir_path().display().to_string());
+        let plane = resolve_plane(&cfg);
         assert_eq!(plane.configured, "auto");
-        assert_eq!(plane.plane, Plane::Herdr, "{}", plane.reason);
+        assert_eq!(plane.plane, Plane::Hc, "{}", plane.reason);
         assert!(!plane.rex_reachable);
         assert!(plane.is_fallback());
         assert!(
             plane
                 .reason
-                .starts_with("auto -> herdr fallback: rex CLI not found"),
+                .starts_with("auto -> hc fallback: rex CLI not found"),
             "the fallback must name the missing CLI: {}",
             plane.reason
         );
@@ -696,9 +699,11 @@ mod spawn_gate_tests {
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn auto_with_a_rex_cli_resolves_to_rex() {
-        let _bin = crate::backend::superlogical::rex_cli::RexBinGuard::install("exit 0");
+        let bin = crate::backend::superlogical::rex_cli::RexBinGuard::install("exit 0");
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
-        let plane = resolve_plane(&Config::default());
+        let mut cfg = Config::default();
+        cfg.rex_bin_dir = Some(bin.dir_path().display().to_string());
+        let plane = resolve_plane(&cfg);
         assert_eq!(plane.plane, Plane::Rex, "{}", plane.reason);
         assert!(plane.rex_reachable);
         assert!(!plane.is_fallback());
@@ -710,13 +715,15 @@ mod spawn_gate_tests {
     }
 
     /// An EXPLICIT rex pin is not a fallback, even with the CLI gone: the
-    /// spawn arm must refuse loud (nothing created), never quietly ride herdr.
+    /// spawn arm must refuse loud (nothing created), never quietly ride hc.
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn an_explicit_rex_pin_never_reports_a_fallback() {
-        let _bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
+        let bin = crate::backend::superlogical::rex_cli::RexBinGuard::empty();
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
-        let plane = resolve_plane(&Config::default());
+        let mut cfg = Config::default();
+        cfg.rex_bin_dir = Some(bin.dir_path().display().to_string());
+        let plane = resolve_plane(&cfg);
         assert_eq!(
             plane.plane,
             Plane::Rex,
@@ -737,16 +744,33 @@ mod spawn_gate_tests {
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 
-    /// `FLYWHEEL_BACKEND=herdr` is a choice, not a fallback: no line, no probe.
+    /// Mutation: if `rex_cli_present` ignored `cfg.rex_bin_dir` and only read
+    /// the process-global `REX_BIN_DIR`, a parallel test that cleared the env
+    /// would make this fail — config is the race-proof path.
+    #[cfg(feature = "backend-superlogical")]
     #[test]
-    fn explicit_herdr_never_reports_a_fallback() {
+    fn config_rex_bin_dir_outranks_a_poisoned_env() {
+        let bin = crate::backend::superlogical::rex_cli::RexBinGuard::install("exit 0");
+        unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
+        // Poison the env the old probe used; config must still see the binary.
+        unsafe { std::env::remove_var("REX_BIN_DIR") };
+        let mut cfg = Config::default();
+        cfg.rex_bin_dir = Some(bin.dir_path().display().to_string());
+        let plane = resolve_plane(&cfg);
+        assert_eq!(plane.plane, Plane::Rex, "{}", plane.reason);
+        assert!(plane.rex_reachable, "{}", plane.reason);
+    }
+
+    /// `FLYWHEEL_BACKEND=hc` is a choice, not a fallback: no line, no probe.
+    #[test]
+    fn explicit_hc_never_reports_a_fallback() {
         let _g = lock_env();
-        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "herdr") };
+        unsafe { std::env::set_var("FLYWHEEL_BACKEND", "hc") };
         let plane = resolve_plane(&Config::default());
-        assert_eq!(plane.plane, Plane::Herdr);
+        assert_eq!(plane.plane, Plane::Hc);
         assert!(!plane.rex_reachable);
         assert!(!plane.is_fallback());
-        assert_eq!(plane.reason, "herdr (configured)");
+        assert_eq!(plane.reason, "hc (configured)");
         unsafe { std::env::remove_var("FLYWHEEL_BACKEND") };
     }
 }

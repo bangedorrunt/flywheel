@@ -198,12 +198,12 @@ pub struct MailSections {
 
 /// Backend selection (ADR-0002). `[backend] multiplexer` / `[backend] mail` in
 /// config.toml; overridden by `FLYWHEEL_BACKEND` / `FLYWHEEL_MAIL` env (which
-/// may themselves be set by `.env`). Defaults: auto (rex-first + herdr
-/// fallback) with the rex backend compiled in, else herdr / toron.
+/// may themselves be set by `.env`). Defaults: auto (rex-first + hc
+/// fallback) with the rex backend compiled in, else hc / toron.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendConfig {
     /// multiplexer backend name (`auto` default with the rex backend
-    /// compiled in, else `herdr`; `superlogical` pins rex without fallback)
+    /// compiled in, else `hc`; `superlogical` pins rex without fallback)
     pub multiplexer: String,
     /// mail backend name (`toron`; the agentmail backend is deleted, bd-euav)
     pub mail: String,
@@ -211,8 +211,11 @@ pub struct BackendConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// herdr socket path (default ~/.config/herdr/herdr.sock)
+    /// hc/herdr-core session socket (HC_SOCKET_PATH / XDG state; see socket_path())
     pub socket_path: Option<String>,
+    /// Optional rex CLI directory (test/config override for REX_BIN_DIR).
+    #[serde(default)]
+    pub rex_bin_dir: Option<String>,
     /// default project root (default ~/workspace)
     pub workspace_root: Option<String>,
     /// default --wait timeout in ms for send/watch (default 1800000)
@@ -621,20 +624,47 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> String {
-        self.socket_path
-            .clone()
-            .or_else(|| std::env::var("HERDR_SOCKET_PATH").ok())
-            .unwrap_or_else(|| {
-                // Converge with the module's own XDG-first base (is1.6): the
-                // canonical herdr client (toron-core backend/herdr.rs) resolves
-                // `HERDR_SOCKET_PATH` or `$XDG_CONFIG_HOME/herdr/herdr.sock`.
-                // `dirs::config_dir()` would point at ~/Library/Application
-                // Support on macOS — divergent, and a real "flywheel can't
-                // find herdr" bug with default config.
-                xdg_config_base()
-                    .join("herdr/herdr.sock")
-                    .to_string_lossy()
-                    .into_owned()
+        // hc resolve order (toron_core::backend::hc::resolve_socket_path):
+        // explicit config → HC_SOCKET_PATH → $XDG_STATE_HOME/herdr-core/$session/$session.sock
+        // (session defaults to `default`). HC_SOCKET_PATH is not consulted.
+        if let Some(p) = self.socket_path.clone().filter(|s| !s.is_empty()) {
+            return p;
+        }
+        if let Ok(p) = std::env::var("HC_SOCKET_PATH") {
+            if !p.is_empty() {
+                return p;
+            }
+        }
+        let session = std::env::var("HC_SESSION").unwrap_or_else(|_| "default".into());
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        state
+            .join("herdr-core")
+            .join(&session)
+            .join(format!("{session}.sock"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Directory that must contain an executable `rex` (config / tests).
+    /// When set, the factory plane probe and Rex::resolve prefer it over PATH.
+    pub fn rex_bin_dir(&self) -> Option<std::path::PathBuf> {
+        self.rex_bin_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("REX_BIN_DIR").and_then(|v| {
+                    let p = std::path::PathBuf::from(v);
+                    if p.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(p)
+                    }
+                })
             })
     }
 
@@ -743,7 +773,7 @@ pub fn registry_after_captain_death(
 
 /// The XDG config BASE (is1.6): `$XDG_CONFIG_HOME` when set, else
 /// `~/.config`. `config_dir()` appends `/flywheel`; the herdr socket appends
-/// `/herdr/herdr.sock` — both converge on this base (matches the canonical
+/// `/herdr-core/default/default.sock` — both converge on this base (matches the canonical
 /// herdr client in toron-core).
 pub fn xdg_config_base() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -1422,39 +1452,39 @@ daily = [
 
     /// is1.6: the herdr socket fallback converges with `config_dir()`
     /// (XDG_CONFIG_HOME first), matching the canonical herdr client in
-    /// toron-core (`HERDR_SOCKET_PATH` else `$XDG_CONFIG_HOME/herdr/herdr.sock`).
+    /// toron-core (`HC_SOCKET_PATH` else `$XDG_CONFIG_HOME/herdr-core/default/default.sock`).
     #[test]
     fn socket_path_follows_xdg_config_home() {
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+        unsafe { std::env::remove_var("HC_SOCKET_PATH") };
         let tmp = std::env::temp_dir().join(format!("flywheel-sock-xdg-{}", std::process::id()));
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
         let cfg = Config::default();
         assert_eq!(
             cfg.socket_path(),
-            tmp.join("herdr/herdr.sock").to_string_lossy()
+            tmp.join("herdr-core/default/default.sock").to_string_lossy()
         );
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
-    /// is1.6: no XDG_CONFIG_HOME → `~/.config/herdr/herdr.sock` (never
+    /// is1.6: no XDG_CONFIG_HOME → `~/.config/herdr-core/default/default.sock` (never
     /// `dirs::config_dir()` / macOS Application Support).
     #[test]
     fn socket_path_falls_back_to_home_dot_config() {
         let _g = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        unsafe { std::env::remove_var("HERDR_SOCKET_PATH") };
+        unsafe { std::env::remove_var("HC_SOCKET_PATH") };
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         let home = std::env::temp_dir().join(format!("flywheel-sock-home-{}", std::process::id()));
         unsafe { std::env::set_var("HOME", &home) };
         let cfg = Config::default();
         assert_eq!(
             cfg.socket_path(),
-            home.join(".config/herdr/herdr.sock").to_string_lossy(),
-            "socket default is ~/.config/herdr/herdr.sock, not Application Support"
+            home.join(".config/herdr-core/default/default.sock").to_string_lossy(),
+            "socket default is ~/.config/herdr-core/default/default.sock, not Application Support"
         );
         unsafe { std::env::remove_var("HOME") };
     }

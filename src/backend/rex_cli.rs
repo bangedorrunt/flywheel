@@ -1115,7 +1115,7 @@ pub mod rex_map {
         }
 
         #[test]
-        fn root_wins_and_a_blocked_child_without_a_root_is_blocked() {
+        fn attention_blocks_when_a_child_is_blocked() {
             assert_eq!(
                 status_from_program_status(&json!({"records": []})),
                 AgentStatus::Unknown
@@ -1133,7 +1133,7 @@ pub mod rex_map {
                     {"id": "eu-west", "state": "blocked"}
                 ]
             }));
-            assert_eq!(root_working, AgentStatus::Working);
+            assert_eq!(root_working, AgentStatus::Blocked);
             let idle = status_from_program_status(&json!({
                 "records": [osc("state=idle:app=claude-code")]
             }));
@@ -1287,6 +1287,10 @@ impl RexBinGuard {
 
     pub(crate) fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    pub(crate) fn dir_path(&self) -> &std::path::Path {
+        self._dir.path()
     }
 }
 

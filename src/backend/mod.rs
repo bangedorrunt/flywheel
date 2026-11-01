@@ -1,4 +1,4 @@
-//! Pluggable backend abstraction — multiplexer (herdr / superlogical)
+//! Pluggable backend abstraction — multiplexer (hc / superlogical)
 //! via the UNIFIED toron-core `Backend` trait (ADR-0005 P1), and the mail
 //! fabric (toron / agent-mail MCP) via the UNIFIED toron-core `MailSurface`
 //! trait (ADR-0007 D2 / R1, consumed by flywheel in bead bd-adr7-mail-adapt-se2.3).
@@ -10,7 +10,7 @@
 //! local `MultiplexerBackend` trait — it re-exports the unified one:
 //! `pub use toron_core::backend::Backend as MultiplexerBackend;`. Call sites
 //! keep the name; the trait is sync, `&self`, object-safe, Unsupported-open.
-//! The herdr *client* was already unified (herdr re-exports toron-core).
+//! The hc client lives in toron-core (`backend::hc`).
 //!
 //! ADR-0007 D2 (se2.3): the flywheel-local `MailBackend` trait is DELETED
 //! (not dual-lived). The coordination-fabric trait is
@@ -32,7 +32,6 @@ pub use factory::{Plane, resolve_plane};
 // arm, so the module is compiled with that backend.
 #[cfg(feature = "backend-superlogical")]
 pub mod fallback;
-pub mod herdr;
 #[cfg(test)]
 mod parity;
 #[cfg(feature = "backend-superlogical")]
@@ -48,7 +47,7 @@ pub mod wire;
 /// this re-export keeps flywheel call sites on the historical name.
 pub use toron_core::backend::Backend as MultiplexerBackend;
 /// Coded `agent.prompt` landing data (unified in toron-core). Reached only
-/// from the `__send` parity mapper (`herdr::map_prompt_result`), which is
+/// from the `__send` parity mapper (`parity` prompt-landing mapper), which is
 /// itself test-only here, so the name ships with that caller.
 #[cfg(test)]
 pub use toron_core::backend::PromptLanding;
@@ -185,11 +184,11 @@ impl From<anyhow::Error> for BackendError {
     }
 }
 
-impl From<crate::herdr::HerdrError> for BackendError {
+impl From<crate::hc_support::HerdrError> for BackendError {
     /// Preserve herdr's typed error code as an `Other` with a lossless
     /// anyhow context. (Backend callers handle `BackendError::Unsupported`;
     /// transport errors stay opaque in `Other`.)
-    fn from(e: crate::herdr::HerdrError) -> Self {
+    fn from(e: crate::hc_support::HerdrError) -> Self {
         Self::Other(anyhow::anyhow!("herdr error {}: {}", e.code, e.message))
     }
 }

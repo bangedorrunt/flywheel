@@ -19,7 +19,7 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use toron_core::backend::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
+use toron_core::backend::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
 use toron_core::backend::{
     AgentStatus, BackendError, BackendErrorCode, EventStream, PromptLanding,
 };

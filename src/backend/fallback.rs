@@ -1,4 +1,4 @@
-//! Multiplexer fallback: rex first, herdr on transport failure.
+//! Multiplexer fallback: rex first, hc on transport failure.
 //!
 //! governed-by: ADR-0002
 //!
@@ -6,20 +6,20 @@
 //! the fallback when the primary fails with a transport code (`Connect`,
 //! `Io`, `Timeout`). Every other code (semantic rejects, malformed replies,
 //! unsupported methods) surfaces loud: falling back there would mask a real
-//! gap as a working call. `name()` is `"auto"`; janitors matching `"herdr"`
+//! gap as a working call. `name()` is `"auto"`; janitors matching `"hc"`
 //! exactly (`pane_keep`) skip auto, which is the safe direction (never
-//! delete a binding the fallback may be serving through herdr).
+//! delete a binding the fallback may be serving through hc).
 
 use serde_json::Value;
-use toron_core::backend::herdr::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
+use toron_core::backend::{AgentInfo, PaneInfo, Subscription, WaitOptions, WorkspaceInfo};
 use toron_core::backend::{
     AgentStatus, BackendError, BackendErrorCode, EventStream, PromptLanding,
 };
 
 use crate::backend::MultiplexerBackend;
 
-/// Rex first, herdr when rex is unreachable. The fallback is fixed at
-/// construction; a missing fallback (herdr daemon down at startup) leaves a
+/// Rex first, hc when rex is unreachable. The fallback is fixed at
+/// construction; a missing fallback (hc server down at startup) leaves a
 /// primary-only backend whose transport errors surface unchanged.
 pub struct FallbackBackend {
     primary: Box<dyn MultiplexerBackend>,
