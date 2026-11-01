@@ -1,5 +1,5 @@
-{"frame":"herdr.status","id":"hs-1","seq":1,"agent_status":"idle","pane_id":"w1:p1","pin":"BlueRidge"}
-{"frame":"herdr.status","id":"hs-2","seq":2,"agent_status":"working","pane_id":"w1:p2","pin":"LilacChapel"}
+{"frame":"hc.status","id":"hs-1","seq":1,"agent_status":"idle","pane_id":"w1:p1","pin":"BlueRidge"}
+{"frame":"hc.status","id":"hs-2","seq":2,"agent_status":"working","pane_id":"w1:p2","pin":"LilacChapel"}
 {"frame":"watch","id":"e1","seq":3,"line":{"content":"idle","id":"e1","kind":20001,"tags":[["p","BlueRidge"]]}}
 {"frame":"watch","id":"r1","seq":4,"line":{"content":"@BlueRidge ack-sla-expired for corr-1 unacked for 40m","id":"r1","kind":9,"tags":[["p","BlueRidge"],["toron-kind","ack-sla-expired"]]}}
 {"frame":"watch","id":"r2","seq":5,"line":{"content":"@Ghost hi","id":"r2","kind":9,"tags":[["p","Ghost"]]}}
