@@ -1,128 +1,140 @@
-# AGENT INSTRUCTION
+# flywheel
+
+Fleet orchestration over a terminal multiplexer. Owns the session door,
+topology classify, durable loops, workflow compose, and doorbell (plane D).
+Work tracking is `br`; mail/reservations are toron. Deps one-way:
+**flywheel → toron-workflow → toron-core**. Never reverse.
+
+Ops crib: `~/.agents/skills/flywheel/SKILL.md`. Deep detail lives under
+`docs/agent-instructions/` and `docs/guides/` — not here.
 
 ## Commands
+
+Rust runs through mbx. Prefix every cargo invocation with
+`mbx +nightly-aarch64-apple-darwin` (bare `cargo` misparses under the mbx
+shim). `test` covers flywheel + doorbell-core/rt/cli via
+`[workspace] default-members`.
 
 ```bash
 mbx +nightly-aarch64-apple-darwin test
 bash scripts/verify-clippy.sh
-k
 mbx +nightly-aarch64-apple-darwin install --path . --force
-mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force # plane D CLI (proxy resolves it co-located or on PATH)
-# macOS (only if a stale-signature SIGKILL appears): codesign --force --sign - ~/.cargo/bin/flywheel
-# Same for the daemon after `cargo install` — a CODESIGNING SIGKILL shows up as the
-# planned `doorbell serve` vanishing mid-tick with an empty log and a
-# ~/Library/Logs/DiagnosticReports/doorbell-*.ips saying "Code Signature Invalid":
+mbx +nightly-aarch64-apple-darwin install --path crates/doorbell-cli --force
+# macOS stale-signature SIGKILL only:
+# codesign --force --sign - ~/.cargo/bin/flywheel
 # codesign --force --sign - ~/.cargo/bin/doorbell && launchctl kickstart -k gui/$(id -u)/com.doorbell.serve
 ```
 
-Rust runs through mbx (cargo cache): prefix every cargo invocation with `mbx +nightly-aarch64-apple-darwin` (bare `cargo` misparses under the mbx shim). `test` runs all four workspace packages (flywheel + doorbell-core/rt/cli) via `[workspace] default-members`, so a doorbell-crate regression is not invisible to the default command.
+`mbx +nightly-aarch64-apple-darwin test --exclude-ignored` is invalid.
+Live ignored tests need a multiplexer + mail (see Test sandbox).
 
-Live ignored tests need herdr + mail. `mbx +nightly-aarch64-apple-darwin test --exclude-ignored` is invalid.
+## Pane plane (rex default)
 
-## Critical overrides (repo invariants — ops live in the flywheel skill)
+Default build features: `serve` + `backend-herdr` + `backend-superlogical` +
+`mail-toron`. Selection:
+`FLYWHEEL_BACKEND` / `[backend] multiplexer` ∈ `{auto,superlogical,herdr}`.
 
-- **An invisible crew is not an empty project.** This gate is owned by the global `~/.agents/AGENTS.md` P2 sub-case, not restated here: `dispatcher=absent` / `no live fleet` describes the DISPATCHER, not the project, so it is not clearance to spawn. Read it there for the three checks (mail inbox, `.unanswered`, `/health.injection`) and for the npub addressing rule. What is repo-specific and worth keeping: the `.unanswered` file this gate reads is load-bearing and a cleanup that empties it silently disarms the gate, so it keeps a tombstone row and always exists even with zero pins. A measured instance is in `flywheel` skill rule 11.
-- **A green suite over a dirty tree is NOT a green tree.** The proof for a change is a CLEAN EXPORT of the commit: `git archive HEAD` into a scratch dir and build THERE. Two commits in one day declared a module whose file was never committed (toron's `engine/mod.rs` declared `pub mod framework;` with no `framework.rs` tracked; flywheel's `src/main.rs` declared `mod elm;` with `src/elm.rs` untracked), so both trees only built because the working tree carried the missing file - and a commit that names a module must ship the file. The same rule applies to the shipped binaries: an install must come from a clean export, never from a working tree that carries another lane's edits.
-- **An uncommitted file is a lost file.** Leave nothing in the working tree that your commit depends on: if the build needs it, the commit needs it. `git add` only the paths you edited, never `git add -A` - the working tree of every repo in this stack carries other lanes' in-flight work.
-- **Classify first:** session door is `arrive` then `briefing --json`, argv runs the work; `decide --json` is the classifier leaf (`topology`, `src/decide.rs`). Modes are `open` and `swarm`. A loop is the work plus one verify check, not a mode. The command `loop-mode run` stays, and ready-bead work classifies as topology `open`. `briefing.mode_text` names one skill: `flywheel-open` or `flywheel-captain`. A crew launch prompt names `flywheel-crew`. Live fleets join loud, never double-compose. `briefing.world.ready_beads` is `br ready` (dispatchable), never jsonl `open` lanes. Leftover opens must not steal diagnose/forensics/beads-lifecycle. `diagnose` routes to `forensics`. Loop-work needles are phrases (`work the ready beads`, `ready beads`, `loop-mode`, `loop`), never bare `work`/`beads`.
-- **Mid-session material reclassify (GS-048 / GS-049):** on AUTHORITATIVE objective change, explicit topology ask, new tracked work-unit class, classifier miss while working, or stage-chain exhaustion then continued asks — **must** re-run `decide --json` + `workflow list --brief` (or `--json`) + `stage list`, then announce `vehicle: …` or `none: raw`. Tick Law path: `Msg::MaterialContext` → caller-applied `Cmd::Reclassify` → `Msg::DecisionReady` announce. Sticky-open: do not flip open→loop/swarm/join/none without explicit request; hold loop against swarm without explicit. After sticky announce, briefing print/commit **aligns** with `session_topology` (no dual SoT); sticky-held open clears invent workflow/argv (no invent `wave-swarm` headless under open) and DecisionReady announces `none: raw` / open vehicle only. `steer` requires `--project` (or inherits cwd) so AUTHORITATIVE objectives always queue MaterialContext. `live_decide_snapshot` uses real assemble `launch_pending` (never invent-green 0). Routine Channel/Job doorbell wakes stay Prompt-only. `flywheel reclassify "<goal>"` enters Elm-plane MaterialContext (sticky-open) then prints briefing. Do **not** decide inside pure `tick`.
-- **Elm deepen (GS-045 P1 / GS-049 / GS-050):** source Msg / source-action identity is immutable through tick (retries keep the same Reclassify goal/reason **and** journal `effect_key` ; `Cmd::Reclassify.effect_key` is durable I8a journal identity — length-prefixed `reclassify:<sha256>` via `reclassify_effect_key`; host `expand_reclassify_cmds` insert-or-loads Prepared→InFlight→Settled under that key). `workflow evaluate <name>` returns validated partition candidates without journal dispatch (evaluate-without-commit / dry evaluate); live effects stay on `workflow run --execute`. Structured failures carry ActionStage (`stage`: normalize|input|execute|output|effect|park) through CLI/run ledger. Sensor edges (WatchNdjson / Herdr / AckSla / InboxSweep) are Msg producers — **no** Sensor GenServer (docs vocabulary only). **Presence** is via Herdr status + roles (and the trusted dispatcher-internal `Msg::Presence` edge), not a Sensor GenServer arm.
+- `auto` (default when `backend-superlogical` is compiled in): **rex-primary**.
+  Every door reads one resolution (`backend::factory::resolve_plane`) —
+  spawn, status, snapshot, crew launch, preflight, captain.
+- `FLYWHEEL_BACKEND=herdr` selects herdr explicitly.
+- `REX_SESSION` is a hint about where a process runs, never proof of the plane.
+- `flywheel preflight` reports a `pane-plane` check, not a herdr socket.
+- Agent status on both backends folds **OSC 7501** program status
+  (`idle|working|done|blocked|error|clear`) via `toron_core::osc7501::Board`.
+  Spec: https://www.superlogical.com/rex/docs/build/program-status
+- Rex vocabulary: **session** / **block** (not herdr workspace/pane). Ids are
+  `session:…` / `block:…` and never compare across backends.
+- Discover the connected server: `rex api list`, `rex api describe <method>`,
+  `rex api call …`. Useful methods include `session.create`,
+  `session.new_split`, `session.view`, and block method
+  `com.superlogical.terminal.program_status`. One-shot Lua: `rex do -e`
+  (`integrations/rex/session-snapshot.lua`). Manual crew escape hatch:
+  `rex new` → `rex split` → `rex block` rename to pin → record
+  `.flywheel/agent-names.json`.
+- Docs: https://www.superlogical.com/rex/docs — also
+  `docs/agent-instructions/backends.md`.
 
-- **Catalogs (wave 1, landed):** one routing table (`src/decide.rs` `ROUTING_TABLE`: earliest-match position, explicit `none`, topology per row) routes `decide`; one workflow catalog (`src/workflow_catalog.rs`: built-ins < user < project tiers) resolves every catalog read/run verb — `list/show/lint/crew/run/compose` take `--project` and layer the project tier; `seed` and `drift` inspect the user tier. **The flywheel-tier lint resolves STAGES through the same tiers** (`StageLibrary::load_layered` with the project root). It used to call `load()` (no project tier) while the composer used `load_layered`, so every project-authored stage in `.flywheel/stages.toml` was reported unresolvable and any composed workflow naming one was REFUSED — while `stage show` listed the same stage as valid. **Both read the compiled-in SOURCE TEXT (`BUILTIN_WORKFLOWS_YAML`), never `serde_yaml::to_string(&Workflow)`.** That round-trip is lossy — `CrewSpec` is `#[serde(untagged)]` with a unit `Auto` variant, so serde emits `crew: null` — and because the user tier WINS over the builtin, seeding silently turned every crew workflow headless while `drift` reported the damage as `current`. `workflow seed` copies every compiled-in workflow and stage into the user tier; `--overwrite <none|stale|all>` (default `none`) widens that, and **only ever replaces a name the binary ships**, so an authored file is safe at any scope. Every replaced file keeps its old bytes at `<name>.bak`. `--dry-run` reports the plan and writes nothing; a destructive overwrite **fails closed with no TTY and no `--yes`** (`--json` gets a machine-readable refusal, never a hang). `workflow drift` reports missing/current/stale/custom, and reads "stale" from the same function `--overwrite stale` uses, so the two can never disagree. `flywheel config seed` fills missing workflows, stages, compiled-in judgment packs, and a commented `config.toml` under `~/.config/flywheel`. `--overwrite none|stale|all` (default `none`) replaces only shipped names, with `--dry-run` and `--yes`; `config.toml` is never overwritten. `flywheel config drift` only reports. `config list` prints every setting and its default. Drift only reports. Packs have the missing half: `judgment pack drift|seed|remove|list` (XDG is truth, the project tier fills gaps, and a user pack at a HIGHER version is never downgraded at any scope). `stage remove` drops a user-tier stage so the compiled-in one shows through. Compose grammar is explicit when ambiguity matters: `stage:<stage>`, `role:<role>:<stage>`, `phase:<phase>:<stage>`, `kind:<harness>:<stage>`, `kind:<harness>:<role>:<stage>`, plus compact `<role>:<stage>` / `<phase>:<stage>`, `workflow:<name>`, bare stage, and nested `each:` / `parallel:` / `when:` / `retry(n):` forms. Compose tokens are workflows expanded at the part position, not stages or squads. `briefing` consumes decide's output.
-- **Run ledger is honest at every door:** one reader rule (`history_row_status`) backs `workflow history`, `runs list`, `--robot-snapshot`, and `cron history` — a row that recorded no status reads `unknown`, never a default `done`. A row that annotates a run rather than recording one declares itself (`annotation_kind`): ship-chain phase gates, the legacy loop monitor's start notice, the warn-first plan-artifact gate. Those carry `kind` + their real verdict, are skipped by `cron history`, and never count as run outcomes. Run rows carry terminal status + real project + failure artifact paths.
-- **Run-path effect journal:** flywheel embeds the engine, so flywheel owns the journal — `src/effect_journal.rs` injects a host-owned `EffectRunner` into every engine built for a run that really dispatches (`workflow run --execute`, `compose --run`, `cron run --live`, the cron daemon): an effectful `job`/`mailbox` leaf commits prepared intent → claims the attempt → invokes its provider **once** → settles (or fails, or records `unknown`), keyed by the engine boundary's own derivation. A sink no provider performs is **not** journaled — it keeps the engine's `bypassed-sink-uncovered` / `bypassed-no-effect-runner` marker with a loud reason. Dry arms (`run` without `--execute`, `cron run` without `--live`) stay unjournaled on purpose: they perform no external effect, so a settled row would claim work nobody did. Mailbox leaves journal only on the in-process plane (a remote `[mail.toron] url` cannot carry `corr`).
-- **The journal mode is the honesty switch:** a journaled constructor is `EffectJournalMode::Enforced` — an effectful leaf with no injected runner **refuses**, it never dispatches unjournaled; a dry arm is `Recording` — the marker, not a refusal. `verify` journals through the same surface: the engine renders the command (a templated `{{inputs.verify}}` reaches the sink resolved), runs the embedding's `VerifySink` first, and hands the executed result via `RunContext.provider_result` — the sink is the provider, so the leaf runner is not invoked and the command is never run twice. With no toron index open the engine keeps the loud marker, never a run that only looks journaled.
-- **Deps:** flywheel → toron-workflow → toron-core. Never reverse.
-- **Mail:** `toron_core::mailbox::surface::MailSurface`. Local `MailBackend` is deleted. Absent `[mail.toron] url` means embedded toron.
-- **Identity is one ladder**: explicit `--as`, then `AGENT_NAME`. `TORON_AGENT`, `FLYWHEEL_MAIL_AS`, and `[agent_mail].name` do not supply a pin. Toron's guard reads the same two rungs. Registered pins pass through verbatim; the hash fallback is for unregistered herdr slugs only. Self-test: `mbx +nightly-aarch64-apple-darwin test reservation_identity identity_ladder_is_shared`.
-- **One operator, one npub**: `mail register` requires `--name` and binds via `--from-project <slug>` / `--adopt-unnamed <name>` instead of forking. Bare re-registration errors naming the fix.
-- **Model routing is strict registry routing:** composite `provider/model` keys, `ModelRegistry::load_routing()` + `resolve_strict()`, caps enforced; unregistered or caps-excluded ids fail the spawn naming the fix. Slot/profile/operator-default semantics live in the flywheel skill; this repo owns the resolver code.
-- **Bead create is fail-closed**: `br create` requires `-d/--description`, `--verify '<cmd>'`, and for P≤2 `--principle 'name — decision'`. Title-only create refuses. `br q` is quick-capture only.
-- **Bead close is two-step and policy-enforced**: `br gate report` first, then `br close --commit-sha` citing the bead in the **full** commit message (`git log -1 --format=%B`); a trailing `.` or `:` is punctuation, not glue. `--force` variants need `BR_OPERATOR=1` + `--bypass-reason`. The gate row's `--note` must carry `sha=<FULL 40-hex sha>`: `flywheel ledger check <id> --dir .` matches that token exactly against the revision `derive_head_sha` resolves — NOT bare HEAD — so a note-less or abbreviated row is unbound and reports clean-false, a verdict is green only at its own revision, and a closed bead can never be re-bound (`closed -> closed` is not a legal gate transition). That `sha=` rule is a FLYWHEEL-side check: beads does not enforce the note's shape, so a flywheel-clean row and a beads-legal close can disagree on the note alone. `derive_head_sha` **ranks the `--grep` matches by CITATION TIER first** — a bracketed subject citation (`[bd-xxxx]`) outranks a bare subject mention, which outranks a body-only mention — and skips bookkeeping-only commits (the `BOOKKEEPING_PATH_PREFIXES` constant, not a literal path list), so the close ceremony's own gate-row commit cannot move the bound revision; the fallback is the highest-ranked match, not the newest bookkeeping match. Belt and braces: keep the bead id out of the bookkeeping commit message anyway (the hook exempts `.beads` from both its reservation and its bead-token rules, so a token-free message commits fine) — a skip is a heuristic, a clean message is a fact. Ceremony details live in the br skill.
-- **Tracker:** `br` CLI + `--json`; bare `br` is the human TUI, never automation. `bv` is deprecated.
+## Hosted control plane (hc)
+
+`FLYWHEEL_BACKEND=hc` is reserved for toron-core's hc backend (Part B of the
+hc-plane revamp). Until that lands, `auto` / `superlogical` remain the pane
+plane and `herdr` stays the explicit escape hatch. Do not document herdr as
+the default.
+
+
+## Test sandbox (hard)
+
+Live suites and any test that shells supervisor tools must:
+
+1. Put **deny-shims** for `launchctl` and `systemctl` first on `PATH`. Shims
+   log argv and exit 1. Check the shim logs empty after the run.
+2. Use a **temp `HOME`** and temp **XDG** (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
+   `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`). Prefer an explicit `TORON_DATA_DIR`
+   when the test opens a mailbox.
+3. Bind daemons on **spare ports**. Never touch live **`:18080`** (toron) or
+   **`:18980`** (doorbell), and never open the live store
+   `~/.local/share/toron/index.sqlite` (or the operator's real
+   `~/.config/toron/`).
+4. Never print key material. `~/.config/toron/operator_nsec` is a secret.
+
+A suite that bootouts the operator's real LaunchAgent is a regression, not a
+pass.
+
+## Critical overrides
+
+- **Clean-export proof.** A green suite over a dirty tree is not a green tree.
+  Proof = `git archive HEAD` into a scratch dir and build there. `git add`
+  only paths you edited — never `git add -A` (other lanes share the tree).
+- **Classify first.** Session door: `arrive` then `briefing --json`; argv runs
+  the work. `decide --json` is the classifier. Modes: `open` | `swarm`. A loop
+  is work + one verify check, not a mode. Live fleets join loud, never
+  double-compose. An invisible crew is not an empty project — see global
+  `~/.agents/AGENTS.md` (mail inbox, `.unanswered`, `/health.injection`).
+- **Material reclassify.** On authoritative objective change, re-run
+  `decide --json` + `workflow list --brief` (or `--json`) + `stage list`, then
+  announce vehicle. Do not decide inside pure `tick`. Sticky-open holds unless
+  the operator asks otherwise. Detail: skill + `docs/agent-instructions/`.
+- **Tick Law / Elm.** Reducers are pure `(Model, Msg) -> (Model, Vec<Cmd>)`.
+  No I/O, clock, rand, env, or locks inside. Checklist:
+  `docs/agent-instructions/effect-kernel.md`. Binding skill:
+  `~/.agents/skills/effect-oriented/SKILL.md`.
+- **Journal honesty.** Live effects journal before the provider runs
+  (`EffectJournalMode::Enforced`). Dry arms are `Recording`. Same store backs
+  effect rows and `RunJournal` lifecycle.
+- **Identity ladder.** Explicit `--as`, then `AGENT_NAME`. Registered pins
+  pass verbatim. Toron guard uses the same two rungs.
+- **Bead create/close.** Create needs `-d`, `--verify`, and for P≤2
+  `--principle`. Close is `br gate report` then `br close --commit-sha` with
+  the bead id in the **full** commit message. Ceremony detail: br skill.
+  Flywheel `ledger check` requires `sha=<40-hex>` in the gate note.
+- **Tracker.** Agents use `br --json` / `--robot-*`. Bare `br` is the human TUI.
 - **TDD. No script-based code edits. No file deletion without permission.**
-- **Engineering principles:** `flywheel principles list`; cite the name that changed the decision.
-- **Compound spine:** `ce-*` stages, `compound` phase, per-project `docs/learnings/`; `p-code` aliases are retired (`ce-execute`, not `p6`). `ce-evaluate` is the verify-phase, fresh-context, read-only evaluator used by repair loops; its result is advisory, never the host verdict.
-- **Host evaluation evidence:** ship-chain phase contracts persist bounded redacted `EvaluationEvidence` under the parent run. `phase_contracts`/`VerifySink` derive the verdict; `artifacts stitch <run_id>` renders the evidence; missing persistence fails the gate (warn mode may continue as `gate-warnings`). Worker `criterion_status` and `claim_support_status` never self-admit artifacts.
-- **Upstream parity:** `docs/upstream-parity.toml` pins the checked refs and local witnesses for Compound Engineering and pstack. The offline `upstream_parity` tests and `--robot-capabilities` summary are the parity doors; network refresh is manual, never a build dependency.
-- **Workflow selection:** the built-in catalog is 40 workflows. Agents should start with `flywheel workflow list --brief --json` (GS-052 hybrid: **name / family / selection / run / topology / compose_token**), pick the smallest match, then bare `workflow list --json` for description + decide_trigger + rest, or `workflow show <name>` for prose/graph detail (no decide_trigger/family/selection/topology); the one-by-one review lives in `docs/guides/workflow-catalog-review.mdx`. This applies in open mode and on every follow-up/material context change, not only session start; preserve open topology unless loop/swarm is explicitly chosen.
-- **Recursive workflows:** durable `call_workflow` children carry serialized lineage and fail closed before child creation on cycles, depth over 8, or exhausted 32-child per-lineage budget. Nested workflow use is bounded execution, not permission to spawn from open mode.
-- **Preflight:** `steer`/`loop-mode run`/`workflow run --execute` auto-run prerequisite checks; `--skip-preflight` bypasses; standalone `flywheel preflight --mode {steer|loop|workflow|cron}`.
-- **ADR-0006 D1 parameterized stage payloads:** `send --stage <name> --param k=v` substitutes `{{k}}` slots in `integrations/prompts/*.tpl`; each stage declares its required slots and a missing one is a usage error naming it. Values are prompt text, never shell-interpolated; zero params behaves exactly as before.
-- **ADR-0006 D2 wave-scoped dispatch:** `loop-mode run --work --wave-label wave-N` intersects `br ready` with the TYPED `wave` field (schema-18; the `wave-N` label is only the fallback) and holds, naming the blockers, while any lower wave is still open. Default `--work` is unchanged.
-- **ADR-0006 D3 `wave-swarm` composed workflow:** the builtin GATE→DISPATCH→OBSERVE→VERIFY→CAPTAIN-SIGNOFF recipe on the `compose --parts` grammar (`workflow compose "<objective>" --parts wave-swarm --run`); DISPATCH emits D1 payloads, VERIFY runs the receipt at committed HEAD and checks the close reason's VERIFY tail plus its principles citations, and the run graduates through the existing `--run --keep` green-run path. `wave-swarm` is a compose token, never a squad and never a spawn.
-- **Captain door (bd-captain-watch-poll-exit-bbwm):** `flywheel captain watch <project>` is the captain's own poll-exit — it captures the captain inbox high-water at arm time, polls it, and exits with a preview when strictly-newer mail lands, so the harness completion callback resumes the captain instead of a hand-rolled shell watcher. `--stall` adds two exits: exit 0 when every bead lane is closed, exit 3 when no pin reads Busy and the newest commit is older than `--stall-minutes` (default 45) with work remaining. An unreadable fleet (`snapshot.degraded` contains `pins`) NEVER alarms — a degraded read is not a stall — and a project with no commit history reads Working. The decision logic is pure (`cmd::captain::{newest_since, stall_verdict}`), pinned by `captain_watch_poll_exit`. `--preflight` (opt-in, `--preflight-mode steer|loop|workflow|cron`, default `loop`=work loop) adds a third arm: it runs the same prerequisite checks the dispatch doors run and exits **4** with the FIRST failing check and its remedy line — checked at arm time (before the mail setup, so a broken environment never arms a watch that cannot act) and re-checked each poll, so a store skew that develops after arming still wakes the captain. The selection is pure (`cmd::captain::first_failing_check`, skipping advisory Skips), pinned by `captain_watch_exits_on_preflight_failure` (unit + a binary-driving e2e in `tests/captain_watch_preflight.rs`). One shot by design: re-arm after each resume.
-- **Hosted captain (ADR-0019):** grokbot is a pull-tier captain pin (`location=hosted` via `binding-rebind` note, never by default). A hosted `steer --as <pin> --request-key <k>` parks (`Parked` + typed payload, `approval_required`) instead of dispatching; `captain approve <project> --request-key <k> --decision approve|deny --as <operator>` verifies (whois, self-approval refuse, 4-line mail, fetch-back, payload rehash) and runs or settles denied. `captain directory` reads sessions, tiers, and per-pin addressability. The grok row stays `hook: None`, steer unsupported — never set either from this ADR.
-- **Phase 4b close:** `flywheel halt <project> [--context <lead>] [--sup-epoch N]` (also `supervisor halt`) cancels that subtree and stops relaunch. Escalate mail is the captain push. `captain watch` is the harness resume when that mail lands, not the only door. `supervisor view --json` includes `goal_proved` (join met, integration proved, no open conflict, assignments released). `FLYWHEEL_SUPERVISOR_JOIN=all|quorum:N|first:N` (default `all`; quorum and first-k cancel the rest once N children are `proved`). `FLYWHEEL_SUPERVISOR_MAX_WALL_MS` pauses and escalates once. Self-reported usage (`supervisor fact --kind usage`) never gates. A page whose text contains a `bd-…` id runs `br hold --kind captain` via `FLYWHEEL_BR_BIN` or `br`. A missing `br` is loud and does not fail the page. OpenCode, pi, grok, and omp stay `hook: None`. Assign appends one `task@1` and does not type a pane. A missing npub fails the command.
-- **Comms defaults:** the inbox is on when `TORON_COMMS_INBOX` is unset or empty AND `[comms] inbox_log` is absent or true (the config default is on). A set env WINS over the config: `1|true|on` forces it on, `0|false|off` and any other set value force it off — as does `inbox_log = false`. (The rule lives in `toron_core::inbox::resolve_enabled`; `crates/doorbell-rt/src/sinks.rs` and `src/comms_send.rs` call it.) `flywheel timer arm|meet|fail|sweep` is the one-shot watch (deadline required, one `notify@1` under `watch:<id>:<outcome>`, no stored shell). It is on unless `FLYWHEEL_TIMER=0|false|off` or `[timer] enabled = false`. `FLYWHEEL_ALLOW_EXEC=0` suppresses that ring and names the suppression. `beads_poller` and `cron_doorbell_sink` default on (`false` opts out). `arrival_triple` and `cross_workspace` stay default false.
-- **Supervise dead-stop probe (bd-supervise-dead-stop-escalation-rweq):** `loop-mode supervise` probes for a dead stop each pass, because a stall is invisible to the pass's own exit code (the pass SUCCEEDS against an idle fleet). No pane working AND no commit for `--stall-minutes` (default 45) with work remaining → ONE loud escalation line + one captain page, then silence (`DeadStopAction::Hold`) — never one page per pass; a commit inside the window clears it (`Clear`) so a later stall escalates again. A pane that reads Busy but moved nothing escalates as `StuckWorking` (a working verdict is not progress), and an unreadable fleet or a repo with no commit history is never judged. Decision is pure (`durable::dead_stop_action`), pinned by `supervise_escalates_on_dead_stop`; the live probe is shared with the captain watch (`cmd::captain::probe_stall`). A failed page is LOUD — the escalation line stands and the failure names itself.
-- **Pane wedge probe (bd-pane-wedge-detect-respawn-pnyi):** the dead-stop probe reads the FLEET; a wedge is per PANE — alive, producing nothing, and parked on a fatal error. `loop-mode supervise` also walks every registered pin: the agent process still UP (`pane.process_info` + `pane_agent_alive`, the kind read off the live agent), the pane's LAST non-empty output line carrying a fatal marker (`durable::parked_error_line` — a marker that merely scrolled past a working pane is not a wedge), and no commit for `--stall-minutes`. herdr exposes no CPU counter, so "zero CPU" is read as its observable equivalent: process alive plus nothing moved. ONE page per wedge naming the pin, the pane, and the parked line (with the relaunch remedy), never one per pass; a commit inside the window re-arms the probe so a later wedge pages again. An unreadable pane, an inconclusive process probe (absent/unknown kind), a dead process (`recover`'s door), and a repo with no commit history all read `Quiet` — a wedge alarm never fires blind. Decision is pure (`durable::pane_wedge_action`), pinned by `pane_wedge_detected_and_paged`.
-- **Loop resume window + peer-hold + closed-reason sweep (bd-resume-window-lease-sweep-4sa2):** `loop-mode run --work` used to re-resume the same in-progress bead every pass (~2 min) and every pane answered with a stand-down commit — churn, not progress. Now an in-progress bead is resumed at most once per (bead, pane) inside a 15-min window (`RESUME_WINDOW_DEFAULT_SECS`); the watermark is persisted per project (`state::load_resume_window`/`record_resume`, keyed `bead\u{1f}pane`) because the loop's in-memory `assigned` set resets per run. A bead whose paths are held by a DIFFERENT live pane draws no resume (`durable::peer_held` reads the toron reservation board's `(reason, holder)` rows — a lane split mid-flight, not a stall; an unstamped holder is never a peer). Each pass also releases leases whose reason bead is closed, through the ONE pure rule `durable::closed_reason_lease_ids` that the shipped sweep and its test share. The decision is pure (`durable::{within_resume_window, peer_held, should_resume_bead, closed_reason_lease_ids}`), pinned by `resume_window_dedupes_and_respects_peer_holds`.
-- **Idle-pane rotation (bd-loop-feeds-idle-panes-rh2z):** the 4sa2 window above stops repeat nudges, but it can leave every pane idle while stalled beads sit unclaimed (measured: 17 in_progress, 5 idle panes, zero sends for several passes; a hand-rolled companion dispatcher had to cover it). `loop-mode run --work` now runs `durable::idle_pane_rotation` each pass: each IDLE pane (idle/done) takes ONE bead — (1) its own stalled in-progress bead, (2) a ready bead already assigned to it, (3) an unowned ready bead, (4) any ready bead whose assignee is NOT a live pane — never a bead another live pane owns, never a peer-held one, never one already queued, never two panes the same bead. The picks are inserted at the HEAD of the queue in fleet order because `plan_actions` pairs the k-th idle agent with the k-th queue item — that order is the mechanism, not a nicety. A tier-1 hit inside the window still defers, for `resume_exempt_passes` consecutive starved passes (`[loop]` config, default 2 = `durable::IDLE_PANE_EXEMPT_AFTER_PASSES`); from that pass the pick is `window-exempt`, and the counters persist (`state::load_pane_starvation`/`record_pane_starvation`, whole-fleet snapshot) because `loop-mode supervise` runs each pass as a CHILD process. A pane whose own stall is still gated takes nothing that pass — free work would fork a lane that is merely slow. Decision is pure (clock as `now_us`, window as a map), pinned by `loop_feeds_idle_panes_stalled_beads`.
-- **A toron `reserve yield` is one more peer source (bd-reserve-yield-taqf):** the loop reads live `(bead, holder)` pairs through `mail.yielded_pairs` — toron-core's one join of the markers against the live lease board, the same join `reserve yields` prints — and folds them into the SAME `peer_held` rule the 4sa2 bullet above describes (one rule, two sources, so a yield needs no second suppression path to drift). A structured stand-down therefore suppresses a bead while its holder's lease is live and clears itself on release; a mail hiccup yields no pairs, never a fabricated hold. Pinned by `yielded_pairs_reads_the_live_board`. Ceiling: a `[mail.toron] url` remote plane carries no yield read (the toron verb is CLI-only by design), so it draws no yield suppression there — the absence of a read, never a fabricated hold.
-- Wave/swarm/doorbell/crew-control semantics live in the flywheel skill; the Tick Law (`workspace::tick` owns the live path, slice reducers private) holds on every path touching `src/workspace.rs`. `src/cli_args.rs` and `src/workspace_reporting.rs` are pure seams; compatibility wrappers must not become new policy authorities.
-- **The journal has two halves, one store:** `effect_journal::journals` builds the effect runner AND a `RunJournal` from one store. The engine reports its own run lifecycle (`Started` → `Running` → `Succeeded`/`Failed`) through the `RunJournal`, so a flywheel-driven run has a `workflow_runs` row with no embedding lifecycle call, and the run row and its effect rows agree on `run_id` by construction. Idempotent by design (durable replay re-delivers phases): create-if-absent, CAS only when the status differs, terminal rows never move. Every journaled constructor passes it (`pane.rs` live arms, both `cron.rs` live engines); dry arms pass `None` — an engine that performs nothing must not mint a row claiming it ran.
-- **Tick Law is Elm law:** reducers (`workspace::tick`, `doorbell-core::tick`, `durable::tick`) are pure `(Model, Msg) -> (Model, Vec<Cmd>)` — no I/O, clock, rand, environment, locks, or `&mut` inside; `now` enters only as a Msg payload; host policy enters as model data (`WorkspacePolicy`, `LoopParams` policy fields), never through env-reading helpers — durable leaves receive policy on their args structs; maps iterated for output are `BTreeMap`, never `HashMap`; the effect layer never mutates the model, I/O results re-enter as Msgs; every drop is journaled (queue transitions, watch dedups). New reducer paths carry same-log-same-effects coverage and malformed/unknown cases; `doorbell why` stays mismatch-free on current journals. Review rejects reducer bypasses, ambient authority reads, silent drops, queue-as-delivery claims, second live models, and unchecked action-stage literals at typed call sites. The full laws/checklist live in `docs/agent-instructions/effect-kernel.md`.
-- **4b.3 hooks:** `flywheel supervisor hooks` reports the marked block. A launch installs that block only for a capable, verified harness (`fake` is the fixture; opencode, pi, grok, omp stay unverified). Hook-capable skips Interrupt and keeps the urgent ring. `FLYWHEEL_ALLOW_EXEC=0` does not write the file. Exit removes the block named by `FLYWHEEL_SUPERVISOR_HOOK_FILE` when exec is allowed.
-- **Audit status (2026-10-02):** reducer, Tick Law, serialized-policy, lifecycle, journal, replay, and Jev authority constraints pass fresh verification. The verdict is **conditional**, not fully complete: legacy Jev helpers still self-resolve `RuntimeAuthority`. Durable leaves no longer sample wall time — a `#[function]` may take `&Info` and read `get_dependency::<RuntimeAuthority>()` (`loop_run_verify` does), `&Info` is runtime-supplied and never serialized so replay keys are unchanged, and a guard walks every leaf body to keep it that way. The one deliberate holdout is the `run_leaf_cmd_bounded` subprocess watchdog, which measures a live child in real time and is a plain helper rather than a leaf body. These are outside reducers, but the Jev residual must be migrated before claiming strict end-to-end authority injection.
+- **Engineering principles.** `flywheel principles list`; cite the name that
+  changed the decision.
+- **Hosted captain (ADR-0019).** grokbot is pull-tier (`location=hosted` via
+  rebind note). Hosted `steer` parks for `captain approve`. Never set
+  `hook` / steer on the grok row from that ADR.
+- **Skill sync.** CLI change → `Commands` enum + `--robot-capabilities` + this
+  file's critical list + `~/.agents/skills/flywheel/SKILL.md` §5.
 
-## Effect law for code and tests
+## Effect law (tests)
 
-Reducer purity stays in the Tick Law bullet above. This section binds every new or edited code path and its tests.
+A change is unfinished until: reducer tests feed one message log and assert
+model + cmds; interpreter tests fake clock/services (no real sleep/network);
+success / typed failure / defect / interrupt stay distinct; live effects
+journal before invoke; retry keeps the same effect key; terminal states emit
+no further cmds. **Prove each test can fail.** No ambient-state tests
+(operator `~/.config`, wall clock, live daemon, cold-vs-warm cache). Cheap
+fence = whole workspace member (`-p <crate>`); full clean-export suite at
+integration HEAD for cross-crate contracts.
 
-Before writing or reviewing a reducer, interpreter, journal, retry, timeout, cancellation, clock, shared mutation, or test double, read `~/.agents/skills/effect-oriented/SKILL.md`. On a remote command the order is fallback outside, breaker inside the retry, budget timeout around the chain, attempt timeout on the call. `docs/agent-instructions/effect-kernel.md` is the reducer checklist.
+## Details (links)
 
-A change is unfinished until its tests show all of the following:
-
-- A reducer test feeds one message log and asserts the next model and the command list. The reducer performs no I/O.
-- An interpreter test substitutes the clock, randomness, and service. It scripts success, typed failure, hang, and cancellation. Real sleep and live network stay out of that test.
-- Success, typed failure, a defect, and interruption stay distinct. Interruption is not stored as success, as a typed provider error, or as `Unknown`.
-- A real effect is journaled before the provider runs. A failed journal insert refuses the effect.
-- Retry wraps that one idempotent command and keeps the same effect key.
-- A terminal state emits no further command.
-
-**Then prove each of those tests can fail.** Delete the call, invert the condition, disable the wiring, and confirm the test goes red. A test never seen failing is not evidence, and the vacuous shapes do not look vacuous while you are writing them. All four of these shipped green in this repo: a source-scan asserting `contains("spawn_heartbeat_ticker")` that passed with the *call* deleted, because the adjacent comment named the function; a VERIFY fence matching ZERO tests, which exits 0 and is therefore unconditionally green; helpers-only tests that stayed green with the call site disabled; and a test whose proof was that a build artifact was fresh, so it passed on a cold cargo cache and failed on a warm one. A test that cannot be made to fail cannot be trusted to pass.
-
-**No test may depend on ambient state**, because it then fails on the wrong day and gets misread as a regression: cold-vs-warm build caches, the operator's real `~/.config` (`sc_bugfix_playbook` spawns the real binary, so it reports config state as code state), wall clock, a live daemon, machine-wide thread counts. Assert the *agreement* between what the code reports and what a reader can independently observe, never a property of the environment. The hermetic form of the build-stamp test reads the same file the resolver read and compares size and mtime; a cached binary satisfies that, a stale or fabricated stamp does not.
-
-**A narrow fence proves the feature, not the test, and not the blast radius.** A fence of `cargo test -p toron-workflow park` let the park tests pass, the bead close LEGAL, and the crate suite go red — because classifying `Action::Park` as `EngineControl` had made the shared boundary tripwire's count 9 → 10 and nothing in the fence could see a shared invariant move. The cheap tier is therefore the **whole workspace member** (`-p <crate>`, never a name filter) for every bead that ships a test or moves an existing invariant — that is what catches a shared count moving. Escalate to the **full clean-export suite** when the change moves a CROSS-CRATE contract (a `Msg`/`Cmd` enum, a partition table, the boundary tripwire, a catalog/fuse, a public API another crate consumes, the feature matrix), because the workspace run is the only one that sees the other consumer. In a multi-crew tree a whole-suite verdict is not evidence about your commit at all — it runs other lanes' in-flight edits — so the full suite belongs at the **integration HEAD** (once per campaign, before install or a done claim), not once per bead.
-
-`ConsecutiveBreaker` clears its failure count when the cooldown elapses, then judges the next call as HALF-OPEN (not closed: the state stays `HalfOpen` until the probe settles). A half-open probe is one trial that re-opens on failure. This breaker is the cooldown reset — without the count reset, a pane that failed five times could never recover.
-
-## Public API
-- Keep the public API surface as small as possible. Use the narrowest visibility that satisfies the current requirement.
-- Add public types, traits, methods, features, or re-exports only for a concrete user need.
-- Preserve backward compatibility unless a breaking change is explicitly required.
-- Document public API changes and update the affected crate's changelog when appropriate.
-- Respect the workspace MSRV, feature boundaries, and no_std support where applicable.
-
-## Performance
-
-- Code must remain efficient on low-end and resource-constrained devices.
-- Keep CPU, memory, allocation, storage, and network costs proportional to the work performed.
-- Avoid unnecessary cloning, repeated parsing or serialization, redundant I/O, and unbounded collections, queues, tasks, or retries.
-- Benchmark performance-sensitive changes when practical, and investigate meaningful regressions.
-- Prefer clear, efficient code over speculative micro-optimizations. Explain non-obvious optimizations and their tradeoffs.
-
-## Skill Sync Contract
-
-When you add/remove/rename a CLI command, update ALL of:
-1. The `Commands` enum (`src/main.rs`) — ground truth (compiles).
-2. The `robot_capabilities` JSON (`src/main.rs`, `--robot-capabilities`) — agent self-discovery.
-3. This AGENTS.md (the Critical overrides + Details sections).
-4. The skill: `~/.agents/skills/flywheel/SKILL.md` §5 Commands.
-
-The skill files are the canonical agent-facing reference. §5 is an ops crib;
-the full enum is `flywheel --help` and `flywheel decide`. Waiter, receipt, and role verbs that are missing from the toron skill are invisible. Do not paste every clap variant into the skill.
-
-## Details
-
-- Backend note: default binary `flywheel backend list` reports `superlogical` status=stub compiled_feature=false; `src/backend/superlogical.rs` is the real rex backend behind feature `backend-superlogical` (feature build reports ready); `flywheel spawn` rides the SELECTED pane plane — `auto` is rex-primary with herdr as a transport-only fallback (`bd-rex-default-plane-xn1t`), and `FLYWHEEL_BACKEND=herdr` selects herdr explicitly. Every door reads that ONE resolution (`backend::factory::resolve_plane`) — spawn, `status`, `snapshot`, crew launch, preflight, captain — and `REX_SESSION` is a hint about where a process runs, never proof of the plane (`bd-l7b05`); `flywheel preflight` reports a `pane-plane` check, not a herdr socket. Rex reference is the Superlogical docs MCP (`search_docs` / `read_doc`): OSC 7501 program status (`idle|working|done|blocked|error|clear`, https://www.superlogical.com/rex/docs/build/program-status) and the connected server's own API (`rex api list` / `rex api describe`; live methods include `com.superlogical.terminal.program_status`, `session.create`, `session.new_split`). OpenCode's rex skill ships with no hook.
 - [Backends + config](docs/agent-instructions/backends.md)
 - [Orchestration](docs/agent-instructions/orchestration.md)
-- [Workflow composition and catalog overlays](docs/agent-instructions/workflow-composition.md): explicit `--parts` forms, `workflow seed`/`drift`, and steering boundaries
-- [Compound/pstack deep dives](docs/guides/compound-engineering.mdx), [pstack](docs/guides/pstack.mdx), [parity manifest](docs/upstream-parity.toml)
-- [Durable loop](docs/agent-instructions/loop.md): resume is opt-in (`loop-mode run --resume` — a pending invocation with no live owner otherwise starts fresh); `loop-mode supervise` owns the once-pass cadence (no `--force`, stops after 3 consecutive failed passes).
-- [Functional effect-kernel discipline](docs/agent-instructions/effect-kernel.md)
-- Workflow DSL: [docs/workflow-authoring.md](docs/workflow-authoring.md)
+- [Workflow composition](docs/agent-instructions/workflow-composition.md)
+- [Durable loop](docs/agent-instructions/loop.md)
+- [Effect kernel](docs/agent-instructions/effect-kernel.md)
+- [Workflow authoring](docs/workflow-authoring.md)
 - Sibling mailbox: `../toron/AGENTS.md`
