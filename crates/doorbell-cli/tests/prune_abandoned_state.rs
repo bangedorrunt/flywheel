@@ -114,7 +114,7 @@ fn daemon_prunes_abandoned_state_and_names_every_family() {
         .arg(&fw)
         .args(["--host", "smoke/smoke"])
         .env("DOORBELL_TORON_BIN", "true")
-        .env("DOORBELL_HERDR_BIN", "true")
+        .env("DOORBELL_HC_BIN", "true")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

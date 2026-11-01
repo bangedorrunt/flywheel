@@ -11,13 +11,13 @@ pub enum RtError {
     /// A sink endpoint is down (mocks + failing test adapters).
     #[error("endpoint down")]
     EndpointDown,
-    /// `herdr agent prompt` could not spawn or timed out.
-    #[error("herdr prompt spawn/timeout failed")]
+    /// `hc agent prompt` could not spawn or timed out.
+    #[error("hc prompt spawn/timeout failed")]
     PromptSpawnFailed,
-    /// `herdr agent prompt` ran and reported failure on stderr.
-    #[error("herdr prompt failed: {0}")]
+    /// `hc agent prompt` ran and reported failure on stderr.
+    #[error("hc prompt failed: {0}")]
     PromptFailed(String),
-    /// The embedded herdr prompt delivered to no pane.
+    /// The embedded hc prompt delivered to no pane.
     #[error("prompt for {0} delivered nowhere")]
     UndeliveredPin(String),
     /// Webhook construction refused: host outside the egress allowlist.

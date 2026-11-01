@@ -1,8 +1,8 @@
 // governed-by: ADR-0012
-//! Resolve the external CLI binaries the daemon execs (`toron`, `herdr`).
+//! Resolve the external CLI binaries the daemon execs (`toron`, `hc`).
 //!
 //! Why this exists: the daemon is routinely launched by launchd/systemd,
-//! whose `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin` — the `toron` and `herdr`
+//! whose `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin` — the `toron` and `hc`
 //! a *login shell* finds are simply not on it. Every bare-name spawn then
 //! returns `NotFound`, which the host reports as an ordinary child death:
 //! the watch child restarts on the retry gate forever (`WatchDied` →
@@ -107,8 +107,8 @@ pub fn resolve_cli_in(
 /// The env var names the daemon honours for an explicit override, kept
 /// beside the resolver so the contract is in one place.
 pub const TORON_BIN_ENV: &str = "DOORBELL_TORON_BIN";
-/// Explicit `herdr` override.
-pub const HERDR_BIN_ENV: &str = "DOORBELL_HERDR_BIN";
+/// Explicit `hc` override.
+pub const HC_BIN_ENV: &str = "DOORBELL_HC_BIN";
 
 /// Resolve a daemon CLI: explicit env override wins verbatim (an operator
 /// named it, so a typo must fail loudly at spawn rather than be silently
@@ -225,14 +225,14 @@ mod tests {
     }
 
     /// The live failure: launchd PATH = /usr/bin:/bin:... and no toron on
-    /// it; the daemon exe lives in mise's shims dir, and `herdr` lives only
+    /// it; the daemon exe lives in mise's shims dir, and `hc` lives only
     /// in `~/.local/bin`. Both must resolve from the home fallbacks.
     #[test]
     fn launchd_minimal_path_still_resolves_stack_bins() {
         let root = scratch("launchd");
         let home = root.join("home");
         touch(&home.join(".cargo/bin/toron"));
-        touch(&home.join(".local/bin/herdr"));
+        touch(&home.join(".local/bin/hc"));
         let shim = root.join("home/.local/share/mise/shims");
         touch(&shim.join("toron"));
         let minimal = OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
@@ -243,13 +243,13 @@ mod tests {
         );
         assert_eq!(
             resolve_cli_in(
-                "herdr",
+                "hc",
                 Some(minimal.as_os_str()),
                 Some(&root.join("nope")),
                 Some(&home)
             ),
-            Some(home.join(".local/bin/herdr")),
-            "herdr resolves under launchd's PATH"
+            Some(home.join(".local/bin/hc")),
+            "hc resolves under launchd's PATH"
         );
         let _ = fs::remove_dir_all(&root);
     }

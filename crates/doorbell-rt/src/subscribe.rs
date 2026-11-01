@@ -14,7 +14,7 @@
 //! | Verb                                    | Local | Operator |
 //! |-----------------------------------------+-------+----------|
 //! | read (status/health/why/digest/events)  |   ✔   |    ✔     |
-//! | subscribe herdr-sink, own workspace     |   ✔   |    ✔     |
+//! | subscribe hc-sink, own workspace     |   ✔   |    ✔     |
 //! | subscribe webhook/DM or cross-workspace |   ✖   |    ✔     |
 //! | budget set ≤ default (own)              |   ✔   |    ✔     |
 //! | budget set > default, inject, mint      |   ✖   |    ✔     |
@@ -79,7 +79,7 @@ pub struct Filter {
 /// Delivery edge (P1 corollary: adapters translate Prompt intents).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SinkKind {
-    Herdr,
+    Hc,
     Webhook,
     Dm,
 }
@@ -95,7 +95,7 @@ impl SinkKind {
     #[must_use]
     pub fn sink_name(self) -> &'static str {
         match self {
-            Self::Herdr => "herdr",
+            Self::Hc => "hc",
             Self::Webhook => "webhook",
             Self::Dm => "dm",
         }
@@ -141,7 +141,7 @@ pub struct Subscription {
     /// endpoint rather than a pane: the webhook URL. Per-row, not
     /// per-daemon — identity x scope x sink x endpoint is the whole point
     /// of the row, and two subscribers routinely target two endpoints.
-    /// Absent for `herdr` (the pane registry is the destination) and for a
+    /// Absent for `hc` (the pane registry is the destination) and for a
     /// legacy row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -152,7 +152,7 @@ impl Subscription {
     ///
     /// bd-8ulu: an endpoint-carrying row gets an adapter OF ITS OWN, named
     /// by its endpoint, so two webhook subscribers can point at two
-    /// destinations. Everything else (herdr, dm, a webhook row that never
+    /// destinations. Everything else (hc, dm, a webhook row that never
     /// named a URL) keeps the bare [`SinkKind::sink_name`].
     #[must_use]
     pub fn route_name(&self) -> String {
@@ -215,7 +215,7 @@ pub fn authorize_subscribe(
     if !actor.is_local && !actor.is_operator {
         return Err(Refusal::OperatorOnly("non-local subscribe".into()));
     }
-    if (sink != SinkKind::Herdr || scope.is_cross(home)) && !actor.is_operator {
+    if (sink != SinkKind::Hc || scope.is_cross(home)) && !actor.is_operator {
         return Err(Refusal::OperatorOnly(
             "webhook/DM sink or cross-workspace scope needs the operator".into(),
         ));
@@ -298,11 +298,11 @@ mod tests {
     /// wake to a sink nobody registered (and the send reports success anyway).
     #[test]
     fn sink_names_are_distinct_and_non_empty() {
-        let names: Vec<&str> = [SinkKind::Herdr, SinkKind::Webhook, SinkKind::Dm]
+        let names: Vec<&str> = [SinkKind::Hc, SinkKind::Webhook, SinkKind::Dm]
             .into_iter()
             .map(SinkKind::sink_name)
             .collect();
-        assert_eq!(names, vec!["herdr", "webhook", "dm"]);
+        assert_eq!(names, vec!["hc", "webhook", "dm"]);
         for n in &names {
             assert!(!n.is_empty());
             assert_eq!(*n, n.to_ascii_lowercase());
@@ -321,7 +321,7 @@ mod tests {
             identity: Identity::Pin("p".into()),
             scope: Scope::One("w".into()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: None,
             endpoint: None,
@@ -333,8 +333,8 @@ mod tests {
     /// (so no pre-existing routing changes spelling).
     #[test]
     fn route_name_is_per_endpoint_only_for_webhook() {
-        let herdr = sub();
-        assert_eq!(herdr.route_name(), "herdr");
+        let hc = sub();
+        assert_eq!(hc.route_name(), "hc");
         let mut dm = sub();
         dm.sink = SinkKind::Dm;
         dm.endpoint = Some("https://ignored.example/x".into());
@@ -358,13 +358,13 @@ mod tests {
     }
 
     #[test]
-    fn local_herdr_own_workspace_roundtrips() {
+    fn local_plane_own_workspace_roundtrips() {
         let dir = std::env::temp_dir().join(format!("dbrt-sub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = SubscriptionStore::open(&dir);
         let back = store
             .subscribe(Actor::local_process(), sub(), "w")
-            .expect("local herdr subscribe");
+            .expect("local hc subscribe");
         assert_eq!(back.id, "s1");
         assert_eq!(store.list().len(), 1);
         // Durable: reopen reads it back.

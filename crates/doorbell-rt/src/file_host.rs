@@ -3,7 +3,7 @@
 //!
 //! Same [`Brain`], file/CLI inputs: flywheel state files (spawn registry,
 //! role binds, pending role-bounds/facts, pid/gen) plus the `toron` /
-//! `herdr` CLIs (inbox, whois, prompt, agent list) and the daemon
+//! `hc` CLIs (inbox, whois, prompt, agent list) and the daemon
 //! `wake.sock` subscription (no `toron watch` child). No flywheel types —
 //! this is what lets the `doorbell` daemon host the loop without linking
 //! the orchestrator.
@@ -123,11 +123,11 @@ pub(crate) fn failing_still_row(
     })
 }
 
-/// HerdrStatus changes the sweep could not enqueue on a full or closed brain
-/// channel. Counted per host (self.herdr advances only on receipt, so drops
+/// PlaneStatus changes the sweep could not enqueue on a full or closed brain
+/// channel. Counted per host (self.hc advances only on receipt, so drops
 /// self-heal next sweep); audited sampled via should_audit_count, the same
 /// repeat-is-a-count shape as wake_brain_full.
-pub const AUDIT_HERDR_FULL: &str = "herdr_brain_full";
+pub const AUDIT_PLANE_FULL: &str = "plane_brain_full";
 
 /// A consumer death relayed to the brain, counted so a STORM reads as a rate.
 ///
@@ -493,7 +493,7 @@ pub struct FileHostConfig {
     /// `XDG_DATA_HOME/toron` > `~/.local/share/toron`.
     pub toron_data_dir: Option<PathBuf>,
     pub toron_bin: String,
-    pub herdr_bin: String,
+    pub plane_bin: String,
     /// Registry file override (tests/sandbox). `None` resolves
     /// `agents/{key}.json` under the flywheel state dir.
     pub registry_file: Option<PathBuf>,
@@ -516,7 +516,7 @@ impl FileHostConfig {
             workspace: workspace.into(),
             toron_data_dir: None,
             toron_bin: "toron".into(),
-            herdr_bin: "herdr".into(),
+            plane_bin: "hc".into(),
             registry_file: None,
             wake_brain_wait: crate::wake_brain::BACKPRESSURE_WAIT,
         }
@@ -602,7 +602,7 @@ pub fn resolve_registry_file(
     (hits.into_iter().next(), ambiguous)
 }
 
-/// (pin, pane_id, herdr name) rows from a registry file, plus the chosen
+/// (pin, pane_id, terminal name) rows from a registry file, plus the chosen
 /// file's name when several hashed candidates matched (the caller audits
 /// that ambiguity). Read-only and `&self`-free so the /health probe can ask
 /// the same question the sweep asks (bd-ba8t).
@@ -643,11 +643,11 @@ fn read_registry_rows(
     (rows, chosen)
 }
 
-/// pane_id -> `agent_status` from one `herdr agent list`. Empty map = herdr
+/// pane_id -> `agent_status` from one `hc agent list`. Empty map = hc
 /// reports no agents at all, which is a fact the /health probe must
 /// distinguish from "every pane is busy" (bd-ba8t).
-fn herdr_agent_statuses(herdr_bin: &str) -> BTreeMap<String, String> {
-    let out = run_cli(herdr_bin, &["agent", "list"], CLI_TIMEOUT_SECS);
+fn plane_agent_statuses(plane_bin: &str) -> BTreeMap<String, String> {
+    let out = run_cli(plane_bin, &["agent", "list"], CLI_TIMEOUT_SECS);
     let Some(out) = out else {
         return BTreeMap::new();
     };
@@ -671,13 +671,13 @@ fn herdr_agent_statuses(herdr_bin: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// What the prompt sink hands `herdr agent prompt` for one routed pin.
+/// What the prompt sink hands `hc agent prompt` for one routed pin.
 ///
-/// herdr resolves an agent by its herdr LABEL or by PANE ID, and a pane
-/// nobody started with `herdr agent start` — every operator pane — has only
-/// the second: live, `herdr agent get w6:p1` answers with the captain's pane
-/// while `herdr agent get AmberQuill` answers `agent_not_found`, which is the
-/// last recorded delivery failure on this host (`delivery failed: herdr
+/// hc resolves an agent by its hc LABEL or by PANE ID, and a pane
+/// nobody started with `hc agent start` — every operator pane — has only
+/// the second: live, `hc agent get w6:p1` answers with the captain's pane
+/// while `hc agent get AmberQuill` answers `agent_not_found`, which is the
+/// last recorded delivery failure on this host (`delivery failed: hc
 /// prompt failed: agent target BlackOrchid not found`). The pane id resolves
 /// for BOTH shapes (a crew pane has one too), so it is the target; a row with
 /// no pane keeps its label rather than becoming an empty target that reads
@@ -688,19 +688,19 @@ fn prompt_target<'a>(pane: &'a str, name: &'a str) -> &'a str {
 
 /// Selected pane plane (bd-hv2j): the plane this host's roster view reads.
 /// `FLYWHEEL_BACKEND` names the selected backend (`auto` is rex-primary);
-/// unset/unknown keeps the historical herdr view this host has always read.
+/// unset/unknown keeps the historical hc view this host has always read.
 fn selected_plane() -> doorbell_core::wake_core::PanePlane {
     std::env::var("FLYWHEEL_BACKEND")
         .ok()
         .and_then(|n| doorbell_core::wake_core::selected_plane_from_backend_name(&n))
-        .unwrap_or(doorbell_core::wake_core::PanePlane::Herdr)
+        .unwrap_or(doorbell_core::wake_core::PanePlane::Hc)
 }
 
 /// (pane_id, agent_status, toron_pin token) rows from one
-/// `herdr agent list`. Empty vec = herdr did not answer (same guard as
+/// `hc agent list`. Empty vec = hc did not answer (same guard as
 /// the status/pane readers): callers keep prior state, never clear it.
-fn herdr_agent_roster(herdr_bin: &str) -> Vec<(String, String, Option<String>)> {
-    let out = run_cli(herdr_bin, &["agent", "list"], CLI_TIMEOUT_SECS);
+fn plane_agent_roster(plane_bin: &str) -> Vec<(String, String, Option<String>)> {
+    let out = run_cli(plane_bin, &["agent", "list"], CLI_TIMEOUT_SECS);
     let Some(out) = out else {
         return Vec::new();
     };
@@ -735,7 +735,7 @@ fn parse_agent_roster(v: &serde_json::Value) -> Vec<(String, String, Option<Stri
         .collect()
 }
 
-/// bd-3vr9: union herdr-known captain panes into the routing set.
+/// bd-3vr9: union hc-known captain panes into the routing set.
 /// Spawn-registry rows cover spawned crews; a captain pane (never
 /// spawned) carries its pin in the `toron_pin` token instead. For every
 /// wanted pin with no route yet, bind the pane whose token names it.
@@ -758,13 +758,13 @@ fn captain_pane_targets(
     out
 }
 
-/// Pane ids from one `herdr pane list` (bd-adms). Pane EXISTENCE is a
+/// Pane ids from one `hc terminal list` (bd-adms). Pane EXISTENCE is a
 /// different question from injectability (bd-ba8t's `agent_status`): a pane
-/// can exist with no agent in it. An empty set means herdr did not answer
+/// can exist with no agent in it. An empty set means hc did not answer
 /// (unknown binary, non-zero exit), and callers must treat that as "cannot
 /// tell" rather than "no panes exist".
-fn herdr_pane_ids(herdr_bin: &str) -> BTreeSet<String> {
-    let out = run_cli(herdr_bin, &["pane", "list"], CLI_TIMEOUT_SECS);
+fn plane_pane_ids(plane_bin: &str) -> BTreeSet<String> {
+    let out = run_cli(plane_bin, &["pane", "list"], CLI_TIMEOUT_SECS);
     let Some(out) = out else {
         return BTreeSet::new();
     };
@@ -786,7 +786,7 @@ fn herdr_pane_ids(herdr_bin: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// `(pin, pane_id, herdr name)` — one spawn-registry row.
+/// `(pin, pane_id, terminal name)` — one spawn-registry row.
 type RegistryRow = (String, String, String);
 
 /// One stale-pin pass (bd-adms): `live` rows keep the sweep; `vanished` pins
@@ -801,14 +801,14 @@ struct StaleReap {
 
 // bd-3uqz: STALE_PANE_GRACE_SECS is GONE, deliberately rather than left as a dead
 // constant. It was a wall-clock window standing in for "we have seen this
-// repeatedly", and it was wrong in both directions: one herdr outage outlasting the
+// repeatedly", and it was wrong in both directions: one hc outage outlasting the
 // window pruned a live fleet, and a pane that died and returned inside the window
 // was never pruned. The evidence is now
 // `registry_prune::REQUIRED_CONFIRMATIONS` consecutive observations, and leaving a
 // named 120s grace behind would invite the next reader to think time still decides
 // something here.
 
-/// bd-3vr9: a presence verdict older than this yields to live herdr
+/// bd-3vr9: a presence verdict older than this yields to live hc
 /// status. Presence rows arrive only on agent publish; hook-less panes
 /// keep stale words for hours.
 const PRESENCE_STALE_SECS: u64 = 120;
@@ -816,7 +816,7 @@ const PRESENCE_STALE_SECS: u64 = 120;
 /// Can the ring's LAST hop land here at all? (bd-ba8t)
 ///
 /// `should_inject` accepts only `idle|done|blocked`, and statuses arrive from
-/// `herdr agent list` mapped through the spawn registry. With zero herdr
+/// `hc agent list` mapped through the spawn registry. With zero hc
 /// agents — the live condition that made gs-044 hard to see — every wake
 /// classifies correctly and then has nowhere to go, while `/health` reads
 /// `hosted, degraded: []`. Counting the picture here turns that into a fact.
@@ -828,41 +828,41 @@ const PRESENCE_STALE_SECS: u64 = 120;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InjectionPicture {
     /// sweep-set pins (non-empty `mail_identity`, pane still listed by
-    /// herdr) — what the sweep actually fetches, never the raw registry
+    /// hc) — what the sweep actually fetches, never the raw registry
     pub pins: usize,
-    /// pins whose pane appears in `herdr agent list`, any status
+    /// pins whose pane appears in `hc agent list`, any status
     pub panes_seen: usize,
     /// pins whose status is injectable right now (`idle|done|blocked`)
     pub injectable: usize,
-    /// pins whose pane is absent from `herdr agent list` (or empty)
+    /// pins whose pane is absent from `hc agent list` (or empty)
     pub panes_missing: usize,
 }
 
-/// The same registry + herdr view the sweep reads, reduced to the counts
+/// The same registry + hc view the sweep reads, reduced to the counts
 /// `/health` needs. Pure read: no journal, no store, no locks.
 pub fn injection_picture(
     flywheel_state: &Path,
     project: &str,
     override_path: Option<&Path>,
-    herdr_bin: &str,
+    plane_bin: &str,
 ) -> InjectionPicture {
     let (rows, _) = read_registry_rows(flywheel_state, project, override_path);
-    let statuses = herdr_agent_statuses(herdr_bin);
+    let statuses = plane_agent_statuses(plane_bin);
     // bd-2i96 G4: `pins` tracks the sweep set, not the raw registry.
-    // Reaped/stale pins (pane absent from `herdr pane list`) leave the
+    // Reaped/stale pins (pane absent from `hc terminal list`) leave the
     // sweep via reap_stale_registry_pins; counting them here reported a
     // fleet that costs no fetches and can land no wake. The fault stays
-    // visible in `panes_missing`. Empty pane set = herdr did not answer
+    // visible in `panes_missing`. Empty pane set = hc did not answer
     // (same guard as the reaper): no evidence, keep all rows.
-    let panes = herdr_pane_ids(herdr_bin);
+    let panes = plane_pane_ids(plane_bin);
     let mut picture = InjectionPicture::default();
-    let herdr_answered = !panes.is_empty();
+    let plane_answered = !panes.is_empty();
     for (_, pane, _) in &rows {
         let status = statuses.get(pane).map(String::as_str);
         account_listed_pane(
             &mut picture,
             pane,
-            herdr_answered,
+            plane_answered,
             panes.contains(pane),
             status,
         );
@@ -871,14 +871,14 @@ pub fn injection_picture(
 }
 
 /// One registry pane's contribution to the injection picture. A `block:`
-/// id is a Rex terminal herdr will never list. It counts as seen so
-/// `/health` does not say `no_pane_in_herdr` while the rex ring can still
+/// id is a Rex terminal hc will never list. It counts as seen so
+/// `/health` does not say `no_pane_in_plane` while the rex ring can still
 /// type. Injectable stays 0 until a status says idle, done, or blocked.
 pub fn account_listed_pane(
     picture: &mut InjectionPicture,
     pane: &str,
-    herdr_answered: bool,
-    herdr_has_pane: bool,
+    plane_answered: bool,
+    plane_has_pane: bool,
     status: Option<&str>,
 ) {
     if pane.starts_with("block:") {
@@ -886,7 +886,7 @@ pub fn account_listed_pane(
         picture.panes_seen += 1;
         return;
     }
-    if herdr_answered && (pane.is_empty() || !herdr_has_pane) {
+    if plane_answered && (pane.is_empty() || !plane_has_pane) {
         picture.panes_missing += 1;
         return;
     }
@@ -911,11 +911,11 @@ pub struct FileHost {
     /// (mirrors the workspace tick arm: direct insert, no fallback).
     presence: BTreeMap<String, PresenceVerdict>,
     /// Wall seconds of the last `Presence` msg per pin (bd-3vr9). A verdict
-    /// with no fresh publisher is stale evidence: live herdr status
-    /// outranks it, fresh self-report outranks herdr.
+    /// with no fresh publisher is stale evidence: live hc status
+    /// outranks it, fresh self-report outranks hc.
     presence_ts: BTreeMap<String, u64>,
-    /// Last-known herdr statuses by pin (poll-joined via registry).
-    herdr: BTreeMap<String, String>,
+    /// Last-known hc statuses by pin (poll-joined via registry).
+    hc: BTreeMap<String, String>,
     /// Role binds (role -> pin), drained from the pending files at sweep
     /// top exactly like the embedded workspace model. The Fact arm reads
     /// `captain`/`wheelhouse` here (bd-ztek: without it every daemon-side
@@ -923,9 +923,9 @@ pub struct FileHost {
     /// Role binds are a JSON boundary (`load_binds`) and feed
     /// `doorbell_core::fact_captain_pin`, so this one stays std's map.
     roles: std::collections::BTreeMap<String, String>,
-    /// pane_id -> pin for the herdr list join.
+    /// pane_id -> pin for the hc list join.
     panes: BTreeMap<String, String>,
-    /// pin -> herdr agent name for prompt delivery. Shared with the
+    /// pin -> hc agent name for prompt delivery. Shared with the
     /// prompt sink: single writer (index refresh on the Brain task),
     /// brief worker-side reads, never held across await.
     targets: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>,
@@ -938,14 +938,14 @@ pub struct FileHost {
     /// Registry ∪ subscription pins, before stale reaping (bd-adms).
     index_pins_raw: Vec<String>,
     /// pin -> first second we saw its registry pane missing from
-    /// `herdr pane list` (bd-adms). RAM-only on purpose: a restart re-arms
+    /// `hc terminal list` (bd-adms). RAM-only on purpose: a restart re-arms
     /// the grace window instead of reaping on stale evidence.
     stale_panes: BTreeMap<String, u64>,
-    /// bd-3uqz: consecutive sweeps in which herdr did NOT list a pin's pane.
+    /// bd-3uqz: consecutive sweeps in which hc did NOT list a pin's pane.
     ///
     /// This replaces a wall-clock window for deciding a pane is dead. Time was a
     /// PROXY for "we have seen this repeatedly" and it is wrong in both directions:
-    /// one herdr outage outlasting the window prunes a live fleet, and a pane that
+    /// one hc outage outlasting the window prunes a live fleet, and a pane that
     /// dies and returns inside the window is never pruned. A count measures the
     /// thing itself.
     ///
@@ -958,11 +958,11 @@ pub struct FileHost {
     tombstones: BTreeMap<String, crate::registry_prune::Tombstone>,
     /// Pins already audited as reaped, so the audit fires once per episode.
     reaped_pins: Vec<String>,
-    /// Operator pins currently bound via herdr token (bd-3vr9), so the
+    /// Operator pins currently bound vian hc token (bd-3vr9), so the
     /// `captain_pane_routed` audit fires on change, not every refresh.
     captain_routed_pins: Vec<String>,
     /// The subset of `index_pins` with no spawn-registry row, so no pane and
-    /// no herdr target (bd-bk9t). Mirrored onto
+    /// no hc target (bd-bk9t). Mirrored onto
     /// `reducer.model.unroutable`; kept here too so the index change guard
     /// notices a pin gaining/losing its route without the pin set changing.
     unroutable_pins: Vec<String>,
@@ -1012,10 +1012,10 @@ pub struct FileHost {
     /// as "death #1" — one row each, unbounded, which is the very shape this
     /// guards against.
     died_relayed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// HerdrStatus sends dropped on a full or closed brain channel, this host.
+    /// PlaneStatus sends dropped on a full or closed brain channel, this host.
     /// Host-wide like died_relayed: the sweep recomputes `changed` every tick,
     /// so the count survives across sweeps by construction.
-    herdr_dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    plane_dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// mcc9: exact wake → brain counters for this workspace, shared by every
     /// consumer this host arms (see [`crate::wake_brain`]).
     wake_counters: std::sync::Arc<crate::wake_brain::WakeBrainCounters>,
@@ -1024,7 +1024,7 @@ pub struct FileHost {
     wake_resume: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     daemon_exe: PathBuf,
     generation: Option<GenRecord>,
-    /// Status-change outbox: the poll loop `tell`s `HerdrStatus` back
+    /// Status-change outbox: the poll loop `tell`s `PlaneStatus` back
     /// through this channel (forwarder topology over a poll transport).
     tx: Option<tokio::sync::mpsc::Sender<BrainMsg>>,
     /// Death side-channel. Captured into each wake consumer so a full `tx`
@@ -1080,7 +1080,7 @@ impl FileHost {
             reducer: CoreReducer::default(),
             presence: BTreeMap::new(),
             presence_ts: BTreeMap::new(),
-            herdr: BTreeMap::new(),
+            hc: BTreeMap::new(),
             roles: std::collections::BTreeMap::new(),
             panes: BTreeMap::new(),
             targets: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -1099,7 +1099,7 @@ impl FileHost {
             restart_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             absent_rows: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             died_relayed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            herdr_dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            plane_dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_counters,
             wake_resume: std::sync::Arc::new(std::sync::Mutex::new(None)),
             daemon_exe,
@@ -1140,7 +1140,7 @@ impl FileHost {
         toron_data_root(self.cfg.toron_data_dir.as_deref())
     }
 
-    /// (pin, pane_id, herdr name) rows from the registry file. Ambiguity
+    /// (pin, pane_id, terminal name) rows from the registry file. Ambiguity
     /// queues a pending audit (drained as one Audit effect on next tick).
     fn registry_rows(&mut self) -> Vec<(String, String, String)> {
         let (rows, ambiguous_file) = read_registry_rows(
@@ -1231,22 +1231,22 @@ impl FileHost {
 
     /// bd-adms: the spawn registry is not garbage-collected, so a fleet that
     /// died leaves its pins behind forever. Live, three pins sat on `w11:*`
-    /// panes herdr had long GC'd: the sweep fetched three dead inboxes on
+    /// panes hc had long GC'd: the sweep fetched three dead inboxes on
     /// every tick, and when those fetches failed they wrote the
     /// `inbox_error` stream that hid a real outage (gs-044). Subscriptions
     /// gained a 7d reaper (bd-2o1v); this is the same belt for registry
-    /// rows — a pin whose pane is absent from `herdr pane list` past the
+    /// rows — a pin whose pane is absent from `hc terminal list` past the
     /// grace window drops out of the sweep set with ONE audit row naming it.
     ///
-    /// Guards: an EMPTY pane list means herdr did not answer, so nothing is
+    /// Guards: an EMPTY pane list means hc did not answer, so nothing is
     /// reaped on a transient failure, and a pin whose pane reappears is
     /// un-reaped. `/health.injection` pins track the same sweep set, so a
     /// reaped pin leaves `pins` and the fault stays visible in
     /// `panes_missing` after it stops costing a fetch per tick.
     fn reap_stale_registry_pins(&mut self, rows: &[RegistryRow], now: u64) -> StaleReap {
-        let known = herdr_pane_ids(&self.cfg.herdr_bin);
+        let known = plane_pane_ids(&self.cfg.plane_bin);
         // bd-3uqz: the DECISION is `registry_prune::decide`, which is pure and
-        // fenced. This function is only the plumbing — herdr's answer in, the audit
+        // fenced. This function is only the plumbing — hc's answer in, the audit
         // and the index out. The two rules that matter live in the pure module
         // because they are the ones that were wrong HERE:
         //
@@ -1255,9 +1255,9 @@ impl FileHost {
         //    pane never matched "alive" and fell through to the reap branch —
         //    deleting exactly the legacy rows `prompt_hop_keeps_the_label_when_the_
         //    row_has_no_pane` exists to support. No test covered the intersection.
-        //  - an EMPTY pane list from herdr is NO EVIDENCE: nothing is pruned and
+        //  - an EMPTY pane list from hc is NO EVIDENCE: nothing is pruned and
         //    nothing is COUNTED, so an outage cannot manufacture confirmations for
-        //    panes that are alive. Live, 13 of 20 rows (65%) had a pane herdr did
+        //    panes that are alive. Live, 13 of 20 rows (65%) had a pane hc did
         //    not list, so absence-based pruning would wipe two thirds of the table
         //    on its first sweep — during an outage, when it matters most.
         let decision_rows: Vec<crate::registry_prune::Row> = rows
@@ -1323,7 +1323,7 @@ impl FileHost {
                             |t| t.confirmations),
                         "required_confirmations": crate::registry_prune::REQUIRED_CONFIRMATIONS,
                         "missing_since": self.stale_panes.get(pin).copied().unwrap_or(0),
-                        "why": "pane absent from `herdr pane list` across consecutive \
+                        "why": "pane absent from `hc terminal list` across consecutive \
                                 confirmations; positive evidence of death, dropped from the sweep",
                     }),
                 );
@@ -1397,7 +1397,7 @@ impl FileHost {
         {
             return;
         }
-        // bd-adms: drop registry pins whose pane herdr no longer has, and
+        // bd-adms: drop registry pins whose pane hc no longer has, and
         // treat a vanished pane like a subscription-only pin — no pane, no
         // route, so its wake digests instead of parking in a queue nothing
         // can drain.
@@ -1433,20 +1433,20 @@ impl FileHost {
         if let Ok(mut targets) = self.targets.lock() {
             targets.clear();
             targets.extend(reap.live.iter().map(|(pin, pane, name)| {
-                // bd-523f: the value is a herdr PROMPT TARGET, not a name —
+                // bd-523f: the value is an hc PROMPT TARGET, not a name —
                 // the sink passes it to `agent prompt` verbatim, and only the
                 // pane id resolves for an operator pane.
                 (pin.clone(), prompt_target(pane, name).to_string())
             }));
-            // bd-3vr9: union herdr-known captain panes (same resolver, no
+            // bd-3vr9: union hc-known captain panes (same resolver, no
             // second table). A subscribed pin whose pane was never spawned
-            // carries its pin in the herdr `toron_pin` token; bind it so
+            // carries its pin in the hc `toron_pin` token; bind it so
             // has_route holds and the wake prompts instead of digesting
             // forever. Vanished panes drop out on the next refresh because
             // the roster no longer names them.
             let routed: std::collections::HashSet<String> = targets.keys().cloned().collect();
             let ops =
-                captain_pane_targets(&herdr_agent_roster(&self.cfg.herdr_bin), &pins, &routed);
+                captain_pane_targets(&plane_agent_roster(&self.cfg.plane_bin), &pins, &routed);
             for (pin, pane) in &ops {
                 targets.insert(pin.clone(), pane.clone());
                 self.panes.insert(pane.clone(), pin.clone());
@@ -1603,9 +1603,9 @@ impl FileHost {
             .collect()
     }
 
-    /// herdr statuses joined to pins: `{pane_id: status}` -> `{pin: status}`.
-    fn poll_herdr(&self) -> BTreeMap<String, String> {
-        herdr_agent_statuses(&self.cfg.herdr_bin)
+    /// hc statuses joined to pins: `{pane_id: status}` -> `{pin: status}`.
+    fn poll_plane(&self) -> BTreeMap<String, String> {
+        plane_agent_statuses(&self.cfg.plane_bin)
             .into_iter()
             .filter_map(|(pane, status)| self.panes.get(&pane).map(|pin| (pin.clone(), status)))
             .collect()
@@ -1742,7 +1742,7 @@ impl FileHost {
                 // behavior drift (parity tests prove it). Threading the
                 // real budget signal (Queue) is the follow-up.
                 Effect::Prompt { pin, line } => {
-                    // bd-3vr9: live herdr status outranks a stale presence
+                    // bd-3vr9: live hc status outranks a stale presence
                     // row — but ONLY for captain-pane-unioned pins, whose
                     // panes run no presence hooks (self-report goes stale
                     // forever). Spawned crews keep the presence contract
@@ -1755,7 +1755,7 @@ impl FileHost {
                         .is_none_or(|t| now.saturating_sub(*t) >= PRESENCE_STALE_SECS);
                     let unioned = self.captain_routed_pins.contains(&pin);
                     let presence = if unioned && presence_stale {
-                        self.herdr
+                        self.hc
                             .get(&pin)
                             .map(|s| doorbell_core::wake_core::parse_presence_word(s))
                             .or_else(|| self.presence.get(&pin).copied())
@@ -1785,7 +1785,7 @@ impl FileHost {
                         doorbell_core::wake_core::WakeEffect::Routed { decision } => Some(decision),
                         _ => None,
                     });
-                    // governed-by: bd-zawk — same typed gate as the herdr
+                    // governed-by: bd-zawk — same typed gate as the hc
                     // path: Busy+urgent breaks through, everything else digests.
                     match decision {
                         Some(decision) => match decision {
@@ -1903,11 +1903,11 @@ impl Host for FileHost {
                 self.reducer.model = next;
                 self.normalize(actions)
             }
-            BrainMsg::HerdrStatus { pin, status } => {
-                self.herdr.insert(pin.clone(), status.clone());
+            BrainMsg::PlaneStatus { pin, status } => {
+                self.hc.insert(pin.clone(), status.clone());
                 let (next, actions) = doorbell_core::tick(
                     &self.reducer.model,
-                    &doorbell_core::DoorbellMsg::HerdrStatus {
+                    &doorbell_core::DoorbellMsg::PlaneStatus {
                         pin: pin.clone(),
                         status: status.clone(),
                     },
@@ -2355,17 +2355,17 @@ impl Host for FileHost {
     }
 
     fn prev_status(&self, pin: &str) -> Option<String> {
-        self.herdr.get(pin).cloned()
+        self.hc.get(pin).cloned()
     }
 
     fn sweep_maintenance(&mut self) -> Vec<(String, String)> {
         self.refresh_index();
-        // Status poll: diff the herdr list against last-known and tell
-        // changes back as HerdrStatus (forwarder topology, poll transport).
-        let current = self.poll_herdr();
+        // Status poll: diff the hc list against last-known and tell
+        // changes back as PlaneStatus (forwarder topology, poll transport).
+        let current = self.poll_plane();
         let mut changed: Vec<(String, String)> = current
             .iter()
-            .filter(|(pin, st)| self.herdr.get(*pin) != Some(*st))
+            .filter(|(pin, st)| self.hc.get(*pin) != Some(*st))
             .map(|(p, s)| (p.clone(), s.clone()))
             .collect();
         changed.sort();
@@ -2383,28 +2383,28 @@ impl Host for FileHost {
                 // while /health kept reporting `mode=hosted`. A full channel
                 // drops the update, which is what the ignored result already
                 // meant.
-                match tx.try_send(BrainMsg::HerdrStatus {
+                match tx.try_send(BrainMsg::PlaneStatus {
                     pin: pin.clone(),
                     status: status.clone(),
                 }) {
                     Ok(()) => {}
                     Err(e) => {
-                        // Self-healing: self.herdr advances only on receipt
-                        // (the BrainMsg::HerdrStatus arm), so a dropped update
+                        // Self-healing: self.hc advances only on receipt
+                        // (the BrainMsg::PlaneStatus arm), so a dropped update
                         // is recomputed as changed next sweep — delay, not
                         // loss. Count every drop and audit sampled, the same
                         // repeat-is-a-count shape as wake_brain_full.
                         let closed = matches!(e, tokio::sync::mpsc::error::TrySendError::Closed(_));
                         let prior = self
-                            .herdr_dropped
+                            .plane_dropped
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         if should_audit_count(prior) {
                             Self::append_audit_row(
                                 &self.cfg.flywheel_state,
                                 &self.cfg.workspace,
-                                AUDIT_HERDR_FULL,
+                                AUDIT_PLANE_FULL,
                                 serde_json::json!({
-                                    "reason": "herdr status change could not be enqueued (brain channel full or closed); next sweep retries",
+                                    "reason": "hc status change could not be enqueued (brain channel full or closed); next sweep retries",
                                     "dropped": prior + 1,
                                     "closed": closed,
                                 }),
@@ -2627,7 +2627,7 @@ mod tests {
     }
 
     /// bd-3vr9: the captain-pane union. A swept pin with no registry
-    /// route binds the pane whose herdr `toron_pin` token names it, so
+    /// route binds the pane whose hc `toron_pin` token names it, so
     /// has_route holds and the wake prompts. Pins already routed, pins
     /// nobody names, and token-less crew panes are untouched — an
     /// unroutable pin keeps exactly one fate: digest-bound.
@@ -2663,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rex_block_counts_as_seen_when_herdr_lists_nothing() {
+    fn a_rex_block_counts_as_seen_when_plane_lists_nothing() {
         let mut pic = InjectionPicture::default();
         account_listed_pane(&mut pic, "block:01a170b3", false, false, None);
         assert_eq!(
@@ -2677,13 +2677,13 @@ mod tests {
     }
 
     /// bd-523f: the LAST hop dies on the TARGET SPELLING, not on the route.
-    /// The routing table's value is handed verbatim to `herdr agent prompt`,
-    /// and herdr resolves an agent by its herdr LABEL or by PANE ID. A pane
-    /// nobody started with `herdr agent start` — every operator pane — has no
-    /// label: on this host `herdr agent get w6:p1` resolves the captain's pane
-    /// while `herdr agent get AmberQuill` answers `agent_not_found`, and the
+    /// The routing table's value is handed verbatim to `hc agent prompt`,
+    /// and hc resolves an agent by its hc LABEL or by PANE ID. A pane
+    /// nobody started with `hc agent start` — every operator pane — has no
+    /// label: on this host `hc agent get w6:p1` resolves the captain's pane
+    /// while `hc agent get AmberQuill` answers `agent_not_found`, and the
     /// last recorded delivery attempt is
-    /// `degraded: delivery failed: herdr prompt failed: agent target
+    /// `degraded: delivery failed: hc prompt failed: agent target
     /// BlackOrchid not found`. The captain union already stores pane ids
     /// (bd-3vr9); the registry half stored the label, so one fleet, one
     /// routing table, two unresolvable spellings.
@@ -2695,7 +2695,7 @@ mod tests {
         assert_eq!(
             targets.get("PinA").map(String::as_str),
             Some("pane-a"),
-            "the sink must be handed the pane id herdr resolves, not the label"
+            "the sink must be handed the pane id hc resolves, not the label"
         );
         assert_eq!(targets.get("PinB").map(String::as_str), Some("pane-b"));
         drop(targets);
@@ -2703,20 +2703,20 @@ mod tests {
     }
 
     /// The unhappy path of the same rule: a registry row with NO pane has
-    /// nothing to prompt. Falling back to the label keeps the one shape herdr
+    /// nothing to prompt. Falling back to the label keeps the one shape hc
     /// can still resolve (a crew row written before panes were recorded)
     /// instead of handing the sink an empty target that reads as a route.
     #[test]
     fn prompt_hop_keeps_the_label_when_the_row_has_no_pane() {
         let (mut host, dir) = host_with_registry(
             "prompt-hop-nopane",
-            serde_json::json!([{"pane_id": "", "name": "herdr-c", "mail_identity": "PinC"}]),
+            serde_json::json!([{"pane_id": "", "name": "hc-c", "mail_identity": "PinC"}]),
         );
         host.refresh_index();
         let targets = host.targets.lock().expect("targets lock");
         assert_eq!(
             targets.get("PinC").map(String::as_str),
-            Some("herdr-c"),
+            Some("hc-c"),
             "a pane-less row keeps the label it has"
         );
         drop(targets);
@@ -2762,7 +2762,7 @@ mod tests {
         .unwrap();
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = "true".into();
+        cfg.plane_bin = "true".into();
         cfg.registry_file = Some(dir.join("agents").join("proj.json"));
         (FileHost::new(cfg), dir)
     }
@@ -2784,7 +2784,7 @@ mod tests {
         }
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = "true".into();
+        cfg.plane_bin = "true".into();
         let mut host = FileHost::new(cfg);
 
         let mut audits = 0;
@@ -2804,13 +2804,13 @@ mod tests {
 
     fn entries() -> serde_json::Value {
         serde_json::json!([
-            {"pane_id": "pane-a", "name": "herdr-a", "mail_identity": "PinA"},
-            {"pane_id": "pane-b", "name": "herdr-b", "mail_identity": "PinB"}
+            {"pane_id": "pane-a", "name": "hc-a", "mail_identity": "PinA"},
+            {"pane_id": "pane-b", "name": "hc-b", "mail_identity": "PinB"}
         ])
     }
 
     /// bd-adms: the registry is not garbage-collected. Live, three pins sat
-    /// on `w11:*` panes herdr had long GC'd, so every tick fetched dead
+    /// on `w11:*` panes hc had long GC'd, so every tick fetched dead
     /// inboxes (and their failed fetches wrote the `inbox_error` stream that
     /// hid a real outage). A pin whose pane is gone must leave the sweep set,
     /// ONCE and visibly — and a pin whose pane is present must never be touched.
@@ -2819,7 +2819,7 @@ mod tests {
     /// evidence is now a count of CONSECUTIVE sweeps, so the test drives sweeps
     /// instead. The intent is unchanged and still worth asserting; only the driver
     /// moved. A clock is a proxy for "we have seen this repeatedly" and it is wrong
-    /// in both directions — one herdr outage outlasting the window prunes a live
+    /// in both directions — one hc outage outlasting the window prunes a live
     /// fleet, and a pane that died and returned inside the window is never pruned.
     #[test]
     fn stale_registry_pins_leave_the_sweep_after_three_confirmations() {
@@ -2827,15 +2827,15 @@ mod tests {
         std::fs::write(
             dir.join("agents").join("proj.json"),
             serde_json::to_string(&serde_json::json!([
-                {"pane_id": "w9:p1", "name": "herdr-a", "mail_identity": "LivePin"},
-                {"pane_id": "w11:p1", "name": "herdr-dead", "mail_identity": "DeadPin"},
+                {"pane_id": "w9:p1", "name": "hc-a", "mail_identity": "LivePin"},
+                {"pane_id": "w11:p1", "name": "hc-dead", "mail_identity": "DeadPin"},
             ]))
             .unwrap(),
         )
         .unwrap();
-        // `herdr pane list` knows only w9:p1; `agent list` keeps w9:p1 idle so
+        // `hc terminal list` knows only w9:p1; `agent list` keeps w9:p1 idle so
         // the live pin stays injectable.
-        let script = dir.join("herdr");
+        let script = dir.join("hc");
         std::fs::write(
             &script,
             "#!/bin/sh\nif [ \"$1\" = \"pane\" ]; then echo '{\"result\":{\"panes\":[{\"pane_id\":\"w9:p1\"}]}}'; \
@@ -2849,7 +2849,7 @@ mod tests {
         }
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = script.to_string_lossy().into_owned();
+        cfg.plane_bin = script.to_string_lossy().into_owned();
         cfg.registry_file = Some(dir.join("agents").join("proj.json"));
         let mut host = FileHost::new(cfg);
         host.refresh_index();
@@ -2898,18 +2898,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// bd-ba8t: `herdr agent list` returning no agents is the live condition
+    /// bd-ba8t: `hc agent list` returning no agents is the live condition
     /// that made the ring's last hop impossible and invisible at once. The
     /// picture must say `panes_seen: 0` rather than "all busy".
     #[test]
-    fn injection_picture_sees_zero_panes_when_herdr_has_no_agents() {
+    fn injection_picture_sees_zero_panes_when_plane_has_no_agents() {
         let dir = tmp_state("inj-none");
         std::fs::write(
             dir.join("agents").join("proj.json"),
             serde_json::to_string(&entries()).unwrap(),
         )
         .unwrap();
-        let script = dir.join("herdr-empty");
+        let script = dir.join("hc-empty");
         std::fs::write(&script, "#!/bin/sh\necho '{\"result\":{\"agents\":[]}}'\n").unwrap();
         #[cfg(unix)]
         {
@@ -2923,13 +2923,13 @@ mod tests {
             &script.to_string_lossy(),
         );
         assert_eq!(pic.pins, 2, "two registry pins");
-        assert_eq!(pic.panes_seen, 0, "herdr saw no agents");
+        assert_eq!(pic.panes_seen, 0, "hc saw no agents");
         assert_eq!(pic.injectable, 0);
         assert_eq!(pic.panes_missing, 2, "both panes unaccounted for");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The healthy shape the signal must NOT fire on: herdr knows the panes
+    /// The healthy shape the signal must NOT fire on: hc knows the panes
     /// (some busy, some idle), so the ring can land.
     #[test]
     fn injection_picture_counts_busy_and_idle_panes() {
@@ -2939,7 +2939,7 @@ mod tests {
             serde_json::to_string(&entries()).unwrap(),
         )
         .unwrap();
-        let script = dir.join("herdr-mixed");
+        let script = dir.join("hc-mixed");
         std::fs::write(
             &script,
             "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"},{\"pane_id\":\"pane-b\",\"agent_status\":\"idle\"}]}}'\n",
@@ -2964,7 +2964,7 @@ mod tests {
     }
 
     /// bd-2i96 G4: `pins` tracks the sweep set, not the raw registry. A
-    /// pin whose pane herdr no longer lists is reaped from the sweep, so
+    /// pin whose pane hc no longer lists is reaped from the sweep, so
     /// /health must stop counting it in pins. The fault stays visible in
     /// `panes_missing`, never in `pins`.
     #[test]
@@ -2976,7 +2976,7 @@ mod tests {
         )
         .unwrap();
         // pane-b is dead: absent from both the pane list and the agents.
-        let script = dir.join("herdr-stale");
+        let script = dir.join("hc-stale");
         std::fs::write(
             &script,
             "#!/bin/sh\nif [ \"$1\" = \"pane\" ]; then echo '{\"result\":{\"panes\":[{\"pane_id\":\"pane-a\"}]}}'; else echo '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"idle\"}]}}'; fi\n",
@@ -3101,14 +3101,14 @@ mod tests {
                     identity: Identity::Pin("OperatorPin".into()),
                     scope: Scope::One("w".into()),
                     filter: Filter::default(),
-                    sink: SinkKind::Herdr,
+                    sink: SinkKind::Hc,
                     budget: Budget::default_530(),
                     project: Some("proj".into()),
                     endpoint: None,
                 },
                 "w",
             )
-            .expect("local herdr subscribe");
+            .expect("local hc subscribe");
         host.refresh_index();
         assert!(
             host.pins().contains(&"OperatorPin".to_string()),
@@ -3132,7 +3132,7 @@ mod tests {
                 .lock()
                 .expect("targets lock")
                 .contains_key("OperatorPin"),
-            "no herdr target is invented for a subscribed pin"
+            "no hc target is invented for a subscribed pin"
         );
         // bd-bk9t: and because there is no route, the index marks it
         // unrouteable so its wakes are digest-bound instead of parked in a
@@ -3171,14 +3171,14 @@ mod tests {
                     identity: Identity::Pin("OperatorPin".into()),
                     scope: Scope::One("w".into()),
                     filter: Filter::default(),
-                    sink: SinkKind::Herdr,
+                    sink: SinkKind::Hc,
                     budget: Budget::default_530(),
                     project: Some("proj".into()),
                     endpoint: None,
                 },
                 "w",
             )
-            .expect("local herdr subscribe");
+            .expect("local hc subscribe");
         host.refresh_index();
         let fx = host.tick(&BrainMsg::Watch(watch_line(
             "OperatorPin",
@@ -3220,14 +3220,14 @@ mod tests {
                     identity: Identity::Pin("Elsewhere".into()),
                     scope: Scope::One("other-ws".into()),
                     filter: Filter::default(),
-                    sink: SinkKind::Herdr,
+                    sink: SinkKind::Hc,
                     budget: Budget::default_530(),
                     project: Some("proj".into()),
                     endpoint: None,
                 },
                 "other-ws",
             )
-            .expect("local herdr subscribe");
+            .expect("local hc subscribe");
         host.refresh_index();
         assert!(
             !host.pins().contains(&"Elsewhere".to_string()),
@@ -3255,8 +3255,8 @@ mod tests {
             state: "idle".into(),
         });
         // No status known -> "unknown" status -> core QUEUES (not prompt).
-        // Set status idle first via HerdrStatus (drain of empty queue).
-        host.tick(&BrainMsg::HerdrStatus {
+        // Set status idle first via PlaneStatus (drain of empty queue).
+        host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
             status: "idle".into(),
         });
@@ -3281,12 +3281,12 @@ mod tests {
 
     #[test]
     fn unknown_presence_urgent_actually_digests() {
-        // bd-v8vi (BrightDog): idle-in-herdr but presence-Unknown — the
+        // bd-v8vi (BrightDog): idle-in-hc but presence-Unknown — the
         // filter held the urgent "for digest" and digested nothing
         // (audit only). The Digest intent must be emitted, not just audited.
         let (mut host, _dir) = host_with_registry("t-unk", entries());
         host.refresh_index();
-        host.tick(&BrainMsg::HerdrStatus {
+        host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
             status: "idle".into(),
         });
@@ -3346,7 +3346,7 @@ mod tests {
     fn busy_presence_urgent_breaks_through() {
         let (mut host, _dir) = host_with_registry("t3", entries());
         host.refresh_index();
-        host.tick(&BrainMsg::HerdrStatus {
+        host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
             status: "idle".into(),
         });
@@ -3369,13 +3369,13 @@ mod tests {
         );
     }
 
-    /// bd-3vr9: live herdr status outranks a stale presence row.
-    /// Presence self-reports only on agent publish; herdr observes every
-    /// sweep. Stale Busy presence + live idle herdr must prompt; live
-    /// working herdr + stale idle presence must digest.
+    /// bd-3vr9: live hc status outranks a stale presence row.
+    /// Presence self-reports only on agent publish; hc observes every
+    /// sweep. Stale Busy presence + live idle hc must prompt; live
+    /// working hc + stale idle presence must digest.
     #[test]
-    fn live_herdr_status_outranks_stale_presence() {
-        let (mut host, _dir) = host_with_registry("t-herdr", entries());
+    fn live_plane_status_outranks_stale_presence() {
+        let (mut host, _dir) = host_with_registry("t-hc", entries());
         host.refresh_index();
         // Simulate the captain-pane union: PinA routed by token, not registry.
         host.captain_routed_pins.push("PinA".into());
@@ -3392,7 +3392,7 @@ mod tests {
         // Age the self-report past the freshness window: supervisor truth
         // must win from here on.
         host.presence_ts.insert("PinA".into(), 0);
-        host.tick(&BrainMsg::HerdrStatus {
+        host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
             status: "idle".into(),
         });
@@ -3400,14 +3400,14 @@ mod tests {
         assert!(
             fx.iter()
                 .any(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
-            "live idle herdr must win over stale presence: {fx:?}"
+            "live idle hc must win over stale presence: {fx:?}"
         );
         host.tick(&BrainMsg::Presence {
             pin: "PinA".into(),
             state: "idle".into(),
         });
         host.presence_ts.insert("PinA".into(), 0);
-        host.tick(&BrainMsg::HerdrStatus {
+        host.tick(&BrainMsg::PlaneStatus {
             pin: "PinA".into(),
             status: "working".into(),
         });
@@ -3415,7 +3415,7 @@ mod tests {
         assert!(
             fx.iter()
                 .all(|e| !matches!(e, Effect::Prompt { pin, .. } if pin == "PinA")),
-            "live working herdr must hold the prompt despite idle presence: {fx:?}"
+            "live working hc must hold the prompt despite idle presence: {fx:?}"
         );
         assert!(
             fx.iter()
@@ -3623,7 +3623,7 @@ mod tests {
         .unwrap();
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = script.to_string_lossy().into_owned();
-        cfg.herdr_bin = "true".into();
+        cfg.plane_bin = "true".into();
         cfg.registry_file = Some(dir.join("agents").join("proj.json"));
         let mut host = FileHost::new(cfg);
         host.refresh_index();
@@ -3636,13 +3636,13 @@ mod tests {
     /// The daemon-hosted Brain runs the `Host` on ITS OWN tokio runtime, so
     /// the sweep path must never use `Sender::blocking_send`: it panics
     /// ("Cannot block the current thread from within a runtime"), the sweep
-    /// task dies on the first herdr status change, and the hosted workspace
+    /// task dies on the first hc status change, and the hosted workspace
     /// goes ring-deaf while `/health` still says `mode=hosted` (only the
     /// climbing `sweep.last_age_s` and a frozen journal show it).
     #[test]
     fn sweep_forwards_status_changes_without_blocking_a_runtime() {
         let dir = tmp_state("sweep-runtime");
-        let script = dir.join("herdr");
+        let script = dir.join("hc");
         std::fs::write(
             &script,
             "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
@@ -3660,7 +3660,7 @@ mod tests {
         .unwrap();
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = script.to_string_lossy().into_owned();
+        cfg.plane_bin = script.to_string_lossy().into_owned();
         cfg.registry_file = Some(dir.join("agents").join("proj.json"));
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut host = FileHost::new(cfg).with_tx(tx);
@@ -3675,7 +3675,7 @@ mod tests {
         });
         assert!(
             rx.try_recv().is_ok(),
-            "the herdr status change must reach the brain channel"
+            "the hc status change must reach the brain channel"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3704,14 +3704,14 @@ mod tests {
         );
     }
 
-    /// bd-jqjh: a full brain channel must not silently drop HerdrStatus.
-    /// The drop self-heals (self.herdr advances only on receipt, so the next
+    /// bd-jqjh: a full brain channel must not silently drop PlaneStatus.
+    /// The drop self-heals (self.hc advances only on receipt, so the next
     /// sweep retries) — but the rate has to be countable and sampled-audited,
     /// same shape as wake_brain_full. Fence: no `let _ =` on this send.
     #[test]
-    fn sweep_full_channel_counts_herdr_drops_and_audits_sampled() {
+    fn sweep_full_channel_counts_plane_drops_and_audits_sampled() {
         let dir = tmp_state("sweep-full");
-        let script = dir.join("herdr");
+        let script = dir.join("hc");
         std::fs::write(
             &script,
             "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
@@ -3729,9 +3729,9 @@ mod tests {
         .unwrap();
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = script.to_string_lossy().into_owned();
+        cfg.plane_bin = script.to_string_lossy().into_owned();
         cfg.registry_file = Some(dir.join("agents").join("proj.json"));
-        // Capacity 1, prefilled: every HerdrStatus send goes Full.
+        // Capacity 1, prefilled: every PlaneStatus send goes Full.
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(BrainMsg::Died).unwrap();
         let mut host = FileHost::new(cfg).with_tx(tx);
@@ -3746,14 +3746,14 @@ mod tests {
             }
         });
         assert_eq!(
-            host.herdr_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            host.plane_dropped.load(std::sync::atomic::Ordering::SeqCst),
             4,
             "every Full send must be counted"
         );
         // The filler never left: nothing the sweep sent got through.
         assert!(matches!(rx.try_recv(), Ok(BrainMsg::Died)));
         let body = std::fs::read_to_string(dir.join("doorbell").join("w.audit.jsonl")).unwrap();
-        let rows = body.matches(AUDIT_HERDR_FULL).count();
+        let rows = body.matches(AUDIT_PLANE_FULL).count();
         assert_eq!(
             rows, 3,
             "sampled audit: priors 0,1,2 row, prior 3 counts only, got: {body}"
@@ -3763,9 +3763,9 @@ mod tests {
 
     /// bd-jqjh: a closed brain channel (brain gone) counts too, flagged closed.
     #[test]
-    fn sweep_closed_channel_counts_herdr_drop_as_closed() {
+    fn sweep_closed_channel_counts_plane_drop_as_closed() {
         let dir = tmp_state("sweep-closed");
-        let script = dir.join("herdr");
+        let script = dir.join("hc");
         std::fs::write(
             &script,
             "#!/bin/sh\necho '{\"result\":{\"agents\":[{\"pane_id\":\"pane-a\",\"agent_status\":\"working\"}]}}'\n",
@@ -3783,7 +3783,7 @@ mod tests {
         .unwrap();
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = script.to_string_lossy().into_owned();
+        cfg.plane_bin = script.to_string_lossy().into_owned();
         cfg.registry_file = Some(dir.join("agents").join("proj.json"));
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         drop(rx);
@@ -3797,13 +3797,13 @@ mod tests {
             let _ = host.sweep_maintenance();
         });
         assert_eq!(
-            host.herdr_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            host.plane_dropped.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the Closed send must be counted"
         );
         let body = std::fs::read_to_string(dir.join("doorbell").join("w.audit.jsonl")).unwrap();
         assert!(
-            body.contains(AUDIT_HERDR_FULL) && body.contains("\"closed\":true"),
+            body.contains(AUDIT_PLANE_FULL) && body.contains("\"closed\":true"),
             "the drop must be audited and flagged closed, got: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3870,7 +3870,7 @@ mod tests {
         let dir = tmp_state("gen-gate");
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = "true".into();
+        cfg.plane_bin = "true".into();
         let host = FileHost::new(cfg);
         assert!(host.inject_allowed("PinA"), "no gen file allows");
         ensure_daemon_gen(&dir, "w");
@@ -3998,7 +3998,7 @@ mod tests {
         let dir = tmp_state("burst");
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = "true".into();
+        cfg.plane_bin = "true".into();
         let mut host = FileHost::new(cfg);
         host.tx = Some(tokio::sync::mpsc::channel(64).0);
 
@@ -4048,7 +4048,7 @@ mod tests {
         let dir = tmp_state("reopen");
         let mut cfg = FileHostConfig::new(dir.clone(), "proj", "w");
         cfg.toron_bin = "true".into();
-        cfg.herdr_bin = "true".into();
+        cfg.plane_bin = "true".into();
         let mut host = FileHost::new(cfg);
         host.tx = Some(tokio::sync::mpsc::channel(64).0);
 

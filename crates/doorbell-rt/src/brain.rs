@@ -51,7 +51,7 @@ impl BrainConfig {
             workspace,
             digest_threshold: 10,
             digest_interval_secs: 300,
-            main_sink: "herdr".into(),
+            main_sink: "hc".into(),
             subscriber,
             budget: crate::subscribe::Budget::default_530(),
         }
@@ -488,7 +488,7 @@ impl<H: Host> Brain<H> {
     async fn dispatch(&mut self, msg: BrainMsg) {
         match msg {
             BrainMsg::Watch(line) => self.on_watch(line).await,
-            BrainMsg::HerdrStatus { pin, status } => self.on_status(pin, status).await,
+            BrainMsg::PlaneStatus { pin, status } => self.on_status(pin, status).await,
             BrainMsg::Died => self.on_died().await,
             BrainMsg::Sweep { now } => self.on_sweep(now).await,
             BrainMsg::RoleBound { role, pin } => self.on_rolebound(role, pin).await,
@@ -694,7 +694,7 @@ impl<H: Host> Brain<H> {
         // transition gate never fires (audit P1). The gate is advisory:
         // an unknown pin still counts as transitioned.
         let from = self.host.prev_status(&pin).map(|f| f.to_ascii_lowercase());
-        let effects = self.host.tick(&BrainMsg::HerdrStatus {
+        let effects = self.host.tick(&BrainMsg::PlaneStatus {
             pin: pin.clone(),
             status: status.clone(),
         });
@@ -703,7 +703,7 @@ impl<H: Host> Brain<H> {
         let now = self.host.now_unix();
         let injects = self.gated(raw.clone(), now);
         self.journal(
-            &serde_json::json!({"rt_kind": "HerdrStatus", "pin": pin}),
+            &serde_json::json!({"rt_kind": "PlaneStatus", "pin": pin}),
             &effects,
             serde_json::json!({"stage": "drain"}),
             &raw.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
@@ -1050,7 +1050,7 @@ impl<H: Host> Brain<H> {
     /// Does a wake for `pin` on `sink` have anywhere to land?
     ///
     /// bd-bk9t made "no prompt route" mean "keep it in the digest" because
-    /// the herdr sink MISSES an unknown pin and still reports `Ok`, so
+    /// the hc sink MISSES an unknown pin and still reports `Ok`, so
     /// flushing would stamp a `Delivered` receipt for a wake nobody received.
     /// A registered non-pane sink is the opposite case: the webhook endpoint
     /// IS the destination, so the pane-less pin finally has a route
@@ -1394,7 +1394,7 @@ const SLOW_DISPATCH_WARN: std::time::Duration = std::time::Duration::from_secs(2
 fn brain_msg_label(msg: &BrainMsg) -> &'static str {
     match msg {
         BrainMsg::Watch(_) => "watch",
-        BrainMsg::HerdrStatus { .. } => "status",
+        BrainMsg::PlaneStatus { .. } => "status",
         BrainMsg::Died => "died",
         BrainMsg::Sweep { .. } => "sweep",
         BrainMsg::RoleBound { .. } => "rolebound",
@@ -1824,8 +1824,8 @@ mod tests {
         let (mut brain, rx, tx) = test_brain("drain", vec![]);
         let (mut sink, _sent) = MockSink::new();
         sink.stall_ms = 12_000;
-        brain.sinks.add_sink("herdr", Box::new(sink));
-        brain.sinks.send("herdr", "p", "slow").await;
+        brain.sinks.add_sink("hc", Box::new(sink));
+        brain.sinks.send("hc", "p", "slow").await;
         // Let the worker pop the intent so it sits inside the 12s send.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         tx.send(BrainMsg::Shutdown).await.expect("shutdown queues");
@@ -1871,7 +1871,7 @@ mod tests {
         // Endpoint down from the first send: nothing delivers, all park.
         let (mut sink, _sent) = MockSink::new();
         sink.fail_after = Some(0);
-        a.sinks.add_sink("herdr", Box::new(sink));
+        a.sinks.add_sink("hc", Box::new(sink));
         tx.send(BrainMsg::Watch("{\"kind\":9}".into()))
             .await
             .expect("watch queues");
@@ -2200,7 +2200,7 @@ mod tests {
         };
         let (mut brain, _rx, _tx) = test_brain("sync-fail", vec![vec![prompt]]);
         let (sink, _sent) = MockSink::new();
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
         let journals = brain
             .store
             .journal_file("w")
@@ -2274,7 +2274,7 @@ mod tests {
             ],
         );
         let (sink, sent) = MockSink::new();
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
 
         brain.dispatch(BrainMsg::Watch(line("aa"))).await;
         brain.dispatch(BrainMsg::Watch(line("bb"))).await;
@@ -2326,7 +2326,7 @@ mod tests {
         use crate::host::CoreReducer;
         let log = [
             BrainMsg::Watch("{\"kind\":9,\"tags\":[[\"p\",\"x\"]]}".into()),
-            BrainMsg::HerdrStatus {
+            BrainMsg::PlaneStatus {
                 pin: "p".into(),
                 status: "idle".into(),
             },
@@ -2363,7 +2363,7 @@ mod tests {
         // Delivered receipt (pending → expire → unanswered).
         let (mut brain, _rx, _tx) = test_brain("hear", vec![]);
         let (sink, _sent) = MockSink::new();
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
         let queued = brain
             .deliver_prompts(vec![("p".into(), "[doorbell] x".into())])
             .await;
@@ -2394,7 +2394,7 @@ mod tests {
             .collect::<Vec<_>>();
         let (mut brain, _rx, tx) = test_brain("budget", vec![prompts]);
         let (sink, sent) = MockSink::new();
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
         brain
             .dispatch(BrainMsg::Fact {
                 summary: "x".into(),
@@ -2440,11 +2440,11 @@ mod tests {
                 ],
             );
             let (sink, _sent) = MockSink::new();
-            brain.sinks.add_sink("herdr", Box::new(sink));
+            brain.sinks.add_sink("hc", Box::new(sink));
             for msg in [
                 BrainMsg::Watch("{\"kind\":9}".into()),
                 BrainMsg::Sweep { now: 1_000_100 },
-                BrainMsg::HerdrStatus {
+                BrainMsg::PlaneStatus {
                     pin: "p".into(),
                     status: "idle".into(),
                 },
@@ -2594,7 +2594,7 @@ mod tests {
         // Pre-crash: three decided+delivered wakes fill the 5/30/3 window.
         let (mut a, _rx, _tx) = mk();
         let (sink, _sent) = MockSink::new();
-        a.sinks.add_sink("herdr", Box::new(sink));
+        a.sinks.add_sink("hc", Box::new(sink));
         a.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
         a.dispatch(BrainMsg::Fact {
             summary: "x".into(),
@@ -2611,7 +2611,7 @@ mod tests {
         let budget = b.budgets.get("p").expect("refolded budget row");
         assert_eq!(budget.prompts.len(), 3, "all three grants refolded");
         let (sink_b, _sent_b) = MockSink::new();
-        b.sinks.add_sink("herdr", Box::new(sink_b));
+        b.sinks.add_sink("hc", Box::new(sink_b));
         let journal = std::fs::read_to_string(b.store.journal_file("w")).unwrap();
         assert!(
             journal.contains("\"stage\":\"resume\"") && journal.contains("\"redelivered\":3"),
@@ -2695,7 +2695,7 @@ mod tests {
             vec![burn_window, vec![], vec![], vec![], one("forward")],
         );
         let (sink, _sent) = MockSink::new();
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
         brain.host.now = t;
         // 3 grants fill the 5/30/3 window at T; the 4th drops.
         brain
@@ -2706,7 +2706,7 @@ mod tests {
         assert_eq!((brain.stats.injects, brain.stats.drops), (3, 1));
         // A real status transition stamps liveness at T.
         brain
-            .dispatch(BrainMsg::HerdrStatus {
+            .dispatch(BrainMsg::PlaneStatus {
                 pin: "p".into(),
                 status: "idle".into(),
             })
@@ -2717,7 +2717,7 @@ mod tests {
         // stamp may rewind.
         brain.host.now = t - 3_600;
         brain
-            .dispatch(BrainMsg::HerdrStatus {
+            .dispatch(BrainMsg::PlaneStatus {
                 pin: "p".into(),
                 status: "done".into(),
             })
@@ -2736,7 +2736,7 @@ mod tests {
         // state re-stabilizes and the next wake goes out.
         brain.host.now = t + 7_200;
         brain
-            .dispatch(BrainMsg::HerdrStatus {
+            .dispatch(BrainMsg::PlaneStatus {
                 pin: "p".into(),
                 status: "idle".into(),
             })
@@ -2819,7 +2819,7 @@ mod tests {
                     "{{\"kind\":{},\"tags\":[[\"p\",\"t\"]]}}",
                     kinds[(next_rand(rng) % 8) as usize]
                 )),
-                1 => BrainMsg::HerdrStatus {
+                1 => BrainMsg::PlaneStatus {
                     pin: ["p", "q"][(next_rand(rng) % 2) as usize].into(),
                     status: ["idle", "working", "done", "blocked", "mystery"]
                         [(next_rand(rng) % 5) as usize]
@@ -2869,7 +2869,7 @@ mod tests {
         let (mut brain, _rx, _tx) = test_brain("deaf", vec![vec![]]);
         brain.cfg.digest_threshold = 1;
         let (sink, sent) = MockSink::new();
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
         // Inject, then sweep past the 120s hear window: pin goes deaf.
         brain.hear.note_inject("svc", None, 1_000_000);
         brain
@@ -2949,7 +2949,7 @@ mod tests {
     }
 
     /// bd-bk9t: a digest batch for a pin with no route must NOT be shipped
-    /// to a sink. The herdr sink misses an unknown pin and returns `Ok`, so
+    /// to a sink. The hc sink misses an unknown pin and returns `Ok`, so
     /// shipping would stamp a `Delivered` receipt (and a hear stamp) for a
     /// wake nobody received. The journal row is the durable record.
     #[tokio::test]
@@ -2964,7 +2964,7 @@ mod tests {
         );
         brain.cfg.digest_threshold = 1; // force the flush during this arm
         let (sink, sent) = MockSink::new();
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
         brain.host.unroutable.insert("OperatorPin".into());
         assert!(!brain.host.has_route("OperatorPin"));
         brain
@@ -2995,14 +2995,14 @@ mod tests {
         use crate::subscribe::*;
         let dir = std::env::temp_dir().join(format!("dbrt-human-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // Operator subscribes the human (npub) on the herdr sink.
+        // Operator subscribes the human (npub) on the hc sink.
         let mut store = SubscriptionStore::open(&dir);
         let sub = Subscription {
             id: "human-1".into(),
             identity: Identity::Npub("npub1human".into()),
             scope: Scope::One("w".into()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: Some("proj".into()),
             endpoint: None,
@@ -3023,7 +3023,7 @@ mod tests {
         cfg.budget = sub.budget;
         let mut brain = Brain::new(cfg, host, FileStore::new(&dir), sinks);
         let (sink, sent) = MockSink::new();
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
         brain.dispatch(BrainMsg::Watch("{\"kind\":9}".into())).await;
         assert_eq!(brain.stats.injects, 1, "human wake delivers");
         // Journal row carries the subscriber tag (why --subscriber replays).
@@ -3047,14 +3047,14 @@ mod tests {
         // real hosts and last_wake never advanced on benign transitions.
         let (mut brain, _rx, _tx) = test_brain("statusgate", vec![]);
         brain
-            .dispatch(BrainMsg::HerdrStatus {
+            .dispatch(BrainMsg::PlaneStatus {
                 pin: "p".into(),
                 status: "working".into(),
             })
             .await;
         let first = brain.wake.last_wake_unix;
         brain
-            .dispatch(BrainMsg::HerdrStatus {
+            .dispatch(BrainMsg::PlaneStatus {
                 pin: "p".into(),
                 status: "idle".into(),
             })
@@ -3066,7 +3066,7 @@ mod tests {
         );
         // Same-status repeats never ratchet (static rows stay silent).
         brain
-            .dispatch(BrainMsg::HerdrStatus {
+            .dispatch(BrainMsg::PlaneStatus {
                 pin: "p".into(),
                 status: "idle".into(),
             })
@@ -3133,7 +3133,7 @@ mod tests {
         }
         let n2 = n.clone();
         brain.sinks.add_sink_with_factory(
-            "herdr",
+            "hc",
             Box::new(FailingThenOk {
                 n: n.clone(),
                 fail: true,
@@ -3150,10 +3150,10 @@ mod tests {
             .deliver_prompts(vec![("p".into(), "[doorbell] wake".into())])
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(brain.sinks.parked("herdr").await, "failed adapter parks");
+        assert!(brain.sinks.parked("hc").await, "failed adapter parks");
         assert!(
             matches!(
-                brain.sinks.send("herdr", "p", "[doorbell] two").await,
+                brain.sinks.send("hc", "p", "[doorbell] two").await,
                 SendOutcome::Shed { .. }
             ),
             "parked sink sheds"
@@ -3172,11 +3172,11 @@ mod tests {
             "restarted adapter delivered the requeued intent, got {}",
             n.load(std::sync::atomic::Ordering::SeqCst)
         );
-        assert!(!brain.sinks.parked("herdr").await, "sink revived");
+        assert!(!brain.sinks.parked("hc").await, "sink revived");
         // And it accepts new intents again (no longer parked).
         assert!(
             matches!(
-                brain.sinks.send("herdr", "p", "[doorbell] three").await,
+                brain.sinks.send("hc", "p", "[doorbell] three").await,
                 SendOutcome::Queued
             ),
             "revived sink queues"
@@ -3192,20 +3192,20 @@ mod tests {
         brain.sinks = SinkManager::new(deg_tx);
         let (mut sink, _sent) = MockSink::new();
         sink.fail_after = Some(0);
-        brain.sinks.add_sink("herdr", Box::new(sink));
+        brain.sinks.add_sink("hc", Box::new(sink));
         brain
             .deliver_prompts(vec![("p".into(), "[doorbell] wake".into())])
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(brain.sinks.parked("herdr").await);
+        assert!(brain.sinks.parked("hc").await);
         brain
             .dispatch(BrainMsg::Degraded {
-                source: "sink:herdr".into(),
+                source: "sink:hc".into(),
                 reason: "delivery failed: endpoint down".into(),
             })
             .await;
         assert!(
-            brain.sinks.parked("herdr").await,
+            brain.sinks.parked("hc").await,
             "no factory: stays parked"
         );
     }

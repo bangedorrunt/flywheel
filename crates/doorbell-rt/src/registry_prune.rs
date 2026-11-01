@@ -4,7 +4,7 @@
 //!
 //! The reaper it replaces lives inside `FileHost` and reads the clock, the audit
 //! log, and two mutable maps. That coupling is why the rule it got wrong was hard
-//! to see: the decision itself is a pure function of (rows, what herdr answered,
+//! to see: the decision itself is a pure function of (rows, what hc answered,
 //! how many times we have seen this), and nothing about it needs a host.
 //!
 //! So the decision lives here, pure, and `FileHost` keeps only the plumbing. The
@@ -17,14 +17,14 @@
 //! evidence that it lives.**
 //!
 //! Live on 2026-09-28 the injection picture read `pins: 7, panes_seen: 2,
-//! panes_missing: 13` — so **13 of 20 rows (65%)** had a pane herdr did not list. A
-//! pruner keyed on "pane not in herdr" would delete two thirds of the routing table
-//! on its first sweep, and would do it precisely when herdr is unhealthy, which is
+//! panes_missing: 13` — so **13 of 20 rows (65%)** had a pane hc did not list. A
+//! pruner keyed on "pane not in hc" would delete two thirds of the routing table
+//! on its first sweep, and would do it precisely when hc is unhealthy, which is
 //! exactly when the table matters most.
 //!
 //! Three categories, three rules:
 //!
-//! 1. **Pane listed by herdr** — alive. Confirmation count resets to zero.
+//! 1. **Pane listed by hc** — alive. Confirmation count resets to zero.
 //! 2. **Row has an EMPTY `pane`** — never pruned. A pane-less row resolves by
 //!    LABEL, which is the legacy shape that still works; `prompt_hop_keeps_the_
 //!    label_when_the_row_has_no_pane` exists for exactly this. The reaper being
@@ -34,8 +34,8 @@
 //! 3. **Pane non-empty and NOT listed** — accumulate one CONFIRMATION. Prune only
 //!    after `required` consecutive observations.
 //!
-//! And the outer guard: **if herdr answered with nothing at all, there is no
-//! evidence, so nothing is pruned and nothing is even counted.** A herdr restart, a
+//! And the outer guard: **if hc answered with nothing at all, there is no
+//! evidence, so nothing is pruned and nothing is even counted.** An hc restart, a
 //! transient API failure and a genuinely empty session are indistinguishable from
 //! the outside, and all three must be treated as "do not know".
 //!
@@ -43,7 +43,7 @@
 //!
 //! The reaper being replaced used `STALE_PANE_GRACE_SECS` — a wall-clock window.
 //! A time window is a PROXY for "we have seen this repeatedly", and it is wrong in
-//! both directions: one herdr outage that outlasts the window prunes a live fleet,
+//! both directions: one hc outage that outlasts the window prunes a live fleet,
 //! while a pane that dies and returns within the window is never pruned. Counting
 //! consecutive observations measures the thing itself. The clock still belongs to
 //! the host; this function takes the count as an input.
@@ -59,7 +59,7 @@
 use bbtree::unsync::{BBTreeMap as BTreeMap, BBTreeSet as BTreeSet};
 
 /// How many consecutive observations of a vanished pane are required before a row
-/// is pruned. Three is enough to ride out a herdr restart without being slow to
+/// is pruned. Three is enough to ride out an hc restart without being slow to
 /// notice a pane that is genuinely gone.
 pub const REQUIRED_CONFIRMATIONS: u32 = 3;
 
@@ -74,7 +74,7 @@ pub struct Row {
 /// What a prune decided to keep, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fate {
-    /// herdr listed the pane on this observation.
+    /// hc listed the pane on this observation.
     Alive,
     /// The row has no pane recorded, so it resolves by label. Never pruned.
     LabelRouted,
@@ -82,7 +82,7 @@ pub enum Fate {
     Unconfirmed,
     /// Pane not listed `required` times running. Positive evidence of death.
     Pruned,
-    /// herdr answered nothing, so nothing was learned. Kept AND uncounted.
+    /// hc answered nothing, so nothing was learned. Kept AND uncounted.
     NoEvidence,
 }
 
@@ -115,9 +115,9 @@ impl Decision {
 }
 
 /// The one rule: a vanished pane is confirmed dead only by REPEATED observation
-/// while herdr is demonstrably answering.
+/// while hc is demonstrably answering.
 ///
-/// `known_panes` empty means herdr did not answer. That is not "every pane is
+/// `known_panes` empty means hc did not answer. That is not "every pane is
 /// gone"; it is "we do not know", and the two must never be conflated — which is
 /// the entire 65% hazard in one branch.
 pub fn decide(
@@ -159,7 +159,7 @@ pub fn decide(
                     pin: row.pin.clone(),
                     pane: row.pane.clone(),
                     confirmations: *seen,
-                    why: "pane absent from herdr across consecutive confirmations",
+                    why: "pane absent from hc across consecutive confirmations",
                 });
                 confirmations.remove(&row.pin);
                 Fate::Pruned
@@ -193,18 +193,18 @@ mod tests {
         ]
     }
 
-    fn herdr(panes: &[&str]) -> BTreeSet<String> {
+    fn hc(panes: &[&str]) -> BTreeSet<String> {
         panes.iter().map(|s| (*s).to_string()).collect()
     }
 
     /// THE FENCE THAT STOPS THE 65% WIPE, and the one the user insisted must exist
-    /// BEFORE the pruning code. A herdr restart answers with an empty pane list
+    /// BEFORE the pruning code. An hc restart answers with an empty pane list
     /// three times running; not one row may be pruned, and not one confirmation
     /// counter may move. Without the second half this test also passes for a
     /// pruner that prunes nothing ever, which is the failure I have been closing all
     /// session in the other direction.
     #[test]
-    fn a_herdr_restart_prunes_nothing_and_counts_nothing() {
+    fn a_plane_restart_prunes_nothing_and_counts_nothing() {
         let mut c: BTreeMap<String, u32> = BTreeMap::new();
         for sweep in 1..=5 {
             let d = decide(&rows(), &Default::default(), &mut c, REQUIRED_CONFIRMATIONS);
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn three_consecutive_confirmations_of_a_vanished_pane_prune() {
         let mut c: BTreeMap<String, u32> = BTreeMap::new();
-        let known = herdr(&["w9:p1"]);
+        let known = hc(&["w9:p1"]);
 
         let d1 = decide(&rows(), &known, &mut c, REQUIRED_CONFIRMATIONS);
         assert_eq!(
@@ -277,7 +277,7 @@ mod tests {
     fn a_row_with_no_pane_is_never_pruned_however_long_it_is_unlisted() {
         let mut c: BTreeMap<String, u32> = BTreeMap::new();
         for _ in 0..50 {
-            let d = decide(&rows(), &herdr(&["w9:p1"]), &mut c, REQUIRED_CONFIRMATIONS);
+            let d = decide(&rows(), &hc(&["w9:p1"]), &mut c, REQUIRED_CONFIRMATIONS);
             assert_eq!(
                 d.fate_of("LabelPin"),
                 Some(Fate::LabelRouted),
@@ -299,12 +299,12 @@ mod tests {
     #[test]
     fn a_pane_that_returns_resets_its_confirmation_count() {
         let mut c: BTreeMap<String, u32> = BTreeMap::new();
-        let gone = herdr(&["w9:p1"]);
+        let gone = hc(&["w9:p1"]);
         let _ = decide(&rows(), &gone, &mut c, REQUIRED_CONFIRMATIONS);
         let _ = decide(&rows(), &gone, &mut c, REQUIRED_CONFIRMATIONS);
         assert_eq!(c.get("DoomedPin").copied(), Some(2), "two sightings banked");
 
-        let back = herdr(&["w9:p1", "w11:p1"]);
+        let back = hc(&["w9:p1", "w11:p1"]);
         let d = decide(&rows(), &back, &mut c, REQUIRED_CONFIRMATIONS);
         assert_eq!(d.fate_of("DoomedPin"), Some(Fate::Alive));
         assert!(
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn a_prune_leaves_a_tombstone_naming_the_pane_and_why() {
         let mut c: BTreeMap<String, u32> = BTreeMap::new();
-        let known = herdr(&["w9:p1"]);
+        let known = hc(&["w9:p1"]);
         let mut last = Decision {
             fates: vec![],
             tombstones: vec![],
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn the_confirmation_requirement_is_caller_controlled() {
         let mut c: BTreeMap<String, u32> = BTreeMap::new();
-        let known = herdr(&["w9:p1"]);
+        let known = hc(&["w9:p1"]);
         let d1 = decide(&rows(), &known, &mut c, 1);
         assert_eq!(
             d1.fate_of("DoomedPin"),

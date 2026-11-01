@@ -8,8 +8,8 @@
 pub enum BrainMsg {
     /// Plane-S watch NDJSON line (`{kind,id,tags,content,created_at}`).
     Watch(String),
-    /// Herdr pane status change for one pin.
-    HerdrStatus { pin: String, status: String },
+    /// Hc pane status change for one pin.
+    PlaneStatus { pin: String, status: String },
     /// Watch child died; supervisor must restart, never exit (GS-007).
     Died,
     /// 1s sweep beat (`since` RFC3339, `now` unix secs).
@@ -62,7 +62,7 @@ pub enum AskReply {
 /// Full; Watch stays try_send-only to avoid parking the reader on every line).
 ///
 /// Call only from **non-async** threads — `blocking_send` panics inside a
-/// tokio runtime (see Host herdr-status path).
+/// tokio runtime (see Host hc-status path).
 pub fn deliver_died_blocking(tx: &tokio::sync::mpsc::Sender<BrainMsg>) {
     let _ = tx.blocking_send(BrainMsg::Died);
 }

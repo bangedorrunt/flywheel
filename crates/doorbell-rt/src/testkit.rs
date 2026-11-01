@@ -10,8 +10,8 @@
 //! The marker is the point. toron already refuses to guess a dev build from
 //! the binary's path (`CACHEDIR.TAG` above it); a child is under test when the
 //! harness SAYS so. So this sets the marker and then every root the child
-//! resolves, all inside one temp root, plus a herdr socket path that does not
-//! exist. A hermetic test cannot dial the real herdr through it.
+//! resolves, all inside one temp root, plus an hc socket path that does not
+//! exist. A hermetic test cannot dial the real hc through it.
 //!
 //! Lives here because it is the only crate both `flywheel` and `doorbell-cli`
 //! depend on, and the workspace does not grow a crate for test support.
@@ -36,7 +36,7 @@ pub fn harness_root() -> PathBuf {
 }
 
 /// Put `cmd` under test: the marker, every root it resolves, and no ambient
-/// daemon or herdr socket.
+/// daemon or terminal socket.
 ///
 /// A test that needs a different root sets that variable AFTER this call; the
 /// later `env` wins and the marker still keeps the child off the operator's
@@ -63,7 +63,7 @@ pub fn apply_test_env(cmd: &mut Command) -> &mut Command {
         .env("TMPDIR", &root)
         // A path under the sandbox that was never bound: a child that dials it
         // fails here instead of reaching the operator's live multiplexer.
-        .env("HERDR_SOCKET_PATH", root.join("no-herdr.sock"))
+        .env("HC_SOCKET_PATH", root.join("no-hc.sock"))
         .env_remove("TORON_MCP_URL")
 }
 
@@ -88,7 +88,7 @@ mod tests {
             "XDG_DATA_HOME",
             "XDG_CACHE_HOME",
             "TMPDIR",
-            "HERDR_SOCKET_PATH",
+            "HC_SOCKET_PATH",
         ] {
             let value = &envs[var];
             assert!(
@@ -96,7 +96,7 @@ mod tests {
                 "{var} must be inside the harness root, got {value}"
             );
         }
-        assert!(!std::path::Path::new(&envs["HERDR_SOCKET_PATH"]).exists());
+        assert!(!std::path::Path::new(&envs["HC_SOCKET_PATH"]).exists());
         // A removal is RECORDED, not merely absent: the child must see it gone
         // even when the parent never exported it.
         assert_eq!(

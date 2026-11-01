@@ -1,6 +1,6 @@
 // governed-by: ADR-0012
 //! Host seams — everything flywheel-shaped the brain needs, behind traits.
-//! bd-asr2.5 binds the real `workspace::tick`, spawn registry, herdr prompt,
+//! bd-asr2.5 binds the real `workspace::tick`, spawn registry, hc prompt,
 //! and toron mailbox here without touching brain logic.
 
 use crate::msg::BrainMsg;
@@ -99,7 +99,7 @@ pub trait Host: Send {
     }
     /// Does `pin` have a prompt route — a pane/target the sink can reach?
     /// bd-bk9t: a digest batch for a pin with no route has nowhere to be
-    /// shipped. The herdr sink MISSES an unknown pin and still returns
+    /// shipped. The hc sink MISSES an unknown pin and still returns
     /// `Ok`, so flushing would stamp a `Delivered` receipt (and a hear
     /// stamp) for a wake nobody received. The brain keeps those batches
     /// journal-recorded only — read them with `flywheel doorbell digest`.
@@ -193,7 +193,7 @@ impl Host for MockHost {
         self.tick_log.push(format!("{msg:?}"));
         // Record the new status at tick time (mirrors FileHost/RtHost):
         // a pre-tick `prev_status` read sees the previous value.
-        if let BrainMsg::HerdrStatus { pin, status } = msg {
+        if let BrainMsg::PlaneStatus { pin, status } = msg {
             self.statuses.insert(pin.clone(), status.clone());
         }
         self.script.pop_front().unwrap_or_default()
@@ -251,7 +251,7 @@ impl CoreReducer {
         use doorbell_core::{DoorbellAction, DoorbellMsg};
         let core_msg = match msg {
             BrainMsg::Watch(line) => DoorbellMsg::WatchNdjson { line: line.clone() },
-            BrainMsg::HerdrStatus { pin, status } => DoorbellMsg::HerdrStatus {
+            BrainMsg::PlaneStatus { pin, status } => DoorbellMsg::PlaneStatus {
                 pin: pin.clone(),
                 status: status.clone(),
             },

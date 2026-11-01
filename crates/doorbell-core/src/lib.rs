@@ -2,7 +2,7 @@
 //! Doorbell pure core (ADR-0012 Phase 0): ring rules, queue coalesce, inject
 //! gate, watch/inbox parsing, and the Elm tick. Moved verbatim from
 //! `src/doorbell.rs` (pure fns, no signature changes) and `src/doorbell_tick.rs`
-//! (verbatim). No I/O, no `&mut` across the API, no tokio/toron/herdr/resonate.
+//! (verbatim). No I/O, no `&mut` across the API, no tokio/toron/hc/resonate.
 //! The effect layer (`cmd_internal_doorbell`, pid files, supervision) stays in
 //! flywheel. Tests assert `same Msg log -> byte-identical Action sequence`.
 
@@ -14,7 +14,7 @@ pub mod wake_core;
 /// home); these paths keep existing users resolving while call sites
 /// migrate to `wake_core::`.
 pub use wake_core::{
-    GateDecision, InjectGate, PresenceVerdict, RouteInput, inject_gate, inject_gate_for_herdr,
+    GateDecision, InjectGate, PresenceVerdict, RouteInput, inject_gate, inject_gate_for_plane,
     parse_presence_word,
 };
 
@@ -91,10 +91,10 @@ pub fn classify(ev: &RingInput) -> Option<EventClass> {
 /// State-level injectability (queue drain transitions only). Kept
 /// urgency-agnostic on purpose: drain is about leaving working for an
 /// await-signal state, not about one line's urgency. Per-wake decisions
-/// MUST use `inject_gate` / `inject_gate_for_herdr` instead.
+/// MUST use `inject_gate` / `inject_gate_for_plane` instead.
 // governed-by: bd-zawk
-pub fn should_inject(herdr_status: &str) -> bool {
-    matches!(herdr_status, "idle" | "done" | "blocked")
+pub fn should_inject(plane_status: &str) -> bool {
+    matches!(plane_status, "idle" | "done" | "blocked")
 }
 
 /// Drain when leaving a non-injectable state for an injectable one.
@@ -551,7 +551,7 @@ pub fn doorbell_line_with_event(class: EventClass, hint: &str, event_id: &str) -
     }
 }
 
-/// Parse `--status pin=idle` pairs for the herdr-mock (`__doorbell --once`).
+/// Parse `--status pin=idle` pairs for the hc-mock (`__doorbell --once`).
 pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
     let (pin, st) = s.split_once('=')?;
     if pin.is_empty() || st.is_empty() {
@@ -561,7 +561,7 @@ pub fn parse_status_pair(s: &str) -> Option<(String, String)> {
 }
 
 // ---- Elm tick (moved verbatim from src/doorbell_tick.rs) ------------------
-// Pure `tick(Model,Msg)->(Model,Actions)` — no I/O, no &mut, no herdr/toron.
+// Pure `tick(Model,Msg)->(Model,Actions)` — no I/O, no &mut, no hc/toron.
 
 /// One doorbell message. Every bus/inbox/status edge is a Msg; nothing
 /// happens outside `tick`.
@@ -576,8 +576,8 @@ pub enum DoorbellMsg {
         rows: Vec<serde_json::Value>,
         pin: String,
     },
-    /// Herdr status change for one pin.
-    HerdrStatus { pin: String, status: String },
+    /// Hc status change for one pin.
+    PlaneStatus { pin: String, status: String },
     /// Captain-bound fact (no alias info here — honest FactMiss).
     Fact { summary: String },
     /// Periodic tick (60s cadence in the live dispatcher); drives the
@@ -631,7 +631,7 @@ pub enum DoorbellAction {
 pub struct DoorbellModel {
     /// LWW queues per pin (working panes hold their wake here).
     pub queues: BTreeMap<String, Vec<String>>,
-    /// Last-known herdr status per pin.
+    /// Last-known hc status per pin.
     pub statuses: BTreeMap<String, String>,
     /// Pins (+npubs) this dispatcher owns.
     pub index: SelfIndex,
@@ -641,7 +641,7 @@ pub struct DoorbellModel {
     /// would reshape decided rows and break the .6 parity gate.
     pub budgets: BTreeMap<String, PinBudget>,
     /// Pins the index knows but cannot route to: subscribed identities with
-    /// no spawn row, so no pane and no herdr target (bd-bk9t). Their wakes
+    /// no spawn row, so no pane and no hc target (bd-bk9t). Their wakes
     /// must NOT park in `queues` — that map only drains on a
     /// `working -> injectable` [`is_drain_transition`], and a pane-less pin
     /// never produces one, so the entry would sit in RAM forever and die
@@ -757,7 +757,7 @@ fn expand_inbox_rows(v: &serde_json::Value) -> Vec<&serde_json::Value> {
     }
 }
 
-/// Pure, total, deterministic: no I/O, no &mut, no herdr/toron calls.
+/// Pure, total, deterministic: no I/O, no &mut, no hc/toron calls.
 pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<DoorbellAction>) {
     let mut next = model.clone();
     let mut actions = Vec::new();
@@ -798,7 +798,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 route_or_queue(&mut next, &mut actions, pin, line_out);
             }
         }
-        DoorbellMsg::HerdrStatus { pin, status } => {
+        DoorbellMsg::PlaneStatus { pin, status } => {
             let from = next
                 .statuses
                 .get(pin)
@@ -840,7 +840,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
 
 /// Idle/done panes get a Prompt now; blocked+urgent prompts while
 /// blocked+routine digests with a reason (bd-zawk G6); working panes queue
-/// (drained on the next working -> idle|done|blocked HerdrStatus).
+/// (drained on the next working -> idle|done|blocked PlaneStatus).
 fn route_or_queue(
     next: &mut DoorbellModel,
     actions: &mut Vec<DoorbellAction>,
@@ -853,10 +853,10 @@ fn route_or_queue(
         .map(String::as_str)
         .unwrap_or("unknown");
     // governed-by: bd-zawk — per-wake verdict via the typed InjectGate so the
-    // herdr-string path agrees with the presence-verdict path by construction.
+    // hc-string path agrees with the presence-verdict path by construction.
     // blocked+urgent prompts; blocked+routine digests with a reason.
     if should_inject(status) {
-        match inject_gate_for_herdr(status, is_urgent_line(&line)) {
+        match inject_gate_for_plane(status, is_urgent_line(&line)) {
             InjectGate::Inject => {
                 actions.push(DoorbellAction::Prompt {
                     pin: pin.to_string(),
@@ -874,7 +874,7 @@ fn route_or_queue(
     } else if next.unroutable.contains(pin) {
         // bd-bk9t: no pane means no drain is possible, ever. Queueing here
         // would be a memory leak wearing a delivery intent — the RAM-only
-        // queue is lost on restart and no `HerdrStatus` will ever drain it.
+        // queue is lost on restart and no `PlaneStatus` will ever drain it.
         // The wake is real and the human is the addressee, so it goes to
         // the digest with a named reason instead.
         actions.push(DoorbellAction::Digest {
@@ -888,7 +888,7 @@ fn route_or_queue(
         // turn; routine lines still queue for the drain. Blocked never
         // reaches here (injectable above), so its shape is untouched.
         if matches!(
-            inject_gate_for_herdr(status, is_urgent_line(&line)),
+            inject_gate_for_plane(status, is_urgent_line(&line)),
             InjectGate::Inject
         ) {
             actions.push(DoorbellAction::Prompt {
@@ -965,22 +965,22 @@ mod tests {
     fn inject_gate_blocked_urgent_injects_routine_digests() {
         // bd-zawk G6: one typed gate for both paths — blocked+urgent injects,
         // blocked+routine digests with a reason, never a silent drop.
-        assert_eq!(inject_gate_for_herdr("blocked", true), InjectGate::Inject);
+        assert_eq!(inject_gate_for_plane("blocked", true), InjectGate::Inject);
         assert!(matches!(
-            inject_gate_for_herdr("blocked", false),
+            inject_gate_for_plane("blocked", false),
             InjectGate::Digest(_)
         ));
-        assert_eq!(inject_gate_for_herdr("idle", false), InjectGate::Inject);
-        assert_eq!(inject_gate_for_herdr("done", false), InjectGate::Inject);
+        assert_eq!(inject_gate_for_plane("idle", false), InjectGate::Inject);
+        assert_eq!(inject_gate_for_plane("done", false), InjectGate::Inject);
         assert!(matches!(
-            inject_gate_for_herdr("working", false),
+            inject_gate_for_plane("working", false),
             InjectGate::Digest(_)
         ));
         assert!(matches!(
-            inject_gate_for_herdr("unknown", true),
+            inject_gate_for_plane("unknown", true),
             InjectGate::Digest(_)
         ));
-        // Verdict path agrees with the herdr-string path by construction.
+        // Verdict path agrees with the hc-string path by construction.
         assert_eq!(inject_gate(PresenceVerdict::Busy, true), InjectGate::Inject);
         assert!(matches!(
             inject_gate(PresenceVerdict::Busy, false),
@@ -1068,7 +1068,7 @@ mod tests {
         assert_eq!(next.queues.get("BlueRidge").map(Vec::len), Some(1));
         let (next2, actions2) = tick(
             &next,
-            &DoorbellMsg::HerdrStatus {
+            &DoorbellMsg::PlaneStatus {
                 pin: "BlueRidge".into(),
                 status: "idle".into(),
             },
@@ -1225,7 +1225,7 @@ mod tests {
     #[test]
     fn routable_unknown_pin_still_queues_not_digests() {
         // Regression: a spawned pin whose status has not arrived yet is a
-        // *transient* unknown — it will drain when herdr reports. Only the
+        // *transient* unknown — it will drain when hc reports. Only the
         // index-marked pane-less kind is digest-bound.
         let mut model = model_with("BlueRidge");
         model.statuses.remove("BlueRidge");

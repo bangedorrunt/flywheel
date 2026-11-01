@@ -1735,7 +1735,7 @@ pub fn render_autostart(
             .replace("DOORBELL_TORON_MCP_URL_KEY", "TORON_MCP_URL")
             .replace("DOORBELL_SERVE_ARGS", &args.join("\n        "))
             // bd-24mm: launchd gives the job no HOME and a PATH without
-            // ~/.local/bin, so the daemon cannot resolve herdr and its
+            // ~/.local/bin, so the daemon cannot resolve hc and its
             // fail-closed boot gate (bd-fuql) refuses to host anything. The
             // installer resolves both bins while HOME is still available and
             // names them here; the daemon's env override wins verbatim. A bin
@@ -1746,11 +1746,11 @@ pub fn render_autostart(
                 doorbell_rt::binpath::TORON_BIN_ENV,
             )
             .replace(
-                "DOORBELL_HERDR_BIN_KEY",
-                doorbell_rt::binpath::HERDR_BIN_ENV,
+                "DOORBELL_HC_BIN_KEY",
+                doorbell_rt::binpath::HC_BIN_ENV,
             )
             .replace("DOORBELL_TORON_BIN_VALUE", &resolved_bin_value("toron"))
-            .replace("DOORBELL_HERDR_BIN_VALUE", &resolved_bin_value("herdr"))
+            .replace("DOORBELL_HC_BIN_VALUE", &resolved_bin_value("hc"))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2359,7 +2359,7 @@ mod tests {
     }
 
     /// bd-24mm: launchd runs the job with no HOME and a PATH that does not
-    /// include ~/.local/bin, so the daemon cannot resolve herdr and its
+    /// include ~/.local/bin, so the daemon cannot resolve hc and its
     /// fail-closed boot gate (bd-fuql) refuses to host anything. The unit
     /// must carry the absolute bin paths.
     #[test]
@@ -2385,7 +2385,7 @@ mod tests {
         );
         for key in [
             doorbell_rt::binpath::TORON_BIN_ENV,
-            doorbell_rt::binpath::HERDR_BIN_ENV,
+            doorbell_rt::binpath::HC_BIN_ENV,
         ] {
             assert!(
                 body.contains(key),
@@ -2395,9 +2395,9 @@ mod tests {
         // The placeholder tokens must be resolved, not shipped verbatim.
         for token in [
             "DOORBELL_TORON_BIN_KEY",
-            "DOORBELL_HERDR_BIN_KEY",
+            "DOORBELL_HC_BIN_KEY",
             "DOORBELL_TORON_BIN_VALUE",
-            "DOORBELL_HERDR_BIN_VALUE",
+            "DOORBELL_HC_BIN_VALUE",
         ] {
             assert!(!body.contains(token), "{token} placeholder resolved");
         }

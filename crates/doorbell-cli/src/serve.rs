@@ -32,7 +32,7 @@ async fn host_workspace(
     let bins = resolved_bins();
     let mut fcfg = FileHostConfig::new(fw_state.clone(), project.clone(), workspace.clone());
     fcfg.toron_bin = bins.toron.clone();
-    fcfg.herdr_bin = bins.herdr.clone();
+    fcfg.plane_bin = bins.hc.clone();
     // mcc9: the backpressure window is host policy, read once here.
     fcfg.wake_brain_wait = doorbell_rt::wake_brain::wait_from_env(
         std::env::var(doorbell_rt::wake_brain::WAIT_ENV)
@@ -57,7 +57,7 @@ async fn host_workspace(
             "doorbell serve: {project}/{workspace} — comms flag off: the legacy typer is gone; this host types nothing"
         );
     }
-    sinks.add_sink_with_factory("herdr", Box::new(doorbell_rt::NoTextSink::new()), || {
+    sinks.add_sink_with_factory("hc", Box::new(doorbell_rt::NoTextSink::new()), || {
         Box::new(doorbell_rt::NoTextSink::new())
     });
     // bd-8ulu: a durable human wake with zero swarm needs somewhere to land.
@@ -154,7 +154,7 @@ struct AppState {
     /// bd-2o1v: hosting is dynamic (auto-host on subscribe), so the table
     /// is shared mutably; handlers snapshot the keys under the lock.
     hosted: Hosts,
-    /// bd-o86s: the served /health snapshot. `health_body` shells herdr and
+    /// bd-o86s: the served /health snapshot. `health_body` shells hc and
     /// greps hundreds of journal/audit files per call (seconds at fleet
     /// scale), so handlers serve this cache and a background tick refreshes
     /// it — never compute per request.
@@ -235,27 +235,27 @@ fn hosted_keys_for_health(hosts: &[HostedLoop]) -> Vec<String> {
 /// The external CLIs this daemon execs. Resolved through the shared search
 /// order (`doorbell_rt::binpath`) — under launchd/systemd `PATH` is
 /// `/usr/bin:/bin:/usr/sbin:/sbin`, which holds neither `toron` nor
-/// `herdr`, so a bare name silently breaks the watch child and every
+/// `hc`, so a bare name silently breaks the watch child and every
 /// prompt while the daemon still advertises `mode: hosted`.
 /// `*_resolved=false` keeps the bare name as a last resort (the spawn then
 /// fails visibly) and is reported as `degraded` in `/health`.
 #[derive(Clone)]
 struct Bins {
     toron: String,
-    herdr: String,
+    hc: String,
     toron_resolved: bool,
-    herdr_resolved: bool,
+    hc_resolved: bool,
 }
 
 fn resolved_bins() -> Bins {
-    use doorbell_rt::binpath::{HERDR_BIN_ENV, TORON_BIN_ENV, resolve_cli_or_name};
+    use doorbell_rt::binpath::{HC_BIN_ENV, TORON_BIN_ENV, resolve_cli_or_name};
     let (toron, toron_resolved) = resolve_cli_or_name("toron", TORON_BIN_ENV);
-    let (herdr, herdr_resolved) = resolve_cli_or_name("herdr", HERDR_BIN_ENV);
+    let (hc, hc_resolved) = resolve_cli_or_name("hc", HC_BIN_ENV);
     Bins {
         toron: toron.to_string_lossy().into_owned(),
-        herdr: herdr.to_string_lossy().into_owned(),
+        hc: hc.to_string_lossy().into_owned(),
         toron_resolved,
-        herdr_resolved,
+        hc_resolved,
     }
 }
 
@@ -476,16 +476,16 @@ fn row_workspace(sub: &doorbell_rt::subscribe::Subscription) -> Option<String> {
     sub.scope.workspaces().into_iter().next()
 }
 
-/// Is the row's workspace still live, per herdr (bd-oub3)?
+/// Is the row's workspace still live, per hc (bd-oub3)?
 ///
 /// Two scope shapes exist, and the id says which wrote the row:
 /// - a spawn row names the spawn's OWN workspace label (`elm-comms-kernel`),
-///   which IS a herdr workspace label;
+///   which IS an hc workspace label;
 /// - a CLI row names a stable per-project scope (`flywheel-<project>`), which
-///   is NOT a herdr label — the project's own workspace is what says the
+///   is NOT an hc label — the project's own workspace is what says the
 ///   project lives.
 ///
-/// A row whose workspace herdr no longer lists is DEAD, whatever its id and
+/// A row whose workspace hc no longer lists is DEAD, whatever its id and
 /// however old its journal: the workspace is the ground truth.
 fn row_workspace_live(
     sub: &doorbell_rt::subscribe::Subscription,
@@ -510,7 +510,7 @@ fn row_workspace_live(
 
 /// Subscription rows to reap (bd-oub3).
 ///
-/// The workspace is the ground truth: herdr enumerates the live workspaces,
+/// The workspace is the ground truth: hc enumerates the live workspaces,
 /// so a row whose workspace is gone is dead whatever its id and however old
 /// its journal. The rule this replaces considered only `spawn-` ids AND a
 /// week of journal silence, so a `cli-` row — what the CLI writes — was
@@ -518,10 +518,10 @@ fn row_workspace_live(
 /// per dead workspace, the toron daemon ran out of descriptors, and it began
 /// refusing LIVE subscribers.
 ///
-/// `live_workspaces` is `None` when herdr did not answer. That is NOT "every
+/// `live_workspaces` is `None` when hc did not answer. That is NOT "every
 /// workspace is gone", it is "we do not know": nothing is pruned by the
 /// workspace rule then, and the journal age decides instead — the only rule
-/// that can act on a workspace herdr cannot answer for.
+/// that can act on a workspace hc cannot answer for.
 fn reap_candidates(
     subs: &[doorbell_rt::subscribe::Subscription],
     live_workspaces: Option<&std::collections::BTreeSet<String>>,
@@ -541,13 +541,13 @@ fn reap_candidates(
         .collect()
 }
 
-/// The live herdr workspace labels, or `None` when herdr did not answer.
+/// The live hc workspace labels, or `None` when hc did not answer.
 ///
-/// `None` is "we do not know" (a herdr restart, a timeout, an unparseable
+/// `None` is "we do not know" (an hc restart, a timeout, an unparseable
 /// answer) and never "every workspace is gone" — the caller falls back to the
 /// journal age rather than pruning on absence of evidence.
-fn herdr_workspace_labels(herdr_bin: &str) -> Option<std::collections::BTreeSet<String>> {
-    let out = doorbell_rt::file_host::run_cli(herdr_bin, &["workspace", "list"], 5)?;
+fn plane_workspace_labels(plane_bin: &str) -> Option<std::collections::BTreeSet<String>> {
+    let out = doorbell_rt::file_host::run_cli(plane_bin, &["workspace", "list"], 5)?;
     if !out.status.success() {
         return None;
     }
@@ -940,20 +940,20 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let started = std::time::Instant::now();
     let log_path = cfg.log_file();
     // Precondition, named loudly: the daemon execs `toron` (bus watch +
-    // inbox fetch) and `herdr` (prompt sink). Under launchd/systemd neither
+    // inbox fetch) and `hc` (prompt sink). Under launchd/systemd neither
     // is on PATH; resolving them here to a real absolute path is what keeps
     // the ring alive, and the miss is stated once instead of being inferred
     // from a wake that never arrives.
     let bins = resolved_bins();
     eprintln!(
-        "doorbell serve: cli toron={} (resolved={}) herdr={} (resolved={})",
-        bins.toron, bins.toron_resolved, bins.herdr, bins.herdr_resolved
+        "doorbell serve: cli toron={} (resolved={}) hc={} (resolved={})",
+        bins.toron, bins.toron_resolved, bins.hc, bins.hc_resolved
     );
-    if !bins.toron_resolved || !bins.herdr_resolved {
+    if !bins.toron_resolved || !bins.hc_resolved {
         eprintln!(
-            "doorbell serve: WARNING no `toron`/`herdr` on PATH, beside this binary, or in \
+            "doorbell serve: WARNING no `toron`/`hc` on PATH, beside this binary, or in \
              ~/.cargo/bin, ~/.local/bin, ~/.local/share/mise/shims — wakes will NOT be \
-             delivered; set DOORBELL_TORON_BIN / DOORBELL_HERDR_BIN or install the binaries"
+             delivered; set DOORBELL_TORON_BIN / DOORBELL_HC_BIN or install the binaries"
         );
     }
     // bd-2o1v: `hosted` starts EMPTY — `spawn_host_loop` is the sole writer,
@@ -1237,8 +1237,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
 
 /// Pure boot-gate predicate (bd-fuql): hosting needs BOTH CLIs resolvable.
 /// Tested without spawning anything; `spawn_host_loop` enforces it.
-fn bins_allow_hosting(toron_resolved: bool, herdr_resolved: bool) -> bool {
-    toron_resolved && herdr_resolved
+fn bins_allow_hosting(toron_resolved: bool, hc_resolved: bool) -> bool {
+    toron_resolved && hc_resolved
 }
 
 /// Spawn one hosted loop (bd-2o1v: shared by boot-time `--host` config and
@@ -1260,18 +1260,18 @@ fn spawn_host_loop(
         return;
     }
     // bd-fuql: fail-closed boot gate — hosting with an unresolvable toron
-    // or herdr CLI is a deaf plane (/health would merely decorate it with
+    // or terminal CLI is a deaf plane (/health would merely decorate it with
     // cli_unresolved while no wake can land). Refuse here: both boot config
     // and reconcile auto-host funnel through this fn. The operator pins
-    // real bins via DOORBELL_TORON_BIN / DOORBELL_HERDR_BIN.
+    // real bins via DOORBELL_TORON_BIN / DOORBELL_HC_BIN.
     let early_bins = resolved_bins();
-    if !bins_allow_hosting(early_bins.toron_resolved, early_bins.herdr_resolved) {
+    if !bins_allow_hosting(early_bins.toron_resolved, early_bins.hc_resolved) {
         let mut missing = Vec::new();
         if !early_bins.toron_resolved {
             missing.push("toron");
         }
-        if !early_bins.herdr_resolved {
-            missing.push("herdr");
+        if !early_bins.hc_resolved {
+            missing.push("hc");
         }
         eprintln!(
             "doorbell serve: REFUSING to host {key} — unresolvable CLI bins ({}) — set {} to absolute binary paths",
@@ -1281,7 +1281,7 @@ fn spawn_host_loop(
                 .map(|b| if *b == "toron" {
                     doorbell_rt::binpath::TORON_BIN_ENV
                 } else {
-                    doorbell_rt::binpath::HERDR_BIN_ENV
+                    doorbell_rt::binpath::HC_BIN_ENV
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -1291,23 +1291,23 @@ fn spawn_host_loop(
     }
     // bd-ba8t: say out loud whether this workspace's wakes have anywhere to
     // land. Silence here is exactly how a hosted-but-deaf plane looks healthy.
-    // Two `herdr agent list` shells per host is acceptable at boot; /health
+    // Two `hc agent list` shells per host is acceptable at boot; /health
     // recomputes it live for readers.
     let inj = doorbell_rt::file_host::injection_picture(
         &cfg.flywheel_state,
         project,
         None,
-        &resolved_bins().herdr,
+        &resolved_bins().hc,
     );
     eprintln!(
-        "doorbell serve: hosting {key} — {} pin(s), {} pane(s) in herdr, {} injectable now",
+        "doorbell serve: hosting {key} — {} pin(s), {} pane(s) in hc, {} injectable now",
         inj.pins, inj.panes_seen, inj.injectable
     );
     if inj.pins > 0 && inj.panes_seen == 0 {
         eprintln!(
-            "doorbell serve: WARNING hosting {key} — {} pin(s) but herdr knows none of their \
+            "doorbell serve: WARNING hosting {key} — {} pin(s) but hc knows none of their \
              panes: NO wake can be injected here (inbox wakes queue/digest instead). Start agents \
-             (`herdr agent start`) or fix the stale registry",
+             (`hc agent start`) or fix the stale registry",
             inj.pins
         );
     }
@@ -1398,12 +1398,12 @@ fn reconcile_once(
     use doorbell_rt::lease;
     use doorbell_rt::subscribe::{Actor, SubscriptionStore};
     let mut store = SubscriptionStore::open(&cfg.flywheel_state);
-    // bd-oub3: herdr enumerates the live workspaces, so a row whose workspace
-    // is gone is dead whatever its id and however old its journal. When herdr
+    // bd-oub3: hc enumerates the live workspaces, so a row whose workspace
+    // is gone is dead whatever its id and however old its journal. When hc
     // does not answer there is no evidence, and the journal age decides.
-    let live = herdr_workspace_labels(&resolved_bins().herdr);
+    let live = plane_workspace_labels(&resolved_bins().hc);
     let reason = if live.is_some() {
-        "workspace gone from herdr".to_string()
+        "workspace gone from hc".to_string()
     } else {
         format!("journal silent > {REAP_AFTER_SECS}s")
     };
@@ -1637,7 +1637,7 @@ fn refresh_health_snapshot(app: &AppState) {
 /// Serve /health from the snapshot (bd-o86s) and NEVER block on a shell.
 ///
 /// The old shape recomputed inline whenever the cache was older than the TTL.
-/// `health_body` runs `herdr`/`toron` as subprocesses, so one loaded host made
+/// `health_body` runs `hc`/`toron` as subprocesses, so one loaded host made
 /// `/health` take longer than any client budget while the daemon was perfectly
 /// healthy — measured live 2026-10-31 during a Rust LTO build: `doorbell
 /// status` said "daemon DOWN — nothing is served" and preflight FAILED on a
@@ -1803,14 +1803,14 @@ fn hosted_workspace(hw: &str) -> Option<&str> {
 }
 
 /// bd-ba8t: the prompt hop's precondition, as counts. A registry pin whose
-/// pane `herdr agent list` does not know can never be injected into, no
+/// pane `hc agent list` does not know can never be injected into, no
 /// matter how well its wake classifies. Summed per hosted PROJECT (the
 /// registry file is project-scoped), not per workspace, so two workspaces of
 /// one project are not double-counted.
 fn hosted_injection(
     fw_state: &std::path::Path,
     hosted: &[String],
-    herdr_bin: &str,
+    plane_bin: &str,
 ) -> doorbell_rt::file_host::InjectionPicture {
     use doorbell_rt::file_host::{InjectionPicture, injection_picture};
     let mut total = InjectionPicture::default();
@@ -1823,7 +1823,7 @@ fn hosted_injection(
             continue;
         }
         projects.push(project);
-        let pic = injection_picture(fw_state, project, None, herdr_bin);
+        let pic = injection_picture(fw_state, project, None, plane_bin);
         total.pins += pic.pins;
         total.panes_seen += pic.panes_seen;
         total.injectable += pic.injectable;
@@ -1834,7 +1834,7 @@ fn hosted_injection(
 
 /// bd-ba8t: when does the ring's LAST hop become structurally impossible?
 /// Only when the daemon hosts something AND the registry names pins AND
-/// herdr knows the panes of NONE of them. A fleet caught mid-work (every
+/// hc knows the panes of NONE of them. A fleet caught mid-work (every
 /// pane `working`) is healthy: the durable queue holds the wake and drains
 /// on the next `idle` transition.
 fn prompt_hop_degraded(
@@ -2170,7 +2170,7 @@ fn health_body(app: &AppState) -> String {
     // (`RestartWatch` rows). Both are read back from the ground-truth
     // surfaces rather than tracked in RAM, so they survive a restart.
     let bins = resolved_bins();
-    if !bins.toron_resolved || !bins.herdr_resolved {
+    if !bins.toron_resolved || !bins.hc_resolved {
         degraded.push("cli_unresolved".to_string());
     }
     let now = doorbell_rt::lease::unix_now();
@@ -2299,9 +2299,9 @@ fn health_body(app: &AppState) -> String {
         degraded.push("watch_restart_loop".to_string());
     }
     // bd-ba8t: the prompt hop needs an INJECTABLE pane, and that precondition
-    // used to be invisible — a hosted daemon with zero herdr agents read
+    // used to be invisible — a hosted daemon with zero hc agents read
     // `degraded: []` while no wake could ever land (gs-044's hard part).
-    let inj = hosted_injection(&app.fw_state, &hosted, &bins.herdr);
+    let inj = hosted_injection(&app.fw_state, &hosted, &bins.hc);
     let no_prompt_hop = prompt_hop_degraded(hosted.len(), &inj);
     if no_prompt_hop {
         degraded.push("no_injectable_panes".to_string());
@@ -2341,13 +2341,13 @@ fn health_body(app: &AppState) -> String {
         "build": build,
         // The CLIs actually exec'd. An operator reading `/health` after a
         // silent ring can see the resolved paths instead of guessing which
-        // `toron`/`herdr` a launchd daemon found.
+        // `toron`/`hc` a launchd daemon found.
         "binaries": {
             "toron": bins.toron,
-            "herdr": bins.herdr,
+            "hc": bins.hc,
             "resolved": {
                 "toron": bins.toron_resolved,
-                "herdr": bins.herdr_resolved,
+                "hc": bins.hc_resolved,
             },
         },
         // last_event_age_s is .event-only (GS-062 split; not hb). Quiet wake
@@ -2392,14 +2392,14 @@ fn health_body(app: &AppState) -> String {
             "presence_age_s": presence_age,
         },
         // bd-ba8t: can a wake land here at all? `prompt_hop` is a word, not a
-        // number to interpret: `no_pane_in_herdr` means every registry pin's
-        // pane is unknown to herdr, so wakes queue/digest and never inject.
+        // number to interpret: `no_pane_in_plane` means every registry pin's
+        // pane is unknown to hc, so wakes queue/digest and never inject.
         "injection": {
             "pins": inj.pins,
             "panes_seen": inj.panes_seen,
             "injectable": inj.injectable,
             "panes_missing": inj.panes_missing,
-            "prompt_hop": if no_prompt_hop { "no_pane_in_herdr" } else { "ok" },
+            "prompt_hop": if no_prompt_hop { "no_pane_in_plane" } else { "ok" },
         },
         "degraded": degraded,
         // bd-5qyt: the tear's SIZE rides beside the flag. `journal_torn_tail`
@@ -3086,7 +3086,7 @@ mod tests {
         assert!(super::straggler_note(&clean).is_none());
     }
     use super::{
-        REAP_AFTER_SECS, any_fresh, bins_allow_hosting, herdr_workspace_labels, inbox_path_down,
+        REAP_AFTER_SECS, any_fresh, bins_allow_hosting, plane_workspace_labels, inbox_path_down,
         reap_candidates, unhosted_subscribed,
     };
 
@@ -3111,7 +3111,7 @@ mod tests {
     fn boot_gate_refuses_unresolved_bins() {
         assert!(bins_allow_hosting(true, true));
         assert!(!bins_allow_hosting(false, true), "toron missing refuses");
-        assert!(!bins_allow_hosting(true, false), "herdr missing refuses");
+        assert!(!bins_allow_hosting(true, false), "hc missing refuses");
         assert!(!bins_allow_hosting(false, false));
     }
 
@@ -3647,7 +3647,7 @@ mod tests {
             identity: Identity::Pin("Buffy".into()),
             scope: Scope::One("flywheel-.".into()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: project.map(str::to_string),
             endpoint: None,
@@ -3678,7 +3678,7 @@ mod tests {
             identity: Identity::Pin("p".into()),
             scope: Scope::One("w".into()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: Some("proj".into()),
             endpoint: None,
@@ -3738,7 +3738,7 @@ mod tests {
             identity: Identity::Pin("p".into()),
             scope: Scope::One("w".into()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: Some("proj".into()),
             endpoint: None,
@@ -3761,11 +3761,11 @@ mod tests {
     /// bd-2o1v: the reaper drops spawn-scoped rows after a week of journal
     /// silence; fresh journals, journal-less workspaces, and operator rows
     /// stay. Missing journal = fresh spawn pre-first-tick, never a corpse.
-    /// bd-ba8t: `herdr agent list` = [] while the registry names pins is the
+    /// bd-ba8t: `hc agent list` = [] while the registry names pins is the
     /// live condition that made the ring unable to land and `/health` look
     /// clean. It must degrade; a busy fleet (panes seen, none free) must not.
     #[test]
-    fn prompt_hop_degrades_only_when_herdr_knows_no_pane() {
+    fn prompt_hop_degrades_only_when_plane_knows_no_pane() {
         use super::prompt_hop_degraded;
         use doorbell_rt::file_host::InjectionPicture;
         let pic = |pins, seen, injectable, missing| InjectionPicture {
@@ -3776,7 +3776,7 @@ mod tests {
         };
         assert!(
             prompt_hop_degraded(1, &pic(3, 0, 0, 3)),
-            "three pins, herdr knows none of their panes"
+            "three pins, hc knows none of their panes"
         );
         assert!(
             !prompt_hop_degraded(1, &pic(3, 3, 0, 0)),
@@ -3793,7 +3793,7 @@ mod tests {
     }
 
     /// bd-oub3: the workspace is the ground truth. A row whose workspace
-    /// herdr no longer lists is dead whatever its id and however old its
+    /// hc no longer lists is dead whatever its id and however old its
     /// journal; a row whose workspace is live survives.
     ///
     /// The rule this replaces reaped only `spawn-` rows whose journal had
@@ -3808,7 +3808,7 @@ mod tests {
             identity: Identity::Pin("p".into()),
             scope: Scope::One(ws.into()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: Some(project.into()),
             endpoint: None,
@@ -3843,23 +3843,23 @@ mod tests {
         );
         assert!(
             !reaped.contains(&"cli-arrival-p".to_string()),
-            "the CLI's arrival scope names a stable per-project name, not a herdr \
+            "the CLI's arrival scope names a stable per-project name, not an hc \
              workspace: the PROJECT's workspace is what says the project lives"
         );
     }
 
-    /// bd-oub3: herdr not answering is "we do not know", not "every workspace
+    /// bd-oub3: hc not answering is "we do not know", not "every workspace
     /// is gone". Nothing is pruned by the workspace rule then; the journal age
     /// decides, and it decides for a CLI row too.
     #[test]
-    fn no_herdr_answer_falls_back_to_the_journal_age_for_every_row() {
+    fn no_plane_answer_falls_back_to_the_journal_age_for_every_row() {
         use doorbell_rt::subscribe::*;
         let row = |id: &str, ws: &str| Subscription {
             id: id.into(),
             identity: Identity::Pin("p".into()),
             scope: Scope::One(ws.into()),
             filter: Filter::default(),
-            sink: SinkKind::Herdr,
+            sink: SinkKind::Hc,
             budget: Budget::default_530(),
             project: Some("proj".into()),
             endpoint: None,
@@ -3880,20 +3880,20 @@ mod tests {
         assert_eq!(
             reaped,
             vec!["cli-old-p".to_string(), "spawn-old-p".to_string()],
-            "with no herdr answer only the journal age decides — and it decides \
+            "with no hc answer only the journal age decides — and it decides \
              for a CLI row as well"
         );
     }
 
-    /// bd-oub3: herdr's answer is read in its own shape. A wrong parse would
+    /// bd-oub3: hc's answer is read in its own shape. A wrong parse would
     /// read as "no workspaces" and fall back to the journal age, which is
     /// safe — but a parse that invents labels would prune live rows, so the
     /// shape is pinned here.
     #[test]
-    fn herdr_workspace_labels_reads_the_live_labels_or_reports_no_evidence() {
-        let dir = std::env::temp_dir().join(format!("db-herdr-ws-{}", std::process::id()));
+    fn plane_workspace_labels_reads_the_live_labels_or_reports_no_evidence() {
+        let dir = std::env::temp_dir().join(format!("db-hc-ws-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("herdr");
+        let script = dir.join("hc");
         std::fs::write(
             &script,
             "#!/bin/sh\nif [ \"$1\" = \"workspace\" ]; then \
@@ -3907,18 +3907,18 @@ mod tests {
             let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
         }
         let bin = script.to_string_lossy().into_owned();
-        let labels = herdr_workspace_labels(&bin).expect("herdr answered");
+        let labels = plane_workspace_labels(&bin).expect("hc answered");
         assert_eq!(
             labels,
             ["one".to_string(), "two".to_string()]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<String>>()
         );
-        // An answer that is not herdr's shape is NO EVIDENCE, never an empty
+        // An answer that is not hc's shape is NO EVIDENCE, never an empty
         // set that would read as "every workspace is gone".
         assert!(
-            herdr_workspace_labels("/nonexistent-herdr-binary").is_none(),
-            "a herdr that cannot be run reports no evidence"
+            plane_workspace_labels("/nonexistent-hc-binary").is_none(),
+            "an hc that cannot be run reports no evidence"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4000,20 +4000,20 @@ mod tests {
         );
 
         // Another workspace's rows are not this host's business, and a
-        // herdr row never becomes a webhook adapter.
+        // hc row never becomes a webhook adapter.
         let elsewhere = row(
             "e",
             SinkKind::Webhook,
             Some("http://127.0.0.1:19100/wake"),
             "other",
         );
-        let herdr = row(
+        let hc = row(
             "f",
-            SinkKind::Herdr,
+            SinkKind::Hc,
             Some("http://127.0.0.1:19200/wake"),
             "w",
         );
-        let (regs, refused) = super::webhook_registrations(&[elsewhere, herdr], "w", &allow);
+        let (regs, refused) = super::webhook_registrations(&[elsewhere, hc], "w", &allow);
         assert!(regs.is_empty(), "scope + sink kind both gate: {regs:?}");
         assert!(refused.is_empty(), "neither is an error: {refused:?}");
     }
@@ -4433,7 +4433,7 @@ mod tests {
         };
         assert_eq!(cached_health_body(&app), "CANNED");
         // A STALE snapshot must still be served as-is: recomputing inline runs
-        // herdr/toron subprocesses, and one loaded host made /health exceed any
+        // hc/toron subprocesses, and one loaded host made /health exceed any
         // client budget while the daemon was healthy (measured live 2026-10-31).
         app.health.lock().computed_at = Instant::now()
             .checked_sub(std::time::Duration::from_secs(3_600))

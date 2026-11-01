@@ -47,7 +47,7 @@ pub fn parse_presence_word(s: &str) -> PresenceVerdict {
 }
 
 /// One typed inject gate (bd-zawk G6): the single owner of the
-/// inject-vs-digest decision for BOTH the herdr-string path
+/// inject-vs-digest decision for BOTH the hc-string path
 /// (`route_or_queue`, `is_drain_transition` inputs) and the presence-verdict
 /// path (`apply_presence_filter`). blocked parses to Busy, so blocked+urgent
 /// injects while blocked+routine digests with a reason — never a silent drop.
@@ -74,12 +74,12 @@ pub fn inject_gate(verdict: PresenceVerdict, urgent: bool) -> InjectGate {
     }
 }
 
-/// Herdr-status string + line urgency -> decision. Parses through
+/// Hc-status string + line urgency -> decision. Parses through
 /// `parse_presence_word` so blocked->Busy and done->Idle agree with the
 /// presence path by construction.
 // governed-by: bd-zawk
-pub fn inject_gate_for_herdr(herdr_status: &str, urgent: bool) -> InjectGate {
-    inject_gate(parse_presence_word(herdr_status), urgent)
+pub fn inject_gate_for_plane(plane_status: &str, urgent: bool) -> InjectGate {
+    inject_gate(parse_presence_word(plane_status), urgent)
 }
 
 /// More than this many previously-unseen ready beads in ONE poll is the
@@ -285,19 +285,19 @@ pub fn route_wake(input: &RouteInput) -> GateDecision {
 }
 
 /// Pane plane (bd-hv2j): classify a pane id by shape. `block:<uuid>` is a
-/// rex block; `<workspace>:p<N>` is a herdr pane. Anything else is
+/// rex block; `<workspace>:p<N>` is an hc pane. Anything else is
 /// unclassifiable (None) — never guessed, so an unknown shape keeps the
 /// old `no_route` fate instead of a false mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanePlane {
-    Herdr,
+    Hc,
     Rex,
 }
 
 impl PanePlane {
     pub fn name(&self) -> &'static str {
         match self {
-            PanePlane::Herdr => "herdr",
+            PanePlane::Hc => "hc",
             PanePlane::Rex => "rex",
         }
     }
@@ -310,18 +310,18 @@ pub fn pane_plane(pane_id: &str) -> Option<PanePlane> {
     if let Some((_, after)) = pane_id.split_once(':') {
         let b = after.as_bytes();
         if b.len() >= 2 && b[0] == b'p' && b[1].is_ascii_digit() {
-            return Some(PanePlane::Herdr);
+            return Some(PanePlane::Hc);
         }
     }
     None
 }
 
 /// Selected backend name -> the plane its roster view can see. `auto` is
-/// rex-primary with herdr as transport-only fallback (bd-rex-default-plane-xn1t),
+/// rex-primary with hc as transport-only fallback (bd-rex-default-plane-xn1t),
 /// so it reads the rex plane.
 pub fn selected_plane_from_backend_name(name: &str) -> Option<PanePlane> {
     match name.trim().to_ascii_lowercase().as_str() {
-        "herdr" => Some(PanePlane::Herdr),
+        "hc" => Some(PanePlane::Hc),
         "rex" | "superlogical" | "auto" => Some(PanePlane::Rex),
         _ => None,
     }
@@ -348,8 +348,8 @@ pub fn plane_mismatch_reason(selected: PanePlane, row_panes: &[&str]) -> Option<
         return None;
     }
     let rows_plane = match selected {
-        PanePlane::Herdr => PanePlane::Rex,
-        PanePlane::Rex => PanePlane::Herdr,
+        PanePlane::Hc => PanePlane::Rex,
+        PanePlane::Rex => PanePlane::Hc,
     };
     Some(format!(
         "plane_mismatch: selected={} rows={} (bd-hv2j)",
@@ -821,7 +821,7 @@ mod wake_core_tests_bd_0nem {
             "nostr",
             "flywheel",
             "doorbell",
-            "herdr",
+            "hc",
             "sqlx",
             "axum",
             "rmcp",

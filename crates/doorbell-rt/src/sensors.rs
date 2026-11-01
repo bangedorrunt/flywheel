@@ -94,7 +94,7 @@ pub fn interval_ticker(
 }
 
 /// Bridge an off-loop producer into the brain (pipe pattern): fetch I/O
-/// off-loop, deliver back as a message. `.5` plugs the bus watch, herdr
+/// off-loop, deliver back as a message. `.5` plugs the bus watch, hc
 /// forwarders, and watch-child NDJSON lines here.
 pub fn bridge<T, F>(
     name: impl Into<String>,

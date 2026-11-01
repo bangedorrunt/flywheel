@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 /// Delivery endpoint. The brain's only delivery intent is `Prompt{pin,line}`;
-/// adapters translate it (herdr prompt today, webhook/DM in Phase 2).
+/// adapters translate it (hc prompt today, webhook/DM in Phase 2).
 pub trait PromptSink: Send + 'static {
     fn send(&mut self, pin: &str, line: &str) -> Result<(), RtError>;
     fn name(&self) -> &str;
@@ -71,7 +71,7 @@ struct Sink {
 
 /// Bound for the shutdown worker join across all sinks (bd-nuf2): a Brain
 /// must exit well inside the 10s SIGTERM drain budget. Healthy in-flight
-/// sends (a herdr CLI prompt is ~100ms) finish far inside this; only a
+/// sends (an hc CLI prompt is ~100ms) finish far inside this; only a
 /// hung endpoint rides out the grace.
 const SHUTDOWN_WORKER_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -271,7 +271,7 @@ impl SinkManager {
     /// journal (the intent was already journaled pre-delivery, D4.2).
     ///
     /// bd-nuf2: the worker join is BOUNDED — a worker inside a hung
-    /// endpoint send (live: 30s herdr CLI timeout) used to hold this await
+    /// endpoint send (live: 30s hc CLI timeout) used to hold this await
     /// past every drain budget, so Brains never joined and every stop
     /// logged DRAIN BUDGET EXCEEDED. Past the grace the join gives up and
     /// shutdown returns; the straggler stays detached until its endpoint
@@ -503,7 +503,7 @@ impl PromptSink for NoTextSink {
 ///
 /// The daemon is launched by launchd/systemd, so an operator surface has to
 /// be an env var it can carry in the unit — same shape as
-/// `DOORBELL_TORON_BIN`/`DOORBELL_HERDR_BIN`.
+/// `DOORBELL_TORON_BIN`/`DOORBELL_HC_BIN`.
 pub const EGRESS_ALLOWLIST_ENV: &str = "DOORBELL_WEBHOOK_ALLOWLIST";
 
 /// Operator-approved egress hosts (D6 threat table: attention metadata
@@ -808,11 +808,11 @@ mod tests {
         let (deg_tx, _deg_rx) = mpsc::channel(16);
         let mut mgr = SinkManager::new(deg_tx);
         let (sink, sent) = MockSink::new();
-        mgr.add_sink("herdr", Box::new(sink));
+        mgr.add_sink("hc", Box::new(sink));
         // Yield long enough for the worker to drain the (empty) queue and park.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            mgr.send("herdr", "p", "after-idle").await
+            mgr.send("hc", "p", "after-idle").await
         })
         .await
         .expect("send after idle must not wedge on the parked worker's lock");
@@ -821,7 +821,7 @@ mod tests {
         assert_eq!(sent_len(&sent), 1, "intent must deliver after the park");
     }
 
-    /// bd-nuf2: a worker inside a hung endpoint send (live: 30s herdr CLI
+    /// bd-nuf2: a worker inside a hung endpoint send (live: 30s hc CLI
     /// timeout) must not hold the drain past budget — shutdown bounds the
     /// worker join and returns. The in-flight intent was journaled
     /// pre-delivery (D4.2); resume redelivers it. Multi-thread: the stall
@@ -833,8 +833,8 @@ mod tests {
         let mut mgr = SinkManager::new(deg_tx);
         let (mut sink, _sent) = MockSink::new();
         sink.stall_ms = 12_000;
-        mgr.add_sink("herdr", Box::new(sink));
-        mgr.send("herdr", "p", "in-flight").await;
+        mgr.add_sink("hc", Box::new(sink));
+        mgr.send("hc", "p", "in-flight").await;
         // Let the worker pop the intent so it sits inside the 20s send.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let done = tokio::time::timeout(std::time::Duration::from_secs(8), mgr.shutdown()).await;
@@ -850,18 +850,18 @@ mod tests {
         let mut mgr = SinkManager::with_cap(deg_tx, 2);
         let (mut sink, sent) = MockSink::new();
         sink.stall_ms = 200;
-        mgr.add_sink("herdr", Box::new(sink));
+        mgr.add_sink("hc", Box::new(sink));
         // Cap 2: first two queue, the rest must shed — never block.
         let mut outcomes = Vec::new();
         for i in 0..6 {
-            outcomes.push(mgr.send("herdr", "p", &format!("m{i}")).await);
+            outcomes.push(mgr.send("hc", "p", &format!("m{i}")).await);
         }
         let sheds = outcomes
             .iter()
             .filter(|o| matches!(o, SendOutcome::Shed { .. }))
             .count();
         assert!(sheds >= 3, "slow sink must shed to digest, got {sheds}");
-        assert_eq!(mgr.sheds("herdr").await, sheds as u64);
+        assert_eq!(mgr.sheds("hc").await, sheds as u64);
         tokio::time::sleep(std::time::Duration::from_millis(900)).await;
         assert!(sent_len(&sent) >= 2, "worker still pumps the queue");
     }
@@ -899,8 +899,8 @@ mod tests {
         let mut mgr = SinkManager::new(deg_tx);
         let (mut sink, _sent) = MockSink::new();
         sink.stall_ms = 500;
-        mgr.add_sink("herdr", Box::new(sink));
-        mgr.send("herdr", "p", "held").await;
+        mgr.add_sink("hc", Box::new(sink));
+        mgr.send("hc", "p", "held").await;
         let undelivered = mgr.shutdown().await;
         assert!(
             undelivered.iter().any(|u| u.line == "held"),
@@ -1020,16 +1020,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e15_stalled_webhook_sheds_while_herdr_prompt_fast() {
+    async fn e15_stalled_webhook_sheds_while_plane_prompt_fast() {
         // E15: webhook stalled 30s (simulated) → shed-to-digest + Degraded;
-        // herdr-prompt latency unaffected (brain never blocks on a sink).
+        // hc-prompt latency unaffected (brain never blocks on a sink).
         let (deg_tx, mut deg_rx) = mpsc::channel(16);
         let mut mgr = SinkManager::with_cap(deg_tx, 1);
         let (mut stall, _sent) = MockSink::new();
         stall.stall_ms = 30_000;
         mgr.add_sink("webhook", Box::new(stall));
         let (fast, sent) = MockSink::new();
-        mgr.add_sink("herdr", Box::new(fast));
+        mgr.add_sink("hc", Box::new(fast));
         // Fill the webhook queue past its cap of 1.
         assert!(matches!(
             mgr.send("webhook", "svc", "one").await,
@@ -1042,19 +1042,19 @@ mod tests {
             }
         }
         assert!(sheds >= 3, "stalled webhook must shed, got {sheds}");
-        // Herdr prompt latency: fast path answers immediately despite the
+        // Hc prompt latency: fast path answers immediately despite the
         // stalled sibling (per-sink isolation, not a shared pump).
         let t = tokio::time::Instant::now();
         assert!(matches!(
-            mgr.send("herdr", "p", "urgent").await,
+            mgr.send("hc", "p", "urgent").await,
             SendOutcome::Queued
         ));
         assert!(
             t.elapsed() < std::time::Duration::from_secs(5),
-            "herdr prompt must not wait on the stalled webhook"
+            "hc prompt must not wait on the stalled webhook"
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(sent_len(&sent), 1, "herdr worker pumps independently");
+        assert_eq!(sent_len(&sent), 1, "hc worker pumps independently");
         // A shed storm is visible: drain overflow names the subscriber sink.
         let _ = deg_rx.try_recv();
     }
