@@ -86,6 +86,16 @@ pub(crate) enum CaptainCmd {
         #[arg(long)]
         json: bool,
     },
+    /// one mikasa-side pull-fresh tick (ADR-0019 D2 amendment 2026-11-01):
+    /// read `toron mail inbox` as the hosted pin so the durable cursor
+    /// advances. Does not install or load any launchd unit.
+    #[command(name = "pull-fresh-tick")]
+    PullFreshTick {
+        project: String,
+        /// hosted captain pin whose inbox cursor must advance
+        #[arg(long = "as")]
+        as_agent: String,
+    },
 }
 
 pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
@@ -136,6 +146,9 @@ pub(crate) fn cmd_captain(cfg: &Config, cmd: &CaptainCmd) -> Result<()> {
             as_agent.as_deref(),
         ),
         CaptainCmd::Directory { project, json } => cmd_captain_directory(cfg, project, *json),
+        CaptainCmd::PullFreshTick { project, as_agent } => {
+            cmd_pull_fresh_tick(project, as_agent)
+        }
     }
 }
 
@@ -420,6 +433,8 @@ fn inbox_rows(mail: &crate::mail::Mail, key: &str, since: Option<&str>) -> Resul
 struct DirPin {
     pin: String,
     harness: String,
+    /// ADR-0019 D6 harness session id from the spawn registry, if any.
+    harness_session: Option<String>,
     pane_id: Option<String>,
     location_hosted: bool,
     live: bool,
@@ -464,7 +479,7 @@ fn assemble_directory(
                     p.location_hosted,
                     &p.pin,
                     (!p.harness.is_empty()).then_some(p.harness.as_str()),
-                    None,
+                    p.harness_session.as_deref(),
                     block_id,
                     p.pane_id.as_deref(),
                     false,
@@ -525,6 +540,25 @@ fn assemble_directory(
     (sessions, truncated, address)
 }
 
+
+/// ADR-0019 D2 amendment: one mikasa-side pull-fresh tick.
+fn cmd_pull_fresh_tick(project: &str, pin: &str) -> Result<()> {
+    crate::check_project_spelling(project, "captain pull-fresh-tick")?;
+    if pin.trim().is_empty() {
+        anyhow::bail!("captain pull-fresh-tick: --as <pin> is required");
+    }
+    let code = crate::pull_fresh_poller::run_tick(project, pin, |bin, argv| {
+        let status = std::process::Command::new(bin).args(argv).status()?;
+        Ok(status.code().unwrap_or(1))
+    })
+    .map_err(|e| anyhow::anyhow!("captain pull-fresh-tick: failed to run toron: {e}"))?;
+    if code != 0 {
+        anyhow::bail!("captain pull-fresh-tick: toron exited {code}");
+    }
+    println!("pull-fresh-tick ok project={project} pin={pin}");
+    Ok(())
+}
+
 /// ADR-0019 D2/D4 read-only directory.
 ///
 /// `flywheel captain directory <project> [--json]`
@@ -535,8 +569,10 @@ fn assemble_directory(
 /// the same question with a loud, actionable refusal.
 #[cfg(feature = "backend-superlogical")]
 fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<()> {
-    // Explicit rex backend on this path: `auto` would return herdr when
-    // REX_SESSION is unset, and herdr has no blocks to project.
+    // Door-scoped rex backend (ADR-0019 D0): directory projects blocks, so
+    // it always constructs SuperlogicalBackend. `auto` is already rex-primary
+    // regardless of REX_SESSION (bd-mknvb / bd-l7b05); this path still pins
+    // rex explicitly so a herdr-only feature build refuses loudly above.
     let backend = crate::backend::superlogical::SuperlogicalBackend;
     let ws_id = crate::find_workspace_dyn(&backend, project)?;
     let agents = backend
@@ -564,6 +600,7 @@ fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<
                 == crate::agent_ref::BindingLocation::Hosted,
             pin,
             harness: e.harness.clone().unwrap_or_default(),
+            harness_session: e.harness_session.clone(),
             pane_id,
             live,
             registered: true,
@@ -579,6 +616,7 @@ fn cmd_captain_directory(cfg: &Config, project: &str, json_out: bool) -> Result<
                 == crate::agent_ref::BindingLocation::Hosted,
             pin: name,
             harness: String::new(),
+            harness_session: None,
             pane_id: Some(a.pane_id.clone()),
             live: true,
             registered: false,
@@ -1190,6 +1228,7 @@ mod tests {
             DirPin {
                 pin: "LivePin".to_string(),
                 harness: "pi".to_string(),
+                harness_session: None,
                 pane_id: Some("block:abc".to_string()),
                 location_hosted: false,
                 live: true,
@@ -1198,6 +1237,7 @@ mod tests {
             DirPin {
                 pin: "HostedPin".to_string(),
                 harness: "grok".to_string(),
+                harness_session: Some("sess-9".to_string()),
                 pane_id: None,
                 location_hosted: true,
                 live: false,

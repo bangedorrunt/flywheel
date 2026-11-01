@@ -13,7 +13,7 @@ The filename still says grokbot. That was the first draft. This decision is the 
 
 | Field | Value |
 | --- | --- |
-| **Status** | **Accepted** (both gates 2026-10-28: Contract D0–D7, Policy D8/D10/D12). Implementation authorized by the operator; a coding agent finding `proposed` in an older copy follows the session word. **Amended 2026-10-31:** the `auto` env gate is gone — `factory::resolve_plane` (bd-mknvb) resolves the plane without `REX_SESSION`, and every door follows it (bd-l7b05); read `rex_selected_via_env` in the body as historical. |
+| **Status** | **Accepted** (both gates 2026-10-28: Contract D0–D7, Policy D8/D10/D12). Implementation authorized by the operator; a coding agent finding `proposed` in an older copy follows the session word. **Amended 2026-10-31:** the `auto` env gate is gone — `factory::resolve_plane` (bd-mknvb) resolves the plane without `REX_SESSION`, and every door follows it (bd-l7b05); read `rex_selected_via_env` in the body as historical. **Amended 2026-11-01:** hosted Grok Bot freshness is a mikasa-side poller (D2); `delivery_of` follows prompt outcome, not tier re-branch (D5). |
 | **Date** | 2026-10-25 |
 | **Decision-makers** | Captain (bangedorrunt) |
 | **Extends** | [ADR-0010](0010-delivery-semantics-attention-triage-decision-lifecycle.md) (delivery is a receipt, not a hope), [ADR-0011](0011-session-conductor-crew-budget-captain-fcfs-join-loud.md) (captain is FCFS; this adds a paneless freshness bit), [ADR-0013](0013-agent-profile-lifecycle-journaled-rebind.md) (pin and npub stay put; binding gains `location`), [ADR-0016](0016-functional-effect-kernel-redesign.md) (one fold, journal before the provider, four outcomes) |
@@ -201,6 +201,31 @@ A hosted pin that has not polled for 120 seconds is stale. FCFS may claim. That 
 
 The hosted client polls at **60 seconds**, so one late poll does not drop the alias. A poll faster than **15 seconds** is a defect in the client: it burns the loop guard in D8 and it does not make the alias fresher than 120 seconds.
 
+#### Amendment 2026-11-01 — hosted Grok Bot cannot self-poll
+
+A hosted Grok Bot captain runs on a separate box. It reaches mikasa only
+through approved Shell, talks bot-to-bot through its own `SendToAgent` (not
+toron mail), and cannot keep a reliable 60-second `toron mail inbox` loop.
+D2's freshness signal is still the durable reader cursor; the *agent that
+advances that cursor* may sit on mikasa.
+
+**Chosen:** a mikasa-side poller. A launchd (or doorbell) job on mikasa runs
+`flywheel captain pull-fresh-tick <project> --as <Pin>` every 60 seconds.
+That command shells `toron mail inbox --project <p> --as <Pin> --since last
+--limit 1 --json`, which advances the pin's durable high-water. The pure
+helpers and cadence live in `src/pull_fresh_poller.rs`. The launchd unit
+template is `integrations/launchd/com.flywheel.pull-fresh.plist` — **template
+only**; the captain installs and loads it. Agents must not bootstrap it.
+
+**Rejected:** a doorbell webhook that wakes the bot. A wake does not advance
+the reader cursor by itself; the bot would still need to poll, which is the
+capability it lacks. Waking also couples freshness to Grok Bot availability
+and to an egress allowlist, which D2 does not require.
+
+Contract note: the poller is a toron mail *reader* as the pin. It does not
+change MailSurface, the delivery word, or the doorbell wake contract. It
+does not touch `:18980` or `com.doorbell.serve`.
+
 ### D3. Delivery tier is computed
 
 New module `src/captain_directory.rs`. The tier is an enum `Push | Turn | Pull | Unknown | None`. The interpreter fills a snapshot from the backend D0 selected. The pure function `tier_of` returns the tier. The fold does not read rex, herdr, the clock, or the environment. `HERDR_INJECTABLE` is not an input.
@@ -305,12 +330,23 @@ Map:
 
 | Append `state` | Backend prompt | `delivery` |
 | --- | --- | --- |
-| `appended` or `already-appended`, tier `pull` or `turn` | not asked, or not ok | `queued` |
-| `appended` or `already-appended`, tier `push` | prompt returned ok | `woke` |
+| `appended` or `already-appended` | not asked, or not ok | `queued` |
+| `appended` or `already-appended` | prompt returned ok (any tier) | `woke` |
 | any, later ack on that `msg_id` | | `read` as an annotation, the row's `delivery` on the directory prefers `read` |
 | `unknown`, or `MailErrorCode::Timeout` or `Io` between claim and settle | | `unknown` |
 | `refused` | | no delivery word. The error code is the result (`loop_refused`, `group_refused`, `tier_none`, `file_held`, `unarrived`). |
 | any, unread past the forget window | | `expired` as an annotation, never a new settle. `history_row_status` ignores it, exactly as it ignores `read`. |
+
+**Amendment 2026-11-01 — `delivery_of` follows the attempt, not a tier
+re-branch.** Tier still selects whether a prompt is *attempted* (call site).
+`delivery_of(append, tier, prompt_ok)` keeps `tier` on the signature so every
+caller names the tier it decided under, but the constructor does not switch
+on it: a successful prompt is `woke` on push, pull, turn, or unknown
+(Verification already required `unknown` + ok → `woke`). The prior table
+rows that listed only `push` + ok → `woke` and `pull`/`turn` + not-ok →
+`queued` were the common cases; they drifted from the verification clause
+and from the single-constructor intent. The code matched verification; this
+table now matches both.
 
 Doorbell text alone does not set `woke`. `left to the doorbell host` is still `queued`.
 

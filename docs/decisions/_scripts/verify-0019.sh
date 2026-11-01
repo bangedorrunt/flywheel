@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # verify-0019.sh — ADR-0019 Contract gate D0-D7 Phase 0. Fail-closed.
 set -u
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+# Resolve against this script's directory, not the caller's cwd. Use a
+# subshell + CDPATH= so a broken interactive `cd` function cannot poison it.
+SCRIPT_DIR="$(CDPATH= command cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(CDPATH= command cd -- "$SCRIPT_DIR/../../.." && pwd)"
 FAIL=0
 pass(){ echo "PASS: $1"; }
 fail(){ echo "FAIL: $1"; FAIL=1; }
@@ -48,11 +51,15 @@ else
   pass "no sqlite mailbox type"
 fi
 
-# Behavior gate: module tests green
+# Behavior gate: module tests green (must run inside ROOT, not the caller's cwd)
 echo "-- behavior (cargo) --"
 if command -v mbx >/dev/null 2>&1; then CARGO="mbx +nightly-aarch64-apple-darwin"; else CARGO="cargo"; fi
-$CARGO test --bin flywheel captain_directory 2>&1 | tail -n 3
-[ "${PIPESTATUS[0]}" -eq 0 ] || fail "captain_directory tests red"
+(
+  CDPATH= command cd -- "$ROOT" || exit 1
+  $CARGO test --bin flywheel captain_directory 2>&1 | tail -n 3
+  exit "${PIPESTATUS[0]}"
+)
+[ $? -eq 0 ] || fail "captain_directory tests red"
 
 if [ "$FAIL" -ne 0 ]; then echo "RESULT: FAIL"; exit 1; fi
 echo "RESULT: PASS"

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- governed-by: ADR-0019 D2 amendment 2026-11-01 — mikasa-side pull-fresh poller.
+     TEMPLATE ONLY. The captain installs and loads this unit; agents must not
+     bootstrap or kickstart it. Replace FLYWHEEL_BIN, PROJECT, PIN, and log paths. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.flywheel.pull-fresh</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>FLYWHEEL_BIN</string>
+        <string>captain</string>
+        <string>pull-fresh-tick</string>
+        <string>PROJECT</string>
+        <string>--as</string>
+        <string>PIN</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/OPERATOR/.local/state/flywheel/pull-fresh.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/OPERATOR/.local/state/flywheel/pull-fresh.log</string>
+</dict>
+</plist>

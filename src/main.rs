@@ -68,6 +68,7 @@ mod init_scaffold;
 mod intent;
 mod lead_claim;
 mod private_fs;
+mod pull_fresh_poller;
 mod proc;
 mod recipient_guard;
 mod redact;
@@ -10452,6 +10453,9 @@ projects available: {}",
             // skills — ledger evidence, not an inferred column.
             entry.model_pin = model_pin;
             entry.skills_digest = skills_digest;
+            // ADR-0019 D6: capture GROK_SESSION_ID (etc.) at register time.
+            entry.harness_session =
+                captain_directory::capture_harness_session(&kind);
             registry.push(entry);
             println!(
                 "  {} {}",
@@ -11293,6 +11297,9 @@ fn cmd_spawn_rex(cfg: &Config, project: &str, opts: SpawnOpts) -> Result<()> {
                 .as_deref()
                 .and_then(|pname| catalog.get(pname))
                 .and_then(|p| profile::skills_digest(&p.skills));
+            // ADR-0019 D6: capture GROK_SESSION_ID (etc.) at register time.
+            entry.harness_session =
+                captain_directory::capture_harness_session(&kind);
             registry.push(entry);
             println!("  {} {}", kind_paint(&kind), dim(&format!("({})", pane_id)));
             let exit_code: Option<i32> = launched_status
@@ -31039,9 +31046,10 @@ fn cmd_steer(
     // operator's steer and never parks.
     let hosted_pin: Option<&str> = match as_agent {
         Some(pin)
-            if request_receipts::is_hosted_caller()
-                && agent_ref::binding_location_for(&project_owned, pin)
-                    == agent_ref::BindingLocation::Hosted =>
+            if request_receipts::is_hosted_caller(agent_ref::binding_location_for(
+                &project_owned,
+                pin,
+            )) =>
         {
             Some(pin)
         }

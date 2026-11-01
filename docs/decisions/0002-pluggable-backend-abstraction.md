@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Accepted (2026-08-13; implemented; captain audit flipped Proposed → Accepted) |
+| **Status** | Accepted (2026-08-13; implemented; captain audit flipped Proposed → Accepted). **Amended 2026-11-01:** default multiplexer selection is `auto` = **rex-primary** when `backend-superlogical` is compiled (herdr is transport fallback only, or the explicit `FLYWHEEL_BACKEND=herdr` escape hatch). Historical R0 rows below that say `FLYWHEEL_BACKEND=herdr` (default) describe the R0 cutover, not today. |
 | **Date** | 2026-08-05 |
 | **Decision Maker** | Captain (bangedorrunt) |
 | **Relates to** | ADR-0001 (collaboration spine — its beads target these traits), toron ADR-0003 (the future embedded core), superlogical.com (future multiplexer) |

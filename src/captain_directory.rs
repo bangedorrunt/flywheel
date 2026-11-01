@@ -125,11 +125,16 @@ pub enum AppendState {
     Refused,
 }
 
-/// Single constructor for the delivery word. The word follows the attempt
-/// outcome, not the tier: tier selects whether a prompt is attempted, and
-/// a prompt that returned ok means the model was shown it (`woke`) on any
-/// tier. (Verification: unknown tier + ok → `woke`; pull/turn + not asked
-/// or not ok → `queued`.)
+/// Single constructor for the delivery word.
+///
+/// Tier selects whether a prompt is *attempted* (call site). The word
+/// itself follows the attempt outcome: a prompt that returned ok is
+/// `woke` on any tier (Verification: unknown tier + ok → `woke`; pull
+/// with a successful prompt is still `woke`). Pull/turn with no prompt
+/// asked, or a prompt that was not ok, is `queued`. The `_tier` argument
+/// stays on the signature so every call site names the tier it decided
+/// under; the constructor does not re-branch on it (ADR-0019 amendment
+/// 2026-11-01).
 pub fn delivery_of(append: AppendState, _tier: Tier, prompt_ok: Option<bool>) -> Delivery {
     match append {
         AppendState::Refused => Delivery::Denied,
@@ -181,6 +186,20 @@ pub fn project_directory(sessions: Vec<Session>) -> (BTreeMap<(String, String), 
         map.insert((s.pin.clone(), s.session_key.clone()), s);
     }
     (map, truncated)
+}
+
+/// ADR-0019 D6: capture the harness session id from the environment at
+/// register time. Today only grok exposes one (`GROK_SESSION_ID`). An
+/// absent or blank value is `None` — do not invent continuity.
+pub fn capture_harness_session(harness: &str) -> Option<String> {
+    let key = match harness {
+        "grok" => "GROK_SESSION_ID",
+        _ => return None,
+    };
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// D6 session key.
@@ -695,6 +714,27 @@ mod tests {
         assert_eq!(map.len(), 100);
         let first = map.keys().next().expect("first");
         assert_eq!(first.0, "Pin000");
+    }
+
+    /// D6: grok session id is captured from GROK_SESSION_ID at register.
+    /// Mutant: returning Some for a non-grok harness invents continuity.
+    /// One test owns the env mutation so parallel cargo workers cannot race.
+    #[test]
+    fn capture_harness_session_reads_grok_env() {
+        let prev = std::env::var("GROK_SESSION_ID").ok();
+        unsafe { std::env::set_var("GROK_SESSION_ID", "sess-abc") };
+        assert_eq!(
+            capture_harness_session("grok").as_deref(),
+            Some("sess-abc")
+        );
+        assert_eq!(capture_harness_session("pi"), None);
+        assert_eq!(capture_harness_session("opencode"), None);
+        unsafe { std::env::set_var("GROK_SESSION_ID", "  ") };
+        assert_eq!(capture_harness_session("grok"), None);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("GROK_SESSION_ID", v) },
+            None => unsafe { std::env::remove_var("GROK_SESSION_ID") },
+        }
     }
 
     #[test]

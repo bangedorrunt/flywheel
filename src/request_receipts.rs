@@ -326,10 +326,18 @@ pub fn load_door_receipt(project: &str, door: &str, slot: &str) -> Option<DoorRe
     })
 }
 
-/// Hosted caller: no rex block in this process (ADR-0019 D5). No block
-/// means `REX_SESSION` empty/unset. A captain sitting in a rex block is
-/// local and never takes the approval park.
-pub fn is_hosted_caller() -> bool {
+/// Hosted caller (ADR-0019 D5): `location == hosted` AND no rex block in
+/// this process. No block means `REX_SESSION` empty/unset. A cron or
+/// doorbell process with no rex session is NOT hosted-shaped unless the
+/// pin's binding location is `Hosted` — absence of a pane is not a
+/// hosted claim. A captain sitting in a rex block is local and never
+/// takes the approval park.
+pub fn is_hosted_caller(location: crate::agent_ref::BindingLocation) -> bool {
+    location == crate::agent_ref::BindingLocation::Hosted && no_rex_session()
+}
+
+/// Process has no rex block: `REX_SESSION` empty or unset.
+pub fn no_rex_session() -> bool {
     std::env::var("REX_SESSION")
         .map(|v| v.trim().is_empty())
         .unwrap_or(true)
@@ -806,4 +814,30 @@ mod tests {
         q.objective = "changed".to_string();
         assert!(!payload_rederives(&q, &d));
     }
+
+    /// D5: hosted shape is location=Hosted AND no rex session. One test owns
+    /// the env mutation so parallel cargo workers cannot race. Mutant: drop
+    /// the location check and a pane-local cron looks hosted-shaped.
+    #[test]
+    fn is_hosted_caller_requires_hosted_location() {
+        use crate::agent_ref::BindingLocation;
+        let prev = std::env::var("REX_SESSION").ok();
+        unsafe { std::env::remove_var("REX_SESSION") };
+        assert!(
+            !is_hosted_caller(BindingLocation::Pane),
+            "pane location must never look hosted just because REX_SESSION is empty"
+        );
+        assert!(
+            is_hosted_caller(BindingLocation::Hosted),
+            "hosted location + no rex session is the hosted shape"
+        );
+        unsafe { std::env::set_var("REX_SESSION", "session:test") };
+        assert!(!is_hosted_caller(BindingLocation::Hosted));
+        assert!(!is_hosted_caller(BindingLocation::Pane));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("REX_SESSION", v) },
+            None => unsafe { std::env::remove_var("REX_SESSION") },
+        }
+    }
+
 }

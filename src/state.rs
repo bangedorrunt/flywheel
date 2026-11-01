@@ -406,6 +406,11 @@ pub struct SpawnEntry {
     /// the deterministic hash mapping for those.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mail_identity: Option<String>,
+    /// ADR-0019 D6: harness session id captured at register time (e.g.
+    /// `GROK_SESSION_ID` for the grok harness). `None` when the harness
+    /// exposed none — session_key then falls back to `block:<id>` / `pane:<id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session: Option<String>,
     /// bd-eign.10: whether the agent already received the profile's
     /// skill-load prefix on its first dispatch. Advisory — a lost update
     /// (concurrent __send subprocesses) at worst repeats the prefix once.
@@ -428,6 +433,7 @@ impl SpawnEntry {
             model: None,
             model_pin: None,
             skills_digest: None,
+            harness_session: None,
             mail_identity: None,
             skills_injected: false,
             incarnation: 0,
@@ -448,6 +454,7 @@ impl SpawnEntry {
             model: None,
             model_pin: None,
             skills_digest: None,
+            harness_session: None,
             mail_identity: Some(mail_identity.into()),
             skills_injected: false,
             incarnation: 0,
@@ -473,6 +480,7 @@ impl SpawnEntry {
             model_pin: None,
             skills_digest: None,
             mail_identity,
+            harness_session: None,
             skills_injected: false,
             incarnation: 0,
         }
@@ -507,6 +515,8 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 #[serde(default)]
                 mail_identity: Option<String>,
                 #[serde(default)]
+                harness_session: Option<String>,
+                #[serde(default)]
                 skills_injected: bool,
                 #[serde(default)]
                 incarnation: u64,
@@ -522,6 +532,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
+                harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             }),
@@ -534,6 +545,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 model_pin,
                 skills_digest,
                 mail_identity,
+                harness_session,
                 skills_injected,
                 incarnation,
             } => Ok(Self {
@@ -545,6 +557,7 @@ impl<'de> Deserialize<'de> for SpawnEntry {
                 model_pin,
                 skills_digest,
                 mail_identity,
+                harness_session,
                 skills_injected,
                 incarnation,
             }),
@@ -3815,6 +3828,7 @@ mod loops_sidecar_tests {
                 model_pin: None,
                 skills_digest: None,
                 mail_identity: None,
+            harness_session: None,
                 skills_injected: false,
                 incarnation: 0,
             },
