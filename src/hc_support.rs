@@ -725,6 +725,17 @@ pub fn pane_wait_output(
     timeout_ms: Option<u64>,
 ) -> std::result::Result<PaneWaitResult, PlaneError> {
     let params = wait_for_output_params(pane_id, mode, pattern, timeout_ms)?;
+    // hc only matches output printed AFTER the wait starts, so a pattern
+    // already on screen would wait out the timeout. The old herdr wait read
+    // the recent buffer first; do the same.
+    let seen = pane_recent_text(c, pane_id).unwrap_or_default();
+    if seen.contains(pattern) {
+        return Ok(PaneWaitResult {
+            pane_id: toron_core::backend::hc::prefix_id(pane_id),
+            matched_line: None,
+            read: seen,
+        });
+    }
     let res = c.call("terminal.wait", params).map_err(to_plane_error)?;
     let mut hit = parse_wait_for_output_result(&res)?;
     // The wait result carries no snapshot text — read it back so `read` is
@@ -3240,6 +3251,68 @@ mod shell_gate_e2e {
     }
 }
 
+/// `__wait-output` against a REAL pane: hc's `output` wait only sees output
+/// printed after the wait starts, so the read-first check is what makes a
+/// pattern already on screen match. Ignored by default (needs a live daemon).
+#[cfg(test)]
+mod wait_output_live {
+    use super::*;
+
+    #[test]
+    #[ignore = "LIVE probe: needs a live hc daemon"]
+    fn a_pattern_already_on_screen_matches_without_waiting() {
+        let cfg = crate::Config::load().expect("config");
+        let c = Client::connect(Some(&cfg.socket_path())).expect("hc connect");
+        let (ws, root) = c
+            .workspace_create(Some("/tmp"), Some("flywheel-wait-output-live"), false, None)
+            .expect("workspace_create");
+        let ws_id = ws.workspace_id.clone();
+        let root = root.expect("workspace_create returns a root pane").pane_id;
+        let split = pane_split(&c, &root, "down", Some("/tmp"), None).expect("pane_split");
+        let pane = split.pane_id.clone();
+        assert!(
+            wait_shell_prompt(&c, &pane, Duration::from_secs(15)),
+            "shell never reached a prompt"
+        );
+        c.pane_run(&pane, "printf 'WAIT-OUTPUT-NEEDLE\\n'; sleep 30")
+            .expect("run");
+
+        // The needle must be on screen BEFORE the measured call, or the
+        // read-first path is not the one being tested.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut visible = false;
+        while std::time::Instant::now() < deadline {
+            visible = pane_recent_text(&c, &pane)
+                .unwrap_or_default()
+                .contains("WAIT-OUTPUT-NEEDLE");
+            if visible {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(visible, "needle never reached the screen");
+
+        let started = std::time::Instant::now();
+        let hit = pane_wait_output(&c, &pane, "match", "WAIT-OUTPUT-NEEDLE", Some(500))
+            .expect("already-visible needle must match");
+        let elapsed = started.elapsed();
+        let _ = c.workspace_close(&ws_id, true);
+        assert!(
+            c.terminal_get(&pane).is_err(),
+            "child {pane} survived workspace close"
+        );
+        assert!(
+            c.terminal_get(&root).is_err(),
+            "root {root} survived workspace close"
+        );
+        assert!(hit.read.contains("WAIT-OUTPUT-NEEDLE"), "{hit:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "matched only after the wait timeout — the read-first check did not run ({elapsed:?})"
+        );
+    }
+}
+
 #[cfg(test)]
 mod bd_crlx_model_pin_tests {
     use super::apply_opencode_model_pin;
@@ -3464,13 +3537,15 @@ impl Client {
             .map(|panes| panes.into_iter().find(|p| p.pane_id == want))?;
         Ok((ws, root))
     }
-    /// The workspace is a shell terminal: killing it ends the tree.
+    /// A workspace is a root shell terminal plus its descendants. Children
+    /// are created `outlive_parent`, so the root's death does not end them —
+    /// the shared client kills and removes every pane in the tree.
     pub fn workspace_close(
         &self,
         workspace_id: &str,
         _close_group: bool,
     ) -> Result<(), BackendError> {
-        self.terminal_kill(workspace_id).map(|_| ())
+        self.inner.close_workspace(workspace_id)
     }
     /// Run `command` IN the pane: `terminal.send` pastes the text and presses
     /// Enter in that terminal (hc has no remote-run — spawning a sibling

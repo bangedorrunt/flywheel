@@ -142,6 +142,9 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             c.terminal_kill(&a.pane_id)
                 .map(|_| ())
                 .with_context(|| format!("terminal.kill for {name} ({})", a.pane_id))?;
+            // Drop the finished record too: `hc ls --all` and the name space
+            // should not carry an exited crew member for the rest of the day.
+            let _ = c.terminal_rm(&a.pane_id);
             println!(
                 "exited {name} ({}) — reservations + dirty files preserved",
                 a.pane_id
@@ -180,6 +183,9 @@ fn cmd_crew_control(cfg: &Config, project: &str, pin: &str, verb: &ControlVerbCm
             c.terminal_kill(&a.pane_id)
                 .map(|_| ())
                 .with_context(|| format!("stop old terminal for {name} ({})", a.pane_id))?;
+            // The old record is done; the relaunch creates a fresh pane, so
+            // leaving a finished twin behind only confuses `ls --all`.
+            let _ = c.terminal_rm(&a.pane_id);
 
             // Fresh pane from the workspace root (same env contract as add).
             let panes = c.pane_list()?;

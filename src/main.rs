@@ -28977,6 +28977,7 @@ fn cmd_profile(cfg: &Config, cmd: &ProfileCmd) -> Result<()> {
                 spec.backend
             );
             if let Some(ref pin) = mail_identity {
+                prime_profile_identity(backend.as_ref(), &info.pane_id, &agent_name, pin);
                 bind_pane_mail_identity(cfg, host_project, &agent_name, &info.pane_id, Some(pin));
             }
             bind_spawn_role(
@@ -29900,6 +29901,7 @@ fn cmd_squad(cfg: &Config, cmd: &SquadCmd) -> Result<()> {
                         backend.agent_start(&agent_name, &spec.harness, &workspace, &args)?;
                     // bd-l2ky: bind pane so __send --profile / conditioning resolve.
                     if let Some(ref pin) = mail_identity {
+                        prime_profile_identity(backend.as_ref(), &info.pane_id, &agent_name, pin);
                         bind_pane_mail_identity(
                             cfg,
                             project_key,
@@ -33984,6 +33986,43 @@ fn resolved_spec_workspace(
         .first()
         .map(|p| p.pane_id.clone())
         .ok_or_else(|| anyhow::anyhow!("no pane in workspace {ws_id} for profile spawn"))
+}
+
+/// Prime a profile-launched agent with its mail identity once its TUI is up.
+///
+/// `profile run`/`squad spawn` get their shell from `workspace_create`, which
+/// carries only `HC_*` — the pin env that `spawn`/`add` inject at split time is
+/// not there, so the agent would run without `AGENT_NAME` and the strict guard
+/// would block its commits. Like `spawn`, type the pin in after boot. The wait
+/// is bounded and the prime is best-effort: a pane that never reports still
+/// gets the line, with a warning.
+fn prime_profile_identity(
+    backend: &dyn backend::MultiplexerBackend,
+    pane_id: &str,
+    name: &str,
+    pin: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        ready = backend
+            .agent_list()
+            .ok()
+            .and_then(|agents| agents.into_iter().find(|a| a.pane_id == pane_id))
+            .is_some_and(|a| a.interactive_ready);
+        if ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if !ready {
+        eprintln!(
+            "flywheel: warn: {name} ({pane_id}) not input-ready within 15s — typing the identity prime anyway"
+        );
+    }
+    if let Err(e) = backend.prompt(pane_id, &doorbell::identity_prime(name, pin), None) {
+        eprintln!("flywheel: warn: identity prime for {name} ({pane_id}) failed: {e:#}");
+    }
 }
 
 /// Merge one entry into the project's spawn registry (bd-l2ky): preserve
