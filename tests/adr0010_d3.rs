@@ -30,22 +30,22 @@ fn adr0010_d3_presence_is_sourced_verdict_enum() {
 
 #[test]
 fn adr0010_d3_no_consumer_branch_reachable_from_unknown() {
-    // The prompt gate never prompts from Unknown; herdr is evidence, never authority.
+    // The prompt gate never prompts from Unknown; hc is evidence, never authority.
     assert!(
         WORKSPACE.contains("Some(Presence::Idle { .. }) => true"),
         "prompt gate must prompt only on exact Idle"
     );
     assert!(
         WORKSPACE.contains("| None => false"),
-        "prompt gate must refuse Unknown/missing outright, never fall back to herdr"
+        "prompt gate must refuse Unknown/missing outright, never fall back to hc"
     );
     assert!(
         WORKSPACE.contains("fn verdict_for"),
-        "verdict_for(presence, herdr_status, endpoint_alive) must exist"
+        "verdict_for(presence, plane_status, endpoint_alive) must exist"
     );
     assert!(
-        WORKSPACE.contains("herdr-evidence"),
-        "herdr-derived verdicts must be labeled evidence, not authority"
+        WORKSPACE.contains("hc-evidence"),
+        "hc-derived verdicts must be labeled evidence, not authority"
     );
     assert!(
         WORKSPACE.contains("never trusted"),

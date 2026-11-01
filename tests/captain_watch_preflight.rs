@@ -4,7 +4,7 @@
 //! The unit test pins the pure selection rule; this drives the REAL binary so
 //! the wiring is proven too (a helper-only test stays green when the arm is
 //! deleted from the watch loop). A nonexistent project makes `project-dir`
-//! fail deterministically — no herdr/resonate/toron store is required, and the
+//! fail deterministically — no hc/resonate/toron store is required, and the
 //! arm runs BEFORE the mail setup so no inbox is reached.
 //!
 //! governed-by: bd-captain-watch-preflight-arm-snak
@@ -63,9 +63,9 @@ fn captain_watch_exits_on_preflight_failure_e2e() {
     );
     // The named failure must be one the REAL preflight can produce, so a
     // fabricated exit cannot pass this: the nonexistent project fails
-    // `project-dir`, or (when herdr is unreachable) that check is named first.
+    // `project-dir`, or (when hc is unreachable) that check is named first.
     assert!(
-        check == "project-dir" || check == "herdr-socket",
+        check == "project-dir" || check == "hc-socket",
         "the named failure is one the real preflight produces: {v}"
     );
 }

@@ -7,7 +7,7 @@
 //! `__reopen-bead` — durable.rs `close_check` / `reopen_bead` delegate to
 //! exactly these leaves via `run_leaf_cmd`) against a hermetic scratch
 //! project (temp dir + `.beads` init + embedded in-process toron mailbox
-//! isolated via `TORON_MCP_DATA_DIR`). No herdr, no swarm — but no mocks:
+//! isolated via `TORON_MCP_DATA_DIR`). No hc, no swarm — but no mocks:
 //! real binary, real br, real git, real mailbox.
 //!
 //! Scenarios (the loop's tick is: close-check → reopen-or-keep):
@@ -69,7 +69,7 @@ impl Scratch {
         // (remote daemon at :18080) is never touched.
         std::fs::write(
             s.cfg.join("config.toml"),
-            "[backend]\nmultiplexer = \"herdr\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-planner\"\n",
+            "[backend]\nmultiplexer = \"hc\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-planner\"\n",
         )
         .unwrap();
         s

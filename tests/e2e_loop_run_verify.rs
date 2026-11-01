@@ -62,7 +62,7 @@ impl Scratch {
         // Embedded in-process toron (NO [mail.toron] url) + test identity.
         std::fs::write(
             s.cfg.join("config.toml"),
-            "[backend]\nmultiplexer = \"herdr\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-planner\"\n",
+            "[backend]\nmultiplexer = \"hc\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-planner\"\n",
         )
         .unwrap();
         s

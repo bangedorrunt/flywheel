@@ -5,12 +5,12 @@
 //!   `cargo test`. A test audit (7f9e117, "test-audit -25, no coverage loss")
 //!   triaged five of those seven cases as duplicative, moving the
 //!   `plan_actions` replays into `main.rs` loop_tests; two remain.
-//! - **Fake herdr (always-on):** `__poll_events` and `__poll` against an
-//!   in-test herdr socket, with a temp HOME and temp XDG dirs: the pushed
+//! - **Fake hc (always-on):** `__poll_events` and `__poll` against an
+//!   in-test hc socket, with a temp HOME and temp XDG dirs: the pushed
 //!   status event comes back inside the short timeout and names the same
 //!   pane `__poll` lists, so the event path can route to the agent.
 //! - **Live (opt-in, `FLYWHEEL_LIVE_E2E=1`, off by default):** measures
-//!   `__poll_events` wake vs pure poll cadence on the real herdr socket.
+//!   `__poll_events` wake vs pure poll cadence on the real hc socket.
 //!
 //! The static "do these seven test names still exist" gate that used to live
 //! here was removed with the cases it named: it asserted names the audit had
@@ -36,10 +36,10 @@ fn live_e2e_opted_in() -> bool {
     std::env::var(LIVE_E2E).as_deref() == Ok("1")
 }
 
-/// The binary with a temp HOME and temp XDG dirs under `root`, `herdr_sock`
-/// as its herdr socket, and none of the operator's TORON_/FLYWHEEL_/
+/// The binary with a temp HOME and temp XDG dirs under `root`, `plane_sock`
+/// as its hc socket, and none of the operator's TORON_/FLYWHEEL_/
 /// DOORBELL_ settings.
-fn hermetic(root: &std::path::Path, herdr_sock: &std::path::Path) -> Command {
+fn hermetic(root: &std::path::Path, plane_sock: &std::path::Path) -> Command {
     let mut cmd = Command::new(flywheel());
     for (key, _) in std::env::vars_os() {
         let key = key.to_string_lossy();
@@ -62,33 +62,33 @@ fn hermetic(root: &std::path::Path, herdr_sock: &std::path::Path) -> Command {
         std::fs::create_dir_all(&dir).expect("hermetic subdir");
         cmd.env(var, dir);
     }
-    // bd-mrga: the fake speaks the herdr protocol — pin the backend to
-    // herdr, or `auto` selects the rex primary and the rex client reads
-    // nothing from a herdr-protocol socket (workspace resolution finds no
+    // bd-mrga: the fake speaks the hc protocol — pin the backend to
+    // hc, or `auto` selects the rex primary and the rex client reads
+    // nothing from an hc-protocol socket (workspace resolution finds no
     // swarm and the test fails without touching any product code).
-    cmd.env("FLYWHEEL_BACKEND", "herdr");
-    cmd.env("HERDR_SOCKET_PATH", herdr_sock);
+    cmd.env("FLYWHEEL_BACKEND", "hc");
+    cmd.env("HC_SOCKET_PATH", plane_sock);
     cmd
 }
 
 const FAKE_LABEL: &str = "fw-parity-fake";
 const FAKE_PANE: &str = "w1:p1";
 
-/// A fake herdr: newline-JSON RPC over a unix socket, one request per
+/// A fake hc: newline-JSON RPC over a unix socket, one request per
 /// connection, except `events.subscribe`, which acks, pushes one
 /// `pane.agent_status_changed` for [`FAKE_PANE`], and holds the stream open.
 /// Serves until the test process exits.
-fn fake_herdr(sock: &std::path::Path) {
-    let listener = UnixListener::bind(sock).expect("bind fake herdr socket");
+fn fake_plane(sock: &std::path::Path) {
+    let listener = UnixListener::bind(sock).expect("bind fake hc socket");
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
-            std::thread::spawn(move || serve_fake_herdr(conn));
+            std::thread::spawn(move || serve_fake_plane(conn));
         }
     });
 }
 
-fn serve_fake_herdr(conn: UnixStream) {
+fn serve_fake_plane(conn: UnixStream) {
     let mut reader = BufReader::new(conn.try_clone().expect("clone"));
     let mut out = conn;
     let mut line = String::new();
@@ -135,15 +135,15 @@ fn serve_fake_herdr(conn: UnixStream) {
     let _ = writeln!(out, "{}", serde_json::json!({ "id": id, "result": result }));
 }
 
-/// The always-on half of the parity check, against a fake herdr. The
+/// The always-on half of the parity check, against a fake hc. The
 /// pushed status event comes back well inside the 400ms window, and it names
 /// the pane `__poll` lists for the swarm, so the event path can route the
 /// wake to the agent the poll path would pick.
 #[test]
-fn event_and_poll_agree_against_a_fake_herdr() {
+fn event_and_poll_agree_against_a_fake_plane() {
     let tmp = tempfile::tempdir().expect("temp root");
-    let sock = tmp.path().join("herdr.sock");
-    fake_herdr(&sock);
+    let sock = tmp.path().join("hc.sock");
+    fake_plane(&sock);
 
     let t0 = Instant::now();
     let events = hermetic(tmp.path(), &sock)
@@ -166,7 +166,7 @@ fn event_and_poll_agree_against_a_fake_herdr() {
     // bd-mrga: this asserts the SHORT TIMEOUT IS HONORED, not how fast a
     // debug-build process spawns. A 400ms leaf budget plus one process start
     // measures the host's page cache as much as the event path (observed
-    // 3.4s on a quiet box: spawn + config + herdr connect), which is exactly
+    // 3.4s on a quiet box: spawn + config + hc connect), which is exactly
     // the ambient-state dependency the repo forbids in tests. The ceiling
     // still fails a leaf that ignored --timeout-ms and waited the 30s
     // default.
@@ -196,8 +196,8 @@ fn event_and_poll_agree_against_a_fake_herdr() {
     );
 }
 
-/// The live test checks the opt-in before it touches herdr: a plain
-/// `cargo test` used to drive the real herdr socket whenever herdr was up.
+/// The live test checks the opt-in before it touches hc: a plain
+/// `cargo test` used to drive the real hc socket whenever hc was up.
 #[test]
 fn live_parity_is_opt_in_before_anything_live() {
     let src = include_str!("event_poll_parity.rs");
@@ -206,7 +206,7 @@ fn live_parity_is_opt_in_before_anything_live() {
         .expect("live test");
     let body = &src[at..];
     let gate = body.find("if !live_e2e_opted_in()").expect("opt-in gate");
-    for live in ["herdr_up()", "Command::new("] {
+    for live in ["plane_up()", "Command::new("] {
         let first = body.find(live).unwrap_or(usize::MAX);
         assert!(gate < first, "the opt-in gate must come before {live}");
     }
@@ -215,28 +215,28 @@ fn live_parity_is_opt_in_before_anything_live() {
     }
 }
 
-fn herdr_up() -> bool {
-    Command::new("herdr")
+fn plane_up() -> bool {
+    Command::new("hc")
         .args(["workspace", "list"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// Live: `__poll_events` against the real herdr socket completes within timeout
+/// Live: `__poll_events` against the real hc socket completes within timeout
 /// and returns valid JSON (empty items ok). Poll leaf also returns valid JSON.
 /// Asserts event wait can finish in less than a typical poll interval (3000ms)
 /// when given a short timeout.
 #[test]
 fn live_event_vs_poll_session_identical_dispatch() {
     if !live_e2e_opted_in() {
-        eprintln!("{LIVE_E2E} unset — live parity skipped (the fake-herdr test is the gate)");
+        eprintln!("{LIVE_E2E} unset — live parity skipped (the fake-hc test is the gate)");
         return;
     }
-    if !herdr_up() {
-        // Not a skip-gap: assert environment explicitly so CI without herdr
+    if !plane_up() {
+        // Not a skip-gap: assert environment explicitly so CI without hc
         // still has the pure simulation test above as the gate.
-        eprintln!("herdr not up — pure simulation test is the default gate");
+        eprintln!("hc not up — pure simulation test is the default gate");
         return;
     }
 

@@ -102,7 +102,7 @@ impl Scratch {
         std::fs::create_dir_all(&s.mailbox).unwrap();
         std::fs::write(
             s.cfg.join("config.toml"),
-            "[backend]\nmultiplexer = \"herdr\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"adr27-tester\"\n",
+            "[backend]\nmultiplexer = \"hc\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"adr27-tester\"\n",
         )
         .unwrap();
         s
@@ -643,18 +643,18 @@ fn adr0027_s1_guard_no_double_bell_model_and_no_status_preinsert_and_watchdied_k
     );
     assert!(
         !content.contains("let mut status_by_pin"),
-        "RED: live dispatcher still owns status_by_pin; Model.doorbell.statuses is the only herdr-status map"
+        "RED: live dispatcher still owns status_by_pin; Model.doorbell.statuses is the only hc-status map"
     );
-    // 7. statuses.insert(to) before HerdrStatus tick (8006 live, 8444 refresh) -> drain dead
-    // Check for the pre-insert pattern immediately before tick for HerdrStatus
-    // We scan for the two-insert sites; after fix they must not appear before doorbell_tick::tick for HerdrStatus
+    // 7. statuses.insert(to) before PlaneStatus tick (8006 live, 8444 refresh) -> drain dead
+    // Check for the pre-insert pattern immediately before tick for PlaneStatus
+    // We scan for the two-insert sites; after fix they must not appear before doorbell_tick::tick for PlaneStatus
     let preinsert_occurrences = content.matches("bell_model.statuses.insert").count();
-    // At bde4daae there are 4 inserts (8006,8444,8528, plus one more); after fix the HerdrStatus inserts (8006/8444) must be gone (tick sees `from`)
-    // We assert that NOT all inserts remain — at least the live/refresh HerdrStatus pre-inserts are removed.
-    // The simplest pin: after fix, the file should NOT contain `bell_model.statuses.insert(pin.clone(), to.clone())` before a HerdrStatus tick.
-    // We check that the specific pattern with `to.clone()` appears at most once (the non-HerdrStatus paths may keep one insert if justified by review, but not the HerdrStatus drain killer)
+    // At bde4daae there are 4 inserts (8006,8444,8528, plus one more); after fix the PlaneStatus inserts (8006/8444) must be gone (tick sees `from`)
+    // We assert that NOT all inserts remain — at least the live/refresh PlaneStatus pre-inserts are removed.
+    // The simplest pin: after fix, the file should NOT contain `bell_model.statuses.insert(pin.clone(), to.clone())` before a PlaneStatus tick.
+    // We check that the specific pattern with `to.clone()` appears at most once (the non-PlaneStatus paths may keep one insert if justified by review, but not the PlaneStatus drain killer)
     if preinsert_occurrences > 2 {
-        // allow at most 1-2 non-Herdr inserts, but the 2 Herdr inserts must be gone
+        // allow at most 1-2 non-Hc inserts, but the 2 Hc inserts must be gone
         // We do a stricter check: look for the comment that was added to disambiguate
         // After fix, the lines 8006/8444 should be gone.
         let has_live_insert = content.contains("// apply_status_change. `from` is kept")
@@ -666,7 +666,7 @@ fn adr0027_s1_guard_no_double_bell_model_and_no_status_preinsert_and_watchdied_k
                 .count();
             assert!(
                 specific <= 1,
-                "RED (bd-6b1y #7): main.rs still pre-inserts statuses before HerdrStatus tick (live 8006, refresh 8444) — stop; let tick see `from` (drain fires on working->idle/done/blocked)"
+                "RED (bd-6b1y #7): main.rs still pre-inserts statuses before PlaneStatus tick (live 8006, refresh 8444) — stop; let tick see `from` (drain fires on working->idle/done/blocked)"
             );
         }
     }
@@ -713,11 +713,11 @@ fn adr0027_s1_guard_once_calls_tick_not_second_reducer() {
 fn adr0027_s1_guard_every_live_event_constructs_msg() {
     let main_rs = flywheel_manifest_dir().join("src/main.rs");
     let content = read_file(&main_rs);
-    // Live dispatcher binds at least: AckSlaTick, WatchNdjson, HerdrStatus, WatchDied, InboxRows sweep
+    // Live dispatcher binds at least: AckSlaTick, WatchNdjson, PlaneStatus, WatchDied, InboxRows sweep
     for msg_variant in [
         "AckSlaTick",
         "WatchNdjson",
-        "HerdrStatus",
+        "PlaneStatus",
         "WatchDied",
         "InboxRows",
     ] {

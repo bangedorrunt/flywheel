@@ -17,8 +17,8 @@
 //!   carrying an extra `git worktree add` sibling exits non-zero WITHOUT
 //!   `--allow-worktree` (preflight worktree check FAIL) and succeeds WITH it
 //!   (operator-only, logged). Opt-in (`FLYWHEEL_LIVE_E2E=1`, off by
-//!   default): it drives the real herdr and the live preflight. Opted in,
-//!   it still skips when herdr or resonate is down.
+//!   default): it drives the real hc and the live preflight. Opted in,
+//!   it still skips when hc or resonate is down.
 //! - Assert the loop dispatch surface contains ZERO worktree-create calls
 //!   (source grep) — the brief bans worktrees, the action enum has no
 //!   worktree variant, and the preflight gate is the structural ban.
@@ -40,10 +40,10 @@ fn live_e2e_opted_in() -> bool {
     std::env::var(LIVE_E2E).as_deref() == Ok("1")
 }
 
-/// The live Scenario B checks the opt-in before it touches herdr, the
+/// The live Scenario B checks the opt-in before it touches hc, the
 /// preflight, or the toron data dir: a plain `cargo test` reaches none of
 /// them (it used to open the operator's `~/.local/share/toron` store and
-/// create a workspace on the real herdr on every full run).
+/// create a workspace on the real hc on every full run).
 #[test]
 fn live_scenario_b_is_opt_in_before_anything_live() {
     let src = include_str!("e2e_serialize_worktree.rs");
@@ -53,10 +53,10 @@ fn live_scenario_b_is_opt_in_before_anything_live() {
     let body = &src[at..];
     let gate = body.find("if !live_e2e_opted_in()").expect("opt-in gate");
     for live in [
-        "herdr_up()",
+        "plane_up()",
         "resonate_up()",
         "Command::new(",
-        "herdr_workspace_create(",
+        "plane_workspace_create(",
     ] {
         let first = body.find(live).unwrap_or(usize::MAX);
         assert!(gate < first, "the opt-in gate must come before {live}");
@@ -67,8 +67,8 @@ fn live_scenario_b_is_opt_in_before_anything_live() {
     }
 }
 
-fn herdr_up() -> bool {
-    Command::new("herdr")
+fn plane_up() -> bool {
+    Command::new("hc")
         .args(["workspace", "list"])
         .output()
         .map(|o| o.status.success())
@@ -152,7 +152,7 @@ impl Scratch {
         // never touched.
         std::fs::write(
             s.cfg.join("config.toml"),
-            "[backend]\nmultiplexer = \"herdr\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-zord\"\n",
+            "[backend]\nmultiplexer = \"hc\"\nmail = \"toron\"\n\n[agent_mail]\nname = \"e2e-zord\"\n",
         )
         .unwrap();
         s
@@ -457,16 +457,16 @@ fn allow_worktree_flag_is_exposed_on_run_surfaces() {
     }
 }
 
-// ---- Scenario B: linked-worktree preflight (live, herdr + resonate) --------
+// ---- Scenario B: linked-worktree preflight (live, hc + resonate) --------
 
 /// `flywheel loop run <scratch>` in a workspace with an extra `git worktree
 /// add` sibling exits NON-ZERO without `--allow-worktree` (preflight FAIL
 /// naming the linked tree) and SUCCEEDS with it (operator opt-out LOGGED).
-/// Live-gated: needs herdr (workspace + worktree list) and resonate (all
+/// Live-gated: needs hc (workspace + worktree list) and resonate (all
 /// preflight checks must pass for the success half). Skips when down.
 ///
 /// Opt-in only (`FLYWHEEL_LIVE_E2E=1`): it creates a workspace on the REAL
-/// herdr and runs `loop run` against the operator's live preflight (doorbell,
+/// hc and runs `loop run` against the operator's live preflight (doorbell,
 /// toron mail store under the real data dir, operator key). Isolating it
 /// would mean faking all of those, so a plain `cargo test` must not reach
 /// any of them; the pure halves are unit-tested in `src/preflight.rs`
@@ -475,12 +475,12 @@ fn allow_worktree_flag_is_exposed_on_run_surfaces() {
 fn linked_worktree_gates_loop_run_until_operator_optout() {
     if !live_e2e_opted_in() {
         eprintln!(
-            "{LIVE_E2E} unset — Scenario B skipped (live herdr/preflight; CLI surface covered above)"
+            "{LIVE_E2E} unset — Scenario B skipped (live hc/preflight; CLI surface covered above)"
         );
         return;
     }
-    if !herdr_up() {
-        eprintln!("herdr down — Scenario B skipped (CLI surface covered above)");
+    if !plane_up() {
+        eprintln!("hc down — Scenario B skipped (CLI surface covered above)");
         return;
     }
     if !resonate_up() {
@@ -492,7 +492,7 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    // Unique repo dir PER RUN: the herdr workspace label derives from the
+    // Unique repo dir PER RUN: the hc workspace label derives from the
     // repo dir's basename (`flywheel-<base>`), so a fixed name like
     // `primary` would collide across runs — a stale duplicate label makes
     // find_workspace resolve the WRONG (already-removed) workspace and the
@@ -529,13 +529,13 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
         "git worktree add sibling",
     );
 
-    // a herdr workspace whose label resolves the project (flywheel-<base>)
+    // an hc workspace whose label resolves the project (flywheel-<base>)
     let project = primary.to_str().unwrap().to_string();
     let label = format!(
         "flywheel-{}",
         primary.file_name().unwrap().to_str().unwrap()
     );
-    let ws = herdr_workspace_create(&label, &project);
+    let ws = plane_workspace_create(&label, &project);
 
     // Scenario B part 1: WITHOUT --allow-worktree → non-zero + linked-tree FAIL
     let out = Command::new(flywheel())
@@ -596,7 +596,7 @@ fn linked_worktree_gates_loop_run_until_operator_optout() {
         .current_dir(&primary)
         .output();
     if let Some(id) = ws {
-        let _ = Command::new("herdr")
+        let _ = Command::new("hc")
             .args(["workspace", "close", &id])
             .output();
     }
@@ -626,9 +626,9 @@ fn run_ok(cwd: &Path, bin: &str, args: &[&str], what: &str) {
     );
 }
 
-/// Create a herdr workspace with the given label + cwd; returns its id.
-fn herdr_workspace_create(label: &str, cwd: &str) -> Option<String> {
-    let out = Command::new("herdr")
+/// Create an hc workspace with the given label + cwd; returns its id.
+fn plane_workspace_create(label: &str, cwd: &str) -> Option<String> {
+    let out = Command::new("hc")
         .args([
             "workspace",
             "create",
@@ -639,10 +639,10 @@ fn herdr_workspace_create(label: &str, cwd: &str) -> Option<String> {
             "--no-focus",
         ])
         .output()
-        .expect("herdr workspace create");
+        .expect("hc workspace create");
     if !out.status.success() {
         eprintln!(
-            "herdr workspace create failed: {}",
+            "hc workspace create failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         return None;

@@ -1,10 +1,10 @@
 //! Replay recorded transcripts through the real host (bd-replay-fixtures-9z0u).
 //!
 //! The fixture (`fixtures/replay_transcript.ndjson`) is raw provider frames
-//! with ids and seq ordering kept — herdr status frames, watch wire lines,
+//! with ids and seq ordering kept — hc status frames, watch wire lines,
 //! and toron-wire delivery frames — never pre-normalized domain events.
 //! The replay replaces ONLY the transports:
-//! - herdr socket → `--status pin=state` seeds on `__doorbell --once`;
+//! - hc socket → `--status pin=state` seeds on `__doorbell --once`;
 //! - toron socket → [`DeliveryEvent`]s folded by the real
 //!   [`toron_core::delivery::DeliveryFsm`].
 //!
@@ -28,7 +28,7 @@ fn flywheel() -> &'static str {
     env!("CARGO_BIN_EXE_flywheel")
 }
 
-/// Split the raw transcript into herdr seeds (`--status`) and watch stdin
+/// Split the raw transcript into hc seeds (`--status`) and watch stdin
 /// lines, in seq order. Panics on any seq gap: lifecycle ordering is the
 /// property under test, so a torn transcript must fail loudly, never replay
 /// past the tear.
@@ -56,9 +56,9 @@ fn split_transcript() -> (Vec<String>, Vec<String>, Vec<serde_json::Value>) {
         );
         expect_seq += 1;
         match v.get("frame").and_then(serde_json::Value::as_str) {
-            Some("herdr.status") => {
-                let pin = v["pin"].as_str().expect("herdr frame pin");
-                let status = v["agent_status"].as_str().expect("herdr frame status");
+            Some("hc.status") => {
+                let pin = v["pin"].as_str().expect("hc frame pin");
+                let status = v["agent_status"].as_str().expect("hc frame status");
                 seeds.push(format!("{pin}={status}"));
             }
             Some("watch") => {

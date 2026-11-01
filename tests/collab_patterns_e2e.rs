@@ -2,9 +2,9 @@
 //!
 //! Always-on: CLI surface + pure parsers + recipe catalog presence. Every
 //! binary call there runs through [`run`]: a fresh temp HOME and temp XDG
-//! dirs, no herdr socket, and no inherited TORON_/FLYWHEEL_/DOORBELL_ env.
+//! dirs, no hc socket, and no inherited TORON_/FLYWHEEL_/DOORBELL_ env.
 //! Live (opt-in, `FLYWHEEL_LIVE_E2E=1`, off by default): the debate and
-//! plan-review soaks against the real herdr and mail, the mail probe, and the
+//! plan-review soaks against the real hc and mail, the mail probe, and the
 //! xproj inbox leaf. Each of those writes to the operator's live stores (the
 //! probe alone created `flywheel-mail-probe` in the real toron data dir on
 //! every plain `cargo test`), so none of them runs unless asked.
@@ -26,7 +26,7 @@ fn live_e2e_opted_in() -> bool {
 }
 
 /// Run the binary hermetically: a fresh temp HOME and XDG data/state/config/
-/// cache, a herdr socket path that does not exist, and none of the operator's
+/// cache, an hc socket path that does not exist, and none of the operator's
 /// TORON_/FLYWHEEL_/DOORBELL_ settings. The temp dir is removed on return.
 fn run(args: &[&str]) -> std::process::Output {
     let tmp = tempfile::tempdir().expect("hermetic temp dir");
@@ -52,15 +52,15 @@ fn run(args: &[&str]) -> std::process::Output {
         std::fs::create_dir_all(&dir).expect("hermetic subdir");
         cmd.env(var, dir);
     }
-    cmd.env("HERDR_SOCKET_PATH", tmp.path().join("no-herdr.sock"));
+    cmd.env("HC_SOCKET_PATH", tmp.path().join("no-hc.sock"));
     cmd.args(args).output().expect("spawn flywheel")
 }
 
-/// Every test reaches the binary, herdr or mail only through [`run`] or after
+/// Every test reaches the binary, hc or mail only through [`run`] or after
 /// the opt-in gate, and the three live soaks carry that gate. A plain
 /// `cargo test` used to run the mail probe (creating `flywheel-mail-probe`
 /// in the operator's toron data dir), the xproj inbox leaf, and the soaks
-/// against the real herdr whenever they were up.
+/// against the real hc whenever they were up.
 #[test]
 fn live_soaks_are_opt_in_before_anything_live() {
     let src = include_str!("collab_patterns_e2e.rs");
@@ -84,7 +84,7 @@ fn live_soaks_are_opt_in_before_anything_live() {
             "{name}: exactly the live soaks carry the opt-in gate"
         );
         let hermetic = &body[..gate.unwrap_or(body.len())];
-        for live in ["Command::new(", "herdr_up()", "mail_up()", "__xproj-inbox"] {
+        for live in ["Command::new(", "plane_up()", "mail_up()", "__xproj-inbox"] {
             assert!(
                 !hermetic.contains(live),
                 "{name}: {live} before the opt-in gate (use run())"
@@ -97,8 +97,8 @@ fn live_soaks_are_opt_in_before_anything_live() {
     }
 }
 
-fn herdr_up() -> bool {
-    Command::new("herdr")
+fn plane_up() -> bool {
+    Command::new("hc")
         .args(["workspace", "list"])
         .output()
         .map(|o| o.status.success())
@@ -191,7 +191,7 @@ fn xproj_parse_contract_for_receiver_loop() {
     assert_eq!(v["workers"], 4);
 }
 
-/// Live debate soak: when herdr+mail up, run a 1-round debate against real
+/// Live debate soak: when hc+mail up, run a 1-round debate against real
 /// agents if available; otherwise validate help + that cmd starts cleanly
 /// and fails fast without hanging when agents are missing.
 #[test]
@@ -201,8 +201,8 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
         return;
     }
     let exe = flywheel();
-    if !herdr_up() {
-        eprintln!("herdr down — CLI wiring covered by collab_recipes_are_wired_into_the_cli");
+    if !plane_up() {
+        eprintln!("hc down — CLI wiring covered by collab_recipes_are_wired_into_the_cli");
         return;
     }
 
@@ -273,7 +273,7 @@ fn debate_soak_three_rounds_ack_gated_verdict() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!err.contains("panic"), "debate must not panic: {err}");
         eprintln!(
-            "SKIP: debate live path failed (no scripted agents in a live herdr \
+            "SKIP: debate live path failed (no scripted agents in a live hc \
              session?) — run against a spawned swarm for the full contract"
         );
     }
@@ -296,7 +296,7 @@ fn plan_review_implement_soak_three_paths() {
         return;
     }
     let exe = flywheel();
-    if !herdr_up() || !mail_up() {
+    if !plane_up() || !mail_up() {
         eprintln!("infra partial — pure plan_review unit tests cover APPROVE/CHANGES/REJECT");
         return;
     }

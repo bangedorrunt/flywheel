@@ -67,7 +67,7 @@ fn sc_d10_loop_playbook_is_not_a_five_min_poll() {
     );
 }
 
-/// SC-D1 herdr-mock: kind-9 `@pin` routes at the edge but triages to
+/// SC-D1 hc-mock: kind-9 `@pin` routes at the edge but triages to
 /// routine (bd-l72k) — no `[doorbell]` inject, no `loop run`. Two pins
 /// registered; the mention is counted, never prompted.
 /// ADR-0010 D3: the mock `--status` is evidence only; trusted presence
@@ -162,7 +162,7 @@ fn run_doorbell_once(stdin_line: &str, status: &[&str]) -> String {
 /// SC-D1 wiring (bd-asr2.5 topology): `cmd_internal_doorbell` selects the
 /// host; the embedded live path is `doorbell_host::run_embedded` driving
 /// doorbell-rt's Brain around `RtHost` (tick decides, journal first,
-/// herdr prompt delivers). Same contracts, new addresses.
+/// hc prompt delivers). Same contracts, new addresses.
 #[test]
 fn sc_d1_live_dispatcher_uses_apply_watch_line() {
     // bd-mngn: cmd_internal_doorbell moved to src/cmd/doorbell.rs, where it is
@@ -196,11 +196,11 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
         "live path must journal ticks for `doorbell why`"
     );
     // 329d66d (bd-delete-flag-off-legacy-wake-27ll) deleted the flag-off pane
-    // typer: the herdr sink is a NoTextSink, and a wake is a ring, never typed
+    // typer: the hc sink is a NoTextSink, and a wake is a ring, never typed
     // text. The old pin (`doorbell_prompt`) asserted the deleted path.
     assert!(
         host.contains("doorbell_rt::NoTextSink::new()"),
-        "the live herdr sink is the NoTextSink (rings, never typed text)"
+        "the live hc sink is the NoTextSink (rings, never typed text)"
     );
     assert!(
         !host.contains("doorbell_prompt("),
@@ -245,7 +245,7 @@ fn sc_d1_live_dispatcher_uses_apply_watch_line() {
     );
 }
 
-/// herdr plane harden item 4: one multiplexed events.subscribe for crew panes;
+/// hc plane harden item 4: one multiplexed events.subscribe for crew panes;
 /// stream death clears covered; events_lost stays compile-gated until toron.
 #[test]
 fn sc_d1_doorbell_multiplex_subscribe_and_stream_death_rearm() {
